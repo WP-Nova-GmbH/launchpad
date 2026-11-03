@@ -36,6 +36,7 @@ const fixture = vi.hoisted(() => ({
   dispatch: vi.fn(),
   receipt: vi.fn(),
   cancelActive: vi.fn(),
+  retryActive: vi.fn(),
   checkActive: vi.fn(),
   refresh: vi.fn(),
   signIn: vi.fn(),
@@ -54,6 +55,7 @@ function read(atom: unknown) {
 function commands(atom: unknown) {
   if (atom === "cancel") return fixture.dispatch;
   if (atom === "cancel-active") return fixture.cancelActive;
+  if (atom === "retry-active") return fixture.retryActive;
   if (atom === "check-active") return fixture.checkActive;
   return fixture.receipt;
 }
@@ -64,6 +66,7 @@ function threads() {
       queueControl: "cancel",
       queueReceipt: "receipt",
       cancelActiveMove: "cancel-active",
+      retryActiveMove: "retry-active",
       checkMoveCancellation: "check-active",
     },
   };
@@ -448,6 +451,7 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       await render(initialQueue, environmentId, threadId, activeReturnPlacement);
       const content = JSON.stringify(renderer!.toJSON());
       expect(content).toContain("Could not save the current history.");
+      expect(button("Retry move")).toBeUndefined();
       expect(content.indexOf("Private VM")).toBeLessThan(content.indexOf("Akina"));
       const rows = renderer!.root
         .findAllByType("div")
@@ -509,6 +513,64 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       expect(fixture.cancelActive).toHaveBeenCalledWith(
         expect.objectContaining({ operationId: "return", sourceGeneration: 3 }),
       );
+      expect(fixture.dispatch).not.toHaveBeenCalled();
+    });
+    it("retries only the exact failed save from a retired view and keeps Cancel available", async () => {
+      const reply = deferred<unknown>();
+      fixture.retryActive.mockImplementationOnce(() => reply.promise);
+      const failed = {
+        ...activeReturnPlacement,
+        activeMove: { ...activeReturnMove, retryRequiredAttempt: 4 },
+        moveFailures: [
+          {
+            environmentId: "vm",
+            generation: 3,
+            attempt: 4,
+            active: true,
+            detail: "The Codex history changed while saving.",
+            reportedAt: "2026-10-26T09:01:00.000Z",
+          },
+        ],
+      } satisfies RelayPortableThreadPlacement;
+      await render(initialQueue, environmentId, threadId, failed);
+      const action = button("Retry move")!;
+      await act(async () => {
+        const press = action.props.onClick ?? action.props.onPress;
+        press();
+        press();
+      });
+      expect(fixture.retryActive).toHaveBeenCalledExactlyOnceWith({
+        accountId: "owner",
+        relayUrl: "https://relay.example.test",
+        threadId,
+        operationId: "return",
+        sourceGeneration: 3,
+        failedAttempt: 4,
+      });
+      expect(JSON.stringify(renderer!.toJSON())).toContain(
+        "The Codex history changed while saving.",
+      );
+      expect(button("Requesting retry…")?.props.disabled).toBe(true);
+      expect(button("Cancel move")?.props.disabled).not.toBe(true);
+      await act(async () => {
+        reply.resolve({ _tag: "Failure", cause: Cause.fail(new Error("Retry reply lost")) });
+      });
+      expect(button("Retry move")).toBeDefined();
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Retry reply lost");
+      const retryRequested = { ...activeReturnMove, retryRequestedAttempt: 4 };
+      fixture.retryActive.mockResolvedValueOnce({ _tag: "Success", value: retryRequested });
+      await click("Retry move");
+      expect(button("Retry requested")?.props.disabled).toBe(true);
+      expect(fixture.retryActive.mock.calls[1]).toEqual(fixture.retryActive.mock.calls[0]);
+      await render(initialQueue, environmentId, threadId, {
+        ...failed,
+        activeMove: retryRequested,
+      });
+      expect(JSON.stringify(renderer!.toJSON())).toContain(
+        "Waiting for the source to try saving again.",
+      );
+      expect(button("Retry move")).toBeUndefined();
+      expect(button("Cancel move")).toBeDefined();
       expect(fixture.dispatch).not.toHaveBeenCalled();
     });
     it("cancels a relay move while the source socket is unavailable", async () => {

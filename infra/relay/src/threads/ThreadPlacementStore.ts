@@ -20,7 +20,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { makeThreadVmActivityStore } from "./ThreadVmActivityStore.ts";
-import { makeThreadMoveParticipantStatus } from "./ThreadMoveParticipantStatus.ts";
+import { makeThreadMoveParticipantStatus, sourceMoveRetry } from "./ThreadMoveParticipantStatus.ts";
 
 export class ThreadPlacementConflict extends Schema.TaggedError<ThreadPlacementConflict>()(
   "ThreadPlacementConflict",
@@ -55,6 +55,7 @@ export interface ThreadMove {
   readonly cancellationBlocker?: "capture_stop_unconfirmed" | "source_reopen_failed" | null;
   readonly legacyCancelCommandId?: string | null;
   readonly sourceMessageId?: string | null;
+  readonly destinationVerifiedCommit?: boolean;
 }
 interface Admission {
   readonly environmentId: string;
@@ -262,7 +263,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
       transfer_encoding_policy AS "transferEncodingPolicy",
       cancellation_protocol AS "cancellationProtocol", (source_reopened_at IS NOT NULL) AS "sourceReopened",
       cancellation_blocker AS "cancellationBlocker", legacy_cancel_command_id AS "legacyCancelCommandId",
-      source_message_id AS "sourceMessageId"
+      source_message_id AS "sourceMessageId", destination_verified_commit AS "destinationVerifiedCommit"
       FROM relay_thread_moves WHERE operation_id = ${input.operationId} AND thread_id = ${input.threadId}`;
     return row ? yield* participants.project(row) : null;
   });
@@ -487,15 +488,18 @@ export function makeThreadPlacementStore(sql: PgClient) {
     );
   });
   const reportFailure = Effect.fn("relay.thread_placement.report_failure")(function* (
-    input: MoveIdentity & Owner & { readonly detail: string; readonly attempt?: number },
+    input: MoveIdentity &
+      Owner & { readonly detail: string; readonly attempt?: number; readonly requiresRetry?: true },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const placement = yield* lock(input.threadId);
         const move = yield* getMove(input);
+        const source =
+          input.environmentId === move.sourceEnvironmentId &&
+          input.generation === move.expectedGeneration;
         const participant =
-          (input.environmentId === move.sourceEnvironmentId &&
-            input.generation === move.expectedGeneration) ||
+          source ||
           (input.environmentId === move.destinationEnvironmentId &&
             input.generation === move.expectedGeneration + 1);
         if (
@@ -508,6 +512,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
           return yield* conflict("Move no longer accepts participant failure reports");
         const detail = input.detail.trim();
         if (!detail || detail.length > 2000) return yield* conflict("Invalid move failure detail");
+        if (
+          input.requiresRetry &&
+          (!source || input.attempt === undefined || !Number.isSafeInteger(input.attempt + 2))
+        )
+          return yield* conflict("Only a numbered source save failure can require retry");
         if (input.attempt === undefined)
           yield* sql`UPDATE relay_thread_moves SET failure_detail = COALESCE(failure_detail,${detail})
             WHERE operation_id = ${input.operationId}`;
@@ -515,6 +524,46 @@ export function makeThreadPlacementStore(sql: PgClient) {
           if (!validAttempt(input.attempt)) return yield* conflict("Invalid move failure attempt");
           yield* participants.reportFailure({ ...input, attempt: input.attempt, detail });
         }
+        return yield* getMove(input);
+      }),
+    );
+  });
+
+  const requestRetry = Effect.fn("relay.thread_placement.request_retry")(function* (
+    input: MoveIdentity & { readonly sourceGeneration: number; readonly failedAttempt: number },
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const placement = yield* lock(input.threadId);
+        const move = yield* getMove(input);
+        if (
+          placement.operationId !== input.operationId ||
+          placement.environmentId !== move.sourceEnvironmentId ||
+          placement.generation !== input.sourceGeneration ||
+          move.expectedGeneration !== input.sourceGeneration ||
+          !["preparing", "frozen", "ready"].includes(move.phase)
+        )
+          return yield* conflict("Move no longer accepts source retry");
+        const source = move.participantStates?.find(
+          (participant) =>
+            participant.environmentId === move.sourceEnvironmentId &&
+            participant.generation === move.expectedGeneration,
+        );
+        if (
+          source?.failure?.attempt !== input.failedAttempt ||
+          !source.failure.requiresRetry ||
+          !Number.isSafeInteger(input.failedAttempt + 2)
+        )
+          return yield* conflict("This source save is no longer waiting for retry");
+        if (source.resolvedBeforeAttempt > input.failedAttempt) return move;
+        if (sourceMoveRetry(move)?.attempt !== input.failedAttempt)
+          return yield* conflict("This source save is no longer waiting for retry");
+        yield* participants.resolveBefore({
+          operationId: move.operationId,
+          environmentId: move.sourceEnvironmentId,
+          generation: move.expectedGeneration,
+          attempt: input.failedAttempt + 1,
+        });
         return yield* getMove(input);
       }),
     );
@@ -537,6 +586,9 @@ export function makeThreadPlacementStore(sql: PgClient) {
           return yield* conflict("Invalid move freeze attempt");
         if (placement.operationId !== input.operationId)
           return yield* conflict("Move no longer owns the handoff");
+        const retry = sourceMoveRetry(move);
+        if (retry && (!retry.requested || (input.attempt ?? 0) <= retry.attempt))
+          return yield* conflict("The source save requires an authorized new attempt");
         if (move.phase === "frozen" || move.phase === "ready") {
           if (
             move.sourceCursor !== input.sourceCursor ||
@@ -574,9 +626,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
   const destinationReady = Effect.fn("relay.thread_placement.destination_ready")(function* (
     input: MoveIdentity & {
       readonly environmentId: string;
+      readonly generation?: number;
       readonly sourceCursor: number;
       readonly manifestSha256: string;
       readonly attempt?: number;
+      readonly destinationVerifiedCommit?: true;
     },
   ) {
     return yield* sql.withTransaction(
@@ -587,13 +641,16 @@ export function makeThreadPlacementStore(sql: PgClient) {
           placement.operationId !== input.operationId ||
           !["frozen", "ready"].includes(move.phase) ||
           move.destinationEnvironmentId !== input.environmentId ||
+          (input.destinationVerifiedCommit && input.generation !== move.expectedGeneration + 1) ||
           move.sourceCursor !== input.sourceCursor ||
           move.manifestSha256 !== input.manifestSha256
         )
           return yield* conflict("Destination does not match the frozen source");
         if (input.attempt !== undefined && !validAttempt(input.attempt))
           return yield* conflict("Invalid move readiness attempt");
-        yield* sql`UPDATE relay_thread_moves SET phase = 'ready', failure_detail = NULL WHERE operation_id = ${input.operationId}`;
+        yield* sql`UPDATE relay_thread_moves SET phase = 'ready', failure_detail = NULL,
+          destination_verified_commit=destination_verified_commit OR ${input.destinationVerifiedCommit ?? false}
+          WHERE operation_id = ${input.operationId}`;
         if (input.attempt !== undefined)
           yield* participants.resolveBefore({
             ...input,
@@ -606,7 +663,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
   });
 
   const commitMove = Effect.fn("relay.thread_placement.commit_move")(function* (
-    input: MoveIdentity,
+    input: MoveIdentity & { readonly environmentId?: string; readonly generation?: number },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -619,6 +676,12 @@ export function makeThreadPlacementStore(sql: PgClient) {
           move.failureDetail
         )
           return yield* conflict("Move is not ready to commit");
+        if (
+          move.destinationVerifiedCommit &&
+          (input.environmentId !== move.destinationEnvironmentId ||
+            input.generation !== move.expectedGeneration + 1)
+        )
+          return yield* conflict("The destination must verify and commit this move");
         yield* requireOwner(placement, {
           threadId: input.threadId,
           environmentId: move.sourceEnvironmentId,
@@ -804,6 +867,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
     beginMove,
     selectEncoding,
     reportFailure,
+    requestRetry,
     sourceFrozen,
     destinationReady,
     commitMove,

@@ -345,7 +345,8 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
             output: string | null;
             started: number;
             probe: string | null;
-          }>`SELECT setup_output_json AS output,setup_started AS started,provider_probe_attempt_id AS probe
+          }>`SELECT setup_output_json AS output,setup_started AS started,
+            CASE WHEN stopped_probe_preflight_fingerprint IS NULL THEN provider_probe_attempt_id END AS probe
             FROM thread_transfer_readiness WHERE operation_id=${input.operationId}`;
           if (readiness?.probe != null)
             return yield* workspaceFailure(
@@ -405,7 +406,8 @@ export function makeThreadCheckoutInstaller(sql: SqlClient.SqlClient) {
               );
             const changed = yield* sql`UPDATE thread_checkout_claims SET phase = 'rolling-back'
             WHERE operation_id = ${input.operationId} AND phase IN ('installing', 'installed', 'rolling-back')
-            AND NOT EXISTS(SELECT 1 FROM thread_transfer_readiness WHERE operation_id=${input.operationId} AND provider_probe_attempt_id IS NOT NULL)
+            AND NOT EXISTS(SELECT 1 FROM thread_transfer_readiness WHERE operation_id=${input.operationId}
+              AND provider_probe_attempt_id IS NOT NULL AND stopped_probe_preflight_fingerprint IS NULL)
             AND EXISTS (SELECT 1 FROM thread_execution_fences WHERE thread_id = ${input.threadId}
               AND generation = ${input.generation} AND operation_id = ${input.operationId} AND phase = 'frozen') RETURNING operation_id`;
             if (!changed.length)

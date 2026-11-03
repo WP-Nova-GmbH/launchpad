@@ -13,6 +13,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -21,8 +22,17 @@ import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts
 import { layer as RunnerLayer } from "../processRunner.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import { ProviderAdapterProbeError } from "../provider/Errors.ts";
+import { exportCodexConversation } from "../provider/Drivers/CodexConversationTransfer.ts";
+import {
+  exportUnstartedPortableCodexConversation,
+  installPortableCodexHome,
+} from "../provider/Drivers/PortableCodexHome.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
-import { assertThreadTransferReady, prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import {
+  assertThreadTransferProbeCheckpoint,
+  assertThreadTransferReady,
+  prepareThreadTransfer,
+} from "./ThreadTransferReadiness.ts";
 import { workspaceGit } from "./ThreadWorkspaceGit.ts";
 
 const encode = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -39,6 +49,7 @@ const fixture = Effect.fnUntraced(function* (options?: {
   resumeFailure?: string;
   cleanupConfirmed?: boolean;
   probe?: Effect.Effect<void>;
+  probeAppend?: string;
 }) {
   const fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
@@ -51,14 +62,36 @@ const fixture = Effect.fnUntraced(function* (options?: {
   const instanceId = ProviderInstanceId.make("codex"),
     driverKind = ProviderDriverKind.make("codex");
   const model = { instanceId, model: "gpt-5" };
-  const cursor = {
-    threadId: "00000000-0000-4000-8000-000000000001",
-    resumePolicy: "require-existing",
-    portableStateId: "a".repeat(64),
-  };
+  const nativeThreadId = "00000000-0000-4000-8000-000000000001";
+  const stateDir = path.join(root, "state");
+  const rolloutName = `rollout-2026-10-05T12-00-00-${nativeThreadId}.jsonl`;
+  const rolloutRelative = path.join("sessions", "2026", "10", "05", rolloutName);
+  const codexHome = path.join(root, "source-codex");
+  const rolloutPath = path.join(codexHome, rolloutRelative);
+  const sourceHistory =
+    `${encode({ type: "session_meta", payload: { id: nativeThreadId, cli_version: "0.159.3", history_mode: "paginated" } })}\n` +
+    `${encode({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "original conversation" }] } })}\n`;
+  yield* fs.makeDirectory(path.dirname(rolloutPath), { recursive: true });
+  yield* fs.writeFileString(rolloutPath, sourceHistory);
+  const source = yield* exportCodexConversation({
+    codexHome,
+    threadId: nativeThreadId,
+    rolloutPath,
+    artifactRoot: path.join(root, "outbound"),
+  });
+  const input = { threadId, operationId, generation: 2, manifestSha256: "b".repeat(64), stateDir };
+  const installed = yield* installPortableCodexHome({
+    ...input,
+    providerInstanceId: instanceId,
+    transferSha256: input.manifestSha256,
+    manifest: source.manifest,
+    rolloutPath: path.join(source.directory, "rollout.jsonl"),
+    codexVersion: "0.159.3",
+  });
+  const cursor = installed.resumeCursor;
+  const installedRollout = path.join(installed.homePath, rolloutRelative);
   const native =
     options?.native === false ? "null" : encode({ ...cursor, providerInstanceId: instanceId });
-  const input = { threadId, operationId, generation: 2, manifestSha256: "b".repeat(64) };
   yield* fs.writeFileString(
     path.join(root, "t3.json"),
     encode({
@@ -145,6 +178,10 @@ const fixture = Effect.fnUntraced(function* (options?: {
           );
           calls.push("resume");
           if (options?.probe) yield* options.probe;
+          if (options?.probeAppend && !resumeFailure)
+            yield* fs
+              .writeFileString(installedRollout, options.probeAppend, { flag: "a" })
+              .pipe(Effect.orDie);
           calls.push("stop");
           if (resumeFailure)
             return yield* new ProviderAdapterProbeError({
@@ -198,6 +235,15 @@ const fixture = Effect.fnUntraced(function* (options?: {
     fs,
     path,
     root,
+    installedRollout,
+    saveWithoutTurn: exportUnstartedPortableCodexConversation({
+      stateDir,
+      threadId,
+      providerInstanceId: instanceId,
+      nativeThreadId,
+      portableStateId: cursor.portableStateId,
+      artifactRoot: path.join(root, "return"),
+    }),
     authenticate: () => {
       status = { ...status, auth: { status: "authenticated" } };
     },
@@ -222,6 +268,26 @@ it.layer(
   );
 
   it.effect(
+    "saves a returned conversation with stopped-probe metadata and no destination turn",
+    () =>
+      Effect.gen(function* () {
+        const probeAppend = '{"type":"event_msg","payload":{"type":"thread_settings_applied"}}\n';
+        const f = yield* fixture({ probeAppend });
+        yield* f.prepare;
+        expect(f.calls).toEqual(["credentials", "resume", "stop"]);
+        yield* f.fence.activate(f.input);
+        const saved = yield* f.saveWithoutTurn;
+        const history = yield* f.fs.readFileString(f.path.join(saved.directory, "rollout.jsonl"));
+        expect(history).toContain("original conversation");
+        expect(history).toContain(probeAppend);
+        yield* f.fs.writeFileString(f.installedRollout, probeAppend, { flag: "a" });
+        expect(yield* Effect.flip(f.saveWithoutTurn)).toMatchObject({
+          _tag: "PortableCodexProbeHistoryError",
+        });
+      }),
+  );
+
+  it.effect(
     "recovers verified readiness without checking credentials or repeating setup and native validation",
     () =>
       Effect.gen(function* () {
@@ -240,6 +306,11 @@ it.layer(
         expect(f.calls).toEqual(["credentials", "resume", "stop"]);
         expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
         yield* f.sql`DROP TRIGGER preserve_ready`;
+        const stoppedHistory = yield* f.fs.readFileString(f.installedRollout);
+        yield* f.fs.writeFileString(f.installedRollout, "{}\n", { flag: "a" });
+        expect((yield* Effect.flip(ready)).message).toContain("readiness");
+        yield* f.fs.writeFileString(f.installedRollout, stoppedHistory);
+        yield* ready;
         expect(
           (yield* Effect.flip(
             assertThreadTransferReady({
@@ -280,6 +351,7 @@ it.layer(
           }),
         )).message,
       ).toContain("readiness");
+      yield* assertThreadTransferProbeCheckpoint(f.input);
       expect(f.calls).toEqual(["credentials", "resume", "stop"]);
     }),
   );
@@ -500,9 +572,76 @@ it.layer(
       yield* Effect.flip(f.prepare);
       yield* f.sql`DROP TRIGGER fail_ready`;
       yield* f.prepare;
-      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials", "resume", "stop"]);
+      expect(f.calls).toEqual(["credentials", "resume", "stop", "credentials"]);
       expect(yield* f.fs.readFileString(f.path.join(f.root, "setup-count"))).toBe("setup\n");
       yield* f.fence.activate(f.input);
     }),
   );
+  for (const failure of ["disk error", "interrupted worker", "runtime change"] as const) {
+    it.effect(`resumes publication from the exact stopped probe after ${failure}`, () =>
+      Effect.gen(function* () {
+        const probeAppend = '{"type":"event_msg","payload":{"type":"thread_settings_applied"}}\n';
+        const f = yield* fixture({ probeAppend });
+        const entered = yield* Deferred.make<void>();
+        const busy = PlatformError.systemError({
+          _tag: "Busy",
+          module: "FileSystem",
+          method: "rename",
+        });
+        const interrupted = failure === "interrupted worker";
+        const fault = f.prepare.pipe(
+          Effect.provideService(FileSystem.FileSystem, {
+            ...f.fs,
+            rename: (source, target) =>
+              target.endsWith("/launchpad-codex-probe-checkpoint.json")
+                ? Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(interrupted ? Effect.never : Effect.fail(busy)),
+                  )
+                : f.fs.rename(source, target),
+          }),
+        );
+        const pending = yield* fault.pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (interrupted) yield* Fiber.interrupt(pending);
+        expect(Exit.isFailure(yield* Fiber.await(pending))).toBe(true);
+        expect(
+          yield* f.sql`SELECT phase,provider_probe_attempt_id,stopped_probe_preflight_fingerprint,
+          native_probe_fingerprint FROM thread_transfer_readiness WHERE operation_id=${f.input.operationId}`,
+        ).toEqual([
+          {
+            phase: "started",
+            provider_probe_attempt_id: expect.any(String),
+            stopped_probe_preflight_fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+            native_probe_fingerprint: null,
+          },
+        ]);
+        expect((yield* f.fence.get(f.input.threadId))?.phase).toBe("frozen");
+        if (failure === "runtime change") {
+          f.changeRuntime("0.163.0-alpha.10.2");
+          expect((yield* Effect.flip(f.prepare)).message).toContain("configured provider changed");
+          expect(f.calls.filter((call) => call === "resume")).toHaveLength(1);
+        }
+        yield* f.prepare;
+        expect(f.calls.filter((call) => call === "resume")).toHaveLength(
+          failure === "runtime change" ? 2 : 1,
+        );
+        expect(
+          yield* f.sql`SELECT phase,provider_probe_attempt_id,stopped_probe_preflight_fingerprint,
+          native_probe_fingerprint FROM thread_transfer_readiness WHERE operation_id=${f.input.operationId}`,
+        ).toEqual([
+          {
+            phase: "ready",
+            provider_probe_attempt_id: null,
+            stopped_probe_preflight_fingerprint: null,
+            native_probe_fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+          },
+        ]);
+        yield* assertThreadTransferProbeCheckpoint(f.input);
+        const archive = yield* f.saveWithoutTurn;
+        expect(
+          yield* f.fs.readFileString(f.path.join(archive.directory, "rollout.jsonl")),
+        ).toContain(probeAppend);
+      }),
+    );
+  }
 });

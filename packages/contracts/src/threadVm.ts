@@ -131,6 +131,8 @@ export const RelayThreadActiveMove = Schema.Struct({
   ]),
   cancellationMode: Schema.Literals(["direct", "legacy"]),
   cancellationBlocker: Schema.optionalKey(ThreadMoveCancellationBlocker),
+  retryRequiredAttempt: Schema.optionalKey(PositiveInt),
+  retryRequestedAttempt: Schema.optionalKey(PositiveInt),
 });
 export type RelayThreadActiveMove = typeof RelayThreadActiveMove.Type;
 

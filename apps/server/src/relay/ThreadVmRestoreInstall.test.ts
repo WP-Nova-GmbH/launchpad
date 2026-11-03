@@ -831,8 +831,8 @@ it.layer(
               // Startup proof uses a verified readiness receipt; provider/setup
               // execution itself has separate real adapter-boundary tests.
               if (worktree)
-                yield* sql`INSERT INTO thread_transfer_readiness(operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_succeeded)
-                  SELECT operation_id,manifest_sha256,native_runtime_json,${"0".repeat(64)},'ready',1 FROM thread_transfer_baselines WHERE operation_id=${f.operationId}`;
+                yield* sql`INSERT INTO thread_transfer_readiness(operation_id,manifest_sha256,native_runtime_json,setup_sha256,phase,setup_succeeded,setup_output_json)
+                  SELECT operation_id,manifest_sha256,native_runtime_json,${"0".repeat(64)},'ready',1,'{}' FROM thread_transfer_baselines WHERE operation_id=${f.operationId}`;
               let calls = 0,
                 ready = false,
                 status = 200;
@@ -937,6 +937,25 @@ it.layer(
                   }),
                 ),
               );
+              if (!worktree) {
+                const installedRollout = f.path.join(
+                  portable.homePath,
+                  "sessions",
+                  "2026",
+                  "10",
+                  "07",
+                  `rollout-2026-10-07T00-00-00-${nativeId}.jsonl`,
+                );
+                const verified = yield* f.fs.readFileString(installedRollout);
+                yield* f.fs.writeFileString(installedRollout, "{}\n", { flag: "a" });
+                yield* Effect.flip(activate);
+                expect(calls).toBe(0);
+                expect(reopens).toBe(0);
+                expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe(
+                  "frozen",
+                );
+                yield* f.fs.writeFileString(installedRollout, verified);
+              }
               expect(yield* activate).toBe(false);
               expect(reopens).toBe(0);
               expect((yield* makeThreadExecutionFence(sql).get(f.threadId))?.phase).toBe("frozen");

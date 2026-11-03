@@ -12,6 +12,7 @@ export const ThreadMoveParticipantFailure = Schema.Struct({
   attempt: PositiveInt,
   detail: TrimmedNonEmptyString.check(Schema.isMaxLength(2000)),
   reportedAt: IsoDateTime,
+  requiresRetry: Schema.optionalKey(Schema.Literal(true)),
 });
 export const ThreadMoveParticipantState = Schema.Struct({
   environmentId: TrimmedNonEmptyString,

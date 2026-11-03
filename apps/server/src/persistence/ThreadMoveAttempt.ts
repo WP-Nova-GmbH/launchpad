@@ -14,6 +14,7 @@ const rowSchema = Schema.Struct({
   acknowledgedRevision: counter,
   ended: Schema.Literals([0, 1]),
   report: Schema.NullOr(Schema.fromJsonString(ThreadMoveProgressReport)),
+  blockedDetail: Schema.NullOr(Schema.String),
 });
 const decodeRow = Schema.decodeUnknownEffect(rowSchema);
 const encodeReport = Schema.encodeSync(Schema.fromJsonString(ThreadMoveProgressReport));
@@ -42,7 +43,7 @@ export function makeThreadMoveAttemptJournal(sql: SqlClient.SqlClient) {
   const read = Effect.fnUntraced(function* (owner: Owner) {
     const [raw] =
       yield* sql`SELECT thread_id AS "threadId",relay_url AS "relayUrl",attempt,revision,
-      acknowledged_revision AS "acknowledgedRevision",ended,report_json AS report FROM thread_move_attempts
+      acknowledged_revision AS "acknowledgedRevision",ended,report_json AS report,blocked_detail AS "blockedDetail" FROM thread_move_attempts
       WHERE operation_id=${owner.operationId} AND environment_id=${owner.environmentId} AND generation=${owner.generation}`;
     if (!raw) return null;
     const row = yield* decodeRow(raw).pipe(Effect.mapError(changed));
@@ -77,6 +78,8 @@ export function makeThreadMoveAttemptJournal(sql: SqlClient.SqlClient) {
             participant.environmentId === owner.environmentId &&
             participant.generation === owner.generation,
         );
+        if (prior?.blockedDetail != null && (state?.resolvedBeforeAttempt ?? 0) <= prior.attempt)
+          return yield* new ThreadMoveAttemptError({ message: "This move is waiting for Retry." });
         const highest = Math.max(
           prior?.attempt ?? 0,
           progress?.attempt ?? 0,
@@ -97,7 +100,7 @@ export function makeThreadMoveAttemptJournal(sql: SqlClient.SqlClient) {
           (operation_id,thread_id,relay_url,environment_id,generation,attempt)
           VALUES(${owner.operationId},${owner.threadId},${owner.relayUrl},${owner.environmentId},${owner.generation},${attempt})
           ON CONFLICT(operation_id,environment_id,generation) DO UPDATE SET attempt=excluded.attempt,
-            revision=0,acknowledged_revision=0,ended=0,report_json=NULL`;
+            revision=0,acknowledged_revision=0,ended=0,report_json=NULL,blocked_detail=NULL`;
         return (yield* read(owner))!;
       }),
     );
@@ -131,9 +134,17 @@ export function makeThreadMoveAttemptJournal(sql: SqlClient.SqlClient) {
       end: sql`UPDATE thread_move_attempts SET ended=1
         WHERE operation_id=${owner.operationId} AND environment_id=${owner.environmentId}
           AND generation=${owner.generation} AND attempt=${attempt}`.pipe(Effect.asVoid),
+      block: (detail: string) =>
+        sql`UPDATE thread_move_attempts SET ended=1,blocked_detail=${detail}
+          WHERE operation_id=${owner.operationId} AND environment_id=${owner.environmentId}
+            AND generation=${owner.generation} AND attempt=${attempt}`.pipe(Effect.asVoid),
     };
   });
-  return { begin };
+  const blocked = Effect.fnUntraced(function* (owner: Owner) {
+    const row = yield* read(owner);
+    return row?.blockedDetail == null ? null : { attempt: row.attempt, detail: row.blockedDetail };
+  });
+  return { begin, blocked };
 }
 
 export type ThreadMoveAttempt = Effect.Success<

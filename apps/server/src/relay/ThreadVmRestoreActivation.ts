@@ -4,12 +4,16 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
+import { ServerConfig } from "../config.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { assertThreadTransferRuntime } from "../persistence/ThreadTransferRuntime.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
-import { prepareThreadTransfer } from "./ThreadTransferReadiness.ts";
+import {
+  assertThreadTransferProbeCheckpoint,
+  prepareThreadTransfer,
+} from "./ThreadTransferReadiness.ts";
 import { inspectVmWorkloads, withSealedVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { configureThreadVmRepository } from "./ThreadVmRepositoryBinding.ts";
@@ -86,6 +90,7 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
       yield* warm ? withSealedVmWorkloads(vm.operationId, configureGit) : configureGit;
     }
     const secrets = yield* ServerSecretStore;
+    const { stateDir } = yield* ServerConfig;
     if (state.phase === "installed") {
       if (owner.phase !== "frozen") return yield* new ThreadVmRestoreActivationError();
       const readiness = prepareThreadTransfer({
@@ -93,6 +98,7 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
         operationId: vm.operationId,
         generation: vm.scope.generation,
         manifestSha256: receipt.manifestSha256,
+        stateDir,
       });
       yield* warm ? withSealedVmWorkloads(vm.operationId, readiness) : readiness;
       yield* secrets.set(
@@ -100,8 +106,10 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
         new TextEncoder().encode(yield* encodeThreadVmRestoreState({ ...state, phase: "ready" })),
       );
     }
-    if (owner.phase === "frozen")
+    if (owner.phase === "frozen") {
       yield* assertThreadTransferRuntime(yield* SqlClient.SqlClient, vm.operationId);
+      yield* assertThreadTransferProbeCheckpoint({ operationId: vm.operationId, stateDir });
+    }
     const client = yield* makeExecutorRelayApiClient({
       url: vm.relayUrl,
       issuer: vm.relayIssuer,

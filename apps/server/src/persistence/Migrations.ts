@@ -110,6 +110,7 @@ import Migration0087 from "./Migrations/087_ThreadMoveAttempts.ts";
 import Migration0088 from "./Migrations/088_CheckoutOperationBoot.ts";
 import Migration0089 from "./Migrations/089_WorkflowExecutionBinding.ts";
 import Migration0090 from "./Migrations/090_ThreadMoveSourceReopens.ts";
+import Migration0091 from "./Migrations/091_ThreadMoveHistoryRecovery.ts";
 /**
  * Migration loader with all migrations defined inline.
  *
@@ -211,6 +212,7 @@ const migrationEntries = [
   [88, "CheckoutOperationBoot", Migration0088],
   [89, "WorkflowExecutionBinding", Migration0089],
   [90, "ThreadMoveSourceReopens", Migration0090],
+  [91, "ThreadMoveHistoryRecovery", Migration0091],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

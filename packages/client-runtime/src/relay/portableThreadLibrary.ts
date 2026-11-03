@@ -190,6 +190,10 @@ export interface ActiveThreadMoveRequest {
   readonly sourceGeneration: number;
 }
 
+export interface RetryActiveThreadMoveRequest extends ActiveThreadMoveRequest {
+  readonly failedAttempt: number;
+}
+
 /** Refresh retained data independently; none of these reads may resume the VM. */
 export async function refreshSavedConversation(input: {
   signal: AbortSignal;
@@ -406,84 +410,123 @@ export function createPortableThreadLibraryAtoms<R, E>(
       return placement;
     }),
   });
+  const moveActionKey = (input: ActiveThreadMoveRequest, failedAttempt?: number) =>
+    JSON.stringify([
+      input.accountId,
+      input.relayUrl,
+      input.threadId,
+      input.operationId,
+      input.sourceGeneration,
+      failedAttempt,
+    ]);
+  const moveAction = Effect.fnUntraced(function* (
+    input: ActiveThreadMoveRequest,
+    registry: AtomRegistry.AtomRegistry,
+    action: "cancel" | "check" | { readonly failedAttempt: number },
+  ) {
+    const { relay, clerkToken, session } = yield* authorize(registry, input);
+    const isCurrent = () =>
+      isPortableThreadPlacementReadScopeCurrent(registry, session, relay.relayUrl);
+    const changed = () =>
+      new OrchestrationDispatchCommandError({
+        message: "Your account or move changed. Refresh to check the move.",
+      });
+    if (!isCurrent()) return yield* changed();
+    const request = {
+      clerkToken,
+      threadId: input.threadId,
+      operationId: input.operationId,
+      sourceGeneration: input.sourceGeneration,
+    };
+    const refresh = Effect.gen(function* () {
+      if (!isCurrent()) return;
+      const read = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
+      const placement = yield* relay
+        .getPortableThreadPlacement({ clerkToken, threadId: input.threadId })
+        .pipe(Effect.orElseSucceed(() => null));
+      if (placement?.threadId === input.threadId)
+        rememberPortableThreadPlacement(
+          registry,
+          session,
+          relay.relayUrl,
+          placement,
+          undefined,
+          read,
+        );
+    });
+    const isConflict = (error: unknown) =>
+      isRelayRequestFailure(error) && isRelayConflict(error.cause);
+    const result = yield* (
+      action === "cancel"
+        ? relay.cancelActiveThreadMove(request)
+        : action === "check"
+          ? relay.getThreadMoveCancellation(request)
+          : relay.retryActiveThreadMove({ ...request, failedAttempt: action.failedAttempt })
+    ).pipe(
+      Effect.tapError((error) =>
+        action !== "cancel" || isConflict(error) ? refresh : Effect.void,
+      ),
+      Effect.mapError((error) =>
+        isConflict(error)
+          ? new OrchestrationDispatchCommandError({
+              message:
+                typeof action === "string"
+                  ? "This move changed. Refresh its status before cancelling."
+                  : "This move changed. Refresh its status before retrying.",
+              cause: error,
+            })
+          : error,
+      ),
+    );
+    if (
+      !isCurrent() ||
+      result.operationId !== input.operationId ||
+      result.sourceGeneration !== input.sourceGeneration
+    )
+      return yield* changed();
+    if (typeof action !== "string" && result.retryRequestedAttempt === action.failedAttempt) {
+      const proofs = registry.get(portableThreadPlacementsAtom);
+      const known = proofs?.placements.get(input.threadId);
+      // The retry receipt can advance this ticket while a full placement read is unavailable.
+      if (
+        proofs?.session === session &&
+        proofs.relayUrl === normalizeSecureRelayUrl(relay.relayUrl) &&
+        known?.operationId === input.operationId &&
+        known.generation === input.sourceGeneration &&
+        known.activeMove?.operationId === input.operationId &&
+        known.activeMove.sourceGeneration === input.sourceGeneration &&
+        known.activeMove.retryRequiredAttempt === action.failedAttempt
+      )
+        rememberPortableThreadPlacement(registry, session, relay.relayUrl, {
+          ...known,
+          activeMove: result,
+        });
+    }
+    // A failed follow-up read does not turn an acknowledged action into a lost reply.
+    yield* refresh;
+    if (!isCurrent()) return yield* changed();
+    return result;
+  });
   const moveCancellationCommand = (action: "cancel" | "check") =>
     createRuntimeCommand(runtime, {
       label: action === "cancel" ? "cancel active thread move" : "check move cancellation",
       concurrency: {
         mode: "singleFlight",
-        key: (input: ActiveThreadMoveRequest) =>
-          JSON.stringify([
-            input.accountId,
-            input.relayUrl,
-            input.threadId,
-            input.operationId,
-            input.sourceGeneration,
-          ]),
+        key: (input: ActiveThreadMoveRequest) => moveActionKey(input),
       },
-      execute: Effect.fnUntraced(function* (input, registry) {
-        const { relay, clerkToken, session } = yield* authorize(registry, input);
-        const isCurrent = () =>
-          isPortableThreadPlacementReadScopeCurrent(registry, session, relay.relayUrl);
-        const changed = () =>
-          new OrchestrationDispatchCommandError({
-            message: "Your account or move changed. Refresh to check the cancellation.",
-          });
-        if (!isCurrent()) return yield* changed();
-        const request = {
-          clerkToken,
-          threadId: input.threadId,
-          operationId: input.operationId,
-          sourceGeneration: input.sourceGeneration,
-        };
-        const refresh = Effect.gen(function* () {
-          if (!isCurrent()) return;
-          const read = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
-          const placement = yield* relay
-            .getPortableThreadPlacement({ clerkToken, threadId: input.threadId })
-            .pipe(Effect.orElseSucceed(() => null));
-          if (placement?.threadId === input.threadId)
-            rememberPortableThreadPlacement(
-              registry,
-              session,
-              relay.relayUrl,
-              placement,
-              undefined,
-              read,
-            );
-        });
-        const isConflict = (error: unknown) =>
-          isRelayRequestFailure(error) && isRelayConflict(error.cause);
-        const result = yield* (
-          action === "cancel"
-            ? relay.cancelActiveThreadMove(request)
-            : relay.getThreadMoveCancellation(request)
-        ).pipe(
-          Effect.tapError((error) =>
-            action === "check" || isConflict(error) ? refresh : Effect.void,
-          ),
-          Effect.mapError((error) =>
-            isConflict(error)
-              ? new OrchestrationDispatchCommandError({
-                  message: "This move changed. Refresh its status before cancelling.",
-                  cause: error,
-                })
-              : error,
-          ),
-        );
-        if (
-          !isCurrent() ||
-          result.operationId !== input.operationId ||
-          result.sourceGeneration !== input.sourceGeneration
-        )
-          return yield* changed();
-        // A failed follow-up read does not turn a confirmed cancellation into a lost reply.
-        yield* refresh;
-        if (!isCurrent()) return yield* changed();
-        return result;
-      }),
+      execute: (input, registry) => moveAction(input, registry, action),
     });
   const cancelActiveMove = moveCancellationCommand("cancel");
   const checkMoveCancellation = moveCancellationCommand("check");
+  const retryActiveMove = createRuntimeCommand(runtime, {
+    label: "retry active thread move",
+    concurrency: {
+      mode: "singleFlight",
+      key: (input: RetryActiveThreadMoveRequest) => moveActionKey(input, input.failedAttempt),
+    },
+    execute: (input, registry) =>
+      moveAction(input, registry, { failedAttempt: input.failedAttempt }),
+  });
   const loadHistory = createRuntimeCommand(runtime, {
     label: "read retained conversation",
     concurrency: {
@@ -630,6 +673,7 @@ export function createPortableThreadLibraryAtoms<R, E>(
     refreshIndex,
     refreshPlacement,
     cancelActiveMove,
+    retryActiveMove,
     checkMoveCancellation,
     loadHistory,
     routeAtom: (

@@ -3,13 +3,16 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import { exportCodexConversation } from "./CodexConversationTransfer.ts";
 import {
   installPortableCodexHome,
+  checkpointPortableCodexAfterProbe,
   exportUnstartedPortableCodexConversation,
   resolvePortableCodexHome,
   preparePortableCodexAuthentication,
+  verifyPortableCodexProbeCheckpoint,
 } from "./PortableCodexHome.ts";
 
 const nativeId = "01900000-0000-7000-8000-000000000001";
@@ -81,6 +84,14 @@ it.layer(NodeServices.layer)("portable Codex homes", (it) => {
           installed = yield* installPortableCodexHome(f.input);
         const file = f.path.join(installed.homePath, "sessions", "2026", "10", "01", f.name);
         yield* f.fs.writeFileString(file, (yield* f.fs.readFileString(file)) + "{}\n");
+        const identity = {
+          ...f.input,
+          nativeThreadId: nativeId,
+          portableStateId: installed.resumeCursor.portableStateId,
+        };
+        expect(yield* Effect.flip(verifyPortableCodexProbeCheckpoint(identity))).toMatchObject({
+          _tag: "PortableCodexProbeHistoryError",
+        });
         expect(
           (yield* Effect.flip(
             exportUnstartedPortableCodexConversation({
@@ -92,6 +103,111 @@ it.layer(NodeServices.layer)("portable Codex homes", (it) => {
           )).message,
         ).toContain("settled destination checkpoint");
       }),
+  );
+  it.effect("saves the verified post-probe bytes and permits another stopped probe to append", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const installed = yield* installPortableCodexHome(f.input);
+      const identity = {
+        ...f.input,
+        nativeThreadId: nativeId,
+        portableStateId: installed.resumeCursor.portableStateId,
+      };
+      const rollout = f.path.join(installed.homePath, "sessions", "2026", "10", "01", f.name);
+      const save = () =>
+        exportUnstartedPortableCodexConversation({
+          ...identity,
+          artifactRoot: f.path.join(f.root, "second-save"),
+        });
+      const append = (marker: string) =>
+        f.fs.writeFileString(rollout, `{"type":"event_msg","payload":{"type":"${marker}"}}\n`, {
+          flag: "a",
+        });
+      const imported = yield* verifyPortableCodexProbeCheckpoint(identity);
+      yield* append("resume_metadata");
+      const first = yield* checkpointPortableCodexAfterProbe(identity, imported);
+      // A lost reply may retry the same publication without changing the receipt.
+      expect(yield* checkpointPortableCodexAfterProbe(identity, imported)).toBe(first);
+      expect(yield* verifyPortableCodexProbeCheckpoint(identity)).toBe(first);
+      expect(first).not.toBe(imported);
+      const archive = yield* save();
+      expect(yield* f.fs.readFileString(f.path.join(archive.directory, "rollout.jsonl"))).toContain(
+        "resume_metadata",
+      );
+      yield* append("second_resume_metadata");
+      const second = yield* checkpointPortableCodexAfterProbe(identity, first);
+      expect(yield* verifyPortableCodexProbeCheckpoint(identity)).toBe(second);
+      expect(second).not.toBe(first);
+      const refreshed = yield* save();
+      expect(
+        yield* f.fs.readFileString(f.path.join(refreshed.directory, "rollout.jsonl")),
+      ).toContain("second_resume_metadata");
+      yield* append("later_uncheckpointed_turn");
+      expect(yield* Effect.flip(save())).toMatchObject({ _tag: "PortableCodexProbeHistoryError" });
+      const bytes = yield* f.fs.readFileString(rollout);
+      yield* f.fs.writeFileString(rollout, bytes.replace("resume_metadata", "edited_metadata"));
+      expect(yield* Effect.flip(checkpointPortableCodexAfterProbe(identity, second))).toMatchObject(
+        {
+          _tag: "PortableCodexProbeHistoryError",
+        },
+      );
+    }),
+  );
+  it.effect("distinguishes temporary I/O failure from missing owned history", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const installed = yield* installPortableCodexHome(f.input);
+      const identity = {
+        ...f.input,
+        nativeThreadId: nativeId,
+        portableStateId: installed.resumeCursor.portableStateId,
+      };
+      const integrity = f.path.join(installed.homePath, "launchpad-native-integrity.json");
+      const busy = PlatformError.systemError({
+        _tag: "Busy",
+        module: "FileSystem",
+        method: "readFileString",
+      });
+      const verify = verifyPortableCodexProbeCheckpoint(identity);
+      expect(
+        yield* Effect.flip(
+          verify.pipe(
+            Effect.provideService(FileSystem.FileSystem, {
+              ...f.fs,
+              readFileString: (file, encoding) =>
+                file === integrity ? Effect.fail(busy) : f.fs.readFileString(file, encoding),
+            }),
+          ),
+        ),
+      ).toBe(busy);
+      yield* f.fs.remove(integrity);
+      expect(yield* Effect.flip(verify)).toMatchObject({ _tag: "PortableCodexProbeHistoryError" });
+    }),
+  );
+  it.effect("does not publish a checkpoint for a torn record appended by the probe", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const installed = yield* installPortableCodexHome(f.input);
+      const identity = {
+        ...f.input,
+        nativeThreadId: nativeId,
+        portableStateId: installed.resumeCursor.portableStateId,
+      };
+      const fingerprint = yield* verifyPortableCodexProbeCheckpoint(identity);
+      const rollout = f.path.join(installed.homePath, "sessions", "2026", "10", "01", f.name);
+      yield* f.fs.writeFileString(rollout, '{"type":"event_msg","payload":', { flag: "a" });
+      expect(
+        yield* Effect.flip(checkpointPortableCodexAfterProbe(identity, fingerprint)),
+      ).toMatchObject({
+        _tag: "PortableCodexProbeHistoryError",
+        message: expect.stringContaining("incomplete"),
+      });
+      expect(
+        yield* f.fs.exists(
+          f.path.join(installed.homePath, "launchpad-codex-probe-checkpoint.json"),
+        ),
+      ).toBe(false);
+    }),
   );
   it.effect("native file references survive atomic home publication and block corrupt reopen", () =>
     Effect.gen(function* () {
@@ -309,9 +425,27 @@ it.layer(NodeServices.layer)("portable Codex homes", (it) => {
           yield* f.fs.writeFile(file, bytes);
         }
         const child = f.path.join(installed.homePath, "sessions", "2026", "10", "01", childName);
+        const probe = yield* verifyPortableCodexProbeCheckpoint(request);
         yield* f.fs.writeFileString(child, yield* row(2, "event_msg", { type: "turn_complete" }), {
           flag: "a",
         });
+        yield* checkpointPortableCodexAfterProbe(request, probe);
+        const savedGraph = yield* exportUnstartedPortableCodexConversation({
+          ...request,
+          artifactRoot: f.path.join(f.root, "retained-graph"),
+        });
+        expect(savedGraph.manifest.rollouts).toHaveLength(3);
+        yield* f.fs.writeFileString(child, yield* row(3, "event_msg", { type: "turn_complete" }), {
+          flag: "a",
+        });
+        expect(
+          yield* Effect.flip(
+            exportUnstartedPortableCodexConversation({
+              ...request,
+              artifactRoot: f.path.join(f.root, "changed-graph"),
+            }),
+          ),
+        ).toMatchObject({ _tag: "PortableCodexProbeHistoryError" });
         expect((yield* resolvePortableCodexHome(request)).homePath).toBe(installed.homePath);
         const receipt = f.path.join(installed.homePath, "launchpad-native-integrity.json");
         const saved = yield* f.fs.readFileString(receipt);

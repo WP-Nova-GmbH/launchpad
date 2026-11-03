@@ -231,9 +231,14 @@ const requireStandaloneHistory = (metadata: typeof SessionMetadata.Type) =>
     : Effect.void;
 
 /** A checksum can faithfully preserve an already truncated source. Validate every native record too. */
-const validateRollout = Effect.fnUntraced(function* (file: string, allowDependencies = false) {
+const validateRollout = Effect.fnUntraced(function* (
+  file: string,
+  allowDependencies = false,
+  range?: { readonly offset: number; readonly bytesToRead: number },
+) {
   const fs = yield* FileSystem.FileSystem;
   let lastByte: number | undefined;
+  let bytesRead = 0;
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const decode = (chunk?: Uint8Array) =>
     Effect.try({
@@ -243,9 +248,10 @@ const validateRollout = Effect.fnUntraced(function* (file: string, allowDependen
           message: "The Codex conversation contains invalid UTF-8 data.",
         }),
     });
-  yield* fs.stream(file).pipe(
+  yield* fs.stream(file, range).pipe(
     Stream.tap((chunk) =>
       Effect.sync(() => {
+        bytesRead += chunk.length;
         if (chunk.length) lastByte = chunk[chunk.length - 1];
       }),
     ),
@@ -279,11 +285,12 @@ const validateRollout = Effect.fnUntraced(function* (file: string, allowDependen
         }),
     ),
   );
-  if (lastByte !== 10)
+  if (lastByte !== 10 || (range && bytesRead !== range.bytesToRead))
     return yield* new CodexConversationTransferError({
       message: "The Codex conversation ends with an incomplete native record.",
     });
 });
+export { validateRollout as validateCodexRollout };
 
 export class CodexConversationTransferError extends Schema.TaggedError<CodexConversationTransferError>()(
   "CodexConversationTransferError",

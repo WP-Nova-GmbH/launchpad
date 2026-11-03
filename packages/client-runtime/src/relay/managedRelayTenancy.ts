@@ -124,7 +124,7 @@ export interface ManagedRelayTenancyClientOptions {
   readonly relayUrl: string;
 }
 
-interface ThreadMoveCancellationRequest {
+interface ActiveThreadMoveRequest {
   readonly clerkToken: string;
   readonly threadId: ThreadId;
   readonly operationId: string;
@@ -264,10 +264,13 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly command: PortableThreadCommand;
     }) => Effect.Effect<RelayThreadCommandReceipt, ManagedRelayClientError>;
     readonly cancelActiveThreadMove: (
-      input: ThreadMoveCancellationRequest,
+      input: ActiveThreadMoveRequest,
+    ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
+    readonly retryActiveThreadMove: (
+      input: ActiveThreadMoveRequest & { readonly failedAttempt: number },
     ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
     readonly getThreadMoveCancellation: (
-      input: ThreadMoveCancellationRequest,
+      input: ActiveThreadMoveRequest,
     ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
     readonly getPendingPortableThreadCommands: (input: {
       readonly clerkToken: string;
@@ -605,6 +608,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
       "clientRuntime.managedRelayTenancy.stagePortableThreadCommand",
     ),
     cancelActiveThreadMove: unavailable("clientRuntime.managedRelayTenancy.cancelActiveThreadMove"),
+    retryActiveThreadMove: unavailable("clientRuntime.managedRelayTenancy.retryActiveThreadMove"),
     getThreadMoveCancellation: unavailable(
       "clientRuntime.managedRelayTenancy.getThreadMoveCancellation",
     ),
@@ -1220,6 +1224,25 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadMoveCancellation"),
+      withRelayClientTracing,
+    ),
+    retryActiveThreadMove: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .retryMove({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+            payload: {
+              sourceGeneration: input.sourceGeneration,
+              failedAttempt: input.failedAttempt,
+            },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("retry active thread move")),
+            timeoutRelayRequest("Active thread move retry"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.retryActiveThreadMove"),
       withRelayClientTracing,
     ),
     getPendingPortableThreadCommands: Effect.fnUntraced(

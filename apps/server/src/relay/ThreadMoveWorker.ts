@@ -39,6 +39,8 @@ import {
 import { ProcessRunner } from "../processRunner.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import { PortableCodexProbeHistoryError } from "../provider/Drivers/PortableCodexHome.ts";
+import { ProviderAdapterProcessError } from "../provider/Errors.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
@@ -58,6 +60,7 @@ import {
 } from "./ThreadTransferChunks.ts";
 import { installThreadTransferArchive } from "./ThreadTransferInstall.ts";
 import {
+  assertThreadTransferProbeCheckpoint,
   assertThreadTransferReady,
   prepareThreadTransfer,
   readThreadTransferInstallation,
@@ -90,6 +93,13 @@ const decodeChunks = Schema.decodeEffect(Schema.fromJsonString(ThreadTransferArt
 const decodeEncodingPolicy = Schema.decodeUnknownEffect(ThreadTransferEncodingPolicy);
 const hasErrorDetail = Schema.is(Schema.Struct({ detail: Schema.NonEmptyString }));
 const hasErrorMessage = Schema.is(Schema.Struct({ message: Schema.NonEmptyString }));
+const isProbeHistoryError = Schema.is(PortableCodexProbeHistoryError);
+const isProviderProcessError = Schema.is(ProviderAdapterProcessError);
+const isMoveError = Schema.is(ThreadMoveError);
+const requiresSaveRetry = (error: unknown) =>
+  isProbeHistoryError(error) ||
+  (isMoveError(error) && error.requiresRetry === true) ||
+  (isProviderProcessError(error) && isProbeHistoryError(error.cause));
 const failureDetail = (error: unknown) =>
   (hasErrorDetail(error)
     ? error.detail
@@ -149,7 +159,12 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   yield* fs.makeDirectory(storageRoot, { recursive: true, mode: 0o700 });
   const root = yield* fs.realPath(storageRoot);
   const now = DateTime.now.pipe(Effect.map(DateTime.formatIso));
-  const fail = (threadId: string, detail: string) => new ThreadMoveError({ threadId, detail });
+  const fail = (threadId: string, detail: string, requiresRetry?: true) =>
+    new ThreadMoveError({
+      threadId,
+      detail,
+      ...(requiresRetry === undefined ? {} : { requiresRetry }),
+    });
   const readQueue = Effect.fnUntraced(function* (threadId: string) {
     const [row] = yield* sql<{ queue: string; model: string; archivedAt: string | null }>`SELECT
       q.state_json AS queue,t.model_selection_json AS model,t.archived_at AS "archivedAt"
@@ -171,12 +186,29 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     Effect.scoped(
       fs.open(path.dirname(directory), { flag: "r" }).pipe(Effect.flatMap((handle) => handle.sync)),
     );
-  const inspectArchive = Effect.fnUntraced(function* (owner: ThreadMoveOwner, directory: string) {
+  const inspectArchive = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    directory: string,
+    sealedSource?: true,
+  ) {
     if ((yield* fs.realPath(directory)) !== directory)
-      return yield* fail(owner.threadId, "Move storage cannot follow a linked directory.");
+      return yield* fail(
+        owner.threadId,
+        "Move storage cannot follow a linked directory.",
+        sealedSource,
+      );
     const manifestPath = path.join(directory, "manifest.json");
+    const damaged = () =>
+      fail(
+        owner.threadId,
+        "The sealed source archive is damaged. Restore its saved bytes before retrying.",
+        true,
+      );
+    if (sealedSource && !(yield* fs.exists(manifestPath))) return yield* damaged();
     const digest = (yield* workspaceFileHash(manifestPath)).sha256;
-    const manifest = yield* decodeArchive(yield* fs.readFileString(manifestPath));
+    const manifest = yield* decodeArchive(yield* fs.readFileString(manifestPath)).pipe(
+      Effect.mapError((error) => (sealedSource ? damaged() : error)),
+    );
     return { directory, manifest, sha256: digest };
   });
   const sourceArchive = Effect.fnUntraced(function* (
@@ -185,11 +217,16 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   ) {
     const target = operationPath(owner, "source");
     if (yield* fs.exists(target)) {
-      const saved = yield* inspectArchive(owner, target);
+      const saved = yield* inspectArchive(
+        owner,
+        target,
+        sealedSha256 === undefined ? undefined : true,
+      );
       if (sealedSha256 !== undefined && saved.sha256 !== sealedSha256)
         return yield* fail(
           owner.threadId,
           "The sealed source archive changed. Restore its saved bytes before retrying.",
+          true,
         );
       yield* syncArchiveParent(target);
       return saved;
@@ -198,6 +235,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       return yield* fail(
         owner.threadId,
         "The sealed source archive is missing. Restore its saved bytes before retrying.",
+        true,
       );
     const exported = yield* archive
       .exportSource(
@@ -587,8 +625,12 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     attempt?: ThreadMoveAttempt,
   ) {
     if (!attempt) return;
-    yield* attempt.end;
-    const detail = failureDetail(error);
+    const destinationHistoryBlocked = side === "destination" && isProbeHistoryError(error);
+    const detail = destinationHistoryBlocked
+      ? `${failureDetail(error)} Cancel the move and start again.`
+      : failureDetail(error);
+    const requiresRetry = side === "source" && requiresSaveRetry(error);
+    yield* requiresRetry || destinationHistoryBlocked ? attempt.block(detail) : attempt.end;
     const move = yield* transport.get(owner);
     yield* assertThreadMoveIdentity(owner, move);
     if (
@@ -597,7 +639,12 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         (side === "source" ? move.sourceEnvironmentId : move.destinationEnvironmentId)
     )
       return;
-    const reported = yield* transport.failed(owner, detail, attempt.attempt);
+    const reported = yield* transport.failed(
+      owner,
+      detail,
+      attempt.attempt,
+      requiresRetry || undefined,
+    );
     yield* assertThreadMoveIdentity(owner, reported);
   });
   const source = Effect.fn("ThreadMoveWorker.source")(function* (threadId: string) {
@@ -830,10 +877,21 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         (report) =>
           report.environmentId === owner.environmentId && report.generation === owner.generation,
       );
+      const sourceFailure = sourceState?.failure;
+      const retryFloor = sourceState?.resolvedBeforeAttempt ?? 0;
+      const blocked = yield* attempts.blocked(owner);
+      if (blocked && retryFloor <= blocked.attempt) {
+        if (sourceFailure?.attempt !== blocked.attempt || !sourceFailure.requiresRetry) {
+          const reported = yield* transport.failed(owner, blocked.detail, blocked.attempt, true);
+          yield* assertThreadMoveIdentity(owner, reported);
+        }
+        return;
+      }
+      if (sourceFailure?.requiresRetry && retryFloor <= sourceFailure.attempt) return;
       const sourceFailed =
-        sourceState?.failure != null &&
-        sourceState.failure.attempt >= sourceState.resolvedBeforeAttempt &&
-        sourceState.failure.attempt >= (sourceProgress?.attempt ?? 0);
+        sourceFailure != null &&
+        (sourceFailure.requiresRetry || sourceFailure.attempt >= retryFloor) &&
+        sourceFailure.attempt >= (sourceProgress?.attempt ?? 0);
       if (
         move.phase === "frozen" &&
         move.manifestArtifactId !== null &&
@@ -841,13 +899,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         !sourceFailed
       )
         return;
-      if (
-        move.phase === "ready" &&
-        move.failureDetail &&
-        !sourceFailed &&
-        move.recoveryVerified === true
-      )
-        return;
+      if (move.phase === "ready" && !sourceFailed && move.recoveryVerified === true) return;
       attempt = yield* attempts.begin(owner, move);
       const progress = makeThreadMoveProgress(
         move.progress ?? [],
@@ -862,13 +914,24 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
       }
       if (move.manifestArtifactId !== null && sourceFailed) {
-        const saved = yield* inspectArchive(owner, operationPath(owner, "source"));
+        const sourcePath = operationPath(owner, "source");
+        if (!(yield* fs.exists(sourcePath)))
+          return yield* fail(
+            threadId,
+            "The sealed source archive is missing. Restore its saved bytes before retrying.",
+            true,
+          );
+        const saved = yield* inspectArchive(owner, sourcePath, true);
         if (
           saved.sha256 !== move.manifestSha256 ||
           saved.manifest.history.environmentId !== owner.environmentId ||
           saved.manifest.history.sourceSequence !== move.sourceCursor
         )
-          return yield* fail(threadId, "The published move no longer matches its sealed source.");
+          return yield* fail(
+            threadId,
+            "The published move no longer matches its sealed source.",
+            true,
+          );
         yield* verifySourceOwner(owner, saved);
         const retained = yield* transport.get(owner);
         yield* assertThreadMoveIdentity(owner, retained);
@@ -879,21 +942,14 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         )
           return yield* fail(threadId, "The frozen recovery save has not been verified.");
         yield* progress.stage("uploading");
-        // Re-read participant failures on the next sweep before committing.
         // This receipt supersedes only the source's prior failed attempt.
         return;
       }
+      // The destination verifies its local checkpoint before committing ownership.
+      if (move.phase === "ready") return;
       // Failure details live in relay placement state. Appending local queue
       // events here would invalidate the immutable source sequence being moved.
       if (move.failureDetail && move.phase !== "preparing" && !sourceFailed) return;
-      if (move.phase === "ready") {
-        const committed = yield* transport.commit(owner);
-        yield* assertThreadMoveIdentity(owner, committed);
-        if (!["committed", "completed"].includes(committed.phase))
-          return yield* fail(threadId, "Ownership has not been committed.");
-        yield* fences.retire(owner);
-        return;
-      }
       const intent = beginIntent ?? (yield* getIntent);
       if (move.transferEncodingPolicy === null) {
         move = yield* transport.selectEncoding(owner);
@@ -1268,6 +1324,10 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       const previous = yield* fences.get(owner.threadId);
       if (move.phase === "completed") {
         if (previous?.operationId === owner.operationId && previous.phase === "frozen") {
+          yield* assertThreadTransferProbeCheckpoint({
+            operationId: owner.operationId,
+            stateDir: config.stateDir,
+          }).pipe(Effect.provideContext(context));
           if (tracked) {
             const claim = yield* claims.get(owner.operationId);
             if (!claim || claim.phase !== "installed")
@@ -1293,6 +1353,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         threadId: ThreadId.make(owner.threadId),
         projectId: move.destinationProjectId,
         manifestSha256: move.manifestSha256,
+        stateDir: config.stateDir,
       };
       const activate = Effect.gen(function* () {
         const committed = move.phase === "committed" ? move : yield* transport.commit(owner);
@@ -1323,6 +1384,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             sourceCursor: move.sourceCursor,
             manifestSha256: move.manifestSha256,
             attempt: attempt.attempt,
+            destinationVerifiedCommit: true,
           });
           yield* assertThreadMoveIdentity(owner, ready);
           if (ready.recoveryVerified !== true) return;
@@ -1331,9 +1393,25 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         return;
       }
       // The persisted child/setup owner, rather than presentation errors, prevents replay.
+      const blocked = yield* attempts.blocked(owner);
+      if (blocked) {
+        if (
+          !move.participantStates?.some(
+            (participant) =>
+              participant.environmentId === owner.environmentId &&
+              participant.generation === owner.generation &&
+              participant.failure?.attempt === blocked.attempt,
+          )
+        ) {
+          const reported = yield* transport.failed(owner, blocked.detail, blocked.attempt);
+          yield* assertThreadMoveIdentity(owner, reported);
+        }
+        return;
+      }
       const held = yield* sql`SELECT 1 FROM thread_transfer_readiness
         WHERE operation_id=${owner.operationId} AND
-          (provider_probe_attempt_id IS NOT NULL OR (phase='started' AND setup_succeeded=0)) LIMIT 1`;
+          ((provider_probe_attempt_id IS NOT NULL AND stopped_probe_preflight_fingerprint IS NULL)
+            OR (phase='started' AND setup_succeeded=0)) LIMIT 1`;
       if (held.length) {
         if (move.failureDetail) return;
         attempt = yield* attempts.begin(owner, move);
@@ -1534,6 +1612,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         sourceCursor: move.sourceCursor,
         manifestSha256: move.manifestSha256,
         attempt: attempt.attempt,
+        destinationVerifiedCommit: true,
       });
       yield* assertThreadMoveIdentity(owner, ready);
       if (ready.recoveryVerified !== true) return;

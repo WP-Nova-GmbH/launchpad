@@ -125,6 +125,18 @@ export const getPortableThreadMoveCancellation = Effect.fn(
   Effect.catchTag("ThreadPlacementConflict", cancellationFailures.ThreadPlacementConflict),
 );
 
+export const retryPortableThreadMove = Effect.fn("relay.api.thread_commands.retry_move")(
+  function* (input: CancelMoveIdentity & { readonly failedAttempt: number }) {
+    const sql = (yield* RelayDb).$client;
+    return yield* withPrivateThreadAccess(input.threadId, "write", () =>
+      makeThreadPlacementStore(sql)
+        .requestRetry(input)
+        .pipe(Effect.flatMap((move) => threadMoveClientStatus(sql, move))),
+    );
+  },
+  Effect.catchTag("ThreadPlacementConflict", cancellationFailures.ThreadPlacementConflict),
+);
+
 export const stagePortableThreadCommand = Effect.fn("relay.api.thread_commands.stage")(function* (
   threadId: string,
   command: PortableThreadCommand,
@@ -262,6 +274,9 @@ export const threadCommandsApi = HttpApiBuilder.group(RelayApi, "threadCommands"
   handlers
     .handle("cancelMove", ({ params, payload }) =>
       cancelPortableThreadMove({ ...params, ...payload }),
+    )
+    .handle("retryMove", ({ params, payload }) =>
+      retryPortableThreadMove({ ...params, ...payload }),
     )
     .handle("getMoveCancellation", ({ params, query }) =>
       getPortableThreadMoveCancellation({ ...params, ...query }),

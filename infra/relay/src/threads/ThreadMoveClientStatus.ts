@@ -3,6 +3,7 @@ import type { RelayThreadActiveMove } from "@t3tools/contracts/relay";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import { makeThreadJournalStore } from "./ThreadJournalStore.ts";
+import { sourceMoveRetry } from "./ThreadMoveParticipantStatus.ts";
 import type { ThreadMove } from "./ThreadPlacementStore.ts";
 
 /** The caller holds the placement lock, including for legacy queue evidence. */
@@ -54,6 +55,7 @@ export const threadMoveClientStatus = Effect.fnUntraced(function* (
         AND event_json->>'type'='thread.prompt-queue-changed'
         AND event_json->'payload'->'entry'->>'operationId'=${move.operationId}
       ORDER BY cursor DESC LIMIT 1`)[0]?.messageId;
+  const retry = sourceMoveRetry(move);
   return {
     operationId: move.operationId,
     sourceEnvironmentId: move.sourceEnvironmentId,
@@ -69,5 +71,10 @@ export const threadMoveClientStatus = Effect.fnUntraced(function* (
         ? "direct"
         : "legacy",
     ...(blocker ? { cancellationBlocker: blocker } : {}),
+    ...(retry
+      ? retry.requested
+        ? { retryRequestedAttempt: retry.attempt }
+        : { retryRequiredAttempt: retry.attempt }
+      : {}),
   } satisfies RelayThreadActiveMove;
 });

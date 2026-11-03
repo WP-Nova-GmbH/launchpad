@@ -109,6 +109,7 @@ import { RelayEnvironmentPrincipal } from "@t3tools/contracts/relay";
 import {
   stagePortableThreadCommand,
   cancelPortableThreadMove,
+  retryPortableThreadMove,
   getPortableThreadMoveCancellation,
   getPortableThreadCommandReceipt,
   getPendingPortableThreadCommands,
@@ -761,6 +762,200 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             moveProgress: [{ attempt: 3, waitingForAuth: "account_selection" }],
           });
           expect((yield* Effect.flip(read("foreign-user")))._tag).toBe("RelayTenancyNotFoundError");
+        }),
+      ),
+    );
+
+    it.effect("requires exact owner retry before a deterministic source save can advance", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { enrollment, move, owner, manifest } = fixture();
+          const userId = NodeCrypto.randomUUID();
+          yield* sql`INSERT INTO relay_organizations(organization_id,name,created_at,updated_at)
+            VALUES('org','Tests','now','now') ON CONFLICT DO NOTHING`;
+          yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name,created_at,updated_at)
+            VALUES('repo','org','Tests','now','now') ON CONFLICT DO NOTHING`;
+          yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
+            VALUES('org',${userId},'admin','now','now')`;
+          yield* store.enroll({ ...enrollment, ownerUserId: userId });
+          yield* store.beginMove({ ...move, actorUserId: userId });
+          yield* makeThreadJournalStore(sql).confirmThrough({
+            ...owner,
+            sourceSequence: manifest.sourceCursor,
+          });
+          const source = { ...move, ...owner };
+          const destination = { ...move, environmentId: "vm", generation: 2 };
+          const db = yield* PgDrizzle.makeWithDefaults().pipe(
+            Effect.provideService(PgClient.PgClient, sql),
+          );
+          const failure = (attempt: number) =>
+            store.reportFailure({
+              ...source,
+              attempt,
+              detail: "The settled Codex history changed.",
+              requiresRetry: true,
+            });
+          const retry = (failedAttempt: number, sourceGeneration = 1, requester: string = userId) =>
+            retryPortableThreadMove({ ...move, sourceGeneration, failedAttempt }).pipe(
+              Effect.provideService(RelayDb, db),
+              Effect.provideService(RelayClientPrincipal, { userId: requester, token: "test" }),
+            );
+          const progress = makeThreadMoveProgressStore(sql);
+          const report = (attempt: number, stage: "capturing" | "uploading" = "capturing") =>
+            Effect.flatMap(store.getMove(move), (current) =>
+              progress.report(current, {
+                ...source,
+                attempt,
+                revision: 1,
+                stage,
+                completedBytes: 0,
+                totalBytes: null,
+                completedArtifacts: 0,
+                totalArtifacts: null,
+              }),
+            );
+          expect(
+            yield* Effect.flip(
+              store.reportFailure({
+                ...destination,
+                attempt: 4,
+                detail: "Destination cannot require a source retry.",
+                requiresRetry: true,
+              }),
+            ),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+          yield* failure(4);
+          yield* report(5);
+          expect(yield* progress.read(move.operationId)).toEqual([]);
+          yield* store.reportFailure({ ...source, attempt: 5, detail: "Later automatic failure." });
+          expect((yield* store.getMove(move)).failureDetail).toBe(
+            "The settled Codex history changed.",
+          );
+          expect(
+            yield* Effect.flip(store.sourceFrozen({ ...source, ...manifest, attempt: 5 })),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+          expect(yield* Effect.flip(retry(4, 1, "unrelated-user"))).toMatchObject({
+            reason: "thread_not_found",
+          });
+          expect(yield* Effect.flip(retry(4, 2))).toMatchObject({
+            reason: "thread_placement_changed",
+          });
+          expect(yield* Effect.flip(retry(3))).toMatchObject({
+            reason: "thread_placement_changed",
+          });
+          const placement = getPortableThreadPlacement(move.threadId).pipe(
+            Effect.provideService(RelayDb, db),
+            Effect.provideService(RelayClientPrincipal, { userId, token: "test" }),
+          );
+          expect((yield* placement).activeMove).toMatchObject({ retryRequiredAttempt: 4 });
+          const accepted = yield* retry(4);
+          expect(accepted).toMatchObject({ retryRequestedAttempt: 4, phase: "preparing" });
+          expect(accepted).not.toHaveProperty("retryRequiredAttempt");
+          expect(yield* retry(4)).toEqual(accepted);
+          expect(
+            yield* Effect.flip(store.sourceFrozen({ ...source, ...manifest, attempt: 4 })),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+          yield* report(6);
+          expect((yield* store.getMove(move)).failureDetail).toBeNull();
+          expect((yield* placement).activeMove).not.toHaveProperty("retryRequestedAttempt");
+          yield* store.sourceFrozen({ ...source, ...manifest, attempt: 6 });
+          yield* store.destinationReady({ ...destination, ...manifest });
+          yield* publishMoveFixture(sql, move);
+          yield* failure(7);
+          expect(yield* Effect.flip(retry(4))).toMatchObject({
+            reason: "thread_placement_changed",
+          });
+          expect(yield* retry(7)).toMatchObject({ retryRequestedAttempt: 7, phase: "ready" });
+          expect(yield* Effect.flip(store.commitMove(move))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          yield* report(9, "uploading");
+          expect((yield* store.commitMove(move)).phase).toBe("committed");
+          expect(yield* Effect.flip(retry(7))).toMatchObject({
+            reason: "thread_placement_changed",
+          });
+        }),
+      ),
+    );
+
+    it.effect("keeps a verified ready move under destination cutover control", () =>
+      run((store, sql) =>
+        Effect.gen(function* () {
+          const { move, owner, manifest, prepare } = fixture();
+          yield* prepare(store, sql);
+          const source = { ...move, ...owner };
+          const destination = { ...move, environmentId: "vm", generation: 2 };
+          expect((yield* store.getMove(move)).destinationVerifiedCommit).toBe(false);
+          expect(
+            yield* Effect.flip(
+              store.destinationReady({
+                ...destination,
+                ...manifest,
+                generation: 1,
+                destinationVerifiedCommit: true,
+              }),
+            ),
+          ).toMatchObject({ _tag: "ThreadPlacementConflict" });
+          expect(
+            yield* store.destinationReady({
+              ...destination,
+              ...manifest,
+              destinationVerifiedCommit: true,
+            }),
+          ).toMatchObject({ phase: "ready", destinationVerifiedCommit: true });
+          expect(yield* store.destinationReady({ ...destination, ...manifest })).toMatchObject({
+            destinationVerifiedCommit: true,
+          });
+          for (const participant of [source, { ...destination, generation: 1 }])
+            expect(yield* Effect.flip(store.commitMove(participant))).toMatchObject({
+              _tag: "ThreadPlacementConflict",
+            });
+          expect((yield* store.get(move.threadId))?.environmentId).toBe(owner.environmentId);
+
+          const refused = yield* store.reportFailure({
+            ...source,
+            attempt: 1,
+            detail: "An older source tried to commit.",
+          });
+          expect(refused.failureDetail).toBeNull();
+          expect(refused.moveFailures).toMatchObject([{ attempt: 1, active: false }]);
+          yield* store.reportFailure({
+            ...destination,
+            attempt: 1,
+            detail: "Destination changed.",
+          });
+          expect(yield* Effect.flip(store.commitMove(destination))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          yield* store.destinationReady({ ...destination, ...manifest, attempt: 2 });
+          yield* store.reportFailure({ ...source, detail: "Legacy unscoped failure." });
+          expect(yield* Effect.flip(store.commitMove(destination))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          yield* store.destinationReady({ ...destination, ...manifest });
+          yield* store.reportFailure({
+            ...source,
+            attempt: 2,
+            detail: "Exact source save changed.",
+            requiresRetry: true,
+          });
+          expect(yield* Effect.flip(store.commitMove(destination))).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          yield* store.requestRetry({ ...move, sourceGeneration: 1, failedAttempt: 2 });
+          yield* makeThreadMoveProgressStore(sql).report(yield* store.getMove(move), {
+            ...source,
+            attempt: 4,
+            revision: 1,
+            stage: "uploading",
+            completedBytes: 0,
+            totalBytes: null,
+            completedArtifacts: 0,
+            totalArtifacts: null,
+          });
+          const committed = yield* store.commitMove(destination);
+          expect(committed).toMatchObject({ phase: "committed", destinationVerifiedCommit: true });
+          expect(yield* store.commitMove(source)).toEqual(committed);
         }),
       ),
     );

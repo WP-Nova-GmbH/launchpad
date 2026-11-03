@@ -15,6 +15,7 @@ import type { ThreadHistoryOwner } from "./ThreadHistorySync.ts";
 export class ThreadMoveError extends Schema.TaggedError<ThreadMoveError>()("ThreadMoveError", {
   threadId: Schema.String,
   detail: Schema.String,
+  requiresRetry: Schema.optionalKey(Schema.Literal(true)),
 }) {}
 export type ThreadMoveOwner = ThreadHistoryOwner & { readonly operationId: string };
 type RelayClient = Effect.Success<ReturnType<typeof makeExecutorRelayApiClient>>;
@@ -139,7 +140,7 @@ export function makeThreadMoveTransport<E, R>(
           payload: { generation: owner.generation, ...report },
         }),
       ),
-    failed: (owner: ThreadMoveOwner, detail: string, attempt?: number) =>
+    failed: (owner: ThreadMoveOwner, detail: string, attempt?: number, requiresRetry?: true) =>
       request(owner, (client, params) =>
         client.threadMoves.failed({
           params,
@@ -147,6 +148,7 @@ export function makeThreadMoveTransport<E, R>(
             generation: owner.generation,
             detail,
             ...(attempt === undefined ? {} : { attempt }),
+            ...(requiresRetry === undefined ? {} : { requiresRetry }),
           },
         }),
       ),
@@ -159,7 +161,12 @@ export function makeThreadMoveTransport<E, R>(
       ),
     ready: (
       owner: ThreadMoveOwner,
-      input: { sourceCursor: number; manifestSha256: string; attempt?: number },
+      input: {
+        sourceCursor: number;
+        manifestSha256: string;
+        attempt?: number;
+        destinationVerifiedCommit?: true;
+      },
     ) =>
       request(owner, (client, params) =>
         client.threadMoves.ready({ params, payload: { generation: owner.generation, ...input } }),

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import type { RelayPortableThreadVmSummary } from "@t3tools/contracts/relay";
+import type { RelayPortableThreadVmSummary, RelayThreadActiveMove } from "@t3tools/contracts/relay";
 import {
   CommandId,
   MessageId,
@@ -43,6 +43,7 @@ import {
 import type { EnvironmentThreadShell } from "../state/models.ts";
 import type { EnvironmentCatalogState } from "../state/connections.ts";
 import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
+import { threadMoveQueuePresentation } from "./threadMoveQueuePresentation.ts";
 
 const threadId = ThreadId.make("saved-thread"),
   at = "2026-10-07T12:00:00.000Z";
@@ -223,6 +224,86 @@ describe("retained conversation view", () => {
         ]);
       }),
     ),
+  );
+
+  it.effect.each(["online", "placement unavailable", "newer failure", "cancelling"] as const)(
+    "reconciles the exact move retry when placement is %s",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const operationId = "9e7fd90d-8dfb-4c7f-a152-95c054709f51";
+          const move = {
+            operationId,
+            sourceEnvironmentId: "offline",
+            sourceGeneration: 1,
+            sourceKind: "vm",
+            destinationEnvironmentId: "mac",
+            destinationProjectId: "project",
+            destinationKind: "environment",
+            phase: "preparing",
+            cancellationMode: "direct",
+          } satisfies RelayThreadActiveMove;
+          const activeMove = { ...move, retryRequestedAttempt: 4 };
+          const newerMove =
+            mode === "newer failure"
+              ? { ...move, retryRequiredAttempt: 5 }
+              : mode === "cancelling"
+                ? { ...move, phase: "aborting" as const }
+                : null;
+          let beforeReply = () => {};
+          const calls: string[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(`${request.method} ${new URL(request.url).pathname}`);
+            if (request.method === "POST") {
+              expect(await request.json()).toEqual({ sourceGeneration: 1, failedAttempt: 4 });
+              beforeReply();
+              return Response.json(activeMove);
+            }
+            return mode === "online"
+              ? Response.json({ ...summary.placement, operationId, activeMove })
+              : new Response(null, { status: 503 });
+          });
+          const remember = (activeMove: RelayThreadActiveMove) =>
+            rememberPortableThreadPlacement(h.registry, h.session, "https://relay.example.test", {
+              ...summary.placement,
+              operationId,
+              activeMove,
+              moveFailureDetail: "The Codex history changed while saving.",
+            });
+          remember({ ...move, retryRequiredAttempt: 4 });
+          if (newerMove) beforeReply = () => void remember(newerMove);
+          const request = {
+            accountId: h.session.accountId,
+            relayUrl: "https://relay.example.test",
+            threadId,
+            operationId,
+            sourceGeneration: 1,
+            failedAttempt: 4,
+          };
+          const wrongScope = yield* Effect.promise(() =>
+            h.library.retryActiveMove.run(h.registry, { ...request, accountId: "other" }),
+          );
+          expect(wrongScope._tag).toBe("Failure");
+          expect(calls).toEqual([]);
+          const result = yield* Effect.promise(() =>
+            h.library.retryActiveMove.run(h.registry, request),
+          );
+          expect(result).toMatchObject({ _tag: "Success", value: activeMove });
+          const placement = h.registry.get(portableThreadPlacementsAtom)?.placements.get(threadId);
+          expect(placement?.activeMove).toEqual(newerMove ?? activeMove);
+          if (mode === "placement unavailable") {
+            expect(threadMoveQueuePresentation({ placement })?.label).toBe("Retry requested");
+            expect(
+              threadMoveQueuePresentation({ placement, cancellation: "requested" })?.label,
+            ).toBe("Cancelling move…");
+          }
+          expect(calls).toEqual([
+            `POST /v1/threads/${threadId}/moves/${operationId}/retry`,
+            `GET /v1/threads/${threadId}/placement`,
+          ]);
+        }),
+      ),
   );
 
   it("uses effective capabilities for overview recovery actions", () => {

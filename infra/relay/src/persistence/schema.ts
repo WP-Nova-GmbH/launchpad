@@ -1029,6 +1029,7 @@ export const relayThreadMoves = pgTable(
     >(),
     legacyCancelCommandId: varchar("legacy_cancel_command_id", { length: 191 }),
     sourceMessageId: varchar("source_message_id", { length: 191 }),
+    destinationVerifiedCommit: boolean("destination_verified_commit").notNull().default(false),
   },
   (table) => [
     check(
@@ -1089,6 +1090,7 @@ export const relayThreadMoveParticipantStatus = pgTable(
     failureAttempt: bigint("failure_attempt", { mode: "number" }),
     failureDetail: varchar("failure_detail", { length: 2000 }),
     failureReportedAt: timestamp("failure_reported_at", { withTimezone: true }),
+    failureRequiresRetry: boolean("failure_requires_retry").notNull().default(false),
   },
   (table) => [
     primaryKey({ columns: [table.operationId, table.environmentId] }),
@@ -1101,6 +1103,7 @@ export const relayThreadMoveParticipantStatus = pgTable(
       "relay_thread_move_participant_failure",
       sql`(
       ${table.failureAttempt} IS NULL AND ${table.failureDetail} IS NULL AND ${table.failureReportedAt} IS NULL
+      AND NOT ${table.failureRequiresRetry}
     ) OR (
       ${table.failureAttempt} IS NOT NULL AND ${table.failureAttempt} BETWEEN 1 AND 9007199254740991 AND ${table.failureDetail} IS NOT NULL
       AND length(trim(${table.failureDetail})) > 0 AND ${table.failureReportedAt} IS NOT NULL

@@ -1,6 +1,11 @@
 import { ProviderEventBarrier } from "../ProviderEventBarrier.ts";
 import { exportCodexConversation } from "../Drivers/CodexConversationTransfer.ts";
-import { installPortableCodexHome } from "../Drivers/PortableCodexHome.ts";
+import {
+  checkpointPortableCodexAfterProbe,
+  installPortableCodexHome,
+  PortableCodexProbeHistoryError,
+  verifyPortableCodexProbeCheckpoint,
+} from "../Drivers/PortableCodexHome.ts";
 import * as NodeCrypto from "node:crypto";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { attachmentRelativePath } from "../../attachmentStore.ts";
@@ -170,6 +175,8 @@ const asTurnId = (value: string): TurnId => TurnId.make(value);
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
+const isProviderProcessError = Schema.is(ProviderAdapterProcessError);
+const isProbeHistoryError = Schema.is(PortableCodexProbeHistoryError);
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 
@@ -7563,15 +7570,18 @@ nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
 
   for (const scenario of [
     "unchanged",
+    "probe-history",
     "newer-work",
     "changed-rollout",
     "changed-runtime",
     "wrong-turn",
   ] as const) {
     it.effect(
-      scenario === "unchanged"
-        ? "an imported thread can freeze again before its first destination turn without reopening Codex"
-        : `rejects an imported frozen checkpoint with ${scenario}`,
+      scenario === "probe-history"
+        ? "an imported thread freezes its stopped probe history before its first destination turn"
+        : scenario === "unchanged"
+          ? "an imported thread can freeze again before its first destination turn without reopening Codex"
+          : `rejects an imported frozen checkpoint with ${scenario}`,
       () =>
         Effect.scoped(
           Effect.gen(function* () {
@@ -7672,7 +7682,9 @@ nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
             const starts = nativeCheckpointAdapter.startSession.mock.calls.length,
               exports = nativeCheckpointExports;
             yield* fs.remove(home, { recursive: true });
-            if (scenario === "changed-rollout") {
+            const probeAppend =
+              '{"type":"event_msg","payload":{"type":"thread_settings_applied"}}\n';
+            if (scenario === "changed-rollout" || scenario === "probe-history") {
               const installedRollout = path.join(
                 installed.homePath,
                 "sessions",
@@ -7681,11 +7693,25 @@ nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
                 "01",
                 archive.manifest.rolloutName,
               );
+              const identity = {
+                stateDir: config.stateDir,
+                threadId,
+                providerInstanceId: codexInstanceId,
+                nativeThreadId: nativeIdForCheckpoint,
+                portableStateId: installed.resumeCursor.portableStateId,
+              };
+              const before =
+                scenario === "probe-history"
+                  ? yield* verifyPortableCodexProbeCheckpoint(identity)
+                  : null;
               yield* fs.writeFileString(
                 installedRollout,
-                '{"type":"event_msg","payload":{"type":"task_started"}}\n',
+                before === null
+                  ? '{"type":"event_msg","payload":{"type":"task_started"}}\n'
+                  : probeAppend,
                 { flag: "a" },
               );
+              if (before !== null) yield* checkpointPortableCodexAfterProbe(identity, before);
             }
             if (scenario === "changed-runtime")
               yield* directory.upsert({
@@ -7694,7 +7720,7 @@ nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
                 providerInstanceId: codexInstanceId,
                 runtimePayload: { activeTurnId: "new-work" },
               });
-            if (scenario !== "unchanged") {
+            if (scenario !== "unchanged" && scenario !== "probe-history") {
               const error = yield* Effect.flip(
                 provider.checkpointConversation!({
                   threadId,
@@ -7703,6 +7729,8 @@ nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
                 }),
               );
               assert.equal(error._tag, "ProviderAdapterProcessError");
+              if (scenario === "changed-rollout")
+                assert.isTrue(isProviderProcessError(error) && isProbeHistoryError(error.cause));
               assert.equal(nativeCheckpointAdapter.startSession.mock.calls.length, starts);
               assert.equal(nativeCheckpointExports, exports);
               assert.equal(
@@ -7735,11 +7763,9 @@ nativeCheckpointFacade.layer("ProviderService native checkpoint", (it) => {
             }>`SELECT generation,turn_id AS "turnId",directory FROM thread_native_checkpoints WHERE thread_id=${threadId}`;
             assert.equal(point?.generation, 2);
             assert.equal(point?.turnId, turnId);
-            assert(
-              (yield* fs.readFileString(path.join(point!.directory, "rollout.jsonl"))).includes(
-                "remember imported native history",
-              ),
-            );
+            const history = yield* fs.readFileString(path.join(point!.directory, "rollout.jsonl"));
+            assert.include(history, "remember imported native history");
+            if (scenario === "probe-history") assert.include(history, probeAppend);
             assert.equal(yield* fs.exists(path.join(point!.directory, "auth.json")), false);
           }),
         ),

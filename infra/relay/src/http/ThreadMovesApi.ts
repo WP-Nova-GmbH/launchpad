@@ -541,7 +541,7 @@ export const freezePortableThreadMove = Effect.fn("relay.api.thread_moves.freeze
 }, Effect.catchTags(failures));
 
 export const reportPortableThreadMoveFailure = Effect.fn("relay.api.thread_moves.failed")(
-  function* (input: Participant & { detail: string; attempt?: number }) {
+  function* (input: Participant & { detail: string; attempt?: number; requiresRetry?: true }) {
     const sql = (yield* RelayDb).$client;
     return yield* response(
       yield* withThreadMoveParticipant(input, "either", true, () =>
@@ -606,7 +606,12 @@ export const readPortableThreadMoveArtifact = Effect.fn("relay.api.thread_moves.
 );
 
 export const readyPortableThreadMove = Effect.fn("relay.api.thread_moves.ready")(function* (
-  input: Participant & { sourceCursor: number; manifestSha256: string; attempt?: number },
+  input: Participant & {
+    sourceCursor: number;
+    manifestSha256: string;
+    attempt?: number;
+    destinationVerifiedCommit?: true;
+  },
 ) {
   const sql = (yield* RelayDb).$client;
   return yield* response(

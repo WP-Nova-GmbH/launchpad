@@ -3810,6 +3810,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           ...RelayThreadGeneration,
           detail: RelayThreadMoveFailureDetail,
           attempt: Schema.optionalKey(PositiveInt),
+          requiresRetry: Schema.optionalKey(Schema.Literal(true)),
         }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
@@ -3856,6 +3857,7 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           sourceCursor: NonNegativeInt,
           manifestSha256: RelayThreadArtifactHash,
           attempt: Schema.optionalKey(PositiveInt),
+          destinationVerifiedCommit: Schema.optionalKey(Schema.Literal(true)),
         }),
         success: RelayThreadMove,
         error: [...RelayTenancyErrors, CodexVmConnectionError],
@@ -3929,6 +3931,13 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
 
 const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
   .add(
+    HttpApiEndpoint.post("retryMove", "/v1/threads/:threadId/moves/:operationId/retry", {
+      params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ sourceGeneration: PositiveInt, failedAttempt: PositiveInt }),
+      success: RelayThreadActiveMove,
+      error: RelayTenancyErrors,
+    }),
     HttpApiEndpoint.post("cancelMove", "/v1/threads/:threadId/moves/:operationId/cancel", {
       params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
       headers: RelayBearerRequestHeaders,

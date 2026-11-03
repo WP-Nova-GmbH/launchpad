@@ -380,6 +380,7 @@ for (const lost of [
             vmBegins = 0;
           let reopenAcks = 0,
             begins = 0;
+          const manualFailures: number[] = [];
           const reopenBlockers: string[] = [];
           const destinationProgress: ThreadMoveProgressReport[] = [];
           const downloadedArtifacts: string[] = [];
@@ -520,10 +521,16 @@ for (const lost of [
                   };
                 return { accepted: true };
               }),
-            failed: (owner, detail, attempt) =>
+            failed: (owner, detail, attempt, requiresRetry) =>
               lost === "cancel-report"
                 ? Effect.fail(failure())
-                : Effect.sync(() => {
+                : Effect.gen(function* () {
+                    if (requiresRetry) {
+                      expect(attempt).toBeDefined();
+                      manualFailures.push(attempt!);
+                      if (lost === "sealed-missing" && manualFailures.length === 1)
+                        return yield* failure();
+                    }
                     expect(["preparing", "frozen", "ready"]).toContain(remote?.phase);
                     return (remote = {
                       ...remote!,
@@ -540,7 +547,12 @@ for (const lost of [
                                 environmentId: owner.environmentId,
                                 generation: owner.generation,
                                 resolvedBeforeAttempt: 0,
-                                failure: { attempt, detail, reportedAt: at },
+                                failure: {
+                                  attempt,
+                                  detail,
+                                  reportedAt: at,
+                                  ...(requiresRetry ? { requiresRetry } : {}),
+                                },
                               },
                             ],
                           }),
@@ -643,9 +655,14 @@ for (const lost of [
                 ),
               );
             },
-            ready: () =>
+            ready: (_owner, input) =>
               Effect.gen(function* () {
-                remote = { ...remote!, phase: "ready", failureDetail: null };
+                expect(input.destinationVerifiedCommit).toBe(true);
+                remote = {
+                  ...remote!,
+                  phase: "ready",
+                  failureDetail: null,
+                };
                 if (lost === "ready" && !lostReply) {
                   lostReply = true;
                   return yield* failure();
@@ -1498,15 +1515,13 @@ for (const lost of [
                 digest: string;
               }>`SELECT operation_id AS "operationId",manifest_sha256 AS digest FROM checkout_capture_holds WHERE release_outcome='sealed'`;
               const completedUploads = uploadStarts;
-              yield* fs.remove(
-                path.join(
-                  (yield* ServerConfig).stateDir,
-                  "move-transfers",
-                  "source",
-                  hold!.operationId,
-                ),
-                { recursive: true },
+              const archivePath = path.join(
+                (yield* ServerConfig).stateDir,
+                "move-transfers",
+                "source",
+                hold!.operationId,
               );
+              yield* fs.rename(archivePath, `${archivePath}-retained`);
               source = yield* makeThreadMoveWorker(transport, history, commands);
               const error = yield* Effect.flip(source.source(threadId));
               expect(error).toMatchObject({
@@ -1520,6 +1535,25 @@ for (const lost of [
                 manifestSha256: hold!.digest,
               });
               expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect(manualFailures).toHaveLength(1);
+              source = yield* makeThreadMoveWorker(transport, history, commands);
+              yield* source.source(threadId);
+              yield* source.source(threadId);
+              expect(manualFailures).toEqual([manualFailures[0], manualFailures[0]]);
+              expect(uploadStarts).toBe(completedUploads);
+              yield* fs.rename(`${archivePath}-retained`, archivePath);
+              yield* source.source(threadId);
+              expect(uploadStarts).toBe(completedUploads);
+              remote = {
+                ...remote!,
+                participantStates: remote!.participantStates!.map((state) => ({
+                  ...state,
+                  resolvedBeforeAttempt: manualFailures[0]! + 1,
+                })),
+              };
+              yield* source.source(threadId);
+              expect(uploadStarts).toBeGreaterThan(completedUploads);
+              expect(remote?.manifestArtifactId).toBeTruthy();
               return;
             }
             if (lost === "source-retargeted-project") {
@@ -1643,11 +1677,11 @@ for (const lost of [
               }
             }
             yield* source.source(threadId);
-            expect(remote?.phase).toBe(lost === "recovery-ready" ? "committed" : "frozen");
+            expect(remote?.phase).toBe(lost === "recovery-ready" ? "ready" : "frozen");
             if (lost === "recovery-ready") {
               expect(remote?.recoveryVerified).toBe(true);
-              expect((yield* fences.get(threadId))?.phase).toBe("retired");
-              expect(commits).toBe(1);
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect(commits).toBe(0);
               return;
             }
             const [capture] = yield* sql<{
@@ -1871,7 +1905,9 @@ for (const lost of [
                   yield* Effect.flip(destination.destination(owner));
                   expect(remote?.phase).toBe("aborting");
                   expect(yield* fs.readFileString(path.join(dst, "README"))).toBe("setup edit\n");
-                  yield* destinationSql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=NULL WHERE operation_id=${owner.operationId}`;
+                  yield* destinationSql`UPDATE thread_transfer_readiness
+                    SET stopped_probe_preflight_fingerprint=${"b".repeat(64)},stopped_probe_runtime_key=${"c".repeat(64)}
+                    WHERE operation_id=${owner.operationId}`;
                 }
                 yield* destination.destination(owner);
                 expect(remote?.phase).toBe("aborted");
@@ -1891,6 +1927,11 @@ for (const lost of [
               if (lost === "ready" || lost === "commit" || lost === "activate") {
                 yield* Effect.flip(destination.destination(owner));
                 expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
+                if (lost === "ready") {
+                  yield* source.source(threadId);
+                  expect(remote?.phase).toBe("ready");
+                  expect(commitAttempts).toBe(0);
+                }
                 if (lost === "ready" || lost === "commit") recoveryMustSkipAuth = true;
                 if (lost === "commit") {
                   expect(remote?.phase).toBe("committed");
@@ -1931,6 +1972,13 @@ for (const lost of [
                       : Layer.empty,
                   ),
                 );
+                if (lost === "activate") {
+                  expect(remote?.phase).toBe("completed");
+                  yield* destinationSql`UPDATE thread_transfer_readiness SET native_probe_fingerprint=${"a".repeat(64)} WHERE operation_id=${owner.operationId}`;
+                  yield* Effect.flip(destination.destination(owner));
+                  expect((yield* destinationFences.get(threadId))?.phase).toBe("frozen");
+                  yield* destinationSql`UPDATE thread_transfer_readiness SET native_probe_fingerprint=NULL WHERE operation_id=${owner.operationId}`;
+                }
               }
               if (lost === "destination-auth" || postInstallAuthLoss) {
                 const error = yield* Effect.flip(destination.destination(owner));
@@ -2097,6 +2145,8 @@ for (const lost of [
                 }
                 yield* source.source(threadId);
                 expect(remote?.recoveryVerified).toBe(true);
+                expect(remote?.phase).toBe("ready");
+                expect(commitAttempts).toBe(0);
               }
               yield* destination.destination(owner);
               expect(remote?.phase).toBe("completed");

@@ -90,7 +90,7 @@ function PreviousMoveErrors({ errors }: { errors: ReadonlyArray<ThreadMoveFailur
 
 type ActiveMove = NonNullable<RelayPortableThreadPlacement["activeMove"]>;
 
-function useActiveMoveCancellation(threadId: ThreadId, move: ActiveMove) {
+function useActiveMoveActions(threadId: ThreadId, move: ActiveMove) {
   const session = useAtomValue(managedRelaySessionAtom);
   const relayUrl = threadMoveRelayUrl();
   const scope = useMemo(
@@ -123,6 +123,21 @@ function useActiveMoveCancellation(threadId: ThreadId, move: ActiveMove) {
   const checkMove = useAtomCommand(portableThreadLibrary.checkMoveCancellation, {
     reportFailure: false,
   });
+  const retryMove = useAtomCommand(portableThreadLibrary.retryActiveMove, {
+    reportFailure: false,
+  });
+  const retrySending = useRef<{ scope: typeof scope; attempt: number } | null>(null);
+  const [retryFeedback, setRetryFeedback] = useState<{
+    scope: typeof scope;
+    attempt: number;
+    phase: "sending" | "accepted" | "failed";
+    error?: string;
+  } | null>(null);
+  const failedAttempt = move.retryRequiredAttempt;
+  const displayedRetry =
+    retryFeedback?.scope === scope && retryFeedback.attempt === failedAttempt
+      ? retryFeedback
+      : null;
   const displayed = feedback?.scope === scope ? feedback : null;
   const displayedPhase = displayed?.phase;
   const confirmedCancelled = displayedPhase === "confirmed";
@@ -183,8 +198,63 @@ function useActiveMoveCancellation(threadId: ThreadId, move: ActiveMove) {
       if (sending.current === scope) sending.current = null;
     }
   };
+  const retryAvailable =
+    session &&
+    relayUrl &&
+    failedAttempt !== undefined &&
+    canCancel &&
+    !retryLegacy &&
+    !displayedPhase;
+  const retry = async () => {
+    if (
+      !retryAvailable ||
+      current.current !== scope ||
+      displayedRetry?.phase === "accepted" ||
+      (retrySending.current?.scope === scope && retrySending.current.attempt === failedAttempt)
+    )
+      return;
+    const ticket = { scope, attempt: failedAttempt };
+    retrySending.current = ticket;
+    setRetryFeedback({ ...ticket, phase: "sending" });
+    const isCurrent = () => current.current === scope && retrySending.current === ticket;
+    try {
+      const result = await retryMove({
+        accountId: session.accountId,
+        relayUrl,
+        threadId,
+        operationId: move.operationId,
+        sourceGeneration: move.sourceGeneration,
+        failedAttempt,
+      });
+      if (!isCurrent()) return;
+      if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      setRetryFeedback({ ...ticket, phase: "accepted" });
+    } catch (error) {
+      if (isCurrent())
+        setRetryFeedback({
+          ...ticket,
+          phase: "failed",
+          error: error instanceof Error ? error.message : "Could not confirm the retry.",
+        });
+    } finally {
+      if (retrySending.current === ticket) retrySending.current = null;
+    }
+  };
   const pending = displayed?.checking || displayed?.phase === "sending";
   return {
+    retryAction: retryAvailable
+      ? {
+          label:
+            displayedRetry?.phase === "accepted"
+              ? "Retry requested"
+              : displayedRetry?.phase === "sending"
+                ? "Requesting retry…"
+                : "Retry move",
+          pending: displayedRetry?.phase === "sending" || displayedRetry?.phase === "accepted",
+          onPress: () => void retry(),
+        }
+      : undefined,
+    retryError: retryAvailable ? displayedRetry?.error : undefined,
     action:
       session && relayUrl && (canCancel || cancelling)
         ? {
@@ -238,16 +308,18 @@ function ActiveThreadMoveQueueItem({
   move,
   ...props
 }: ThreadMoveQueueItemProps & { move: ActiveMove }) {
-  const cancellation = useActiveMoveCancellation(props.threadId, move);
+  const actions = useActiveMoveActions(props.threadId, move);
   return (
     <ThreadMoveQueueItemContent
       {...props}
       disabled={props.activeCancellationDisabled}
       onCancel={undefined}
-      activeCancellationAction={cancellation.action}
-      cancellation={cancellation.phase}
-      cancellationError={cancellation.error}
-      confirmedCancelled={cancellation.confirmedCancelled}
+      activeCancellationAction={actions.action}
+      retryAction={actions.retryAction}
+      retryError={actions.retryError}
+      cancellation={actions.phase}
+      cancellationError={actions.error}
+      confirmedCancelled={actions.confirmedCancelled}
     />
   );
 }
@@ -260,6 +332,8 @@ function ThreadMoveQueueItemContent({
   cancellation,
   cancellationError,
   activeCancellationAction,
+  retryAction,
+  retryError,
   confirmedCancelled,
   queuePaused,
   disabled,
@@ -267,7 +341,9 @@ function ThreadMoveQueueItemContent({
   children,
 }: ThreadMoveQueueItemProps & {
   cancellationError?: string | undefined;
-  activeCancellationAction?: ReturnType<typeof useActiveMoveCancellation>["action"];
+  activeCancellationAction?: ReturnType<typeof useActiveMoveActions>["action"];
+  retryAction?: ReturnType<typeof useActiveMoveActions>["retryAction"];
+  retryError?: string | undefined;
   confirmedCancelled?: boolean;
 }) {
   const view = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
@@ -356,16 +432,25 @@ function ThreadMoveQueueItemContent({
             {label}
           </Text>
           {detail && <Text className="text-xs text-foreground-muted">{detail}</Text>}
-          {cancellationError && (
+          {(cancellationError ?? retryError) && (
             <Text accessibilityLiveRegion="polite" className="text-xs text-destructive">
-              {cancellationError}
+              {cancellationError ?? retryError}
             </Text>
           )}
         </View>
+        {retryAction && (
+          <Action
+            label={retryAction.label}
+            disabled={disabled || retryAction.pending}
+            onPress={retryAction.onPress}
+          />
+        )}
         {presentation.ownsNotice &&
           !waiting &&
           !cancelling &&
           !confirmedCancelled &&
+          activeMove?.retryRequiredAttempt === undefined &&
+          activeMove?.retryRequestedAttempt === undefined &&
           ui?.moveAction && (
             <Action
               label={ui.moveAction.label}

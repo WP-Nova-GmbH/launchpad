@@ -15,6 +15,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ProcessRunner } from "../processRunner.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { ProviderAdapterProbeError } from "../provider/Errors.ts";
+import {
+  checkpointPortableCodexAfterProbe,
+  verifyPortableCodexProbeCheckpoint,
+} from "../provider/Drivers/PortableCodexHome.ts";
 import { captureThreadTransferSetupOutput } from "./ThreadTransferSetupOutput.ts";
 import { makeThreadCheckoutClaims } from "./ThreadCheckoutClaim.ts";
 
@@ -40,6 +44,9 @@ const encodeSetup = Schema.encodeEffect(
     }),
   ),
 );
+const encodeProbeRuntime = Schema.encodeEffect(
+  Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.NullOr(Schema.String)])),
+);
 export class ThreadTransferReadinessError extends Schema.TaggedError<ThreadTransferReadinessError>()(
   "ThreadTransferReadinessError",
   { message: Schema.String },
@@ -56,6 +63,17 @@ type ThreadTransferPreparationIdentity = {
   readonly relayUrl?: string;
   readonly projectId?: string;
 };
+
+const portableProbeIdentity = (
+  input: { readonly stateDir: string; readonly threadId: string },
+  native: typeof NativeRuntime.Type,
+) => ({
+  stateDir: input.stateDir,
+  threadId: input.threadId,
+  providerInstanceId: native.providerInstanceId,
+  nativeThreadId: native.threadId,
+  portableStateId: native.portableStateId,
+});
 
 /** Validate an installed baseline without starting provider work or reinstalling it. */
 export const readThreadTransferInstallation = Effect.fn("readThreadTransferInstallation")(
@@ -139,6 +157,35 @@ export const readThreadTransferInstallation = Effect.fn("readThreadTransferInsta
   },
 );
 
+/** Check an already-ready frozen activation without revisiting checkout setup or auth. */
+export const assertThreadTransferProbeCheckpoint = Effect.fn("assertThreadTransferProbeCheckpoint")(
+  function* (input: { readonly operationId: string; readonly stateDir: string }) {
+    const sql = yield* SqlClient.SqlClient;
+    const [ready] = yield* sql<{
+      threadId: string;
+      nativeRuntime: string;
+      fingerprint: string | null;
+    }>`SELECT b.thread_id AS "threadId",b.native_runtime_json AS "nativeRuntime",
+        r.native_probe_fingerprint AS fingerprint
+      FROM thread_transfer_readiness r JOIN thread_transfer_baselines b USING(operation_id)
+      WHERE r.operation_id=${input.operationId} AND r.manifest_sha256=b.manifest_sha256
+        AND r.native_runtime_json=b.native_runtime_json AND r.phase='ready' AND r.setup_succeeded=1
+        AND r.setup_output_json IS NOT NULL AND r.provider_probe_attempt_id IS NULL
+        AND r.stopped_probe_preflight_fingerprint IS NULL`;
+    if (!ready) return yield* fail("Destination readiness no longer matches this move.");
+    if (ready.fingerprint === null) return;
+    const native = yield* decodeNative(ready.nativeRuntime);
+    if (
+      !native ||
+      ready.fingerprint !==
+        (yield* verifyPortableCodexProbeCheckpoint(
+          portableProbeIdentity({ ...input, threadId: ready.threadId }, native),
+        ))
+    )
+      return yield* fail("Destination Codex history no longer matches its readiness checkpoint.");
+  },
+);
+
 /** A matching durable ready receipt recovers relay handoff replies without reopening auth or probes. */
 export const assertThreadTransferReady = Effect.fn("assertThreadTransferReady")(
   function* (
@@ -146,6 +193,7 @@ export const assertThreadTransferReady = Effect.fn("assertThreadTransferReady")(
       readonly environmentId: string;
       readonly relayUrl: string;
       readonly projectId: string;
+      readonly stateDir: string;
     },
   ) {
     const { baseline, setupSha256 } = yield* readThreadTransferInstallation(input);
@@ -156,6 +204,7 @@ export const assertThreadTransferReady = Effect.fn("assertThreadTransferReady")(
         AND phase='ready' AND setup_succeeded=1 AND setup_output_json IS NOT NULL
         AND provider_probe_attempt_id IS NULL`;
     if (!ready) return yield* fail("Destination readiness no longer matches this move.");
+    yield* assertThreadTransferProbeCheckpoint(input);
   },
   Effect.mapError(() => fail("Destination readiness could not be verified for this move.")),
 );
@@ -170,6 +219,7 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
     readonly operationId: string;
     readonly generation: number;
     readonly manifestSha256: string;
+    readonly stateDir: string;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const fs = yield* FileSystem.FileSystem;
@@ -198,22 +248,29 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
       return yield* fail(
         "The destination requires Codex to be installed with a configured sign-in.",
       );
+    const runtimeKey = NodeCrypto.createHash("sha256")
+      .update(
+        yield* encodeProbeRuntime([instance.continuationIdentity.continuationKey, status.version]),
+      )
+      .digest("hex");
     if (yield* instance.adapter.hasSession(input.threadId))
       return yield* fail("A provider session is already using the destination thread.");
     // Check current prerequisites before recording a setup attempt. The receipt still prevents replay.
-    const setupComplete = yield* sql.withTransaction(
+    const setupState = yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* readBaseline;
         const [prior] = yield* sql<{
           manifest: string;
           nativeRuntime: string;
           setup: string;
-          phase: string;
           succeeded: number;
           probe: string | null;
+          stoppedPreflight: string | null;
+          stoppedRuntime: string | null;
         }>`
-        SELECT manifest_sha256 AS manifest, native_runtime_json AS "nativeRuntime", setup_sha256 AS setup, phase,
-          setup_succeeded AS succeeded,provider_probe_attempt_id AS probe
+        SELECT manifest_sha256 AS manifest, native_runtime_json AS "nativeRuntime", setup_sha256 AS setup,
+          setup_succeeded AS succeeded,provider_probe_attempt_id AS probe,
+          stopped_probe_preflight_fingerprint AS "stoppedPreflight",stopped_probe_runtime_key AS "stoppedRuntime"
         FROM thread_transfer_readiness WHERE operation_id = ${input.operationId}`;
         if (prior) {
           if (
@@ -222,7 +279,7 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
             prior.setup !== setupSha256
           )
             return yield* fail("Destination setup intent changed.");
-          if (prior.probe !== null)
+          if (prior.probe !== null && prior.stoppedPreflight === null)
             return yield* fail(
               "Destination native validation has no confirmed exit; cleanup remains held.",
             );
@@ -230,14 +287,22 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
             return yield* fail(
               "Destination setup has not been confirmed complete; do not replay it.",
             );
-          return true;
+          const stopped =
+            prior.stoppedPreflight !== null && prior.probe !== null && prior.stoppedRuntime !== null
+              ? {
+                  attempt: prior.probe,
+                  preflight: prior.stoppedPreflight,
+                  runtimeKey: prior.stoppedRuntime,
+                }
+              : null;
+          return { complete: true, stopped };
         }
         yield* sql`INSERT INTO thread_transfer_readiness (operation_id, manifest_sha256, native_runtime_json, setup_sha256, phase)
         VALUES (${input.operationId}, ${input.manifestSha256}, ${baseline.nativeRuntime}, ${setupSha256}, 'started')`;
-        return false;
+        return { complete: false, stopped: null };
       }),
     );
-    if (!setupComplete) {
+    if (!setupState.complete) {
       const recordSetupOutput = Effect.gen(function* () {
         const output = yield* captureThreadTransferSetupOutput(claim.checkoutPath);
         const rows = yield* sql`UPDATE thread_transfer_readiness SET setup_output_json=${output}
@@ -275,18 +340,16 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
     }
     if ((yield* fs.realPath(claim.checkoutPath)) !== claim.checkoutPath)
       return yield* fail("The moved checkout path changed during setup.");
-    // A setup receipt can be reused; compatibility must be checked against the
-    // current provider runtime again before committing destination ownership.
-    let probeAttempt: string | null = null;
+    let startedAttempt: string | null = null;
     let cleanupConfirmed = false;
-    yield* Effect.gen(function* () {
-      if (native) {
+    const stopProbe = (cursor: typeof NativeRuntime.Type) =>
+      Effect.gen(function* () {
         const attempt = NodeCrypto.randomUUID();
         yield* sql.withTransaction(
           Effect.gen(function* () {
             yield* readBaseline;
             const claimed =
-              yield* sql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=${attempt},phase='started'
+              yield* sql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=${attempt},phase='started',native_probe_fingerprint=NULL
             WHERE operation_id=${input.operationId} AND setup_succeeded=1 AND provider_probe_attempt_id IS NULL
               AND manifest_sha256=${input.manifestSha256} AND native_runtime_json=${baseline.nativeRuntime} AND setup_sha256=${setupSha256}
             RETURNING operation_id`;
@@ -296,7 +359,11 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
               );
           }),
         );
-        probeAttempt = attempt;
+        startedAttempt = attempt;
+        const nativeIdentity = portableProbeIdentity(input, cursor);
+        cleanupConfirmed = true;
+        const beforeProbe = yield* verifyPortableCodexProbeCheckpoint(nativeIdentity);
+        cleanupConfirmed = false;
         // Only a stopped probe can release this exact owner. Crashes, interruptions,
         // and unknown child ownership keep it held; setup success never permits replay.
         const session = yield* probeSession({
@@ -307,9 +374,9 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
           modelSelection,
           runtimeMode,
           resumeCursor: {
-            threadId: native.threadId,
-            resumePolicy: native.resumePolicy,
-            portableStateId: native.portableStateId,
+            threadId: cursor.threadId,
+            resumePolicy: cursor.resumePolicy,
+            portableStateId: cursor.portableStateId,
           },
         }).pipe(
           Effect.mapError((error) => {
@@ -318,21 +385,56 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
           }),
         );
         cleanupConfirmed = true;
-        const cursor = session.resumeCursor;
+        const resumed = session.resumeCursor;
         if (
           session.threadId !== input.threadId ||
           session.provider !== "codex" ||
           session.status !== "ready" ||
           session.cwd !== claim.checkoutPath ||
           session.activeTurnId !== undefined ||
-          !isNativeCursor(cursor) ||
-          cursor.threadId !== native.threadId ||
-          cursor.portableStateId !== native.portableStateId
+          !isNativeCursor(resumed) ||
+          resumed.threadId !== cursor.threadId ||
+          resumed.portableStateId !== cursor.portableStateId
         )
           return yield* fail("Codex did not resume the transferred conversation in an idle state.");
+        // Persist positive stop evidence before publishing to the filesystem.
+        // A later sweep can finish sealing the same bytes without another probe.
+        cleanupConfirmed = false;
+        const stopped = yield* sql`UPDATE thread_transfer_readiness SET
+              stopped_probe_preflight_fingerprint=${beforeProbe},stopped_probe_runtime_key=${runtimeKey}
+              WHERE operation_id=${input.operationId} AND phase='started' AND provider_probe_attempt_id=${attempt}
+                AND stopped_probe_preflight_fingerprint IS NULL RETURNING operation_id`.pipe(
+          Effect.uninterruptible,
+        );
+        if (!stopped.length)
+          return yield* fail("Destination probe no longer owns its stop record.");
+        return { attempt, preflight: beforeProbe, runtimeKey };
+      });
+    yield* Effect.gen(function* () {
+      if (setupState.stopped && !native)
+        return yield* fail("Destination probe no longer matches the installed conversation.");
+      const stopped = setupState.stopped ?? (native ? yield* stopProbe(native) : null);
+      let fingerprint: string | null = null;
+      if (native && stopped) {
+        fingerprint = yield* checkpointPortableCodexAfterProbe(
+          portableProbeIdentity(input, native),
+          stopped.preflight,
+        );
       }
-      if ((yield* registry.getInstance(instance.instanceId)) !== instance)
+      if (
+        (yield* registry.getInstance(instance.instanceId)) !== instance ||
+        (stopped && stopped.runtimeKey !== runtimeKey)
+      ) {
+        if (stopped) {
+          // The old probe's bytes are now verified. A newer runtime can probe
+          // them without replaying setup or blessing unknown appended history.
+          yield* sql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=NULL,
+            stopped_probe_preflight_fingerprint=NULL,stopped_probe_runtime_key=NULL
+            WHERE operation_id=${input.operationId} AND provider_probe_attempt_id=${stopped.attempt}
+              AND stopped_probe_preflight_fingerprint=${stopped.preflight}`;
+        }
         return yield* fail("The configured provider changed during destination setup.");
+      }
       yield* claims.verifyLocation(input.operationId);
       if ((yield* fs.realPath(claim.checkoutPath)) !== claim.checkoutPath)
         return yield* fail("The moved checkout path changed during setup.");
@@ -346,25 +448,26 @@ export const prepareThreadTransfer = Effect.fn("prepareThreadTransfer")(
           )
             return yield* fail("Destination conversation changed during setup.");
           const ready =
-            yield* sql`UPDATE thread_transfer_readiness SET phase = 'ready',provider_probe_attempt_id=NULL
-        WHERE operation_id = ${input.operationId} AND setup_succeeded=1 AND provider_probe_attempt_id IS ${probeAttempt} RETURNING operation_id`;
+            yield* sql`UPDATE thread_transfer_readiness SET phase='ready',provider_probe_attempt_id=NULL,
+          native_probe_fingerprint=${fingerprint},stopped_probe_preflight_fingerprint=NULL,stopped_probe_runtime_key=NULL
+        WHERE operation_id=${input.operationId} AND setup_succeeded=1 AND provider_probe_attempt_id IS ${stopped?.attempt ?? null}
+          AND stopped_probe_preflight_fingerprint IS ${stopped?.preflight ?? null} RETURNING operation_id`;
           if (!ready.length)
             return yield* fail("Destination setup no longer owns its completion record.");
         }),
       );
     }).pipe(
       Effect.tapError(() =>
-        cleanupConfirmed && probeAttempt !== null
+        cleanupConfirmed && startedAttempt !== null
           ? sql`UPDATE thread_transfer_readiness SET provider_probe_attempt_id=NULL
-          WHERE operation_id=${input.operationId} AND provider_probe_attempt_id=${probeAttempt}`.pipe(
-              Effect.asVoid,
-            )
+          WHERE operation_id=${input.operationId} AND provider_probe_attempt_id=${startedAttempt}
+            AND stopped_probe_preflight_fingerprint IS NULL`.pipe(Effect.asVoid)
           : Effect.void,
       ),
     );
   },
   Effect.mapError((error) =>
-    error._tag === "ThreadTransferReadinessError"
+    error._tag === "ThreadTransferReadinessError" || error._tag === "PortableCodexProbeHistoryError"
       ? error
       : fail("Destination setup or native continuation could not be verified."),
   ),

@@ -93,6 +93,7 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
   checkoutOperationBoot: boolean,
   executionBinding: boolean,
   moveSourceReopens: boolean,
+  moveHistoryRecovery: boolean,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const schema = yield* sql<{
@@ -186,6 +187,9 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
       expected += ",setup_output_json,setup_started";
     if (table === "thread_transfer_readiness" && probeReceipt)
       expected += ",setup_succeeded,provider_probe_attempt_id";
+    if (table === "thread_transfer_readiness" && moveHistoryRecovery)
+      expected +=
+        ",native_probe_fingerprint,stopped_probe_preflight_fingerprint,stopped_probe_runtime_key";
     if (table === "thread_native_checkpoints" && vmThrough >= 69)
       expected =
         "thread_id,generation,checkpoint_id,turn_id,capture_operation_id,environment_id,source_sequence,native_thread_id,directory,manifest_sha256,archive_sha256,published_artifact_id";
@@ -204,6 +208,11 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
         "operation_id,thread_id,relay_url,environment_id,generation,message_id")
   )
     return yield* fail("Move source reopen receipts do not match migration history.");
+  if (
+    moveHistoryRecovery &&
+    !(yield* columns("thread_move_attempts")).some((column) => column.name === "blocked_detail")
+  )
+    return yield* fail("Move retry holds do not match migration history.");
   for (const [introduced, name] of [
     [59, "thread_cleanup_fence_on_delete"],
     [60, "portable_thread_reader_barrier"],
@@ -359,6 +368,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         !legacy && through >= 88,
         !legacy && through >= 89,
         !legacy && through >= 90,
+        !legacy && through >= 91,
       );
     return {
       kind: legacy ? ("legacy-workflow" as const) : ("canonical" as const),

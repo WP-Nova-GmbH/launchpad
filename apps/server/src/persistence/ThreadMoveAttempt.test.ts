@@ -5,7 +5,10 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadMoveAttemptJournal } from "./ThreadMoveAttempt.ts";
-import migration from "./Migrations/087_ThreadMoveAttempts.ts";
+import createReadiness from "./Migrations/065_ThreadTransferReadiness.ts";
+import addProbeReceipt from "./Migrations/085_ThreadTransferProbeReceipt.ts";
+import createAttempts from "./Migrations/087_ThreadMoveAttempts.ts";
+import addHistoryRecovery from "./Migrations/091_ThreadMoveHistoryRecovery.ts";
 import { makeThreadMoveProgress } from "../relay/ThreadMoveProgress.ts";
 
 const owner = {
@@ -16,6 +19,11 @@ const owner = {
   relayUrl: "https://relay.example",
 };
 const move = { operationId: owner.operationId, threadId: owner.threadId };
+const migration = createReadiness.pipe(
+  Effect.andThen(addProbeReceipt),
+  Effect.andThen(createAttempts),
+  Effect.andThen(addHistoryRecovery),
+);
 const wait = {
   stage: "downloading" as const,
   completedBytes: 0,

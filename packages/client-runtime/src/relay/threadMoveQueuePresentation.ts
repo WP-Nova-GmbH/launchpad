@@ -248,6 +248,19 @@ export function threadMoveQueuePresentation(input: {
         ? "Waiting for shared checkout"
         : "Waiting in queue";
     detail = entry?.detail ?? null;
+  } else if (activeMove?.retryRequiredAttempt !== undefined) {
+    label = "Could not save the thread";
+    detail =
+      matching?.moveFailures?.find(
+        (failure) =>
+          failure.environmentId === activeMove.sourceEnvironmentId &&
+          failure.generation === activeMove.sourceGeneration &&
+          failure.attempt === activeMove.retryRequiredAttempt,
+      )?.detail ?? "Retry the save or cancel the move.";
+    tone = "danger";
+  } else if (activeMove?.retryRequestedAttempt !== undefined) {
+    label = "Retry requested";
+    detail = "Waiting for the source to try saving again.";
   } else if (entry?.state === "blocked" || matching?.moveFailureDetail) {
     label = "Move needs attention";
     detail = matching?.moveFailureDetail ?? entry?.detail ?? null;
