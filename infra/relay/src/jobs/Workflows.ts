@@ -20,7 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Routing from "../workflowEvents/Routing.ts";
-import { vmWorkflowExecutionUnavailable } from "./WorkflowTarget.ts";
+import { vmWorkflowExecutionUnavailable, workflowRunTargetChanged } from "./WorkflowTarget.ts";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 
@@ -80,6 +80,19 @@ export const make = Effect.gen(function* () {
         .where(eq(relayRepositoryWorkflows.workflowId, workflowId))
         .limit(1),
     ).pipe(Effect.map((rows) => (rows[0] ? normalizeStoredWorkflow(rows[0].record) : null)));
+  const lockSavedWorkflow = (workflowId: string, repositoryId: string) =>
+    persist(
+      db
+        .select({ record: relayRepositoryWorkflows.record })
+        .from(relayRepositoryWorkflows)
+        .where(
+          and(
+            eq(relayRepositoryWorkflows.workflowId, workflowId),
+            eq(relayRepositoryWorkflows.repositoryId, repositoryId),
+          ),
+        )
+        .for("share"),
+    ).pipe(Effect.map((rows) => (rows[0] ? normalizeStoredWorkflow(rows[0].record) : null)));
   const getJob = (jobId: string) =>
     persist(
       db.select().from(relayWorkflowJobs).where(eq(relayWorkflowJobs.jobId, jobId)).limit(1),
@@ -88,6 +101,12 @@ export const make = Effect.gen(function* () {
         rows[0] ? { ...rows[0], record: normalizeStoredWorkflowJob(rows[0].record) } : null,
       ),
     );
+  const createJob = (row: WorkflowJobRecord) =>
+    persist(
+      Effect.try(() => validateOrigin(row)).pipe(
+        Effect.flatMap((record) => db.insert(relayWorkflowJobs).values({ ...row, record })),
+      ),
+    ).pipe(Effect.as(row));
   const updateJob = Effect.fn("Workflows.updateJob")(function* (
     previous: WorkflowJobRecord,
     record: RepositoryWorkflowJob,
@@ -228,12 +247,33 @@ export const make = Effect.gen(function* () {
         });
       return record;
     }),
-    createJob: (row: WorkflowJobRecord) =>
-      persist(
-        Effect.try(() => validateOrigin(row)).pipe(
-          Effect.flatMap((record) => db.insert(relayWorkflowJobs).values({ ...row, record })),
-        ),
-      ).pipe(Effect.as(row)),
+    createJob,
+    createManualJob: Effect.fn("Workflows.createManualJob")(function* (
+      row: WorkflowJobRecord,
+      expected: {
+        readonly expectedRevision: number;
+        readonly expectedTargetKind: RepositoryWorkflow["definition"]["target"]["kind"];
+      },
+    ) {
+      return yield* db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            const workflow = yield* lockSavedWorkflow(row.record.workflowId, row.repositoryId);
+            if (!workflow || workflow.archived)
+              return yield* new WorkflowInvalidError({
+                message: "The workflow is archived or unavailable. Restore it before running.",
+              });
+            if (workflow.definition.target.kind !== expected.expectedTargetKind)
+              return yield* workflowRunTargetChanged();
+            if (workflow.revision !== expected.expectedRevision)
+              return yield* new WorkflowConflictError({
+                message: "The workflow changed while checking this run. Review it and try again.",
+              });
+            return yield* createJob(row);
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+    }),
     listJobs: (repositoryId: string) =>
       persist(
         db
@@ -377,19 +417,7 @@ export const make = Effect.gen(function* () {
       return yield* db.$client
         .withTransaction(
           Effect.gen(function* () {
-            const [saved] = yield* persist(
-              db
-                .select({ record: relayRepositoryWorkflows.record })
-                .from(relayRepositoryWorkflows)
-                .where(
-                  and(
-                    eq(relayRepositoryWorkflows.workflowId, record.workflowId),
-                    eq(relayRepositoryWorkflows.repositoryId, previous.repositoryId),
-                  ),
-                )
-                .for("share"),
-            );
-            const current = saved ? normalizeStoredWorkflow(saved.record) : null;
+            const current = yield* lockSavedWorkflow(record.workflowId, previous.repositoryId);
             if (!current || current.archived)
               return yield* new WorkflowInvalidError({
                 message: "The workflow is archived or unavailable. Restore it or cancel this job.",

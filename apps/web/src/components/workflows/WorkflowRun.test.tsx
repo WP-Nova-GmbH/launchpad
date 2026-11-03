@@ -3,7 +3,12 @@ import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflow, RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import {
+  WorkflowInvalidError,
+  type RepositoryWorkflow,
+  type RepositoryWorkflowJob,
+} from "@t3tools/contracts/workflows";
+import { ManagedRelay, type ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
   clearWorkflowScope,
   setWorkflowSessionAccount,
@@ -156,15 +161,63 @@ afterEach(async () => {
 });
 
 describe("Run receipt and navigation ownership", () => {
+  it("keeps instructions copyable after a rejected Run and a refresh to the VM target", async () => {
+    const message = "The workflow execution target changed. Review the saved target and try again.";
+    type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+    const runWorkflow = vi.fn<Client["runWorkflow"]>();
+    const client = { runWorkflow } as unknown as Client;
+    await mount({
+      ...base,
+      call: async (operation) => {
+        void operation(client, "fixture-token");
+        throw new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: new WorkflowInvalidError({ message }),
+        });
+      },
+    });
+    await submit();
+    expect(runWorkflow).toHaveBeenCalledExactlyOnceWith({
+      clerkToken: "fixture-token",
+      repositoryId: scope.repositoryId,
+      payload: {
+        workflowId: workflow.workflowId,
+        instruction: "Run A",
+        expectedTargetKind: "machine",
+      },
+    });
+    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+    expect(draft()).toMatchObject({ operation: null, startedJobId: null });
+    expect(navigate).not.toHaveBeenCalled();
+
+    await update({
+      ...base,
+      workflow: {
+        ...workflow,
+        revision: 2,
+        definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+      },
+    });
+    expect(renderer!.root.findByType("textarea").props).toMatchObject({
+      readOnly: true,
+      value: "Run A",
+    });
+    expect(renderer!.root.findByType("textarea").props.disabled).toBeFalsy();
+    expect(renderer!.root.findAllByType("form")).toHaveLength(0);
+  });
+
   it("does not present a submission form on the direct VM Run route", async () => {
     await mount({
       ...base,
       workflow: {
         ...workflow,
+        workflowId: "vm-without-draft",
         definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
       },
     });
     expect(renderer!.root.findAllByType("form")).toHaveLength(0);
+    expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
     expect(JSON.stringify(renderer!.toJSON())).toContain(
       "Running VM workflows is not available yet.",
     );

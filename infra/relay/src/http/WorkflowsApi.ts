@@ -23,6 +23,7 @@ import {
   validateWorkflowTarget,
   vmWorkflowDefinitionIssue,
   vmWorkflowExecutionUnavailable,
+  workflowRunTargetChanged,
 } from "../jobs/WorkflowTarget.ts";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import {
@@ -327,6 +328,8 @@ export const runRepositoryWorkflow = Effect.fn("WorkflowsApi.run")(function* (
     return yield* tenancyNotFound("repository_not_found");
   if (workflow.archived)
     return yield* new WorkflowInvalidError({ message: "Restore this workflow before running it." });
+  if (workflow.definition.target.kind !== payload.expectedTargetKind)
+    return yield* workflowRunTargetChanged();
   if (workflow.definition.target.kind === "vm") return yield* vmWorkflowExecutionUnavailable();
   yield* validateWorkflowTarget(
     membership.organization.organizationId,
@@ -351,20 +354,23 @@ export const runRepositoryWorkflow = Effect.fn("WorkflowsApi.run")(function* (
     createdAt: now,
     updatedAt: now,
   };
-  yield* store.createJob({
-    jobId,
-    repositoryId,
-    organizationId: membership.organization.organizationId,
-    submitterUserId: membership.userId,
-    repositoryCanonicalKey: null,
-    status: "queued",
-    record: job,
-    revision: 0,
-    leaseUntil: null,
-    pendingControl: null,
-    createdAt: now,
-    checkedAt: now,
-  });
+  yield* store.createManualJob(
+    {
+      jobId,
+      repositoryId,
+      organizationId: membership.organization.organizationId,
+      submitterUserId: membership.userId,
+      repositoryCanonicalKey: null,
+      status: "queued",
+      record: job,
+      revision: 0,
+      leaseUntil: null,
+      pendingControl: null,
+      createdAt: now,
+      checkedAt: now,
+    },
+    { expectedRevision: workflow.revision, expectedTargetKind: payload.expectedTargetKind },
+  );
   return (yield* refreshWorkflowJobForClient(jobId)) ?? job;
 });
 

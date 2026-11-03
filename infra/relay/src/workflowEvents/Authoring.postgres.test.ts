@@ -233,13 +233,55 @@ describe("VM workflow authoring (PostgreSQL)", () => {
         expect(yield* store.get(vmInput.workflowId)).toEqual(saved);
         expect(
           yield* Effect.flip(
-            runRepositoryWorkflow("repo", { workflowId: saved.workflowId, instruction: "Test" }),
+            runRepositoryWorkflow("repo", {
+              workflowId: saved.workflowId,
+              instruction: "Test",
+              expectedTargetKind: "vm",
+            }),
           ),
         ).toMatchObject({
           _tag: "WorkflowInvalidError",
           message: "Running VM workflows is not available yet.",
         });
         expect(yield* store.listJobs("repo")).toEqual([]);
+      }),
+    ),
+  );
+
+  it.live("rejects stale Run forms after switching execution targets in either direction", () =>
+    testVmAuthoring(
+      Effect.gen(function* () {
+        yield* seed;
+        const machine = yield* save("flow", trigger, false);
+        const store = yield* Workflows;
+        const rejectStaleRun = Effect.fnUntraced(function* (expectedTargetKind: "machine" | "vm") {
+          const error = yield* Effect.flip(
+            runRepositoryWorkflow("repo", {
+              workflowId: machine.workflowId,
+              instruction: "Test",
+              expectedTargetKind,
+            }),
+          );
+          expect(error).toMatchObject({
+            _tag: "WorkflowInvalidError",
+            message:
+              "The workflow execution target changed. Review the saved target and try again.",
+          });
+          expect(yield* store.listJobs("repo")).toEqual([]);
+        });
+
+        const vm = yield* saveRepositoryWorkflow("repo", {
+          ...vmInput,
+          expectedRevision: machine.revision,
+        });
+        yield* rejectStaleRun("machine");
+
+        yield* saveRepositoryWorkflow("repo", {
+          ...vmInput,
+          expectedRevision: vm.revision,
+          definition: machine.definition,
+        });
+        yield* rejectStaleRun("vm");
       }),
     ),
   );

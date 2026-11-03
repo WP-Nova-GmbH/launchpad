@@ -21,6 +21,11 @@ import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatal
 export const vmWorkflowExecutionUnavailable = () =>
   new WorkflowInvalidError({ message: "Running VM workflows is not available yet." });
 
+export const workflowRunTargetChanged = () =>
+  new WorkflowInvalidError({
+    message: "The workflow execution target changed. Review the saved target and try again.",
+  });
+
 export const vmWorkflowAutomationUnavailable = () =>
   new WorkflowInvalidError({
     message: "Turn off automatic triggering to save this workflow with a VM target.",

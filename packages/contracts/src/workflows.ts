@@ -439,6 +439,7 @@ export const SaveRepositoryWorkflow = Schema.Struct({
 });
 export const RunRepositoryWorkflow = Schema.Struct({
   workflowId: TrimmedNonEmptyString,
+  expectedTargetKind: Schema.Literals(["machine", "vm"]),
   instruction: Instruction,
 });
 export const RespondToWorkflowJob = Schema.Union([

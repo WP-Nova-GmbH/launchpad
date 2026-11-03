@@ -30,12 +30,7 @@ type WorkflowRunProps = {
 
 export function WorkflowRun(props: WorkflowRunProps) {
   if (props.workflow.definition.target.kind === "vm")
-    return (
-      <div className="mx-auto w-full max-w-xl space-y-2">
-        <h1 className="text-xl font-semibold">Run {props.workflow.definition.name}</h1>
-        <p className="text-sm text-muted-foreground">Running VM workflows is not available yet.</p>
-      </div>
-    );
+    return <UnavailableVmWorkflowRun scope={props.scope} workflow={props.workflow} />;
   return (
     <WorkflowRunForm
       key={workflowSessionKey(
@@ -44,6 +39,26 @@ export function WorkflowRun(props: WorkflowRunProps) {
       )}
       {...props}
     />
+  );
+}
+
+function UnavailableVmWorkflowRun({
+  scope,
+  workflow,
+}: Pick<WorkflowRunProps, "scope" | "workflow">) {
+  const instruction =
+    useWorkflowDrafts().runs[workflowSessionKey(scope, workflow.workflowId)]?.instruction;
+  return (
+    <div className="mx-auto w-full max-w-xl space-y-2">
+      <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
+      <p className="text-sm text-muted-foreground">Running VM workflows is not available yet.</p>
+      {instruction?.trim() ? (
+        <label className="block space-y-2">
+          <span className="text-sm font-medium">Retained instructions</span>
+          <Textarea readOnly value={instruction} />
+        </label>
+      ) : null}
+    </div>
   );
 }
 
@@ -81,6 +96,7 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
       workflow.archived
     )
       return;
+    const expectedTargetKind = workflow.definition.target.kind;
     const request = { draft: current };
     submission.current = request;
     const ownsSubmission = () =>
@@ -105,7 +121,7 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
           client.runWorkflow({
             clerkToken: token,
             repositoryId: scope.repositoryId,
-            payload: { workflowId: workflow.workflowId, instruction },
+            payload: { workflowId: workflow.workflowId, instruction, expectedTargetKind },
           }),
         ),
       );
