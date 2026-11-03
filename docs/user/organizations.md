@@ -262,9 +262,12 @@ and manual Run are available on web and desktop.
 ## Machines
 
 Machines are existing computers an admin connects to the organization. Every member can see
-the list. In **Settings → Organization**, choose **Connect existing machine**, then run the
-returned setup command on that computer. The invitation expires after one day; if it expires,
-disconnect the unused entry and create another.
+the list. In **Settings → Organization → Machines**, choose **Connect your own machine**.
+On the target computer, [install the dependencies for your Launchpad checkout](../operations/development.md).
+Run the copied setup command from that checkout's root in a shell such as Bash or Zsh.
+Leave the server running while the machine is in use. To restart it, rerun the same command
+from the checkout. It reuses the machine's saved enrollment. An unused invitation expires
+after one day. If it expires, disconnect the unused entry and create another.
 
 Once enrolled, the machine appears alongside your environments on every signed-in client.
 An admin can disconnect it from Organization settings. Disconnecting removes organization

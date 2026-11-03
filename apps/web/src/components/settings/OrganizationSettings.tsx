@@ -1462,7 +1462,7 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
         <>
           <MachineCreateRow
             title="Connect your own machine"
-            description="Registers a computer this organization already runs. Copy the setup command it hands back and run it on that computer within 24 hours — the machine enrolls itself from there."
+            description="On that computer, install the dependencies for your Launchpad checkout. Copy the setup command and run it from the checkout root within 24 hours."
             actionLabel="Connect"
             busy={state.busy}
             onCreate={(input) => state.connectMachine(input)}

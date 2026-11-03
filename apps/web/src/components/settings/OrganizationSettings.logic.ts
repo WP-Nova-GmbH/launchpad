@@ -147,20 +147,23 @@ export function machineStatusPresentation(
 }
 
 /**
- * The one command an admin runs on their own computer to turn it into this
- * machine. A dedicated home directory keeps the executor's state out of any
- * Launchpad the person already runs there — an environment somebody linked
- * can never enroll, so pointing at an existing install would only fail.
+ * Launch the target computer's Launchpad checkout. The npm package named
+ * t3 belongs to upstream, and a source executor must not update this checkout.
  */
 export function machineEnrollmentCommand(enrollment: {
+  readonly machineId: string;
   readonly seed: string;
   readonly relayUrl: string;
 }): string {
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
   return [
-    'T3CODE_HOME="$HOME/.t3/machine"',
-    `T3CODE_MACHINE_ENROLLMENT_SEED="${enrollment.seed}"`,
-    `T3CODE_MACHINE_ENROLLMENT_RELAY_URL="${enrollment.relayUrl}"`,
-    "npx t3 serve",
+    "( if [ ! -f ./apps/server/src/cloud/machineEnrollment.ts ]; then",
+    "printf '%s\\n' 'Run this command from the root of a Launchpad checkout with dependencies installed.' >&2; exit 1; fi;",
+    'T3CODE_HOME="$HOME/.t3/machines/"' + quote(enrollment.machineId),
+    "T3CODE_MACHINE_ENROLLMENT_SEED=" + quote(enrollment.seed),
+    "T3CODE_MACHINE_ENROLLMENT_RELAY_URL=" + quote(enrollment.relayUrl),
+    "T3CODE_EXECUTOR_SELF_UPDATE=0",
+    "vp env exec node ./apps/server/src/bin.ts serve )",
   ].join(" ");
 }
 
