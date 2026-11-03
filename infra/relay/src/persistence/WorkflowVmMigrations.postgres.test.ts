@@ -21,6 +21,7 @@ const codexVmHead = "dab2362b-4578-42d4-a278-a4ee43d1214e";
 const stockVmHead = "c57df92d-b498-403e-9d19-d8453f1502dd";
 const runtimeMigration = "20261028221922_thread_vm_runtime_protocol";
 const foundationMigration = "20261102170843_workflow_execution_foundation";
+const configurationMigration = "20261103125456_workflow_run_configuration";
 const prefix = "workflow_vm_merge_20261027_";
 type Snapshot = Awaited<ReturnType<typeof generateDrizzleJson>>;
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -99,10 +100,15 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
     yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at) VALUES ('merge-org','merge-user','admin','2026','2026')`;
     yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name,created_at,updated_at) VALUES ('merge-repo','merge-org','Repository','2026','2026')`;
     if (names.has("20261019163246_workflow_automatic_starts")) {
-      const definition = {
-        name: "Preserved workflow",
+      const target = {
+        kind: "machine" as const,
         environmentId: "environment",
         projectId: "project",
+      };
+      const canonical = names.has(foundationMigration);
+      const definition = {
+        name: "Preserved workflow",
+        ...(canonical ? { target } : { environmentId: "environment", projectId: "project" }),
         steps: [
           {
             id: "agent",
@@ -129,7 +135,7 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
         jobId: "merge-job",
         repositoryId: "merge-repo",
         workflowId: "merge-flow",
-        environmentId: "environment",
+        ...(canonical ? { runtime: null } : { environmentId: "environment" }),
         instruction: "Preserved task",
         origin: { kind: "manual", userId: "merge-user" },
         status: "queued",
@@ -142,6 +148,7 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
       yield* sql`INSERT INTO relay_workflow_jobs(job_id,repository_id,organization_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES ('merge-job','merge-repo','merge-org','merge-user','queued',${sql.json(record)},0,'2026','2026')`;
       const accepted = {
         ...record,
+        ...(canonical ? { runtime: target } : {}),
         jobId: "merge-accepted-job",
         status: "dispatching",
         workflow: flow,
@@ -215,7 +222,7 @@ const records = (sql: PgClient.PgClient, omitNativeAllocationColumns = false) =>
 
 describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => {
   it.live(
-    "upgrades empty, common, workflow, VM, Codex and stock databases without losing data or replaying migrations",
+    "upgrades empty and prior workflow and VM databases without losing data or replaying migrations",
     () =>
       Effect.gen(function* () {
         const adminUrl = new URL(url!);
@@ -257,6 +264,12 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
         expect(leaves).toHaveLength(1);
         const head = leaves[0]!.snapshot;
         expect(ancestors(head.id).size).toBe(entries.length);
+        const configuration = entries.find((entry) => entry.name === configurationMigration);
+        expect(configuration).toBeDefined();
+        const beforeConfiguration = new Set(
+          configuration!.snapshot.prevIds.flatMap((id) => [...ancestors(id)]),
+        );
+        expect(beforeConfiguration.has(foundationMigration)).toBe(true);
         const generated = yield* Effect.promise(() => generateDrizzleJson(schema));
         expect(yield* Effect.promise(() => generateMigration(head, generated))).toEqual([]);
         const empty = yield* Effect.promise(() => generateDrizzleJson({}));
@@ -283,6 +296,7 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
           ["codex", codex],
           ["stock", stock],
           ["current", current],
+          ["before-configuration", beforeConfiguration],
         ] as const) {
           const baselineFolder = path.join(folder, label);
           yield* fs.makeDirectory(baselineFolder);
@@ -309,6 +323,8 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
                 migrationsTable: "relay_migrations",
               });
               const after = yield* records(sql, omitNativeAllocationColumns);
+              expect(after.relay_repository_workflow_configurations).toBeUndefined();
+              expect(after.relay_workflow_run_configurations).toBeUndefined();
               if (baseline.has("20261023131714_thread_original_location")) {
                 const [allocation] = yield* sql<{
                   protocol: string;

@@ -115,7 +115,7 @@ export const RELAY_HTTP_ROUTER_CONFIG = {
   maxParamLength: 512,
 } as const;
 
-const relayCorsAllowedMethods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"] as const;
+const relayCorsAllowedMethods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
 const relayCorsAllowedHeaders = [
   "authorization",
   "b3",

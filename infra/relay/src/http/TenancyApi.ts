@@ -29,6 +29,10 @@ import {
   toApiOrganizationSkill,
 } from "./OrganizationSkillsApi.ts";
 import { sealProviderAccountPayload, toApiProviderAccount } from "./ProviderAccountsApi.ts";
+import {
+  getRepositoryWorkflowConfiguration,
+  updateRepositoryWorkflowConfiguration,
+} from "./RepositoryWorkflowConfigurationApi.ts";
 import { tenancyConflict, tenancyForbidden, tenancyNotFound } from "./tenancyErrors.ts";
 import * as RelayConfiguration from "../Config.ts";
 import * as RelayDb from "../db.ts";
@@ -968,6 +972,12 @@ export const repositoriesApi = HttpApiBuilder.group(
             ),
           };
         }, mapRelayCommonApiErrors("not_authorized")),
+      )
+      .handle("getRepositoryWorkflowConfiguration", ({ params }) =>
+        getRepositoryWorkflowConfiguration(params.repositoryId),
+      )
+      .handleRaw("updateRepositoryWorkflowConfiguration", ({ params, request }) =>
+        updateRepositoryWorkflowConfiguration(params.repositoryId, request),
       )
       .handle(
         "registerRepository",

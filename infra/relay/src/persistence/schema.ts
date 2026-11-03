@@ -517,6 +517,21 @@ export const relayRepositories = pgTable(
   (table) => [index("idx_relay_repositories_organization").on(table.organizationId, table.name)],
 );
 
+export const relayRepositoryWorkflowConfigurations = pgTable(
+  "relay_repository_workflow_configurations",
+  {
+    repositoryId: varchar("repository_id", { length: 64 })
+      .primaryKey()
+      .references(() => relayRepositories.repositoryId, { onDelete: "cascade" }),
+    revision: integer("revision").notNull(),
+    entries: jsonb("entries").notNull(),
+  },
+  (table) => [
+    check("repo_workflow_configuration_revision", sql`${table.revision} > 0`),
+    check("repo_workflow_configuration_entries", sql`jsonb_typeof(${table.entries}) = 'array'`),
+  ],
+);
+
 /**
  * The canonical keys a repository answers to (ADR-0006). The key is the primary
  * key, so one key can only ever belong to one repository — mirrors and forks
@@ -857,6 +872,32 @@ export const relayWorkflowJobs = pgTable(
     index("idx_workflow_jobs_history_page")
       .on(table.repositoryId, table.createdAt, table.jobId)
       .where(sql`"status" IN ('done','cancelled','failed')`),
+  ],
+);
+
+// A run's configuration outlives changes to the live repository settings.
+export const relayWorkflowRunConfigurations = pgTable(
+  "relay_workflow_run_configurations",
+  {
+    jobId: varchar("job_id", { length: 64 }).primaryKey(),
+    organizationId: varchar("organization_id", { length: 64 }).notNull(),
+    repositoryId: varchar("repository_id", { length: 64 }).notNull(),
+    threadId: varchar("thread_id", { length: 191 }).notNull(),
+    sourceRevision: integer("source_revision").notNull(),
+    hasSecrets: boolean("has_secrets").notNull(),
+    sealedPayload: text("sealed_payload").notNull(),
+  },
+  (table) => [
+    foreignKey({
+      name: "workflow_run_configuration_job_tenant_fk",
+      columns: [table.jobId, table.organizationId, table.repositoryId],
+      foreignColumns: [
+        relayWorkflowJobs.jobId,
+        relayWorkflowJobs.organizationId,
+        relayWorkflowJobs.repositoryId,
+      ],
+    }).onDelete("cascade"),
+    check("workflow_run_configuration_revision", sql`${table.sourceRevision} >= 0`),
   ],
 );
 

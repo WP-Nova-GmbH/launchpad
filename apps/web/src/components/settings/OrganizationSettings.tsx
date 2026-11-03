@@ -80,6 +80,7 @@ import {
 import { searchableSetting } from "./settingsSearch";
 import { ThreadVmPolicySettings } from "./ThreadVmPolicySettings";
 import { CodexVmConnectionSettings } from "./CodexVmConnectionSettings";
+import { WorkflowEnvironmentButton } from "./WorkflowEnvironmentSettings";
 
 const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
   admin: "Admin",
@@ -554,6 +555,14 @@ function RepositoryRow({
         ) : null}
         <div className="flex flex-wrap gap-2 border-t pt-3">
           {canConfigure ? <RepositorySourcesButton repositoryId={repositoryId} /> : null}
+          {canConfigure && state.snapshot ? (
+            <WorkflowEnvironmentButton
+              accountId={state.snapshot.membership.userId}
+              organizationId={entry.repository.organizationId}
+              repositoryId={repositoryId}
+              repositoryName={entry.repository.name}
+            />
+          ) : null}
           <Button
             variant="outline"
             render={

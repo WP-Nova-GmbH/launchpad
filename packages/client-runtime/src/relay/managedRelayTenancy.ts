@@ -92,6 +92,13 @@ import {
   type RelayRepositoryAccessEntry,
   type RelayRepositoryId,
   type RelayRepositorySummary,
+  type RelayRepositoryWorkflowConfiguration,
+  type RelayUpdateRepositoryWorkflowConfiguration,
+  RelayAuthInvalidError,
+  RelayTenancyConflictError,
+  RelayTenancyForbiddenError,
+  RelayTenancyInvalidError,
+  RelayTenancyNotFoundError,
 } from "@t3tools/contracts/relay";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
@@ -109,6 +116,7 @@ import * as Context from "effect/Context";
 import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import {
@@ -129,6 +137,28 @@ interface ActiveThreadMoveRequest {
   readonly threadId: ThreadId;
   readonly operationId: string;
   readonly sourceGeneration: number;
+}
+
+const isWorkflowEnvironmentError = Schema.is(
+  Schema.Union([
+    RelayAuthInvalidError,
+    RelayTenancyConflictError,
+    RelayTenancyForbiddenError,
+    RelayTenancyInvalidError,
+    RelayTenancyNotFoundError,
+  ]),
+);
+
+function workflowEnvironmentRequestError(
+  action: "read workflow environment" | "save workflow environment",
+) {
+  return (cause: unknown) =>
+    new ManagedRelayRequestFailedError({
+      action,
+      // Transport and schema errors can carry the complete request, including a secret.
+      cause: undefined,
+      ...(isWorkflowEnvironmentError(cause) ? { relayError: cause, traceId: cause.traceId } : {}),
+    });
 }
 
 export class ManagedRelayTenancyClient extends Context.Service<
@@ -219,6 +249,15 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listRepositories: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayRepositorySummary>, ManagedRelayClientError>;
+    readonly getRepositoryWorkflowConfiguration: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<RelayRepositoryWorkflowConfiguration, ManagedRelayClientError>;
+    readonly updateRepositoryWorkflowConfiguration: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly payload: RelayUpdateRepositoryWorkflowConfiguration;
+    }) => Effect.Effect<RelayRepositoryWorkflowConfiguration, ManagedRelayClientError>;
     readonly listOrganizationProjects: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayOrganizationProject>, ManagedRelayClientError>;
@@ -593,6 +632,12 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     revokeInvitation: unavailable("clientRuntime.managedRelayTenancy.revokeInvitation"),
     acceptInvitation: unavailable("clientRuntime.managedRelayTenancy.acceptInvitation"),
     listRepositories: unavailable("clientRuntime.managedRelayTenancy.listRepositories"),
+    getRepositoryWorkflowConfiguration: unavailable(
+      "clientRuntime.managedRelayTenancy.getRepositoryWorkflowConfiguration",
+    ),
+    updateRepositoryWorkflowConfiguration: unavailable(
+      "clientRuntime.managedRelayTenancy.updateRepositoryWorkflowConfiguration",
+    ),
     listOrganizationProjects: unavailable(
       "clientRuntime.managedRelayTenancy.listOrganizationProjects",
     ),
@@ -1041,6 +1086,29 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.listRepositories"),
       withRelayClientTracing,
     ),
+    getRepositoryWorkflowConfiguration: (input) =>
+      client.repositories
+        .getRepositoryWorkflowConfiguration({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+        })
+        .pipe(
+          Effect.mapError(workflowEnvironmentRequestError("read workflow environment")),
+          timeoutRelayRequest("Workflow environment read"),
+          Effect.withTracerEnabled(false),
+        ),
+    updateRepositoryWorkflowConfiguration: (input) =>
+      client.repositories
+        .updateRepositoryWorkflowConfiguration({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+          payload: input.payload,
+        })
+        .pipe(
+          Effect.mapError(workflowEnvironmentRequestError("save workflow environment")),
+          timeoutRelayRequest("Workflow environment update"),
+          Effect.withTracerEnabled(false),
+        ),
     listOrganizationProjects: Effect.fnUntraced(
       function* (input) {
         return yield* client.organizationProjects

@@ -259,6 +259,17 @@ On mobile, open **Settings → Workflow jobs** to inspect a job, answer checkpoi
 request changes, open the PR, retry publishing, pause, resume, or cancel. Workflow creation
 and manual Run are available on web and desktop.
 
+### Workflow environment
+
+On web or desktop, repository maintainers and organization admins can open
+**Settings → Organization → Repositories → Workflow environment** to manage values for the
+repository's workflow VMs. Use a variable for ordinary settings and a secret for credentials.
+Saved secret values are hidden and can be replaced or deleted.
+
+A VM run keeps the settings it had when preparation began. If a run needs a new credential
+after rotation, update the repository setting and start a fresh run. These values are used
+once VM workflow execution is available.
+
 ## Machines
 
 Machines are existing computers an admin connects to the organization. Every member can see

@@ -791,6 +791,7 @@ export const RelayTenancyConflictReason = Schema.Literals([
   "invitation_email_mismatch",
   "machine_limit_reached",
   "vm_policy_changed",
+  "workflow_configuration_changed",
   "thread_command_conflict",
   "thread_artifact_conflict",
   "thread_checkpoint_conflict",
@@ -849,6 +850,8 @@ export class RelayTenancyConflictError extends Schema.TaggedError<RelayTenancyCo
 export const RelayTenancyInvalidReason = Schema.Literals([
   "skill_manifest_malformed",
   "skill_name_mismatch",
+  "workflow_configuration_invalid",
+  "workflow_configuration_limit",
 ]);
 export type RelayTenancyInvalidReason = typeof RelayTenancyInvalidReason.Type;
 
@@ -1514,6 +1517,51 @@ export const RelayRepository = Schema.Struct({
   createdAt: TrimmedNonEmptyString,
 });
 export type RelayRepository = typeof RelayRepository.Type;
+
+export const RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH = 128;
+export const RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES = 4 * 1024;
+export const RELAY_WORKFLOW_ENV_MAX_ENTRIES = 64;
+export const RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES = 32 * 1024;
+
+const RelayWorkflowEnvironmentName = Schema.String.check(
+  Schema.isMaxLength(RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH),
+  Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/u),
+);
+const RelayWorkflowConfigurationRevision = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: 2_147_483_647 }),
+);
+const RelayWorkflowEnvironmentEntry = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("variable"),
+    name: RelayWorkflowEnvironmentName,
+    value: Schema.String,
+  }),
+  Schema.Struct({ kind: Schema.Literal("secret"), name: RelayWorkflowEnvironmentName }),
+]);
+
+export const RelayRepositoryWorkflowConfiguration = Schema.Struct({
+  organizationId: RelayOrganizationId,
+  repositoryId: RelayRepositoryId,
+  revision: RelayWorkflowConfigurationRevision,
+  entries: Schema.Array(RelayWorkflowEnvironmentEntry).check(
+    Schema.isMaxLength(RELAY_WORKFLOW_ENV_MAX_ENTRIES),
+  ),
+});
+export type RelayRepositoryWorkflowConfiguration = typeof RelayRepositoryWorkflowConfiguration.Type;
+
+export const RelayUpdateRepositoryWorkflowConfiguration = Schema.Struct({
+  expectedRevision: RelayWorkflowConfigurationRevision,
+  mutation: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literals(["setVariable", "setSecret"]),
+      name: RelayWorkflowEnvironmentName,
+      value: Schema.String,
+    }),
+    Schema.Struct({ kind: Schema.Literal("delete"), name: RelayWorkflowEnvironmentName }),
+  ]),
+});
+export type RelayUpdateRepositoryWorkflowConfiguration =
+  typeof RelayUpdateRepositoryWorkflowConfiguration.Type;
 
 /** A repository plus the caller's own role on it; `null` for an admin with no grant. */
 export const RelayRepositorySummary = Schema.Struct({
@@ -4490,6 +4538,27 @@ const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
       success: RelayOkResponse,
       error: RelayTenancyErrors,
     }).annotate(OpenApi.Summary, "Remove a repository and its keys"),
+    HttpApiEndpoint.get(
+      "getRepositoryWorkflowConfiguration",
+      "/v1/repositories/:repositoryId/workflow-environment",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        success: RelayRepositoryWorkflowConfiguration,
+        error: RelayTenancyErrors,
+      },
+    ).annotate(OpenApi.Summary, "Read repository workflow variables and secret names"),
+    HttpApiEndpoint.patch(
+      "updateRepositoryWorkflowConfiguration",
+      "/v1/repositories/:repositoryId/workflow-environment",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        payload: RelayUpdateRepositoryWorkflowConfiguration,
+        success: RelayRepositoryWorkflowConfiguration,
+        error: RelayTenancyErrors,
+      },
+    ).annotate(OpenApi.Summary, "Update one repository workflow variable or secret"),
     HttpApiEndpoint.post("addRepositoryAlias", "/v1/repositories/:repositoryId/aliases", {
       headers: RelayBearerRequestHeaders,
       params: RelayRepositoryParams,
