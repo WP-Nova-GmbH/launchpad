@@ -231,6 +231,31 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
               expect(
                 (yield* store.pageJobs("repo", { view: "attention" })).jobs.map((j) => j.jobId),
               ).toEqual(["blocked", "cancellation-failed", "input", "paused"]);
+
+              const capacity = job("000-vm-capacity", "queued");
+              capacity.record = {
+                ...capacity.record,
+                queueReason: { code: "vm_waiting_capacity", retryAt: null },
+              };
+              yield* store.createJob(capacity);
+              const limitDisabled = job("001-vm-limit-disabled", "queued");
+              limitDisabled.record = {
+                ...limitDisabled.record,
+                queueReason: { code: "vm_limit_disabled", retryAt: null },
+              };
+              yield* store.createJob(limitDisabled);
+              const active = yield* store.pageJobs("repo", { view: "active", limit: 1 });
+              expect(active.jobs).toMatchObject([{ jobId: capacity.jobId, needsAttention: false }]);
+              const firstAttention = yield* store.pageJobs("repo", { view: "attention", limit: 1 });
+              expect(firstAttention.jobs).toMatchObject([
+                { jobId: limitDisabled.jobId, needsAttention: true },
+              ]);
+              const nextAttention = yield* store.pageJobs("repo", {
+                view: "attention",
+                limit: 1,
+                cursor: firstAttention.nextCursor!,
+              });
+              expect(nextAttention.jobs).toMatchObject([{ jobId: blocked.jobId }]);
               expect(
                 yield* store
                   .pageJobs("repo", {

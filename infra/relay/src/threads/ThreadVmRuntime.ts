@@ -65,6 +65,7 @@ export interface ThreadVmRuntimeSettings {
   readonly compute: E2BThreadVmSettings;
   readonly templateBuildId: string;
   readonly workflowModelCatalog?: WorkflowVmModelCatalog;
+  readonly workflowExecutionEnabled?: boolean;
   readonly hostId: string;
   readonly maxRunningVms: number;
   readonly publicRelayUrl: string;
@@ -129,6 +130,9 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
     templateId,
     templateBuildId,
   );
+  const workflowExecutionEnabled = yield* Config.Boolean(
+    "RELAY_WORKFLOW_VM_EXECUTION_ENABLED",
+  ).pipe(Config.withDefault(false));
   const hostId = yield* Config.String("E2B_HOST_ID");
   const maxRunningVms = yield* Config.Number("E2B_MAX_RUNNING_VMS");
   const publicRelayUrl = yield* Config.String("E2B_PUBLIC_RELAY_URL");
@@ -249,6 +253,7 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
     compute: { apiUrl, sandboxUrl, apiKey, templateId, hostAddresses, timeoutMs: 600_000 },
     templateBuildId,
     ...(workflowModelCatalog ? { workflowModelCatalog } : {}),
+    ...(workflowExecutionEnabled ? { workflowExecutionEnabled } : {}),
     hostId,
     maxRunningVms,
     publicRelayUrl: publicRelayUrl.replace(/\/$/u, ""),

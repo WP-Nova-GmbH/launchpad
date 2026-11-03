@@ -5,6 +5,7 @@ import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import {
   WorkflowInvalidError,
+  WorkflowSubmissionPendingError,
   type RepositoryWorkflow,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
@@ -19,12 +20,15 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 
-const { navigate, confirmation } = vi.hoisted(() => ({
+const { navigate, confirmation, getToken, runPromiseExit } = vi.hoisted(() => ({
   navigate: vi.fn(),
   confirmation: vi.fn<() => Promise<boolean>>(),
+  getToken: vi.fn<() => Promise<string | null>>(),
+  runPromiseExit: vi.fn(),
 }));
+vi.mock("@clerk/react", () => ({ useAuth: () => ({ getToken }) }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => navigate }));
-vi.mock("../../lib/runtime", () => ({ runtime: {} }));
+vi.mock("../../lib/runtime", () => ({ runtime: { runPromiseExit } }));
 vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: confirmation }));
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
@@ -34,6 +38,7 @@ vi.mock("../ui/textarea", () => ({
 }));
 
 import { WorkflowRun } from "./WorkflowRun";
+import { useWorkflowClient } from "./workflowState";
 
 type Props = Parameters<typeof WorkflowRun>[0];
 const scope: WorkflowScope = {
@@ -99,9 +104,21 @@ const view = (props: Props) => (
     <WorkflowRun {...props} />
   </AppAtomRegistryProvider>
 );
-async function mount(props = base) {
+function AuthenticatedWorkflowRun(props: Props) {
+  const call = useWorkflowClient(props.scope);
+  return <WorkflowRun {...props} call={call} />;
+}
+async function mount(props = base, withAuth = false) {
   await act(() => {
-    renderer = create(view(props));
+    renderer = create(
+      withAuth ? (
+        <AppAtomRegistryProvider>
+          <AuthenticatedWorkflowRun {...props} />
+        </AppAtomRegistryProvider>
+      ) : (
+        view(props)
+      ),
+    );
   });
 }
 async function update(props: Props) {
@@ -144,6 +161,8 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   navigate.mockReset();
   confirmation.mockReset().mockResolvedValue(true);
+  getToken.mockReset().mockResolvedValue("fixture-token");
+  runPromiseExit.mockReset();
   read.mockReset().mockResolvedValue(job);
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
@@ -158,6 +177,7 @@ beforeEach(() => {
 afterEach(async () => {
   await unmount();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("Run receipt and navigation ownership", () => {
@@ -278,6 +298,332 @@ describe("Run receipt and navigation ownership", () => {
         .findAllByType("button")
         .some((button) => button.props.children === "View started run"),
     ).toBe(true);
+  });
+});
+
+describe("VM Run submission recovery", () => {
+  const vmWorkflow: RepositoryWorkflow = {
+    ...workflow,
+    definition: { ...workflow.definition, target: { kind: "vm", baseBranch: "release/1.x" } },
+  };
+  const captureSubmissions = () => {
+    type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+    const runWorkflow = vi.fn<Client["runWorkflow"]>();
+    const client = { runWorkflow } as unknown as Client;
+    const call: Props["call"] = async <A,>(operation: Parameters<Props["call"]>[0]) => {
+      void operation(client, "fixture-token");
+      return (await read()) as A;
+    };
+    return { runWorkflow, call };
+  };
+  const press = (label: string) =>
+    act(async () => {
+      renderer!.root
+        .findAllByType("button")
+        .find((node) => node.props.children === label)!
+        .props.onClick();
+    });
+
+  it.each([
+    ["VM", "missing"],
+    ["VM", "rejected"],
+    ["Machine", "missing"],
+  ] as const)(
+    "keeps the original %s submission after the replacement's Clerk token is %s",
+    async (kind, failure) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const initial = {
+        ...base,
+        workflow: kind === "VM" ? vmWorkflow : workflow,
+        vmExecutionAvailable: true,
+        call,
+      };
+      vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "workflow-test");
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await mount(initial);
+      await submit();
+      const original = runWorkflow.mock.calls[0]![0].payload;
+      await edit("A different run");
+      await unmount();
+      await mount(initial, true);
+      if (failure === "missing") getToken.mockResolvedValueOnce(null);
+      else getToken.mockRejectedValueOnce(new Error("Could not load the token"));
+
+      await submit();
+      expect(confirmation).toHaveBeenCalledOnce();
+      expect(getToken).toHaveBeenCalledOnce();
+      expect(runPromiseExit).not.toHaveBeenCalled();
+      expect(runWorkflow).toHaveBeenCalledOnce();
+      expect(renderer!.root.findByProps({ role: "alert" }).props.children).toContain(
+        "Launchpad Connect",
+      );
+
+      await unmount();
+      await mount(initial);
+      if (kind === "VM") {
+        await press("Retry previous submission");
+        expect(runWorkflow.mock.calls[1]![0].payload).toEqual(original);
+      } else {
+        await press("Check recent runs");
+        expect(runWorkflow).toHaveBeenCalledOnce();
+        expect(navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/workflows/$repositoryId",
+          params: { repositoryId: scope.repositoryId },
+          search: { tab: "runs" },
+        });
+      }
+      expect(renderer!.root.findByType("textarea").props.value).toBe("A different run");
+    },
+  );
+
+  it("retries the replacement ID when the replacement's reply is lost after sending", async () => {
+    const { call, runWorkflow } = captureSubmissions();
+    const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+    read.mockRejectedValueOnce(new Error("Original reply lost")).mockRejectedValueOnce(
+      new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        transportFailed: true,
+        cause: new Error("Replacement reply lost"),
+      }),
+    );
+    await mount(initial);
+    await submit();
+    await edit("A different run");
+    await submit();
+    const original = runWorkflow.mock.calls[0]![0].payload;
+    const replacement = runWorkflow.mock.calls[1]![0].payload;
+    expect(replacement.requestId).not.toBe(original.requestId);
+
+    await press("Retry previous submission");
+    expect(runWorkflow.mock.calls[2]![0].payload).toEqual(replacement);
+  });
+
+  it("keeps the recovered run shortcut after the next submission is rejected", async () => {
+    const { call } = captureSubmissions();
+    const message = "This run could not start.";
+    read
+      .mockRejectedValueOnce(new Error("Reply lost"))
+      .mockResolvedValueOnce(job)
+      .mockRejectedValueOnce(
+        new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: new WorkflowInvalidError({ message }),
+        }),
+      );
+    await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call });
+    await submit();
+    await edit("A different run");
+    await press("Retry previous submission");
+    await submit();
+
+    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+    expect(renderer!.root.findByType("textarea").props.value).toBe("A different run");
+    await press("View started run");
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({
+      to: "/workflows/$repositoryId/jobs/$jobId",
+      params: { repositoryId: scope.repositoryId, jobId: job.jobId },
+    });
+  });
+
+  it.each(["archived", "gated"] as const)(
+    "keeps the Machine history shortcut after the form becomes %s",
+    async (condition) => {
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await mount();
+      await submit();
+      await edit("");
+      await update({
+        ...base,
+        workflow: condition === "archived" ? { ...workflow, archived: true } : vmWorkflow,
+      });
+
+      expect(renderer!.root.findAllByType("form")).toHaveLength(0);
+      expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
+      await press("Check recent runs");
+      expect(navigate).toHaveBeenCalledExactlyOnceWith({
+        to: "/workflows/$repositoryId",
+        params: { repositoryId: scope.repositoryId },
+        search: { tab: "runs" },
+      });
+      expect(read).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["enabled", "gate closed", "Machine target", "archived"] as const)(
+    "recovers the captured VM request after reopening with %s and keeps newer instructions",
+    async (condition) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await mount(initial);
+      expect(JSON.stringify(renderer!.toJSON())).toContain("VM · release/1.x");
+      await submit();
+      const captured = runWorkflow.mock.calls[0]![0].payload;
+      expect(captured).toEqual({
+        workflowId: workflow.workflowId,
+        instruction: "Run A",
+        expectedTargetKind: "vm",
+        requestId: expect.any(String),
+      });
+      await edit("Instructions for a separate run");
+      await unmount();
+      await mount({
+        ...initial,
+        ...(condition === "gate closed" ? { vmExecutionAvailable: false } : {}),
+        ...(condition === "Machine target" ? { workflow } : {}),
+        ...(condition === "archived" ? { workflow: { ...vmWorkflow, archived: true } } : {}),
+      });
+      if (condition === "gate closed" || condition === "archived") {
+        expect(renderer!.root.findAllByType("form")).toHaveLength(0);
+        expect(renderer!.root.findByType("textarea").props.readOnly).toBe(true);
+      }
+      await press(
+        condition === "enabled" ? "Retry previous submission" : "Check previous submission",
+      );
+      expect(runWorkflow.mock.calls[1]![0].payload).toEqual({
+        ...captured,
+        ...(condition === "enabled" ? {} : { replayOnly: true }),
+      });
+      expect(draft()).toMatchObject({
+        instruction: "Instructions for a separate run",
+        operation: null,
+        startedJobId: job.jobId,
+      });
+      expect(confirmation).not.toHaveBeenCalled();
+      expect(navigate).not.toHaveBeenCalled();
+      expect(renderer!.root.findByType("textarea").props.value).toBe(
+        "Instructions for a separate run",
+      );
+      await press("View started run");
+      expect(navigate).toHaveBeenCalledExactlyOnceWith({
+        to: "/workflows/$repositoryId/jobs/$jobId",
+        params: { repositoryId: scope.repositoryId, jobId: job.jobId },
+      });
+    },
+  );
+
+  it.each(["vm", "machine"] as const)(
+    "confirms a separate %s Run and preserves original VM recovery if it is rejected",
+    async (targetKind) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+      const message = "This run could not start.";
+      read.mockRejectedValueOnce(new Error("Reply lost")).mockRejectedValueOnce(
+        new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: new WorkflowInvalidError({ message }),
+        }),
+      );
+      await mount(initial);
+      await submit();
+      const original = runWorkflow.mock.calls[0]![0].payload;
+      await edit("A different run");
+      if (targetKind === "machine") await update({ ...initial, workflow });
+      const retained = draft();
+      confirmation.mockResolvedValueOnce(false);
+      await submit();
+      expect(runWorkflow).toHaveBeenCalledTimes(1);
+      expect(draft()).toBe(retained);
+
+      await submit();
+      expect(confirmation).toHaveBeenCalledTimes(2);
+      const replacement = runWorkflow.mock.calls[1]![0].payload;
+      expect(replacement).toEqual({
+        workflowId: workflow.workflowId,
+        instruction: "A different run",
+        expectedTargetKind: targetKind,
+        ...(targetKind === "vm" ? { requestId: expect.any(String) } : {}),
+      });
+      expect(replacement.requestId).not.toBe(original.requestId);
+      expect(draft()).toMatchObject({
+        instruction: "A different run",
+        operation: retained.operation,
+        error: message,
+      });
+
+      await press(targetKind === "vm" ? "Retry previous submission" : "Check previous submission");
+      expect(runWorkflow.mock.calls[2]![0].payload).toEqual({
+        ...original,
+        ...(targetKind === "machine" ? { replayOnly: true } : {}),
+      });
+      expect(draft()).toMatchObject({ instruction: "A different run", operation: null });
+    },
+  );
+
+  it.each(["target", "gate", "archive"] as const)(
+    "does not start a separate run when the %s changes during confirmation",
+    async (change) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await mount(initial);
+      await submit();
+      const answer = deferred<boolean>();
+      confirmation.mockReturnValueOnce(answer.promise);
+      await submit();
+      expect(confirmation).toHaveBeenCalledOnce();
+      await update(
+        change === "target"
+          ? { ...initial, workflow }
+          : change === "gate"
+            ? { ...initial, vmExecutionAvailable: false }
+            : { ...initial, workflow: { ...vmWorkflow, archived: true } },
+      );
+      const retained = draft();
+      await accept(answer, true);
+      expect(runWorkflow).toHaveBeenCalledTimes(1);
+      expect(draft()).toBe(retained);
+    },
+  );
+
+  it.each([false, true])(
+    "keeps an unresolved VM request after a retry error (gate closed: %s)",
+    async (gateClosed) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+      const message = gateClosed
+        ? "This submission has no receipt yet. Check again shortly."
+        : "Connect organization Codex before running.";
+      const retry = gateClosed ? "Check previous submission" : "Retry previous submission";
+      read.mockRejectedValueOnce(new Error("Reply lost")).mockRejectedValueOnce(
+        new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: gateClosed
+            ? new WorkflowSubmissionPendingError({ message })
+            : new WorkflowInvalidError({ message }),
+        }),
+      );
+      await mount(initial);
+      await submit();
+      if (gateClosed) await update({ ...initial, vmExecutionAvailable: false });
+      await press(retry);
+      expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+      expect(draft().operation).toMatchObject({ state: "uncertain", targetKind: "vm" });
+      expect(navigate).not.toHaveBeenCalled();
+      await press(retry);
+      expect(runWorkflow.mock.calls[2]![0].payload).toEqual(runWorkflow.mock.calls[1]![0].payload);
+      expect(draft().startedJobId).toBe(job.jobId);
+    },
+  );
+
+  it("lets a first VM preflight rejection keep the instructions for a fresh submission", async () => {
+    const { call, runWorkflow } = captureSubmissions();
+    const message = "Connect organization Codex before running.";
+    read.mockRejectedValueOnce(
+      new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        cause: new WorkflowInvalidError({ message }),
+      }),
+    );
+    await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call });
+    await submit();
+    expect(draft()).toMatchObject({ operation: null, instruction: "Run A" });
+    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+    await submit();
+    expect(runWorkflow.mock.calls[0]![0].payload.requestId).not.toBe(
+      runWorkflow.mock.calls[1]![0].payload.requestId,
+    );
+    expect(draft().startedJobId).toBe(job.jobId);
   });
 });
 

@@ -50,6 +50,7 @@ import {
   WorkflowControlResult,
   WorkflowConflictError,
   WorkflowInvalidError,
+  WorkflowSubmissionPendingError,
 } from "./workflows.ts";
 import {
   RepositoryPolicyProof,
@@ -4250,7 +4251,7 @@ const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
       params: RelayRepositoryParams,
       payload: RunRepositoryWorkflow,
       success: RepositoryWorkflowJob,
-      error: WorkflowErrors,
+      error: [...WorkflowErrors, WorkflowSubmissionPendingError],
     }),
     HttpApiEndpoint.get("getJob", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
       headers: RelayBearerRequestHeaders,

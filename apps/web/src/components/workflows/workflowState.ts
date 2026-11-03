@@ -20,13 +20,19 @@ import { randomUUID } from "../../lib/utils";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
+import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useRef } from "react";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { runtime } from "../../lib/runtime";
-import { resolveRelayClerkTokenOptions } from "../../cloud/publicConfig";
+import {
+  CloudPublicConfigMissingError,
+  resolveRelayClerkTokenOptions,
+} from "../../cloud/publicConfig";
 import { requestConfirmDialog } from "../../confirmDialog";
+import { WorkflowRequestNotSentError } from "./workflowOperations";
 
 type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+const isCloudPublicConfigMissing = Schema.is(CloudPublicConfigMissingError);
 export const workflowError = (cause: unknown) =>
   cause instanceof Error ? cause.message : "The request could not be completed.";
 export const confirmWorkflow = (message: string) =>
@@ -41,9 +47,19 @@ export function useWorkflowClient(scope: WorkflowScope) {
         token: string,
       ) => Effect.Effect<A, ManagedRelay.ManagedRelayClientError>,
     ) => {
-      const token = await getToken(resolveRelayClerkTokenOptions());
+      let token;
+      try {
+        token = await getToken(resolveRelayClerkTokenOptions());
+      } catch (cause) {
+        throw new WorkflowRequestNotSentError(
+          isCloudPublicConfigMissing(cause)
+            ? cause.message
+            : "Could not sign in to Launchpad Connect. Try again.",
+          { cause },
+        );
+      }
       if (!token || appAtomRegistry.get(workflowDraftAtom).accountId !== scope.accountId)
-        throw new Error("Sign in to Launchpad Connect to continue.");
+        throw new WorkflowRequestNotSentError("Sign in to Launchpad Connect to continue.");
       const result = await runtime.runPromiseExit(
         ManagedRelayTenancy.ManagedRelayTenancyClient.pipe(
           Effect.flatMap((client) => operation(client, token)),

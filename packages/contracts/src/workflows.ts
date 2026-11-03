@@ -169,6 +169,11 @@ export const WorkflowQueueReason = Schema.Struct({
     "issue_unavailable",
     "issue_context_invalid",
     "issue_context_too_large",
+    "vm_waiting_capacity",
+    "vm_limit_disabled",
+    "vm_waiting_codex",
+    "vm_codex_replaced",
+    "vm_target_changed",
   ]),
   retryAt: Schema.NullOr(Schema.Number),
 });
@@ -297,6 +302,9 @@ export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 export const RepositoryWorkflowJob = Schema.Struct({
   issueSnapshot: Schema.optional(WorkflowIssueSnapshot),
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
+  vmAdmission: Schema.optional(
+    Schema.Struct({ codexConnectionId: TrimmedNonEmptyString, hasSecrets: Schema.Boolean }),
+  ),
   /** Marked before sending: absent on legacy offers means delivery may already have happened. */
   startAttempted: Schema.optional(Schema.Boolean),
   offerAuthority: Schema.optional(
@@ -441,6 +449,8 @@ export const RunRepositoryWorkflow = Schema.Struct({
   workflowId: TrimmedNonEmptyString,
   expectedTargetKind: Schema.Literals(["machine", "vm"]),
   instruction: Instruction,
+  requestId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+  replayOnly: Schema.optional(Schema.Boolean),
 });
 export const RespondToWorkflowJob = Schema.Union([
   Schema.Struct({
@@ -484,6 +494,11 @@ export class WorkflowInvalidError extends Schema.TaggedError<WorkflowInvalidErro
   },
   { httpApiStatus: 400 },
 ) {}
+export class WorkflowSubmissionPendingError extends Schema.TaggedError<WorkflowSubmissionPendingError>()(
+  "WorkflowSubmissionPendingError",
+  { message: Schema.String },
+  { httpApiStatus: 409 },
+) {}
 
 export function isTerminalWorkflowJob(status: RepositoryWorkflowJob["status"]): boolean {
   return status === "done" || status === "cancelled" || status === "failed";
@@ -524,6 +539,7 @@ export type WorkflowVmModelCatalog = typeof WorkflowVmModelCatalog.Type;
 export const WorkflowCatalog = Schema.Struct({
   workflows: Schema.Array(RepositoryWorkflow),
   automationSupported: Schema.optional(Schema.Boolean),
+  vmExecutionAvailable: Schema.optional(Schema.Boolean),
   automationSummaries: Schema.optional(Schema.Array(WorkflowAutomationSummary)),
   vmAuthoring: Schema.optional(Schema.Struct({ models: Schema.NullOr(WorkflowVmModelCatalog) })),
 });

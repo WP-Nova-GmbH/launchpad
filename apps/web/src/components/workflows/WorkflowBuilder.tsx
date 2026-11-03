@@ -74,6 +74,7 @@ type WorkflowBuilderProps = {
   projects: ReadonlyArray<RelayOrganizationProject>;
   projectsUnavailable?: boolean | undefined;
   vmAuthoring?: WorkflowCatalog["vmAuthoring"];
+  vmExecutionAvailable?: boolean;
   codexRefreshVersion?: number;
   canConfigure: boolean;
   call: ReturnType<typeof useWorkflowClient>;
@@ -114,6 +115,7 @@ function WorkflowBuilderEditor({
   projects,
   projectsUnavailable,
   vmAuthoring,
+  vmExecutionAvailable = false,
   codexRefreshVersion = 0,
   canConfigure,
   call,
@@ -552,6 +554,11 @@ function WorkflowBuilderEditor({
     });
     return inserted ? stepId : null;
   };
+  const vmRunUnavailable = currentSaved?.definition.target.kind === "vm" && !vmExecutionAvailable;
+  const runDraft = state.runs[key];
+  const hasRunSubmission =
+    runDraft?.operation?.targetKind === "vm" ||
+    ((archived || vmRunUnavailable) && runDraft?.operation?.state === "uncertain");
   return (
     <WorkflowBuilderWorkspace
       automationSupported={automationSupported}
@@ -564,7 +571,9 @@ function WorkflowBuilderEditor({
       codexNotice={checkCodex ? codexNotice : null}
       pending={pending}
       archived={archived}
-      savedVm={currentSaved?.definition.target.kind === "vm"}
+      vmRunUnavailable={vmRunUnavailable}
+      hasRunSubmission={hasRunSubmission}
+      hasRunInstructions={!!runDraft?.instruction.trim()}
       reading={reading}
       notice={notice}
       issue={issue}
@@ -603,7 +612,9 @@ function WorkflowBuilderWorkspace({
   codexNotice,
   pending,
   archived,
-  savedVm,
+  vmRunUnavailable,
+  hasRunSubmission,
+  hasRunInstructions,
   reading,
   notice,
   issue,
@@ -627,7 +638,9 @@ function WorkflowBuilderWorkspace({
   codexNotice: string | null;
   pending: boolean;
   archived: boolean;
-  savedVm: boolean;
+  vmRunUnavailable: boolean;
+  hasRunSubmission: boolean;
+  hasRunInstructions: boolean;
   reading: boolean;
   notice: string | null;
   issue: ReturnType<typeof workflowDraftIssue>;
@@ -645,6 +658,10 @@ function WorkflowBuilderWorkspace({
   scope: WorkflowScope;
 }) {
   const navigate = useNavigate();
+  const runBlocked = archived || vmRunUnavailable;
+  const hasRetainedInstructions = runBlocked && hasRunInstructions;
+  const canOpenRun =
+    !!draft.baseline && (hasRunSubmission || hasRetainedInstructions || (!pending && !runBlocked));
   const vm = draft.definition.target.kind === "vm" ? draft.definition.target : null;
   const models = useWorkflowEditorModels(draft.definition, vmAuthoring?.models);
   const [settingsOpen, setSettingsOpen] = useState(!!vmAuthoring && !draft.targetConfirmed);
@@ -1173,10 +1190,10 @@ function WorkflowBuilderWorkspace({
           <Button
             type="button"
             variant="outline"
-            disabled={pending || !draft.baseline || archived || savedVm}
-            aria-describedby={savedVm ? "workflow-vm-run-unavailable" : undefined}
+            disabled={!canOpenRun}
+            aria-describedby={vmRunUnavailable ? "workflow-vm-run-unavailable" : undefined}
             onClick={() => {
-              if (!pending && draft.baseline && !archived && !savedVm)
+              if (canOpenRun)
                 void navigate({
                   to: "/workflows/$repositoryId/$workflowId/run",
                   params: { repositoryId: scope.repositoryId, workflowId: draft.workflowId },
@@ -1184,7 +1201,11 @@ function WorkflowBuilderWorkspace({
             }}
           >
             <PlayIcon />
-            Run
+            {hasRunSubmission
+              ? "View run submission"
+              : hasRetainedInstructions
+                ? "View retained instructions"
+                : "Run"}
           </Button>
           <Button type="submit" disabled={pending}>
             {draft.operation?.state === "uncertain" ? "Retry save" : "Save"}
@@ -1200,7 +1221,7 @@ function WorkflowBuilderWorkspace({
           </Button>
         </div>
       </div>
-      {savedVm ||
+      {vmRunUnavailable ||
       codexNotice ||
       draft.error ||
       draft.operation?.state === "uncertain" ||
@@ -1208,7 +1229,7 @@ function WorkflowBuilderWorkspace({
       issue ||
       models.issues.length ? (
         <div className={styles["workflow-editor-notices"]}>
-          {savedVm ? (
+          {vmRunUnavailable ? (
             <p id="workflow-vm-run-unavailable" className="text-sm text-muted-foreground">
               Running VM workflows is not available yet.
             </p>

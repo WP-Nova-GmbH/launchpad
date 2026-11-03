@@ -21,10 +21,14 @@ import {
   type WorkflowCatalog,
   type WorkflowDefinition,
   type RepositoryWorkflowJob,
+  type RunRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { randomUUID } from "../../lib/utils";
+
+export class WorkflowRequestNotSentError extends Error {}
+
 const workflowError = (cause: unknown) => {
   if (isRequestFailed(cause) && (isConflict(cause.cause) || isInvalid(cause.cause)))
     return cause.cause.message;
@@ -254,16 +258,29 @@ export async function saveWorkflowDraft(
 export async function runWorkflowDraft(
   scope: WorkflowScope,
   id: string,
-  start: (instruction: string) => Promise<RepositoryWorkflowJob>,
+  intent:
+    | { kind: "start"; targetKind: WorkflowTarget["kind"]; replaceUncertain?: boolean }
+    | { kind: "recover"; replayOnly: boolean },
+  start: (payload: typeof RunRepositoryWorkflow.Type) => Promise<RepositoryWorkflowJob>,
 ) {
   const key = workflowSessionKey(scope, id);
   const draft = appAtomRegistry.get(workflowDraftAtom).runs[key];
-  if (!draft?.instruction.trim() || draft.operation?.state === "pending") return null;
-  const operation = {
-    requestId: randomUUID(),
-    state: "pending" as const,
-    instruction: draft.instruction,
-  };
+  if (!draft || draft.operation?.state === "pending") return null;
+  const previous = draft.operation;
+  const previousVm = previous?.targetKind === "vm" ? previous : null;
+  let operation: NonNullable<typeof draft.operation>;
+  if (intent.kind === "recover") {
+    if (!previousVm) return null;
+    operation = { ...previousVm, state: "pending" };
+  } else {
+    if ((previousVm && !intent.replaceUncertain) || !draft.instruction.trim()) return null;
+    operation = {
+      requestId: randomUUID(),
+      state: "pending",
+      instruction: draft.instruction,
+      ...(intent.targetKind === "vm" ? { targetKind: "vm" } : {}),
+    };
+  }
   if (
     !updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
       ...state,
@@ -272,11 +289,17 @@ export async function runWorkflowDraft(
   )
     return null;
   try {
-    const job = await start(operation.instruction);
+    const job = await start({
+      workflowId: id,
+      instruction: operation.instruction,
+      expectedTargetKind: operation.targetKind ?? "machine",
+      ...(operation.targetKind === "vm" ? { requestId: operation.requestId } : {}),
+      ...(intent.kind === "recover" && intent.replayOnly ? { replayOnly: true } : {}),
+    });
     let applied = false;
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const current = state.runs[key];
-      if (current?.operation?.requestId !== operation.requestId) return state;
+      if (current?.operation !== operation) return state;
       applied = true;
       return {
         ...state,
@@ -294,16 +317,20 @@ export async function runWorkflowDraft(
     });
     return applied ? job : null;
   } catch (cause) {
+    const rejected =
+      intent.kind === "start" &&
+      (cause instanceof WorkflowRequestNotSentError || definitiveRejection(cause));
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const current = state.runs[key];
-      if (current?.operation?.requestId !== operation.requestId) return state;
+      if (current?.operation !== operation) return state;
       return {
         ...state,
         runs: {
           ...state.runs,
           [key]: {
             ...current,
-            operation: definitiveRejection(cause) ? null : { ...operation, state: "uncertain" },
+            operation: rejected ? previous : { ...operation, state: "uncertain" },
+            startedJobId: rejected ? draft.startedJobId : current.startedJobId,
             error: workflowError(cause),
           },
         },

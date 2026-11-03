@@ -1,4 +1,5 @@
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { DEFAULT_WORKFLOW_VM_LIMIT } from "@t3tools/contracts/relay";
 import {
   WorkflowInvalidError,
   WorkflowConflictError,
@@ -18,7 +19,7 @@ import { Machines, type MachineRecord } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Repositories, RepositoryPersistenceError } from "../tenancy/Repositories.ts";
-import { Workflows, type WorkflowJobRecord } from "./Workflows.ts";
+import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "./Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "./WorkflowDispatcher.ts";
 
 const NOW = "2026-10-08T12:00:00.000Z";
@@ -119,8 +120,14 @@ const missing: WorkflowControlResult = {
 
 const harness = Effect.gen(function* () {
   const row = yield* Ref.make(initial);
-  const definition = yield* Ref.make(workflow);
+  const definition = yield* Ref.make<RepositoryWorkflow>(workflow);
   const target = yield* Ref.make<MachineRecord | null>(machine);
+  const codex = yield* Ref.make<{
+    connectionId: string;
+    status: "connected" | "disconnected" | "reconnect_required";
+  } | null>(null);
+  const workflowVmLimit = yield* Ref.make<number>(DEFAULT_WORKFLOW_VM_LIMIT);
+  const repositoryAvailable = yield* Ref.make(true);
   const mode = yield* Ref.make<
     | "online"
     | "offline"
@@ -173,6 +180,8 @@ const harness = Effect.gen(function* () {
     Layer.mock(Workflows)({
       get: () => Ref.get(definition),
       getJob: () => Ref.get(row),
+      getWorkflowVmCodexConnection: () => Ref.get(codex),
+      getWorkflowVmLimit: () => Ref.get(workflowVmLimit),
       claim: () =>
         Ref.modify(row, (value) =>
           value.leaseUntil
@@ -183,6 +192,18 @@ const harness = Effect.gen(function* () {
               ],
         ),
       updateJob,
+      settleQueuedVmCancellation: (previous, expectedLease) =>
+        Effect.gen(function* () {
+          if (yield* Ref.get(permissionOutage))
+            return yield* new WorkflowPersistenceError({ cause: "Permission store unavailable" });
+          return yield* updateJob(
+            previous,
+            { ...previous.record, status: "cancelled", queueReason: null },
+            null,
+            false,
+            expectedLease,
+          );
+        }),
       bindManualOffer: (previous, record, expectedLease) =>
         updateJob(previous, record, previous.pendingControl, false, expectedLease),
       release: (_id, leaseUntil) =>
@@ -206,13 +227,19 @@ const harness = Effect.gen(function* () {
           ),
         ),
       getById: () =>
-        Effect.succeed({
-          repositoryId: "repo-1",
-          organizationId: "org-1",
-          name: "Repo",
-          canonicalKeys: ["github.com/acme/repo"],
-          createdAt: NOW,
-        }),
+        Ref.get(repositoryAvailable).pipe(
+          Effect.map((available) =>
+            available
+              ? {
+                  repositoryId: "repo-1",
+                  organizationId: "org-1",
+                  name: "Repo",
+                  canonicalKeys: ["github.com/acme/repo"],
+                  createdAt: NOW,
+                }
+              : null,
+          ),
+        ),
     }),
     Layer.mock(OrganizationProjectCatalog)({
       listForOrganization: () =>
@@ -414,6 +441,9 @@ const harness = Effect.gen(function* () {
     row,
     reply,
     definition,
+    codex,
+    workflowVmLimit,
+    repositoryAvailable,
     target,
     mode,
     offers,
@@ -426,6 +456,139 @@ const harness = Effect.gen(function* () {
     ),
   };
 });
+
+const vmWorkflow: RepositoryWorkflow = {
+  ...workflow,
+  definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+};
+const vmAdmission = { codexConnectionId: "original-connection", hasSecrets: false };
+
+it.effect("keeps a queued VM admission bound to its original target kind and Codex identity", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.set(h.definition, vmWorkflow);
+    yield* Ref.update(h.row, (row) => ({ ...row, record: { ...row.record, vmAdmission } }));
+    yield* Ref.set(h.codex, {
+      connectionId: vmAdmission.codexConnectionId,
+      status: "disconnected" as const,
+    });
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_waiting_codex");
+
+    yield* Ref.set(h.codex, {
+      connectionId: vmAdmission.codexConnectionId,
+      status: "connected" as const,
+    });
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_waiting_capacity");
+    const revision = (yield* Ref.get(h.row)).revision;
+    yield* h.refresh;
+    assert.equal((yield* Ref.get(h.row)).revision, revision);
+
+    yield* Ref.set(h.definition, { ...workflow, revision: 2 });
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_target_changed");
+    yield* Ref.set(h.definition, { ...vmWorkflow, revision: 3 });
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_waiting_capacity");
+
+    yield* Ref.set(h.codex, {
+      connectionId: "replacement-connection",
+      status: "connected" as const,
+    });
+    const blocked = yield* h.refresh;
+    assert.equal(blocked?.queueReason?.code, "vm_codex_replaced");
+    assert.deepStrictEqual(blocked?.vmAdmission, vmAdmission);
+    assert.isNull(blocked?.runtime);
+    assert.isNull(blocked?.workflow);
+
+    yield* Ref.set(h.repositoryAvailable, false);
+    assert.equal((yield* h.refresh)?.queueReason?.code, "workflow_unavailable");
+    assert.lengthOf(yield* Ref.get(h.controls), 0);
+  }),
+);
+
+it.effect("shows a disabled VM limit until an organization admin raises it", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.set(h.definition, vmWorkflow);
+    yield* Ref.update(h.row, (row) => ({ ...row, record: { ...row.record, vmAdmission } }));
+    yield* Ref.set(h.workflowVmLimit, 0);
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_waiting_codex");
+
+    yield* Ref.set(h.codex, {
+      connectionId: vmAdmission.codexConnectionId,
+      status: "connected" as const,
+    });
+    const disabled = yield* h.refresh;
+    assert.equal(disabled?.status, "queued");
+    assert.equal(disabled?.queueReason?.code, "vm_limit_disabled");
+    assert.include(disabled?.detail ?? "", "Workflow VMs limit");
+
+    yield* Ref.set(h.definition, workflow);
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_target_changed");
+    yield* Ref.set(h.definition, vmWorkflow);
+    assert.equal((yield* h.refresh)?.queueReason?.code, "vm_limit_disabled");
+
+    yield* Ref.set(h.workflowVmLimit, 1);
+    const waiting = yield* h.refresh;
+    assert.equal(waiting?.status, "queued");
+    assert.equal(waiting?.queueReason?.code, "vm_waiting_capacity");
+    assert.lengthOf(yield* Ref.get(h.controls), 0);
+  }),
+);
+
+for (const prepared of [false, true])
+  it.effect(
+    `keeps cancellation local only before VM preparation (${prepared ? "prepared" : "unprepared"})`,
+    () =>
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const pendingControl = {
+          userId: "user-1",
+          response: { operation: "cancel" as const },
+        };
+        yield* Ref.update(h.row, (row): WorkflowJobRecord => ({
+          ...row,
+          status: "cancelling",
+          pendingControl,
+          record: {
+            ...row.record,
+            vmAdmission,
+            status: "cancelling",
+            queueReason: { code: "vm_target_changed", retryAt: null },
+            ...(prepared
+              ? {
+                  runtime: { kind: "vm" as const, threadId: ThreadId.make("vm-thread") },
+                  workflow: vmWorkflow,
+                }
+              : {}),
+          },
+        }));
+        const result = yield* h.refresh;
+        assert.equal(result?.status, prepared ? "cancelling" : "cancelled");
+        const row = yield* Ref.get(h.row);
+        assert.deepStrictEqual(row.pendingControl, prepared ? pendingControl : null);
+        if (!prepared) assert.isNull(result?.queueReason);
+        assert.lengthOf(yield* Ref.get(h.controls), 0);
+      }),
+  );
+
+it.effect("retries pending queued VM cancellation after a storage outage", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.update(h.row, (row): WorkflowJobRecord => ({
+      ...row,
+      status: "cancelling",
+      pendingControl: { userId: "user-1", response: { operation: "cancel" } },
+      record: { ...row.record, vmAdmission, status: "cancelling" },
+    }));
+    yield* Ref.set(h.permissionOutage, true);
+    assert.equal((yield* h.refresh)?.status, "cancelling");
+    assert.isNotNull((yield* Ref.get(h.row)).pendingControl);
+
+    yield* Ref.set(h.permissionOutage, false);
+    assert.equal((yield* h.refresh)?.status, "cancelled");
+    assert.isNull((yield* Ref.get(h.row)).pendingControl);
+    assert.lengthOf(yield* Ref.get(h.controls), 0);
+  }),
+);
 
 for (const operation of ["retry_preparation", "retry_cancellation"] as const)
   it.effect(`redelivers a pending ${operation} with its original observed revision`, () =>

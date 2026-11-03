@@ -940,8 +940,59 @@ describe("VM authoring", () => {
     );
   });
 
-  it("keeps the saved VM Run gate when the draft switches to a machine", async () => {
-    const definition = newWorkflowDraft([], "review", true)!.definition;
+  it.each([false, true])(
+    "uses saved VM Run availability %s when the draft switches to a machine",
+    async (vmExecutionAvailable) => {
+      const definition = newWorkflowDraft([], "review", true)!.definition;
+      const workflow: RepositoryWorkflow = {
+        workflowId: "saved-vm",
+        repositoryId: scope.repositoryId,
+        organizationId: scope.organizationId,
+        revision: 1,
+        createdAt: "now",
+        updatedAt: "now",
+        definition,
+        archived: false,
+      };
+      read.mockRejectedValueOnce(new Error("status unavailable"));
+      await mount({
+        ...base,
+        workflow,
+        isNew: false,
+        vmAuthoring: { models: null },
+        vmExecutionAvailable,
+      });
+      expect(JSON.stringify(renderer!.toJSON())).toContain(
+        "Could not check the organization's Codex connection.",
+      );
+      await act(() =>
+        renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+      );
+      await act(() =>
+        renderer!.root.findByProps({ "data-workflow-select": true }).props.onValueChange("machine"),
+      );
+      expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
+      const run = renderer!.root
+        .findAllByType("button")
+        .find((node) => node.props.children?.[1] === "Run")!;
+      expect(run.props.disabled).toBe(!vmExecutionAvailable);
+      await act(() => run.props.onClick());
+      if (vmExecutionAvailable)
+        expect(navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/workflows/$repositoryId/$workflowId/run",
+          params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+        });
+      else expect(navigate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["gated", "View retained instructions"],
+    ["archived", "View retained instructions"],
+    ["gated", "View run submission"],
+    ["archived", "View run submission"],
+  ] as const)("opens %s editor Run details via %s", async (condition, label) => {
+    const uncertainMachine = label === "View run submission";
     const workflow: RepositoryWorkflow = {
       workflowId: "saved-vm",
       repositoryId: scope.repositoryId,
@@ -949,27 +1000,45 @@ describe("VM authoring", () => {
       revision: 1,
       createdAt: "now",
       updatedAt: "now",
-      definition,
-      archived: false,
+      definition:
+        uncertainMachine && condition === "archived"
+          ? newWorkflowDraft([project])!.definition
+          : newWorkflowDraft([], "review", true)!.definition,
+      archived: condition === "archived",
     };
-    read.mockRejectedValueOnce(new Error("status unavailable"));
-    await mount({ ...base, workflow, isNew: false, vmAuthoring: { models: null } });
-    expect(JSON.stringify(renderer!.toJSON())).toContain(
-      "Could not check the organization's Codex connection.",
-    );
+    read.mockResolvedValueOnce({ status: "connected" });
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      vmAuthoring: { models: null },
+      vmExecutionAvailable: condition !== "gated",
+    });
     await act(() =>
-      renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        runs: {
+          ...state.runs,
+          [workflowSessionKey(scope, workflow.workflowId)]: {
+            instruction: uncertainMachine ? "" : "New instructions",
+            operation: uncertainMachine
+              ? { requestId: "submitted", instruction: "Task", state: "uncertain" }
+              : null,
+            startedJobId: uncertainMachine ? null : "existing-run",
+            error: null,
+          },
+        },
+      })),
     );
-    await act(() =>
-      renderer!.root.findByProps({ "data-workflow-select": true }).props.onValueChange("machine"),
-    );
-    expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
     const run = renderer!.root
       .findAllByType("button")
-      .find((node) => node.props.children?.[1] === "Run")!;
-    expect(run.props.disabled).toBe(true);
+      .find((node) => node.props.children?.[1] === label)!;
+    expect(run.props.disabled).toBe(false);
     await act(() => run.props.onClick());
-    expect(navigate).not.toHaveBeenCalled();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({
+      to: "/workflows/$repositoryId/$workflowId/run",
+      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+    });
   });
 
   it("saves Off and VM together after an explicit Off action, keeping the trigger", async () => {

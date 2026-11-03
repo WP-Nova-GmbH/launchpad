@@ -17,6 +17,7 @@ import { queueReasonText } from "../workflowSources/IssueContext.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
+import { Repositories } from "../tenancy/Repositories.ts";
 import { Workflows, type WorkflowJobRecord, type WorkflowDispatchScope } from "./Workflows.ts";
 import { validateWorkflowTarget, vmWorkflowExecutionUnavailable } from "./WorkflowTarget.ts";
 export { validateWorkflowTarget } from "./WorkflowTarget.ts";
@@ -26,6 +27,51 @@ const decodeOrigin = Schema.decodeUnknownEffect(WorkflowOrigin);
 const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 const isWorkflowQueued = Schema.is(WorkflowQueued);
+
+const canDeliverControl = Effect.fnUntraced(function* (
+  row: WorkflowJobRecord,
+  userId: string,
+  allowRepositoryMember: boolean,
+) {
+  const membership = yield* (yield* Organizations).getMembershipForUser({ userId });
+  if (membership?.organization.organizationId !== row.organizationId) return false;
+  const scope = { membership, repositoryId: row.repositoryId };
+  const authorization = allowRepositoryMember
+    ? requireVisibleRepository(scope).pipe(Effect.asVoid)
+    : requireMaintainableRepository(scope).pipe(Effect.asVoid);
+  return yield* authorization.pipe(
+    Effect.as(true),
+    Effect.catchTags({
+      RelayTenancyForbiddenError: () => Effect.succeed(false),
+      RelayTenancyNotFoundError: () => Effect.succeed(false),
+    }),
+  );
+});
+
+const queuedWorkflowVmReason = Effect.fnUntraced(function* (
+  row: WorkflowJobRecord,
+  codexConnectionId: string,
+) {
+  const store = yield* Workflows;
+  const workflow = yield* store.get(row.record.workflowId);
+  if (
+    !workflow ||
+    workflow.archived ||
+    workflow.repositoryId !== row.repositoryId ||
+    workflow.organizationId !== row.organizationId
+  )
+    return "workflow_unavailable" as const;
+  const repository = yield* (yield* Repositories).getById({ repositoryId: row.repositoryId });
+  if (repository?.organizationId !== row.organizationId) return "workflow_unavailable" as const;
+  if (workflow.definition.target.kind !== "vm") return "vm_target_changed" as const;
+  const connection = yield* store.getWorkflowVmCodexConnection(row.organizationId);
+  if (connection && connection.connectionId !== codexConnectionId)
+    return "vm_codex_replaced" as const;
+  if (connection?.status !== "connected") return "vm_waiting_codex" as const;
+  if ((yield* store.getWorkflowVmLimit(row.organizationId)) === 0)
+    return "vm_limit_disabled" as const;
+  return "vm_waiting_capacity" as const;
+});
 
 export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(function* (
   jobId: string,
@@ -44,10 +90,31 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     yield* store.release(jobId, leaseUntil);
     return row.record;
   }
-  const connector = yield* EnvironmentConnector;
   const refresh = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     let job = row!.record;
+    if (job.vmAdmission) {
+      // Only an unprepared VM run can settle locally. Never dispatch a VM admission to a Machine.
+      if (job.workflow !== null || job.runtime !== null) return job;
+      if (row!.pendingControl?.response.operation === "cancel")
+        return (yield* store.settleQueuedVmCancellation(row!, leaseUntil)).record;
+      if (job.status !== "queued") return job;
+      const code = yield* queuedWorkflowVmReason(row!, job.vmAdmission.codexConnectionId);
+      const detail = queueReasonText[code];
+      if (
+        job.queueReason?.code === code &&
+        job.queueReason.retryAt === null &&
+        job.detail === detail
+      )
+        return job;
+      return (yield* update(row!, {
+        ...job,
+        queueReason: { code, retryAt: null },
+        detail,
+        updatedAt: now,
+      })).record;
+    }
+    const connector = yield* EnvironmentConnector;
     const origin = yield* decodeOrigin(
       job.origin ??
         (row!.submitterUserId ? { kind: "manual", userId: row!.submitterUserId } : undefined),
@@ -184,34 +251,18 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     if (row!.pendingControl) {
       // A saved response is only deliverable while its author still has the checkpoint's role.
       const pending = row!.pendingControl;
-      const membership = yield* (yield* Organizations).getMembershipForUser({
-        userId: pending.userId,
-      });
       const response = pending.response;
       const checkpointResponse =
         response.operation === "approve" ||
         response.operation === "input" ||
         response.operation === "request_changes";
-      const authorized =
-        membership && membership.organization.organizationId === row!.organizationId
-          ? yield* (
-              checkpointResponse && job.progress?.checkpoint?.role === "member"
-                ? requireVisibleRepository({ membership, repositoryId: job.repositoryId }).pipe(
-                    Effect.asVoid,
-                  )
-                : requireMaintainableRepository({
-                    membership,
-                    repositoryId: job.repositoryId,
-                  }).pipe(Effect.asVoid)
-            ).pipe(
-              Effect.as(true),
-              Effect.catchTags({
-                RelayTenancyForbiddenError: () => Effect.succeed(false),
-                RelayTenancyNotFoundError: () => Effect.succeed(false),
-              }),
-            )
-          : false;
-      if (!authorized) {
+      if (
+        !(yield* canDeliverControl(
+          row!,
+          pending.userId,
+          checkpointResponse && job.progress?.checkpoint?.role === "member",
+        ))
+      ) {
         row = yield* update(
           row!,
           {
@@ -493,6 +544,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           latest.leaseUntil !== leaseUntil
         )
           return latest?.record ?? null;
+        if (latest.record.vmAdmission) return latest.record;
         if (latest.record.origin?.kind === "automation" && latest.record.workflow === null) {
           const reason = isWorkflowQueued(error)
             ? error

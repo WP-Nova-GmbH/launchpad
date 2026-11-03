@@ -1,5 +1,5 @@
 import type { RelayRepositoryRole } from "@t3tools/contracts/relay";
-import { and, asc, eq, inArray, sql as drizzleSql } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -418,37 +418,46 @@ export const make = Effect.gen(function* () {
 
     addAlias: Effect.fn("relay.repositories.add_alias")(function* (input) {
       yield* Effect.annotateCurrentSpan({ "relay.repository_id": input.repositoryId });
-      yield* insertAlias({ ...input, operation: "add-alias" });
+      const sql = db.$client;
+      const failure = (cause: unknown) =>
+        new RepositoryPersistenceError({
+          operation: "add-alias",
+          repositoryId: input.repositoryId,
+          organizationId: input.organizationId,
+          cause,
+        });
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            // Workflow admission holds this row while it verifies the repository's eligible aliases.
+            const [repository] = yield* sql`SELECT repository_id FROM relay_repositories
+              WHERE repository_id=${input.repositoryId} AND organization_id=${input.organizationId}
+              FOR NO KEY UPDATE`;
+            if (!repository) return yield* failure("Repository is unavailable");
+            yield* insertAlias({ ...input, operation: "add-alias" });
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", failure));
     }),
 
     removeAlias: Effect.fn("relay.repositories.remove_alias")(function* (input) {
       yield* Effect.annotateCurrentSpan({ "relay.repository_id": input.repositoryId });
-      const counted = yield* db
-        .select({ total: drizzleSql<number>`count(*)::int` })
-        .from(relayRepositoryAliases)
-        .where(eq(relayRepositoryAliases.repositoryId, input.repositoryId))
-        .pipe(
-          Effect.mapError(
-            (cause) =>
-              new RepositoryPersistenceError({
-                operation: "remove-alias",
-                repositoryId: input.repositoryId,
-                cause,
-              }),
-          ),
-        );
-      if ((counted[0]?.total ?? 0) <= 1) {
-        return "last-alias" as const;
-      }
-      const rows = yield* db
-        .delete(relayRepositoryAliases)
-        .where(
-          and(
-            eq(relayRepositoryAliases.repositoryId, input.repositoryId),
-            eq(relayRepositoryAliases.canonicalKey, input.canonicalKey),
-          ),
+      const sql = db.$client;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const [repository] = yield* sql`SELECT repository_id FROM relay_repositories
+              WHERE repository_id=${input.repositoryId} FOR NO KEY UPDATE`;
+            if (!repository) return "not-found" as const;
+            const [counted] = yield* sql<{ total: number }>`SELECT count(*)::int AS total
+              FROM relay_repository_aliases WHERE repository_id=${input.repositoryId}`;
+            if ((counted?.total ?? 0) <= 1) return "last-alias" as const;
+            const rows = yield* sql`DELETE FROM relay_repository_aliases
+              WHERE repository_id=${input.repositoryId} AND canonical_key=${input.canonicalKey}
+              RETURNING canonical_key`;
+            return rows.length > 0 ? ("removed" as const) : ("not-found" as const);
+          }),
         )
-        .returning({ canonicalKey: relayRepositoryAliases.canonicalKey })
         .pipe(
           Effect.mapError(
             (cause) =>
@@ -459,7 +468,6 @@ export const make = Effect.gen(function* () {
               }),
           ),
         );
-      return rows.length > 0 ? ("removed" as const) : ("not-found" as const);
     }),
 
     listAccess: Effect.fn("relay.repositories.list_access")(function* (input) {

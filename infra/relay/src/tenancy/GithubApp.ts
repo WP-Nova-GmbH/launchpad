@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import type { RelayThreadVmGitMetadata } from "@t3tools/contracts/relay";
@@ -52,6 +53,8 @@ export class GithubRequestFailed extends Schema.TaggedError<GithubRequestFailed>
       "read-installation",
       "mint-token",
       "list-repositories",
+      "read-repository",
+      "read-branch",
     ]),
     status: Schema.optionalKey(Schema.Number),
     cause: Schema.Defect(),
@@ -90,7 +93,16 @@ export class GithubApp extends Context.Service<
     readonly mintRepositoryToken: (input: {
       readonly installationId: string;
       readonly canonicalKey: string;
+      readonly access?: "read";
     }) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
+    readonly resolveRepositoryBranch: (input: {
+      readonly installationId: string;
+      readonly canonicalKey: string;
+      readonly baseBranch: string | null;
+    }) => Effect.Effect<
+      { readonly branch: string; readonly commitSha: string },
+      GithubAppNotConfigured | GithubRequestFailed
+    >;
     /** Public bot authorship only; unavailable metadata never prevents importing a repository. */
     readonly gitMetadata: Effect.Effect<RelayThreadVmGitMetadata>;
     /** Every account the App is installed on, as GitHub reports it. */
@@ -139,6 +151,20 @@ const decodeRepositoryToken = Schema.decodeUnknownEffect(
     token: Schema.String.check(Schema.isMinLength(1)),
     expires_at: Schema.String,
     repositories: Schema.Array(Schema.Struct({ full_name: Schema.String })),
+    permissions: Schema.optionalKey(Schema.Unknown),
+  }),
+);
+const isPermissions = Schema.is(Schema.Record(Schema.String, Schema.String));
+const decodeDefaultBranch = Schema.decodeUnknownEffect(
+  Schema.Struct({ default_branch: Schema.String.check(Schema.isMinLength(1)) }),
+);
+const decodeBranchRef = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    ref: Schema.String,
+    object: Schema.Struct({
+      type: Schema.Literal("commit"),
+      sha: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)),
+    }),
   }),
 );
 const decodeApp = Schema.decodeUnknownEffect(
@@ -293,7 +319,11 @@ export const make = () => {
       readonly method?: "GET" | "POST";
       readonly token?: string;
       readonly operation: GithubRequestFailed["operation"];
-      readonly body?: { readonly repositories: ReadonlyArray<string> };
+      readonly body?: {
+        readonly repositories: ReadonlyArray<string>;
+        readonly permissions?: { readonly contents: "read" };
+      };
+      readonly rejectRedirects?: boolean;
     }) {
       let httpRequest = (input.method === "POST" ? HttpClientRequest.post : HttpClientRequest.get)(
         `${GITHUB_API}${input.path}`,
@@ -316,14 +346,21 @@ export const make = () => {
           ),
         );
       }
-      const response = yield* httpClient
-        .execute(httpRequest)
-        .pipe(
-          Effect.mapError(
-            (cause) => new GithubRequestFailed({ operation: input.operation, cause }),
-          ),
-        );
-      if (response.status >= 400) {
+      const execute = httpClient.execute(httpRequest);
+      const response = yield* (
+        input.rejectRedirects
+          ? execute.pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }))
+          : execute
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GithubRequestFailed({
+              operation: input.operation,
+              cause: input.rejectRedirects ? "Could not reach GitHub" : cause,
+            }),
+        ),
+      );
+      if (response.status >= 400 || (input.rejectRedirects && response.status >= 300)) {
         return yield* new GithubRequestFailed({
           operation: input.operation,
           status: response.status,
@@ -336,7 +373,7 @@ export const make = () => {
             new GithubRequestFailed({
               operation: input.operation,
               status: response.status,
-              cause,
+              cause: input.rejectRedirects ? "Invalid GitHub response" : cause,
             }),
         ),
       );
@@ -461,7 +498,7 @@ export const make = () => {
       return metadata;
     });
 
-    return GithubApp.of({
+    const github: GithubApp["Service"] = GithubApp.of({
       gitMetadata,
       installUrl: credentials.pipe(
         Effect.map((app) => `https://github.com/apps/${app.appSlug}/installations/new`),
@@ -535,7 +572,11 @@ export const make = () => {
           method: "POST",
           token: jwt,
           operation: "mint-token",
-          body: { repositories: [repository] },
+          body: {
+            repositories: [repository],
+            ...(input.access === "read" ? { permissions: { contents: "read" } } : {}),
+          },
+          rejectRedirects: input.access === "read",
         });
         if ((yield* credentials).appId !== app.appId) {
           return yield* new GithubRequestFailed({
@@ -558,6 +599,13 @@ export const make = () => {
           parsed.repositories.length !== 1 ||
           `github.com/${parsed.repositories[0]?.full_name}`.toLowerCase() !==
             input.canonicalKey.toLowerCase() ||
+          (input.access === "read" &&
+            (!isPermissions(parsed.permissions) ||
+              parsed.permissions.contents !== "read" ||
+              Object.entries(parsed.permissions).some(
+                ([permission, level]) =>
+                  (permission !== "contents" && permission !== "metadata") || level !== "read",
+              ))) ||
           !Number.isFinite(Date.parse(parsed.expires_at)) ||
           Date.parse(parsed.expires_at) <= (yield* DateTime.now).epochMilliseconds
         ) {
@@ -568,6 +616,58 @@ export const make = () => {
         }
         return { token: parsed.token, expiresAt: parsed.expires_at };
       }),
+
+      resolveRepositoryBranch: Effect.fn("relay.github.resolve_repository_branch")(
+        function* (input) {
+          const { token } = yield* github.mintRepositoryToken({ ...input, access: "read" });
+          const repositoryPath = `/repos/${input.canonicalKey.slice("github.com/".length)}`;
+          const branch =
+            input.baseBranch ??
+            (yield* request({
+              path: repositoryPath,
+              token,
+              operation: "read-repository",
+              rejectRedirects: true,
+            }).pipe(
+              Effect.flatMap(decodeDefaultBranch),
+              Effect.catchTag(
+                "SchemaError",
+                () =>
+                  new GithubRequestFailed({
+                    operation: "read-repository",
+                    cause: "GitHub returned no default branch",
+                  }),
+              ),
+            )).default_branch;
+          const branchPath = yield* Effect.try({
+            try: () => branch.split("/").map(encodeURIComponent).join("/"),
+            catch: () =>
+              new GithubRequestFailed({ operation: "read-branch", cause: "Invalid branch name" }),
+          });
+          const resolved = yield* request({
+            path: `${repositoryPath}/git/ref/heads/${branchPath}`,
+            token,
+            operation: "read-branch",
+            rejectRedirects: true,
+          }).pipe(
+            Effect.flatMap(decodeBranchRef),
+            Effect.catchTag(
+              "SchemaError",
+              () =>
+                new GithubRequestFailed({
+                  operation: "read-branch",
+                  cause: "Invalid GitHub branch reference",
+                }),
+            ),
+          );
+          if (resolved.ref !== `refs/heads/${branch}`)
+            return yield* new GithubRequestFailed({
+              operation: "read-branch",
+              cause: "GitHub returned a different branch reference",
+            });
+          return { branch, commitSha: resolved.object.sha };
+        },
+      ),
 
       listInstallations: Effect.gen(function* () {
         const app = yield* credentials;
@@ -648,6 +748,7 @@ export const make = () => {
         return collected;
       }),
     });
+    return github;
   });
 };
 

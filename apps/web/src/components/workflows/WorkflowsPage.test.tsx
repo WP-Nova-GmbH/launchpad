@@ -47,6 +47,7 @@ const fixture = vi.hoisted(() => ({
   workflowId: undefined as string | undefined,
   supported: false,
   vmAuthoring: undefined as WorkflowCatalog["vmAuthoring"],
+  vmExecutionAvailable: false,
   projectsUnavailable: false,
   projects: [] as ReadonlyArray<RelayOrganizationProject>,
   repositoryError: null as string | null,
@@ -72,7 +73,10 @@ vi.mock("@tanstack/react-router", () => ({
   useParams: () => ({ repositoryId: "repository", workflowId: fixture.workflowId }),
   useSearch: () => ({ tab: fixture.tab }),
 }));
-vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => true }));
+vi.mock(import("../../cloud/publicConfig"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  hasCloudPublicConfig: () => true,
+}));
 vi.mock("../../cloud/managedRelayState", () => ({
   useManagedRelayOrganizationCatalog: () => {
     const [, refreshSnapshot] = useState(0);
@@ -194,6 +198,7 @@ const client = {
         return {
           workflows,
           vmAuthoring: fixture.vmAuthoring,
+          vmExecutionAvailable: fixture.vmExecutionAvailable,
           ...(fixture.supported
             ? {
                 automationSupported: true,
@@ -322,6 +327,7 @@ beforeEach(() => {
   fixture.workflowId = undefined;
   fixture.supported = false;
   fixture.vmAuthoring = undefined;
+  fixture.vmExecutionAvailable = false;
   fixture.projectsUnavailable = false;
   fixture.projects = [];
   fixture.repositoryError = null;
@@ -551,6 +557,123 @@ async function mountVmEditor(saved = vmWorkflow) {
     await Promise.all(deliveries);
   });
 }
+
+it.effect("keeps the Run draft reachable after VM receipt recovery while gated and archived", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.definitions.mockResolvedValue([vmWorkflow]);
+      await mountCatalog();
+      expect(content()).toContain("VM execution unavailable");
+      expect(button("Run")).toBeUndefined();
+
+      fixture.vmExecutionAvailable = true;
+      await press("Refresh");
+      await press("Run");
+      const route = {
+        to: "/workflows/$repositoryId/$workflowId/run",
+        params: { repositoryId, workflowId: vmWorkflow.workflowId },
+      };
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [workflowSessionKey(scope, vmWorkflow.workflowId)]: {
+              instruction: "Task",
+              operation: {
+                requestId: "submitted",
+                instruction: "Task",
+                targetKind: "vm",
+                state: "uncertain",
+              },
+              startedJobId: null,
+              error: null,
+            },
+          },
+        })),
+      );
+      fixture.vmExecutionAvailable = false;
+      await press("Refresh");
+      expect(button("Run")).toBeUndefined();
+      await press("View run submission");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [workflowSessionKey(scope, vmWorkflow.workflowId)]: {
+              instruction: "New instructions",
+              operation: null,
+              startedJobId: "existing-run",
+              error: null,
+            },
+          },
+        })),
+      );
+      expect(button("View run submission")).toBeUndefined();
+      await press("View retained instructions");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      fixture.definitions.mockResolvedValue([{ ...vmWorkflow, revision: 2, archived: true }]);
+      fixture.vmExecutionAvailable = true;
+      await press("Refresh");
+      expect(button("Run")).toBeUndefined();
+      await press("View retained instructions");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+    });
+  }),
+);
+
+it.effect("reopens an uncertain Machine submission with no text after a VM switch or archive", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.definitions.mockResolvedValue([workflow]);
+      await mountCatalog();
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [workflowSessionKey(scope, workflow.workflowId)]: {
+              instruction: "",
+              operation: { requestId: "submitted", instruction: "Task", state: "uncertain" },
+              startedJobId: null,
+              error: null,
+            },
+          },
+        })),
+      );
+      const route = {
+        to: "/workflows/$repositoryId/$workflowId/run",
+        params: { repositoryId, workflowId: workflow.workflowId },
+      };
+      fixture.definitions.mockResolvedValue([
+        { ...workflow, definition: vmWorkflow.definition, revision: 2 },
+      ]);
+      await press("Refresh");
+      expect(button("Run")).toBeUndefined();
+      await press("View run submission");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      fixture.definitions.mockResolvedValue([{ ...workflow, revision: 3, archived: true }]);
+      await press("Refresh");
+      expect(button("Run")).toBeUndefined();
+      await press("View run submission");
+      expect(fixture.navigate).toHaveBeenCalledTimes(2);
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+    });
+  }),
+);
 
 it.effect("uses catalog Refresh to recover Machine choices and reload workflow definitions", () =>
   Effect.gen(function* () {

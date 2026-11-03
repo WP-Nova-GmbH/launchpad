@@ -1035,3 +1035,35 @@ it.effect("reads verified VM model choices from the repository workflow catalog"
     expect(yield* client.readWorkflowCatalog(input)).toEqual(catalog);
   }).pipe(Effect.provide(testLayer(async () => Response.json(catalog))));
 });
+
+it.effect("preserves a pending VM submission receipt response and its message", () => {
+  const payload = {
+    workflowId: "workflow",
+    expectedTargetKind: "vm",
+    instruction: "Prepare the release",
+    requestId: "original-request",
+    replayOnly: true,
+  } as const;
+  const message = "This submission has no receipt yet. Check again shortly.";
+  const fetchFn = (async (input, init) => {
+    const request = new Request(input, init);
+    expect(new URL(request.url).pathname).toBe("/v1/repositories/repo/workflow-jobs");
+    expect(await request.json()).toEqual(payload);
+    return Response.json({ _tag: "WorkflowSubmissionPendingError", message }, { status: 409 });
+  }) satisfies typeof globalThis.fetch;
+  return Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancyClient;
+    const error = yield* client
+      .runWorkflow({
+        clerkToken: "token",
+        repositoryId: RelayRepositoryId.make("repo"),
+        payload,
+      })
+      .pipe(Effect.flip);
+    expect(error).toMatchObject({
+      _tag: "ManagedRelayRequestFailedError",
+      cause: { _tag: "WorkflowSubmissionPendingError", message },
+    });
+    expect(error.message).toBe(message);
+  }).pipe(Effect.provide(testLayer(fetchFn)));
+});

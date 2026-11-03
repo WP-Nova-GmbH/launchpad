@@ -183,6 +183,32 @@ const call = Effect.fnUntraced(function* (
   };
 });
 
+const callAlias = Effect.fnUntraced(function* (
+  http: Effect.Success<ReturnType<typeof buildHttp>>,
+  repositoryId: string,
+  userId: string,
+  canonicalKey: string,
+  operation: "add" | "remove",
+) {
+  const path = `/v1/repositories/${repositoryId}/aliases${operation === "remove" ? "/remove" : ""}`;
+  const response = yield* http.pipe(
+    Effect.provideService(
+      HttpServerRequest.HttpServerRequest,
+      HttpServerRequest.fromWeb(
+        new Request(`https://relay.test${path}`, {
+          method: "POST",
+          headers: { authorization: "Bearer " + userId, "content-type": "application/json" },
+          body: encode({ canonicalKey }),
+        }),
+      ),
+    ),
+  );
+  return {
+    status: response.status,
+    body: decode(yield* Effect.promise(() => HttpServerResponse.toWeb(response).text())),
+  };
+});
+
 describe.skipIf(!databaseUrl)("repository workflow environment HTTP (Postgres)", () => {
   layer(services)((it) => {
     it.effect(
@@ -456,6 +482,106 @@ describe.skipIf(!databaseUrl)("repository workflow environment HTTP (Postgres)",
         expect((yield* call(http, repositoryId, maintainer)).status).toBe(403);
       }).pipe(Effect.scoped),
     );
+
+    for (const operation of ["add", "remove"] as const) {
+      it.effect(
+        `rejects an alias ${operation} when the grant is revoked after preliminary authorization`,
+        () =>
+          Effect.gen(function* () {
+            const { organizationId, repositoryId, maintainer } = yield* fixture();
+            const repositories = yield* Repositories.Repositories;
+            const canonicalKey = `github.com/fork/${repositoryId}`;
+            if (operation === "remove")
+              yield* repositories.addAlias({ organizationId, repositoryId, canonicalKey });
+            const before = yield* repositories.getById({ repositoryId });
+            const authorized = yield* Deferred.make<void>();
+            const proceed = yield* Deferred.make<void>();
+            const http = yield* buildHttp().pipe(
+              Effect.provideService(Repositories.Repositories, {
+                ...repositories,
+                getAccess: (input) =>
+                  repositories.getAccess(input).pipe(
+                    Effect.tap(() => Deferred.succeed(authorized, undefined)),
+                    Effect.tap(() => Deferred.await(proceed)),
+                  ),
+              }),
+            );
+            const editing = yield* callAlias(
+              http,
+              repositoryId,
+              maintainer,
+              canonicalKey,
+              operation,
+            ).pipe(Effect.forkChild);
+            yield* Deferred.await(authorized);
+            try {
+              expect(yield* repositories.revokeAccess({ repositoryId, userId: maintainer })).toBe(
+                true,
+              );
+            } finally {
+              yield* Deferred.succeed(proceed, undefined);
+            }
+            expect(yield* Fiber.join(editing)).toMatchObject({
+              status: 403,
+              body: { reason: "no_repository_access" },
+            });
+            expect((yield* repositories.getById({ repositoryId }))?.canonicalKeys).toEqual(
+              before?.canonicalKeys,
+            );
+          }).pipe(Effect.scoped),
+      );
+
+      it.effect(`holds the maintainer grant through an alias ${operation} write`, () =>
+        Effect.gen(function* () {
+          const { organizationId, repositoryId, maintainer } = yield* fixture();
+          const repositories = yield* Repositories.Repositories;
+          const canonicalKey = `github.com/fork/${repositoryId}`;
+          if (operation === "remove")
+            yield* repositories.addAlias({ organizationId, repositoryId, canonicalKey });
+          const http = yield* buildHttp();
+          const atWrite = yield* Deferred.make<void>();
+          const proceed = yield* Deferred.make<void>();
+          const editing = yield* callAlias(
+            http,
+            repositoryId,
+            maintainer,
+            canonicalKey,
+            operation,
+          ).pipe(
+            Effect.provideService(Statement.CurrentTransformer, (statement) => {
+              const query = statement.compile()[0].trimStart().toLowerCase().replaceAll('"', "");
+              const prefix = operation === "add" ? "insert into" : "delete from";
+              return query.startsWith(`${prefix} relay_repository_aliases`)
+                ? Deferred.succeed(atWrite, undefined).pipe(
+                    Effect.andThen(Deferred.await(proceed)),
+                    Effect.as(statement),
+                  )
+                : Effect.succeed(statement);
+            }),
+            Effect.forkChild,
+          );
+          yield* Deferred.await(atWrite);
+          try {
+            const sql = (yield* RelayDb).$client;
+            const grant = sql`SELECT 1 FROM relay_repository_access
+              WHERE organization_id=${organizationId} AND repository_id=${repositoryId}
+                AND user_id=${maintainer} FOR UPDATE NOWAIT`;
+            expect(yield* Effect.flip(grant)).toMatchObject({
+              _tag: "SqlError",
+              reason: { cause: { code: "55P03" } },
+            });
+          } finally {
+            yield* Deferred.succeed(proceed, undefined);
+          }
+          const canonicalKeys = [`github.com/launchpad/${repositoryId}`];
+          if (operation === "add") canonicalKeys.push(canonicalKey);
+          expect(yield* Fiber.join(editing)).toMatchObject({
+            status: 200,
+            body: { canonicalKeys: expect.arrayContaining(canonicalKeys) },
+          });
+        }).pipe(Effect.scoped),
+      );
+    }
 
     it.effect(
       "redacts malformed, oversized and failed secret writes from responses and diagnostics",

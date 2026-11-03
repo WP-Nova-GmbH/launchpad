@@ -1,4 +1,3 @@
-import type { PgClient } from "@effect/sql-pg/PgClient";
 import {
   RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES,
   RelayClientPrincipal,
@@ -12,13 +11,12 @@ import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { RelayDb } from "../db.ts";
 import * as Configurations from "../jobs/RepositoryWorkflowConfiguration.ts";
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
-import { requireMaintainableRepository, resolveMembership } from "./TenancyApi.ts";
 import {
-  tenancyConflict,
-  tenancyForbidden,
-  tenancyInvalid,
-  tenancyNotFound,
-} from "./tenancyErrors.ts";
+  lockMaintainableRepository,
+  requireMaintainableRepository,
+  resolveMembership,
+} from "./TenancyApi.ts";
+import { tenancyConflict, tenancyInvalid } from "./tenancyErrors.ts";
 
 // A 4 KiB value can take six JSON bytes per byte when escaped.
 const maxRequestBytes = RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES * 6 + 1024;
@@ -53,40 +51,6 @@ const readUpdate = Effect.fnUntraced(function* (request: HttpServerRequest) {
   );
 });
 
-/** Hold current authority through the settings operation in the caller's transaction. */
-const lockAuthority = Effect.fnUntraced(function* (
-  sql: PgClient,
-  scope: {
-    readonly organizationId: string;
-    readonly repositoryId: string;
-    readonly userId: string;
-  },
-  operation: "read" | "write",
-) {
-  const { organizationId, repositoryId, userId } = scope;
-  // Match repository removal's lock order.
-  const [current] = yield* sql<{ role: "admin" | "member" }>`
-    SELECT role FROM relay_organization_members
-    WHERE organization_id=${organizationId} AND user_id=${userId} FOR SHARE
-  `;
-  if (!current) return yield* tenancyNotFound("repository_not_found");
-  if (current.role !== "admin") {
-    const [grant] = yield* sql<{ role: "maintainer" | "developer" }>`
-      SELECT role FROM relay_repository_access
-      WHERE organization_id=${organizationId} AND repository_id=${repositoryId}
-        AND user_id=${userId} FOR SHARE
-    `;
-    if (grant?.role !== "maintainer")
-      return yield* tenancyForbidden(grant ? "not_a_maintainer" : "no_repository_access");
-  }
-  const [repository] = yield* sql`
-    SELECT repository_id FROM relay_repositories
-    WHERE repository_id=${repositoryId} AND organization_id=${organizationId}
-    ${sql.literal(operation === "read" ? "FOR SHARE" : "FOR NO KEY UPDATE")}
-  `;
-  if (!repository) return yield* tenancyNotFound("repository_not_found");
-});
-
 export const getRepositoryWorkflowConfiguration = Effect.fn(
   "relay.api.repository_workflow_configuration.get",
 )(function* (repositoryId: string) {
@@ -98,7 +62,7 @@ export const getRepositoryWorkflowConfiguration = Effect.fn(
   return yield* sql
     .withTransaction(
       Effect.gen(function* () {
-        yield* lockAuthority(sql, { ...scope, userId }, "read");
+        yield* lockMaintainableRepository(sql, { ...scope, userId }, "read");
         return yield* Configurations.getRepositoryWorkflowConfiguration(sql, scope).pipe(
           Effect.catch(() => relayInternalErrorResponse("persistence_failed")),
         );
@@ -120,7 +84,7 @@ export const updateRepositoryWorkflowConfiguration = Effect.fn(
   return yield* sql
     .withTransaction(
       Effect.gen(function* () {
-        yield* lockAuthority(sql, { organizationId, repositoryId, userId }, "write");
+        yield* lockMaintainableRepository(sql, { organizationId, repositoryId, userId }, "write");
         return yield* Configurations.updateRepositoryWorkflowConfiguration(
           sql,
           box,

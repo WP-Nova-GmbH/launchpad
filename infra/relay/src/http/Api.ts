@@ -520,7 +520,10 @@ export const healthApi = HttpApiBuilder.group(
             service: "relay" as const,
             threadTransferFormats: THREAD_TRANSFER_SUPPORTED_FORMATS,
             threadVmConfigured: settings !== undefined,
-            workflowVmCapabilities: { configuration: true, execution: false },
+            workflowVmCapabilities: {
+              configuration: true,
+              execution: settings?.workflowExecutionEnabled === true,
+            },
             threadVmCapabilities: {
               configured: settings !== undefined,
               autoPause: settings?.autoPauseEnabled ?? false,

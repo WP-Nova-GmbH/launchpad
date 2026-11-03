@@ -110,6 +110,13 @@ export const queueReasonText: Record<WorkflowQueueReason["code"], string> = {
   workflow_unavailable: "Restore the workflow or cancel this queued job.",
   workflow_changed: "The workflow changed before starting. Preparing its latest saved steps.",
   target_invalid: "Choose a valid checkout in the workflow, then refresh this job.",
+  vm_waiting_capacity: "Waiting for a workflow VM slot.",
+  vm_limit_disabled: "Ask an organization admin to raise the Workflow VMs limit to start this run.",
+  vm_waiting_codex: "Reconnect the organization's Codex account to start this run.",
+  vm_codex_replaced:
+    "The original Codex connection was replaced. Cancel this run and start a new one.",
+  vm_target_changed:
+    "The workflow no longer targets a VM. Switch it back to VM or cancel this run.",
   source_unavailable: "Linear is temporarily unavailable. The job will retry automatically.",
   source_rate_limited: "Linear is rate limited. The job will retry after its waiting period.",
   source_reconnect: "The source owner must reconnect Linear before this job can start.",

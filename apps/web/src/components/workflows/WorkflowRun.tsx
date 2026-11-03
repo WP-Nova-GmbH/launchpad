@@ -26,43 +26,32 @@ type WorkflowRunProps = {
   workflow: RepositoryWorkflow;
   projects: ReadonlyArray<RelayOrganizationProject>;
   call: ReturnType<typeof useWorkflowClient>;
+  vmExecutionAvailable?: boolean;
 };
 
 export function WorkflowRun(props: WorkflowRunProps) {
-  if (props.workflow.definition.target.kind === "vm")
-    return <UnavailableVmWorkflowRun scope={props.scope} workflow={props.workflow} />;
+  const { workflow, vmExecutionAvailable } = props;
+  const kind = workflow.definition.target.kind;
+  const vmUnavailable = kind === "vm" && !vmExecutionAvailable;
   return (
     <WorkflowRunForm
       key={workflowSessionKey(
         props.scope,
-        `${props.workflow.workflowId}:${props.workflow.archived}`,
+        `${workflow.workflowId}:${kind}:${workflow.archived}:${vmUnavailable}`,
       )}
       {...props}
+      vmUnavailable={vmUnavailable}
     />
   );
 }
 
-function UnavailableVmWorkflowRun({
+function WorkflowRunForm({
   scope,
   workflow,
-}: Pick<WorkflowRunProps, "scope" | "workflow">) {
-  const instruction =
-    useWorkflowDrafts().runs[workflowSessionKey(scope, workflow.workflowId)]?.instruction;
-  return (
-    <div className="mx-auto w-full max-w-xl space-y-2">
-      <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
-      <p className="text-sm text-muted-foreground">Running VM workflows is not available yet.</p>
-      {instruction?.trim() ? (
-        <label className="block space-y-2">
-          <span className="text-sm font-medium">Retained instructions</span>
-          <Textarea readOnly value={instruction} />
-        </label>
-      ) : null}
-    </div>
-  );
-}
-
-function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) {
+  projects,
+  call,
+  vmUnavailable,
+}: WorkflowRunProps & { vmUnavailable: boolean }) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
   const submission = useRef<{ draft: WorkflowRunDraft } | null>(null);
@@ -76,27 +65,34 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
   );
   const drafts = useWorkflowDrafts();
   const key = workflowSessionKey(scope, workflow.workflowId);
-  const draft = drafts.runs[key] ?? emptyWorkflowRun;
-  const machine = workflow.definition.target.kind === "machine" ? workflow.definition.target : null;
+  const draft =
+    (drafts.accountId === scope.accountId ? drafts.runs[key] : undefined) ?? emptyWorkflowRun;
+  const savedTarget = workflow.definition.target;
+  const machine = savedTarget.kind === "machine" ? savedTarget : null;
   const target = projects.find(
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
   const pending = draft.operation?.state === "pending";
   const uncertain = draft.operation?.state === "uncertain";
-  const submit = async () => {
+  const uncertainVm = uncertain && draft.operation?.targetKind === "vm";
+  const runBlocked = vmUnavailable || workflow.archived;
+  const replayOnly = runBlocked || savedTarget.kind !== "vm";
+  const checkingPrevious = pending && replayOnly && draft.operation?.targetKind === "vm";
+  const submit = async (recover: boolean) => {
     const state = appAtomRegistry.get(workflowDraftAtom);
     const current = state.runs[key];
     if (
       state.accountId !== scope.accountId ||
       !active.current ||
       submission.current ||
-      !current?.instruction.trim() ||
-      current.operation?.state === "pending" ||
-      workflow.archived
+      !current ||
+      current.operation?.state === "pending"
     )
       return;
-    const expectedTargetKind = workflow.definition.target.kind;
+    if (recover) {
+      if (current.operation?.targetKind !== "vm") return;
+    } else if (!current.instruction.trim() || runBlocked) return;
     const request = { draft: current };
     submission.current = request;
     const ownsSubmission = () =>
@@ -104,11 +100,11 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
       submission.current === request &&
       appAtomRegistry.get(workflowDraftAtom).accountId === scope.accountId;
     try {
-      if (current.operation?.state === "uncertain") {
+      if (!recover && current.operation?.state === "uncertain") {
         setConfirming(true);
         if (
           !(await confirmWorkflow(
-            "The previous run may already have started. Starting another can create an additional job. Continue?",
+            "The previous submission may already have started or could still start. Starting another can create an additional run. Continue?",
           ))
         )
           return;
@@ -116,16 +112,23 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
       if (!ownsSubmission() || appAtomRegistry.get(workflowDraftAtom).runs[key] !== request.draft)
         return;
       setConfirming(false);
-      const job = await runWorkflowDraft(scope, workflow.workflowId, (instruction) =>
-        call((client, token) =>
-          client.runWorkflow({
-            clerkToken: token,
-            repositoryId: scope.repositoryId,
-            payload: { workflowId: workflow.workflowId, instruction, expectedTargetKind },
-          }),
-        ),
+      const job = await runWorkflowDraft(
+        scope,
+        workflow.workflowId,
+        recover
+          ? { kind: "recover", replayOnly }
+          : {
+              kind: "start",
+              targetKind: savedTarget.kind,
+              replaceUncertain: current.operation?.state === "uncertain",
+            },
+        (payload) =>
+          call((client, token) =>
+            client.runWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
+          ),
       );
-      if (job && ownsSubmission())
+      const retained = appAtomRegistry.get(workflowDraftAtom).runs[key]?.instruction;
+      if (job && ownsSubmission() && (!recover || !retained?.trim()))
         void navigate({
           to: "/workflows/$repositoryId/jobs/$jobId",
           params: { repositoryId: scope.repositoryId, jobId: job.jobId },
@@ -137,29 +140,101 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
       }
     }
   };
+  const error = draft.error ? (
+    <p role="alert" className="text-sm text-destructive">
+      {draft.error}
+    </p>
+  ) : null;
+  const recoverVm = uncertainVm ? (
+    <div className="space-y-2">
+      <p className="text-sm text-warning">The previous VM submission could not be confirmed.</p>
+      <Button
+        type="button"
+        variant="outline"
+        disabled={confirming}
+        onClick={() => void submit(true)}
+      >
+        {replayOnly ? "Check previous submission" : "Retry previous submission"}
+      </Button>
+    </div>
+  ) : null;
+  const recoverMachine =
+    uncertain && !uncertainVm ? (
+      <div className="space-y-2">
+        <p className="text-sm text-warning">Run may have started. Check recent runs to confirm.</p>
+        <Button
+          type="button"
+          variant="outline"
+          onClick={() =>
+            navigate({
+              to: "/workflows/$repositoryId",
+              params: { repositoryId: scope.repositoryId },
+              search: { tab: "runs" },
+            })
+          }
+        >
+          Check recent runs
+        </Button>
+      </div>
+    ) : null;
+  const startedJob = draft.startedJobId ? (
+    <Button
+      type="button"
+      variant="outline"
+      onClick={() =>
+        navigate({
+          to: "/workflows/$repositoryId/jobs/$jobId",
+          params: { repositoryId: scope.repositoryId, jobId: draft.startedJobId! },
+        })
+      }
+    >
+      View started run
+    </Button>
+  ) : null;
+  if (runBlocked)
+    return (
+      <div className="mx-auto w-full max-w-xl space-y-2">
+        <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
+        <p className="text-sm text-muted-foreground">
+          {workflow.archived
+            ? "Restore this workflow before running it."
+            : "Running VM workflows is not available yet."}
+        </p>
+        {draft.instruction.trim() ? (
+          <label className="block space-y-2">
+            <span className="text-sm font-medium">Retained instructions</span>
+            <Textarea readOnly value={draft.instruction} />
+          </label>
+        ) : null}
+        {error}
+        {recoverVm}
+        {recoverMachine}
+        {checkingPrevious ? <p role="status">Checking previous submission…</p> : null}
+        {startedJob}
+      </div>
+    );
   return (
     <form
       className="mx-auto w-full max-w-xl space-y-5"
       onSubmit={(event) => {
         event.preventDefault();
-        void submit();
+        void submit(false);
       }}
     >
       <div>
         <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
         <p className="mt-2 text-sm text-muted-foreground">
           {workflow.definition.steps.length} steps ·{" "}
-          {target
-            ? target.machineLabel + " · " + target.title
-            : "Saved execution target is unavailable"}
+          {savedTarget.kind === "vm"
+            ? `VM · ${savedTarget.baseBranch ?? "Repository default"}`
+            : target
+              ? target.machineLabel + " · " + target.title
+              : "Saved execution target is unavailable"}
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Uses the saved workflow. Queued jobs use its current definition when dispatched.
         </p>
       </div>
-      {workflow.archived ? (
-        <p className="text-sm text-warning">Restore this workflow before running it.</p>
-      ) : null}
       <label className="block space-y-2">
         <span className="text-sm font-medium">What should this run accomplish?</span>
         <Textarea
@@ -176,57 +251,21 @@ function WorkflowRunForm({ scope, workflow, projects, call }: WorkflowRunProps) 
           }
         />
       </label>
-      {draft.error ? (
-        <p role="alert" className="text-sm text-destructive">
-          {draft.error}
-        </p>
-      ) : null}
-      {uncertain ? (
-        <div className="space-y-2">
-          <p className="text-sm text-warning">
-            Run may have started. Check recent runs before starting another.
-          </p>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() =>
-              navigate({
-                to: "/workflows/$repositoryId",
-                params: { repositoryId: scope.repositoryId },
-                search: { tab: "runs" },
-              })
-            }
-          >
-            Check recent runs
-          </Button>
-        </div>
-      ) : null}
-      {draft.startedJobId ? (
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() =>
-            navigate({
-              to: "/workflows/$repositoryId/jobs/$jobId",
-              params: { repositoryId: scope.repositoryId, jobId: draft.startedJobId! },
-            })
-          }
-        >
-          View started run
-        </Button>
-      ) : null}
+      {error}
+      {recoverVm}
+      {recoverMachine}
+      {startedJob}
       <div>
-        <Button
-          type="submit"
-          disabled={confirming || pending || workflow.archived || !draft.instruction.trim()}
-        >
+        <Button type="submit" disabled={confirming || pending || !draft.instruction.trim()}>
           {confirming
             ? "Awaiting confirmation…"
-            : pending
-              ? "Starting…"
-              : uncertain
-                ? "Start another run"
-                : "Run workflow"}
+            : checkingPrevious
+              ? "Checking previous submission…"
+              : pending
+                ? "Starting…"
+                : uncertain
+                  ? "Start another run"
+                  : "Run workflow"}
         </Button>
       </div>
     </form>

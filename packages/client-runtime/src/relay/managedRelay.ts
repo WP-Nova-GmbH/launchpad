@@ -1,4 +1,8 @@
-import { WorkflowConflictError, WorkflowInvalidError } from "@t3tools/contracts/workflows";
+import {
+  WorkflowConflictError,
+  WorkflowInvalidError,
+  WorkflowSubmissionPendingError,
+} from "@t3tools/contracts/workflows";
 import {
   RelayAccessTokenType,
   CodexVmConnectionError,
@@ -353,6 +357,7 @@ export class ManagedRelayUrlInvalidError extends Schema.TaggedError<ManagedRelay
 
 const isWorkflowConflictError = Schema.is(WorkflowConflictError);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
+const isWorkflowSubmissionPendingError = Schema.is(WorkflowSubmissionPendingError);
 const isCodexVmConnectionError = Schema.is(CodexVmConnectionError);
 
 export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRelayRequestFailedError>()(
@@ -369,6 +374,7 @@ export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRe
     if (
       isWorkflowConflictError(this.cause) ||
       isWorkflowInvalidError(this.cause) ||
+      isWorkflowSubmissionPendingError(this.cause) ||
       isCodexVmConnectionError(this.cause)
     )
       return this.cause.message;
@@ -430,6 +436,7 @@ export type RelayHttpRequestError =
   | import("@t3tools/contracts/relay").CodexVmConnectionError
   | import("@t3tools/contracts/workflows").WorkflowConflictError
   | import("@t3tools/contracts/workflows").WorkflowInvalidError
+  | import("@t3tools/contracts/workflows").WorkflowSubmissionPendingError
   | RelayProtectedErrorType
   | HttpClientError.HttpClientError
   | Schema.SchemaError;

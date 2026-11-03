@@ -130,8 +130,9 @@ describe("workflow writes surviving navigation", () => {
   it("keeps one Run request in flight and retains its acknowledged job link after unmount", async () => {
     const result = deferred<RepositoryWorkflowJob>();
     const start = vi.fn(() => result.promise);
-    const pending = runWorkflowDraft(scope, saved.workflowId, start);
-    expect(await runWorkflowDraft(scope, saved.workflowId, start)).toBeNull();
+    const intent = { kind: "start", targetKind: "machine" } as const;
+    const pending = runWorkflowDraft(scope, saved.workflowId, intent, start);
+    expect(await runWorkflowDraft(scope, saved.workflowId, intent, start)).toBeNull();
     expect(start).toHaveBeenCalledTimes(1);
     result.resolve(job);
     expect(await pending).toEqual(job);
@@ -147,7 +148,14 @@ describe("workflow writes surviving navigation", () => {
     const start = vi.fn(async () => {
       throw new Error("Disconnected");
     });
-    expect(await runWorkflowDraft(scope, saved.workflowId, start)).toBeNull();
+    expect(
+      await runWorkflowDraft(
+        scope,
+        saved.workflowId,
+        { kind: "start", targetKind: "machine" },
+        start,
+      ),
+    ).toBeNull();
     expect(start).toHaveBeenCalledTimes(1);
     expect(appAtomRegistry.get(workflowDraftAtom).runs[key]).toMatchObject({
       instruction: "Task",
@@ -157,7 +165,12 @@ describe("workflow writes surviving navigation", () => {
   });
   it("discards a previous account's late Run result", async () => {
     const result = deferred<RepositoryWorkflowJob>();
-    const pending = runWorkflowDraft(scope, saved.workflowId, () => result.promise);
+    const pending = runWorkflowDraft(
+      scope,
+      saved.workflowId,
+      { kind: "start", targetKind: "machine" },
+      () => result.promise,
+    );
     setWorkflowSessionAccount(appAtomRegistry, "different-account");
     result.resolve(job);
     expect(await pending).toBeNull();

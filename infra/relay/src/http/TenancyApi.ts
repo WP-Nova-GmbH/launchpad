@@ -1,5 +1,6 @@
 import * as RepositoryPolicies from "../tenancy/RepositoryPolicies.ts";
 import { createClerkClient } from "@clerk/backend";
+import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -164,6 +165,40 @@ export const requireMaintainableRepository = Effect.fn(
     return yield* tenancyForbidden(role === null ? "no_repository_access" : "not_a_maintainer");
   }
   return repository;
+});
+
+/** Hold current maintainer authority through the caller's repository transaction. */
+export const lockMaintainableRepository = Effect.fnUntraced(function* (
+  sql: PgClient,
+  scope: {
+    readonly organizationId: string;
+    readonly repositoryId: string;
+    readonly userId: string;
+  },
+  operation: "read" | "write",
+) {
+  const { organizationId, repositoryId, userId } = scope;
+  // Match repository removal's lock order.
+  const [current] = yield* sql<{ role: "admin" | "member" }>`
+    SELECT role FROM relay_organization_members
+    WHERE organization_id=${organizationId} AND user_id=${userId} FOR SHARE
+  `;
+  if (!current) return yield* tenancyNotFound("repository_not_found");
+  if (current.role !== "admin") {
+    const [grant] = yield* sql<{ role: "maintainer" | "developer" }>`
+      SELECT role FROM relay_repository_access
+      WHERE organization_id=${organizationId} AND repository_id=${repositoryId}
+        AND user_id=${userId} FOR SHARE
+    `;
+    if (grant?.role !== "maintainer")
+      return yield* tenancyForbidden(grant ? "not_a_maintainer" : "no_repository_access");
+  }
+  const [repository] = yield* sql`
+    SELECT repository_id FROM relay_repositories
+    WHERE repository_id=${repositoryId} AND organization_id=${organizationId}
+    ${sql.literal(operation === "read" ? "FOR SHARE" : "FOR NO KEY UPDATE")}
+  `;
+  if (!repository) return yield* tenancyNotFound("repository_not_found");
 });
 
 export const requireVisibleRepository = Effect.fn("relay.api.tenancy.require_visible_repository")(
@@ -941,15 +976,32 @@ export const repositoriesApi = HttpApiBuilder.group(
       Effect.catch(() => relayInternalErrorResponse("internal_error")),
     );
 
-    /**
-     * Registration and removal each write three tables. Half of either would
-     * leave an alias pointing at a repository that does not exist, and that
-     * key can then never be claimed by anything.
-     */
+    /** Keep repository writes and their authority checks in one transaction. */
     const atomically = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       transactions
         .withTransaction(effect)
         .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
+
+    const mutateRepositoryAlias = Effect.fnUntraced(function* <E, R>(
+      repositoryId: string,
+      mutate: (repository: Repositories.RepositoryRecord) => Effect.Effect<void, E, R>,
+    ) {
+      const membership = yield* requireMembership();
+      const repository = yield* requireMaintainableRepository({ membership, repositoryId });
+      const sql = (yield* RelayDb.RelayDb).$client;
+      return yield* atomically(
+        Effect.gen(function* () {
+          yield* lockMaintainableRepository(
+            sql,
+            { organizationId: repository.organizationId, repositoryId, userId: membership.userId },
+            "write",
+          );
+          yield* mutate(repository);
+          const updated = yield* repositories.getById({ repositoryId });
+          return toApiRepository(updated ?? repository);
+        }),
+      );
+    });
 
     return handlers
       .handle(
@@ -1043,52 +1095,34 @@ export const repositoriesApi = HttpApiBuilder.group(
       )
       .handle(
         "addRepositoryAlias",
-        Effect.fn("relay.api.repositories.add_alias")(function* (args) {
-          const membership = yield* requireMembership();
-          const repository = yield* requireMaintainableRepository({
-            membership,
-            repositoryId: args.params.repositoryId,
-          });
-          yield* repositories
-            .addAlias({
-              repositoryId: repository.repositoryId,
-              organizationId: repository.organizationId,
-              canonicalKey: args.payload.canonicalKey,
-            })
-            .pipe(
-              Effect.catchTag("RepositoryCanonicalKeyTaken", () =>
-                tenancyConflict("canonical_key_taken"),
-              ),
-            );
-          const updated = yield* repositories.getById({
-            repositoryId: repository.repositoryId,
-          });
-          return toApiRepository(updated ?? repository);
-        }, mapRelayCommonApiErrors("not_authorized")),
+        Effect.fn("relay.api.repositories.add_alias")(
+          ({ params, payload }) =>
+            mutateRepositoryAlias(params.repositoryId, ({ repositoryId, organizationId }) =>
+              repositories
+                .addAlias({ repositoryId, organizationId, ...payload })
+                .pipe(
+                  Effect.catchTag("RepositoryCanonicalKeyTaken", () =>
+                    tenancyConflict("canonical_key_taken"),
+                  ),
+                ),
+            ),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
       )
       .handle(
         "removeRepositoryAlias",
-        Effect.fn("relay.api.repositories.remove_alias")(function* (args) {
-          const membership = yield* requireMembership();
-          const repository = yield* requireMaintainableRepository({
-            membership,
-            repositoryId: args.params.repositoryId,
-          });
-          const outcome = yield* repositories.removeAlias({
-            repositoryId: repository.repositoryId,
-            canonicalKey: args.payload.canonicalKey,
-          });
-          if (outcome === "last-alias") {
-            return yield* tenancyConflict("last_alias");
-          }
-          if (outcome === "not-found") {
-            return yield* tenancyNotFound("alias_not_found");
-          }
-          const updated = yield* repositories.getById({
-            repositoryId: repository.repositoryId,
-          });
-          return toApiRepository(updated ?? repository);
-        }, mapRelayCommonApiErrors("not_authorized")),
+        Effect.fn("relay.api.repositories.remove_alias")(
+          ({ params, payload }) =>
+            mutateRepositoryAlias(
+              params.repositoryId,
+              Effect.fnUntraced(function* ({ repositoryId }) {
+                const outcome = yield* repositories.removeAlias({ repositoryId, ...payload });
+                if (outcome === "last-alias") return yield* tenancyConflict("last_alias");
+                if (outcome === "not-found") return yield* tenancyNotFound("alias_not_found");
+              }),
+            ),
+          mapRelayCommonApiErrors("not_authorized"),
+        ),
       )
       .handle(
         "listRepositoryAccess",

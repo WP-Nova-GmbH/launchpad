@@ -13,6 +13,7 @@ import {
   normalizeStoredWorkflowJob,
 } from "@t3tools/shared/workflowStorage";
 import { WorkflowOrigin, sameWorkflowOrigin } from "@t3tools/contracts";
+import { DEFAULT_WORKFLOW_VM_LIMIT } from "@t3tools/contracts/relay";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -23,6 +24,10 @@ import * as Routing from "../workflowEvents/Routing.ts";
 import { vmWorkflowExecutionUnavailable, workflowRunTargetChanged } from "./WorkflowTarget.ts";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
+import { getRepositoryWorkflowConfiguration } from "./RepositoryWorkflowConfiguration.ts";
+import { recheckWorkflowVmGitHub, type WorkflowVmGitHubResolution } from "./WorkflowVmGithub.ts";
+import { tenancyForbidden, tenancyNotFound } from "../http/tenancyErrors.ts";
+import { lockWorkflowVmOrganization } from "../threads/WorkflowVmPolicyLock.ts";
 
 export type WorkflowDispatchScope = {
   occurrenceId?: string;
@@ -30,6 +35,13 @@ export type WorkflowDispatchScope = {
   environmentId?: string;
 };
 export type WorkflowJobRecord = Omit<typeof relayWorkflowJobs.$inferSelect, "summary">;
+type WorkflowVmSubmissionScope = Pick<
+  WorkflowJobRecord,
+  "organizationId" | "repositoryId" | "submitterUserId"
+>;
+type WorkflowVmSubmission = WorkflowVmSubmissionScope &
+  Pick<WorkflowJobRecord, "jobId"> &
+  Pick<RepositoryWorkflowJob, "workflowId" | "instruction">;
 const isInvalid = Schema.is(WorkflowInvalidError);
 const isConflict = Schema.is(WorkflowConflictError);
 const decodeOrigin = Schema.decodeUnknownSync(WorkflowOrigin);
@@ -101,6 +113,96 @@ export const make = Effect.gen(function* () {
         rows[0] ? { ...rows[0], record: normalizeStoredWorkflowJob(rows[0].record) } : null,
       ),
     );
+  const findVmSubmission = Effect.fnUntraced(function* (input: WorkflowVmSubmission) {
+    const row = yield* getJob(input.jobId);
+    if (
+      row &&
+      (row.organizationId !== input.organizationId ||
+        row.repositoryId !== input.repositoryId ||
+        row.submitterUserId !== input.submitterUserId ||
+        !row.record.vmAdmission ||
+        row.record.workflowId !== input.workflowId ||
+        row.record.instruction !== input.instruction)
+    )
+      return yield* new WorkflowConflictError({
+        message: "This submission ID was already used. Start a new run to change its instructions.",
+      });
+    return row;
+  });
+  const getWorkflowVmCodexConnection = Effect.fn("Workflows.getWorkflowVmCodexConnection")(
+    function* (organizationId: string, lock = false) {
+      const sql = db.$client;
+      const [connection] = yield* persist(sql<{
+        connectionId: string;
+        status: "connected" | "disconnected" | "reconnect_required";
+      }>`
+        SELECT connection_id AS "connectionId",
+          CASE WHEN status='connected' AND refresh_started_at::timestamptz <=
+            clock_timestamp() - interval '6 seconds' THEN 'reconnect_required'
+          ELSE status END AS status
+        FROM relay_codex_vm_connections
+        WHERE organization_id=${organizationId} ${lock ? sql`FOR SHARE` : sql``}
+      `);
+      return connection ?? null;
+    },
+  );
+  const requireVisibleVmRepository = Effect.fnUntraced(function* (
+    scope: Pick<WorkflowVmSubmissionScope, "organizationId" | "repositoryId">,
+    userId: string | null,
+    lock: boolean,
+  ) {
+    const sql = db.$client;
+    const forShare = lock ? sql`FOR SHARE` : sql``;
+    const [membership] = yield* persist(sql<{ role: string }>`
+        SELECT role FROM relay_organization_members
+        WHERE organization_id=${scope.organizationId} AND user_id=${userId}
+        ${forShare}
+      `);
+    if (!membership) return yield* tenancyNotFound("repository_not_found");
+    const [grant] =
+      membership.role === "admin"
+        ? []
+        : yield* persist(sql<{ role: string }>`
+              SELECT role FROM relay_repository_access WHERE organization_id=${scope.organizationId}
+                AND repository_id=${scope.repositoryId} AND user_id=${userId}
+              ${forShare}
+            `);
+    if (membership.role !== "admin" && !grant)
+      return yield* tenancyNotFound("repository_not_found");
+    const [repository] = yield* persist(sql`
+        SELECT repository_id FROM relay_repositories
+        WHERE organization_id=${scope.organizationId} AND repository_id=${scope.repositoryId}
+        ${forShare}
+      `);
+    if (!repository) return yield* tenancyNotFound("repository_not_found");
+    return membership.role === "admin" || grant?.role === "maintainer";
+  });
+  const checkWorkflowVmSecretAccess = Effect.fnUntraced(function* (
+    scope: WorkflowVmSubmissionScope,
+    canUseSecrets: boolean,
+  ) {
+    const configuration = yield* persist(getRepositoryWorkflowConfiguration(db.$client, scope));
+    const hasSecrets = configuration.entries.some((entry) => entry.kind === "secret");
+    if (hasSecrets && !canUseSecrets) return yield* tenancyForbidden("not_a_maintainer");
+    return hasSecrets;
+  });
+  const getWorkflowVmLimit = Effect.fn("Workflows.getWorkflowVmLimit")(function* (
+    organizationId: string,
+  ) {
+    const sql = db.$client;
+    const [policy] = yield* persist(sql<{ limit: number }>`
+      SELECT max_running_workflow_vms AS "limit"
+      FROM relay_thread_vm_policies WHERE organization_id=${organizationId}
+    `);
+    return policy?.limit ?? DEFAULT_WORKFLOW_VM_LIMIT;
+  });
+  const requireWorkflowVmLimit = Effect.fnUntraced(function* (organizationId: string) {
+    if ((yield* getWorkflowVmLimit(organizationId)) === 0)
+      return yield* new WorkflowInvalidError({
+        message:
+          "Workflow VMs are disabled. An organization admin can raise the limit in Workflow VMs settings.",
+      });
+  });
   const createJob = (row: WorkflowJobRecord) =>
     persist(
       Effect.try(() => validateOrigin(row)).pipe(
@@ -248,16 +350,65 @@ export const make = Effect.gen(function* () {
       return record;
     }),
     createJob,
+    getVmSubmission: Effect.fn("Workflows.getVmSubmission")(function* (
+      input: WorkflowVmSubmission,
+    ) {
+      return yield* db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* requireVisibleVmRepository(input, input.submitterUserId, true);
+            return yield* findVmSubmission(input);
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+    }),
+    getWorkflowVmCodexConnection,
+    getWorkflowVmLimit,
+    requireWorkflowVmLimit,
+    checkWorkflowVmSubmissionAccess: Effect.fn("Workflows.checkWorkflowVmSubmissionAccess")(
+      function* (scope: WorkflowVmSubmissionScope) {
+        const canUseSecrets = yield* requireVisibleVmRepository(
+          scope,
+          scope.submitterUserId,
+          false,
+        );
+        return yield* checkWorkflowVmSecretAccess(scope, canUseSecrets);
+      },
+    ),
     createManualJob: Effect.fn("Workflows.createManualJob")(function* (
       row: WorkflowJobRecord,
       expected: {
         readonly expectedRevision: number;
         readonly expectedTargetKind: RepositoryWorkflow["definition"]["target"]["kind"];
+        readonly vm?: {
+          readonly codexConnectionId: string;
+          readonly github: WorkflowVmGitHubResolution;
+        };
       },
     ) {
       return yield* db.$client
         .withTransaction(
           Effect.gen(function* () {
+            const vm = expected.vm;
+            const input = {
+              ...row,
+              workflowId: row.record.workflowId,
+              instruction: row.record.instruction,
+            };
+            const sql = db.$client;
+            let hasSecrets = false;
+            if (vm) {
+              const canUseSecrets = yield* requireVisibleVmRepository(
+                row,
+                row.submitterUserId,
+                true,
+              );
+              const prior = yield* findVmSubmission(input);
+              if (prior) return prior;
+              hasSecrets = yield* checkWorkflowVmSecretAccess(row, canUseSecrets);
+              yield* lockWorkflowVmOrganization(sql, row.organizationId);
+              yield* requireWorkflowVmLimit(row.organizationId);
+            }
             const workflow = yield* lockSavedWorkflow(row.record.workflowId, row.repositoryId);
             if (!workflow || workflow.archived)
               return yield* new WorkflowInvalidError({
@@ -269,7 +420,30 @@ export const make = Effect.gen(function* () {
               return yield* new WorkflowConflictError({
                 message: "The workflow changed while checking this run. Review it and try again.",
               });
-            return yield* createJob(row);
+            if (!vm) return yield* createJob(row);
+            yield* recheckWorkflowVmGitHub(sql, row, vm.github);
+            const codex = yield* getWorkflowVmCodexConnection(row.organizationId, true);
+            if (codex?.status !== "connected" || codex.connectionId !== vm.codexConnectionId)
+              return yield* new WorkflowInvalidError({
+                message: "The organization Codex connection changed. Check it and try again.",
+              });
+            const record = validateOrigin(row, {
+              ...row.record,
+              vmAdmission: { codexConnectionId: vm.codexConnectionId, hasSecrets },
+            });
+            const inserted = yield* persist(
+              db
+                .insert(relayWorkflowJobs)
+                .values({ ...row, record })
+                .onConflictDoNothing({ target: relayWorkflowJobs.jobId })
+                .returning({ jobId: relayWorkflowJobs.jobId }),
+            );
+            return inserted.length
+              ? { ...row, record }
+              : ((yield* findVmSubmission(input)) ??
+                  (yield* new WorkflowPersistenceError({
+                    cause: "Missing VM submission after conflict.",
+                  })));
           }),
         )
         .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
@@ -305,9 +479,11 @@ export const make = Effect.gen(function* () {
       const jobs = relayWorkflowJobs;
       const history = query.view === "history";
       const limit = query.limit ?? 50;
+      const needsAttention = sql<boolean>`(${jobs.summary}->>'needsAttention' IS NOT DISTINCT FROM 'true'
+        AND ${jobs.summary}#>>'{queueReason,code}' IS DISTINCT FROM 'vm_waiting_capacity')`;
       const rows = yield* persist(
         db
-          .select({ summary: jobs.summary })
+          .select({ summary: jobs.summary, needsAttention })
           .from(jobs)
           .where(
             and(
@@ -315,9 +491,7 @@ export const make = Effect.gen(function* () {
               history
                 ? sql`${jobs.status} IN ('done','cancelled','failed')`
                 : sql`${jobs.status} NOT IN ('done','cancelled','failed')`,
-              query.view === "attention"
-                ? sql`${jobs.summary}->>'needsAttention' = 'true'`
-                : undefined,
+              query.view === "attention" ? needsAttention : undefined,
               cursor
                 ? history
                   ? sql`(${jobs.createdAt}, ${jobs.jobId}) < (${cursor.createdAt}, ${cursor.jobId})`
@@ -331,7 +505,10 @@ export const make = Effect.gen(function* () {
           )
           .limit(limit + 1),
       );
-      const page = rows.slice(0, limit).map((row) => row.summary);
+      const page = rows.slice(0, limit).map(({ summary, needsAttention }) => ({
+        ...summary,
+        needsAttention,
+      }));
       const last = page.at(-1);
       return {
         jobs: page,
@@ -408,6 +585,58 @@ export const make = Effect.gen(function* () {
       return row;
     }),
     updateJob,
+    settleQueuedVmCancellation: Effect.fn("Workflows.settleQueuedVmCancellation")(function* (
+      previous: WorkflowJobRecord,
+      expectedLease: string,
+    ) {
+      const job = previous.record;
+      const pending = previous.pendingControl;
+      if (
+        !job.vmAdmission ||
+        job.status !== "cancelling" ||
+        job.workflow !== null ||
+        job.runtime !== null ||
+        pending?.response.operation !== "cancel"
+      )
+        return previous;
+      const ownSecretFreeRun =
+        job.vmAdmission.hasSecrets === false && previous.submitterUserId === pending.userId;
+      return yield* db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            const authorized = yield* requireVisibleVmRepository(
+              previous,
+              pending.userId,
+              true,
+            ).pipe(
+              Effect.map((canManage) => canManage || ownSecretFreeRun),
+              Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(false)),
+            );
+            return yield* updateJob(
+              previous,
+              {
+                ...job,
+                ...(authorized
+                  ? {
+                      status: "cancelled" as const,
+                      queueReason: null,
+                      detail: "Cancelled before preparation.",
+                    }
+                  : {
+                      status: "queued" as const,
+                      detail:
+                        "Cancellation was withdrawn because the requester no longer has permission.",
+                    }),
+                updatedAt: yield* now,
+              },
+              null,
+              false,
+              expectedLease,
+            );
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+    }),
     /** Recheck the definition after the remote probe, before committing the initial binding. */
     bindManualOffer: Effect.fn("Workflows.bindManualOffer")(function* (
       previous: WorkflowJobRecord,

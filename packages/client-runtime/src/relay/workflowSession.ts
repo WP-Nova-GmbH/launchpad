@@ -65,6 +65,8 @@ export interface WorkflowRunDraft {
     readonly requestId: string;
     readonly state: "pending" | "uncertain";
     readonly instruction: string;
+    /** VM requests replay the captured payload. Machine submissions retain their existing retry flow. */
+    readonly targetKind?: "vm";
   } | null;
   readonly startedJobId: string | null;
   readonly error: string | null;

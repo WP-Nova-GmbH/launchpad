@@ -430,6 +430,102 @@ describe("GithubApp.mintRepositoryToken", () => {
   );
 });
 
+describe("GithubApp.resolveRepositoryBranch", () => {
+  const input = { installationId: "42", canonicalKey: "github.com/acme/project" };
+  const repoUrl = "https://api.github.com/repos/acme/project";
+  const mintUrl = "https://api.github.com/app/installations/42/access_tokens";
+  const readToken = {
+    ...scopedTokenResponse,
+    permissions: { contents: "read", metadata: "read" },
+  };
+  const commitSha = "aa218f56b14c9653891f9e74264a383fa43fefbd";
+  const decodeReadRequest = Schema.decodeUnknownSync(
+    Schema.fromJsonString(
+      Schema.Struct({
+        repositories: Schema.Array(Schema.String),
+        permissions: Schema.Record(Schema.String, Schema.String),
+      }),
+    ),
+  );
+
+  it.effect("resolves the live default branch and an explicit branch with a read-only token", () =>
+    Effect.gen(function* () {
+      for (const baseBranch of [null, "release/café"]) {
+        const branch = baseBranch ?? "trunk";
+        const { app, requests } = makeApp((request) =>
+          request.url === mintUrl
+            ? Response.json(readToken, { status: 201 })
+            : request.url === repoUrl
+              ? Response.json({ default_branch: branch })
+              : Response.json({
+                  ref: `refs/heads/${branch}`,
+                  object: { type: "commit", sha: commitSha },
+                }),
+        );
+        const github = yield* app;
+        expect(yield* github.resolveRepositoryBranch({ ...input, baseBranch })).toEqual({
+          branch,
+          commitSha,
+        });
+        expect(requests.map((request) => request.url)).toEqual([
+          mintUrl,
+          ...(baseBranch === null ? [repoUrl] : []),
+          `${repoUrl}/git/ref/heads/${baseBranch === null ? "trunk" : "release/caf%C3%A9"}`,
+        ]);
+        const mint = requests[0]!;
+        if (mint.body._tag !== "Uint8Array") throw new Error("Expected JSON request body");
+        expect(decodeReadRequest(new TextDecoder().decode(mint.body.body))).toEqual({
+          repositories: ["project"],
+          permissions: { contents: "read" },
+        });
+        for (const read of requests.slice(1)) {
+          expect(read.method).toBe("GET");
+          expect(read.headers.authorization).toBe(`Bearer ${readToken.token}`);
+        }
+      }
+    }),
+  );
+
+  it.effect("rejects tokens with missing or excessive permissions before using them", () =>
+    Effect.gen(function* () {
+      for (const permissions of [
+        undefined,
+        { contents: "write" },
+        { contents: "read", pull_requests: "write" },
+      ]) {
+        const { app, requests } = makeApp(() => Response.json({ ...readToken, permissions }));
+        const github = yield* app;
+        const error = yield* Effect.flip(
+          github.resolveRepositoryBranch({ ...input, baseBranch: "main" }),
+        );
+        expect(error).toMatchObject({ _tag: "GithubRequestFailed", operation: "mint-token" });
+        expect(String(error)).not.toContain(readToken.token);
+        expect(requests.map((request) => request.url)).toEqual([mintUrl]);
+      }
+    }),
+  );
+
+  it.effect("rejects redirects, missing refs, and responses for another ref or a non-commit", () =>
+    Effect.gen(function* () {
+      for (const reply of [
+        Response.redirect("https://api.github.com/repos/acme/renamed"),
+        new Response(null, { status: 404 }),
+        Response.json({ ref: "refs/heads/other", object: { type: "commit", sha: commitSha } }),
+        Response.json({ ref: "refs/heads/main", object: { type: "tag", sha: commitSha } }),
+        Response.json({ ref: "refs/heads/main", object: { type: "commit", sha: "aa218f5" } }),
+      ]) {
+        const { app } = makeApp((request) =>
+          request.url === mintUrl ? Response.json(readToken) : reply,
+        );
+        const github = yield* app;
+        expect(
+          yield* Effect.flip(github.resolveRepositoryBranch({ ...input, baseBranch: "main" })),
+        ).toMatchObject({ _tag: "GithubRequestFailed", operation: "read-branch" });
+      }
+    }),
+  );
+});
+
 const verifiedBot = {
   status: "ready",
   appId: "12345",

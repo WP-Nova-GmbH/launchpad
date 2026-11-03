@@ -295,6 +295,7 @@ function WorkflowRepositoryView({
   const catalogRevision = useAtomValue(workflowCatalogRevisionAtom);
   const [automationSupported, setAutomationSupported] = useState(false);
   const [vmAuthoring, setVmAuthoring] = useState<WorkflowCatalog["vmAuthoring"] | null>(null);
+  const [vmExecutionAvailable, setVmExecutionAvailable] = useState(false);
   const [summaries, setSummaries] = useState<ReadonlyArray<WorkflowAutomationSummary>>([]);
   const [listedWorkflows, setWorkflows] = useState<ReadonlyArray<RepositoryWorkflow>>([]);
   const workflows = listedWorkflows.map((workflow) => {
@@ -416,6 +417,7 @@ function WorkflowRepositoryView({
       if (generation !== loadGeneration.current) return;
       setWorkflows(result.workflows);
       setVmAuthoring(result.vmAuthoring);
+      setVmExecutionAvailable(result.vmExecutionAvailable === true);
       setAutomationSupported(result.automationSupported === true);
       setSummaries(result.automationSummaries ?? []);
       setLoaded(true);
@@ -612,7 +614,15 @@ function WorkflowRepositoryView({
     workflows
       .filter((workflow) => workflow.archived === archived)
       .map((workflow) => {
-        const local = drafts.editors[workflowSessionKey(scope, workflow.workflowId)];
+        const key = workflowSessionKey(scope, workflow.workflowId);
+        const local = drafts.editors[key];
+        const runDraft = drafts.runs[key];
+        const vmUnavailable = workflow.definition.target.kind === "vm" && !vmExecutionAvailable;
+        const canStartRun = !archived && !vmUnavailable;
+        const hasRunSubmission =
+          runDraft?.operation?.targetKind === "vm" ||
+          (!canStartRun && runDraft?.operation?.state === "uncertain");
+        const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
         const summary = summaries.find(
           (item) => item.workflowId === workflow.workflowId && item.revision === workflow.revision,
         );
@@ -718,11 +728,13 @@ function WorkflowRepositoryView({
                     {local?.operation ? "Retry save" : "Restore"}
                   </Button>
                 ) : null
-              ) : workflow.definition.target.kind === "vm" ? (
+              ) : null}
+              {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
                 <span className="self-center text-xs text-muted-foreground">
                   VM execution unavailable
                 </span>
-              ) : (
+              ) : null}
+              {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
                 <Button
                   variant="outline"
                   onClick={() =>
@@ -732,9 +744,13 @@ function WorkflowRepositoryView({
                     })
                   }
                 >
-                  Run
+                  {hasRunSubmission
+                    ? "View run submission"
+                    : hasRetainedInstructions
+                      ? "View retained instructions"
+                      : "Run"}
                 </Button>
-              )}
+              ) : null}
             </div>
           </div>
         );
@@ -812,6 +828,7 @@ function WorkflowRepositoryView({
             projects={projects}
             projectsUnavailable={projectsUnavailable}
             vmAuthoring={vmAuthoring ?? undefined}
+            vmExecutionAvailable={vmExecutionAvailable}
             codexRefreshVersion={codexRefreshVersion}
             canConfigure={canConfigure}
             call={call}
@@ -935,7 +952,13 @@ function WorkflowRepositoryView({
             <Spinner />
           ) : view === "run" ? (
             workflow ? (
-              <WorkflowRun scope={scope} workflow={workflow} projects={projects} call={call} />
+              <WorkflowRun
+                scope={scope}
+                workflow={workflow}
+                projects={projects}
+                call={call}
+                vmExecutionAvailable={vmExecutionAvailable}
+              />
             ) : (
               <p>Workflow unavailable. Refresh or return to the list.</p>
             )
