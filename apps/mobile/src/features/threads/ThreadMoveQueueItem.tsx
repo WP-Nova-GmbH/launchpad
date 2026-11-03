@@ -5,8 +5,9 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { useAtomValue } from "@effect/atom-react";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
+  activeThreadMove,
   threadMoveQueuePresentation,
-  threadMoveQueueOwnership,
+  threadMoveQueueRows,
 } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import {
   CommandId,
@@ -19,7 +20,15 @@ import type {
   RelayPortableThreadPlacement,
   ThreadMoveFailureDiagnostic,
 } from "@t3tools/contracts/relay";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Pressable, View } from "react-native";
 import { AppText as Text } from "../../components/AppText";
 import { SymbolView } from "../../components/AppSymbol";
@@ -79,17 +88,126 @@ function PreviousMoveErrors({ errors }: { errors: ReadonlyArray<ThreadMoveFailur
   );
 }
 
-export function ThreadMoveQueueItem({
-  environmentId,
-  threadId,
-  entry,
-  placement: knownPlacement,
-  cancellation,
-  queuePaused,
-  disabled,
-  onCancel,
-  children,
-}: {
+type ActiveMove = NonNullable<RelayPortableThreadPlacement["activeMove"]>;
+
+function useActiveMoveCancellation(threadId: ThreadId, move: ActiveMove) {
+  const session = useAtomValue(managedRelaySessionAtom);
+  const relayUrl = threadMoveRelayUrl();
+  const scope = useMemo(
+    () => ({
+      session,
+      relayUrl,
+      threadId,
+      operationId: move.operationId,
+      generation: move.sourceGeneration,
+    }),
+    [session, relayUrl, threadId, move.operationId, move.sourceGeneration],
+  );
+  const current = useRef<typeof scope | null>(null);
+  useLayoutEffect(() => {
+    current.current = scope;
+    return () => {
+      current.current = null;
+    };
+  }, [scope]);
+  const sending = useRef<typeof scope | null>(null);
+  const [feedback, setFeedback] = useState<{
+    scope: typeof scope;
+    phase: "sending" | "requested" | "confirmed" | "unknown";
+    checking?: boolean;
+    error?: string;
+  } | null>(null);
+  const cancelMove = useAtomCommand(portableThreadLibrary.cancelActiveMove, {
+    reportFailure: false,
+  });
+  const checkMove = useAtomCommand(portableThreadLibrary.checkMoveCancellation, {
+    reportFailure: false,
+  });
+  const displayed = feedback?.scope === scope ? feedback : null;
+  const displayedPhase = displayed?.phase;
+  const confirmedCancelled = displayedPhase === "confirmed";
+  const retryLegacy = !confirmedCancelled && move.cancellationBlocker === "legacy_cancel_rejected";
+  const cancelling = move.phase === "aborting" || move.phase === "reopening";
+  const canCancel =
+    move.phase === "preparing" || move.phase === "frozen" || move.phase === "ready" || retryLegacy;
+  const acknowledgedPhase = confirmedCancelled ? "confirmed" : "requested";
+  const shouldCheck =
+    !retryLegacy && (cancelling || confirmedCancelled || displayed?.phase === "requested");
+  const submit = async () => {
+    if (!session || !relayUrl || current.current !== scope || sending.current === scope) return;
+    const input = {
+      accountId: session.accountId,
+      relayUrl,
+      threadId,
+      operationId: move.operationId,
+      sourceGeneration: move.sourceGeneration,
+    };
+    sending.current = scope;
+    setFeedback(
+      shouldCheck
+        ? { scope, phase: acknowledgedPhase, checking: true }
+        : { scope, phase: "sending" },
+    );
+    const reportFailure = (error: unknown) => {
+      setFeedback({
+        scope,
+        phase: shouldCheck ? acknowledgedPhase : "unknown",
+        error: error instanceof Error ? error.message : "Could not confirm cancellation.",
+      });
+    };
+    const acknowledge = (reply: ActiveMove) =>
+      setFeedback({ scope, phase: reply.phase === "aborted" ? "confirmed" : acknowledgedPhase });
+    try {
+      const result = await (shouldCheck ? checkMove : cancelMove)(input);
+      if (current.current !== scope) return;
+      if (result._tag === "Success") {
+        acknowledge(result.value);
+        return;
+      }
+      const failure = squashAtomCommandFailure(result);
+      if (shouldCheck) {
+        reportFailure(failure);
+        return;
+      }
+      const checked = await checkMove(input);
+      if (current.current !== scope) return;
+      if (
+        checked._tag === "Success" &&
+        ["aborting", "reopening", "aborted"].includes(checked.value.phase)
+      )
+        acknowledge(checked.value);
+      else reportFailure(failure);
+    } catch (error) {
+      if (current.current === scope) reportFailure(error);
+    } finally {
+      if (sending.current === scope) sending.current = null;
+    }
+  };
+  const pending = displayed?.checking || displayed?.phase === "sending";
+  return {
+    action:
+      session && relayUrl && (canCancel || cancelling)
+        ? {
+            label: shouldCheck
+              ? pending
+                ? "Checking…"
+                : "Check status"
+              : pending
+                ? "Cancelling…"
+                : retryLegacy || displayed?.phase === "unknown"
+                  ? "Retry cancellation"
+                  : "Cancel move",
+            pending,
+            onPress: () => void submit(),
+          }
+        : undefined,
+    confirmedCancelled,
+    phase: (canCancel || cancelling) && !confirmedCancelled ? displayedPhase : undefined,
+    error: canCancel || cancelling ? displayed?.error : undefined,
+  };
+}
+
+type ThreadMoveQueueItemProps = {
   environmentId: EnvironmentId;
   threadId: ThreadId;
   entry?: ThreadMoveQueueEntry | undefined;
@@ -97,11 +215,61 @@ export function ThreadMoveQueueItem({
   cancellation?: "sending" | "requested" | "unknown" | undefined;
   queuePaused?: boolean | undefined;
   disabled?: boolean | undefined;
-  onCancel?: () => void;
+  activeCancellationDisabled?: boolean | undefined;
+  onCancel?: (() => void) | undefined;
   children?: ReactNode;
-}) {
+};
+
+/** The same queue item is used in live chat and retained conversation history. */
+export function ThreadMoveQueueItem(props: ThreadMoveQueueItemProps) {
+  const { environmentId, threadId, entry, placement: knownPlacement } = props;
   const currentPlacement = useThreadMovePlacement(environmentId, threadId);
   const placement = currentPlacement ?? knownPlacement;
+  const move = activeThreadMove(placement);
+  const activeMove = move && (!entry || entry.operationId === move.operationId) ? move : null;
+  return activeMove ? (
+    <ActiveThreadMoveQueueItem {...props} placement={placement} move={activeMove} />
+  ) : (
+    <ThreadMoveQueueItemContent {...props} placement={placement} />
+  );
+}
+
+function ActiveThreadMoveQueueItem({
+  move,
+  ...props
+}: ThreadMoveQueueItemProps & { move: ActiveMove }) {
+  const cancellation = useActiveMoveCancellation(props.threadId, move);
+  return (
+    <ThreadMoveQueueItemContent
+      {...props}
+      disabled={props.activeCancellationDisabled}
+      onCancel={undefined}
+      activeCancellationAction={cancellation.action}
+      cancellation={cancellation.phase}
+      cancellationError={cancellation.error}
+      confirmedCancelled={cancellation.confirmedCancelled}
+    />
+  );
+}
+
+function ThreadMoveQueueItemContent({
+  environmentId,
+  threadId,
+  entry,
+  placement,
+  cancellation,
+  cancellationError,
+  activeCancellationAction,
+  confirmedCancelled,
+  queuePaused,
+  disabled,
+  onCancel,
+  children,
+}: ThreadMoveQueueItemProps & {
+  cancellationError?: string | undefined;
+  activeCancellationAction?: ReturnType<typeof useActiveMoveCancellation>["action"];
+  confirmedCancelled?: boolean;
+}) {
   const view = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
   const { environments } = useEnvironments();
   const ui = useThreadVmUi();
@@ -117,26 +285,42 @@ export function ThreadMoveQueueItem({
     error: view?.error,
   });
   if (!presentation) return null;
-  const { label, detail, tone, steps, step, completedSteps, waiting, outbound, cancelling } =
+  const { tone, steps, step, completedSteps, waiting, outbound, cancelling, activeMove } =
     presentation;
+  const label = confirmedCancelled ? "Move cancelled" : presentation.label;
+  const detail = confirmedCancelled ? "The source has reopened." : presentation.detail;
   const machineLabel = (id: string | undefined) =>
     environments.find((item) => item.environmentId === id)?.label ?? "Your machine";
   const sourceEnvironment = environments.find(
     (item) => item.environmentId === (presentation.sourceEnvironmentId ?? environmentId),
   );
-  const sourceIsVm = sourceEnvironment?.serverConfig?.environment.threadVm?.threadId === threadId;
-  const source = entry
-    ? sourceIsVm
-      ? "Private VM"
-      : (sourceEnvironment?.label ?? "Current location")
-    : "Current location";
-  const destination = entry
-    ? outbound
-      ? "Private VM"
-      : machineLabel(
-          entry.destination.kind === "environment" ? entry.destination.environmentId : undefined,
-        )
-    : "New location";
+  const sourceIsVm =
+    presentation.sourceIsVm ??
+    sourceEnvironment?.serverConfig?.environment.threadVm?.threadId === threadId;
+  const source =
+    entry || activeMove
+      ? sourceIsVm
+        ? "Private VM"
+        : (sourceEnvironment?.label ?? "Current location")
+      : "Current location";
+  const destinationId =
+    activeMove?.destinationEnvironmentId ??
+    (entry?.destination.kind === "environment" ? entry.destination.environmentId : undefined);
+  const destination =
+    entry || activeMove ? (outbound ? "Private VM" : machineLabel(destinationId)) : "New location";
+  const cancelAction =
+    activeCancellationAction ??
+    (onCancel
+      ? {
+          label: cancelling
+            ? "Cancelling…"
+            : cancellation === "unknown"
+              ? "Retry cancellation"
+              : "Cancel move",
+          pending: cancelling,
+          onPress: onCancel,
+        }
+      : undefined);
   return (
     <View
       className="my-1 gap-3 rounded-xl border border-border bg-card p-3"
@@ -152,17 +336,11 @@ export function ThreadMoveQueueItem({
           <SymbolView name={outbound ? "server.rack" : "laptopcomputer"} size={14} />
           <Text className="text-xs font-medium text-foreground">{destination}</Text>
         </View>
-        {entry && onCancel && (
+        {cancelAction && (
           <Action
-            label={
-              cancelling
-                ? "Cancelling…"
-                : cancellation === "unknown"
-                  ? "Retry cancellation"
-                  : "Cancel move"
-            }
-            disabled={disabled || cancelling}
-            onPress={onCancel}
+            label={cancelAction.label}
+            disabled={disabled || cancelAction.pending}
+            onPress={cancelAction.onPress}
           />
         )}
       </View>
@@ -170,7 +348,7 @@ export function ThreadMoveQueueItem({
         <View className="min-w-0 flex-1 gap-1" accessibilityLiveRegion="polite">
           <Text
             className={
-              tone === "danger"
+              !confirmedCancelled && tone === "danger"
                 ? "text-xs font-medium text-destructive"
                 : "text-xs font-medium text-foreground"
             }
@@ -178,16 +356,25 @@ export function ThreadMoveQueueItem({
             {label}
           </Text>
           {detail && <Text className="text-xs text-foreground-muted">{detail}</Text>}
+          {cancellationError && (
+            <Text accessibilityLiveRegion="polite" className="text-xs text-destructive">
+              {cancellationError}
+            </Text>
+          )}
         </View>
-        {presentation.ownsNotice && !waiting && !cancelling && ui?.moveAction && (
-          <Action
-            label={ui.moveAction.label}
-            disabled={ui.moveAction.disabled}
-            onPress={ui.moveAction.onPress}
-          />
-        )}
+        {presentation.ownsNotice &&
+          !waiting &&
+          !cancelling &&
+          !confirmedCancelled &&
+          ui?.moveAction && (
+            <Action
+              label={ui.moveAction.label}
+              disabled={ui.moveAction.disabled}
+              onPress={ui.moveAction.onPress}
+            />
+          )}
       </View>
-      {!waiting && (
+      {!waiting && !confirmedCancelled && (
         <View className="flex-row gap-2" accessibilityLabel="Move stages">
           {steps.map((name, index) => (
             <View key={name} className="flex-1 gap-1.5">
@@ -212,7 +399,7 @@ export function ThreadMoveQueueItem({
           errors={presentation.previousErrors}
         />
       )}
-      {!waiting && ui?.moveFeedback}
+      {!waiting && !confirmedCancelled && ui?.moveFeedback}
       {waiting && !cancelling && children && (
         <View className="flex-row flex-wrap gap-2">{children}</View>
       )}
@@ -340,6 +527,7 @@ export function SavedThreadQueue({
   environmentId,
   threadId,
   queue,
+  queueGeneration,
   placement,
   onChange,
   cancellation,
@@ -347,11 +535,17 @@ export function SavedThreadQueue({
   environmentId: EnvironmentId;
   threadId: ThreadId;
   queue: ThreadPromptQueue | undefined;
+  queueGeneration?: number | undefined;
   placement?: RelayPortableThreadPlacement | null | undefined;
   onChange: () => Promise<void>;
   cancellation: ReturnType<typeof useSavedThreadMoveCancellation>;
 }) {
-  const fallback = threadMoveQueueOwnership({ entries: queue?.entries, placement }).fallback;
+  const { entries, fallback } = threadMoveQueueRows({
+    entries: queue?.entries,
+    placement,
+    queueEnvironmentId: environmentId,
+    queueGeneration,
+  });
   return (
     <View>
       {fallback && (
@@ -361,7 +555,7 @@ export function SavedThreadQueue({
           placement={placement}
         />
       )}
-      {queue?.entries.map((entry) =>
+      {entries.map((entry) =>
         entry.kind === "move" ? (
           <ThreadMoveQueueItem
             key={entry.messageId}

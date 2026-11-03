@@ -303,6 +303,7 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(
     ThreadRelayCoordinator.layer.pipe(
       Layer.provide(ProviderSessionRuntime.layer),
+      Layer.provide(SetupProcessAdapter.layer.pipe(Layer.provide(ResourceMonitorBinary.layer))),
       Layer.provide(ProcessRunner.layer),
       Layer.provide(ServerSecretStore.layer),
       Layer.provide(ThreadExecutionLayerLive),

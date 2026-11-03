@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "./Layers/Sqlite.ts";
 import { makeCheckoutCapture } from "./CheckoutCapture.ts";
-import { runMigrations } from "./Migrations.ts";
+import { combinedReaderMarker, runMigrations } from "./Migrations.ts";
 
 const source = { checkoutRoot: "/workspace/source", gitCommonRoot: "/workspace/repository/.git" };
 const owner = { operationId: "move", threadId: "moving", environmentId: "source", generation: 1 };
@@ -209,6 +209,22 @@ describe("durable checkout capture admission", () => {
       yield* capture.release(owner, { outcome: "failed", expectedPhase: "capturing" });
     }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
+  it.effect("requires a same-host reboot after establishing a legacy capture baseline", () =>
+    Effect.gen(function* () {
+      const capture = makeCheckoutCapture(yield* SqlClient.SqlClient);
+      yield* capture.acquireDrain({ ...owner, ...source });
+      yield* capture.enterCapturing(owner);
+      const boot = { host: "source", session: "first" };
+      assert.isFalse(yield* capture.cancelAfterReboot(owner, boot));
+      assert.isFalse(yield* capture.cancelAfterReboot(owner, boot));
+      assert.isFalse(
+        yield* capture.cancelAfterReboot(owner, { host: "different", session: "second" }),
+      );
+      assert.equal((yield* capture.get(owner.operationId))?.phase, "capturing");
+      assert.isTrue(yield* capture.cancelAfterReboot(owner, { ...boot, session: "second" }));
+      assert.equal((yield* capture.get(owner.operationId))?.releaseOutcome, "cancelled");
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
   it.effect("waits for projected blockers and actual checkout operations before capture", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
@@ -380,7 +396,7 @@ describe("durable checkout capture admission", () => {
       const [marker] = yield* sql<{
         name: string;
       }>`SELECT name FROM effect_sql_migrations WHERE migration_id=1`;
-      assert.equal(marker?.name, "OrchestrationEvents_CheckoutCaptureReaderV1");
+      assert.equal(marker?.name, combinedReaderMarker);
       assert.lengthOf(yield* runMigrations(), 0);
     }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );

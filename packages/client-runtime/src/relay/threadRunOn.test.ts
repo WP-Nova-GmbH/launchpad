@@ -3,10 +3,12 @@ import {
   MessageId,
   ThreadId,
   EnvironmentId,
+  ProjectId,
   type ThreadMoveQueueEntry,
   type ThreadPromptQueue,
   type ThreadPromptQueueEntry,
 } from "@t3tools/contracts";
+import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
 import { describe, expect, it } from "vite-plus/test";
 import { threadRunOnStatus, threadRunOnTargetAvailability } from "./threadRunOn.ts";
 import type { ThreadMoveSubmission } from "./threadMoveSubmission.ts";
@@ -81,6 +83,52 @@ describe("threadRunOnStatus", () => {
     });
     expect(status?.phase).toBe("paused");
     expect(status?.detail).toBe("Paused by Vali");
+  });
+
+  it("shows the admitted VM-to-machine move instead of the retired machine's outbound queue", () => {
+    const activeMove = {
+      operationId: "return-move",
+      sourceEnvironmentId: "vm",
+      sourceGeneration: 2,
+      sourceKind: "vm",
+      destinationEnvironmentId: "source",
+      destinationProjectId: "original-project",
+      destinationKind: "environment",
+      phase: "reopening",
+      cancellationMode: "legacy",
+    } as const;
+    const placement = {
+      threadId: "thread",
+      organizationId: "org",
+      repositoryId: "repo",
+      ownerUserId: "user",
+      environmentId: "vm",
+      projectId: "vm-project",
+      generation: 2,
+      operationId: null,
+      activeMove,
+    } satisfies RelayPortableThreadPlacement;
+    const retiredQueue = {
+      ...queue,
+      entries: [{ ...move, state: "blocked", detail: "Old move failed" }],
+    } satisfies typeof queue;
+    const scope = { queueEnvironmentId: "source", queueGeneration: 1, saved };
+    expect(threadRunOnStatus({ ...scope, queue: retiredQueue, placement })).toMatchObject({
+      phase: "cancelling",
+      title: "Reopening source…",
+      destination: {
+        kind: "environment",
+        environmentId: EnvironmentId.make("source"),
+        projectId: ProjectId.make("original-project"),
+      },
+    });
+    expect(
+      threadRunOnStatus({
+        ...scope,
+        queue: retiredQueue,
+        placement: { ...placement, activeMove: { ...activeMove, phase: "aborted" } },
+      }),
+    ).toBeNull();
   });
 
   it("distinguishes unknown replies, accepted awaiting projection and rejected requests", () => {

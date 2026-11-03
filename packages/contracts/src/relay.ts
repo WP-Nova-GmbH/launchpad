@@ -21,6 +21,7 @@ export {
 import { ThreadMoveParticipantState } from "./threadMoveProgress.ts";
 import {
   RelayPortableThreadPlacement,
+  RelayThreadActiveMove,
   RelayThreadCurrentQueue,
   ThreadVmCapabilities,
   RelayThreadHistoryPage,
@@ -131,6 +132,7 @@ import {
   IsoDateTime,
   CommandId,
   EnvironmentId,
+  MessageId,
   NonNegativeInt,
   PositiveInt,
   ProjectId,
@@ -765,6 +767,7 @@ export type RelayTenancyForbiddenReason = typeof RelayTenancyForbiddenReason.Typ
 
 export const RelayTenancyNotFoundReason = Schema.Literals([
   "thread_not_found",
+  "thread_move_not_found",
   "member_not_found",
   "repository_not_found",
   "alias_not_found",
@@ -3670,6 +3673,8 @@ export const RelayThreadMove = Schema.Struct({
   actorUserId: TrimmedNonEmptyString,
   sourceEnvironmentId: EnvironmentId,
   expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
+  sourceReopenRequired: Schema.optionalKey(Schema.Boolean),
+  sourceReopened: Schema.optionalKey(Schema.Boolean),
   destinationEnvironmentId: EnvironmentId,
   destinationProjectId: ProjectId,
   repositoryCanonicalKeys: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString)),
@@ -3746,6 +3751,8 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           destinationEnvironmentId: EnvironmentId,
           destinationProjectId: ProjectId,
           sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+          supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+          sourceMessageId: Schema.optionalKey(MessageId),
         }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
@@ -3761,6 +3768,8 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
           actorUserId: TrimmedNonEmptyString,
           cancelBeforeStart: Schema.Boolean,
           sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+          supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+          sourceMessageId: Schema.optionalKey(MessageId),
         }),
         success: Schema.Union([
           Schema.Struct({ status: Schema.Literal("accepted"), move: RelayThreadMove }),
@@ -3784,7 +3793,10 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
       "/v1/environments/:environmentId/threads/:threadId/moves/:operationId",
       {
         params: RelayThreadMoveParams,
-        payload: Schema.Struct(RelayThreadGeneration),
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+        }),
         success: RelayThreadMove,
         error: RelayTenancyErrors,
       },
@@ -3889,11 +3901,50 @@ const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
         error: RelayTenancyErrors,
       },
     ),
+    HttpApiEndpoint.post(
+      "sourceReopened",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/reopened",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "reopenBlocked",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/reopen-blocked",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          reason: Schema.Literals(["capture_stop_unconfirmed", "source_reopen_failed"]),
+        }),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
   )
   .middleware(RelayEnvironmentAuth);
 
 const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
   .add(
+    HttpApiEndpoint.post("cancelMove", "/v1/threads/:threadId/moves/:operationId/cancel", {
+      params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ sourceGeneration: PositiveInt }),
+      success: RelayThreadActiveMove,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getMoveCancellation", "/v1/threads/:threadId/moves/:operationId/cancel", {
+      params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({
+        sourceGeneration: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0)),
+      }),
+      success: RelayThreadActiveMove,
+      error: RelayTenancyErrors,
+    }),
     HttpApiEndpoint.post("stage", "/v1/threads/:threadId/commands", {
       params: Schema.Struct({ threadId: ThreadId }),
       headers: RelayBearerRequestHeaders,
@@ -5018,6 +5069,8 @@ export type RelayApi = typeof RelayApi;
 export {
   RelayThreadPendingCommandPage,
   RelayPortableThreadPlacement,
+  RelayThreadActiveMove,
+  ThreadMoveCancellationBlocker,
   RelayPrivateThreadPlacement,
   RelayWorkflowThreadPlacement,
   RelayPreparingWorkflowThreadPlacement,

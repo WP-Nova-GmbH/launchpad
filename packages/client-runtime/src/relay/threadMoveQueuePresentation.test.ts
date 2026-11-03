@@ -8,10 +8,15 @@ import {
   ProviderInstanceId,
   type ThreadMoveQueueEntry,
 } from "@t3tools/contracts";
-import type { RelayPortableThreadPlacement, RelayThreadVmStatus } from "@t3tools/contracts/relay";
+import type {
+  RelayPortableThreadPlacement,
+  RelayThreadActiveMove,
+  RelayThreadVmStatus,
+} from "@t3tools/contracts/relay";
 import {
   threadMoveQueuePresentation,
   threadMoveQueueOwnership,
+  threadMoveQueueRows,
 } from "./threadMoveQueuePresentation.ts";
 import { refreshSavedConversation } from "./portableThreadLibrary.ts";
 
@@ -67,7 +72,119 @@ const status: RelayThreadVmStatus = {
   lastVerifiedBackupAt: null,
 };
 
+const returnMove: RelayThreadActiveMove = {
+  operationId: "return",
+  sourceEnvironmentId: "vm",
+  sourceGeneration: 3,
+  sourceKind: "vm",
+  destinationEnvironmentId: "mac",
+  destinationProjectId: "project",
+  destinationKind: "environment",
+  phase: "preparing",
+  cancellationMode: "direct",
+};
+const returnPlacement: RelayPortableThreadPlacement = {
+  ...placement,
+  environmentId: "vm",
+  generation: 3,
+  operationId: "return",
+  moveProgress: [],
+  moveFailureDetail: "Could not save the current Codex history.",
+  activeMove: returnMove,
+};
+
 describe("move queue presentation", () => {
+  it("renders the failed return move without using the retired Mac queue or waiting for progress", () => {
+    expect(
+      threadMoveQueueRows({
+        entries: [entry],
+        placement: returnPlacement,
+        queueEnvironmentId: "mac",
+        queueGeneration: 2,
+      }),
+    ).toEqual({ entries: [], fallback: true });
+    expect(threadMoveQueuePresentation({ placement: returnPlacement, status })).toMatchObject({
+      label: "Move needs attention",
+      activeMove: returnMove,
+      sourceIsVm: true,
+      outbound: false,
+      cancelling: false,
+    });
+  });
+
+  it("keeps cancellation visible through source reopening and then hides the exact cancelled row", () => {
+    const claimed = { ...entry, operationId: CommandId.make(returnMove.operationId) };
+    const reopening: RelayPortableThreadPlacement = {
+      ...returnPlacement,
+      operationId: null,
+      activeMove: {
+        ...returnMove,
+        phase: "reopening",
+        cancellationMode: "legacy",
+        cancellationBlocker: "capture_stop_unconfirmed",
+      },
+    };
+    expect(threadMoveQueueRows({ entries: [claimed], placement: reopening })).toEqual({
+      entries: [claimed],
+      fallback: false,
+    });
+    expect(
+      threadMoveQueuePresentation({
+        entry: claimed,
+        placement: reopening,
+        cancellation: "unknown",
+      }),
+    ).toMatchObject({
+      label: "Reopening source…",
+      detail: "Waiting to confirm the save stopped. If this persists, restart the source machine.",
+      cancelling: true,
+    });
+    expect(
+      threadMoveQueueRows({
+        entries: [claimed, entry],
+        placement: { ...reopening, activeMove: { ...returnMove, phase: "aborted" } },
+      }),
+    ).toEqual({ entries: [entry], fallback: false });
+  });
+
+  it("hides the pending snapshot of an admitted move and preserves later moves to the same destination", () => {
+    const { operationId: _claimed, ...base } = entry;
+    const pending: ThreadMoveQueueEntry = { ...base, state: "pending" };
+    const later: ThreadMoveQueueEntry = { ...pending, messageId: MessageId.make("later") };
+    const activeMove: RelayThreadActiveMove = {
+      ...returnMove,
+      operationId: "move",
+      sourceEnvironmentId: "mac",
+      sourceGeneration: 2,
+      sourceKind: "environment",
+      sourceMessageId: pending.messageId,
+      destinationEnvironmentId: "vm",
+      destinationKind: "vm",
+    };
+    const rows = (entries: readonly ThreadMoveQueueEntry[], move: RelayThreadActiveMove) =>
+      threadMoveQueueRows({
+        entries,
+        placement: {
+          ...placement,
+          operationId: move.phase === "aborted" ? null : "move",
+          activeMove: move,
+        },
+        queueEnvironmentId: "mac",
+        queueGeneration: 2,
+      });
+    expect(rows([pending, later], activeMove)).toEqual({ entries: [later], fallback: true });
+    expect(rows([later], activeMove)).toEqual({ entries: [later], fallback: true });
+    expect(rows([pending, later], { ...activeMove, phase: "aborted" })).toEqual({
+      entries: [later],
+      fallback: false,
+    });
+    const { sourceMessageId: _absent, ...legacy } = activeMove;
+    expect(rows([pending, later], { ...legacy, cancellationMode: "legacy" })).toEqual({
+      entries: [later],
+      fallback: true,
+    });
+  });
+
   it("shows worker account waits neutrally and returns to real progress without stale auth errors", () => {
     const pending = {
       ...status,

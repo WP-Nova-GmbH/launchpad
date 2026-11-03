@@ -903,6 +903,112 @@ describe("ProviderCommandReactor", () => {
   );
 
   effectIt.effect(
+    "keeps following prompts queued until the cancelled move's source reopening is acknowledged",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const movingThread = ThreadId.make("thread-1");
+          const otherThread = ThreadId.make("other-thread");
+          const resumed = yield* Deferred.make<void>();
+          const independent = yield* Deferred.make<void>();
+          const harness = yield* Effect.promise(() =>
+            createHarness({
+              sendTurnEffect: (request, callbacks) =>
+                Effect.gen(function* () {
+                  const result = {
+                    threadId: request.threadId,
+                    turnId: TurnId.make(`reopened-${request.threadId}`),
+                  };
+                  if (callbacks) yield* callbacks.onAdmitted(result, "provider-ack");
+                  yield* Deferred.succeed(
+                    request.threadId === movingThread ? resumed : independent,
+                    undefined,
+                  );
+                  return result;
+                }),
+            }),
+          );
+          const checkoutRoot = NodeFS.realpathSync(harness.stateDir);
+          const at = "2026-01-01T00:00:00.000Z";
+          yield* harness.engine.dispatch({
+            type: "project.meta.update",
+            commandId: CommandId.make("source-reopen-checkout"),
+            projectId: ProjectId.make("project-1"),
+            workspaceRoot: checkoutRoot,
+          });
+          yield* harness.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("other-thread-create"),
+            threadId: otherThread,
+            projectId: ProjectId.make("project-1"),
+            title: "Unrelated prompt",
+            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            createdAt: at,
+          });
+          const owner = {
+            threadId: movingThread,
+            projectId: "project-1",
+            relayUrl: "https://relay.example",
+            environmentId: "source",
+            generation: 2,
+            operationId: "return-move",
+          };
+          const fences = makeThreadExecutionFence(harness.sql);
+          yield* fences.prepare(owner);
+          yield* fences.activate(owner);
+          yield* harness.sql`INSERT INTO thread_move_source_reopens
+            (operation_id,thread_id,relay_url,environment_id,generation,message_id)
+            VALUES (${owner.operationId},${owner.threadId},${owner.relayUrl},${owner.environmentId},${owner.generation},'removed-move')`;
+          const readMovingQueue = yield* Deferred.make<void>();
+          const read = harness.snapshotQuery.getThreadDetailById;
+          const spy = vi
+            .spyOn(harness.snapshotQuery, "getThreadDetailById")
+            .mockImplementation((...args) =>
+              read(...args).pipe(
+                Effect.tap((thread) =>
+                  Option.isSome(thread) && thread.value.id === movingThread
+                    ? Deferred.succeed(readMovingQueue, undefined)
+                    : Effect.void,
+                ),
+              ),
+            );
+          for (const threadId of [movingThread, otherThread])
+            yield* harness.engine.dispatch({
+              type: "thread.prompt.enqueue",
+              commandId: CommandId.make(`enqueue-${threadId}`),
+              threadId,
+              message: {
+                messageId: MessageId.make(`message-${threadId}`),
+                text: "continue work",
+                attachments: [],
+              },
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              createdAt: at,
+            });
+          yield* Deferred.await(readMovingQueue);
+          yield* Deferred.await(independent);
+          yield* Effect.promise(harness.drain);
+          spy.mockRestore();
+          expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+          const pending = (yield* Effect.promise(harness.readModel)).threads.find(
+            (thread) => thread.id === movingThread,
+          );
+          expect(pending?.promptQueue).toMatchObject({ enabled: true, pauseReason: null });
+          expect(pending?.promptQueue?.entries[0]?.state).toBe("pending");
+          yield* harness.sql`DELETE FROM thread_move_source_reopens WHERE operation_id=${owner.operationId}`;
+          yield* notifyCheckoutCaptureReleased(harness.sql, checkoutRoot);
+          yield* Deferred.await(resumed);
+          expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+        }),
+      ),
+  );
+
+  effectIt.effect(
     "a checkout release skips unreadable unrelated roots and wakes aliased queues",
     () =>
       Effect.scoped(

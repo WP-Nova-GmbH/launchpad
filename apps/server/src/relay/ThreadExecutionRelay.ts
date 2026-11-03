@@ -6,8 +6,13 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   makeThreadExecutionFence,
   ThreadExecutionFenceError,
+  threadMoveSourceReopening,
 } from "../persistence/ThreadExecutionFence.ts";
-import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
+import {
+  CheckoutAdmission,
+  CheckoutCaptureError,
+  makeCheckoutCapture,
+} from "../persistence/CheckoutCapture.ts";
 
 export class ThreadExecutionRelayError extends Schema.TaggedError<ThreadExecutionRelayError>()(
   "ThreadExecutionRelayError",
@@ -139,6 +144,11 @@ export function makeThreadExecutionRelay(
     const prior = yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* recheckScope(input.threadId, scope);
+        if (yield* threadMoveSourceReopening(sql, input.threadId))
+          return yield* new CheckoutCaptureError({
+            message: "Waiting for the relay to confirm the thread reopened after cancellation.",
+            waitingForCheckout: true,
+          });
         const admitted = yield* captures.admit({
           ...input,
           ...scope,

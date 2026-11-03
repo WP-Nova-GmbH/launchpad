@@ -61,6 +61,24 @@ const fixture = Effect.gen(function* () {
   return { sql, fence, remote, authority };
 });
 describe("portable execution handshake", () => {
+  it.effect("blocks portable work without reserving it until cancellation is acknowledged", () =>
+    Effect.gen(function* () {
+      const { sql, fence, remote, authority } = yield* fixture;
+      yield* fence.beginDrain(move);
+      yield* fence.activate(move);
+      yield* sql`INSERT INTO thread_move_source_reopens VALUES
+        (${move.operationId},${move.threadId},${enrollment.relayUrl},${enrollment.environmentId},${move.generation},'message')`;
+      const relay = makeThreadExecutionRelay(sql, authority);
+      const terminal = { ...work, kind: "terminal" as const, workId: "during-reopen" };
+      assert.propertyVal(yield* Effect.flip(relay.begin(terminal)), "waitingForCheckout", true);
+      assert.deepEqual(yield* sql`SELECT * FROM thread_execution_work`, []);
+      assert.deepEqual(yield* sql`SELECT * FROM checkout_work_admissions`, []);
+      assert.equal(remote.size, 0);
+      yield* sql`DELETE FROM thread_move_source_reopens`;
+      assert.equal(yield* relay.begin(terminal), "start");
+      assert.isTrue(remote.has("terminal:during-reopen"));
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
   it.effect.each(["thread", "ordinary"] as const)(
     "keeps a held rejected reply retryable until %s admits another invocation",
     (threadId) =>

@@ -11,6 +11,7 @@ import {
 } from "../../mcp/IssueTrackerApprovalBroker.ts";
 import { withWorkspaceLease } from "../../workspace/workspaceLease.ts";
 import { CheckoutAdmission, makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
+import { threadMoveSourceReopening } from "../../persistence/ThreadExecutionFence.ts";
 import { checkoutCaptureReleases } from "../../workspace/CheckoutCaptureSignals.ts";
 import { resolveCheckoutPath } from "../../workspace/CheckoutAccess.ts";
 import {
@@ -2390,6 +2391,12 @@ const make = Effect.gen(function* () {
     const thread = yield* readPromptThread(threadId);
     const queue = thread?.promptQueue;
     if (!thread || !queue || thread.archivedAt !== null) return;
+    // Move cancellation may remove the local head before the relay permits execution.
+    if (
+      (queue.handoff || (queue.entries.length > 0 && queue.entries[0]?.kind !== "move")) &&
+      (yield* threadMoveSourceReopening(sql, threadId))
+    )
+      return;
     if (queue.handoff) {
       if (
         queue.entries.some((entry) => entry.state === "unknown") ||

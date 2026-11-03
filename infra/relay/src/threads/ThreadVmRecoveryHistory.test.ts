@@ -23,6 +23,7 @@ import {
 } from "./testUtils/attachmentCheckpointCatalog.ts";
 import { nativeCheckpointCatalogTestLayer } from "./testUtils/nativeCheckpointCatalog.ts";
 import { makeThreadVmRecoveryHistory } from "./ThreadVmRecoveryHistory.ts";
+import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 
 const decode = Schema.decodeUnknownSync(OrchestrationEvent),
   at = "2026-10-15T00:00:00.000Z";
@@ -336,6 +337,57 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               yield* f.sql`UPDATE relay_thread_history_watermarks SET source_sequence=${f.sourceSequence} WHERE thread_id=${f.threadId} AND generation=1`;
               yield* f.sql`INSERT INTO relay_thread_history_watermarks(thread_id,environment_id,generation,source_sequence) VALUES(${f.threadId},${f.sourceEnvironmentId},3,${f.sourceSequence + 1})`;
               yield* Effect.flip(f.history.inspect(f.input));
+            }),
+          ),
+      );
+      it.effect(
+        "keeps relay-only cancellation acknowledgements out of recovered engine history",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture;
+              const placements = makeThreadPlacementStore(f.sql);
+              const placement = (yield* placements.get(f.threadId))!;
+              const move = yield* placements.beginMove({
+                threadId: f.threadId,
+                operationId: NodeCrypto.randomUUID(),
+                actorUserId: placement.ownerUserId,
+                sourceEnvironmentId: f.sourceEnvironmentId,
+                expectedGeneration: 1,
+                destinationEnvironmentId: "cancelled-destination",
+                destinationProjectId: "cancelled-project",
+                supportsSourceReopenAck: true,
+              });
+              const request = {
+                threadId: f.threadId,
+                actor: { userId: placement.ownerUserId, displayName: null, imageUrl: null },
+                command: decodeCommand({
+                  type: "thread.move.cancel",
+                  commandId: NodeCrypto.randomUUID(),
+                  threadId: f.threadId,
+                  messageId: NodeCrypto.randomUUID(),
+                  expectedRevision: 1,
+                  createdAt: at,
+                }),
+              };
+              const staged = yield* f.journal.stage(request);
+              yield* placements.requestAbort({
+                threadId: f.threadId,
+                operationId: move.operationId,
+              });
+              const admitted = yield* f.journal.acceptMoveCancellationRequest({
+                ...f.owner,
+                operationId: move.operationId,
+                commandId: request.command.commandId,
+              });
+              expect(admitted?.receipt?.status).toBe("accepted");
+              yield* placements.destinationRemoved(move);
+              yield* placements.sourceReopened({ ...f.owner, operationId: move.operationId });
+              expect(yield* f.journal.stage(request)).toEqual(admitted);
+              expect(yield* f.journal.next(f.owner)).toBeNull();
+              expect((yield* f.history.inspect(f.input)).throughCommandPosition).toBe(
+                staged?.position,
+              );
             }),
           ),
       );

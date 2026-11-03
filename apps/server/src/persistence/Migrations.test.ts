@@ -322,6 +322,7 @@ it.effect("upgrades workflow ownership without changing accepted jobs", () =>
       [87, "ThreadMoveAttempts"],
       [88, "CheckoutOperationBoot"],
       [89, "WorkflowExecutionBinding"],
+      [90, "ThreadMoveSourceReopens"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM repository_workflow_jobs`, [
       {
@@ -394,6 +395,7 @@ it.effect(
         [87, "ThreadMoveAttempts"],
         [88, "CheckoutOperationBoot"],
         [89, "WorkflowExecutionBinding"],
+        [90, "ThreadMoveSourceReopens"],
       ]);
       const rows = yield* sql<{
         state: string;
@@ -448,6 +450,7 @@ it.effect("V4 upgrade preserves cleanup proof and blocks old PID-only fence read
       [87, "ThreadMoveAttempts"],
       [88, "CheckoutOperationBoot"],
       [89, "WorkflowExecutionBinding"],
+      [90, "ThreadMoveSourceReopens"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT record_json FROM setup_processes`, [
       { record_json: record },
@@ -482,6 +485,7 @@ it.effect(
         [87, "ThreadMoveAttempts"],
         [88, "CheckoutOperationBoot"],
         [89, "WorkflowExecutionBinding"],
+        [90, "ThreadMoveSourceReopens"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT record_json FROM repository_workflow_jobs`, [
         { record_json: record },

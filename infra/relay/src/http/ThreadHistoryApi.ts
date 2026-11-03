@@ -1,5 +1,6 @@
 import type { CommandId } from "@t3tools/contracts";
 import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
+import { threadMoveClientStatus } from "../threads/ThreadMoveClientStatus.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { makeThreadCurrentQueueStore } from "../threads/ThreadCurrentQueueStore.ts";
 import { threadVmQuotaUsage } from "../threads/ThreadVmQuota.ts";
@@ -175,10 +176,21 @@ export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.pl
     return yield* withPrivateThreadAccess(threadId, "read", (placement) =>
       Effect.gen(function* () {
         const sql = (yield* RelayDb).$client;
-        const move = placement.operationId
+        const [recentCancellation] =
+          placement.operationId === null
+            ? yield* sql<{ operationId: string }>`SELECT m.operation_id AS "operationId"
+              FROM relay_thread_moves m LEFT JOIN relay_thread_commands c
+                ON c.thread_id=m.thread_id AND c.command_id=m.legacy_cancel_command_id
+              WHERE m.thread_id=${threadId} AND m.source_environment_id=${placement.environmentId}
+                AND m.expected_generation=${placement.generation} AND m.phase='aborted'
+                AND (m.source_reopened_at IS NOT NULL OR c.admitted_at IS NOT NULL)
+              ORDER BY coalesce(m.source_reopened_at,c.admitted_at) DESC, m.operation_id DESC LIMIT 1`
+            : [];
+        const operationId = placement.operationId ?? recentCancellation?.operationId;
+        const move = operationId
           ? yield* makeThreadPlacementStore(sql).findMove({
               threadId,
-              operationId: placement.operationId,
+              operationId,
             })
           : null;
         const previousLocations = yield* sql<{
@@ -188,8 +200,9 @@ export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.pl
         return {
           ...placement,
           previousLocations,
-          moveFailureDetail: move?.failureDetail ?? null,
-          moveFailures: move?.moveFailures ?? [],
+          activeMove: move ? yield* threadMoveClientStatus(sql, move) : null,
+          moveFailureDetail: placement.operationId ? (move?.failureDetail ?? null) : null,
+          moveFailures: placement.operationId ? (move?.moveFailures ?? []) : [],
           moveProgress: placement.operationId
             ? yield* makeThreadMoveProgressStore(sql).read(placement.operationId)
             : [],

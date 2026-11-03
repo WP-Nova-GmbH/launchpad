@@ -1,4 +1,7 @@
-import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
+import {
+  activeThreadMove,
+  threadMoveQueueRows,
+} from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import {
   squashAtomCommandFailure,
   type AtomCommandResult,
@@ -120,7 +123,9 @@ type SharedPromptQueueProps = {
   ref?: Ref<SharedPromptQueueHandle>;
   environmentId: EnvironmentId;
   threadId: ThreadId;
-  queue: ThreadPromptQueue;
+  queue?: ThreadPromptQueue | undefined;
+  queueGeneration?: number | undefined;
+  queueRetired?: boolean | undefined;
   activeTurnId: TurnId | null;
   unavailable: boolean;
   workflowControlled?: boolean;
@@ -136,13 +141,24 @@ export interface SharedPromptQueueHandle {
 
 export function SharedPromptQueue(props: SharedPromptQueueProps) {
   const account = useAtomValue(managedRelaySessionAtom);
+  const placement = useThreadMovePlacement(props.environmentId, props.threadId);
   const scope = JSON.stringify([
     account?.accountId ?? null,
     threadMoveRelayUrl(),
     props.environmentId,
     props.threadId,
   ]);
-  return <SharedPromptQueueContent key={scope} {...props} />;
+  if (!props.queue)
+    return activeThreadMove(placement) && !props.workflowControlled ? (
+      <ThreadMoveQueueItem
+        environmentId={props.environmentId}
+        threadId={props.threadId}
+        placement={placement}
+      />
+    ) : null;
+  return (
+    <SharedPromptQueueContent key={scope} {...props} queue={props.queue} placement={placement} />
+  );
 }
 
 function SharedPromptQueueContent({
@@ -150,15 +166,25 @@ function SharedPromptQueueContent({
   environmentId,
   threadId,
   queue,
+  queueGeneration,
+  queueRetired = false,
+  placement,
   activeTurnId,
   unavailable,
   workflowControlled = false,
   supportsPreparation = false,
   hasStartedTurn = false,
   visibleEntries = queue.entries,
-}: SharedPromptQueueProps) {
-  const placement = useThreadMovePlacement(environmentId, threadId);
-  const fallbackMove = threadMoveQueueOwnership({ entries: queue.entries, placement }).fallback;
+}: SharedPromptQueueProps & {
+  queue: ThreadPromptQueue;
+  placement: ReturnType<typeof useThreadMovePlacement>;
+}) {
+  const { entries: visibleQueueEntries, fallback: fallbackMove } = threadMoveQueueRows({
+    entries: queueRetired ? queue.entries.filter((entry) => entry.kind !== "move") : queue.entries,
+    placement,
+    queueEnvironmentId: environmentId,
+    queueGeneration,
+  });
   const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
   const getCommandReceipt = useAtomCommand(threadEnvironment.getCommandReceipt, {
     reportFailure: false,
@@ -225,7 +251,14 @@ function SharedPromptQueueContent({
   const canReorder =
     queue.handoff === null && queue.entries.every((entry) => entry.state === "pending");
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
-  const disabled = unavailable || busy || workflowControlled;
+  const disabled =
+    unavailable ||
+    busy ||
+    workflowControlled ||
+    queueRetired ||
+    (placement != null &&
+      (placement.environmentId !== environmentId ||
+        (queueGeneration !== undefined && placement.generation !== queueGeneration)));
   const preparation = queue.preparation;
   const blockedByPreparation = preparation !== undefined && preparation.state !== "ready";
   const setupActive =
@@ -324,8 +357,11 @@ function SharedPromptQueueContent({
     },
   }));
   const visibleIds = new Set(visibleEntries.map((entry) => entry.messageId));
+  const visibleCount = visibleQueueEntries.filter((entry) =>
+    visibleIds.has(entry.messageId),
+  ).length;
   const hasQueueChrome =
-    visibleEntries.length > 0 ||
+    visibleCount > 0 ||
     queue.pauseReason !== null ||
     blockedByPreparation ||
     fallbackMove ||
@@ -340,7 +376,7 @@ function SharedPromptQueueContent({
       {hasQueueChrome ? (
         <View className="mb-2 flex-row items-center justify-between gap-2">
           <Text className="font-t3-medium text-sm text-foreground">
-            Queued {visibleEntries.length + (fallbackMove ? 1 : 0)}
+            Queued {visibleCount + (fallbackMove ? 1 : 0)}
           </Text>
           {queue.pauseReason === null || setupActive ? (
             <QueueButton
@@ -478,9 +514,10 @@ function SharedPromptQueueContent({
           environmentId={environmentId}
           threadId={threadId}
           placement={placement}
+          activeCancellationDisabled={workflowControlled}
         />
       )}
-      {queue.entries.map((entry, index) =>
+      {visibleQueueEntries.map((entry, index) =>
         !visibleIds.has(entry.messageId) ? null : entry.kind === "move" ? (
           <ThreadMoveQueueItem
             key={entry.messageId}
@@ -491,6 +528,7 @@ function SharedPromptQueueContent({
             queuePaused={!queue.enabled || queue.pauseReason !== null}
             cancellation={cancellation.phase(cancellationScope, entry.messageId)}
             disabled={disabled}
+            activeCancellationDisabled={workflowControlled}
             onCancel={() => void requestCancellation(entry)}
           >
             <QueueButton

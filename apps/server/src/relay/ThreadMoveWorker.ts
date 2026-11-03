@@ -43,6 +43,7 @@ import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
+import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
 import { resolveCheckoutPath } from "../workspace/CheckoutAccess.ts";
 import { notifyCheckoutCaptureReleased } from "../workspace/CheckoutCaptureSignals.ts";
 import {
@@ -121,6 +122,12 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   const vmAuth = yield* Effect.serviceOption(ThreadVmProviderAuth);
   const environmentIdentity = yield* ServerEnvironmentIdentity;
   const terminals = yield* TerminalManager;
+  const processes = yield* Effect.serviceOption(SetupProcessAdapter);
+  const captureBoot = yield* Effect.cached(
+    Option.isSome(processes)
+      ? processes.value.host.pipe(Effect.orElseSucceed(() => null))
+      : Effect.succeed(null),
+  );
   const execution = yield* ThreadExecution;
   const repositories = yield* RepositoryIdentityResolver;
   const archive = makeThreadTransferArchive(sql, yield* OrchestrationEventStore);
@@ -299,26 +306,32 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     outcome: "failed" | "cancelled",
   ) {
     const hold = yield* captures.get(owner.operationId);
-    if (!hold || hold.phase === "released") return;
+    if (!hold || hold.phase === "released") return true;
     // A persisted capture can outlive its process reply. Cancellation must not
     // reopen the checkout while that copy's completion is still uncertain.
     if (hold.phase === "capturing") {
-      const target = operationPath(owner, "source");
-      if (!(yield* fs.exists(target))) return;
-      // The final rename follows export verification and the artifact-tree
-      // durability receipt. Recover a crash before the SQL seal receipt.
-      const saved = yield* inspectArchive(owner, target);
-      yield* verifySourceOwner(owner, saved);
-      yield* syncArchiveParent(target);
-      yield* captures.release(owner, { outcome: "sealed", manifestSha256: saved.sha256 });
+      const rebooted =
+        outcome === "cancelled" && (yield* captures.cancelAfterReboot(owner, yield* captureBoot));
+      if (!rebooted) {
+        const target = operationPath(owner, "source");
+        if (!(yield* fs.exists(target))) return false;
+        // The final rename follows export verification and the artifact-tree
+        // durability receipt. Recover a crash before the SQL seal receipt.
+        const saved = yield* inspectArchive(owner, target);
+        yield* verifySourceOwner(owner, saved);
+        yield* syncArchiveParent(target);
+        yield* captures.release(owner, { outcome: "sealed", manifestSha256: saved.sha256 });
+      }
     } else yield* captures.release(owner, { outcome });
     yield* notifyCheckoutCaptureReleased(sql, hold.checkoutRoot);
+    return true;
   });
   const enterCapture = Effect.fnUntraced(function* (
     owner: ThreadMoveOwner,
     prepared: Effect.Success<ReturnType<typeof prepareCapture>>,
   ) {
     const live = yield* provider.listSessions();
+    const boot = yield* captureBoot;
     const ids = prepared.sharedThreadIds;
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -448,7 +461,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             waitingForCheckout: true,
           });
         }
-        return yield* captures.enterCapturing(owner);
+        return yield* captures.enterCapturing(owner, { boot });
       }),
     );
   });
@@ -471,6 +484,102 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       createdAt: yield* now,
     });
   });
+  const sourceReopenMessageId = Effect.fnUntraced(function* (owner: ThreadMoveOwner) {
+    const [receipt] = yield* sql<{ messageId: string }>`SELECT message_id AS "messageId"
+      FROM thread_move_source_reopens WHERE operation_id=${owner.operationId}
+      AND thread_id=${owner.threadId} AND relay_url=${owner.relayUrl}
+      AND environment_id=${owner.environmentId} AND generation=${owner.generation}`;
+    return receipt?.messageId;
+  });
+  const reportSourceReopenFailure = (owner: ThreadMoveOwner, error: unknown) =>
+    Effect.logWarning("Could not prove cancelled move source reopening", {
+      threadId: owner.threadId,
+      operationId: owner.operationId,
+      error,
+    }).pipe(
+      Effect.andThen(transport.reopenBlocked(owner, "source_reopen_failed").pipe(Effect.ignore)),
+    );
+  const confirmLocalSourceReopen = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    messageId: string,
+  ) {
+    const current = yield* fences.get(owner.threadId);
+    const hold = yield* captures.get(owner.operationId);
+    if (
+      current?.phase !== "active" ||
+      current.operationId !== owner.operationId ||
+      current.relayUrl !== owner.relayUrl ||
+      current.environmentId !== owner.environmentId ||
+      current.generation !== owner.generation ||
+      (hold && hold.phase !== "released")
+    )
+      return yield* fail(owner.threadId, "The cancelled move's source is not ready to reopen.");
+    const state = yield* readQueue(owner.threadId);
+    if (!state) return yield* fail(owner.threadId, "The cancelled move's queue is unavailable.");
+    const entry = state.queue.entries.find((candidate) => candidate.messageId === messageId);
+    if (entry) {
+      if (
+        entry.kind !== "move" ||
+        entry.operationId !== owner.operationId ||
+        state.queue.entries[0] !== entry
+      )
+        return yield* fail(owner.threadId, "The cancelled move's queue entry changed.");
+      if (entry.state !== "cancelling")
+        yield* engine.dispatch(
+          {
+            type: "thread.move.cancel",
+            threadId: ThreadId.make(owner.threadId),
+            commandId: CommandId.make(`${owner.operationId}:source-reopen:${entry.revision}`),
+            messageId: entry.messageId,
+            expectedRevision: entry.revision,
+            createdAt: yield* now,
+          },
+          { expectedThreadOwnership: owner },
+        );
+      yield* finish(owner, "cancelled");
+      const finished = yield* readQueue(owner.threadId);
+      if (
+        !finished ||
+        finished.queue.entries.some((candidate) => candidate.messageId === messageId)
+      )
+        return yield* fail(owner.threadId, "The cancelled move's queue entry was not cleared.");
+    }
+    return hold;
+  });
+  const acknowledgeSourceReopen = Effect.fn("ThreadMoveWorker.acknowledgeSourceReopen")(function* (
+    owner: ThreadMoveOwner,
+    messageId: string,
+  ) {
+    const hold = yield* confirmLocalSourceReopen(owner, messageId).pipe(
+      Effect.tapError((error) => reportSourceReopenFailure(owner, error)),
+    );
+    // The receipt is persisted before removing the queue entry, so the
+    // coordinator can retry even after a restart or a lost relay reply.
+    const move = yield* transport.sourceReopened(owner);
+    yield* assertThreadMoveIdentity(owner, move);
+    if (move.phase !== "aborted" || move.sourceReopened !== true)
+      return yield* fail(owner.threadId, "The relay did not confirm source reopening.");
+    const [binding] = hold
+      ? []
+      : yield* sql<{
+          checkoutRoot: string;
+        }>`SELECT COALESCE(t.worktree_path,p.workspace_root) AS "checkoutRoot"
+          FROM projection_threads t JOIN projection_projects p USING(project_id)
+          WHERE t.thread_id=${owner.threadId} AND t.deleted_at IS NULL AND p.deleted_at IS NULL`;
+    const checkoutRoot =
+      hold?.checkoutRoot ??
+      (binding
+        ? yield* resolveCheckoutPath(binding.checkoutRoot, fs, path).pipe(
+            Effect.orElseSucceed(() => path.resolve(binding.checkoutRoot)),
+          )
+        : undefined);
+    yield* sql`DELETE FROM thread_move_source_reopens WHERE operation_id=${owner.operationId}
+        AND thread_id=${owner.threadId} AND relay_url=${owner.relayUrl}
+        AND environment_id=${owner.environmentId} AND generation=${owner.generation}`.pipe(
+      Effect.andThen(checkoutRoot ? notifyCheckoutCaptureReleased(sql, checkoutRoot) : Effect.void),
+      Effect.uninterruptible,
+    );
+  });
   const reportFailure = Effect.fnUntraced(function* (
     owner: ThreadMoveOwner,
     error: unknown,
@@ -492,15 +601,19 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     yield* assertThreadMoveIdentity(owner, reported);
   });
   const source = Effect.fn("ThreadMoveWorker.source")(function* (threadId: string) {
+    const fence = yield* fences.get(threadId);
+    if (!fence || fence.phase === "retired") return;
+    const reopening = yield* sourceReopenMessageId(fence);
+    if (reopening) return yield* acknowledgeSourceReopen(fence, reopening);
     const state = yield* readQueue(threadId);
-    let fence = yield* fences.get(threadId);
-    if (!state || !fence || fence.phase === "retired") return;
+    if (!state) return;
     let head = state.queue.entries[0];
     if (!head || head.kind !== "move") return;
-    yield* assertWorkflowThreadReleased(sql, threadId).pipe(
+    const workflowReleased = assertWorkflowThreadReleased(sql, threadId).pipe(
       Effect.mapError((error) => fail(threadId, error.message)),
     );
     if (head.state === "pending") {
+      yield* workflowReleased;
       if (
         !state.queue.enabled ||
         state.archivedAt !== null ||
@@ -556,19 +669,34 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     return yield* Effect.gen(function* () {
       const head = claimed;
       let fence = sourceFence;
-      const intent =
-        (yield* transferIntents.get(owner)) ??
-        (yield* transferIntents.create(
-          owner,
-          head.state === "cancelling"
-            ? ["launchpad-thread-chunks-v1"]
-            : yield* transport.sourceFormats(owner),
-        ));
-      const offers = intent.sourceThreadTransferFormats.includes("launchpad-thread-chunks-v2")
-        ? { sourceThreadTransferFormats: intent.sourceThreadTransferFormats }
-        : {};
-      let move;
-      if (fence.phase === "active" && fence.operationId !== owner.operationId) {
+      const getIntent = Effect.gen(function* () {
+        return (
+          (yield* transferIntents.get(owner)) ??
+          (yield* transferIntents.create(
+            owner,
+            head.state === "cancelling"
+              ? ["launchpad-thread-chunks-v1"]
+              : yield* transport.sourceFormats(owner),
+          ))
+        );
+      });
+      const needsDrain = fence.phase === "active" && fence.operationId !== owner.operationId;
+      let beginIntent = needsDrain ? yield* transferIntents.get(owner) : undefined;
+      // A lost begin reply leaves the old fence and the new transfer intent.
+      // Reconcile the exact relay operation before applying admission prerequisites.
+      let move = needsDrain
+        ? beginIntent
+          ? yield* transport.getIfStarted(owner)
+          : null
+        : yield* transport.get(owner);
+      if (!move) {
+        yield* workflowReleased;
+        beginIntent ??= yield* getIntent;
+        const offers = beginIntent.sourceThreadTransferFormats.includes(
+          "launchpad-thread-chunks-v2",
+        )
+          ? { sourceThreadTransferFormats: beginIntent.sourceThreadTransferFormats }
+          : {};
         const actorUserId = (head.editedBy ?? head.author)?.userId;
         if (!actorUserId)
           return yield* fail(threadId, "Sign in before moving this private thread.");
@@ -576,6 +704,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           const result = yield* transport.beginVm(owner, {
             actorUserId,
             cancelBeforeStart: head.state === "cancelling",
+            sourceMessageId: head.messageId,
             ...offers,
           });
           if (result.status === "quota_reached") {
@@ -605,10 +734,12 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             actorUserId,
             destinationEnvironmentId: head.destination.environmentId,
             destinationProjectId: head.destination.projectId,
+            sourceMessageId: head.messageId,
             ...offers,
           });
-      } else move = yield* transport.get(owner);
+      }
       yield* assertThreadMoveIdentity(owner, move);
+      if (move.sourceEnvironmentId !== owner.environmentId) return;
       if (
         head.destination.kind === "environment" &&
         (move.destinationEnvironmentId !== head.destination.environmentId ||
@@ -620,11 +751,19 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           "The relay returned a different destination for the queued move.",
         );
       }
-      if (fence.phase === "active" && fence.operationId !== owner.operationId) {
-        yield* fences.beginDrain({ ...owner, previousOperationId: fence.operationId });
+      if (needsDrain) {
+        const cancelling =
+          move.sourceReopenRequired === true &&
+          (move.phase === "aborting" || move.phase === "aborted");
+        yield* fences
+          .beginDrain({ ...owner, previousOperationId: fence.operationId })
+          .pipe(
+            Effect.tapError((error) =>
+              cancelling ? reportSourceReopenFailure(owner, error) : Effect.void,
+            ),
+          );
         fence = (yield* fences.get(threadId))!;
       }
-      if (move.sourceEnvironmentId !== owner.environmentId) return;
       if (["committed", "completed"].includes(move.phase)) {
         if (fence.phase !== "retired") yield* fences.retire(owner);
         return;
@@ -634,28 +773,54 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         move = yield* transport.abort(owner);
         yield* assertThreadMoveIdentity(owner, move);
       }
-      if (move.phase === "aborting") {
-        yield* releaseCapture(owner, "cancelled");
-        return;
-      }
-      if (move.phase === "aborted") {
-        yield* releaseCapture(owner, "cancelled");
-        const held = yield* captures.get(owner.operationId);
-        if (held?.phase === "capturing") return;
-        if (tracked) {
-          const inventory = yield* inspectVmWorkloads({ type: "inspect" });
-          if (inventory.sealedBy !== null)
-            yield* inspectVmWorkloads({
-              type: "reopen",
-              bootId: inventory.bootId,
-              operationId: owner.operationId,
-            });
-        }
-        yield* fences.activate(owner);
+      if (move.phase === "aborting" || move.phase === "aborted") {
+        const sourceReopenRequired = move.sourceReopenRequired === true;
+        const destinationRemoved = move.phase === "aborted";
+        const canFinish = yield* Effect.gen(function* () {
+          if (!(yield* releaseCapture(owner, "cancelled"))) {
+            if (sourceReopenRequired)
+              yield* transport.reopenBlocked(owner, "capture_stop_unconfirmed").pipe(Effect.ignore);
+            return false;
+          }
+          if (!destinationRemoved) return false;
+          if (tracked) {
+            const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+            if (inventory.sealedBy !== null)
+              yield* inspectVmWorkloads({
+                type: "reopen",
+                bootId: inventory.bootId,
+                operationId: owner.operationId,
+              });
+          }
+          if (sourceReopenRequired) {
+            yield* sql.withTransaction(
+              Effect.gen(function* () {
+                yield* fences.activate(owner);
+                yield* sql`INSERT INTO thread_move_source_reopens
+                  (operation_id,thread_id,relay_url,environment_id,generation,message_id)
+                  VALUES (${owner.operationId},${owner.threadId},${owner.relayUrl},${owner.environmentId},${owner.generation},${head.messageId})
+                  ON CONFLICT(operation_id) DO NOTHING`;
+                if ((yield* sourceReopenMessageId(owner)) !== head.messageId)
+                  return yield* fail(
+                    threadId,
+                    "The retained source reopen receipt belongs to another move.",
+                  );
+              }),
+            );
+          } else yield* fences.activate(owner);
+          return true;
+        }).pipe(
+          Effect.tapError((error) =>
+            sourceReopenRequired ? reportSourceReopenFailure(owner, error) : Effect.void,
+          ),
+        );
+        if (!canFinish) return;
+        if (sourceReopenRequired) return yield* acknowledgeSourceReopen(owner, head.messageId);
         yield* commands.synchronize(threadId);
         yield* finish(owner, "cancelled");
         return;
       }
+      yield* workflowReleased;
       const sourceState = move.participantStates?.find(
         (participant) =>
           participant.environmentId === owner.environmentId &&
@@ -729,6 +894,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         yield* fences.retire(owner);
         return;
       }
+      const intent = beginIntent ?? (yield* getIntent);
       if (move.transferEncodingPolicy === null) {
         move = yield* transport.selectEncoding(owner);
         yield* assertThreadMoveIdentity(owner, move);

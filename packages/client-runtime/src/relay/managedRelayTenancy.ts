@@ -48,6 +48,7 @@ import {
   type RelayThreadVmReplacement,
   type RelayThreadVmReplacementCandidate,
   type RelayPortableThreadPlacement,
+  type RelayThreadActiveMove,
   type RelayPortableThreadPage,
   type RelayThreadHistoryPage,
   type RelayThreadCurrentQueue,
@@ -121,6 +122,13 @@ import {
 
 export interface ManagedRelayTenancyClientOptions {
   readonly relayUrl: string;
+}
+
+interface ThreadMoveCancellationRequest {
+  readonly clerkToken: string;
+  readonly threadId: ThreadId;
+  readonly operationId: string;
+  readonly sourceGeneration: number;
 }
 
 export class ManagedRelayTenancyClient extends Context.Service<
@@ -255,6 +263,12 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly threadId: ThreadId;
       readonly command: PortableThreadCommand;
     }) => Effect.Effect<RelayThreadCommandReceipt, ManagedRelayClientError>;
+    readonly cancelActiveThreadMove: (
+      input: ThreadMoveCancellationRequest,
+    ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
+    readonly getThreadMoveCancellation: (
+      input: ThreadMoveCancellationRequest,
+    ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
     readonly getPendingPortableThreadCommands: (input: {
       readonly clerkToken: string;
       readonly threadId: ThreadId;
@@ -589,6 +603,10 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     revokeAccess: unavailable("clientRuntime.managedRelayTenancy.revokeAccess"),
     stagePortableThreadCommand: unavailable(
       "clientRuntime.managedRelayTenancy.stagePortableThreadCommand",
+    ),
+    cancelActiveThreadMove: unavailable("clientRuntime.managedRelayTenancy.cancelActiveThreadMove"),
+    getThreadMoveCancellation: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadMoveCancellation",
     ),
     getPendingPortableThreadCommands: unavailable(
       "clientRuntime.managedRelayTenancy.getPendingPortableThreadCommands",
@@ -1170,6 +1188,38 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.stagePortableThreadCommand"),
+      withRelayClientTracing,
+    ),
+    cancelActiveThreadMove: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .cancelMove({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+            payload: { sourceGeneration: input.sourceGeneration },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel active thread move")),
+            timeoutRelayRequest("Active thread move cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelActiveThreadMove"),
+      withRelayClientTracing,
+    ),
+    getThreadMoveCancellation: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .getMoveCancellation({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+            query: { sourceGeneration: input.sourceGeneration },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read thread move cancellation")),
+            timeoutRelayRequest("Thread move cancellation read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadMoveCancellation"),
       withRelayClientTracing,
     ),
     getPendingPortableThreadCommands: Effect.fnUntraced(

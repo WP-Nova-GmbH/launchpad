@@ -27,6 +27,7 @@ import {
   threadMoveSnapshotReached,
 } from "@t3tools/client-runtime/relay/threadMoveRecovery";
 import { threadRunOnStatus } from "@t3tools/client-runtime/relay/threadRunOn";
+import { activeThreadMove } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   CommandId,
@@ -68,6 +69,8 @@ import { appAtomRegistry } from "../../state/atom-registry";
 import { hasCloudPublicConfig } from "../cloud/publicConfig";
 import { environmentCatalog } from "../../connection/catalog";
 
+import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
+
 function FollowThreadLocation({
   environmentId,
   threadId,
@@ -80,6 +83,7 @@ function FollowThreadLocation({
   const state = useAtomValue(
     threadVmControls.locationViewAtom(environmentId, threadId, recoverUnavailable),
   );
+  const placement = useThreadMovePlacement(environmentId, threadId, recoverUnavailable);
   const session = useAtomValue(managedRelaySessionAtom);
   const relayUrl = threadMoveRelayUrl();
   const checkLocation = useAtomCommand(threadVmControls.checkLocation, { reportFailure: false });
@@ -212,6 +216,16 @@ function FollowThreadLocation({
     open,
     navigation,
   ]);
+  if (recoverUnavailable && activeThreadMove(placement))
+    return (
+      <View className="mx-3">
+        <ThreadMoveQueueItem
+          environmentId={environmentId}
+          threadId={threadId}
+          placement={placement}
+        />
+      </View>
+    );
   if (
     !state ||
     (!recoverUnavailable && !state.recoveryRequested && !state.destination && !state.error)
@@ -494,6 +508,7 @@ function ThreadMachinePicker({
   const vm = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
   const host = useAtomValue(threadVmControls.hostConfigurationAtom);
   const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
+  const movePlacement = useThreadMovePlacement(environmentId, threadId);
   const confirmedPlacementAtom = threadVmControls.confirmedLocationAtom(environmentId, threadId);
   const placement = useAtomValue(confirmedPlacementAtom);
   const routeAtom = threadVmControls.routeAtom(environmentId, threadId);
@@ -756,12 +771,15 @@ function ThreadMachinePicker({
                   (!canonicalKey
                     ? "Register this project’s Git repository in the host app first."
                     : null));
-  const pendingMove = queue?.entries.find((entry) => entry.kind === "move");
+  const presentation = threadRunOnStatus({
+    queue,
+    saved,
+    placement: movePlacement,
+    queueEnvironmentId: environmentId,
+    queueGeneration: thread.relayRouting?.generation,
+  });
   const outstanding =
-    saved !== null ||
-    pendingMove !== undefined ||
-    location?.movePending === true ||
-    location?.destination != null;
+    presentation !== null || location?.movePending === true || location?.destination != null;
   const disabled = busy || !ready || outstanding || setupBlocker !== null;
   const canChooseVmAccount =
     session !== null &&
@@ -833,20 +851,22 @@ function ThreadMachinePicker({
       ? `${label} / ${target.title} (${target.workspaceRoot})`
       : `${label} / Unavailable project`;
   };
-  const presentation = threadRunOnStatus({ queue, saved });
-  const visibleError = error ?? location?.moveFailureDetail ?? null;
-  const detailedProgress = threadMoveProgressPresentation(location?.placement);
-  const progress = location?.moveFailureDetail
-    ? "Move needs attention"
-    : location?.destination
-      ? `Thread moved → ${currentLabel}`
-      : detailedProgress && !presentation?.warning
-        ? `${detailedProgress.label}${detailedProgress.detail ? ` · ${detailedProgress.detail}` : ""}`
-        : presentation
-          ? `${presentation.title}${presentation.destination ? ` → ${destinationLabel(presentation.destination)}` : ""}`
-          : location?.movePending
-            ? "Moving thread…"
-            : null;
+  const visibleError =
+    presentation?.source === "relay" ? null : (error ?? location?.moveFailureDetail ?? null);
+  const detailedProgress =
+    presentation?.source === "relay" ? null : threadMoveProgressPresentation(location?.placement);
+  const progress =
+    location?.moveFailureDetail && presentation?.source !== "relay"
+      ? "Move needs attention"
+      : location?.destination
+        ? `Thread moved → ${currentLabel}`
+        : detailedProgress && !presentation?.warning
+          ? `${detailedProgress.label}${detailedProgress.detail ? ` · ${detailedProgress.detail}` : ""}`
+          : presentation
+            ? `${presentation.title}${presentation.destination ? ` → ${destinationLabel(presentation.destination)}` : ""}`
+            : location?.movePending
+              ? "Moving thread…"
+              : null;
   const ensureCurrent = () => {
     if (!isCurrent())
       throw new Error("Your account changed. Reopen this thread to check the move.");
@@ -1149,9 +1169,9 @@ function ThreadMachinePicker({
                   ) : null}
                   {location?.destination ? (
                     <Action label="Show location recovery" onPress={close} />
-                  ) : pendingMove ? (
+                  ) : presentation?.source === "queue" ? (
                     <Action label="Manage in shared queue" onPress={close} />
-                  ) : saved ? (
+                  ) : presentation?.source === "saved" && saved ? (
                     <View className="gap-2">
                       {saved.rejection ? (
                         <Action

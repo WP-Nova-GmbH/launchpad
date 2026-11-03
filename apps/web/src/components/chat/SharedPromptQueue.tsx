@@ -1,4 +1,7 @@
-import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
+import {
+  activeThreadMove,
+  threadMoveQueueRows,
+} from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import {
   squashAtomCommandFailure,
   type AtomCommandResult,
@@ -11,6 +14,7 @@ import {
   type ThreadPromptQueue,
   type TurnId,
 } from "@t3tools/contracts";
+import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
 import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
 import { createThreadMoveCancellation } from "@t3tools/client-runtime/relay/threadMoveSubmission";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
@@ -36,7 +40,9 @@ import { SharedPromptQueueRow } from "./SharedPromptQueueRow";
 
 type SharedPromptQueueProps = {
   threadRef: ScopedThreadRef;
-  queue: ThreadPromptQueue;
+  queue?: ThreadPromptQueue | undefined;
+  queueGeneration?: number | undefined;
+  queueRetired?: boolean | undefined;
   activeTurnId: TurnId | null;
   unavailable?: boolean;
   workflowControlled?: boolean;
@@ -53,18 +59,33 @@ export type SharedPromptQueueHandle = {
 
 export function SharedPromptQueue(props: SharedPromptQueueProps) {
   const account = useAtomValue(managedRelaySessionAtom);
+  const { environmentId, threadId } = props.threadRef;
+  const placement = useThreadMovePlacement(environmentId, threadId);
   const scope = JSON.stringify([
     account?.accountId ?? null,
     threadMoveRelayUrl(),
-    props.threadRef.environmentId,
-    props.threadRef.threadId,
+    environmentId,
+    threadId,
   ]);
-  return <SharedPromptQueueContent key={scope} {...props} />;
+  if (!props.queue)
+    return activeThreadMove(placement) && !props.workflowControlled ? (
+      <ThreadMoveQueueItem
+        environmentId={environmentId}
+        threadId={threadId}
+        placement={placement}
+      />
+    ) : null;
+  return (
+    <SharedPromptQueueContent key={scope} {...props} queue={props.queue} placement={placement} />
+  );
 }
 
 function SharedPromptQueueContent({
   threadRef,
   queue,
+  queueGeneration,
+  queueRetired = false,
+  placement,
   activeTurnId,
   unavailable = false,
   workflowControlled = false,
@@ -72,9 +93,16 @@ function SharedPromptQueueContent({
   canWorkLocally = false,
   visibleEntryIds,
   controlsRef,
-}: SharedPromptQueueProps) {
-  const placement = useThreadMovePlacement(threadRef.environmentId, threadRef.threadId);
-  const fallbackMove = threadMoveQueueOwnership({ entries: queue.entries, placement }).fallback;
+}: SharedPromptQueueProps & {
+  queue: ThreadPromptQueue;
+  placement: RelayPortableThreadPlacement | null | undefined;
+}) {
+  const { entries: visibleQueueEntries, fallback: fallbackMove } = threadMoveQueueRows({
+    entries: queueRetired ? queue.entries.filter((entry) => entry.kind !== "move") : queue.entries,
+    placement,
+    queueEnvironmentId: threadRef.environmentId,
+    queueGeneration,
+  });
   const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
   const getCommandReceipt = useAtomCommand(threadEnvironment.getCommandReceipt, {
     reportFailure: false,
@@ -147,7 +175,14 @@ function SharedPromptQueueContent({
   const canReorder =
     queue.handoff === null && queue.entries.every((entry) => entry.state === "pending");
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
-  const disabled = busy || unavailable || workflowControlled;
+  const disabled =
+    busy ||
+    unavailable ||
+    workflowControlled ||
+    queueRetired ||
+    (placement != null &&
+      (placement.environmentId !== threadRef.environmentId ||
+        (queueGeneration !== undefined && placement.generation !== queueGeneration)));
   const preparation = queue.preparation;
   const preparing = preparation !== undefined && preparation.state !== "ready";
   const setupRunning = preparation?.state === "pending" || preparation?.state === "running";
@@ -250,8 +285,8 @@ function SharedPromptQueueContent({
   };
   const visibleIds = visibleEntryIds ? new Set(visibleEntryIds) : null;
   const visibleCount = visibleIds
-    ? queue.entries.filter((entry) => visibleIds.has(entry.messageId)).length
-    : queue.entries.length;
+    ? visibleQueueEntries.filter((entry) => visibleIds.has(entry.messageId)).length
+    : visibleQueueEntries.length;
   if (
     visibleCount === 0 &&
     queue.pauseReason === null &&
@@ -461,10 +496,11 @@ function SharedPromptQueueContent({
               environmentId={threadRef.environmentId}
               threadId={threadRef.threadId}
               placement={placement}
+              activeCancellationDisabled={workflowControlled}
             />
           </li>
         )}
-        {queue.entries.map((entry, index) =>
+        {visibleQueueEntries.map((entry, index) =>
           visibleIds && !visibleIds.has(entry.messageId) ? null : entry.kind === "move" ? (
             <li key={entry.messageId}>
               <ThreadMoveQueueItem
@@ -475,6 +511,7 @@ function SharedPromptQueueContent({
                 queuePaused={!queue.enabled || queue.pauseReason !== null}
                 cancellation={cancellation.phase(cancellationScope, entry.messageId)}
                 disabled={disabled}
+                activeCancellationDisabled={workflowControlled}
                 onCancel={() => void requestCancellation(entry)}
               >
                 <Button

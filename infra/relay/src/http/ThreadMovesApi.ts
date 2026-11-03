@@ -1,4 +1,4 @@
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId, type MessageId } from "@t3tools/contracts";
 import {
   RelayApi,
   RelayEnvironmentPrincipal,
@@ -22,7 +22,11 @@ import { RelayDb } from "../db.ts";
 import { ThreadArtifactObjectStorage } from "../threads/ThreadArtifactObjects.ts";
 import { makeThreadMoveArtifactStore } from "../threads/ThreadMoveArtifactStore.ts";
 import { makeThreadMoveCheckpointStore } from "../threads/ThreadMoveCheckpointStore.ts";
-import { makeThreadPlacementStore, type ThreadMove } from "../threads/ThreadPlacementStore.ts";
+import {
+  makeThreadPlacementStore,
+  ThreadPlacementConflict,
+  type ThreadMove,
+} from "../threads/ThreadPlacementStore.ts";
 import { makeThreadMoveProgressStore } from "../threads/ThreadMoveProgressStore.ts";
 import { authorizeThreadEnvironment, withEnvironmentThread } from "./ThreadEnvironmentApi.ts";
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
@@ -41,6 +45,25 @@ const failures = {
   SqlError: () => relayInternalErrorResponse("persistence_failed"),
 };
 const response = Effect.fnUntraced(function* (move: ThreadMove) {
+  const identity = {
+    operationId: move.operationId,
+    actorUserId: move.actorUserId,
+    expectedGeneration: move.expectedGeneration,
+    phase: move.phase,
+    manifestSha256: move.manifestSha256,
+    threadId: ThreadId.make(move.threadId),
+    sourceEnvironmentId: EnvironmentId.make(move.sourceEnvironmentId),
+    destinationEnvironmentId: EnvironmentId.make(move.destinationEnvironmentId),
+    destinationProjectId: ProjectId.make(move.destinationProjectId),
+    ...(move.cancellationProtocol === "source-reopen-v1" ? { sourceReopenRequired: true } : {}),
+    ...(move.sourceReopened !== undefined ? { sourceReopened: move.sourceReopened } : {}),
+  };
+  // Cleanup participants can still confirm rollback after private access is
+  // revoked. Only the identity, phase and rollback hash are needed here.
+  if (!needsMoveAccess(move)) {
+    const cleanup: RelayThreadMove = { ...identity, sourceCursor: null, manifestArtifactId: null };
+    return cleanup;
+  }
   const sql = (yield* RelayDb).$client;
   const objects = yield* ThreadArtifactObjectStorage;
   const [artifact] = yield* sql<{
@@ -51,8 +74,14 @@ const response = Effect.fnUntraced(function* (move: ThreadMove) {
     FROM relay_repository_aliases a
     JOIN relay_thread_placements p ON p.repository_id=a.repository_id AND p.organization_id=a.organization_id
     WHERE p.thread_id=${move.threadId} ORDER BY a.canonical_key`;
-  return {
-    ...move,
+  const full: RelayThreadMove = {
+    ...identity,
+    sourceCursor: move.sourceCursor,
+    ...(move.failureDetail !== undefined ? { failureDetail: move.failureDetail } : {}),
+    ...(move.transferEncodingPolicy !== undefined
+      ? { transferEncodingPolicy: move.transferEncodingPolicy }
+      : {}),
+    ...(move.participantStates !== undefined ? { participantStates: move.participantStates } : {}),
     repositoryCanonicalKeys: aliases.map((alias) => alias.canonicalKey),
     progress: yield* makeThreadMoveProgressStore(sql).read(move.operationId),
     manifestArtifactId: artifact?.manifestArtifactId ?? null,
@@ -63,11 +92,8 @@ const response = Effect.fnUntraced(function* (move: ThreadMove) {
           manifestArtifactId: artifact.manifestArtifactId,
         })
       : false,
-    threadId: ThreadId.make(move.threadId),
-    sourceEnvironmentId: EnvironmentId.make(move.sourceEnvironmentId),
-    destinationEnvironmentId: EnvironmentId.make(move.destinationEnvironmentId),
-    destinationProjectId: ProjectId.make(move.destinationProjectId),
-  } satisfies RelayThreadMove;
+  };
+  return full;
 });
 
 /** Destination checks never substitute a client's UUID for a live trusted identity. */
@@ -136,8 +162,9 @@ const requireDestination = Effect.fnUntraced(function* (
 export const withThreadMoveParticipant = <A, E, R>(
   input: Participant,
   role: "source" | "destination" | "either",
-  currentAccess: boolean,
+  currentAccess: boolean | ((move: ThreadMove) => boolean),
   action: (move: ThreadMove, placement: RelayPortableThreadPlacement) => Effect.Effect<A, E, R>,
+  verifyMissingSourceMove = false,
 ) =>
   Effect.gen(function* () {
     const sql = (yield* RelayDb).$client;
@@ -148,8 +175,26 @@ export const withThreadMoveParticipant = <A, E, R>(
         if (!locked) return yield* tenancyNotFound("thread_not_found");
         const store = makeThreadPlacementStore(sql);
         const placement = yield* store.get(input.threadId);
-        const move = yield* store.getMove(input);
         if (!placement) return yield* tenancyNotFound("thread_not_found");
+        const move = yield* store.findMove(input);
+        if (!move) {
+          if (
+            !verifyMissingSourceMove ||
+            placement.operationId !== null ||
+            placement.environmentId !== input.environmentId ||
+            placement.generation !== input.generation
+          )
+            return yield* new ThreadPlacementConflict({
+              message: "Move does not exist for this thread",
+            });
+          yield* authorizeThreadEnvironment(input, placement, true);
+          return yield* withPrivateThreadOwnerAccess(
+            input.threadId,
+            "write",
+            placement.ownerUserId,
+            () => tenancyNotFound("thread_move_not_found"),
+          );
+        }
         const source =
           input.environmentId === move.sourceEnvironmentId &&
           input.generation === move.expectedGeneration;
@@ -171,8 +216,10 @@ export const withThreadMoveParticipant = <A, E, R>(
             !["completed", "aborted"].includes(move.phase))
         )
           return yield* tenancyConflict("thread_placement_changed");
-        yield* authorizeThreadEnvironment(input, placement, currentAccess);
-        return yield* currentAccess
+        const requireCurrentAccess =
+          typeof currentAccess === "boolean" ? currentAccess : currentAccess(move);
+        yield* authorizeThreadEnvironment(input, placement, requireCurrentAccess);
+        return yield* requireCurrentAccess
           ? withPrivateThreadOwnerAccess(input.threadId, "write", move.actorUserId, () =>
               action(move, placement),
             )
@@ -187,6 +234,8 @@ export const beginPortableThreadMove = Effect.fn("relay.api.thread_moves.begin")
     destinationEnvironmentId: string;
     destinationProjectId: string;
     sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+    supportsSourceReopenAck?: true;
+    sourceMessageId?: MessageId;
   },
 ) {
   const sql = (yield* RelayDb).$client;
@@ -215,6 +264,8 @@ export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin
       actorUserId: string;
       cancelBeforeStart: boolean;
       sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+      supportsSourceReopenAck?: true;
+      sourceMessageId?: MessageId;
     },
   ) {
     const sql = (yield* RelayDb).$client;
@@ -281,6 +332,12 @@ export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin
                 sourceCredentialId: principal.credentialId,
                 sourcePublicKey: principal.environmentPublicKey,
                 sourceAllocationId: principal.threadVm?.allocationId ?? null,
+                ...(input.supportsSourceReopenAck
+                  ? { supportsSourceReopenAck: true as const }
+                  : {}),
+                ...(input.sourceMessageId === undefined
+                  ? {}
+                  : { sourceMessageId: input.sourceMessageId }),
                 ...(input.sourceThreadTransferFormats === undefined
                   ? {}
                   : {
@@ -316,12 +373,29 @@ export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin
 );
 
 export const getPortableThreadMove = Effect.fn("relay.api.thread_moves.get")(function* (
-  input: Participant,
+  input: Participant & { supportsSourceReopenAck?: true },
 ) {
-  return yield* response(
-    yield* withThreadMoveParticipant(input, "either", true, (move) => Effect.succeed(move)),
+  const sql = (yield* RelayDb).$client;
+  const store = makeThreadPlacementStore(sql);
+  // Read-only cleanup discovery survives loss of user access. A participant
+  // may still release its exact move, but cannot resume normal transfer work.
+  const move = yield* withThreadMoveParticipant(
+    input,
+    "either",
+    needsMoveAccess,
+    (move) =>
+      input.supportsSourceReopenAck &&
+      move.sourceEnvironmentId === input.environmentId &&
+      move.cancellationProtocol === "legacy" &&
+      ["preparing", "frozen", "ready"].includes(move.phase)
+        ? store.advertiseSourceReopen(input)
+        : Effect.succeed(move),
+    input.supportsSourceReopenAck === true,
   );
+  return yield* response(move);
 }, Effect.catchTags(failures));
+
+const needsMoveAccess = (move: ThreadMove) => !["aborting", "aborted"].includes(move.phase);
 
 /** Select before packing; an admitted guest can report formats without starting its import server. */
 export const selectPortableThreadMoveEncoding = Effect.fn("relay.api.thread_moves.encoding")(
@@ -398,7 +472,9 @@ export const pendingPortableThreadMoves = Effect.fn("relay.api.thread_moves.pend
     }>`SELECT
     m.thread_id AS "threadId", m.operation_id AS "operationId", m.source_environment_id AS source,
     m.expected_generation AS generation FROM relay_thread_moves m JOIN relay_thread_placements p USING(thread_id)
-    WHERE p.operation_id=m.operation_id AND m.phase NOT IN ('completed','aborted')
+    WHERE p.operation_id=m.operation_id AND m.phase <> 'completed'
+      AND (m.phase <> 'aborted' OR (m.cancellation_protocol='source-reopen-v1'
+        AND m.source_reopened_at IS NULL AND m.source_environment_id=${input.environmentId}))
       AND (m.source_environment_id=${input.environmentId} OR m.destination_environment_id=${input.environmentId})
       AND (${input.after}::text IS NULL OR m.operation_id>${input.after})
       AND (${principal.threadVm?.threadId ?? null}::text IS NULL OR m.thread_id=${principal.threadVm?.threadId ?? null})
@@ -411,7 +487,7 @@ export const pendingPortableThreadMoves = Effect.fn("relay.api.thread_moves.pend
         environmentId: input.environmentId,
         generation: candidate.generation + (candidate.source === input.environmentId ? 0 : 1),
       };
-      const move = yield* withThreadMoveParticipant(participant, "either", true, (move) =>
+      const select = (move: ThreadMove) =>
         Effect.gen(function* () {
           if (
             principal.threadVm ||
@@ -436,7 +512,12 @@ export const pendingPortableThreadMoves = Effect.fn("relay.api.thread_moves.pend
             ...move,
             destinationThreadTransferFormats: destination,
           });
-        }),
+        });
+      const move = yield* withThreadMoveParticipant(
+        participant,
+        "either",
+        needsMoveAccess,
+        select,
       ).pipe(
         Effect.flatMap(response),
         Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
@@ -596,6 +677,32 @@ export const confirmPortableThreadMoveDestinationRemoved = Effect.fn(
   );
 }, Effect.catchTags(failures));
 
+export const confirmPortableThreadMoveSourceReopened = Effect.fn(
+  "relay.api.thread_moves.source_reopened",
+)(function* (input: Participant) {
+  const sql = (yield* RelayDb).$client;
+  return yield* response(
+    yield* withThreadMoveParticipant(input, "source", false, () =>
+      makeThreadPlacementStore(sql).sourceReopened(input),
+    ),
+  );
+}, Effect.catchTags(failures));
+
+export const reportPortableThreadMoveReopenBlocked = Effect.fn(
+  "relay.api.thread_moves.reopen_blocked",
+)(function* (
+  input: Participant & {
+    reason: "capture_stop_unconfirmed" | "source_reopen_failed";
+  },
+) {
+  const sql = (yield* RelayDb).$client;
+  return yield* response(
+    yield* withThreadMoveParticipant(input, "source", false, () =>
+      makeThreadPlacementStore(sql).reopenBlocked(input),
+    ),
+  );
+}, Effect.catchTags(failures));
+
 export const threadMovesApi = HttpApiBuilder.group(RelayApi, "threadMoves", (handlers) =>
   handlers
     .handle("progress", ({ params, payload }) =>
@@ -630,5 +737,11 @@ export const threadMovesApi = HttpApiBuilder.group(RelayApi, "threadMoves", (han
     .handle("abort", ({ params, payload }) => abortPortableThreadMove({ ...params, ...payload }))
     .handle("removed", ({ params, payload }) =>
       confirmPortableThreadMoveDestinationRemoved({ ...params, ...payload }),
+    )
+    .handle("sourceReopened", ({ params, payload }) =>
+      confirmPortableThreadMoveSourceReopened({ ...params, ...payload }),
+    )
+    .handle("reopenBlocked", ({ params, payload }) =>
+      reportPortableThreadMoveReopenBlocked({ ...params, ...payload }),
     ),
 );

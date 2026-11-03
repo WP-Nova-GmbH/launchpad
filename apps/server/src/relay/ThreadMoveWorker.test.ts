@@ -37,6 +37,7 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
+import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ThreadBackgroundLivenessService } from "../orchestration/ThreadBackgroundLiveness.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
@@ -53,9 +54,11 @@ import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
+import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
 import { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import { ThreadMoveError, type ThreadMoveTransport } from "./ThreadMoveTransport.ts";
 import { makeThreadMoveWorker } from "./ThreadMoveWorker.ts";
+import { makeThreadMoveSweep } from "./ThreadRelayCoordinator.ts";
 import { ThreadVmProviderAuth, makeThreadVmProviderAuth } from "./ThreadVmProviderAuth.ts";
 import { ProviderAuthService } from "../provider/Services/ProviderAuthService.ts";
 import {
@@ -217,6 +220,9 @@ for (const lost of [
   "shared-ready-no-git",
   "capture-cancel",
   "capture-failure",
+  "direct-cancel-reopen",
+  "direct-cancel-before-drain",
+  "direct-cancel-capture-unconfirmed",
   "capture-stop-failure",
   "capture-upload-blocked",
   "capture-retargeted",
@@ -259,25 +265,31 @@ for (const lost of [
                       ? "drains canonical checkout siblings and checkpoints before sealing, then reuses the archive"
                       : lost === "capture-cancel"
                         ? "releases a draining checkout before a lost cancellation reply"
-                        : lost === "capture-failure"
-                          ? "releases a settled capture failure while the moving thread stays frozen"
-                          : lost === "capture-stop-failure"
-                            ? "releases a draining checkout after an uncertain terminal stop"
-                            : lost === "capture-upload-blocked"
-                              ? "releases sibling admission while the sealed source upload waits"
-                              : lost.startsWith("capture-retargeted")
-                                ? `rejects ${lost} after capture admission before exporting`
-                                : lost.startsWith("capture-rename")
-                                  ? `syncs the recovered archive rename before releasing ${lost}`
-                                  : lost === "sealed-missing"
-                                    ? "refuses to recapture a missing sealed source archive after restart"
-                                    : lost === "destination-wrong-repository" ||
-                                        lost === "destination-repointed-project" ||
-                                        lost === "destination-nested-project" ||
-                                        lost === "destination-unconfirmed-repository" ||
-                                        lost === "destination-repointed-during-download"
-                                      ? `blocks ${lost} before installing a checkout or changing local files`
-                                      : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
+                        : lost === "direct-cancel-reopen"
+                          ? "cancels a failed save without inbox delivery and retries a lost reopen reply after queue removal"
+                          : lost === "direct-cancel-before-drain"
+                            ? "reopens a directly cancelled move after its begin reply was lost"
+                            : lost === "direct-cancel-capture-unconfirmed"
+                              ? "holds an interrupted capture until a host reboot proves it stopped"
+                              : lost === "capture-failure"
+                                ? "releases a settled capture failure while the moving thread stays frozen"
+                                : lost === "capture-stop-failure"
+                                  ? "releases a draining checkout after an uncertain terminal stop"
+                                  : lost === "capture-upload-blocked"
+                                    ? "releases sibling admission while the sealed source upload waits"
+                                    : lost.startsWith("capture-retargeted")
+                                      ? `rejects ${lost} after capture admission before exporting`
+                                      : lost.startsWith("capture-rename")
+                                        ? `syncs the recovered archive rename before releasing ${lost}`
+                                        : lost === "sealed-missing"
+                                          ? "refuses to recapture a missing sealed source archive after restart"
+                                          : lost === "destination-wrong-repository" ||
+                                              lost === "destination-repointed-project" ||
+                                              lost === "destination-nested-project" ||
+                                              lost === "destination-unconfirmed-repository" ||
+                                              lost === "destination-repointed-during-download"
+                                            ? `blocks ${lost} before installing a checkout or changing local files`
+                                            : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -366,6 +378,9 @@ for (const lost of [
           let formatReads = 0,
             selections = 0,
             vmBegins = 0;
+          let reopenAcks = 0,
+            begins = 0;
+          const reopenBlockers: string[] = [];
           const destinationProgress: ThreadMoveProgressReport[] = [];
           const downloadedArtifacts: string[] = [];
           const packedEncoding = [
@@ -409,6 +424,7 @@ for (const lost of [
               Effect.sync(() => {
                 expect(lost.startsWith("encoding-cancel-")).toBe(true);
                 expect(input.cancelBeforeStart).toBe(true);
+                expect(input.sourceMessageId).toBe("move");
                 expect(input.sourceThreadTransferFormats).toEqual(
                   lost === "encoding-cancel-v2"
                     ? ["launchpad-thread-chunks-v1", "launchpad-thread-chunks-v2"]
@@ -458,8 +474,16 @@ for (const lost of [
                     manifestSha256: null,
                     ...(packedEncoding ? { transferEncodingPolicy: null } : {}),
                   }),
+              ).pipe(
+                Effect.tap(() => {
+                  expect(input.sourceMessageId).toBe("move");
+                  return lost === "direct-cancel-before-drain" && ++begins === 1
+                    ? Effect.fail(failure())
+                    : Effect.void;
+                }),
               ),
             get: () => current,
+            getIfStarted: () => Effect.sync(() => remote ?? null),
             progress: (owner, report) =>
               Effect.sync(() => {
                 if (owner.environmentId === destinationId) destinationProgress.push(report);
@@ -656,6 +680,22 @@ for (const lost of [
                 ? Effect.fail(failure())
                 : Effect.sync(() => (remote = { ...remote!, phase: "aborting" })),
             removed: () => Effect.sync(() => (remote = { ...remote!, phase: "aborted" })),
+            sourceReopened: (owner) =>
+              Effect.gen(function* () {
+                expect(owner.operationId).toBe(remote?.operationId);
+                expect(owner.environmentId).toBe(sourceId);
+                expect(owner.generation).toBe(remote?.expectedGeneration);
+                expect(remote?.phase).toBe("aborted");
+                remote = { ...remote!, sourceReopened: true };
+                if (++reopenAcks === 1 && lost === "direct-cancel-reopen") return yield* failure();
+                return remote;
+              }),
+            reopenBlocked: (owner, reason) =>
+              Effect.sync(() => {
+                expect(owner.operationId).toBe(remote?.operationId);
+                reopenBlockers.push(reason);
+                return remote!;
+              }),
           };
           yield* Effect.gen(function* () {
             const engine = yield* OrchestrationEngineService,
@@ -1278,8 +1318,10 @@ for (const lost of [
               expect(yield* moveDetail).toBe('Waiting for "Sibling" to finish its provider turn.');
               siblingStatus = "ready";
             }
-            if (lost === "capture-failure") {
-              source = yield* makeThreadMoveWorker(transport, history, commands).pipe(
+            if (lost === "capture-failure" || lost === "direct-cancel-reopen") {
+              const sourceCommands =
+                lost === "direct-cancel-reopen" ? { synchronize: unused } : commands;
+              source = yield* makeThreadMoveWorker(transport, history, sourceCommands).pipe(
                 Effect.provideService(FileSystem.FileSystem, {
                   ...fs,
                   readDirectory: (directory) =>
@@ -1295,6 +1337,137 @@ for (const lost of [
                 outcome: string;
               }>`SELECT phase,release_outcome AS outcome FROM checkout_capture_holds`;
               expect(hold).toEqual({ phase: "released", outcome: "failed" });
+              if (lost === "direct-cancel-reopen") {
+                expect((yield* queue).entries[0]?.state).toBe("moving");
+                expect(remote?.phase).toBe("preparing");
+                remote = { ...remote!, phase: "aborting", sourceReopenRequired: true };
+                yield* source.source(threadId);
+                expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+                expect(reopenAcks).toBe(0);
+                remote = { ...remote!, phase: "aborted" };
+                yield* sql`INSERT INTO thread_move_source_reopens VALUES
+                  (${remote.operationId},${threadId},${enrolled.relayUrl},'wrong-source',1,'other-message')`;
+                expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
+                expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+                expect(reopenAcks).toBe(0);
+                yield* sql`DELETE FROM thread_move_source_reopens WHERE environment_id='wrong-source'`;
+                const failingFinish = yield* makeThreadMoveWorker(
+                  transport,
+                  history,
+                  sourceCommands,
+                ).pipe(
+                  Effect.provideService(OrchestrationEngineService, {
+                    ...engine,
+                    dispatch: (command, options) =>
+                      command.type === "thread.move.finish"
+                        ? Effect.fail(
+                            new OrchestrationCommandInvariantError({
+                              commandType: command.type,
+                              detail: "Local finish could not persist",
+                            }),
+                          )
+                        : engine.dispatch(command, options),
+                  }),
+                );
+                expect((yield* Effect.flip(failingFinish.source(threadId)))._tag).toBe(
+                  "OrchestrationCommandInvariantError",
+                );
+                expect(reopenBlockers).toEqual(["source_reopen_failed", "source_reopen_failed"]);
+                expect(reopenAcks).toBe(0);
+                expect((yield* queue).entries[0]?.state).toBe("cancelling");
+                expect(yield* sql`SELECT 1 FROM thread_move_source_reopens`).toHaveLength(1);
+                expect((yield* Effect.flip(source.source(threadId)))._tag).toBe("ThreadMoveError");
+                expect((yield* fences.get(threadId))?.phase).toBe("active");
+                expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+                expect(yield* sql`SELECT 1 FROM thread_move_source_reopens`).toHaveLength(1);
+                expect(reopenAcks).toBe(1);
+                const restarted = yield* makeThreadMoveWorker(transport, history, sourceCommands);
+                const sweep = yield* makeThreadMoveSweep(
+                  {
+                    discoveryOwner: Effect.succeed(enrolled),
+                    moves: { pending: () => Effect.fail(failure()) },
+                  },
+                  { synchronize: () => Effect.succeed(true) },
+                  { source: restarted.source, destination: unused },
+                );
+                yield* sweep;
+                expect(reopenAcks).toBe(2);
+                expect(yield* sql`SELECT 1 FROM thread_move_source_reopens`).toEqual([]);
+                expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+                expect(yield* fs.readFileString(path.join(src, "README"))).toBe(
+                  "uncommitted work\n",
+                );
+              }
+              return;
+            }
+            if (lost === "direct-cancel-before-drain") {
+              yield* Effect.flip(source.source(threadId));
+              expect(remote?.phase).toBe("preparing");
+              expect((yield* fences.get(threadId))?.operationId).toBe(enrolled.operationId);
+              remote = { ...remote!, phase: "aborted", sourceReopenRequired: true };
+              const restarted = yield* makeThreadMoveWorker(transport, history, {
+                synchronize: unused,
+              });
+              yield* restarted.source(threadId);
+              expect(begins).toBe(1);
+              expect(reopenAcks).toBe(1);
+              expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+              return;
+            }
+            if (lost === "direct-cancel-capture-unconfirmed") {
+              const copying = yield* Deferred.make<void>();
+              const workerOn = (session: string) =>
+                makeThreadMoveWorker(transport, history, { synchronize: unused }).pipe(
+                  Effect.provideService(SetupProcessAdapter, {
+                    host: Effect.succeed({ host: "capture-host", session }),
+                    launcher: unused(),
+                    inspect: unused,
+                    arm: unused,
+                    stop: unused,
+                  }),
+                );
+              const copy = yield* workerOn("first-boot").pipe(
+                Effect.provideService(FileSystem.FileSystem, {
+                  ...fs,
+                  readDirectory: (directory) =>
+                    Effect.gen(function* () {
+                      if (
+                        directory === src &&
+                        (yield* captures.active).some((hold) => hold.phase === "capturing")
+                      ) {
+                        yield* Deferred.succeed(copying, undefined);
+                        return yield* Effect.never;
+                      }
+                      return yield* fs.readDirectory(directory);
+                    }).pipe(Effect.orDie),
+                }),
+              );
+              const interrupted = yield* copy.source(threadId).pipe(Effect.forkChild);
+              yield* Deferred.await(copying);
+              yield* Fiber.interrupt(interrupted);
+              remote = { ...remote!, phase: "aborted", sourceReopenRequired: true };
+              const restarted = yield* workerOn("first-boot");
+              yield* restarted.source(threadId);
+              expect(reopenBlockers).toEqual(["capture_stop_unconfirmed"]);
+              expect(reopenAcks).toBe(0);
+              expect((yield* captures.active)[0]?.phase).toBe("capturing");
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect((yield* queue).entries[0]?.state).toBe("moving");
+              expect(yield* sql`SELECT 1 FROM thread_move_source_reopens`).toEqual([]);
+              const damagedArchive = path.join(
+                (yield* ServerConfig).stateDir,
+                "move-transfers",
+                "source",
+                remote.operationId,
+              );
+              yield* fs.makeDirectory(damagedArchive, { recursive: true });
+              const rebooted = yield* workerOn("second-boot");
+              yield* rebooted.source(threadId);
+              expect(reopenAcks).toBe(1);
+              expect((yield* captures.get(remote.operationId))?.releaseOutcome).toBe("cancelled");
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+              expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
               return;
             }
             if (lost === "capture-upload-blocked") {
@@ -2063,6 +2236,9 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
               activate: unused,
               abort: unused,
               removed: unused,
+              sourceReopened: unused,
+              getIfStarted: unused,
+              reopenBlocked: unused,
               publish: unused,
               artifact: unused,
               beginVm: (owner) =>
@@ -2350,6 +2526,9 @@ for (const kind of ["terminal", "setup"] as const)
             activate: unused,
             abort: unused,
             removed: unused,
+            sourceReopened: unused,
+            getIfStarted: unused,
+            reopenBlocked: unused,
             publish: unused,
             artifact: unused,
           };
@@ -2490,6 +2669,9 @@ for (const reportFault of ["none", "lookup", "journal", "controller"] as const)
               activate: unexpected,
               abort: unexpected,
               removed: unexpected,
+              sourceReopened: unexpected,
+              getIfStarted: unexpected,
+              reopenBlocked: unexpected,
             };
             const history = makeThreadHistorySync(sql, engine, {
               append: () => Effect.void,

@@ -3,8 +3,14 @@ import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
+import {
+  type BootEvidence,
+  decodeBootEvidence,
+  encodeBootEvidence,
+} from "../terminal/SetupProcessAdapter.ts";
 
 export const CheckoutAdmission = Context.Reference<string | undefined>("t3/CheckoutAdmission", {
   defaultValue: () => undefined,
@@ -28,6 +34,7 @@ export interface CheckoutCaptureHold extends CheckoutCaptureOwner, CheckoutCaptu
   readonly phase: "draining" | "capturing" | "released";
   readonly releaseOutcome: "sealed" | "failed" | "cancelled" | null;
   readonly manifestSha256: string | null;
+  readonly bootJson: string | null;
 }
 export interface CheckoutWorkAdmission extends CheckoutCaptureScope {
   readonly sequence: number;
@@ -56,7 +63,7 @@ const overlaps = (a: string, b: string) => within(a, b) || within(b, a);
 export function makeCheckoutCapture(sql: SqlClient.SqlClient) {
   const holdFields = sql`operation_id AS "operationId",thread_id AS "threadId",
     environment_id AS "environmentId",generation,checkout_root AS "checkoutRoot",git_common_root AS "gitCommonRoot",
-    admission_sequence AS "admissionSequence",phase,release_outcome AS "releaseOutcome",manifest_sha256 AS "manifestSha256"`;
+    admission_sequence AS "admissionSequence",phase,release_outcome AS "releaseOutcome",manifest_sha256 AS "manifestSha256",boot_json AS "bootJson"`;
   const active = sql<CheckoutCaptureHold>`SELECT ${holdFields} FROM checkout_capture_holds WHERE phase!='released' ORDER BY operation_id`;
   const get = (operationId: string) =>
     Effect.map(
@@ -118,7 +125,7 @@ export function makeCheckoutCapture(sql: SqlClient.SqlClient) {
           sequence: number;
         }>`SELECT COALESCE(MAX(sequence),0) AS sequence FROM checkout_work_admissions`;
         if (prior) {
-          yield* sql`UPDATE checkout_capture_holds SET phase='draining',release_outcome=NULL,manifest_sha256=NULL,
+          yield* sql`UPDATE checkout_capture_holds SET phase='draining',release_outcome=NULL,manifest_sha256=NULL,boot_json=NULL,
           admission_sequence=${last!.sequence} WHERE operation_id=${input.operationId}`;
         } else {
           yield* sql`INSERT INTO checkout_capture_holds
@@ -236,13 +243,22 @@ export function makeCheckoutCapture(sql: SqlClient.SqlClient) {
   };
   const enterCapturing = Effect.fn("CheckoutCapture.enterCapturing")(function* (
     owner: CheckoutCaptureOwner,
-    options?: { readonly additionalBlockers?: ReadonlyArray<string> },
+    options?: {
+      readonly additionalBlockers?: ReadonlyArray<string>;
+      readonly boot?: typeof BootEvidence.Type | null;
+    },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const row = yield* owned(owner);
         if (row.phase === "released")
           return yield* fail("This capture has already released its checkout.");
+        const boot = options?.boot ?? null;
+        if (row.phase === "capturing" && row.bootJson !== null) {
+          const priorBoot = decodeBootEvidence(row.bootJson);
+          if (Option.isNone(priorBoot) || priorBoot.value.host !== boot?.host)
+            return yield* fail("The host of this interrupted capture could not be confirmed.");
+        }
         if (options?.additionalBlockers?.length || (yield* blockers(row)).length)
           return yield* fail("Waiting for admitted checkout work to finish.", true);
         const operations = yield* sql<{
@@ -267,8 +283,37 @@ export function makeCheckoutCapture(sql: SqlClient.SqlClient) {
           )
         )
           return yield* fail("Another capture is reading this repository's Git metadata.", true);
-        yield* sql`UPDATE checkout_capture_holds SET phase='capturing' WHERE operation_id=${owner.operationId}`;
+        yield* sql`UPDATE checkout_capture_holds SET phase='capturing',boot_json=${boot ? encodeBootEvidence(boot) : null}
+          WHERE operation_id=${owner.operationId}`;
         return (yield* get(owner.operationId))!;
+      }),
+    );
+  });
+  const cancelAfterReboot = Effect.fn("CheckoutCapture.cancelAfterReboot")(function* (
+    owner: CheckoutCaptureOwner,
+    boot: typeof BootEvidence.Type | null,
+  ) {
+    if (!boot) return false;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* owned(owner);
+        if (row.phase === "released") return true;
+        if (row.phase !== "capturing") return false;
+        if (row.bootJson === null) {
+          // An old hold needs a baseline before a later reboot can prove the copy stopped.
+          yield* sql`UPDATE checkout_capture_holds SET boot_json=${encodeBootEvidence(boot)}
+            WHERE operation_id=${owner.operationId}`;
+          return false;
+        }
+        const prior = decodeBootEvidence(row.bootJson);
+        if (
+          Option.isNone(prior) ||
+          prior.value.host !== boot.host ||
+          prior.value.session === boot.session
+        )
+          return false;
+        yield* release(owner, { outcome: "cancelled", expectedPhase: "capturing" });
+        return true;
       }),
     );
   });
@@ -347,6 +392,7 @@ export function makeCheckoutCapture(sql: SqlClient.SqlClient) {
     acquireDrain,
     enterCapturing,
     release,
+    cancelAfterReboot,
     admit,
     complete,
     completeUnboundRequest,

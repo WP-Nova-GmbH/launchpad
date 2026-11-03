@@ -193,6 +193,25 @@ export function makeThreadJournalStore(sql: PgClient) {
       }),
     );
   });
+  /** The relay itself accepted this queue cancellation. No inbox dispatch is needed. */
+  const acceptMoveCancellationRequest = Effect.fnUntraced(function* (
+    input: Owner & { commandId: string; operationId: string },
+  ) {
+    yield* sql`UPDATE relay_thread_commands SET relay_move_cancel_operation_id=${input.operationId},
+      receipt_json=jsonb_build_object(
+      'status','accepted','sequence',coalesce(
+        (SELECT source_sequence FROM relay_thread_history_watermarks
+          WHERE thread_id=${input.threadId} AND environment_id=${input.environmentId}
+            AND generation=${input.generation}),0))
+      WHERE thread_id=${input.threadId} AND command_id=${input.commandId}
+        AND accepted_generation=${input.generation} AND receipt_json IS NULL
+        AND payload_json->>'type'='thread.move.cancel'
+        AND EXISTS(SELECT 1 FROM relay_thread_moves m WHERE m.operation_id=${input.operationId}
+          AND m.thread_id=${input.threadId} AND m.source_environment_id=${input.environmentId}
+          AND m.expected_generation=${input.generation} AND m.cancellation_protocol='source-reopen-v1'
+          AND m.phase IN ('aborting','aborted'))`;
+    return yield* command(input.threadId, input.commandId);
+  });
   const next = Effect.fn("relay.thread_journal.next")(function* (input: Owner) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -402,5 +421,15 @@ export function makeThreadJournalStore(sql: PgClient) {
     return yield* sql<HistoryEntry>`SELECT cursor, environment_id AS "environmentId", event_json AS event
       FROM relay_thread_history WHERE thread_id = ${input.threadId} AND cursor > ${input.after} ORDER BY cursor LIMIT ${input.limit}`;
   });
-  return { command, pending, stage, next, acknowledge, append, confirmThrough, history };
+  return {
+    command,
+    pending,
+    stage,
+    acceptMoveCancellationRequest,
+    next,
+    acknowledge,
+    append,
+    confirmThrough,
+    history,
+  };
 }

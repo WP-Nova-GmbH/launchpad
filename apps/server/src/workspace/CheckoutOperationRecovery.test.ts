@@ -25,7 +25,9 @@ it.effect(
       yield* sql`INSERT INTO checkout_operations(operation_id,kind) VALUES('legacy','vcs')`;
       yield* sql`INSERT INTO checkout_operation_paths(operation_id,path) VALUES('legacy','/repo/.git')`;
       yield* sql`INSERT INTO checkout_operation_projects(operation_id,project_id) VALUES('legacy','project')`;
-      assert.deepStrictEqual(yield* runMigrations(), [[88, "CheckoutOperationBoot"]]);
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 88 }), [
+        [88, "CheckoutOperationBoot"],
+      ]);
       assert.deepStrictEqual(yield* operations(sql), [{ operationId: "legacy", bootJson: null }]);
       assert.deepStrictEqual(yield* sql`SELECT * FROM checkout_operation_paths`, [
         { operation_id: "legacy", path: "/repo/.git" },
@@ -34,7 +36,7 @@ it.effect(
         { operation_id: "legacy", project_id: "project" },
       ]);
       assert.strictEqual((yield* verifyMigrationHistory).through, 88);
-      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* runMigrations({ toMigrationInclusive: 88 }), []);
     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
 

@@ -11,7 +11,13 @@ import type {
 import { act, useState, type ComponentProps, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { CommandId, EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
+import {
+  CommandId,
+  EnvironmentId,
+  MessageId,
+  ThreadId,
+  type ThreadPromptQueue,
+} from "@t3tools/contracts";
 import { AsyncResult } from "effect/unstable/reactivity";
 import type { ThreadVmActionSubmission } from "@t3tools/client-runtime/relay/threadVmActionSubmission";
 import type { ThreadVmProviderAuthDialogEvidence } from "@t3tools/client-runtime/relay/threadVmControls";
@@ -28,6 +34,7 @@ const fixture = vi.hoisted(() => ({
   cloudConfigured: false,
   vmAccountPending: false,
   localThread: null as Record<string, unknown> | null,
+  queue: null as ThreadPromptQueue | null,
   route: null as {
     phase: "active" | "retired";
     relayUrl: string;
@@ -122,7 +129,7 @@ vi.mock("../../state/threads", async () => {
       stateAtom: () => ({
         status: "live",
         data: fixture.cloudConfigured
-          ? { _tag: "Some", value: { promptQueue: emptyThreadPromptQueue() } }
+          ? { _tag: "Some", value: { promptQueue: fixture.queue ?? emptyThreadPromptQueue() } }
           : { _tag: "None" },
       }),
     },
@@ -463,6 +470,7 @@ beforeEach(() => {
   fixture.cloudConfigured = false;
   fixture.vmAccountPending = false;
   fixture.localThread = null;
+  fixture.queue = null;
   fixture.route = null;
   fixture.status = {};
   fixture.candidates = [];
@@ -638,6 +646,72 @@ describe("simplified VM controls", () => {
     expect(button("Recover from backup…")).toBeDefined();
     expect(button("Reset VM…")).toBeUndefined();
     expect(button("Permanently delete thread")).toBeUndefined();
+  });
+  it("shows the relay's reopening state in Run on over a retired machine's old move", async () => {
+    fixture.signedIn = true;
+    fixture.local = true;
+    fixture.cloudConfigured = true;
+    fixture.localThread = {
+      id: thread,
+      projectId: "project",
+      modelSelection: { instanceId: "codex" },
+      archivedAt: null,
+      relayRouting: { generation: 1 },
+    };
+    fixture.queue = {
+      ...emptyThreadPromptQueue(),
+      entries: [
+        {
+          kind: "move",
+          messageId: MessageId.make("old-message"),
+          operationId: CommandId.make("old-move"),
+          destination: { kind: "vm" },
+          state: "blocked",
+          detail: "Old VM setup failure",
+          revision: 1,
+          acceptedSequence: 2,
+          createdAt: "2026-10-22T10:00:00Z",
+        },
+      ],
+    };
+    fixture.location = {
+      placement: {
+        threadId: thread,
+        environmentId: "guest",
+        projectId: "vm-project",
+        ownerUserId: "owner",
+        organizationId: "org",
+        repositoryId: "repo",
+        generation: 2,
+        operationId: null,
+        activeMove: {
+          operationId: "return-move",
+          sourceEnvironmentId: "guest",
+          sourceGeneration: 2,
+          sourceKind: "vm",
+          destinationEnvironmentId: env,
+          destinationProjectId: "project",
+          destinationKind: "environment",
+          phase: "reopening",
+          cancellationMode: "legacy",
+        },
+      },
+      destination: null,
+      recoveryRequested: false,
+      isPending: false,
+      movePending: true,
+      error: null,
+    };
+    await mount(true);
+    await openRunOn();
+    const status = renderer!.root.findAllByProps({ role: "status" });
+    expect(
+      status.some((node) => node.children.join("").includes("Reopening source… → Akina")),
+    ).toBe(true);
+    expect(status.some((node) => node.children.join("").includes("Move blocked"))).toBe(false);
+    expect(status.some((node) => node.children.join("").includes("Old VM setup failure"))).toBe(
+      false,
+    );
   });
   it("offers the next VM account editor only for a registered current local chat", async () => {
     fixture.signedIn = true;

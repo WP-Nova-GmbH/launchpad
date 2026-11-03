@@ -2,17 +2,30 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import { ClientOrchestrationCommand } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import type { Fragment } from "effect/unstable/sql/Statement";
 import { makeThreadVmResumeStore, threadVmResumePlacement } from "./ThreadVmResumeStore.ts";
 
 type ThreadCommand = Extract<ClientOrchestrationCommand, { readonly threadId: string }>;
 const decodeCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const legacyCancellation = (sql: PgClient, threadId: string, commandId: string | Fragment) => sql`
+  EXISTS (SELECT 1 FROM relay_thread_moves m JOIN relay_thread_placements t USING(thread_id)
+    WHERE m.thread_id=${threadId} AND m.legacy_cancel_command_id=${commandId}
+      AND m.phase='aborted' AND m.cancellation_protocol='legacy'
+      AND t.operation_id IS NULL AND m.source_environment_id=t.environment_id
+      AND m.expected_generation=t.generation)`;
+
 // Queue management is durable while compute sleeps. Only new work or an
-// explicit continuation asks for power; archive/unarchive retain the hold.
+// explicit continuation asks for power, except for an exact legacy move cleanup.
 export const threadCommandRequestsWake = Effect.fnUntraced(function* (
   sql: PgClient,
   threadId: string,
   command: ThreadCommand,
 ) {
+  if (command.type === "thread.move.cancel")
+    return (
+      (yield* sql`SELECT 1 WHERE ${legacyCancellation(sql, threadId, command.commandId)}`).length >
+      0
+    );
   const explicitResume =
     command.type === "thread.queue.resume" || command.type === "thread.preparation.retry";
   if (
@@ -82,12 +95,14 @@ export const wakeQueuedThreadVm = Effect.fn("relay.thread_vm.wake_queued")(funct
         AND ${threadVmResumePlacement(sql)}
         AND (a.native_paused_generation=${placement.generation} OR (x.phase='completed' AND x.generation=${placement.generation}))`;
       if (!paused) return false;
+      const cleanup = legacyCancellation(sql, threadId, sql`q.command_id`);
       const [candidate] = yield* sql<{
         payload: unknown;
       }>`SELECT payload_json AS payload FROM relay_thread_commands
-      WHERE thread_id=${threadId} AND receipt_json IS NULL
-        AND payload_json->>'type' IN ('thread.prompt.enqueue','thread.turn.start','thread.move.enqueue','thread.queue.resume','thread.preparation.retry')
-      ORDER BY position DESC LIMIT 1`;
+      q WHERE thread_id=${threadId} AND receipt_json IS NULL
+        AND (payload_json->>'type' IN ('thread.prompt.enqueue','thread.turn.start','thread.move.enqueue','thread.queue.resume','thread.preparation.retry')
+          OR (payload_json->>'type'='thread.move.cancel' AND ${cleanup}))
+      ORDER BY (payload_json->>'type'='thread.move.cancel') DESC, position DESC LIMIT 1`;
       if (!candidate) return false;
       const command = yield* decodeCommand(candidate.payload);
       if (

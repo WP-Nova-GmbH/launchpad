@@ -1,4 +1,4 @@
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, type MessageId, ThreadId } from "@t3tools/contracts";
 import type {
   RelayThreadMove,
   RelayThreadArtifactReceipt,
@@ -59,6 +59,11 @@ export function makeThreadMoveTransport<E, R>(
       Effect.timeout("15 seconds"),
       Effect.mapError(() => fail(owner.threadId)),
     );
+  const getMove = (owner: ThreadMoveOwner, client: RelayClient, params: Parameters) =>
+    client.threadMoves.get({
+      params,
+      payload: { generation: owner.generation, supportsSourceReopenAck: true },
+    });
   return {
     sourceFormats: (owner: ThreadMoveOwner) =>
       Effect.gen(function* () {
@@ -88,26 +93,40 @@ export function makeThreadMoveTransport<E, R>(
         actorUserId: string;
         destinationEnvironmentId: EnvironmentId;
         destinationProjectId: import("@t3tools/contracts").ProjectId;
+        sourceMessageId?: MessageId;
         sourceThreadTransferFormats?: ThreadTransferFormats;
       },
     ) =>
       request(owner, (client, params) =>
-        client.threadMoves.begin({ params, payload: { generation: owner.generation, ...input } }),
+        client.threadMoves.begin({
+          params,
+          payload: { generation: owner.generation, supportsSourceReopenAck: true, ...input },
+        }),
       ),
     beginVm: (
       owner: ThreadMoveOwner,
       input: {
         actorUserId: string;
         cancelBeforeStart: boolean;
+        sourceMessageId?: MessageId;
         sourceThreadTransferFormats?: ThreadTransferFormats;
       },
     ) =>
       request(owner, (client, params) =>
-        client.threadMoves.beginVm({ params, payload: { generation: owner.generation, ...input } }),
+        client.threadMoves.beginVm({
+          params,
+          payload: { generation: owner.generation, supportsSourceReopenAck: true, ...input },
+        }),
       ),
     get: (owner: ThreadMoveOwner) =>
+      request(owner, (client, params) => getMove(owner, client, params)),
+    getIfStarted: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) =>
-        client.threadMoves.get({ params, payload: { generation: owner.generation } }),
+        getMove(owner, client, params).pipe(
+          Effect.catchTag("RelayTenancyNotFoundError", (error) =>
+            error.reason === "thread_move_not_found" ? Effect.succeed(null) : Effect.fail(error),
+          ),
+        ),
       ),
     selectEncoding: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) =>
@@ -160,6 +179,20 @@ export function makeThreadMoveTransport<E, R>(
     removed: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) =>
         client.threadMoves.removed({ params, payload: { generation: owner.generation } }),
+      ),
+    sourceReopened: (owner: ThreadMoveOwner) =>
+      request(owner, (client, params) =>
+        client.threadMoves.sourceReopened({ params, payload: { generation: owner.generation } }),
+      ),
+    reopenBlocked: (
+      owner: ThreadMoveOwner,
+      reason: "capture_stop_unconfirmed" | "source_reopen_failed",
+    ) =>
+      request(owner, (client, params) =>
+        client.threadMoves.reopenBlocked({
+          params,
+          payload: { generation: owner.generation, reason },
+        }),
       ),
     publish: (owner: ThreadMoveOwner, manifestArtifactId: string) =>
       Effect.gen(function* () {

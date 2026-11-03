@@ -5,7 +5,10 @@ import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import type { RelayThreadArtifactReceipt } from "@t3tools/contracts/relay";
+import {
+  RelayTenancyNotFoundError,
+  type RelayThreadArtifactReceipt,
+} from "@t3tools/contracts/relay";
 import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientError from "effect/unstable/http/HttpClientError";
@@ -46,6 +49,43 @@ const moveResponse = {
   manifestSha256: null,
   manifestArtifactId: null,
 };
+
+it.effect("allows admission retry only when the exact move is absent", () =>
+  Effect.gen(function* () {
+    const transport = makeThreadMoveTransport(
+      () =>
+        makeExecutorRelayApiClient({
+          url: owner.relayUrl,
+          issuer: owner.relayUrl,
+          environmentCredential: "current-token",
+        }),
+      () => Effect.die("No artifact upload"),
+    );
+    const lookup = (reason: RelayTenancyNotFoundError["reason"]) =>
+      transport.getIfStarted(owner).pipe(
+        Effect.provideService(
+          HttpClient.HttpClient,
+          HttpClient.make((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(
+                request,
+                Response.json(
+                  new RelayTenancyNotFoundError({
+                    code: "tenancy_not_found",
+                    reason,
+                    traceId: "move-test",
+                  }),
+                  { status: 404 },
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    expect(yield* lookup("thread_move_not_found")).toBeNull();
+    expect((yield* Effect.flip(lookup("thread_not_found")))._tag).toBe("ThreadMoveError");
+  }),
+);
 
 it.effect("advertises receiver formats on the existing authenticated move poll", () =>
   Effect.gen(function* () {

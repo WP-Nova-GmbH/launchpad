@@ -22,6 +22,7 @@ const fixture = vi.hoisted(() => ({
   session: { accountId: "owner" },
   relayUrl: "https://relay.example.test",
   index: { entries: [] as RelayPortableThreadSummary[], next: null },
+  placement: null as RelayPortableThreadSummary["placement"] | null,
   detail: {
     history: { thread: { messages: [] }, deleted: false },
     hasMore: false,
@@ -112,7 +113,9 @@ vi.mock("./ThreadVmControls", () => ({
 }));
 vi.mock("./ThreadMoveQueueItem", () => ({
   useThreadMovePlacement: (_environmentId: string, threadId: string) =>
-    fixture.index.entries.find((row) => row.placement.threadId === threadId)?.placement,
+    fixture.placement?.threadId === threadId
+      ? fixture.placement
+      : fixture.index.entries.find((row) => row.placement.threadId === threadId)?.placement,
   useSavedThreadMoveCancellation: () => ({
     refresh: fixture.refreshCancellations,
     observe: fixture.observeCancellations,
@@ -192,7 +195,9 @@ vi.mock("../../../../mobile/src/features/threads/ThreadVmControls", () => ({
 }));
 vi.mock("../../../../mobile/src/features/threads/ThreadMoveQueueItem", () => ({
   useThreadMovePlacement: (_environmentId: string, threadId: string) =>
-    fixture.index.entries.find((row) => row.placement.threadId === threadId)?.placement,
+    fixture.placement?.threadId === threadId
+      ? fixture.placement
+      : fixture.index.entries.find((row) => row.placement.threadId === threadId)?.placement,
   useSavedThreadMoveCancellation: () => ({
     refresh: fixture.refreshCancellations,
     observe: fixture.observeCancellations,
@@ -287,6 +292,7 @@ for (const [surface, Component] of [
       fixture.session = { accountId: "owner" };
       fixture.relayUrl = "https://relay.example.test";
       fixture.index = { entries: [entry("First"), entry("Second")], next: null };
+      fixture.placement = null;
       for (const fn of Object.values(fixture.commands))
         fn.mockResolvedValue({ _tag: "Success", value: null });
       fixture.commands.loadQueue.mockImplementation(async ({ threadId }) => ({
@@ -398,7 +404,7 @@ for (const [surface, Component] of [
       await act(async () => {
         (refresh.props.onClick ?? refresh.props.onPress)();
       });
-      expect(fixture.commands.refreshPlacement).toHaveBeenCalledTimes(1);
+      expect(fixture.commands.refreshPlacement).toHaveBeenCalledTimes(2);
       expect(fixture.commands.refreshStatus).toHaveBeenCalledWith({
         environmentId: "vm",
         threadId: "First",
@@ -409,6 +415,38 @@ for (const [surface, Component] of [
       });
       await act(async () => next.resolve({ _tag: "Success", value: null }));
       expect(refresh.props.disabled).toBe(false);
+      expect(fixture.commands.openChat).not.toHaveBeenCalled();
+      expect(fixture.run).not.toHaveBeenCalled();
+    });
+
+    it("finds legacy cancellation still reopening when the saved summary looks idle", async () => {
+      const reopening = {
+        ...entry("First").placement,
+        activeMove: {
+          operationId: "legacy-cancel",
+          sourceEnvironmentId: "vm",
+          sourceGeneration: 2,
+          sourceKind: "vm",
+          destinationEnvironmentId: "mac",
+          destinationProjectId: "original-project",
+          destinationKind: "environment",
+          phase: "reopening",
+          cancellationMode: "legacy",
+        },
+      } satisfies RelayPortableThreadSummary["placement"];
+      fixture.commands.refreshPlacement.mockImplementationOnce(async () => {
+        fixture.placement = reopening;
+        return { _tag: "Success", value: reopening };
+      });
+      await render();
+      await click("Details for First");
+      expect(fixture.commands.refreshPlacement).not.toHaveBeenCalled();
+      await click("Read conversation");
+      await render();
+      expect(content()).toContain("Move queue");
+      expect(fixture.commands.refreshPlacement).toHaveBeenCalledExactlyOnceWith({
+        threadId: "First",
+      });
       expect(fixture.commands.openChat).not.toHaveBeenCalled();
       expect(fixture.run).not.toHaveBeenCalled();
     });

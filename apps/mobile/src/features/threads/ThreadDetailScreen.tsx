@@ -1149,30 +1149,27 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   representedMessageIds={representedMessageIds}
                 />
                 <ThreadVmNotice queue={props.promptQueue} />
-                {props.promptQueue ? (
-                  <SharedPromptQueue
-                    ref={sharedQueueRef}
-                    key={`${props.environmentId}:${props.selectedThread.id}`}
-                    environmentId={props.environmentId}
-                    threadId={props.selectedThread.id}
-                    queue={props.promptQueue}
-                    visibleEntries={queuePresentation.queuedEntries}
-                    workflowControlled={props.selectedThread.workflowJob != null}
-                    supportsPreparation={
-                      props.serverConfig?.environment.capabilities.sharedPreparation === true
-                    }
-                    hasStartedTurn={props.selectedThread.latestTurn !== null}
-                    activeTurnId={
-                      props.selectedThread.session?.status === "running"
-                        ? props.selectedThread.session.activeTurnId
-                        : null
-                    }
-                    unavailable={
-                      props.connectionStateLabel !== "connected" ||
-                      props.threadSyncStatus !== "live"
-                    }
-                  />
-                ) : null}
+                <SharedPromptQueue
+                  ref={sharedQueueRef}
+                  key={`${props.environmentId}:${props.selectedThread.id}`}
+                  environmentId={props.environmentId}
+                  threadId={props.selectedThread.id}
+                  queue={props.promptQueue}
+                  queueGeneration={props.selectedThread.relayRouting?.generation}
+                  queueRetired={props.selectedThread.relayRouting?.phase === "retired"}
+                  visibleEntries={queuePresentation.queuedEntries}
+                  workflowControlled={props.selectedThread.workflowJob != null}
+                  supportsPreparation={
+                    props.serverConfig?.environment.capabilities.sharedPreparation === true
+                  }
+                  hasStartedTurn={props.selectedThread.latestTurn !== null}
+                  activeTurnId={
+                    props.selectedThread.session?.status === "running"
+                      ? props.selectedThread.session.activeTurnId
+                      : null
+                  }
+                  unavailable={queueUnavailable}
+                />
                 <ThreadRunOnControl
                   environmentId={props.environmentId}
                   thread={props.selectedThread}

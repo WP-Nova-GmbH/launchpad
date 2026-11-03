@@ -64,7 +64,17 @@ export const makeThreadMoveSweep = Effect.fn("ThreadRelayCoordinator.makeMoveSwe
       const pending: {
         entries: ReadonlyArray<import("@t3tools/contracts/relay").RelayThreadMove>;
         next: string | null;
-      } = yield* authority.moves.pending(discovery, after);
+      } | null = yield* authority.moves.pending(discovery, after).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterrupts(cause),
+          (cause) =>
+            (Cause.hasDies(cause)
+              ? Effect.logWarning("Incoming thread move discovery failed; will retry", { cause })
+              : Effect.logDebug("Incoming thread move discovery will retry")
+            ).pipe(Effect.as(null)),
+        ),
+      );
+      if (!pending) break;
       for (const move of pending.entries)
         if (move.destinationEnvironmentId === discovery.environmentId)
           incoming.set(move.operationId, {
@@ -82,7 +92,11 @@ export const makeThreadMoveSweep = Effect.fn("ThreadRelayCoordinator.makeMoveSwe
     }>`SELECT q.thread_id AS "threadId" FROM projection_thread_prompt_queues q
       LEFT JOIN thread_execution_fences f USING(thread_id) WHERE (f.phase IS NULL OR f.phase!='retired')
       AND (json_extract(q.state_json,'$.entries[0].kind')='move' OR EXISTS
-        (SELECT 1 FROM thread_local_enrollments e WHERE e.thread_id=q.thread_id AND e.phase='pending'))`;
+        (SELECT 1 FROM thread_local_enrollments e WHERE e.thread_id=q.thread_id AND e.phase='pending'))
+      UNION SELECT r.thread_id AS "threadId" FROM thread_move_source_reopens r
+      JOIN thread_execution_fences f ON f.thread_id=r.thread_id AND f.operation_id=r.operation_id
+        AND f.environment_id=r.environment_id AND f.generation=r.generation AND f.relay_url=r.relay_url
+      WHERE f.phase='active'`;
     yield* Effect.forEach(
       candidates,
       ({ threadId }) =>

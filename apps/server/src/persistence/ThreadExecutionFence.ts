@@ -41,6 +41,13 @@ type Work = Identity & {
   readonly kind: "provider" | "terminal" | "setup" | "workspace";
 };
 
+export const threadMoveSourceReopening = (sql: SqlClient.SqlClient, threadId: string) =>
+  sql`SELECT 1 FROM thread_execution_fences f
+    JOIN thread_move_source_reopens r ON r.operation_id=f.operation_id
+      AND r.thread_id=f.thread_id AND r.relay_url=f.relay_url
+      AND r.environment_id=f.environment_id AND r.generation=f.generation
+    WHERE f.thread_id=${threadId} LIMIT 1`.pipe(Effect.map((rows) => rows.length > 0));
+
 /**
  * Local durable half of relay ownership. Callers verify relay acknowledgements before
  * activation/admission; elapsed time or a server restart can never release a fence.

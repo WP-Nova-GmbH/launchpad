@@ -10366,19 +10366,21 @@ export default function ChatView(props: ChatViewProps) {
                         representedMessageIds={representedSharedMessageIds}
                       />
                     ) : null}
-                    {supportsSharedPromptQueue && activeThreadRef && activeThread?.promptQueue ? (
+                    {activeThreadRef ? (
                       <SharedPromptQueue
                         key={activeThreadKey}
                         threadRef={activeThreadRef}
-                        queue={activeThread.promptQueue}
+                        queue={supportsSharedPromptQueue ? activeThread?.promptQueue : undefined}
+                        queueGeneration={routeServerThreadShell?.relayRouting?.generation}
+                        queueRetired={routeServerThreadShell?.relayRouting?.phase === "retired"}
                         controlsRef={sharedQueueControls}
                         visibleEntryIds={sharedQueuePresentation.queuedEntries.map(
                           (entry) => entry.messageId,
                         )}
-                        workflowControlled={activeThread.workflowJob != null}
+                        workflowControlled={activeThread?.workflowJob != null}
                         supportsPreparation={supportsSharedPreparation}
                         canWorkLocally={
-                          activeThread.latestTurn === null &&
+                          activeThread?.latestTurn === null &&
                           activeThread.messages.every((message) => message.role !== "user")
                         }
                         activeTurnId={

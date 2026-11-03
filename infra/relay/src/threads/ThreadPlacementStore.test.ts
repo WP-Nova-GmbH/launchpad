@@ -21,6 +21,8 @@ import {
   activatePortableThreadMove,
   abortPortableThreadMove,
   confirmPortableThreadMoveDestinationRemoved,
+  confirmPortableThreadMoveSourceReopened,
+  reportPortableThreadMoveReopenBlocked,
 } from "../http/ThreadMovesApi.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
@@ -106,6 +108,8 @@ import {
 import { RelayEnvironmentPrincipal } from "@t3tools/contracts/relay";
 import {
   stagePortableThreadCommand,
+  cancelPortableThreadMove,
+  getPortableThreadMoveCancellation,
   getPortableThreadCommandReceipt,
   getPendingPortableThreadCommands,
 } from "../http/ThreadCommandsApi.ts";
@@ -3241,6 +3245,8 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       "unarchived-resume",
       "mirrored-unarchived-send",
       "mirrored-enabled-send",
+      "ordinary-cancel",
+      "legacy-cancel-retry",
     ] as const) {
       it.effect(`paused VM wake admission: ${scenario}`, () =>
         Effect.gen(function* () {
@@ -3257,6 +3263,26 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           });
           const provision = (yield* makeThreadVmProvisionStore(f.sql).get(f.input.allocationId))!;
           const allocation = (yield* makeThreadVmAllocationStore(f.sql).get(f.input.allocationId))!;
+          const cancel = {
+            type: "thread.move.cancel",
+            commandId: NodeCrypto.randomUUID(),
+            messageId: NodeCrypto.randomUUID(),
+            expectedRevision: 1,
+          };
+          if (scenario === "legacy-cancel-retry") {
+            const placements = makeThreadPlacementStore(f.sql);
+            const move = yield* placements.beginMove({
+              operationId: NodeCrypto.randomUUID(),
+              threadId: f.input.threadId,
+              actorUserId: f.input.ownerUserId,
+              sourceEnvironmentId: f.environmentId,
+              expectedGeneration: 1,
+              destinationEnvironmentId: "test-cancel-destination",
+              destinationProjectId: "test-cancel-project",
+            });
+            yield* placements.requestAbort({ ...move, legacyCancelCommandId: cancel.commandId });
+            yield* placements.destinationRemoved(move);
+          }
           yield* makeThreadVmAllocationStore(f.sql).recordPowerState({
             allocationId: f.input.allocationId,
             computeRef: allocation.computeRef!,
@@ -3341,11 +3367,17 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
                         }
                       : scenario === "resume" || scenario === "unarchived-resume"
                         ? { type: "thread.queue.resume", expectedRevision: 0 }
-                        : send,
+                        : scenario === "ordinary-cancel" || scenario === "legacy-cancel-retry"
+                          ? cancel
+                          : send,
           );
-          const wakes = ["send", "resume", "unarchived-resume", "mirrored-enabled-send"].includes(
-            scenario,
-          );
+          const wakes = [
+            "send",
+            "resume",
+            "unarchived-resume",
+            "mirrored-enabled-send",
+            "legacy-cancel-retry",
+          ].includes(scenario);
           expect(yield* resumes.get(f.input.allocationId)).toEqual(
             wakes ? expect.objectContaining({ phase: "waiting" }) : null,
           );
@@ -7369,11 +7401,20 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           };
           const asSource = Effect.provideService(RelayEnvironmentPrincipal, source),
             asDestination = Effect.provideService(RelayEnvironmentPrincipal, destination);
+          const asOwner = Effect.provideService(RelayClientPrincipal, {
+            userId: ownerUserId,
+            token: "test",
+          });
+          const directory = Effect.provideService(UserDirectory, {
+            lookup: () => Effect.succeed(new Map()),
+          });
+          const committedMessageId = MessageId.make(NodeCrypto.randomUUID());
           const intent = {
             ...src,
             actorUserId: ownerUserId,
             destinationEnvironmentId: destination.environmentId,
             destinationProjectId: "destination-project",
+            sourceMessageId: committedMessageId,
           };
           const begun = yield* beginPortableThreadMove(intent).pipe(asSource);
           expect(begun).toMatchObject({ phase: "preparing", manifestArtifactId: null });
@@ -7481,6 +7522,18 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           yield* sql`UPDATE relay_environment_links SET revoked_at=NULL WHERE environment_id=${destination.environmentId}`;
           const committed = yield* commitPortableThreadMove(src).pipe(asSource);
           expect(committed.phase).toBe("committed");
+          const tryLateCancel = () =>
+            stagePortableThreadCommand(threadId, {
+              type: "thread.move.cancel",
+              commandId: CommandId.make(NodeCrypto.randomUUID()),
+              threadId: ThreadId.make(threadId),
+              messageId: committedMessageId,
+              expectedRevision: 1,
+              createdAt: "2026-10-07T00:00:00Z",
+            }).pipe(asOwner, directory);
+          expect(yield* Effect.flip(tryLateCancel())).toMatchObject({
+            reason: "thread_command_conflict",
+          });
           expect(
             yield* Effect.flip(
               reportPortableThreadMoveFailure({ ...dst, detail: "Too late" }).pipe(asDestination),
@@ -7497,6 +7550,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           expect((yield* activatePortableThreadMove(dst).pipe(asDestination)).phase).toBe(
             "completed",
           );
+          expect(yield* Effect.flip(tryLateCancel())).toMatchObject({
+            reason: "thread_command_conflict",
+          });
           expect(
             (yield* getPortableThreadPlacement(threadId).pipe(
               Effect.provideService(RelayClientPrincipal, { userId: ownerUserId, token: "test" }),
@@ -7591,33 +7647,236 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             expectedRevision: 2,
             createdAt: at,
           };
-          const asOwner = Effect.provideService(RelayClientPrincipal, {
-            userId: ownerUserId,
-            token: "test",
-          });
-          const directory = Effect.provideService(UserDirectory, {
-            lookup: () => Effect.succeed(new Map()),
-          });
           expect(
-            (yield* stagePortableThreadCommand(threadId, cancel).pipe(asOwner, directory)).receipt,
-          ).toBeNull();
+            yield* Effect.flip(
+              stagePortableThreadCommand(threadId, cancel).pipe(asOwner, directory),
+            ),
+          ).toMatchObject({ reason: "thread_command_conflict" });
           expect((yield* store.getMove(cancelSource)).phase).toBe("frozen");
-          const matched = {
-            ...cancel,
-            commandId: CommandId.make(NodeCrypto.randomUUID()),
-            expectedRevision: 3,
-          };
-          const staged = yield* stagePortableThreadCommand(threadId, matched).pipe(
-            asOwner,
-            directory,
-          );
-          expect(staged.receipt).toBeNull();
-          expect((yield* store.getMove(cancelSource)).phase).toBe("aborting");
+          const legacy = { threadId, operationId: cancelledId, sourceGeneration: 2 };
+          const requestLegacy = () => cancelPortableThreadMove(legacy).pipe(asOwner);
           expect(
-            yield* stagePortableThreadCommand(threadId, matched).pipe(asOwner, directory),
-          ).toEqual(staged);
+            yield* Effect.flip(
+              cancelPortableThreadMove({ ...legacy, sourceGeneration: 1 }).pipe(asOwner),
+            ),
+          ).toMatchObject({
+            reason: "thread_placement_changed",
+          });
+          expect(yield* requestLegacy()).toMatchObject({
+            phase: "aborting",
+            cancellationMode: "legacy",
+          });
+          expect((yield* store.getMove(cancelSource)).phase).toBe("aborting");
+          const journal = makeThreadJournalStore(sql);
+          const firstCancelId = (yield* store.getMove(cancelSource)).legacyCancelCommandId!;
+          expect(yield* journal.command(threadId, firstCancelId)).toMatchObject({
+            command: { messageId, expectedRevision: 3 },
+          });
+          yield* requestLegacy();
+          expect((yield* store.getMove(cancelSource)).legacyCancelCommandId).toBe(firstCancelId);
           yield* confirmPortableThreadMoveDestinationRemoved(cancelTarget).pipe(asSource);
           expect((yield* store.get(threadId))?.generation).toBe(2);
+          expect(
+            (yield* getPortableThreadPlacement(threadId).pipe(asOwner)).activeMove,
+          ).toMatchObject({
+            phase: "reopening",
+            operationId: cancelledId,
+          });
+          yield* journal.acknowledge({
+            ...cancelSource,
+            commandId: firstCancelId,
+            receipt: {
+              status: "rejected",
+              detail: "The move changed.",
+            },
+          });
+          expect(yield* getPortableThreadMoveCancellation(legacy).pipe(asOwner)).toMatchObject({
+            phase: "reopening",
+            cancellationBlocker: "legacy_cancel_rejected",
+          });
+          yield* requestLegacy();
+          const retryId = (yield* store.getMove(cancelSource)).legacyCancelCommandId!;
+          expect(retryId).not.toBe(firstCancelId);
+          yield* journal.acknowledge({
+            ...cancelSource,
+            commandId: retryId,
+            receipt: {
+              status: "accepted",
+              sequence: 33,
+            },
+          });
+          expect((yield* getPortableThreadMoveCancellation(legacy).pipe(asOwner)).phase).toBe(
+            "reopening",
+          );
+          yield* journal.append({
+            ...cancelSource,
+            event: yield* decodeMoveHistoryEvent({
+              ...event,
+              type: "thread.prompt-queue-changed",
+              eventId: NodeCrypto.randomUUID(),
+              sequence: 34,
+              commandId: `${cancelledId}:finish:cancelled:4`,
+              payload: { threadId, updatedAt: at, removedMessageId: messageId },
+            }),
+          });
+          expect(
+            (yield* getPortableThreadPlacement(threadId).pipe(asOwner)).activeMove,
+          ).toMatchObject({
+            phase: "aborted",
+            operationId: cancelledId,
+          });
+
+          // A compatible source cancels even without a mirrored queue entry
+          // or source manifest. Destination cleanup alone cannot release it.
+          const modernId = NodeCrypto.randomUUID();
+          const modernSource = { ...cancelSource, operationId: modernId };
+          const modernTarget = { ...cancelTarget, operationId: modernId };
+          const modern = { threadId, operationId: modernId, sourceGeneration: 2 };
+          const lookup = getPortableThreadMove({ ...modernSource, supportsSourceReopenAck: true });
+          expect(yield* Effect.flip(lookup.pipe(asDestination))).toMatchObject({
+            reason: "thread_move_not_found",
+          });
+          expect(yield* Effect.flip(lookup.pipe(asSource))).toMatchObject({
+            reason: "thread_not_found",
+          });
+          const modernMessageId = MessageId.make(NodeCrypto.randomUUID());
+          const begin = (operationId: string, sourceMessageId = modernMessageId) =>
+            beginPortableThreadMove({
+              ...modernSource,
+              operationId,
+              actorUserId: ownerUserId,
+              destinationEnvironmentId: source.environmentId,
+              destinationProjectId: "source-project",
+              supportsSourceReopenAck: true,
+              sourceMessageId,
+            }).pipe(asDestination);
+          yield* begin(modernId);
+          const canonicalKey = `github.com/example/${repositoryId}`;
+          yield* sql`INSERT INTO relay_repository_aliases (canonical_key,repository_id,organization_id,created_at)
+            VALUES (${canonicalKey},${repositoryId},${organizationId},'now')`;
+          yield* reportPortableThreadMoveFailure({ ...modernSource, detail: "Save failed" }).pipe(
+            asDestination,
+          );
+          expect(yield* getPortableThreadMove(modernTarget).pipe(asSource)).toMatchObject({
+            repositoryCanonicalKeys: [canonicalKey],
+          });
+          expect(yield* cancelPortableThreadMove(modern).pipe(asOwner)).toMatchObject({
+            phase: "aborting",
+            cancellationMode: "direct",
+            sourceMessageId: modernMessageId,
+          });
+          yield* sql`UPDATE relay_organization_members SET role='member' WHERE organization_id=${organizationId}
+            AND user_id=${ownerUserId}`;
+          const cleanup = yield* getPortableThreadMove(modernTarget).pipe(asSource);
+          expect(cleanup).toMatchObject({ phase: "aborting", manifestArtifactId: null });
+          for (const field of [
+            "repositoryCanonicalKeys",
+            "failureDetail",
+            "participantStates",
+            "progress",
+          ])
+            expect(cleanup).not.toHaveProperty(field);
+          expect(
+            (yield* pendingPortableThreadMoves({
+              environmentId: source.environmentId,
+              after: null,
+              limit: 50,
+            }).pipe(asSource)).entries,
+          ).toEqual([cleanup]);
+          yield* sql`UPDATE relay_organization_members SET role='admin' WHERE organization_id=${organizationId}
+            AND user_id=${ownerUserId}`;
+          yield* confirmPortableThreadMoveDestinationRemoved(modernTarget).pipe(asSource);
+          expect((yield* store.get(threadId))?.operationId).toBe(modernId);
+          expect(
+            yield* Effect.flip(store.admit({ ...modernSource, workId: "too-early" })),
+          ).toMatchObject({
+            _tag: "ThreadPlacementConflict",
+          });
+          yield* reportPortableThreadMoveReopenBlocked({
+            ...modernSource,
+            reason: "capture_stop_unconfirmed",
+          }).pipe(asDestination);
+          expect(
+            (yield* getPortableThreadPlacement(threadId).pipe(asOwner)).activeMove,
+          ).toMatchObject({
+            phase: "reopening",
+            cancellationBlocker: "capture_stop_unconfirmed",
+          });
+          expect(
+            yield* Effect.flip(
+              confirmPortableThreadMoveSourceReopened(modernTarget).pipe(asSource),
+            ),
+          ).toMatchObject({
+            _tag: "RelayTenancyNotFoundError",
+          });
+          yield* confirmPortableThreadMoveSourceReopened(modernSource).pipe(asDestination);
+          expect((yield* getPortableThreadMoveCancellation(modern).pipe(asOwner)).phase).toBe(
+            "aborted",
+          );
+          const newer = NodeCrypto.randomUUID();
+          const newerMessageId = MessageId.make(NodeCrypto.randomUUID());
+          yield* begin(newer, newerMessageId);
+          yield* confirmPortableThreadMoveSourceReopened(modernSource).pipe(asDestination);
+          expect((yield* store.get(threadId))?.operationId).toBe(newer);
+          const queueCancel = {
+            ...cancel,
+            commandId: CommandId.make(NodeCrypto.randomUUID()),
+            messageId: newerMessageId,
+            expectedRevision: 1,
+          };
+          const stage = (command: typeof queueCancel) =>
+            stagePortableThreadCommand(threadId, command).pipe(asOwner, directory);
+          const pendingMessageId = MessageId.make(NodeCrypto.randomUUID());
+          yield* journal.append({
+            ...modernSource,
+            event: yield* decodeMoveHistoryEvent({
+              ...event,
+              type: "thread.prompt-queue-changed",
+              eventId: NodeCrypto.randomUUID(),
+              sequence: 35,
+              payload: {
+                threadId,
+                updatedAt: at,
+                entry: {
+                  kind: "move",
+                  messageId: pendingMessageId,
+                  destination: { kind: "vm" },
+                  revision: 1,
+                  acceptedSequence: 35,
+                  createdAt: at,
+                  state: "pending",
+                },
+              },
+            }),
+          });
+          const pending = yield* stage({
+            ...queueCancel,
+            messageId: pendingMessageId,
+            commandId: CommandId.make(NodeCrypto.randomUUID()),
+          });
+          expect(pending.receipt).toBeNull();
+          expect((yield* store.getMove({ threadId, operationId: newer })).phase).toBe("preparing");
+          const admitted = yield* stage(queueCancel);
+          expect(admitted.receipt).toMatchObject({ status: "accepted" });
+          expect(yield* stage(queueCancel)).toEqual(admitted);
+          expect(yield* store.getMove({ threadId, operationId: newer })).toMatchObject({
+            phase: "aborting",
+            cancellationProtocol: "source-reopen-v1",
+            legacyCancelCommandId: null,
+          });
+          yield* confirmPortableThreadMoveDestinationRemoved({
+            ...modernTarget,
+            operationId: newer,
+          }).pipe(asSource);
+          expect((yield* store.get(threadId))?.operationId).toBe(newer);
+          expect(
+            (yield* stage({ ...queueCancel, commandId: CommandId.make(NodeCrypto.randomUUID()) }))
+              .receipt,
+          ).toMatchObject({ status: "accepted" });
+          expect(yield* journal.pending(threadId, 0, 20)).toEqual({
+            entries: [pending],
+            hasMore: false,
+          });
         }),
     );
 

@@ -1,4 +1,5 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
+import { MessageId } from "@t3tools/contracts";
 import { ThreadTransferFormats } from "@t3tools/contracts/threadTransferFormat";
 import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 import {
@@ -52,6 +53,8 @@ const Intent = Schema.Union([
     sourcePublicKey: Schema.String,
     sourceAllocationId: Schema.NullOr(Schema.String),
     sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+    supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+    sourceMessageId: Schema.optionalKey(MessageId),
   }),
 ]);
 export type ThreadVmReplacementIntent = typeof Intent.Type;
@@ -247,6 +250,20 @@ export function makeThreadVmReplacementCoordinator(
         yield* lockOwner(input.ownerUserId);
         const prior = yield* get(input.requestId);
         if (prior) {
+          // Capability and queue identity were optional additions to existing move intents.
+          let comparable = prior.intent;
+          let candidate: ThreadVmReplacementIntent = input.intent;
+          if (comparable.kind === "move" && candidate.kind === "move") {
+            const sourceMessageId = comparable.sourceMessageId ?? candidate.sourceMessageId;
+            const defaults = {
+              ...(sourceMessageId === undefined ? {} : { sourceMessageId }),
+              ...(comparable.supportsSourceReopenAck || candidate.supportsSourceReopenAck
+                ? { supportsSourceReopenAck: true as const }
+                : {}),
+            };
+            comparable = { ...defaults, ...comparable };
+            candidate = { ...defaults, ...candidate };
+          }
           if (
             prior.ownerUserId !== input.ownerUserId ||
             prior.threadId !== input.threadId ||
@@ -254,9 +271,20 @@ export function makeThreadVmReplacementCoordinator(
             prior.repositoryId !== input.repositoryId ||
             prior.hostId !== input.hostId ||
             prior.templateId !== input.templateId ||
-            (yield* encode(prior.intent)) !== encoded
+            (yield* encode(comparable)) !== (yield* encode(candidate))
           )
             return yield* conflict("VM request ID reused with different intent");
+          if (
+            prior.intent.kind === "move" &&
+            comparable.kind === "move" &&
+            (prior.phase === "awaiting_choice" || prior.phase === "waiting") &&
+            (prior.intent.sourceMessageId !== comparable.sourceMessageId ||
+              prior.intent.supportsSourceReopenAck !== comparable.supportsSourceReopenAck)
+          ) {
+            yield* sql`UPDATE relay_thread_vm_replacements SET intent_json=${yield* encode(comparable)}::jsonb
+              WHERE request_id=${prior.requestId}`;
+            return { ...prior, intent: comparable };
+          }
           return prior;
         }
         const request = {

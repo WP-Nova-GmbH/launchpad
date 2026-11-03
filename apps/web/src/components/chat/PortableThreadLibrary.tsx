@@ -1,4 +1,4 @@
-import { threadMoveQueueOwnership } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
+import { threadMoveQueueRows } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { RelayPortableThreadSummary } from "@t3tools/contracts/relay";
@@ -590,6 +590,10 @@ function SavedConversation({
 
   const session = useAtomValue(managedRelaySessionAtom);
   const relayUrl = threadMoveRelayUrl();
+  // The list can look idle while a legacy source is still reopening.
+  useEffect(() => {
+    if (session && relayUrl) void refreshPlacement({ threadId });
+  }, [session, relayUrl, threadId, refreshPlacement]);
   const accountAbort = useRef<AbortController | null>(null);
   useEffect(() => {
     if (!session || !relayUrl) return;
@@ -859,10 +863,12 @@ function SavedConversation({
       if (!abort.signal.aborted) setBusy(false);
     }
   };
-  const fallbackMove = threadMoveQueueOwnership({
+  const { entries: visibleQueueEntries, fallback: fallbackMove } = threadMoveQueueRows({
     entries: currentQueue?.queue.entries,
     placement,
-  }).fallback;
+    queueEnvironmentId: vmEnvironmentId,
+    queueGeneration: currentQueue?.generation,
+  });
   const thread = detail?.history.thread,
     messages = thread?.messages ?? [],
     end = Math.max(0, messages.length - earlier),
@@ -932,7 +938,7 @@ function SavedConversation({
           </div>
         )}
         {(currentQueue &&
-          (currentQueue.queue.entries.length > 0 ||
+          (visibleQueueEntries.length > 0 ||
             !currentQueue.queue.enabled ||
             currentQueue.queue.pauseReason)) ||
         fallbackMove ? (
@@ -961,6 +967,7 @@ function SavedConversation({
               environmentId={vmEnvironmentId}
               threadId={threadId}
               queue={currentQueue?.queue}
+              queueGeneration={currentQueue?.generation}
               cancellation={cancellation}
               placement={placement}
               onChange={async () => {

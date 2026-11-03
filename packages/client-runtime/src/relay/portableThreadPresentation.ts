@@ -75,6 +75,32 @@ export const portableThreadPlacementsAtom = Atom.make<PlacementProofs | null>(nu
   Atom.keepAlive,
 );
 
+/** An access rejection supersedes earlier in-flight reads just like a successful placement. */
+export function forgetPortableThreadPlacement(
+  registry: AtomRegistry.AtomRegistry,
+  session: ManagedRelaySession,
+  relayUrl: string,
+  threadId: ThreadId,
+  request: number,
+) {
+  const normalizedRelay = normalizeSecureRelayUrl(relayUrl);
+  if (
+    !normalizedRelay ||
+    !isPortableThreadPlacementReadCurrent(registry, session, relayUrl, threadId, request)
+  )
+    return;
+  registry.update(portableThreadPlacementsAtom, (previous) => {
+    const sameScope = previous?.session === session && previous.relayUrl === normalizedRelay;
+    const placements = new Map(sameScope ? previous.placements : []),
+      summaries = new Map(sameScope ? previous.summaries : []),
+      reads = new Map(sameScope ? previous.reads : []);
+    placements.delete(threadId);
+    summaries.delete(threadId);
+    reads.set(threadId, request);
+    return { session, relayUrl: normalizedRelay, placements, summaries, reads };
+  });
+}
+
 export function rememberPortableThreadPlacement(
   registry: AtomRegistry.AtomRegistry,
   session: ManagedRelaySession,
@@ -97,7 +123,9 @@ export function rememberPortableThreadPlacement(
     if (known && known.generation > placement.generation) return previous;
     const sameMove =
       known !== undefined &&
-      placement.operationId !== null &&
+      (placement.operationId !== null ||
+        known.activeMove?.phase === "reopening" ||
+        known.activeMove?.phase === "aborted") &&
       known.threadId === placement.threadId &&
       known.organizationId === placement.organizationId &&
       known.repositoryId === placement.repositoryId &&
@@ -113,6 +141,9 @@ export function rememberPortableThreadPlacement(
       sameMove
         ? {
             ...placement,
+            ...(placement.activeMove === undefined && known.activeMove !== undefined
+              ? { activeMove: known.activeMove }
+              : {}),
             ...(placement.moveProgress === undefined && known.moveProgress !== undefined
               ? { moveProgress: known.moveProgress }
               : {}),

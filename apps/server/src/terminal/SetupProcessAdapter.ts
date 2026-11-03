@@ -13,6 +13,9 @@ export const BootEvidence = Schema.Struct({
   host: Schema.NonEmptyString,
   session: Schema.NonEmptyString,
 });
+const bootJson = Schema.fromJsonString(BootEvidence);
+export const decodeBootEvidence = Schema.decodeUnknownOption(bootJson);
+export const encodeBootEvidence = Schema.encodeSync(bootJson);
 const State = Schema.Struct({
   protocol: Schema.Literal(4),
   identity: Schema.NullOr(Schema.String),

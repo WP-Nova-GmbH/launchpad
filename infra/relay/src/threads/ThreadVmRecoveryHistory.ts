@@ -327,10 +327,12 @@ export function makeThreadVmRecoveryHistory(
     const throughCommandPosition = input.throughCommandPosition ?? head?.position ?? 0;
     if (throughCommandPosition > (head?.position ?? 0))
       return yield* fail("Recovery command cursor is unavailable.");
+    // Relay-only cancellation acknowledgements never execute in the engine.
+    // Keep their journal positions, but do not require or import engine receipts for them.
     const [commandSize] = yield* sql<{
       count: number;
       bytes: number;
-    }>`SELECT count(*)::int AS count,COALESCE(sum(octet_length(payload_json::text)+COALESCE(octet_length(archive_receipt_json::text),0)),0)::float8 AS bytes FROM relay_thread_commands WHERE thread_id=${input.threadId} AND position<=${throughCommandPosition}`;
+    }>`SELECT count(*)::int AS count,COALESCE(sum(octet_length(payload_json::text)+COALESCE(octet_length(archive_receipt_json::text),0)),0)::float8 AS bytes FROM relay_thread_commands WHERE thread_id=${input.threadId} AND position<=${throughCommandPosition} AND relay_move_cancel_operation_id IS NULL`;
     const [localSize] = yield* sql<{
       count: number;
       bytes: number;
@@ -349,7 +351,7 @@ export function makeThreadVmRecoveryHistory(
       receipt: unknown;
       archive: unknown;
       command: unknown;
-    }>`SELECT command_id AS "commandId",accepted_generation AS "acceptedGeneration",receipt_json AS receipt,archive_receipt_json AS archive,payload_json AS command FROM relay_thread_commands WHERE thread_id=${input.threadId} AND position<=${throughCommandPosition} ORDER BY position LIMIT 100001`;
+    }>`SELECT command_id AS "commandId",accepted_generation AS "acceptedGeneration",receipt_json AS receipt,archive_receipt_json AS archive,payload_json AS command FROM relay_thread_commands WHERE thread_id=${input.threadId} AND position<=${throughCommandPosition} AND relay_move_cancel_operation_id IS NULL ORDER BY position LIMIT 100001`;
     if (commands.length > 100000) return yield* fail("Recovery command journal exceeds its bound.");
     for (const command of commands.filter((v) => v.receipt !== null)) {
       const ack = yield* decodePersisted(command.receipt),

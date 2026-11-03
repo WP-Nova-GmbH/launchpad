@@ -747,6 +747,93 @@ describe("completed thread location handoff", () => {
     ),
   );
 
+  for (const status of [503, 404]) {
+    it.effect(`handles a ${status} placement read while polling a known cancellation`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          const detail = Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>({
+            promptQueue: {
+              enabled: true,
+              revision: 1,
+              pauseReason: null,
+              handoff: null,
+              awaitingTurnId: null,
+              admissions: [],
+              finalizedTurnId: null,
+              entries: [
+                {
+                  kind: "move",
+                  state: "moving",
+                  operationId: CommandId.make("moving"),
+                  messageId: MessageId.make("move-entry"),
+                  destination: { kind: "vm" },
+                  revision: 1,
+                  acceptedSequence: 1,
+                  createdAt: at,
+                },
+              ],
+            },
+          });
+          const h = yield* harness(
+            async () => {
+              reads++;
+              if (reads === 2)
+                return status === 404
+                  ? Response.json(
+                      {
+                        _tag: "RelayTenancyNotFoundError",
+                        code: "tenancy_not_found",
+                        reason: "thread_not_found",
+                        traceId: "trace",
+                      },
+                      { status },
+                    )
+                  : Response.json({ error: "Temporarily unavailable" }, { status });
+              return Response.json({
+                ...placement,
+                operationId: reads === 1 ? "moving" : null,
+                activeMove: {
+                  operationId: "moving",
+                  sourceEnvironmentId: environmentId,
+                  sourceGeneration: 1,
+                  sourceKind: "environment",
+                  destinationEnvironmentId: "vm",
+                  destinationProjectId: "vm-project",
+                  destinationKind: "vm",
+                  phase: reads === 1 ? "reopening" : "aborted",
+                  cancellationMode: "direct",
+                },
+              });
+            },
+            activeSnapshot,
+            null,
+            detail,
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId),
+            query = h.controls.locationQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view)).toMatchObject({ movePending: true, destination: null });
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+          expect(reads).toBe(2);
+          expect(h.registry.get(view)?.error).toBeTruthy();
+          expect(h.registry.get(view)?.movePending).toBe(status === 503);
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(8_000));
+          expect(reads).toBe(status === 404 ? 2 : 3);
+          if (status === 503) {
+            expect(h.registry.get(view)).toBeNull();
+            expect(
+              h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+            ).toMatchObject({ operationId: null, activeMove: { phase: "aborted" } });
+          }
+        }),
+      ),
+    );
+  }
+
   it.effect("hides a failure belonging to another claimed move", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1386,6 +1473,65 @@ describe("completed thread location handoff", () => {
         expect(reads).toBe(1);
       }),
     ),
+  );
+  it.effect(
+    "keeps checking a relay cancellation without a source queue until reopening finishes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          let reopened = false;
+          const h = yield* harness(
+            async (url, init) => {
+              expect(new URL(new Request(url, init).url).pathname).toBe(
+                "/v1/threads/vm-thread/placement",
+              );
+              reads++;
+              return Response.json({
+                ...placement,
+                environmentId: "vm",
+                generation: 3,
+                operationId: null,
+                activeMove: {
+                  operationId: "cancelled-move",
+                  sourceEnvironmentId: "vm",
+                  sourceGeneration: 3,
+                  sourceKind: "vm",
+                  destinationEnvironmentId: "mac",
+                  destinationProjectId: "project",
+                  destinationKind: "environment",
+                  phase: reopened ? "aborted" : "reopening",
+                  cancellationMode: "legacy",
+                },
+              });
+            },
+            { ...snapshot, threads: [] },
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId, true);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(
+            h.registry,
+            h.controls.locationQueryAtom(environmentId, threadId, true),
+            {
+              suspendOnWaiting: true,
+            },
+          );
+          expect(h.registry.get(view)).toMatchObject({ movePending: true, destination: null });
+          const pendingReads = reads;
+          reopened = true;
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(4_000));
+          expect(reads).toBeGreaterThan(pendingReads);
+          expect(h.registry.get(view)).toMatchObject({
+            movePending: false,
+            destination: { environmentId: "vm", threadId, generation: 3 },
+          });
+          const finishedReads = reads;
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+          expect(reads).toBe(finishedReads);
+        }),
+      ),
   );
   it.effect("a cold pending move or denied lookup waits for explicit retry without polling", () =>
     Effect.scoped(

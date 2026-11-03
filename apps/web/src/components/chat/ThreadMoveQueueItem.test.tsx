@@ -16,6 +16,7 @@ import type {
   ThreadMoveWaitingForAuth,
 } from "@t3tools/contracts/relay";
 import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
+import * as Cause from "effect/Cause";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -34,6 +35,8 @@ const fixture = vi.hoisted(() => ({
   providerAuthError: null as string | null,
   dispatch: vi.fn(),
   receipt: vi.fn(),
+  cancelActive: vi.fn(),
+  checkActive: vi.fn(),
   refresh: vi.fn(),
   signIn: vi.fn(),
   uuid: vi.fn(),
@@ -49,12 +52,20 @@ function read(atom: unknown) {
   return null;
 }
 function commands(atom: unknown) {
-  return atom === "cancel" ? fixture.dispatch : fixture.receipt;
+  if (atom === "cancel") return fixture.dispatch;
+  if (atom === "cancel-active") return fixture.cancelActive;
+  if (atom === "check-active") return fixture.checkActive;
+  return fixture.receipt;
 }
 function threads() {
   return {
     threadVmControls: { viewAtom: () => "view", locationViewAtom: () => "location" },
-    portableThreadLibrary: { queueControl: "cancel", queueReceipt: "receipt" },
+    portableThreadLibrary: {
+      queueControl: "cancel",
+      queueReceipt: "receipt",
+      cancelActiveMove: "cancel-active",
+      checkMoveCancellation: "check-active",
+    },
   };
 }
 function vmUi() {
@@ -153,6 +164,25 @@ const initialMove = {
 const initialQueue: ThreadPromptQueue = {
   ...emptyThreadPromptQueue(),
   entries: [initialMove],
+};
+const activeReturnMove = {
+  operationId: "return",
+  sourceEnvironmentId: "vm",
+  sourceGeneration: 3,
+  sourceKind: "vm",
+  destinationEnvironmentId: "mac",
+  destinationProjectId: "project",
+  destinationKind: "environment",
+  phase: "preparing",
+  cancellationMode: "direct",
+} satisfies NonNullable<RelayPortableThreadPlacement["activeMove"]>;
+const activeReturnPlacement: RelayPortableThreadPlacement = {
+  ...placement,
+  environmentId: "vm",
+  generation: 3,
+  operationId: "return",
+  activeMove: activeReturnMove,
+  moveFailureDetail: "Could not save the current history.",
 };
 function withWorkerAuth(waitingForAuth: ThreadMoveWaitingForAuth): RelayPortableThreadPlacement {
   fixture.status = {
@@ -281,6 +311,14 @@ for (const [surface, Component, useCancellation, MoveItem] of [
         value: { commandId: command.commandId, position: 1, receipt: null },
       }));
       fixture.receipt.mockResolvedValue({ _tag: "Success", value: null });
+      fixture.cancelActive.mockResolvedValue({
+        _tag: "Success",
+        value: { ...activeReturnMove, phase: "aborting" },
+      });
+      fixture.checkActive.mockResolvedValue({
+        _tag: "Success",
+        value: { ...activeReturnMove, phase: "aborting" },
+      });
       fixture.refresh.mockResolvedValue(undefined);
     });
     afterEach(async () => {
@@ -406,6 +444,107 @@ for (const [surface, Component, useCancellation, MoveItem] of [
       expect(button("Cancel move")).toBeUndefined();
       expect(fixture.dispatch).not.toHaveBeenCalled();
     });
+    it("cancels the relay's failed return move from a stale outbound queue", async () => {
+      await render(initialQueue, environmentId, threadId, activeReturnPlacement);
+      const content = JSON.stringify(renderer!.toJSON());
+      expect(content).toContain("Could not save the current history.");
+      expect(content.indexOf("Private VM")).toBeLessThan(content.indexOf("Akina"));
+      const rows = renderer!.root
+        .findAllByType("div")
+        .filter(
+          (row) => (row.props["aria-label"] ?? row.props.accessibilityLabel) === "Thread move",
+        );
+      expect(rows).toHaveLength(1);
+      await click("Cancel move");
+      expect(fixture.dispatch).not.toHaveBeenCalled();
+      expect(fixture.cancelActive).toHaveBeenCalledWith({
+        accountId: "owner",
+        relayUrl: "https://relay.example.test",
+        threadId,
+        operationId: "return",
+        sourceGeneration: 3,
+      });
+      // A successful reply can arrive before the scoped placement read.
+      await click("Check status");
+      expect(fixture.checkActive).toHaveBeenCalledWith(fixture.cancelActive.mock.calls[0]![0]);
+      expect(fixture.cancelActive).toHaveBeenCalledTimes(1);
+      await render(initialQueue, environmentId, threadId, {
+        ...activeReturnPlacement,
+        activeMove: { ...activeReturnMove, phase: "reopening" },
+      });
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Reopening source…");
+      expect(button("Cancel move")).toBeUndefined();
+      fixture.checkActive.mockResolvedValueOnce({
+        _tag: "Success",
+        value: { ...activeReturnMove, phase: "aborted" },
+      });
+      await click("Check status");
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Move cancelled");
+      await render(
+        { ...initialQueue, entries: [{ ...initialMove, operationId: CommandId.make("return") }] },
+        EnvironmentId.make("vm"),
+        threadId,
+        {
+          ...activeReturnPlacement,
+          operationId: null,
+          activeMove: { ...activeReturnMove, phase: "aborted" },
+        },
+      );
+      expect(JSON.stringify(renderer!.toJSON())).not.toContain("Thread move");
+      expect(button("Check status")).toBeUndefined();
+    });
+    it("retries a rejected legacy cancel against the same move during source reopen", async () => {
+      await render(initialQueue, environmentId, threadId, {
+        ...activeReturnPlacement,
+        operationId: null,
+        activeMove: {
+          ...activeReturnMove,
+          phase: "reopening",
+          cancellationMode: "legacy",
+          cancellationBlocker: "legacy_cancel_rejected",
+        },
+      });
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Reopening source…");
+      await click("Retry cancellation");
+      expect(fixture.cancelActive).toHaveBeenCalledWith(
+        expect.objectContaining({ operationId: "return", sourceGeneration: 3 }),
+      );
+      expect(fixture.dispatch).not.toHaveBeenCalled();
+    });
+    it("cancels a relay move while the source socket is unavailable", async () => {
+      await act(async () => {
+        renderer = create(
+          <MoveItem
+            environmentId={environmentId}
+            threadId={threadId}
+            placement={activeReturnPlacement}
+            disabled
+          />,
+        );
+      });
+      await click("Cancel move");
+      expect(fixture.cancelActive).toHaveBeenCalledTimes(1);
+    });
+    it("ignores a lost reply for an operation that the relay already replaced", async () => {
+      const reply = deferred<unknown>();
+      fixture.cancelActive.mockImplementationOnce(() => reply.promise);
+      await render(initialQueue, environmentId, threadId, activeReturnPlacement);
+      await click("Cancel move");
+      await render(initialQueue, environmentId, threadId, {
+        ...activeReturnPlacement,
+        operationId: "replacement",
+        activeMove: { ...activeReturnMove, operationId: "replacement" },
+      });
+      await act(async () => {
+        reply.resolve({ _tag: "Failure", cause: Cause.fail(new Error("lost reply")) });
+      });
+      expect(fixture.checkActive).not.toHaveBeenCalled();
+      expect(fixture.cancelActive).toHaveBeenCalledTimes(1);
+      await click("Cancel move");
+      expect(fixture.cancelActive).toHaveBeenLastCalledWith(
+        expect.objectContaining({ operationId: "replacement" }),
+      );
+    });
     it("keeps relay sign-in usable when the source queue is unavailable", async () => {
       fixture.status = {
         threadId,
@@ -493,7 +632,12 @@ for (const [surface, Component, useCancellation, MoveItem] of [
         ...initialQueue,
         entries: initialQueue.entries.map((entry) => ({ ...entry, revision: 8 })),
       };
-      await render(nextQueue, EnvironmentId.make("new-location"));
+      const newLocation = EnvironmentId.make("new-location");
+      await render(nextQueue, newLocation, threadId, {
+        ...placement,
+        environmentId: newLocation,
+        generation: placement.generation + 1,
+      });
       await click("Refresh thread");
       await click("Retry cancellation");
       expect(fixture.dispatch.mock.calls[1]![0]).toEqual(fixture.dispatch.mock.calls[0]![0]);

@@ -1,12 +1,13 @@
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
-import { BootEvidence } from "../terminal/SetupProcessAdapter.ts";
+import {
+  type BootEvidence,
+  decodeBootEvidence,
+  encodeBootEvidence,
+} from "../terminal/SetupProcessAdapter.ts";
 
-const bootJson = Schema.fromJsonString(BootEvidence);
-const decodeBoot = Schema.decodeUnknownOption(bootJson);
-export const encodeCheckoutOperationBoot = Schema.encodeSync(bootJson);
+export const encodeCheckoutOperationBoot = encodeBootEvidence;
 
 /** An OS reboot ends old writers; restarting the server alone does not. */
 export const recoverCheckoutOperations = Effect.fn("CheckoutOperationRecovery.recover")(function* (
@@ -26,7 +27,7 @@ export const recoverCheckoutOperations = Effect.fn("CheckoutOperationRecovery.re
           WHERE operation_id=${row.operationId} AND boot_json IS NULL`;
       continue;
     }
-    const prior = decodeBoot(row.bootJson);
+    const prior = decodeBootEvidence(row.bootJson);
     if (
       Option.isSome(prior) &&
       prior.value.host === currentBoot.host &&

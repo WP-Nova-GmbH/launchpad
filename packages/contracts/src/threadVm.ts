@@ -15,6 +15,7 @@ import {
 import {
   CommandId,
   IsoDateTime,
+  MessageId,
   NonNegativeInt,
   PositiveInt,
   TrimmedNonEmptyString,
@@ -101,6 +102,38 @@ export const WorkflowVmCapabilities = Schema.Struct({
 });
 export type WorkflowVmCapabilities = typeof WorkflowVmCapabilities.Type;
 
+export const ThreadMoveCancellationBlocker = Schema.Literals([
+  "capture_stop_unconfirmed",
+  "source_reopen_failed",
+  "legacy_cancel_rejected",
+]);
+export type ThreadMoveCancellationBlocker = typeof ThreadMoveCancellationBlocker.Type;
+
+/** The relay's authoritative move identity and cancellation status for client controls. */
+export const RelayThreadActiveMove = Schema.Struct({
+  operationId: TrimmedNonEmptyString,
+  sourceEnvironmentId: TrimmedNonEmptyString,
+  sourceGeneration: PositiveInt,
+  sourceMessageId: Schema.optionalKey(MessageId),
+  sourceKind: Schema.Literals(["vm", "environment"]),
+  destinationEnvironmentId: TrimmedNonEmptyString,
+  destinationProjectId: TrimmedNonEmptyString,
+  destinationKind: Schema.Literals(["vm", "environment"]),
+  phase: Schema.Literals([
+    "preparing",
+    "frozen",
+    "ready",
+    "committed",
+    "completed",
+    "aborting",
+    "reopening",
+    "aborted",
+  ]),
+  cancellationMode: Schema.Literals(["direct", "legacy"]),
+  cancellationBlocker: Schema.optionalKey(ThreadMoveCancellationBlocker),
+});
+export type RelayThreadActiveMove = typeof RelayThreadActiveMove.Type;
+
 const threadPlacementFields = {
   threadId: TrimmedNonEmptyString,
   organizationId: TrimmedNonEmptyString,
@@ -132,6 +165,7 @@ export const RelayPrivateThreadPlacement = Schema.Struct({
   ownerUserId: TrimmedNonEmptyString,
   environmentId: TrimmedNonEmptyString,
   projectId: TrimmedNonEmptyString,
+  activeMove: Schema.optionalKey(Schema.NullOr(RelayThreadActiveMove)),
 });
 export type RelayPrivateThreadPlacement = typeof RelayPrivateThreadPlacement.Type;
 // Existing portable-thread endpoints authorize private assigned threads only.

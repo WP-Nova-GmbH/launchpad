@@ -24,6 +24,8 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
     cancelBeforeStart: boolean;
     replacementRequestId?: string;
     sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+    supportsSourceReopenAck?: true;
+    sourceMessageId?: string;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -46,6 +48,9 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
             move.actorUserId !== input.actorUserId ||
             move.sourceEnvironmentId !== input.sourceEnvironmentId ||
             move.expectedGeneration !== input.expectedGeneration ||
+            (move.sourceMessageId != null &&
+              input.sourceMessageId != null &&
+              move.sourceMessageId !== input.sourceMessageId) ||
             !offer ||
             normalizeThreadTransferFormats(offer.formats).join(",") !==
               normalizeThreadTransferFormats(input.sourceThreadTransferFormats).join(",") ||

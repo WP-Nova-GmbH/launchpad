@@ -1019,11 +1019,25 @@ export const relayThreadMoves = pgTable(
       .$type<ThreadTransferEncodingPolicy>()
       .default("v1-64MiB"),
     failureDetail: varchar("failure_detail", { length: 2000 }),
+    cancellationProtocol: varchar("cancellation_protocol", { length: 16 })
+      .$type<"legacy" | "available" | "source-reopen-v1">()
+      .notNull()
+      .default("legacy"),
+    sourceReopenedAt: timestamp("source_reopened_at", { withTimezone: true }),
+    cancellationBlocker: varchar("cancellation_blocker", { length: 32 }).$type<
+      "capture_stop_unconfirmed" | "source_reopen_failed"
+    >(),
+    legacyCancelCommandId: varchar("legacy_cancel_command_id", { length: 191 }),
+    sourceMessageId: varchar("source_message_id", { length: 191 }),
   },
   (table) => [
     check(
       "relay_thread_moves_phase",
       sql`${table.phase} IN ('preparing','frozen','ready','committed','completed','aborting','aborted')`,
+    ),
+    check(
+      "relay_thread_moves_cancellation_protocol",
+      sql`${table.cancellationProtocol} IN ('legacy','available','source-reopen-v1')`,
     ),
     check("relay_thread_moves_generation", sql`${table.expectedGeneration} > 0`),
     check(
@@ -1883,6 +1897,9 @@ export const relayThreadCommands = pgTable(
     payloadJson: jsonb("payload_json").notNull(),
     receiptJson: jsonb("receipt_json"),
     archiveReceiptJson: jsonb("archive_receipt_json"),
+    relayMoveCancelOperationId: varchar("relay_move_cancel_operation_id", {
+      length: 64,
+    }).references(() => relayThreadMoves.operationId),
     admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [

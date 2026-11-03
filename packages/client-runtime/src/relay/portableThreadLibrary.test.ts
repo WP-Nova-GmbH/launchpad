@@ -159,6 +159,72 @@ const harness = Effect.fnUntraced(function* (
 });
 
 describe("retained conversation view", () => {
+  it.effect("cancels the exact relay move without consulting the environment queue", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const operationId = "9e7fd90d-8dfb-4c7f-a152-95c054709f51";
+        const activeMove = {
+          operationId,
+          sourceEnvironmentId: "offline",
+          sourceGeneration: 1,
+          sourceKind: "vm",
+          destinationEnvironmentId: "mac",
+          destinationProjectId: "project",
+          destinationKind: "environment",
+          phase: "aborting",
+          cancellationMode: "direct",
+        };
+        const calls: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          const path = new URL(request.url).pathname;
+          calls.push(request.method + " " + path);
+          if (request.method === "POST") {
+            expect(await request.json()).toEqual({ sourceGeneration: 1 });
+            return Response.json(activeMove);
+          }
+          if (path.endsWith("/cancel")) {
+            expect(new URL(request.url).searchParams.get("sourceGeneration")).toBe("1");
+            return Response.json(activeMove);
+          }
+          return Response.json({ ...summary.placement, operationId, activeMove });
+        });
+        const request = {
+          accountId: h.session.accountId,
+          relayUrl: "https://relay.example.test",
+          threadId,
+          operationId,
+          sourceGeneration: 1,
+        };
+        const wrongRelay = yield* Effect.promise(() =>
+          h.library.cancelActiveMove.run(h.registry, {
+            ...request,
+            relayUrl: "https://other.test",
+          }),
+        );
+        expect(wrongRelay._tag).toBe("Failure");
+        expect(calls).toEqual([]);
+        const cancelled = yield* Effect.promise(() =>
+          h.library.cancelActiveMove.run(h.registry, request),
+        );
+        expect(cancelled).toMatchObject({ _tag: "Success", value: activeMove });
+        expect(
+          h.registry.get(portableThreadPlacementsAtom)?.placements.get(threadId)?.activeMove,
+        ).toEqual(activeMove);
+        const checked = yield* Effect.promise(() =>
+          h.library.checkMoveCancellation.run(h.registry, request),
+        );
+        expect(checked).toMatchObject({ _tag: "Success", value: activeMove });
+        expect(calls).toEqual([
+          `POST /v1/threads/${threadId}/moves/${operationId}/cancel`,
+          `GET /v1/threads/${threadId}/placement`,
+          `GET /v1/threads/${threadId}/moves/${operationId}/cancel`,
+          `GET /v1/threads/${threadId}/placement`,
+        ]);
+      }),
+    ),
+  );
+
   it("uses effective capabilities for overview recovery actions", () => {
     const vm = vmSummary;
     const capabilities = {

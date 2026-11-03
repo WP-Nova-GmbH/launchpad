@@ -92,6 +92,7 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
   probeReceipt: boolean,
   checkoutOperationBoot: boolean,
   executionBinding: boolean,
+  moveSourceReopens: boolean,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const schema = yield* sql<{
@@ -177,6 +178,7 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
     if (vmThrough < introduced) continue;
     let expected = vmColumns[table];
     if (table === "checkout_operations" && checkoutOperationBoot) expected += ",boot_json";
+    if (table === "checkout_capture_holds" && moveSourceReopens) expected += ",boot_json";
     if (table === "thread_transfer_baselines" && vmThrough >= 63)
       expected += ",native_runtime_json";
     if (table === "thread_checkout_claims" && vmThrough >= 72) expected += ",fresh_checkout";
@@ -193,6 +195,15 @@ const verifySchema = Effect.fn("MigrationCompatibility.verifySchema")(function* 
     if ((yield* columns(table)).map((column) => column.name).join(",") !== expected)
       return yield* fail(`VM columns do not match migration history for ${table}.`);
   }
+  if (
+    schema.some(
+      (entry) => entry.type === "table" && entry.name === "thread_move_source_reopens",
+    ) !== moveSourceReopens ||
+    (moveSourceReopens &&
+      (yield* columns("thread_move_source_reopens")).map((column) => column.name).join(",") !==
+        "operation_id,thread_id,relay_url,environment_id,generation,message_id")
+  )
+    return yield* fail("Move source reopen receipts do not match migration history.");
   for (const [introduced, name] of [
     [59, "thread_cleanup_fence_on_delete"],
     [60, "portable_thread_reader_barrier"],
@@ -297,7 +308,8 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
       return yield* fail("Migration IDs must be positive.");
     const legacy = recorded.some((row) => row.migration_id === 60 && row.name === workflowNames[0]);
     const highest = Math.max(0, ...recorded.map((row) => row.migration_id));
-    const through = Math.min(highest, 89);
+    const latestKnown = manifest.at(-1)?.[0] ?? 0;
+    const through = Math.min(highest, latestKnown);
     const marker = recorded.find((row) => row.migration_id === 1)?.name;
     const has = (id: number, name: string) =>
       recorded.some((row) => row.migration_id === id && row.name === name);
@@ -336,7 +348,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         );
     }
     // Unknown future rows remain tolerated only after the complete known prefix.
-    if (!legacy && highest > 89 && through !== 89)
+    if (!legacy && highest > latestKnown && through !== latestKnown)
       return yield* fail("Future migration skips the required prefix.");
     if (through >= 59)
       yield* verifySchema(
@@ -346,6 +358,7 @@ export const checkMigrationHistory = (manifest: ReadonlyArray<readonly [number, 
         !legacy && through >= 85,
         !legacy && through >= 88,
         !legacy && through >= 89,
+        !legacy && through >= 90,
       );
     return {
       kind: legacy ? ("legacy-workflow" as const) : ("canonical" as const),

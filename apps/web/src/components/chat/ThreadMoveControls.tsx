@@ -18,6 +18,7 @@ import {
   type ThreadMoveSubmissionScope,
 } from "@t3tools/client-runtime/relay/threadMoveSubmission";
 import { threadRunOnStatus } from "@t3tools/client-runtime/relay/threadRunOn";
+import { activeThreadMove } from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
 import {
   recoverThreadMove,
   threadMoveObservation,
@@ -71,6 +72,8 @@ import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./Thr
 import { ThreadVmAccountPreference } from "./ThreadVmAccountPreference";
 import { useComposerMenuProps } from "./composerEventScope";
 
+import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
+
 function FollowThreadLocation({
   environmentId,
   threadId,
@@ -83,6 +86,7 @@ function FollowThreadLocation({
   const state = useAtomValue(
     threadVmControls.locationViewAtom(environmentId, threadId, recoverUnavailable),
   );
+  const placement = useThreadMovePlacement(environmentId, threadId, recoverUnavailable);
   const session = useAtomValue(managedRelaySessionAtom);
   const relayUrl = threadMoveRelayUrl();
   const checkLocation = useAtomCommand(threadVmControls.checkLocation, { reportFailure: false });
@@ -208,6 +212,16 @@ function FollowThreadLocation({
     open,
     navigate,
   ]);
+  if (recoverUnavailable && activeThreadMove(placement))
+    return (
+      <div className="mx-3">
+        <ThreadMoveQueueItem
+          environmentId={environmentId}
+          threadId={threadId}
+          placement={placement}
+        />
+      </div>
+    );
   if (
     !state ||
     (!recoverUnavailable && !state.recoveryRequested && !state.destination && !state.error)
@@ -521,6 +535,7 @@ function RunOnPicker({
   const projects = useAtomValue(environmentProjects.projectsAtom);
   const vm = useAtomValue(threadVmControls.viewAtom(environmentId, threadId));
   const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
+  const movePlacement = useThreadMovePlacement(environmentId, threadId);
   const routeAtom = threadVmControls.routeAtom(environmentId, threadId);
   const route = useAtomValue(routeAtom);
   const vmAccountPending = useAtomValue(
@@ -757,10 +772,18 @@ function RunOnPicker({
   );
   const codexSupported = threadMoveProviderSupported(provider, "environment");
   const vmSupported = threadMoveProviderSupported(provider, "vm");
-  const status = threadRunOnStatus({ queue, saved });
-  const detailedProgress = threadMoveProgressPresentation(location?.placement);
+  const status = threadRunOnStatus({
+    queue,
+    saved,
+    placement: movePlacement,
+    queueEnvironmentId: environmentId,
+    queueGeneration: thread?.relayRouting?.generation,
+  });
+  const detailedProgress =
+    status?.source === "relay" ? null : threadMoveProgressPresentation(location?.placement);
   const movePending = location?.movePending === true;
-  const visibleError = error ?? location?.moveFailureDetail ?? null;
+  const visibleError =
+    status?.source === "relay" ? null : (error ?? location?.moveFailureDetail ?? null);
   const destinationLabel = (destination: ThreadMoveDestination) => {
     if (destination.kind === "vm") return "Private VM";
     const destinationEnvironment = environments.find(
@@ -1081,13 +1104,8 @@ function RunOnPicker({
                   {detailedProgress && !status.warning ? detailedProgress.label : status.title} →{" "}
                   {destinationLabel(status.destination)}
                 </p>
-                <p>
-                  {detailedProgress && !status.warning ? detailedProgress.label : status.detail}
-                </p>
-                {detailedProgress?.detail && !status.warning ? (
-                  <p>{detailedProgress.detail}</p>
-                ) : null}
-                {saved ? (
+                <p>{(status.warning ? null : detailedProgress?.detail) ?? status.detail}</p>
+                {status.source === "saved" && saved ? (
                   <div className="flex flex-wrap gap-2">
                     {saved.rejection ? (
                       <Button
@@ -1117,9 +1135,9 @@ function RunOnPicker({
                       Check outcome
                     </Button>
                   </div>
-                ) : (
+                ) : status.source === "queue" ? (
                   <p>Use the queue to cancel, reorder or resume this move.</p>
-                )}
+                ) : null}
               </>
             ) : movePending ? (
               <p role="status">

@@ -50,6 +50,11 @@ export interface ThreadMove {
   readonly transferEncodingPolicy?: ThreadTransferEncodingPolicy | null;
   readonly participantStates?: readonly ThreadMoveParticipantState[];
   readonly moveFailures?: readonly ThreadMoveFailureDiagnostic[];
+  readonly cancellationProtocol?: "legacy" | "available" | "source-reopen-v1";
+  readonly sourceReopened?: boolean;
+  readonly cancellationBlocker?: "capture_stop_unconfirmed" | "source_reopen_failed" | null;
+  readonly legacyCancelCommandId?: string | null;
+  readonly sourceMessageId?: string | null;
 }
 interface Admission {
   readonly environmentId: string;
@@ -254,7 +259,10 @@ export function makeThreadPlacementStore(sql: PgClient) {
       actor_user_id AS "actorUserId", source_environment_id AS "sourceEnvironmentId", expected_generation AS "expectedGeneration",
       destination_environment_id AS "destinationEnvironmentId", destination_project_id AS "destinationProjectId",
       phase, source_cursor AS "sourceCursor", manifest_sha256 AS "manifestSha256", failure_detail AS "failureDetail",
-      transfer_encoding_policy AS "transferEncodingPolicy"
+      transfer_encoding_policy AS "transferEncodingPolicy",
+      cancellation_protocol AS "cancellationProtocol", (source_reopened_at IS NOT NULL) AS "sourceReopened",
+      cancellation_blocker AS "cancellationBlocker", legacy_cancel_command_id AS "legacyCancelCommandId",
+      source_message_id AS "sourceMessageId"
       FROM relay_thread_moves WHERE operation_id = ${input.operationId} AND thread_id = ${input.threadId}`;
     return row ? yield* participants.project(row) : null;
   });
@@ -351,6 +359,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
   const beginMove = Effect.fn("relay.thread_placement.begin_move")(function* (
     input: Omit<ThreadMove, "phase" | "manifestSha256" | "sourceCursor"> & {
       readonly sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+      readonly supportsSourceReopenAck?: true;
     },
   ) {
     const formats = normalizeThreadTransferFormats(input.sourceThreadTransferFormats);
@@ -375,6 +384,9 @@ export function makeThreadPlacementStore(sql: PgClient) {
             move.expectedGeneration !== input.expectedGeneration ||
             move.destinationEnvironmentId !== input.destinationEnvironmentId ||
             move.destinationProjectId !== input.destinationProjectId ||
+            (move.sourceMessageId != null &&
+              input.sourceMessageId != null &&
+              move.sourceMessageId !== input.sourceMessageId) ||
             !offer ||
             normalizeThreadTransferFormats(offer.formats).join(",") !== formats.join(",")
           )
@@ -415,10 +427,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
         if (input.sourceEnvironmentId === input.destinationEnvironmentId)
           return yield* conflict("Destination is already the current environment");
         yield* sql`INSERT INTO relay_thread_moves (operation_id, thread_id, actor_user_id, source_environment_id,
-        expected_generation, destination_environment_id, destination_project_id, phase, source_formats_json,transfer_encoding_policy)
+        expected_generation, destination_environment_id, destination_project_id, phase, source_formats_json,transfer_encoding_policy,cancellation_protocol,source_message_id)
         VALUES (${input.operationId}, ${input.threadId}, ${input.actorUserId}, ${input.sourceEnvironmentId},
         ${input.expectedGeneration}, ${input.destinationEnvironmentId}, ${input.destinationProjectId}, 'preparing',
-          ${encodeFormats(formats)}::jsonb,${formats.includes("launchpad-thread-chunks-v2") ? null : "v1-64MiB"})`;
+          ${encodeFormats(formats)}::jsonb,${formats.includes("launchpad-thread-chunks-v2") ? null : "v1-64MiB"},
+          ${input.supportsSourceReopenAck ? "available" : "legacy"}, ${input.sourceMessageId ?? null})`;
         yield* sql`UPDATE relay_thread_placements SET operation_id = ${input.operationId} WHERE thread_id = ${input.threadId}`;
         return yield* getMove(input);
       }),
@@ -658,7 +671,9 @@ export function makeThreadPlacementStore(sql: PgClient) {
   });
 
   const requestAbort = Effect.fn("relay.thread_placement.request_abort")(function* (
-    input: MoveIdentity,
+    input: MoveIdentity & {
+      readonly legacyCancelCommandId?: string;
+    },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -671,7 +686,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
           move.phase === "completed"
         )
           return yield* conflict("Committed ownership cannot be cancelled");
-        yield* sql`UPDATE relay_thread_moves SET phase = 'aborting' WHERE operation_id = ${input.operationId}`;
+        const sourceReopenRequired = move.cancellationProtocol === "available";
+        yield* sql`UPDATE relay_thread_moves SET phase = 'aborting',
+          cancellation_protocol=${sourceReopenRequired ? "source-reopen-v1" : "legacy"},
+          legacy_cancel_command_id=${sourceReopenRequired ? null : (input.legacyCancelCommandId ?? null)}
+          WHERE operation_id = ${input.operationId}`;
         return yield* getMove(input);
       }),
     );
@@ -689,7 +708,84 @@ export function makeThreadPlacementStore(sql: PgClient) {
         if (placement.operationId !== input.operationId || move.phase !== "aborting")
           return yield* conflict("Move is not aborting");
         yield* sql`UPDATE relay_thread_moves SET phase = 'aborted' WHERE operation_id = ${input.operationId}`;
-        yield* sql`UPDATE relay_thread_placements SET operation_id = NULL WHERE thread_id = ${input.threadId}`;
+        if (move.cancellationProtocol !== "source-reopen-v1")
+          yield* sql`UPDATE relay_thread_placements SET operation_id = NULL WHERE thread_id = ${input.threadId}`;
+        return yield* getMove(input);
+      }),
+    );
+  });
+
+  const advertiseSourceReopen = Effect.fn("relay.thread_placement.advertise_source_reopen")(
+    function* (input: MoveIdentity & Owner) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const placement = yield* lock(input.threadId);
+          const move = yield* getMove(input);
+          if (
+            placement.operationId !== input.operationId ||
+            move.sourceEnvironmentId !== input.environmentId ||
+            move.expectedGeneration !== input.generation ||
+            move.cancellationProtocol !== "legacy" ||
+            !["preparing", "frozen", "ready"].includes(move.phase)
+          )
+            return move;
+          yield* sql`UPDATE relay_thread_moves SET cancellation_protocol='available'
+            WHERE operation_id=${input.operationId}`;
+          return yield* getMove(input);
+        }),
+      );
+    },
+  );
+
+  const sourceReopened = Effect.fn("relay.thread_placement.source_reopened")(function* (
+    input: MoveIdentity & Owner,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const placement = yield* lock(input.threadId);
+        const move = yield* getMove(input);
+        if (
+          move.sourceEnvironmentId !== input.environmentId ||
+          move.expectedGeneration !== input.generation ||
+          move.cancellationProtocol !== "source-reopen-v1" ||
+          move.phase !== "aborted"
+        )
+          return yield* conflict("The move is not waiting for this source to reopen");
+        if (move.sourceReopened) return move;
+        yield* requireOwner(placement, input);
+        if (placement.operationId !== input.operationId)
+          return yield* conflict("Source reopening belongs to a different move");
+        yield* sql`UPDATE relay_thread_moves SET source_reopened_at=clock_timestamp(),
+          cancellation_blocker=NULL WHERE operation_id=${input.operationId}`;
+        yield* sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${input.threadId}`;
+        return yield* getMove(input);
+      }),
+    );
+  });
+
+  const reopenBlocked = Effect.fn("relay.thread_placement.reopen_blocked")(function* (
+    input: MoveIdentity &
+      Owner & {
+        readonly reason: "capture_stop_unconfirmed" | "source_reopen_failed";
+      },
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const placement = yield* lock(input.threadId);
+        const move = yield* getMove(input);
+        yield* requireOwner(placement, input);
+        if (
+          placement.operationId !== input.operationId ||
+          move.sourceEnvironmentId !== input.environmentId ||
+          move.expectedGeneration !== input.generation ||
+          move.cancellationProtocol !== "source-reopen-v1" ||
+          !["aborting", "aborted"].includes(move.phase) ||
+          move.sourceReopened
+        )
+          return yield* conflict("The move is not waiting for this source to reopen");
+        if (move.cancellationBlocker === input.reason) return move;
+        yield* sql`UPDATE relay_thread_moves SET cancellation_blocker=${input.reason}
+          WHERE operation_id=${input.operationId}`;
         return yield* getMove(input);
       }),
     );
@@ -714,5 +810,8 @@ export function makeThreadPlacementStore(sql: PgClient) {
     activated,
     requestAbort,
     destinationRemoved,
+    advertiseSourceReopen,
+    sourceReopened,
+    reopenBlocked,
   };
 }

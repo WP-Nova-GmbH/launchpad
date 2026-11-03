@@ -54,10 +54,16 @@ import {
   AlertDialogDescription,
   AlertDialogFooter,
 } from "../ui/alert-dialog";
-export function useThreadMovePlacement(environmentId: EnvironmentId, threadId: ThreadId) {
+export function useThreadMovePlacement(
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  recoverUnavailable = false,
+) {
   const session = useAtomValue(managedRelaySessionAtom);
   const proofs = useAtomValue(portableThreadPlacementsAtom);
-  const location = useAtomValue(threadVmControls.locationViewAtom(environmentId, threadId));
+  const location = useAtomValue(
+    threadVmControls.locationViewAtom(environmentId, threadId, recoverUnavailable),
+  );
   return proofs?.session === session && proofs.relayUrl === threadMoveRelayUrl()
     ? (proofs.placements.get(threadId) ?? location?.placement)
     : location?.placement;
@@ -79,7 +85,7 @@ const ThreadVmUiContext = createContext<ThreadVmUi | null>(null);
 export const useThreadVmUi = () => useContext(ThreadVmUiContext);
 export function ThreadVmNotice({ queue }: { queue?: ThreadPromptQueue | undefined }) {
   const ui = useThreadVmUi();
-  return queue && ui?.ownsMoveNotice(queue) ? null : (ui?.notice ?? null);
+  return ui?.ownsMoveNotice(queue) ? null : (ui?.notice ?? null);
 }
 export function ThreadVmMenuActions({ onAction }: { onAction: () => void }) {
   return useThreadVmUi()?.actions(onAction) ?? null;
@@ -1167,6 +1173,7 @@ function ThreadVmControlPanel({
                 : null,
             moveFeedback: requestFeedback,
             ownsMoveNotice: (queue: ThreadPromptQueue | null | undefined) => {
+              if (queue === undefined && !placement?.activeMove) return false;
               return threadMoveQueueOwnership({
                 entries: queue?.entries,
                 placement,

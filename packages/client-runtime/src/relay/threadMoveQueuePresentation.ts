@@ -11,6 +11,67 @@ import {
   threadVmWorkerAuthState,
 } from "./threadVmControls.ts";
 
+export function activeThreadMove(placement: RelayPortableThreadPlacement | null | undefined) {
+  const move = placement?.activeMove;
+  if (!move || !placement || move.phase === "aborted") return null;
+  const destinationOwns = move.phase === "committed" || move.phase === "completed";
+  if (
+    (placement.operationId !== move.operationId &&
+      !(placement.operationId === null && move.phase === "reopening")) ||
+    placement.generation !== move.sourceGeneration + (destinationOwns ? 1 : 0) ||
+    placement.environmentId !==
+      (destinationOwns ? move.destinationEnvironmentId : move.sourceEnvironmentId)
+  )
+    return null;
+  return move;
+}
+
+/** A retired environment may still project a queue that predates the current move. */
+export function threadMoveQueueRows(input: {
+  entries?: ReadonlyArray<ThreadQueueEntry> | undefined;
+  placement?: RelayPortableThreadPlacement | null | undefined;
+  queueEnvironmentId?: string | undefined;
+  queueGeneration?: number | undefined;
+}) {
+  const { placement, queueEnvironmentId, queueGeneration } = input;
+  const activeMove = activeThreadMove(placement);
+  const cancelledMove =
+    placement?.activeMove?.phase === "aborted" &&
+    placement.activeMove.sourceGeneration === placement.generation &&
+    placement.activeMove.sourceEnvironmentId === placement.environmentId
+      ? placement.activeMove
+      : null;
+  const staleQueue =
+    placement &&
+    ((queueEnvironmentId !== undefined && placement.environmentId !== queueEnvironmentId) ||
+      (queueGeneration !== undefined && placement.generation !== queueGeneration));
+  const entries = (input.entries ?? []).filter((entry, index) => {
+    if (entry.kind !== "move") return true;
+    if (staleQueue) return false;
+    if (
+      cancelledMove &&
+      (entry.operationId === cancelledMove.operationId ||
+        entry.messageId === cancelledMove.sourceMessageId)
+    )
+      return false;
+    if (!activeMove || entry.operationId === activeMove.operationId) return true;
+    if (entry.state !== "pending") return false;
+    if (activeMove.sourceMessageId !== undefined)
+      return entry.messageId !== activeMove.sourceMessageId;
+    // Older sources can publish admission before the claim is mirrored. Hide
+    // the ambiguous head while the exact active move has its own Cancel action.
+    return !(
+      index === 0 &&
+      (entry.destination.kind === "vm"
+        ? activeMove.destinationKind === "vm"
+        : activeMove.destinationKind === "environment" &&
+          entry.destination.environmentId === activeMove.destinationEnvironmentId &&
+          entry.destination.projectId === activeMove.destinationProjectId)
+    );
+  });
+  return { entries, fallback: threadMoveQueueOwnership({ entries, placement }).fallback };
+}
+
 function currentMoveSnapshots(placement: RelayPortableThreadPlacement | null | undefined) {
   return placement?.operationId
     ? (placement.moveProgress?.filter(
@@ -35,6 +96,7 @@ export function threadMoveQueueOwnership(input: {
   status?: RelayThreadVmStatus | null | undefined;
 }) {
   const { placement, status } = input;
+  const activeMove = activeThreadMove(placement);
   const staleStatus =
     !!status &&
     (status.threadId !== placement?.threadId || status.generation !== placement?.generation);
@@ -52,14 +114,15 @@ export function threadMoveQueueOwnership(input: {
       candidate.kind === "move" &&
       candidate.state !== "pending" &&
       candidate.operationId !== undefined &&
-      candidate.operationId === placement?.operationId,
+      candidate.operationId === (activeMove?.operationId ?? placement?.operationId),
   );
+  if (activeMove) return { fallback: !entry, ownsNotice: true, lifecycle: false };
   const fallback =
     !lifecycle && !staleStatus && !entry && currentMoveSnapshots(placement).length > 0;
   return { fallback, ownsNotice: !lifecycle && !staleStatus && (!!entry || fallback), lifecycle };
 }
 
-/** Queue state owns the move; transfer receipts only describe that exact operation. */
+/** Relay ownership controls active moves; the source queue still controls pre-admission moves. */
 export function threadMoveQueuePresentation(input: {
   entry?: ThreadMoveQueueEntry | undefined;
   placement?: RelayPortableThreadPlacement | null | undefined;
@@ -73,13 +136,18 @@ export function threadMoveQueuePresentation(input: {
 }) {
   const { entry, cancellation } = input;
   const placement = input.placement;
+  const currentMove = activeThreadMove(placement);
+  const activeMove =
+    currentMove && (!entry || currentMove.operationId === entry.operationId) ? currentMove : null;
   const ownership = threadMoveQueueOwnership({
     entries: entry ? [entry] : [],
     placement,
     status: input.status,
   });
   if (!entry && !ownership.fallback) return null;
-  const outbound = entry?.destination.kind === "vm";
+  const outbound = activeMove
+    ? activeMove.destinationKind === "vm"
+    : entry?.destination.kind === "vm";
   const steps = outbound
     ? ["Upload", "Prepare VM", "Switch"]
     : ["Save", entry ? "Restore" : "Prepare", "Switch"];
@@ -152,7 +220,25 @@ export function threadMoveQueuePresentation(input: {
   let detail: string | null = null;
   let step: number | null = null;
   let tone: "neutral" | "attention" | "danger" = "neutral";
-  if (entry?.state === "cancelling" || cancellation === "sending" || cancellation === "requested") {
+  const relayCancelling = activeMove?.phase === "aborting" || activeMove?.phase === "reopening";
+  if (activeMove?.phase === "reopening") {
+    label = "Reopening source…";
+    detail =
+      activeMove.cancellationBlocker === "capture_stop_unconfirmed"
+        ? "Waiting to confirm the save stopped. If this persists, restart the source machine."
+        : activeMove.cancellationBlocker === "source_reopen_failed"
+          ? "Could not reopen the source. Waiting for it to retry."
+          : activeMove.cancellationBlocker === "legacy_cancel_rejected"
+            ? "The source could not clear this move from its queue."
+            : "Waiting for the source to reopen the chat.";
+  } else if (activeMove?.phase === "aborting") {
+    label = "Cancelling move…";
+    detail = "Waiting for the destination to confirm cleanup.";
+  } else if (
+    entry?.state === "cancelling" ||
+    cancellation === "sending" ||
+    cancellation === "requested"
+  ) {
     label = cancellation === "sending" ? "Requesting cancellation…" : "Cancelling move…";
     detail = "Waiting for both locations to confirm cancellation.";
   } else if (waiting) {
@@ -203,7 +289,7 @@ export function threadMoveQueuePresentation(input: {
   } else {
     detail = entry?.detail ?? null;
   }
-  if (cancellation === "unknown" && entry?.state !== "cancelling") {
+  if (cancellation === "unknown" && entry?.state !== "cancelling" && !relayCancelling) {
     label = "Could not confirm cancellation";
     detail = "Retry cancellation to send the same request.";
     tone = "attention";
@@ -228,10 +314,16 @@ export function threadMoveQueuePresentation(input: {
             : [],
     waiting,
     outbound,
-    sourceEnvironmentId: snapshots.find((snapshot) => snapshot.participant === "source")
-      ?.environmentId,
+    activeMove,
+    sourceIsVm: activeMove ? activeMove.sourceKind === "vm" : undefined,
+    sourceEnvironmentId:
+      activeMove?.sourceEnvironmentId ??
+      snapshots.find((snapshot) => snapshot.participant === "source")?.environmentId,
     cancelling:
-      entry?.state === "cancelling" || cancellation === "sending" || cancellation === "requested",
+      relayCancelling ||
+      entry?.state === "cancelling" ||
+      cancellation === "sending" ||
+      cancellation === "requested",
   };
 }
 
