@@ -148,6 +148,9 @@ vi.mock("../ui/tooltip", () => ({
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
+vi.mock("../ui/input", () => ({
+  Input: (props: Record<string, unknown>) => createElement("input", props),
+}));
 vi.mock("../ui/select", () => {
   const component = ({ children }: PropsWithChildren) => children;
   return {
@@ -185,13 +188,14 @@ const draft = () =>
   appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, id())]!;
 const canvas = () => renderer!.root.findByProps({ "data-testid": "canvas" });
 const field = (key: string) => nodes.get(key)! as TextField;
-async function mount() {
+async function mount(vm = false) {
   await act(() => {
     renderer = create(
       <AppAtomRegistryProvider>
         <WorkflowBuilder
           scope={scope}
-          projects={[project]}
+          projects={vm ? [] : [project]}
+          vmAuthoring={vm ? { models: null } : undefined}
           isNew
           workflow={undefined}
           canConfigure
@@ -210,7 +214,9 @@ async function mount() {
               ? props["data-focus-key"]
               : props["aria-label"] === "Workflow name"
                 ? "name"
-                : null;
+                : props.placeholder === "Repository default"
+                  ? "baseBranch"
+                  : null;
           if (!key) return null;
           const cacheKey = `${presentation}:${key}`;
           let node = cache.get(cacheKey);
@@ -339,6 +345,41 @@ describe("Inspector presentation focus", () => {
     await act(() => dismissSheet!(false));
     expect(draft().selectedStepId).toBe("");
     expect(focusDocument.activeElement === opener).toBe(true);
+  });
+  it("keeps the Base branch value, focus, and selection through both presentation changes", async () => {
+    await mount(true);
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+    );
+    await act(() =>
+      renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
+        target: { value: "release/1.x" },
+      }),
+    );
+    const wide = field("baseBranch");
+    wide.focus();
+    wide.setSelectionRange(2, 7, "backward");
+    await changeWidth(800);
+    const narrow = field("baseBranch");
+    expect(narrow).not.toBe(wide);
+    expect(focusDocument.activeElement).toBe(narrow);
+    expect([
+      narrow.value,
+      narrow.selectionStart,
+      narrow.selectionEnd,
+      narrow.selectionDirection,
+    ]).toEqual(["release/1.x", 2, 7, "backward"]);
+    narrow.setSelectionRange(9, 9);
+    await changeWidth(1200);
+    const docked = field("baseBranch");
+    expect(docked).not.toBe(narrow);
+    expect(focusDocument.activeElement).toBe(docked);
+    expect([docked.value, docked.selectionStart, docked.selectionEnd]).toEqual([
+      "release/1.x",
+      9,
+      9,
+    ]);
+    expect(draft().definition.target).toEqual({ kind: "vm", baseBranch: "release/1.x" });
   });
   it("ignores an old Sheet callback after dismissal and reopening", async () => {
     width = 800;

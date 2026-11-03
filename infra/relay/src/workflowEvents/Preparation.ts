@@ -10,7 +10,7 @@ import {
 import { WorkflowSourceError, RelayJobId } from "@t3tools/contracts/relay";
 import { RelayDb } from "../db.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
-import { validateWorkflowTarget } from "../jobs/WorkflowTarget.ts";
+import { validateWorkflowTarget, vmWorkflowAutomationUnavailable } from "../jobs/WorkflowTarget.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";
@@ -25,13 +25,12 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
   input: typeof SaveRepositoryWorkflow.Type,
   previous: RepositoryWorkflow | null,
 ) {
-  if (input.definition.target.kind !== "machine")
-    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
-  const target = input.definition.target;
   const next = Routing.automation(
     input.automation === undefined ? previous?.automation : input.automation,
   );
   if (!next.enabled || input.archived) return { userId: user };
+  const target = input.definition.target;
+  if (target.kind === "vm") return yield* vmWorkflowAutomationUnavailable();
   const config = yield* Fence.configuration;
   if (!config?.admissionEnabled || !next.trigger)
     return yield* new WorkflowInvalidError({

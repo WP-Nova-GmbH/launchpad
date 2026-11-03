@@ -1,10 +1,18 @@
-import { useEnvironments } from "../../state/environments";
+import { useEnvironment } from "../../state/environments";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useProject } from "../../state/entities";
 import styles from "./workflowEditor.module.css";
 import { UploadIcon, BotIcon, MessageSquareIcon, UserRoundCheckIcon, XIcon } from "lucide-react";
-import type { WorkflowStep, WorkflowDefinition } from "@t3tools/contracts/workflows";
-import { workflowModelState } from "../settings/workflowModels";
+import type {
+  WorkflowStep,
+  WorkflowDefinition,
+  WorkflowVmModelCatalog,
+} from "@t3tools/contracts/workflows";
+import {
+  workflowModelState,
+  workflowVmCodexInstanceId,
+  workflowVmModelState,
+} from "../settings/workflowModels";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
@@ -17,6 +25,7 @@ export function WorkflowStepEditor({
   change,
   move: moveSteps,
   models,
+  vmModels,
   disabled,
   close,
   registerField,
@@ -27,6 +36,7 @@ export function WorkflowStepEditor({
   change: (steps: ReadonlyArray<WorkflowStep>) => void;
   move: (steps: ReadonlyArray<WorkflowStep>) => void;
   models: ReturnType<typeof workflowModelState>;
+  vmModels?: WorkflowVmModelCatalog | null | undefined;
   disabled: boolean;
   close: () => void;
   registerField: (field: string, node: HTMLElement | null) => void;
@@ -44,6 +54,8 @@ export function WorkflowStepEditor({
     moveSteps(steps);
   };
   const triggerLabel = step?.kind === "agent" ? models.triggerLabel(step) : undefined;
+  const vm = definition.target.kind === "vm";
+  const vmModelIssue = vm ? models.issues.find((issue) => issue.stepId === step?.id) : undefined;
   return (
     <div className="space-y-3">
       {step ? (
@@ -129,7 +141,55 @@ export function WorkflowStepEditor({
             {step.kind === "agent" ? (
               <div className="space-y-2">
                 <p className="text-sm">Model · approvals required</p>
-                {entries[0] ? (
+                {vm ? (
+                  <>
+                    <Select
+                      value={
+                        vmModelIssue
+                          ? null
+                          : step.modelSelection
+                            ? "model:" + step.modelSelection.model
+                            : "default"
+                      }
+                      onValueChange={(value) => {
+                        const model = vmModels?.models.find(
+                          (entry) => "model:" + entry.slug === value,
+                        );
+                        if (value === "default" || model)
+                          patch({
+                            ...step,
+                            modelSelection: model
+                              ? { instanceId: workflowVmCodexInstanceId, model: model.slug }
+                              : null,
+                          });
+                      }}
+                    >
+                      <SelectTrigger
+                        aria-label="Managed Codex model"
+                        ref={(node) => registerField("model", node)}
+                      >
+                        <SelectValue>{triggerLabel}</SelectValue>
+                      </SelectTrigger>
+                      <SelectPopup>
+                        <SelectItem value="default">Managed default</SelectItem>
+                        {vmModels?.models.map((model) => (
+                          <SelectItem key={model.slug} value={"model:" + model.slug}>
+                            {model.name}
+                          </SelectItem>
+                        ))}
+                      </SelectPopup>
+                    </Select>
+                    {vmModelIssue ? (
+                      <p role="alert" className="text-sm text-warning">
+                        {vmModelIssue.detail}
+                      </p>
+                    ) : !vmModels ? (
+                      <p className="text-sm text-muted-foreground">
+                        VM model choices could not be loaded. The managed default is available.
+                      </p>
+                    ) : null}
+                  </>
+                ) : entries[0] ? (
                   <ProviderModelPicker
                     activeInstanceId={
                       models.effectiveSelection(step)?.instanceId ?? entries[0].instanceId
@@ -168,7 +228,7 @@ export function WorkflowStepEditor({
                     variant="ghost"
                     onClick={() => patch({ ...step, modelSelection: null })}
                   >
-                    Use project default
+                    {vm ? "Use managed default" : "Use project default"}
                   </Button>
                 ) : null}
               </div>
@@ -279,16 +339,15 @@ export function WorkflowStepEditor({
   );
 }
 
-export function useWorkflowEditorModels(definition: WorkflowDefinition) {
-  const target = definition.target;
-  if (target.kind !== "machine") throw new Error("VM workflow editing is not available yet.");
-  const { environments } = useEnvironments();
-  const environment = environments.find((entry) => entry.environmentId === target.environmentId);
-  const settings = useEnvironmentSettings(target.environmentId);
-  const project = useProject({
-    environmentId: target.environmentId,
-    projectId: target.projectId,
-  });
+export function useWorkflowEditorModels(
+  definition: WorkflowDefinition,
+  vmModels: WorkflowVmModelCatalog | null = null,
+) {
+  const target = definition.target.kind === "machine" ? definition.target : null;
+  const environment = useEnvironment(target?.environmentId ?? null);
+  const settings = useEnvironmentSettings(target?.environmentId ?? null);
+  const project = useProject(target);
+  if (!target) return workflowVmModelState(definition, vmModels);
   return workflowModelState(
     definition,
     environment?.serverConfig?.providers ?? [],

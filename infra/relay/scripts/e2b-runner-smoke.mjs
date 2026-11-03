@@ -5,6 +5,13 @@ import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import * as NodeAssert from "node:assert/strict";
+import * as Schema from "effect/Schema";
+import {
+  WORKFLOW_VM_MODEL_PROOF_VERSION,
+  WorkflowVmModelProof,
+  workflowVmModelProofPath,
+} from "../src/threads/ThreadVmWorkflowModelProof.ts";
+import { writeJsonAtomically } from "./e2b-build-template.mjs";
 const { values } = NodeUtil.parseArgs({
   options: { receipt: { type: "string" }, output: { type: "string" } },
 });
@@ -25,6 +32,7 @@ NodeAssert.equal(receipt.state, "built");
 NodeAssert.equal(new URL(receipt.apiUrl).href, new URL(options.apiUrl).href);
 NodeAssert.equal(receipt.templateRef, `${receipt.templateId}:${receipt.buildTag}`);
 NodeAssert.ok(/^build-[a-f0-9-]+$/.test(receipt.buildTag));
+NodeAssert.match(receipt.buildId, /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/u);
 const tags = await Template.getTags(receipt.templateId, options);
 NodeAssert.ok(
   tags.some((tag) => tag.tag === receipt.buildTag && tag.buildId === receipt.buildId),
@@ -45,6 +53,7 @@ const save = (name, data) =>
   });
 await save("identity.json", { proof, templateRef: receipt.templateRef, buildId: receipt.buildId });
 let sandboxId;
+let modelProof;
 try {
   const vm = await Sandbox.create(receipt.templateRef, {
     ...options,
@@ -70,21 +79,63 @@ try {
       LAUNCHPAD_INSTALLER_SHA256: receipt.installerSha256,
     },
   });
+  const modelScript = await NodeFSP.readFile(
+    new URL("../../e2b/workflow-model-proof.py", import.meta.url),
+    "utf8",
+  );
+  const modelResult = await vm.commands.run(
+    `python3 - <<'WORKFLOW_MODEL_PROOF'\n${modelScript}\nWORKFLOW_MODEL_PROOF`,
+    { user: "user", timeoutMs: 50_000 },
+  );
+  const guestCatalog = Schema.decodeUnknownSync(
+    Schema.fromJsonString(
+      Schema.Struct({
+        defaultModel: Schema.String,
+        models: Schema.Array(
+          Schema.Struct({
+            slug: Schema.String,
+            name: Schema.String,
+          }),
+        ),
+      }),
+    ),
+  )(modelResult.stdout);
+  modelProof = Schema.decodeUnknownSync(WorkflowVmModelProof)({
+    schemaVersion: WORKFLOW_VM_MODEL_PROOF_VERSION,
+    templateRef: receipt.templateRef,
+    buildId: receipt.buildId,
+    catalog: {
+      defaultModel: guestCatalog.defaultModel,
+      models: guestCatalog.models.map(({ slug, name }) => ({
+        slug,
+        name,
+        isCustom: false,
+        ...(slug === guestCatalog.defaultModel ? { isDefault: true } : {}),
+        capabilities: null,
+      })),
+    },
+  });
   await save("result.json", {
     proof,
     sandboxId: vm.sandboxId,
     ...JSON.parse(result.stdout.trim()),
   });
-  console.log("Runner tools, native terminal, resource monitor and server startup passed.");
+  console.log(
+    "Runner tools, native terminal, resource monitor, server startup and Codex model probe passed.",
+  );
 } catch (error) {
   // The fixed guest proof has no credentials. Capture its command output only;
   // SDK transport errors may embed authorization headers and must stay opaque.
-  if (error instanceof CommandExitError)
+  if (error instanceof CommandExitError) {
     await save("guest-failure.json", {
       exitCode: error.exitCode,
       stderr: error.stderr,
       stdout: error.stdout,
     });
+    if (error.stderr.split(/\r?\n/u).includes("launchpad-workflow-model-policy-unavailable")) {
+      console.error("Rebuild the selected VM runner to publish its Codex model catalog.");
+    }
+  }
   await save("failure.json", { proof, errorType: error?.name ?? "Error" });
   console.error(`Runner proof failed (${error?.name ?? "Error"}).`);
   process.exitCode = 1;
@@ -100,6 +151,15 @@ try {
     console.error("Runner proof cleanup needs reconciliation using its saved identity.");
     process.exitCode = 1;
   }
+}
+
+if (modelProof && !process.exitCode) {
+  const selection =
+    process.env.E2B_TEMPLATE_FILE?.trim() ||
+    NodePath.join(import.meta.dirname, "../.t3/e2b-template.json");
+  NodeAssert.ok(NodePath.isAbsolute(selection), "E2B_TEMPLATE_FILE must be an absolute path.");
+  await writeJsonAtomically(NodePath.join(values.output, "workflow-models.json"), modelProof);
+  await writeJsonAtomically(workflowVmModelProofPath(selection, modelProof.buildId), modelProof);
 }
 
 async function cleanup() {

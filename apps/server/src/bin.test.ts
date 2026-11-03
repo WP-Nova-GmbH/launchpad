@@ -22,6 +22,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -92,6 +93,16 @@ const runCli = (args: ReadonlyArray<string>, command = cli) =>
 const runConnectCli = (args: ReadonlyArray<string>) => runCli(args, connectCli);
 const runCliWithRuntime = (args: ReadonlyArray<string>) =>
   runCli(args).pipe(Effect.provide(CliRuntimeLayer));
+const decodeGuestCodexModelPolicy = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      schemaVersion: Schema.Literal(1),
+      defaultModel: Schema.String,
+      modelSlugs: Schema.Array(Schema.String),
+      probeArgs: Schema.Array(Schema.String),
+    }),
+  ),
+);
 
 const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
@@ -913,3 +924,17 @@ it("private VM commands resolve their own server configuration", () => {
     : never = true;
   assert.isTrue(selfConfigured);
 });
+
+it.effect("reports the installed guest's credential-free Codex model policy", () =>
+  Effect.gen(function* () {
+    const { output } = yield* captureStdout(runCli(["__thread-vm-codex-model-policy"]));
+    const policy = yield* decodeGuestCodexModelPolicy(output);
+    assert.include(policy.modelSlugs, policy.defaultModel);
+    assert.equal(policy.probeArgs[0], "app-server");
+    const configuration = policy.probeArgs.join(" ");
+    assert.include(configuration, `model="${policy.defaultModel}"`);
+    assert.include(configuration, 'base_url="http://127.0.0.1:1/v1"');
+    assert.include(configuration, 'auth={command="/usr/bin/false",args=[]');
+    assert.notInclude(configuration, "__thread-vm-codex-token");
+  }),
+);

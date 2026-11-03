@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Routing from "../workflowEvents/Routing.ts";
+import { vmWorkflowExecutionUnavailable } from "./WorkflowTarget.ts";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 
@@ -87,6 +88,55 @@ export const make = Effect.gen(function* () {
         rows[0] ? { ...rows[0], record: normalizeStoredWorkflowJob(rows[0].record) } : null,
       ),
     );
+  const updateJob = Effect.fn("Workflows.updateJob")(function* (
+    previous: WorkflowJobRecord,
+    record: RepositoryWorkflowJob,
+    pendingControl = previous.pendingControl,
+    releaseLease = true,
+    expectedLease?: string,
+  ) {
+    if (isTerminalWorkflowJob(previous.record.status)) return previous;
+    record = yield* persist(
+      Effect.try(() => {
+        const saved = validateOrigin(previous);
+        const next = validateOrigin(previous, record);
+        if (!sameWorkflowOrigin(saved.origin, next.origin))
+          throw new Error("Workflow origin is immutable.");
+        return next;
+      }),
+    );
+    const rows = yield* persist(
+      db
+        .update(relayWorkflowJobs)
+        .set({
+          record,
+          status: record.status,
+          repositoryCanonicalKey: previous.repositoryCanonicalKey,
+          pendingControl,
+          revision: previous.revision + 1,
+          ...(releaseLease ? { leaseUntil: null } : {}),
+        })
+        .where(
+          and(
+            eq(relayWorkflowJobs.jobId, previous.jobId),
+            eq(relayWorkflowJobs.revision, previous.revision),
+            ...(expectedLease === undefined
+              ? []
+              : [
+                  eq(relayWorkflowJobs.leaseUntil, expectedLease),
+                  sql`${relayWorkflowJobs.leaseUntil}::timestamptz > clock_timestamp()`,
+                ]),
+          ),
+        )
+        .returning(),
+    );
+    if (rows.length === 0)
+      return yield* new WorkflowConflictError({
+        message: "The job changed. Refresh its current state.",
+      });
+    const row: WorkflowJobRecord = rows[0]!;
+    return row;
+  });
   return {
     get,
     getJob,
@@ -103,8 +153,6 @@ export const make = Effect.gen(function* () {
       input: typeof SaveRepositoryWorkflow.Type,
       context?: Routing.SaveContext,
     ) {
-      if (input.definition.target.kind !== "machine")
-        return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
       const timestamp = yield* now;
       const previous = yield* get(input.workflowId);
       if (
@@ -126,7 +174,12 @@ export const make = Effect.gen(function* () {
         createdAt: previous?.createdAt ?? timestamp,
         updatedAt: timestamp,
       } satisfies RepositoryWorkflow;
-      if (input.automation !== undefined || previous?.automation?.trigger) {
+      if (
+        input.definition.target.kind === "vm" ||
+        previous?.definition.target.kind === "vm" ||
+        input.automation !== undefined ||
+        previous?.automation?.trigger
+      ) {
         return yield* Routing.save(
           {
             ...record,
@@ -314,54 +367,50 @@ export const make = Effect.gen(function* () {
         : null;
       return row;
     }),
-    updateJob: Effect.fn("Workflows.updateJob")(function* (
+    updateJob,
+    /** Recheck the definition after the remote probe, before committing the initial binding. */
+    bindManualOffer: Effect.fn("Workflows.bindManualOffer")(function* (
       previous: WorkflowJobRecord,
       record: RepositoryWorkflowJob,
-      pendingControl = previous.pendingControl,
-      releaseLease = true,
-      expectedLease?: string,
+      expectedLease: string,
     ) {
-      if (isTerminalWorkflowJob(previous.record.status)) return previous;
-      record = yield* persist(
-        Effect.try(() => {
-          const saved = validateOrigin(previous);
-          const next = validateOrigin(previous, record);
-          if (!sameWorkflowOrigin(saved.origin, next.origin))
-            throw new Error("Workflow origin is immutable.");
-          return next;
-        }),
-      );
-      const rows = yield* persist(
-        db
-          .update(relayWorkflowJobs)
-          .set({
-            record,
-            status: record.status,
-            repositoryCanonicalKey: previous.repositoryCanonicalKey,
-            pendingControl,
-            revision: previous.revision + 1,
-            ...(releaseLease ? { leaseUntil: null } : {}),
-          })
-          .where(
-            and(
-              eq(relayWorkflowJobs.jobId, previous.jobId),
-              eq(relayWorkflowJobs.revision, previous.revision),
-              ...(expectedLease === undefined
-                ? []
-                : [
-                    eq(relayWorkflowJobs.leaseUntil, expectedLease),
-                    sql`${relayWorkflowJobs.leaseUntil}::timestamptz > clock_timestamp()`,
-                  ]),
-            ),
-          )
-          .returning(),
-      );
-      if (rows.length === 0)
-        return yield* new WorkflowConflictError({
-          message: "The job changed. Refresh its current state.",
-        });
-      const row: WorkflowJobRecord = rows[0]!;
-      return row;
+      return yield* db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            const [saved] = yield* persist(
+              db
+                .select({ record: relayRepositoryWorkflows.record })
+                .from(relayRepositoryWorkflows)
+                .where(
+                  and(
+                    eq(relayRepositoryWorkflows.workflowId, record.workflowId),
+                    eq(relayRepositoryWorkflows.repositoryId, previous.repositoryId),
+                  ),
+                )
+                .for("share"),
+            );
+            const current = saved ? normalizeStoredWorkflow(saved.record) : null;
+            if (!current || current.archived)
+              return yield* new WorkflowInvalidError({
+                message: "The workflow is archived or unavailable. Restore it or cancel this job.",
+              });
+            if (current.definition.target.kind === "vm")
+              return yield* vmWorkflowExecutionUnavailable();
+            if (current.revision !== record.workflow?.revision)
+              return yield* new WorkflowInvalidError({
+                message:
+                  "The workflow changed while preparing this run. Waiting to retry with the saved definition.",
+              });
+            return yield* updateJob(
+              previous,
+              record,
+              previous.pendingControl,
+              false,
+              expectedLease,
+            );
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
     }),
     release: (jobId: string, leaseUntil: string) =>
       persist(

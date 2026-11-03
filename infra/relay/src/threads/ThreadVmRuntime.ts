@@ -1,4 +1,5 @@
 import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
+import type { WorkflowVmModelCatalog } from "@t3tools/contracts/workflows";
 import * as Option from "effect/Option";
 import { ManagedEndpointProvider } from "../environments/ManagedEndpointProvider.ts";
 import { threadVmEndpointOwner } from "./threadVmEndpointOwner.ts";
@@ -54,6 +55,7 @@ import { makeThreadVmSavedDiskWorker } from "./ThreadVmSavedDiskWorker.ts";
 import { makeThreadVmCancelledSetupCleanupWorker } from "./ThreadVmCancelledSetupCleanupWorker.ts";
 import { ThreadArtifactObjectStorage } from "./ThreadArtifactObjects.ts";
 import { makeThreadArtifactTransfer } from "./ThreadArtifactTransfer.ts";
+import { verifiedWorkflowVmModelCatalog } from "./ThreadVmWorkflowModelProof.ts";
 
 export class ThreadVmRuntimeConfigurationError extends Schema.TaggedError<ThreadVmRuntimeConfigurationError>()(
   "ThreadVmRuntimeConfigurationError",
@@ -62,6 +64,7 @@ export class ThreadVmRuntimeConfigurationError extends Schema.TaggedError<Thread
 export interface ThreadVmRuntimeSettings {
   readonly compute: E2BThreadVmSettings;
   readonly templateBuildId: string;
+  readonly workflowModelCatalog?: WorkflowVmModelCatalog;
   readonly hostId: string;
   readonly maxRunningVms: number;
   readonly publicRelayUrl: string;
@@ -118,6 +121,14 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
   const apiKey = yield* Config.Redacted("E2B_API_KEY");
   const templateId = yield* Config.String("E2B_TEMPLATE_REF");
   const templateBuildId = yield* Config.String("E2B_TEMPLATE_BUILD_ID");
+  const workflowModelProof = yield* Config.String("E2B_WORKFLOW_MODEL_PROOF").pipe(
+    Config.withDefault(""),
+  );
+  const workflowModelCatalog = verifiedWorkflowVmModelCatalog(
+    workflowModelProof,
+    templateId,
+    templateBuildId,
+  );
   const hostId = yield* Config.String("E2B_HOST_ID");
   const maxRunningVms = yield* Config.Number("E2B_MAX_RUNNING_VMS");
   const publicRelayUrl = yield* Config.String("E2B_PUBLIC_RELAY_URL");
@@ -237,6 +248,7 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
     ...(previewBaseUrl ? { previewBaseUrl: new URL(previewBaseUrl).origin } : {}),
     compute: { apiUrl, sandboxUrl, apiKey, templateId, hostAddresses, timeoutMs: 600_000 },
     templateBuildId,
+    ...(workflowModelCatalog ? { workflowModelCatalog } : {}),
     hostId,
     maxRunningVms,
     publicRelayUrl: publicRelayUrl.replace(/\/$/u, ""),

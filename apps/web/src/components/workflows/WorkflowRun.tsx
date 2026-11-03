@@ -29,6 +29,13 @@ type WorkflowRunProps = {
 };
 
 export function WorkflowRun(props: WorkflowRunProps) {
+  if (props.workflow.definition.target.kind === "vm")
+    return (
+      <div className="mx-auto w-full max-w-xl space-y-2">
+        <h1 className="text-xl font-semibold">Run {props.workflow.definition.name}</h1>
+        <p className="text-sm text-muted-foreground">Running VM workflows is not available yet.</p>
+      </div>
+    );
   return (
     <WorkflowRunForm
       key={workflowSessionKey(

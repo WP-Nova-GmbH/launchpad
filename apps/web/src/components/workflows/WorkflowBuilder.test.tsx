@@ -1,6 +1,9 @@
-vi.mock("./WorkflowTriggerInspector", async () => ({
-  ...(await vi.importActual("./WorkflowTriggerInspector")),
-  WorkflowTriggerInspector: () => null,
+vi.mock("../../cloud/workflowSources", () => ({
+  useWorkflowSources: () => ({ snapshot: null, loading: false, refresh: vi.fn() }),
+}));
+vi.mock("./WorkflowSources", () => ({
+  RepositorySources: () => null,
+  RepositorySourcesButton: () => null,
 }));
 vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
 import { act, createElement, type PropsWithChildren } from "react";
@@ -45,6 +48,8 @@ vi.mock("../ui/sheet", () => ({
   Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) => (open ? children : null),
   SheetPopup: ({ children }: PropsWithChildren) => children,
   SheetTitle: ({ children }: PropsWithChildren) => children,
+  SheetHeader: ({ children }: PropsWithChildren) => children,
+  SheetDescription: ({ children }: PropsWithChildren) => children,
 }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
@@ -60,11 +65,13 @@ vi.mock("../ui/input", () => ({
 vi.mock("../ui/select", () => {
   const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
-    Select: component,
+    Select: ({ children, ...props }: PropsWithChildren) =>
+      createElement("div", { ...props, "data-workflow-select": true }, children),
     SelectTrigger: component,
     SelectValue: component,
     SelectPopup: component,
-    SelectItem: component,
+    SelectItem: ({ children, ...props }: PropsWithChildren) =>
+      createElement("div", { ...props, "data-workflow-select-item": true }, children),
   };
 });
 
@@ -697,6 +704,45 @@ describe("Editor Run archive eligibility", () => {
 });
 
 describe("workflow templates and copies", () => {
+  it.each(["review", "publish"] as const)(
+    "requires a target for the %s template when both kinds are available",
+    (template) => {
+      expect(newWorkflowDraft([project], template, true)?.targetConfirmed).toBe(false);
+      expect(newWorkflowDraft([], template, true)).toMatchObject({
+        definition: { target: { kind: "vm", baseBranch: null } },
+        targetConfirmed: true,
+      });
+    },
+  );
+
+  it("copies a VM workflow without a machine and keeps the base branch only in the same repository", () => {
+    const draft = newWorkflowDraft([], "review", true)!;
+    const source: RepositoryWorkflow = {
+      workflowId: "vm-source",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 3,
+      createdAt: "now",
+      updatedAt: "now",
+      definition: { ...draft.definition, target: { kind: "vm", baseBranch: "release/1.x" } },
+      automation: { enabled: false, trigger: recoveryAuto.trigger },
+      archived: false,
+    };
+    expect(copiedWorkflowDraft(source, [], true, true)).toMatchObject({
+      targetConfirmed: true,
+      automation: { enabled: false, trigger: null },
+      definition: {
+        target: { kind: "vm", baseBranch: "release/1.x" },
+        steps: draft.definition.steps,
+      },
+    });
+    expect(copiedWorkflowDraft(source, [project], false, true)?.definition.target).toEqual({
+      kind: "vm",
+      baseBranch: null,
+    });
+    expect(copiedWorkflowDraft(source, [project], false)).toBeNull();
+  });
+
   it("starts the publish template as an independent unsaved definition", () => {
     const draft = newWorkflowDraft([project], "publish")!;
     expect(
@@ -767,6 +813,233 @@ describe("workflow templates and copies", () => {
       "reconcile",
     );
     expect(newId()).toBe(id);
+  });
+});
+
+describe("VM authoring", () => {
+  const openExecutionSettings = () =>
+    act(() => renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick());
+  const chooseExecutionTarget = (kind: "machine" | "vm") =>
+    act(() =>
+      renderer!.root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange(kind),
+    );
+  const changeBaseBranch = (value: string) =>
+    act(() =>
+      renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
+        target: { value },
+      }),
+    );
+
+  it.each([
+    { name: "the saved override", edit: undefined, expected: "release/1.x" },
+    { name: "an unsaved override", edit: "release/2.x", expected: "release/2.x" },
+    { name: "an unsaved reset to the default", edit: "", expected: null },
+  ])("restores $name after returning to VM in the retained draft", async ({ edit, expected }) => {
+    const workflow: RepositoryWorkflow = {
+      workflowId: "saved-vm",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 1,
+      createdAt: "now",
+      updatedAt: "now",
+      definition: {
+        ...newWorkflowDraft([], "review", true)!.definition,
+        target: { kind: "vm", baseBranch: "release/1.x" },
+      },
+      archived: false,
+    };
+    const props = { ...base, workflow, isNew: false, vmAuthoring: { models: null } };
+    read.mockResolvedValue({ status: "connected" });
+    await mount(props);
+    await openExecutionSettings();
+    if (edit !== undefined) await changeBaseBranch(edit);
+    await chooseExecutionTarget("machine");
+    expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
+    await unmount();
+    await mount(props);
+    await openExecutionSettings();
+    await chooseExecutionTarget("vm");
+    expect(editor(workflow.workflowId).definition.target).toEqual({
+      kind: "vm",
+      baseBranch: expected,
+    });
+    expect(renderer!.root.findByProps({ placeholder: "Repository default" }).props.value).toBe(
+      expected ?? "",
+    );
+  });
+
+  it.each(["Discard changes", "Reload saved version"] as const)(
+    "forgets the alternate VM branch when using %s",
+    async (action) => {
+      const workflow: RepositoryWorkflow = {
+        workflowId: "saved-machine",
+        repositoryId: scope.repositoryId,
+        organizationId: scope.organizationId,
+        revision: 1,
+        createdAt: "now",
+        updatedAt: "now",
+        definition: newWorkflowDraft([project])!.definition,
+        archived: false,
+      };
+      read.mockResolvedValue({ status: "connected" });
+      await mount({ ...base, workflow, isNew: false, vmAuthoring: { models: null } });
+      await openExecutionSettings();
+      await chooseExecutionTarget("vm");
+      await changeBaseBranch("unsaved-branch");
+      await chooseExecutionTarget("machine");
+      if (action === "Reload saved version") {
+        await conflict(workflow.workflowId);
+        read.mockResolvedValueOnce({ workflows: [{ ...workflow, revision: 2 }] });
+      }
+      await click(action);
+      await openExecutionSettings();
+      await chooseExecutionTarget("vm");
+      expect(editor(workflow.workflowId).definition.target).toEqual({
+        kind: "vm",
+        baseBranch: null,
+      });
+    },
+  );
+
+  it("saves a base branch override with no checkout or Codex connection", async () => {
+    read.mockResolvedValueOnce({ status: "disconnected" });
+    await mount({ ...base, projects: [], vmAuthoring: { models: null } });
+    const id = newId();
+    expect(editor(id).definition.target).toEqual({ kind: "vm", baseBranch: null });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Connect Codex before running.");
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+    );
+    await act(() =>
+      renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
+        target: { value: "release/1.x " },
+      }),
+    );
+    const receipt: RepositoryWorkflow = {
+      ...saved(id),
+      definition: { ...editor(id).definition, target: { kind: "vm", baseBranch: "release/1.x" } },
+    };
+    read.mockRejectedValueOnce(new Error("Reply lost"));
+    await submit();
+    expect(editor(id).operation).toMatchObject({
+      state: "uncertain",
+      definition: receipt.definition,
+    });
+    read.mockResolvedValueOnce({ workflows: [receipt], vmAuthoring: { models: null } });
+    await submit();
+    expect(editor(id).baseline?.definition.target).toEqual({
+      kind: "vm",
+      baseBranch: "release/1.x",
+    });
+    expect(editor(id).operation).toBeNull();
+    expect(read).toHaveBeenCalledTimes(3);
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "/workflows/$repositoryId/$workflowId/edit",
+      }),
+    );
+  });
+
+  it("keeps the saved VM Run gate when the draft switches to a machine", async () => {
+    const definition = newWorkflowDraft([], "review", true)!.definition;
+    const workflow: RepositoryWorkflow = {
+      workflowId: "saved-vm",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 1,
+      createdAt: "now",
+      updatedAt: "now",
+      definition,
+      archived: false,
+    };
+    read.mockRejectedValueOnce(new Error("status unavailable"));
+    await mount({ ...base, workflow, isNew: false, vmAuthoring: { models: null } });
+    expect(JSON.stringify(renderer!.toJSON())).toContain(
+      "Could not check the organization's Codex connection.",
+    );
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+    );
+    await act(() =>
+      renderer!.root.findByProps({ "data-workflow-select": true }).props.onValueChange("machine"),
+    );
+    expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
+    const run = renderer!.root
+      .findAllByType("button")
+      .find((node) => node.props.children?.[1] === "Run")!;
+    expect(run.props.disabled).toBe(true);
+    await act(() => run.props.onClick());
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("saves Off and VM together after an explicit Off action, keeping the trigger", async () => {
+    const workflow: RepositoryWorkflow = {
+      workflowId: "saved-machine",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      revision: 1,
+      createdAt: "now",
+      updatedAt: "now",
+      definition: newWorkflowDraft([project])!.definition,
+      automation: recoveryAuto,
+      archived: false,
+    };
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      vmAuthoring: { models: null },
+      automationSupported: true,
+    });
+    const root = renderer!.root;
+    const openSettings = () =>
+      root.findByProps({ "aria-label": "Workflow settings" }).props.onClick();
+    const openTrigger = () =>
+      root.findByProps({ "aria-label": "Trigger settings" }).props.onClick();
+    const toggle = () =>
+      root.findAllByType("button").find((node) => node.props["aria-pressed"] !== undefined)!;
+    const selectVm = () =>
+      root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange("vm");
+    await act(openSettings);
+    const vmChoice = root.findByProps({ "data-workflow-select-item": true, value: "vm" });
+    expect(vmChoice.props.disabled).toBe(true);
+    await act(selectVm);
+    expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
+    expect(editor(workflow.workflowId).automation).toEqual(recoveryAuto);
+
+    await act(openTrigger);
+    await act(() => toggle().props.onClick());
+    await act(openSettings);
+    read.mockResolvedValueOnce({ status: "connected" });
+    await act(selectVm);
+    await act(openTrigger);
+    expect(toggle().props.disabled).toBe(true);
+    await act(() => toggle().props.onClick());
+    expect(editor(workflow.workflowId).automation).toEqual({
+      enabled: false,
+      trigger: recoveryTrigger,
+    });
+
+    const definition = editor(workflow.workflowId).definition;
+    read.mockImplementationOnce(async () => {
+      expect(editor(workflow.workflowId).operation).toMatchObject({
+        includesAutomation: true,
+        automation: { enabled: false, trigger: recoveryTrigger },
+        definition: { target: { kind: "vm", baseBranch: null } },
+      });
+      return {
+        ...workflow,
+        revision: 2,
+        definition,
+        automation: { enabled: false, trigger: recoveryTrigger },
+      };
+    });
+    await submit();
+    expect(editor(workflow.workflowId).baseline).toMatchObject({
+      revision: 2,
+      automation: { enabled: false, trigger: recoveryTrigger },
+      definition: { target: { kind: "vm", baseBranch: null } },
+    });
   });
 });
 

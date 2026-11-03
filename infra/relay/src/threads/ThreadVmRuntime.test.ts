@@ -2,7 +2,10 @@ import { expect, it } from "@effect/vitest";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
 import { loadThreadVmRuntimeSettings } from "./ThreadVmRuntime.ts";
+
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const configured = {
   RELAY_THREAD_VM_PROVISIONING_ENABLED: "true",
@@ -24,6 +27,55 @@ it.effect("keeps provisioning off without requiring any compute credentials", ()
   Effect.gen(function* () {
     expect(yield* load({})).toBeUndefined();
     expect(yield* load({ E2B_API_URL: "incomplete" })).toBeUndefined();
+  }),
+);
+it.effect("uses only valid model proof for the explicitly configured template build", () =>
+  Effect.gen(function* () {
+    const catalog = {
+      defaultModel: "gpt-6-astra",
+      models: [{ slug: "gpt-6-astra", name: "GPT-6 Astra", isCustom: false, capabilities: null }],
+    };
+    const proof = {
+      schemaVersion: 2,
+      templateRef: configured.E2B_TEMPLATE_REF,
+      buildId: configured.E2B_TEMPLATE_BUILD_ID,
+      catalog,
+    };
+    const verified = yield* load({
+      ...configured,
+      E2B_WORKFLOW_MODEL_PROOF: encodeJson({
+        ...proof,
+        auth: { command: "fixture-command" },
+        catalog: {
+          ...catalog,
+          models: catalog.models.map((model) => ({ ...model, apiKey: "fixture-key" })),
+        },
+      }),
+    });
+    expect(verified?.workflowModelCatalog).toEqual(catalog);
+    for (const value of [
+      "",
+      "{broken",
+      encodeJson({ ...proof, schemaVersion: 1 }),
+      encodeJson({ ...proof, templateRef: "different:build-same" }),
+      encodeJson({ ...proof, buildId: "different-build" }),
+      encodeJson({ ...proof, catalog: { ...catalog, models: [] } }),
+      encodeJson({
+        ...proof,
+        catalog: {
+          ...catalog,
+          models: Array.from({ length: 33 }, (_, index) => ({
+            ...catalog.models[0]!,
+            slug: index === 0 ? catalog.defaultModel : `other-${index}`,
+          })),
+        },
+      }),
+      encodeJson({ ...proof, unused: "x".repeat(64 * 1024) }),
+    ]) {
+      const settings = yield* load({ ...configured, E2B_WORKFLOW_MODEL_PROOF: value });
+      expect(settings?.templateBuildId).toBe(configured.E2B_TEMPLATE_BUILD_ID);
+      expect(settings?.workflowModelCatalog).toBeUndefined();
+    }
   }),
 );
 it.effect(

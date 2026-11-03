@@ -156,6 +156,20 @@ afterEach(async () => {
 });
 
 describe("Run receipt and navigation ownership", () => {
+  it("does not present a submission form on the direct VM Run route", async () => {
+    await mount({
+      ...base,
+      workflow: {
+        ...workflow,
+        definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+      },
+    });
+    expect(renderer!.root.findAllByType("form")).toHaveLength(0);
+    expect(JSON.stringify(renderer!.toJSON())).toContain(
+      "Running VM workflows is not available yet.",
+    );
+    expect(read).not.toHaveBeenCalled();
+  });
   it("navigates once from the same current form and retains its receipt", async () => {
     await mount();
     await submit();

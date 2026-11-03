@@ -14,7 +14,7 @@ import {
   type WorkflowEditorDraft,
   type WorkflowRunDraft,
 } from "@t3tools/client-runtime/relay/workflow-session";
-import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
+import type { RepositoryWorkflow, WorkflowTarget } from "@t3tools/contracts/workflows";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { randomUUID } from "../../lib/utils";
 import * as Effect from "effect/Effect";
@@ -133,21 +133,27 @@ export const savedWorkflowDraft = (
 export function newWorkflowDraft(
   projects: ReadonlyArray<RelayOrganizationProject>,
   template: "review" | "publish" = "review",
+  vmAuthoring = false,
 ): WorkflowEditorDraft | null {
-  const target = projects[0];
+  const project = projects[0];
+  const target: WorkflowTarget | null = vmAuthoring
+    ? { kind: "vm", baseBranch: null }
+    : project
+      ? { kind: "machine", environmentId: project.environmentId, projectId: project.projectId }
+      : null;
   if (!target) return null;
   return {
     workflowId: randomUUID(),
     automation: normalizeWorkflowAutomation(),
     automationResolved: true,
     baseline: null,
-    targetConfirmed: projects.length === 1,
+    targetConfirmed: projects.length + Number(vmAuthoring) === 1,
     selectedStepId: "",
     operation: null,
     error: null,
     definition: {
       name: template === "publish" ? "Reviewed implementation" : "New workflow",
-      target: { kind: "machine", environmentId: target.environmentId, projectId: target.projectId },
+      target,
       steps: [
         {
           id: "agent",
@@ -182,11 +188,13 @@ export function copiedWorkflowDraft(
   source: RepositoryWorkflow,
   projects: ReadonlyArray<RelayOrganizationProject>,
   sameRepository: boolean,
+  vmAuthoring = false,
 ) {
-  const draft = newWorkflowDraft(projects);
+  if (source.definition.target.kind === "vm" && !vmAuthoring) return null;
+  const draft = newWorkflowDraft(projects, "review", vmAuthoring);
   if (!draft) return null;
   const sourceTarget = source.definition.target;
-  const target =
+  const machine =
     sameRepository && sourceTarget.kind === "machine"
       ? projects.find(
           (project) =>
@@ -194,21 +202,19 @@ export function copiedWorkflowDraft(
             project.projectId === sourceTarget.projectId,
         )
       : undefined;
+  const target: WorkflowTarget | undefined =
+    sourceTarget.kind === "vm" && vmAuthoring
+      ? { kind: "vm", baseBranch: sameRepository ? sourceTarget.baseBranch : null }
+      : machine
+        ? { kind: "machine", environmentId: machine.environmentId, projectId: machine.projectId }
+        : undefined;
   return {
     ...draft,
-    targetConfirmed: !!target || projects.length === 1,
+    targetConfirmed: !!target || draft.targetConfirmed,
     definition: {
       ...draft.definition,
       name: `Copy of ${source.definition.name}`.slice(0, 120),
-      ...(target
-        ? {
-            target: {
-              kind: "machine" as const,
-              environmentId: target.environmentId,
-              projectId: target.projectId,
-            },
-          }
-        : {}),
+      ...(target ? { target } : {}),
       steps: structuredClone(source.definition.steps),
     },
   };

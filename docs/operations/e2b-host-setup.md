@@ -205,6 +205,25 @@ selection (`settings.compute.templateId`) and verify the next allocation uses th
 Move a thread back to a machine and into a new VM to pick up updated Git setup;
 rebuilding alone does not update running or paused VMs.
 
+To publish the Codex model choices for VM workflow authoring, run the disposable runner
+smoke check with `E2B_API_URL`, `E2B_SANDBOX_URL`, and `E2B_API_KEY_FILE` set for your
+self-hosted E2B instance:
+
+```sh
+node infra/relay/scripts/e2b-runner-smoke.mjs \
+  --receipt "/absolute/e2b-builds/<build-tag>.json" \
+  --output /absolute/new-runner-proof-directory
+```
+
+The check reads the model policy and model list from the selected build without a Codex account.
+If the build cannot report its model policy, rebuild the runner and run the check again.
+Proof generated before the runner reported its own policy must be regenerated. On success,
+restart the dev relay to load the proof alongside the template selection. If you use an
+alternate selection file, set `E2B_TEMPLATE_FILE` for the check too. For a deployed relay,
+set `E2B_WORKFLOW_MODEL_PROOF` to the contents of the output directory's `workflow-models.json`
+when deploying the matching template. Workflows can still use the managed default while an
+explicit model catalog is unavailable.
+
 For relay authentication, database migrations, Cloudflare and app startup, continue
 with [VM development](vm-development.md). The E2B management API and proxy must stay
 private; the authenticated relay is the clients' entry point.

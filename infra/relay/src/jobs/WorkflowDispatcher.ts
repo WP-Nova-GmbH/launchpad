@@ -18,7 +18,7 @@ import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Workflows, type WorkflowJobRecord, type WorkflowDispatchScope } from "./Workflows.ts";
-import { validateWorkflowTarget } from "./WorkflowTarget.ts";
+import { validateWorkflowTarget, vmWorkflowExecutionUnavailable } from "./WorkflowTarget.ts";
 export { validateWorkflowTarget } from "./WorkflowTarget.ts";
 
 const decodeOrigin = Schema.decodeUnknownEffect(WorkflowOrigin);
@@ -108,15 +108,13 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           );
           return row.record;
         }
+        if (workflow.definition.target.kind === "vm")
+          return yield* vmWorkflowExecutionUnavailable();
         const canonicalKey = yield* validateWorkflowTarget(
           row!.organizationId,
           job.repositoryId,
           workflow.definition,
         );
-        if (workflow.definition.target.kind !== "machine")
-          return yield* new WorkflowInvalidError({
-            message: "VM workflows are not available yet.",
-          });
         const machineTarget = workflow.definition.target;
         const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
         const protocol = WORKFLOW_PROTOCOL;
@@ -160,14 +158,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           detail: "Offering this workflow to its environment.",
           updatedAt: now,
         };
-        row = yield* update(
+        row = yield* store.bindManualOffer(
           { ...row!, repositoryCanonicalKey: canonicalKey },
           job,
-          row!.pendingControl,
-          false,
+          leaseUntil,
         );
-        // Store the remote binding beside the offer, including across relay restart.
-        row = { ...row, repositoryCanonicalKey: canonicalKey };
       }
     }
     const runtime = job.runtime;

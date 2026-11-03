@@ -13,7 +13,7 @@ import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows } from "../persistence/schema.ts";
 import * as Sources from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";
-import { lockWorkflowTarget } from "../jobs/WorkflowTarget.ts";
+import { lockWorkflowTarget, vmWorkflowAutomationUnavailable } from "../jobs/WorkflowTarget.ts";
 
 export const automation = (value: RepositoryWorkflow["automation"] | null | undefined) => ({
   enabled: value?.enabled ?? false,
@@ -76,6 +76,8 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
   const config = yield* Fence.configuration;
   const next = automation(record.automation);
   if (record.archived) next.enabled = false;
+  if (next.enabled && record.definition.target.kind === "vm")
+    return yield* vmWorkflowAutomationUnavailable();
   if (next.enabled && (!next.trigger || !config?.admissionEnabled))
     return yield* invalid("Automatic event admission is not enabled on this relay.");
   const db = yield* RelayDb;

@@ -16,7 +16,7 @@ const standardResources = {
   minUsableDiskMb: 20480,
 };
 
-async function writeJsonAtomically(path, value) {
+export async function writeJsonAtomically(path, value) {
   await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${NodeCrypto.randomUUID()}.tmp`;
   try {

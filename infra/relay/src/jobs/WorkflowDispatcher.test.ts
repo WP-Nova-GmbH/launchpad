@@ -141,6 +141,25 @@ const harness = Effect.gen(function* () {
   const reply = yield* Ref.make<WorkflowControlResult | null>(null);
   const offers = yield* Ref.make<ReadonlyArray<RepositoryWorkflow>>([]);
   const controls = yield* Ref.make<ReadonlyArray<WorkflowControl>>([]);
+  const updateJob: Workflows["Service"]["updateJob"] = (
+    previous,
+    record,
+    pendingControl = previous.pendingControl,
+    releaseLease = true,
+  ) =>
+    Effect.gen(function* () {
+      if ((yield* Ref.get(row)).revision !== previous.revision)
+        return yield* new WorkflowConflictError({ message: "Job changed" });
+      return yield* Ref.updateAndGet(row, (value) => ({
+        ...value,
+        record,
+        status: record.status,
+        repositoryCanonicalKey: previous.repositoryCanonicalKey,
+        pendingControl,
+        revision: value.revision + 1,
+        leaseUntil: releaseLease ? null : value.leaseUntil,
+      }));
+    });
   const layer = Layer.mergeAll(
     Layer.mock(Organizations)({
       getMembershipForUser: ({ userId }) =>
@@ -163,25 +182,9 @@ const harness = Effect.gen(function* () {
                 { ...value, leaseUntil: "lease-1" },
               ],
         ),
-      updateJob: (
-        previous,
-        record,
-        pendingControl = previous.pendingControl,
-        releaseLease = true,
-      ) =>
-        Effect.gen(function* () {
-          if ((yield* Ref.get(row)).revision !== previous.revision)
-            return yield* new WorkflowConflictError({ message: "Job changed" });
-          return yield* Ref.updateAndGet(row, (value) => ({
-            ...value,
-            record,
-            status: record.status,
-            repositoryCanonicalKey: previous.repositoryCanonicalKey,
-            pendingControl,
-            revision: value.revision + 1,
-            leaseUntil: releaseLease ? null : value.leaseUntil,
-          }));
-        }),
+      updateJob,
+      bindManualOffer: (previous, record, expectedLease) =>
+        updateJob(previous, record, previous.pendingControl, false, expectedLease),
       release: (_id, leaseUntil) =>
         Ref.update(row, (value) =>
           value.leaseUntil === leaseUntil ? { ...value, leaseUntil: null } : value,

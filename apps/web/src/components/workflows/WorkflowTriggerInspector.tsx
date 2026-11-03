@@ -34,6 +34,7 @@ export function WorkflowTriggerInspector({
   scope,
   automation,
   supported,
+  vmTarget = false,
   resolved = true,
   disabled,
   onChange,
@@ -43,6 +44,7 @@ export function WorkflowTriggerInspector({
   scope: WorkflowScope;
   automation: WorkflowAutomation | undefined;
   supported: boolean;
+  vmTarget?: boolean;
   resolved?: boolean;
   disabled: boolean;
   onChange: (automation: WorkflowAutomation) => void;
@@ -80,7 +82,9 @@ export function WorkflowTriggerInspector({
       </header>
       <div className={styles["workflow-inspector-fields"]}>
         <p className="text-sm text-muted-foreground">
-          Manual Run is always available. Automatic triggering changes after Save.
+          {vmTarget
+            ? "Automatic triggering is unavailable for VM workflows."
+            : "Manual Run is always available. Automatic triggering changes after Save."}
         </p>
         {!supported ? (
           <p role="alert">
@@ -97,8 +101,11 @@ export function WorkflowTriggerInspector({
             type="button"
             variant={value.enabled ? "default" : "outline"}
             aria-pressed={value.enabled}
+            disabled={vmTarget && !value.enabled}
             ref={(node) => registerField?.("trigger:enabled", node)}
-            onClick={() => onChange({ ...value, enabled: !value.enabled })}
+            onClick={() => {
+              if (!vmTarget || value.enabled) onChange({ ...value, enabled: !value.enabled });
+            }}
           >
             Automatic triggering:{" "}
             {supported && resolved ? (value.enabled ? "On" : "Off") : "Unavailable"}

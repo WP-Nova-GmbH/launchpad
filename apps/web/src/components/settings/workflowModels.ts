@@ -5,11 +5,56 @@ import type {
   UnifiedSettings,
 } from "@t3tools/contracts";
 import type { WorkflowDefinition, WorkflowStep } from "@t3tools/contracts/workflows";
+import type { WorkflowVmModelCatalog } from "@t3tools/contracts/workflows";
+import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
 } from "../../providerInstances";
 import { getCustomModelOptionsByInstance } from "../../modelSelection";
+
+export const workflowVmCodexInstanceId = defaultInstanceIdForDriver(
+  ProviderDriverKind.make("codex"),
+);
+
+export function workflowVmModelState(
+  definition: WorkflowDefinition,
+  catalog: WorkflowVmModelCatalog | null,
+): ReturnType<typeof workflowModelState> {
+  const disabledReason = (instanceId: ProviderInstanceId, model: string): string | null => {
+    if (!catalog)
+      return "A verified VM model catalog is required to keep this model. Select the managed default before saving, or refresh once the catalog is available.";
+    if (instanceId !== workflowVmCodexInstanceId) return "Choose a managed Codex model.";
+    if (!catalog.models.some((entry) => entry.slug === model))
+      return "Choose a model supported by this VM build.";
+    return null;
+  };
+  const issues = definition.steps.flatMap((step) => {
+    if (step.kind !== "agent" || !step.modelSelection) return [];
+    const { instanceId, model, options } = step.modelSelection;
+    const detail =
+      disabledReason(instanceId, model) ??
+      (options?.length ? "Choose a model without saved options." : null);
+    return detail ? [{ stepId: step.id, title: step.title, detail }] : [];
+  });
+  return {
+    entries: [],
+    modelOptions: new Map(),
+    anchor: undefined,
+    first: definition.steps.find((step) => step.kind === "agent"),
+    effectiveSelection: (step) => step.modelSelection,
+    disabledReason,
+    triggerLabel: (step) => {
+      const selection = step.modelSelection;
+      if (!selection) return "Managed default";
+      if (!catalog) return selection.model + " (Unverified)";
+      const label =
+        catalog.models.find((entry) => entry.slug === selection.model)?.name ?? selection.model;
+      return issues.some((issue) => issue.stepId === step.id) ? label + " (Unavailable)" : label;
+    },
+    issues,
+  };
+}
 
 /** Project defaults and model choices must come from the workflow's execution environment. */
 export function workflowModelState(

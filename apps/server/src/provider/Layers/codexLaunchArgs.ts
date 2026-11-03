@@ -2,9 +2,10 @@ import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 
 const T3CODE_CODEX_LAUNCH_ARGS_ENV = "T3CODE_CODEX_LAUNCH_ARGS";
 export const MANAGED_CODEX_MODEL_PROVIDER = "launchpad_vm";
+const MANAGED_CODEX_DEFAULT_MODEL = "gpt-6-astra";
 export const MANAGED_CODEX_MODELS = new Set([
   "gpt-6.1-sol",
-  "gpt-6-astra",
+  MANAGED_CODEX_DEFAULT_MODEL,
   "gpt-6-sol",
   "gpt-6-luna",
   "gpt-5.6-sol",
@@ -18,17 +19,38 @@ export const managedCodexModelIssue = (model: string) =>
     : `The organization's Codex connection does not support '${model}'. Select a supported model before continuing this conversation.`;
 
 /** Replace the entire provider table so an inherited env_key or bearer cannot become a fallback. */
+const managedCodexProviderArgs = (
+  baseUrl: string,
+  authCommand: string,
+  authArgs: ReadonlyArray<string>,
+): ReadonlyArray<string> => [
+  "-c",
+  `model_provider="${MANAGED_CODEX_MODEL_PROVIDER}"`,
+  "-c",
+  `model="${MANAGED_CODEX_DEFAULT_MODEL}"`,
+  "-c",
+  `model_providers.${MANAGED_CODEX_MODEL_PROVIDER}={name="Organization Codex",base_url=${JSON.stringify(baseUrl)},wire_api="responses",requires_openai_auth=false,supports_websockets=false,auth={command=${JSON.stringify(authCommand)},args=${JSON.stringify(authArgs)},timeout_ms=10000,refresh_interval_ms=300000}}`,
+];
+
 const managedCodexArgs = (connectionId?: string): ReadonlyArray<string> =>
   connectionId
-    ? [
-        "-c",
-        `model_provider="${MANAGED_CODEX_MODEL_PROVIDER}"`,
-        "-c",
-        'model="gpt-6-astra"',
-        "-c",
-        `model_providers.${MANAGED_CODEX_MODEL_PROVIDER}={name="Organization Codex",base_url="https://api.openai.com/v1",wire_api="responses",requires_openai_auth=false,supports_websockets=false,auth={command="/opt/launchpad/server/t3",args=["__thread-vm-codex-token","--connection-id",${JSON.stringify(connectionId)}],timeout_ms=10000,refresh_interval_ms=300000}}`,
-      ]
+    ? managedCodexProviderArgs("https://api.openai.com/v1", "/opt/launchpad/server/t3", [
+        "__thread-vm-codex-token",
+        "--connection-id",
+        connectionId,
+      ])
     : [];
+
+/** This policy is emitted by the packaged guest for the offline runner smoke probe. */
+export const managedCodexModelProbePolicy = () => ({
+  schemaVersion: 1 as const,
+  defaultModel: MANAGED_CODEX_DEFAULT_MODEL,
+  modelSlugs: [...MANAGED_CODEX_MODELS],
+  probeArgs: [
+    "app-server",
+    ...managedCodexProviderArgs("http://127.0.0.1:1/v1", "/usr/bin/false", []),
+  ],
+});
 
 export const managedCodexEnvironment = (environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
   Object.fromEntries(

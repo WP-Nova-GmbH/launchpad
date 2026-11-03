@@ -5,6 +5,7 @@ import type {
   WorkflowDefinition,
   WorkflowJobPage,
   RepositoryWorkflowJobSummary,
+  WorkflowVmTarget,
 } from "@t3tools/contracts/workflows";
 import {
   WorkflowDefinition as WorkflowDefinitionSchema,
@@ -43,6 +44,8 @@ export interface WorkflowEditorDraft {
   readonly baseline: RepositoryWorkflow | null;
   readonly selectedStepId: string;
   readonly targetConfirmed: boolean;
+  /** Editor-only VM choice while Machine is selected. Retained until the draft is reset or VM is selected again. */
+  readonly lastVmTarget?: typeof WorkflowVmTarget.Type;
   readonly operation: {
     readonly requestId: string;
     readonly state: "pending" | "uncertain";

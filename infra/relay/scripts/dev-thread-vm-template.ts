@@ -8,12 +8,14 @@ import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "@t3tools/contracts";
 import { loadThreadVmRuntimeSettings } from "../src/threads/ThreadVmRuntime.ts";
+import { workflowVmModelProofPath } from "../src/threads/ThreadVmWorkflowModelProof.ts";
 
 export const defaultDevThreadVmTemplatePath = NodeURL.fileURLToPath(
   new URL("../.t3/e2b-template.json", import.meta.url),
 );
 
 const templateReference = TrimmedNonEmptyString.check(Schema.isPattern(/^[^:]+:build-[^:]+$/u));
+const buildId = TrimmedNonEmptyString.check(Schema.isPattern(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/u));
 const isImmutableTemplateReference = Schema.is(templateReference);
 const decodeTemplateSelection = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
@@ -22,7 +24,7 @@ const decodeTemplateSelection = Schema.decodeUnknownEffect(
       state: Schema.Literal("built"),
       apiUrl: TrimmedNonEmptyString,
       templateRef: templateReference,
-      buildId: TrimmedNonEmptyString,
+      buildId,
     }),
   ),
 );
@@ -85,6 +87,9 @@ export const loadDevThreadVmRuntimeSettings = Effect.gen(function* () {
       templateError(path, "The selected VM template belongs to a different E2B_API_URL"),
     );
 
+  const modelProof = yield* fs
+    .readFileString(workflowVmModelProofPath(path, selected.buildId))
+    .pipe(Effect.catch(() => Effect.void));
   const provider = yield* ConfigProvider.ConfigProvider;
   return yield* loadThreadVmRuntimeSettings.pipe(
     Effect.provideService(
@@ -93,6 +98,7 @@ export const loadDevThreadVmRuntimeSettings = Effect.gen(function* () {
         ConfigProvider.fromUnknown({
           E2B_TEMPLATE_REF: selected.templateRef,
           E2B_TEMPLATE_BUILD_ID: selected.buildId,
+          ...(modelProof === undefined ? {} : { E2B_WORKFLOW_MODEL_PROOF: modelProof }),
         }),
         provider,
       ),

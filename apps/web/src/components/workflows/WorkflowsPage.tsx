@@ -10,13 +10,17 @@ import {
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useLayoutEffect, useState, useCallback, useRef } from "react";
 import {
   RelayRepositoryId,
   type RelayRepositorySummary,
   type RelayOrganizationProject,
 } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflow, WorkflowAutomationSummary } from "@t3tools/contracts/workflows";
+import type {
+  RepositoryWorkflow,
+  WorkflowAutomationSummary,
+  WorkflowCatalog,
+} from "@t3tools/contracts/workflows";
 import {
   workflowDraftAtom,
   workflowCatalogRevisionAtom,
@@ -113,7 +117,7 @@ function WorkflowNotice({ message }: { message: string }) {
 function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
   const { isLoaded, isSignedIn, userId } = useAuth();
   const { openAuthPrompt } = useT3ConnectAuthPrompt();
-  const catalog = useManagedRelayOrganizationCatalog();
+  const catalog = useManagedRelayOrganizationCatalog({ allowMissingProjects: true });
   const { refresh: refreshCatalog } = catalog;
   useEffect(refreshCatalog, [refreshCatalog]);
   const navigate = useNavigate();
@@ -226,6 +230,8 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
       entry={entry}
       repositories={catalog.data.repositories}
       allProjects={catalog.data.projects}
+      refreshOrganizationCatalog={refreshCatalog}
+      projectsUnavailable={catalog.data.projectsUnavailable === true}
       copyRepositories={catalog.data.repositories.filter(
         (destination) =>
           catalog.data!.membership.role === "admin" || destination.role === "maintainer",
@@ -262,6 +268,8 @@ function WorkflowRepositoryView({
   allProjects,
   copyRepositories,
   projects,
+  projectsUnavailable,
+  refreshOrganizationCatalog,
   canConfigure,
   view,
 }: {
@@ -271,6 +279,8 @@ function WorkflowRepositoryView({
   copyRepositories: ReadonlyArray<RelayRepositorySummary>;
   allProjects: ReadonlyArray<RelayOrganizationProject>;
   projects: ReadonlyArray<RelayOrganizationProject>;
+  projectsUnavailable: boolean;
+  refreshOrganizationCatalog: () => void;
   canConfigure: boolean;
   view: WorkflowView;
 }) {
@@ -284,16 +294,32 @@ function WorkflowRepositoryView({
   const drafts = useWorkflowDrafts();
   const catalogRevision = useAtomValue(workflowCatalogRevisionAtom);
   const [automationSupported, setAutomationSupported] = useState(false);
+  const [vmAuthoring, setVmAuthoring] = useState<WorkflowCatalog["vmAuthoring"] | null>(null);
   const [summaries, setSummaries] = useState<ReadonlyArray<WorkflowAutomationSummary>>([]);
-  const [workflows, setWorkflows] = useState<ReadonlyArray<RepositoryWorkflow>>([]);
+  const [listedWorkflows, setWorkflows] = useState<ReadonlyArray<RepositoryWorkflow>>([]);
+  const workflows = listedWorkflows.map((workflow) => {
+    const baseline = drafts.editors[workflowSessionKey(scope, workflow.workflowId)]?.baseline;
+    return baseline && baseline.revision > workflow.revision ? baseline : workflow;
+  });
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [codexRefreshVersion, setCodexRefreshVersion] = useState(0);
   const active = useActiveWorkflowView();
   const [copy, setCopy] = useState<RepositoryWorkflow | null>(null);
   const [copyDestination, setCopyDestination] = useState<string>(scope.repositoryId);
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const copyRequest = useRef<object | null>(null);
+  const copyCatalog = useRef({ allProjects, copyRepositories, vmAuthoring });
+  useLayoutEffect(() => {
+    copyCatalog.current = { allProjects, copyRepositories, vmAuthoring };
+  }, [allProjects, copyRepositories, vmAuthoring]);
+  useLayoutEffect(
+    () => () => {
+      copyRequest.current = null;
+    },
+    [],
+  );
   const closeCopy = () => {
     copyRequest.current = null;
     setCopy(null);
@@ -323,20 +349,33 @@ function WorkflowRepositoryView({
       if (!owns()) return;
       if (!saved) throw new Error("The saved source workflow is no longer available.");
       const destinationScope = { ...scope, repositoryId: destination.repository.repositoryId };
-      const targets = allProjects.filter(
-        (project) =>
-          project.repositoryCanonicalKey !== null &&
-          destination.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
-      );
-      const id = await openNewWorkflowDraft(destinationScope, () =>
-        owns()
-          ? copiedWorkflowDraft(
-              saved,
-              targets,
-              destinationScope.repositoryId === scope.repositoryId,
-            )
-          : null,
-      );
+      const readCopyOptions = () => {
+        const current = copyCatalog.current;
+        const currentDestination = current.copyRepositories.find(
+          (entry) => entry.repository.repositoryId === destinationScope.repositoryId,
+        );
+        if (!currentDestination) throw new Error("Choose a repository you can configure.");
+        if (saved.definition.target.kind === "vm" && !current.vmAuthoring)
+          throw new Error("Update the relay to copy a VM workflow.");
+        return { current, currentDestination };
+      };
+      readCopyOptions();
+      const id = await openNewWorkflowDraft(destinationScope, () => {
+        if (!owns()) return null;
+        // A draft replacement confirmation can outlive another refresh.
+        const { current, currentDestination } = readCopyOptions();
+        const targets = current.allProjects.filter(
+          (project) =>
+            project.repositoryCanonicalKey !== null &&
+            currentDestination.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
+        );
+        return copiedWorkflowDraft(
+          saved,
+          targets,
+          destinationScope.repositoryId === scope.repositoryId,
+          !!current.vmAuthoring,
+        );
+      });
       if (!owns() || !id) return;
       closeCopy();
       void navigate({
@@ -353,9 +392,10 @@ function WorkflowRepositoryView({
     }
   };
   const useTemplate = async (template: "review" | "publish") => {
+    if (vmAuthoring === null) return;
     try {
       const id = await openNewWorkflowDraft(scope, () =>
-        active.current ? newWorkflowDraft(projects, template) : null,
+        active.current ? newWorkflowDraft(projects, template, !!vmAuthoring) : null,
       );
       if (active.current && id)
         void navigate({
@@ -375,6 +415,7 @@ function WorkflowRepositoryView({
       );
       if (generation !== loadGeneration.current) return;
       setWorkflows(result.workflows);
+      setVmAuthoring(result.vmAuthoring);
       setAutomationSupported(result.automationSupported === true);
       setSummaries(result.automationSummaries ?? []);
       setLoaded(true);
@@ -385,6 +426,11 @@ function WorkflowRepositoryView({
       setLoaded(true);
     }
   }, [call, scope.repositoryId]);
+  const refreshView = () => {
+    refreshOrganizationCatalog();
+    void refresh();
+    if (view === "builder") setCodexRefreshVersion((version) => version + 1);
+  };
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- The relay read settles asynchronously; this effect owns the initial request.
     void refresh();
@@ -468,7 +514,11 @@ function WorkflowRepositoryView({
     const key = workflowSessionKey(scope, workflow.workflowId);
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const draft = state.editors[key] ?? savedWorkflowDraft(workflow, automationSupported);
-      if (draft.operation)
+      if (
+        draft.operation ||
+        draft.definition.target.kind === "vm" ||
+        workflow.definition.target.kind === "vm"
+      )
         return { ...state, editors: { ...state.editors, [key]: { ...draft, triggerSetup: true } } };
       return {
         ...state,
@@ -498,11 +548,18 @@ function WorkflowRepositoryView({
     });
   };
   const toggleAutomation = async (workflow: RepositoryWorkflow) => {
-    if (!automationSupported || error || workflow.archived) return;
+    if (
+      !automationSupported ||
+      error ||
+      workflow.archived ||
+      workflow.definition.target.kind === "vm"
+    )
+      return;
     const key = workflowSessionKey(scope, workflow.workflowId);
     const current = appAtomRegistry.get(workflowDraftAtom).editors[key];
     if (
       current?.operation?.state === "pending" ||
+      current?.definition.target.kind === "vm" ||
       (current?.baseline && current.baseline.revision > workflow.revision)
     )
       return;
@@ -568,6 +625,9 @@ function WorkflowRepositoryView({
               <p className="font-medium">{workflow.definition.name}</p>
               <p className="text-xs text-muted-foreground">
                 {workflow.definition.steps.length} steps
+                {workflow.definition.target.kind === "vm"
+                  ? ` · VM · ${workflow.definition.target.baseBranch ?? "Repository default"}`
+                  : ""}
                 {local && workflowEditorDirty(local) ? " · Unsaved changes" : ""}
               </p>
               <p className="text-xs text-muted-foreground">
@@ -583,7 +643,11 @@ function WorkflowRepositoryView({
               ) : null}
             </div>
             <div className="flex flex-wrap gap-2">
-              {canConfigure && automationSupported && !archived ? (
+              {canConfigure &&
+              automationSupported &&
+              !archived &&
+              workflow.definition.target.kind === "machine" &&
+              local?.definition.target.kind !== "vm" ? (
                 <Button
                   variant="outline"
                   size="sm"
@@ -612,7 +676,8 @@ function WorkflowRepositoryView({
                   Trigger settings
                 </Button>
               ) : null}
-              {copyRepositories.length ? (
+              {copyRepositories.length &&
+              (workflow.definition.target.kind === "machine" || vmAuthoring) ? (
                 <Button
                   variant="ghost"
                   onClick={() => {
@@ -653,6 +718,10 @@ function WorkflowRepositoryView({
                     {local?.operation ? "Retry save" : "Restore"}
                   </Button>
                 ) : null
+              ) : workflow.definition.target.kind === "vm" ? (
+                <span className="self-center text-xs text-muted-foreground">
+                  VM execution unavailable
+                </span>
               ) : (
                 <Button
                   variant="outline"
@@ -711,7 +780,7 @@ function WorkflowRepositoryView({
                 </SelectPopup>
               </Select>
             </div>
-            <Button type="button" variant="ghost" size="sm" onClick={refresh}>
+            <Button type="button" variant="ghost" size="sm" onClick={refreshView}>
               Refresh
             </Button>
           </div>
@@ -723,6 +792,10 @@ function WorkflowRepositoryView({
         ) : null}
         {!loaded ? (
           <Spinner />
+        ) : !workflowId && vmAuthoring === null ? (
+          <p className="px-4 py-2 text-sm text-muted-foreground">
+            Refresh the workflow catalog before creating a workflow.
+          </p>
         ) : (
           <WorkflowBuilder
             scope={scope}
@@ -737,6 +810,9 @@ function WorkflowRepositoryView({
             workflowId={workflowId}
             isNew={!workflowId}
             projects={projects}
+            projectsUnavailable={projectsUnavailable}
+            vmAuthoring={vmAuthoring ?? undefined}
+            codexRefreshVersion={codexRefreshVersion}
             canConfigure={canConfigure}
             call={call}
             refresh={refresh}
@@ -845,7 +921,7 @@ function WorkflowRepositoryView({
               </div>
             </div>
             {view !== "catalog" || tab !== "runs" ? (
-              <Button variant="ghost" onClick={refresh}>
+              <Button variant="ghost" onClick={refreshView}>
                 Refresh
               </Button>
             ) : null}
@@ -907,7 +983,9 @@ function WorkflowRepositoryView({
                   <div className="flex flex-wrap gap-2">
                     <RepositorySourcesButton repositoryId={scope.repositoryId} />
                     <Menu>
-                      <MenuTrigger render={<Button variant="outline" />}>
+                      <MenuTrigger
+                        render={<Button variant="outline" disabled={vmAuthoring === null} />}
+                      >
                         Use template <ChevronDownIcon />
                       </MenuTrigger>
                       <MenuPopup>
@@ -920,11 +998,13 @@ function WorkflowRepositoryView({
                       </MenuPopup>
                     </Menu>
                     <Button
+                      disabled={vmAuthoring === null}
                       onClick={() => {
+                        if (vmAuthoring === null) return;
                         startNewWorkflowDraft(
                           appAtomRegistry,
                           scope,
-                          () => newWorkflowDraft(projects),
+                          () => newWorkflowDraft(projects, "review", !!vmAuthoring),
                           true,
                         );
                         navigate({

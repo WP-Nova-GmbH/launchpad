@@ -9,6 +9,7 @@ import { Template } from "e2b";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, it, expect, vi } from "vite-plus/test";
@@ -235,7 +236,13 @@ describe("runner build publication", () => {
               readFileString: (path) =>
                 path === fixture.selected
                   ? Effect.succeed(selected)
-                  : Effect.die(new Error("Unexpected selection path")),
+                  : Effect.fail(
+                      PlatformError.systemError({
+                        _tag: "NotFound",
+                        module: "FileSystem",
+                        method: "readFileString",
+                      }),
+                    ),
             }),
           ),
           Effect.provide(

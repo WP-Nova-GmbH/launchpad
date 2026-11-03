@@ -43,7 +43,7 @@ function ConfiguredWorkflowResultReturn() {
   const session = useAtomValue(managedRelaySessionAtom);
   const location = useLocation();
   const navigate = useNavigate();
-  const catalog = useManagedRelayOrganizationCatalog();
+  const catalog = useManagedRelayOrganizationCatalog({ allowMissingProjects: true });
   const params = useParams({ strict: false });
   const origin = workflowResultOrigin(
     location.state,

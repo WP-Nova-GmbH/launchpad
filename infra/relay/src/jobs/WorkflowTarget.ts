@@ -1,4 +1,9 @@
-import { WorkflowInvalidError, type WorkflowDefinition } from "@t3tools/contracts/workflows";
+import { ProviderDriverKind, defaultInstanceIdForDriver } from "@t3tools/contracts";
+import {
+  WorkflowInvalidError,
+  type WorkflowDefinition,
+  type WorkflowVmModelCatalog,
+} from "@t3tools/contracts/workflows";
 import * as Effect from "effect/Effect";
 import { and, eq, isNull } from "drizzle-orm";
 import { RelayDb } from "../db.ts";
@@ -12,6 +17,65 @@ import {
 import { Machines } from "../machines/Machines.ts";
 import { Repositories } from "../tenancy/Repositories.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
+
+export const vmWorkflowExecutionUnavailable = () =>
+  new WorkflowInvalidError({ message: "Running VM workflows is not available yet." });
+
+export const vmWorkflowAutomationUnavailable = () =>
+  new WorkflowInvalidError({
+    message: "Turn off automatic triggering to save this workflow with a VM target.",
+  });
+
+const codexInstanceId = defaultInstanceIdForDriver(ProviderDriverKind.make("codex"));
+
+/** Git short branch names without ref expressions or checkout history expansion. */
+function validBranchName(branch: string) {
+  return (
+    branch !== "HEAD" &&
+    !branch.startsWith("-") &&
+    !branch.endsWith(".") &&
+    !branch.includes("..") &&
+    !branch.includes("@{") &&
+    !Array.from(branch).some(
+      (char) => char.charCodeAt(0) <= 32 || char.charCodeAt(0) === 127 || "~^:?*[\\".includes(char),
+    ) &&
+    branch.split("/").every((part) => part && !part.startsWith(".") && !part.endsWith(".lock"))
+  );
+}
+
+export function vmWorkflowDefinitionIssue(
+  baseBranch: string | null,
+  steps: WorkflowDefinition["steps"],
+  catalog: WorkflowVmModelCatalog | null,
+): string | null {
+  if (baseBranch !== null && !validBranchName(baseBranch)) return "Enter a valid Git branch name.";
+  for (const step of steps) {
+    if (step.kind !== "agent" || !step.modelSelection) continue;
+    const { instanceId, model, options } = step.modelSelection;
+    if (instanceId !== codexInstanceId) return "Choose a managed Codex model for this VM workflow.";
+    if (!catalog)
+      return "This VM build has no verified model catalog. Verify its models or choose the managed default before saving.";
+    const selected = catalog.models.find((entry) => entry.slug === model);
+    if (!selected) return "Choose a model supported by this VM build.";
+    const seen = new Set<string>();
+    for (const option of options ?? []) {
+      const descriptor = selected.capabilities?.optionDescriptors?.find(
+        ({ id }) => id === option.id,
+      );
+      if (
+        seen.has(option.id) ||
+        !descriptor ||
+        (descriptor.type === "boolean"
+          ? typeof option.value !== "boolean"
+          : !descriptor.options.some(({ id }) => id === option.value))
+      ) {
+        return "Choose model options supported by this VM build.";
+      }
+      seen.add(option.id);
+    }
+  }
+  return null;
+}
 
 const invalidTarget = () =>
   new WorkflowInvalidError({
@@ -47,8 +111,7 @@ export const validateWorkflowTarget = Effect.fn("WorkflowDispatcher.validateTarg
   repositoryId: string,
   definition: WorkflowDefinition,
 ) {
-  if (definition.target.kind !== "machine")
-    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
+  if (definition.target.kind !== "machine") return yield* vmWorkflowExecutionUnavailable();
   const target = definition.target;
   const machine = yield* (yield* Machines).getActiveByEnvironmentId({
     environmentId: target.environmentId,
@@ -74,8 +137,7 @@ export const lockWorkflowTarget = Effect.fn("WorkflowTarget.lock")(function* (
   repositoryId: string,
   definition: WorkflowDefinition,
 ) {
-  if (definition.target.kind !== "machine")
-    return yield* new WorkflowInvalidError({ message: "VM workflows are not available yet." });
+  if (definition.target.kind !== "machine") return yield* vmWorkflowExecutionUnavailable();
   const target = definition.target;
   const db = yield* RelayDb;
   const [repository] = yield* db

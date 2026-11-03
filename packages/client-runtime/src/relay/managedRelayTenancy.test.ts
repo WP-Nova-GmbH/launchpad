@@ -1016,3 +1016,22 @@ it.effect("keeps legacy catalog capability unknown and retains the legacy array 
     expect(yield* client.listWorkflows(input)).toEqual([]);
   }).pipe(Effect.provide(testLayer(async () => Response.json({ workflows: [] })))),
 );
+
+it.effect("reads verified VM model choices from the repository workflow catalog", () => {
+  const catalog = {
+    workflows: [],
+    vmAuthoring: {
+      models: {
+        defaultModel: "example-codex",
+        models: [
+          { slug: "example-codex", name: "Example Codex", isCustom: false, capabilities: null },
+        ],
+      },
+    },
+  };
+  return Effect.gen(function* () {
+    const client = yield* ManagedRelayTenancyClient;
+    const input = { clerkToken: "token", repositoryId: RelayRepositoryId.make("repo") };
+    expect(yield* client.readWorkflowCatalog(input)).toEqual(catalog);
+  }).pipe(Effect.provide(testLayer(async () => Response.json(catalog))));
+});

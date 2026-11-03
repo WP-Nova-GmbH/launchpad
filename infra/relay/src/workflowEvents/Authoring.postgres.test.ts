@@ -1,10 +1,19 @@
 import { describe, expect, it } from "@effect/vitest";
+import { ProviderInstanceId } from "@t3tools/contracts";
+import { RelayClientPrincipal } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { RelayConfiguration } from "../Config.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
+import { runRepositoryWorkflow, saveRepositoryWorkflow } from "../http/WorkflowsApi.ts";
+import { Workflows, layer as workflows } from "../jobs/Workflows.ts";
+import { layer as machines } from "../machines/Machines.ts";
+import { layer as catalog } from "../projects/OrganizationProjectCatalog.ts";
+import { layer as organizations } from "../tenancy/Organizations.ts";
+import { layer as repositories } from "../tenancy/Repositories.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import * as Layer from "effect/Layer";
 import * as Routing from "./Routing.ts";
 import { RelayDb } from "../db.ts";
@@ -20,6 +29,7 @@ import {
   issue,
   receive,
   counts,
+  definition,
   webhookConfig,
 } from "./test-fixture.ts";
 import { summaries } from "./Summaries.ts";
@@ -197,6 +207,170 @@ const noSummaryIo = Layer.mergeAll(
     dispatchJob: () => Effect.die("Readiness must not probe an executor"),
   }),
 );
+
+const vmInput = {
+  workflowId: "flow",
+  expectedRevision: 0,
+  definition: { ...definition, target: { kind: "vm", baseBranch: "release/1.x" } },
+  archived: false,
+} as const;
+const testVmAuthoring = <A, E, R>(program: Effect.Effect<A, E, R>) =>
+  testDb(
+    program.pipe(
+      Effect.provide([workflows, organizations, repositories, machines, catalog, noSummaryIo]),
+      Effect.provideService(ThreadVmRuntimeConfiguration, { settings: undefined }),
+      Effect.provideService(RelayClientPrincipal, { userId: "maintainer", token: "fixture" }),
+    ),
+  );
+
+describe("VM workflow authoring (PostgreSQL)", () => {
+  it.live("saves without a machine or model catalog and rejects Run before creating a job", () =>
+    testVmAuthoring(
+      Effect.gen(function* () {
+        const store = yield* Workflows;
+        const saved = yield* saveRepositoryWorkflow("repo", vmInput);
+        expect(saved.definition.target).toEqual(vmInput.definition.target);
+        expect(yield* store.get(vmInput.workflowId)).toEqual(saved);
+        expect(
+          yield* Effect.flip(
+            runRepositoryWorkflow("repo", { workflowId: saved.workflowId, instruction: "Test" }),
+          ),
+        ).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: "Running VM workflows is not available yet.",
+        });
+        expect(yield* store.listJobs("repo")).toEqual([]);
+      }),
+    ),
+  );
+
+  for (const operation of ["creating a VM workflow", "switching a VM workflow to Machine"] as const)
+    it.live(`rechecks maintainer access when ${operation} with omitted automation`, () =>
+      testVmAuthoring(
+        Effect.gen(function* () {
+          const store = yield* Workflows;
+          const previous =
+            operation === "switching a VM workflow to Machine"
+              ? yield* saveRepositoryWorkflow("repo", vmInput)
+              : null;
+          if (previous) yield* seed;
+          const input = previous
+            ? { ...vmInput, expectedRevision: previous.revision, definition }
+            : vmInput;
+          const sql = (yield* RelayDb).$client;
+          const error = yield* saveRepositoryWorkflow("repo", input).pipe(
+            Effect.provideService(Workflows, {
+              ...store,
+              save: (...args) =>
+                sql`DELETE FROM relay_repository_access WHERE repository_id='repo' AND user_id='maintainer'`.pipe(
+                  Effect.orDie,
+                  Effect.andThen(store.save(...args)),
+                ),
+            }),
+            Effect.flip,
+          );
+          expect(error).toMatchObject({
+            _tag: "WorkflowInvalidError",
+            message: "Repository maintainer access is required.",
+          });
+          expect(yield* store.get(vmInput.workflowId)).toEqual(previous);
+          if (previous) {
+            const converted = yield* saveRepositoryWorkflow("repo", input).pipe(
+              Effect.provideService(RelayClientPrincipal, { userId: "owner", token: "fixture" }),
+            );
+            expect(converted).toMatchObject({
+              definition,
+              revision: previous.revision + 1,
+              automation: { enabled: false, trigger: null },
+            });
+            expect(yield* store.get(vmInput.workflowId)).toEqual(converted);
+          }
+        }),
+      ),
+    );
+
+  it.live("rejects inherited On but accepts explicit Off plus VM, preserving the trigger", () =>
+    testVmAuthoring(
+      Effect.gen(function* () {
+        yield* seed;
+        const previous = yield* save();
+        const store = yield* Workflows;
+        const input = { ...vmInput, expectedRevision: previous.revision };
+        const message = /Turn off automatic triggering/;
+        expect((yield* Effect.flip(saveRepositoryWorkflow("repo", input))).message).toMatch(
+          message,
+        );
+        expect(
+          (yield* Effect.flip(store.save("org", "repo", input, { userId: "maintainer" }))).message,
+        ).toMatch(message);
+        const off = { enabled: false, trigger };
+        const saved = yield* saveRepositoryWorkflow("repo", { ...input, automation: off });
+        expect(saved.automation).toEqual(off);
+        expect(yield* summaries("repo")).toEqual([
+          { workflowId: saved.workflowId, revision: saved.revision, state: "off", reason: null },
+        ]);
+        expect(
+          yield* Effect.flip(saveRepositoryWorkflow("repo", { ...input, automation: off })),
+        ).toMatchObject({
+          _tag: "WorkflowConflictError",
+        });
+        expect((yield* receive(issue(yield* clock))).status).toBe(200);
+        expect((yield* counts).jobs).toBe(0);
+      }),
+    ),
+  );
+
+  it.live("permits archive and restore of an unchanged VM definition with a stale model", () =>
+    testVmAuthoring(
+      Effect.gen(function* () {
+        const store = yield* Workflows;
+        const stale = {
+          ...vmInput.definition,
+          steps: [
+            {
+              ...definition.steps[0]!,
+              kind: "agent" as const,
+              instruction: "Implement",
+              modelSelection: {
+                instanceId: ProviderInstanceId.make("codex"),
+                model: "previously-verified",
+              },
+            },
+          ],
+        };
+        const saved = yield* store.save(
+          "org",
+          "repo",
+          { ...vmInput, definition: stale },
+          { userId: "maintainer" },
+        );
+        const archive = {
+          ...vmInput,
+          definition: stale,
+          expectedRevision: saved.revision,
+          archived: true,
+        };
+        const archived = yield* saveRepositoryWorkflow("repo", archive);
+        expect(archived.archived).toBe(true);
+        const restore = { ...archive, expectedRevision: archived.revision, archived: false };
+        expect(
+          yield* Effect.flip(
+            saveRepositoryWorkflow("repo", {
+              ...restore,
+              definition: { ...stale, name: "Changed" },
+            }),
+          ),
+        ).toMatchObject({ _tag: "WorkflowInvalidError", message: /managed default/ });
+        expect(yield* saveRepositoryWorkflow("repo", restore)).toMatchObject({
+          archived: false,
+          definition: stale,
+          automation: { enabled: false, trigger: null },
+        });
+      }),
+    ),
+  );
+});
+
 it.live(
   "same-source reconnect restores On after current team delivery without another workflow Save",
   () =>

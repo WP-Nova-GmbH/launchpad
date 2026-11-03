@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { WorkflowOrigin, WorkflowOriginSummary } from "./workflowOrigin.ts";
 import { ModelSelection } from "./orchestration.ts";
+import { ServerProviderModel } from "./server.ts";
 
 const Label = TrimmedNonEmptyString.check(Schema.isMaxLength(120));
 const Instruction = TrimmedNonEmptyString.check(Schema.isMaxLength(32_000));
@@ -512,9 +513,17 @@ export const WorkflowAutomationSummary = Schema.Struct({
   reason: Schema.NullOr(Schema.String),
 });
 export type WorkflowAutomationSummary = typeof WorkflowAutomationSummary.Type;
+
+export const WorkflowVmModelCatalog = Schema.Struct({
+  defaultModel: TrimmedNonEmptyString,
+  models: Schema.Array(ServerProviderModel),
+});
+export type WorkflowVmModelCatalog = typeof WorkflowVmModelCatalog.Type;
+
 export const WorkflowCatalog = Schema.Struct({
   workflows: Schema.Array(RepositoryWorkflow),
   automationSupported: Schema.optional(Schema.Boolean),
   automationSummaries: Schema.optional(Schema.Array(WorkflowAutomationSummary)),
+  vmAuthoring: Schema.optional(Schema.Struct({ models: Schema.NullOr(WorkflowVmModelCatalog) })),
 });
 export type WorkflowCatalog = typeof WorkflowCatalog.Type;

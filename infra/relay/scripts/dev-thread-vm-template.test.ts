@@ -8,6 +8,7 @@ import {
   defaultDevThreadVmTemplatePath,
   loadDevThreadVmRuntimeSettings,
 } from "./dev-thread-vm-template.ts";
+import { workflowVmModelProofPath } from "../src/threads/ThreadVmWorkflowModelProof.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -66,7 +67,10 @@ describe("local VM runner selection", () => {
       expect(settings?.templateBuildId).toBe(selected.buildId);
       expect(settings?.compute.apiUrl).toBe(configured.E2B_API_URL);
       expect(settings?.hostId).toBe(configured.E2B_HOST_ID);
-      expect(paths).toEqual([defaultDevThreadVmTemplatePath]);
+      expect(paths).toEqual([
+        defaultDevThreadVmTemplatePath,
+        workflowVmModelProofPath(defaultDevThreadVmTemplatePath, selected.buildId),
+      ]);
       expect(defaultDevThreadVmTemplatePath).toMatch(/\/infra\/relay\/\.t3\/e2b-template\.json$/u);
     }),
   );
@@ -82,7 +86,10 @@ describe("local VM runner selection", () => {
         },
         FileSystem.makeNoop({
           readFileString: (path) => {
-            expect(path).toBe("/fixture/selected-template.json");
+            expect([
+              "/fixture/selected-template.json",
+              workflowVmModelProofPath("/fixture/selected-template.json", selected.buildId),
+            ]).toContain(path);
             return Effect.succeed(encodeJson(selected));
           },
         }),
@@ -114,7 +121,10 @@ describe("local VM runner selection", () => {
         { ...configured, E2B_TEMPLATE_FILE: " \t " },
         FileSystem.makeNoop({
           readFileString: (path) => {
-            expect(path).toBe(defaultDevThreadVmTemplatePath);
+            expect([
+              defaultDevThreadVmTemplatePath,
+              workflowVmModelProofPath(defaultDevThreadVmTemplatePath, selected.buildId),
+            ]).toContain(path);
             return Effect.succeed(encodeJson(selected));
           },
         }),
@@ -161,6 +171,47 @@ describe("local VM runner selection", () => {
       const settings = yield* load({ ...configured, ...legacy });
       expect(settings?.compute.templateId).toBe(legacy.E2B_TEMPLATE_REF);
       expect(settings?.templateBuildId).toBe(legacy.E2B_TEMPLATE_BUILD_ID);
+    }),
+  );
+
+  it.effect("loads a verified catalog and drops it when the next selected build lacks proof", () =>
+    Effect.gen(function* () {
+      let selection = selected;
+      const catalog = {
+        defaultModel: "gpt-6-astra",
+        models: [{ slug: "gpt-6-astra", name: "GPT-6 Astra", isCustom: false, capabilities: null }],
+      };
+      const receipt = {
+        schemaVersion: 2,
+        templateRef: selected.templateRef,
+        buildId: selected.buildId,
+        catalog,
+      };
+      let proof = encodeJson(receipt);
+      const fs = FileSystem.makeNoop({
+        readFileString: (path) =>
+          path === defaultDevThreadVmTemplatePath
+            ? Effect.succeed(encodeJson(selection))
+            : path === workflowVmModelProofPath(defaultDevThreadVmTemplatePath, selected.buildId)
+              ? Effect.succeed(proof)
+              : Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "FileSystem",
+                    method: "readFileString",
+                  }),
+                ),
+      });
+      const env = { ...configured, E2B_WORKFLOW_MODEL_PROOF: proof };
+      expect((yield* load(env, fs))?.workflowModelCatalog).toEqual(catalog);
+      proof = encodeJson({ ...receipt, schemaVersion: 1 });
+      expect((yield* load(env, fs))?.workflowModelCatalog).toBeUndefined();
+      proof = encodeJson({ ...receipt, templateRef: "runner:build-other" });
+      expect((yield* load(env, fs))?.workflowModelCatalog).toBeUndefined();
+      selection = { ...selected, templateRef: "runner:build-next", buildId: "next-build-id" };
+      const settings = yield* load(env, fs);
+      expect(settings?.compute.templateId).toBe(selection.templateRef);
+      expect(settings?.workflowModelCatalog).toBeUndefined();
     }),
   );
 

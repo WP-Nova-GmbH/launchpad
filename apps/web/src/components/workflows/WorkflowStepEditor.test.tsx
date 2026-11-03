@@ -2,9 +2,13 @@ import { act, createElement, useLayoutEffect, useState, type PropsWithChildren }
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
-import type { WorkflowDefinition, WorkflowStep } from "@t3tools/contracts/workflows";
+import type {
+  WorkflowDefinition,
+  WorkflowStep,
+  WorkflowVmModelCatalog,
+} from "@t3tools/contracts/workflows";
 import { workflowDraftIssue } from "@t3tools/client-runtime/relay/workflow-session";
-import { workflowModelState } from "../settings/workflowModels";
+import { workflowVmCodexInstanceId } from "../settings/workflowModels";
 
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
@@ -15,20 +19,21 @@ vi.mock("../ui/textarea", () => ({
 vi.mock("../ui/select", () => {
   const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
-    Select: component,
+    Select: ({ children, ...props }: PropsWithChildren) =>
+      createElement("div", { ...props, "data-workflow-model-select": true }, children),
     SelectTrigger: component,
     SelectValue: component,
     SelectPopup: component,
     SelectItem: component,
   };
 });
-vi.mock("../../state/environments", () => ({ useEnvironments: () => ({ environments: [] }) }));
+vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
 vi.mock("../../hooks/useSettings", () => ({
   useEnvironmentSettings: () => DEFAULT_UNIFIED_SETTINGS,
 }));
 vi.mock("../../state/entities", () => ({ useProject: () => null }));
 vi.mock("../chat/ProviderModelPicker", () => ({ ProviderModelPicker: () => null }));
-import { WorkflowStepEditor } from "./WorkflowStepEditor";
+import { useWorkflowEditorModels, WorkflowStepEditor } from "./WorkflowStepEditor";
 const original: WorkflowDefinition = {
   name: "Example",
   target: {
@@ -66,13 +71,16 @@ let selectedId = "";
 function Harness({
   initial = original,
   selection = "implement",
+  vmModels = null,
 }: {
   initial?: WorkflowDefinition;
   selection?: string;
+  vmModels?: WorkflowVmModelCatalog | null;
 }) {
   const [steps, change] = useState<ReadonlyArray<WorkflowStep>>(initial.steps);
   const [selected, select] = useState(selection);
   const current = { ...initial, steps };
+  const models = useWorkflowEditorModels(current, vmModels);
   useLayoutEffect(() => {
     definition = current;
     selectedId = selected;
@@ -84,7 +92,8 @@ function Harness({
       select={select}
       change={change}
       move={change}
-      models={workflowModelState(current, [], DEFAULT_UNIFIED_SETTINGS, null, false)}
+      models={models}
+      vmModels={vmModels}
       disabled={false}
       close={() => select("")}
       registerField={() => {}}
@@ -111,6 +120,54 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 describe("Workflow step editing", () => {
+  it("keeps an unavailable VM model visible and allows returning to the managed default", async () => {
+    const current = original.steps[1]!;
+    if (current.kind !== "agent") throw new Error("Expected the Agent step fixture.");
+    await mount({
+      initial: {
+        ...original,
+        target: { kind: "vm", baseBranch: null },
+        steps: [
+          original.steps[0]!,
+          {
+            ...current,
+            modelSelection: { instanceId: workflowVmCodexInstanceId, model: "saved-model" },
+          },
+          original.steps[2]!,
+        ],
+      },
+    });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("saved-model (Unverified)");
+    expect(JSON.stringify(renderer!.toJSON())).toContain(
+      "Select the managed default before saving",
+    );
+    expect(definition.steps[1]).toMatchObject({
+      modelSelection: { instanceId: workflowVmCodexInstanceId, model: "saved-model" },
+    });
+    await click("Use managed default");
+    expect(definition.steps[1]).toMatchObject({ modelSelection: null });
+  });
+
+  it("selects explicit models using the managed Codex instance", async () => {
+    await mount({
+      initial: { ...original, target: { kind: "vm", baseBranch: null } },
+      vmModels: {
+        defaultModel: "verified-model",
+        models: [
+          { name: "Verified model", slug: "verified-model", isCustom: false, capabilities: null },
+        ],
+      },
+    });
+    await act(() =>
+      renderer!.root
+        .findByProps({ "data-workflow-model-select": true })
+        .props.onValueChange("model:verified-model"),
+    );
+    expect(definition.steps[1]).toMatchObject({
+      modelSelection: { instanceId: workflowVmCodexInstanceId, model: "verified-model" },
+    });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Verified model");
+  });
   it("retains the selected identity and explicit rework target after moving an Agent", async () => {
     await mount();
     await click("Move up");

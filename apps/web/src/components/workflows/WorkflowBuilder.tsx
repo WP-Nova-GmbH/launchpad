@@ -8,7 +8,11 @@ import styles from "./workflowEditor.module.css";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflow, WorkflowStep } from "@t3tools/contracts/workflows";
+import type {
+  RepositoryWorkflow,
+  WorkflowCatalog,
+  WorkflowStep,
+} from "@t3tools/contracts/workflows";
 import {
   workflowSessionKey,
   workflowDraftIssue,
@@ -26,11 +30,19 @@ import {
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
+import { Input } from "../ui/input";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 import { WorkflowStepEditor, useWorkflowEditorModels } from "./WorkflowStepEditor";
 import { WorkflowCanvas, workflowInsertionIndex, type WorkflowInsertion } from "./WorkflowCanvas";
 import { Sheet, SheetPopup, SheetTitle } from "../ui/sheet";
-import { Settings2Icon, XIcon, PlayIcon, MonitorIcon, ChevronDownIcon } from "lucide-react";
+import {
+  Settings2Icon,
+  XIcon,
+  PlayIcon,
+  MonitorIcon,
+  CloudIcon,
+  ChevronDownIcon,
+} from "lucide-react";
 
 import {
   useWorkflowDrafts,
@@ -49,6 +61,7 @@ import {
   assertWorkflowSaveSupport,
   matchesWorkflowSave,
   applyWorkflowSaveReceipt,
+  normalizeWorkflowDefinitionForSave,
 } from "./workflowOperations";
 
 const isWorkflowAutomation = Schema.is(WorkflowAutomation);
@@ -59,6 +72,9 @@ type WorkflowBuilderProps = {
   workflowId?: string | undefined;
   isNew: boolean;
   projects: ReadonlyArray<RelayOrganizationProject>;
+  projectsUnavailable?: boolean | undefined;
+  vmAuthoring?: WorkflowCatalog["vmAuthoring"];
+  codexRefreshVersion?: number;
   canConfigure: boolean;
   call: ReturnType<typeof useWorkflowClient>;
   refresh: () => void;
@@ -96,6 +112,9 @@ function WorkflowBuilderEditor({
   workflow,
   isNew,
   projects,
+  projectsUnavailable,
+  vmAuthoring,
+  codexRefreshVersion = 0,
   canConfigure,
   call,
   refresh,
@@ -117,6 +136,37 @@ function WorkflowBuilderEditor({
   const readRequest = useRef<{ draft: WorkflowEditorDraft } | null>(null);
   const [reading, setReading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [codexNotice, setCodexNotice] = useState<string | null>(null);
+  const checkCodex =
+    canConfigure &&
+    !!vmAuthoring &&
+    draft?.definition.target.kind === "vm" &&
+    draft.targetConfirmed;
+  useEffect(() => {
+    if (!checkCodex) return;
+    let active = true;
+    void Promise.resolve()
+      .then(() => call((client, token) => client.getCodexVmConnection({ clerkToken: token })))
+      .then(
+        ({ status }) => {
+          if (active)
+            setCodexNotice(
+              status === "disconnected"
+                ? "Connect Codex before running."
+                : status === "reconnect_required"
+                  ? "Reconnect Codex before running."
+                  : null,
+            );
+        },
+        () => {
+          if (active) setCodexNotice("Could not check the organization's Codex connection.");
+        },
+      );
+    return () => {
+      active = false;
+    };
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Explicit workflow refresh retries the VM status lookup.
+  }, [call, checkCodex, codexRefreshVersion]);
   useEffect(
     () => () => {
       readRequest.current = null;
@@ -126,7 +176,9 @@ function WorkflowBuilderEditor({
   useEffect(() => {
     if (!canConfigure || isDeparting()) return;
     if (isNew) {
-      startNewWorkflowDraft(appAtomRegistry, scope, () => newWorkflowDraft(projects));
+      startNewWorkflowDraft(appAtomRegistry, scope, () =>
+        newWorkflowDraft(projects, "review", !!vmAuthoring),
+      );
       return;
     }
     if (!id || !workflow) return;
@@ -157,7 +209,18 @@ function WorkflowBuilderEditor({
         };
       return state;
     });
-  }, [canConfigure, workflow, isNew, projects, scope, key, id, isDeparting, automationSupported]);
+  }, [
+    canConfigure,
+    workflow,
+    isNew,
+    projects,
+    scope,
+    key,
+    id,
+    isDeparting,
+    automationSupported,
+    vmAuthoring,
+  ]);
   useEffect(() => {
     if (!isNew || !id || !draft?.baseline || !active.current) return;
     const current = appAtomRegistry.get(workflowDraftAtom);
@@ -175,28 +238,27 @@ function WorkflowBuilderEditor({
   }, [isNew, id, draft?.baseline, active, scope, key, navigate]);
   if (!canConfigure)
     return <p>Repository maintainers and organization admins can configure workflows.</p>;
-  if (draft?.definition.target.kind === "vm")
-    return <p>VM workflow editing is not available yet.</p>;
   if (!draft)
     return (
       <p className="text-sm text-muted-foreground">
         {isNew
-          ? "Enroll an organization machine with a checkout of this repository before creating a workflow."
+          ? "Update the relay to create a VM workflow, or enroll an organization machine with a checkout of this repository."
           : "Workflow unavailable."}
       </p>
     );
   const pending = draft.operation?.state === "pending";
-  const archived =
+  const currentSaved =
     workflow && draft.baseline && workflow.revision > draft.baseline.revision
-      ? workflow.archived
-      : !!draft.baseline?.archived;
-  const issue = workflowDraftIssue(draft.definition);
+      ? workflow
+      : draft.baseline;
+  const archived = !!currentSaved?.archived;
+  const issue = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
   const edit = (update: (draft: WorkflowEditorDraft) => WorkflowEditorDraft) =>
     editWorkflowDraft(scope, draft.workflowId, update);
   const save = async () => {
     if (pending) return;
     if (!draft.operation) {
-      const problem = workflowDraftIssue(draft.definition);
+      const problem = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
       if (problem) {
         edit((draft) => ({
           ...draft,
@@ -497,8 +559,12 @@ function WorkflowBuilderEditor({
       onDepart={onDepart}
       draft={draft}
       projects={projects}
+      projectsUnavailable={projectsUnavailable}
+      vmAuthoring={vmAuthoring}
+      codexNotice={checkCodex ? codexNotice : null}
       pending={pending}
       archived={archived}
+      savedVm={currentSaved?.definition.target.kind === "vm"}
       reading={reading}
       notice={notice}
       issue={issue}
@@ -532,8 +598,12 @@ function WorkflowBuilderWorkspace({
   automationReason,
   onDepart,
   projects,
+  projectsUnavailable,
+  vmAuthoring,
+  codexNotice,
   pending,
   archived,
+  savedVm,
   reading,
   notice,
   issue,
@@ -552,8 +622,12 @@ function WorkflowBuilderWorkspace({
   automationReason?: string | null | undefined;
   onDepart: () => void;
   projects: ReadonlyArray<RelayOrganizationProject>;
+  projectsUnavailable: boolean | undefined;
+  vmAuthoring: WorkflowCatalog["vmAuthoring"];
+  codexNotice: string | null;
   pending: boolean;
   archived: boolean;
+  savedVm: boolean;
   reading: boolean;
   notice: string | null;
   issue: ReturnType<typeof workflowDraftIssue>;
@@ -571,8 +645,9 @@ function WorkflowBuilderWorkspace({
   scope: WorkflowScope;
 }) {
   const navigate = useNavigate();
-  const models = useWorkflowEditorModels(draft.definition);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const vm = draft.definition.target.kind === "vm" ? draft.definition.target : null;
+  const models = useWorkflowEditorModels(draft.definition, vmAuthoring?.models);
+  const [settingsOpen, setSettingsOpen] = useState(!!vmAuthoring && !draft.targetConfirmed);
   const triggerOpen = draft.triggerSetup === true;
   const setTriggerOpen = (open: boolean) =>
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
@@ -598,14 +673,17 @@ function WorkflowBuilderWorkspace({
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
   const panelOpen = triggerOpen || settingsOpen || !!selected;
   const machine = draft.definition.target.kind === "machine" ? draft.definition.target : null;
+  const automation = workflowDraftAutomation(draft);
   const target = projects.find(
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
   const targetLabel = draft.targetConfirmed
-    ? target
-      ? `${target.machineLabel} · ${target.title}`
-      : "Saved execution target is unavailable"
+    ? vm
+      ? `VM · ${vm.baseBranch ?? "Repository default"}`
+      : target
+        ? `${target.machineLabel} · ${target.title}`
+        : "Saved execution target is unavailable"
     : "Choose an execution target";
   const registerField = useCallback((field: string, node: HTMLElement | null) => {
     if (node) fields.current.set(field, node);
@@ -749,7 +827,7 @@ function WorkflowBuilderWorkspace({
       await save();
       return;
     }
-    const problem = workflowDraftIssue(draft.definition);
+    const problem = issue;
     if (problem) {
       edit((current) => ({ ...current, error: problem.message }));
       setSettingsOpen(false);
@@ -765,7 +843,14 @@ function WorkflowBuilderWorkspace({
       }));
       return;
     }
-    const automation = workflowDraftAutomation(draft);
+    if (vm && draft.targetConfirmed && automation.enabled) {
+      openTrigger();
+      edit((current) => ({
+        ...current,
+        error: "Turn off automatic triggering to save this workflow with a VM target.",
+      }));
+      return;
+    }
     if (
       automationSupported &&
       (!isWorkflowAutomation(automation) || (automation.enabled && !automation.trigger))
@@ -777,14 +862,24 @@ function WorkflowBuilderWorkspace({
       }));
       return;
     }
-    if (!draft.targetConfirmed || (!target && !draft.baseline)) {
-      select("");
-      setSettingsOpen(true);
+    if (!draft.targetConfirmed || (machine && !target && !draft.baseline) || (vm && !vmAuthoring)) {
+      openSettings();
       edit((current) => ({
         ...current,
-        error: "Choose an available execution target before saving.",
+        error:
+          vm && !vmAuthoring
+            ? "Update the relay to save a VM workflow."
+            : "Choose an available execution target before saving.",
       }));
-      setFocusRequest({ field: "target", stepId: null });
+      setFocusRequest({ field: vmAuthoring && machine ? "checkout" : "target", stepId: null });
+      return;
+    }
+    const modelIssue = vm ? models.issues[0] : undefined;
+    if (modelIssue) {
+      setTriggerOpen(false);
+      setSettingsOpen(false);
+      select(modelIssue.stepId);
+      setFocusRequest({ field: "model", stepId: modelIssue.stepId });
       return;
     }
     setFocusRequest(null);
@@ -795,6 +890,7 @@ function WorkflowBuilderWorkspace({
       scope={scope}
       automation={draft.automation ?? draft.baseline?.automation}
       supported={automationSupported}
+      vmTarget={!!vm && draft.targetConfirmed}
       resolved={workflowDraftAutomationResolved(draft)}
       registerField={registerField}
       disabled={pending || archived}
@@ -820,48 +916,151 @@ function WorkflowBuilderWorkspace({
         <div className="space-y-2">
           <RepositorySourcesButton repositoryId={scope.repositoryId} />
           <p className="text-sm">Execution target</p>
-          <Select
-            value={
-              draft.targetConfirmed && draft.definition.target.kind === "machine"
-                ? `${draft.definition.target.environmentId}:${draft.definition.target.projectId}`
-                : null
-            }
-            onValueChange={(value) => {
-              const next = projects.find(
-                (entry) => `${entry.environmentId}:${entry.projectId}` === value,
-              );
-              if (next)
-                edit((current) => ({
-                  ...current,
-                  targetConfirmed: true,
-                  definition: {
-                    ...current.definition,
-                    target: {
-                      kind: "machine",
-                      environmentId: next.environmentId,
-                      projectId: next.projectId,
-                    },
-                  },
-                }));
-            }}
-          >
-            <SelectTrigger
-              aria-label="Execution target"
-              ref={(node) => registerField("target", node)}
-            >
-              <SelectValue>{targetLabel}</SelectValue>
-            </SelectTrigger>
-            <SelectPopup>
-              {projects.map((project) => (
-                <SelectItem
-                  key={`${project.environmentId}:${project.projectId}`}
-                  value={`${project.environmentId}:${project.projectId}`}
+          {vmAuthoring ? (
+            <>
+              <Select
+                value={machine ? "machine" : draft.targetConfirmed ? "vm" : null}
+                onValueChange={(value) => {
+                  if (value === "vm") {
+                    edit((current) => {
+                      if (workflowDraftAutomation(current).enabled) return current;
+                      const { lastVmTarget, ...draft } = current;
+                      const target = draft.definition.target;
+                      const savedTarget = draft.baseline?.definition.target;
+                      return {
+                        ...draft,
+                        targetConfirmed: true,
+                        error: null,
+                        definition: {
+                          ...draft.definition,
+                          target:
+                            target.kind === "vm"
+                              ? target
+                              : (lastVmTarget ??
+                                (savedTarget?.kind === "vm"
+                                  ? savedTarget
+                                  : { kind: "vm", baseBranch: null })),
+                        },
+                      };
+                    });
+                    return;
+                  }
+                  const project = projects[0];
+                  if (value === "machine" && project)
+                    edit((current) => {
+                      const lastVmTarget = current.definition.target;
+                      if (lastVmTarget.kind === "machine") return current;
+                      return {
+                        ...current,
+                        lastVmTarget,
+                        targetConfirmed: projects.length === 1,
+                        error: null,
+                        definition: {
+                          ...current.definition,
+                          target: {
+                            kind: "machine",
+                            environmentId: project.environmentId,
+                            projectId: project.projectId,
+                          },
+                        },
+                      };
+                    });
+                }}
+              >
+                <SelectTrigger
+                  aria-label="Execution target"
+                  ref={(node) => registerField("target", node)}
                 >
-                  {project.machineLabel} · {project.title}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
+                  <SelectValue>
+                    {machine ? "Machine" : draft.targetConfirmed ? "VM" : "Choose a target"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup>
+                  <SelectItem value="vm" disabled={automation.enabled}>
+                    VM
+                  </SelectItem>
+                  <SelectItem value="machine" disabled={!projects.length && !machine}>
+                    Machine
+                  </SelectItem>
+                </SelectPopup>
+              </Select>
+              {automation.enabled && !vm ? (
+                <p className="text-xs text-muted-foreground">
+                  Turn off automatic triggering before choosing VM.
+                </p>
+              ) : null}
+              {!projects.length ? (
+                <p className="text-xs text-muted-foreground">
+                  {projectsUnavailable
+                    ? "Machine checkouts could not be loaded."
+                    : "Machine requires an enrolled checkout of this repository."}
+                </p>
+              ) : null}
+            </>
+          ) : null}
+          {!vmAuthoring || machine ? (
+            <Select
+              value={
+                draft.targetConfirmed && draft.definition.target.kind === "machine"
+                  ? `${draft.definition.target.environmentId}:${draft.definition.target.projectId}`
+                  : null
+              }
+              onValueChange={(value) => {
+                const next = projects.find(
+                  (entry) => `${entry.environmentId}:${entry.projectId}` === value,
+                );
+                if (next)
+                  edit((current) => ({
+                    ...current,
+                    targetConfirmed: true,
+                    definition: {
+                      ...current.definition,
+                      target: {
+                        kind: "machine",
+                        environmentId: next.environmentId,
+                        projectId: next.projectId,
+                      },
+                    },
+                  }));
+              }}
+            >
+              <SelectTrigger
+                aria-label={vmAuthoring ? "Checkout" : "Execution target"}
+                ref={(node) => registerField(vmAuthoring ? "checkout" : "target", node)}
+              >
+                <SelectValue>
+                  {vmAuthoring && !draft.targetConfirmed ? "Choose a checkout" : targetLabel}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup>
+                {projects.map((project) => (
+                  <SelectItem
+                    key={`${project.environmentId}:${project.projectId}`}
+                    value={`${project.environmentId}:${project.projectId}`}
+                  >
+                    {project.machineLabel} · {project.title}
+                  </SelectItem>
+                ))}
+              </SelectPopup>
+            </Select>
+          ) : null}
+          {vm && draft.targetConfirmed ? (
+            <label className="block space-y-1 text-sm">
+              <span>Base branch</span>
+              <Input
+                ref={(node) => registerField("baseBranch", node)}
+                value={vm.baseBranch ?? ""}
+                placeholder="Repository default"
+                onChange={(event) => {
+                  const baseBranch = event.target.value || null;
+                  edit((current) => ({
+                    ...current,
+                    definition: { ...current.definition, target: { kind: "vm", baseBranch } },
+                  }));
+                }}
+              />
+            </label>
+          ) : null}
         </div>
         <Button type="button" variant="outline" onClick={() => void discard()}>
           Discard changes
@@ -884,6 +1083,7 @@ function WorkflowBuilderWorkspace({
       definition={draft.definition}
       selectedId={selected.id}
       models={models}
+      vmModels={vmAuthoring?.models}
       disabled={pending}
       close={close}
       registerField={(field, node) => registerField(`${selected.id}:${field}`, node)}
@@ -963,7 +1163,7 @@ function WorkflowBuilderWorkspace({
                 />
               }
             >
-              <MonitorIcon />
+              {vm && draft.targetConfirmed ? <CloudIcon /> : <MonitorIcon />}
               <span>{targetLabel}</span>
               <ChevronDownIcon />
             </TooltipTrigger>
@@ -973,9 +1173,10 @@ function WorkflowBuilderWorkspace({
           <Button
             type="button"
             variant="outline"
-            disabled={pending || !draft.baseline || archived}
+            disabled={pending || !draft.baseline || archived || savedVm}
+            aria-describedby={savedVm ? "workflow-vm-run-unavailable" : undefined}
             onClick={() => {
-              if (!pending && draft.baseline && !archived)
+              if (!pending && draft.baseline && !archived && !savedVm)
                 void navigate({
                   to: "/workflows/$repositoryId/$workflowId/run",
                   params: { repositoryId: scope.repositoryId, workflowId: draft.workflowId },
@@ -999,12 +1200,24 @@ function WorkflowBuilderWorkspace({
           </Button>
         </div>
       </div>
-      {draft.error ||
+      {savedVm ||
+      codexNotice ||
+      draft.error ||
       draft.operation?.state === "uncertain" ||
       notice ||
       issue ||
       models.issues.length ? (
         <div className={styles["workflow-editor-notices"]}>
+          {savedVm ? (
+            <p id="workflow-vm-run-unavailable" className="text-sm text-muted-foreground">
+              Running VM workflows is not available yet.
+            </p>
+          ) : null}
+          {codexNotice ? (
+            <p role="status" className="text-sm text-muted-foreground">
+              {codexNotice}
+            </p>
+          ) : null}
           {draft.error || draft.operation?.state === "uncertain" ? (
             <div role="alert" className="space-y-2">
               <p className="text-sm text-destructive">

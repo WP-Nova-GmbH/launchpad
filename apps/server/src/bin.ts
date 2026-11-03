@@ -8,6 +8,7 @@ import {
   threadVmServeCommand,
   threadVmGitCredentialCommand,
   threadVmCodexTokenCommand,
+  threadVmCodexModelPolicyCommand,
 } from "./cli/threadVm.ts";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -91,6 +92,7 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
       threadVmServeCommand,
       threadVmGitCredentialCommand,
       threadVmCodexTokenCommand,
+      threadVmCodexModelPolicyCommand,
       sshHelperCommand,
       themeCommand,
       triageCommand,

@@ -11,6 +11,7 @@
  */
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { useAtomValue } from "@effect/atom-react";
+import { Atom } from "effect/unstable/reactivity";
 import {
   DEFAULT_SERVER_SETTINGS,
   type EnvironmentId,
@@ -379,12 +380,18 @@ export function useLegacySidebarEnabled(): boolean {
   return settingsHydrated && legacySidebarEnabled;
 }
 
+const NO_ENVIRONMENT_SETTINGS = Atom.make(DEFAULT_SERVER_SETTINGS);
+
 /** Read current settings for one environment, merged with client-local preferences. */
 export function useEnvironmentSettings<T = UnifiedSettings>(
-  environmentId: EnvironmentId,
+  environmentId: EnvironmentId | null,
   selector?: (settings: UnifiedSettings) => T,
 ): T {
-  const serverSettings = useAtomValue(serverEnvironment.settingsValueAtom(environmentId));
+  const serverSettings = useAtomValue(
+    environmentId === null
+      ? NO_ENVIRONMENT_SETTINGS
+      : serverEnvironment.settingsValueAtom(environmentId),
+  );
   return useMergedSettings(serverSettings ?? DEFAULT_SERVER_SETTINGS, selector);
 }
 

@@ -9,7 +9,7 @@ import { automation } from "../workflowEvents/Routing.ts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
 import { RelayClientPrincipal } from "@t3tools/contracts/relay";
 import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
 import { Organizations } from "../tenancy/Organizations.ts";
@@ -17,6 +17,8 @@ import { Repositories } from "../tenancy/Repositories.ts";
 import { Machines } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
 import { Workflows } from "../jobs/Workflows.ts";
+import { vmWorkflowDefinitionIssue } from "../jobs/WorkflowTarget.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { saveRepositoryWorkflow } from "./WorkflowsApi.ts";
 const definition: RepositoryWorkflow["definition"] = {
   name: "Workflow",
@@ -81,6 +83,7 @@ describe("manual target validation with explicit automation Off", () => {
           ),
           Layer.succeed(RelayDb, {} as unknown as RelayDb["Service"]),
           Layer.succeed(RelayConfiguration, config),
+          Layer.succeed(ThreadVmRuntimeConfiguration, { settings: undefined }),
           Layer.mock(RelaySecretBox)({}),
           Layer.mock(EnvironmentConnector)({}),
           Layer.mock(Organizations)({
@@ -124,9 +127,72 @@ describe("manual target validation with explicit automation Off", () => {
           Effect.provideService(RelayClientPrincipal, { userId: "maintainer", token: "fixture" }),
           Effect.result,
         );
-        const recovery = mode === "disable" || mode === "archive";
+        const recovery = mode === "disable" || mode === "archive" || mode === "VM";
         expect(result._tag).toBe(recovery ? "Success" : "Failure");
         expect(saves).toBe(recovery ? 1 : 0);
       }),
     );
+});
+
+describe("VM workflow definition checks", () => {
+  it("accepts literal branches and rejects invalid refs and checkout history syntax", () => {
+    for (const branch of [null, "release/1.x", "heads/main", "feat/café"])
+      expect(vmWorkflowDefinitionIssue(branch, definition.steps, null)).toBeNull();
+    for (const branch of [
+      "HEAD",
+      "-topic",
+      "a b",
+      "@{-1}",
+      "a..b",
+      "a//b",
+      "a/.b",
+      "a.lock/b",
+      "a/b.",
+      "a\\b",
+    ])
+      expect(vmWorkflowDefinitionIssue(branch, definition.steps, null)).toMatch(/branch name/);
+  });
+
+  it("accepts only managed models and options verified by the selected VM build", () => {
+    const catalog = {
+      defaultModel: "codex-verified",
+      models: [
+        { slug: "codex-verified", name: "Codex verified", isCustom: false, capabilities: null },
+      ],
+    };
+    const steps = (
+      model: string,
+      instance = "codex",
+      options?: [{ id: string; value: string }],
+    ) => [
+      {
+        kind: "agent" as const,
+        id: "agent",
+        title: "Agent",
+        instruction: "Implement",
+        modelSelection: {
+          instanceId: ProviderInstanceId.make(instance),
+          model,
+          ...(options ? { options } : {}),
+        },
+      },
+    ];
+    expect(vmWorkflowDefinitionIssue(null, steps("codex-verified"), catalog)).toBeNull();
+    expect(
+      vmWorkflowDefinitionIssue(null, steps("codex-verified", "personal-codex"), catalog),
+    ).toMatch(/managed Codex/);
+    expect(vmWorkflowDefinitionIssue(null, steps("codex-verified"), null)).toMatch(
+      /Verify its models or choose the managed default/,
+    );
+    expect(vmWorkflowDefinitionIssue(null, steps("codex-other"), catalog)).toMatch(
+      /model supported/,
+    );
+    expect(
+      vmWorkflowDefinitionIssue(
+        null,
+        steps("codex-verified", "codex", [{ id: "effort", value: "high" }]),
+        catalog,
+      ),
+    ).toMatch(/options supported/);
+  });
 });

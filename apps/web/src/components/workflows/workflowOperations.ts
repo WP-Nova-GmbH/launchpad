@@ -19,6 +19,7 @@ import {
   WorkflowTarget,
   type RepositoryWorkflow,
   type WorkflowCatalog,
+  type WorkflowDefinition,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
 import * as Schema from "effect/Schema";
@@ -57,6 +58,17 @@ type SaveOptions = {
 };
 type SaveOperation = NonNullable<WorkflowEditorDraft["operation"]>;
 const sameWorkflowTarget = Schema.toEquivalence(WorkflowTarget);
+
+export function normalizeWorkflowDefinitionForSave(
+  definition: WorkflowDefinition,
+): WorkflowDefinition {
+  const target = definition.target;
+  if (target.kind !== "vm") return definition;
+  const baseBranch = target.baseBranch?.trim() || null;
+  return baseBranch === target.baseBranch
+    ? definition
+    : { ...definition, target: { ...target, baseBranch } };
+}
 
 export function assertWorkflowSaveSupport(operation: SaveOperation, catalog?: WorkflowCatalog) {
   if (typeof operation.includesAutomation !== "boolean")
@@ -148,7 +160,7 @@ export async function saveWorkflowDraft(
     : {
         requestId: randomUUID(),
         state: "pending" as const,
-        definition: draft.definition,
+        definition: normalizeWorkflowDefinitionForSave(draft.definition),
         automation,
         includesAutomation: automationSupported,
         archived: nextArchived,
@@ -160,6 +172,7 @@ export async function saveWorkflowDraft(
       ...state.editors,
       [key]: {
         ...draft,
+        ...(!previous ? { definition: operation.definition } : {}),
         ...(archived !== undefined
           ? { automation: normalizeWorkflowAutomation(operation.automation) }
           : {}),

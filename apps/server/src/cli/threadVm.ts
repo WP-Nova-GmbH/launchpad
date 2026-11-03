@@ -68,6 +68,7 @@ import {
   ThreadVmEnrollmentInput,
 } from "../relay/ThreadVmEnrollment.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
+import { managedCodexModelProbePolicy } from "../provider/Layers/codexLaunchArgs.ts";
 import { resolveCliAuthConfig, resolveServerConfig } from "./config.ts";
 
 const encodeSetupReceipt = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmSetupReply));
@@ -84,6 +85,16 @@ const encodeWarmReceipt = Schema.encodeEffect(
 );
 const decodeControlJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const isCodexTokenError = Schema.is(ThreadVmCodexTokenError);
+const encodeCodexModelProbePolicy = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      schemaVersion: Schema.Literal(1),
+      defaultModel: Schema.String,
+      modelSlugs: Schema.Array(Schema.String),
+      probeArgs: Schema.Array(Schema.String),
+    }),
+  ),
+);
 
 /** Fixed loopback bridge; stdin contains identity and action, never credentials or shell commands. */
 export const threadVmProviderAuthCommand = Command.make("__thread-vm-provider-auth").pipe(
@@ -473,5 +484,12 @@ export const threadVmCodexTokenCommand = Command.make("__thread-vm-codex-token",
       );
       yield* Console.log(Redacted.value(token));
     }),
+  ),
+);
+
+export const threadVmCodexModelPolicyCommand = Command.make("__thread-vm-codex-model-policy").pipe(
+  Command.unlisted,
+  Command.withHandler(() =>
+    encodeCodexModelProbePolicy(managedCodexModelProbePolicy()).pipe(Effect.flatMap(Console.log)),
   ),
 );

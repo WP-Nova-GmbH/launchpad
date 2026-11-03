@@ -452,6 +452,7 @@ export interface ManagedRelayOrganizationCatalogSnapshot {
   readonly membership: RelayOrganizationMembership;
   readonly repositories: ReadonlyArray<RelayRepositorySummary>;
   readonly projects: ReadonlyArray<RelayOrganizationProject>;
+  readonly projectsUnavailable?: true;
 }
 
 /**
@@ -461,7 +462,11 @@ export interface ManagedRelayOrganizationCatalogSnapshot {
  */
 export function createManagedRelayOrganizationCatalogQueryManager(
   runtime: Atom.AtomRuntime<ManagedRelayTenancy.ManagedRelayTenancyClient>,
-  options?: { readonly staleTimeMs?: number; readonly idleTtlMs?: number },
+  options?: {
+    readonly staleTimeMs?: number;
+    readonly idleTtlMs?: number;
+    readonly allowMissingProjects?: boolean;
+  },
 ) {
   const staleTime = options?.staleTimeMs ?? DEFAULT_STALE_TIME_MS;
   const idleTtl = options?.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
@@ -471,20 +476,42 @@ export function createManagedRelayOrganizationCatalogQueryManager(
         Effect.gen(function* () {
           const clerkToken = yield* requireClerkToken(get, accountId);
           const relay = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
-          return yield* Effect.all(
+          const readProjects = relay
+            .listOrganizationProjects({ clerkToken })
+            .pipe(
+              Effect.map(
+                (
+                  projects,
+                ): Pick<
+                  ManagedRelayOrganizationCatalogSnapshot,
+                  "projects" | "projectsUnavailable"
+                > => ({ projects }),
+              ),
+            );
+          const { membership, repositories, projectCatalog } = yield* Effect.all(
             {
               membership: relay.getOrganization({ clerkToken }),
               repositories: relay.listRepositories({ clerkToken }),
-              projects: relay.listOrganizationProjects({ clerkToken }),
+              projectCatalog: options?.allowMissingProjects
+                ? readProjects.pipe(
+                    Effect.orElseSucceed(() => ({
+                      projects: [],
+                      projectsUnavailable: true as const,
+                    })),
+                  )
+                : readProjects,
             },
             { concurrency: "unbounded" },
           );
+          return { membership, repositories, ...projectCatalog };
         }),
       )
       .pipe(
         Atom.swr({ staleTime, revalidateOnMount: true }),
         Atom.setIdleTTL(idleTtl),
-        Atom.withLabel(`managed-relay:organization-catalog:${accountId}`),
+        Atom.withLabel(
+          `managed-relay:organization-catalog:${accountId}${options?.allowMissingProjects ? ":workflows" : ""}`,
+        ),
       ),
   );
 
