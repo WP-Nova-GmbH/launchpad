@@ -215,13 +215,14 @@ class WorkflowWorkloadTest(unittest.TestCase):
         self.marked = self.stack.enter_context(mock.patch.object(workload, 'workflow_guest', return_value=True))
         self.uid = self.stack.enter_context(mock.patch.object(os, 'getuid', return_value=1000))
         self.identity = self.stack.enter_context(mock.patch.object(workload, 'process_identity', return_value={'startTicks': '42'}))
-        self.launch = ['run-workflow', self.work_id, 'terminal', '--', '/bin/sh', '-c', 'arbitrary argv']
+        self.cwd = '/workspace/project/private'
+        self.launch = ['run-workflow', self.work_id, 'terminal', self.cwd, '--', '/bin/sh', '-c', 'arbitrary argv']
 
     def test_registers_original_pid_in_workflow_cgroup_before_dropping(self):
         with mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute:
             with self.assertRaisesRegex(RuntimeError, 'exec captured'):
                 workload.main(self.launch)
-        execute.assert_called_once_with(workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec', '--', *self.launch[4:]])
+        execute.assert_called_once_with(workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec', *self.launch[3:]])
         self.assertEqual((self.group / 'cgroup.procs').read_text(), str(os.getpid()))
         self.assertEqual(json.loads(self.record.read_text()), {
             'id': self.work_id, 'kind': 'terminal', 'leaderPid': os.getpid(),
@@ -235,6 +236,12 @@ class WorkflowWorkloadTest(unittest.TestCase):
         self.marked.return_value = True
         self.uid.return_value = 10001
         with self.assertRaises(RuntimeError):
+            workload.main(self.launch)
+        self.assertFalse(self.group.exists())
+
+    def test_workflow_rejects_relative_working_directory_before_registration(self):
+        self.launch[3] = 'relative/path'
+        with self.assertRaisesRegex(ValueError, 'Invalid workflow working directory'):
             workload.main(self.launch)
         self.assertFalse(self.group.exists())
 
@@ -280,11 +287,11 @@ class WorkflowWorkloadTest(unittest.TestCase):
             mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
         ):
             with self.assertRaisesRegex(RuntimeError, 'exec captured'):
-                workload.main(['run-workflow', self.work_id, 'provider', '--', 'codex', 'app-server'])
+                workload.main(['run-workflow', self.work_id, 'provider', self.cwd, '--', 'codex', 'app-server'])
         policy.assert_called_once_with()
         execute.assert_called_once_with(
             workload.WORKFLOW_EXEC,
-            [workload.WORKFLOW_EXEC, 'exec-provider', '--', '/pinned/codex', 'app-server'],
+            [workload.WORKFLOW_EXEC, 'exec-provider', self.cwd, '--', '/pinned/codex', 'app-server'],
         )
 
     def test_workflow_checkpoint_reader_uses_fixed_execute_only_python(self):
@@ -297,7 +304,7 @@ class WorkflowWorkloadTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, 'exec captured'):
                 workload.main([
-                    'run-workflow', self.work_id, 'process', '--',
+                    'run-workflow', self.work_id, 'process', self.cwd, '--',
                     '/usr/bin/python3', '-IS', str(workload.CHECKPOINT_READER), 'capture',
                 ])
         policy.assert_called_once_with()
@@ -305,7 +312,7 @@ class WorkflowWorkloadTest(unittest.TestCase):
             mock.call(workload.CHECKPOINT_PYTHON), mock.call(workload.CHECKPOINT_READER),
         ])
         execute.assert_called_once_with(
-            workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec-checkpoint-reader', 'capture'],
+            workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec-checkpoint-reader', self.cwd, 'capture'],
         )
 
     def test_coordinator_launched_workflow_git_uses_fixed_execute_only_binary(self):
@@ -319,12 +326,12 @@ class WorkflowWorkloadTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, 'exec captured'):
                     workload.main([
-                        'run-workflow', digit * 32, 'process', '--', git, 'ls-files', '--others', '-z',
+                        'run-workflow', digit * 32, 'process', self.cwd, '--', git, 'ls-files', '--others', '-z',
                     ])
                 policy.assert_called_once_with()
                 immutable.assert_called_once_with(workload.WORKFLOW_GIT)
                 execute.assert_called_once_with(workload.WORKFLOW_EXEC, [
-                    workload.WORKFLOW_EXEC, 'exec-git', '--', 'ls-files', '--others', '-z',
+                    workload.WORKFLOW_EXEC, 'exec-git', self.cwd, '--', 'ls-files', '--others', '-z',
                 ])
 
     def test_workflow_setup_waits_for_native_ready_before_locking_and_binds_exact_group(self):
@@ -395,7 +402,7 @@ class WorkflowWorkloadTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, 'exec captured'):
                 workload.main([
-                    'run-workflow', self.work_id, 'terminal', '--', str(workload.RESOURCE_MONITOR),
+                    'run-workflow', self.work_id, 'terminal', self.cwd, '--', str(workload.RESOURCE_MONITOR),
                     '--setup-owner-v4', '--script-file-v1', script,
                 ])
         self.assertTrue(json.loads(self.record.read_text())['setupOwner'])
@@ -403,7 +410,7 @@ class WorkflowWorkloadTest(unittest.TestCase):
         policy.assert_called_once_with()
         immutable.assert_called_once_with(workload.WORKFLOW_SETUP_OWNER)
         execute.assert_called_once_with(
-            workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec-setup-owner', script],
+            workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec-setup-owner', self.cwd, script],
         )
 
     def test_workflow_setup_stop_waits_for_owned_cgroup_and_retries_after_reap(self):

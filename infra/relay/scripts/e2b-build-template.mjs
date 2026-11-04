@@ -41,7 +41,7 @@ export async function writeJsonAtomically(path, value, { ifAbsent = false } = {}
   }
 }
 
-export async function prepareTemplateContext(archive, expectedSha256) {
+export async function prepareTemplateContext(archive, expectedSha256, buildTag) {
   if (!/^[a-f0-9]{64}$/.test(expectedSha256))
     throw new Error("A lowercase SHA-256 checksum is required.");
   const context = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "launchpad-template-"));
@@ -59,6 +59,11 @@ export async function prepareTemplateContext(archive, expectedSha256) {
       `${expectedSha256}  server.tar.gz\n`,
       { mode: 0o600 },
     );
+    // The E2B sandbox API returns the template ID, but omits the build ID.
+    await NodeFSP.writeFile(NodePath.join(context, "runner-build-tag"), `${buildTag}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
     for (const file of [
       "workload.py",
       "workflow-exec.c",
@@ -108,7 +113,11 @@ export async function buildTemplate(args, apiKey) {
   );
   if (output === selectionPath)
     throw new Error("The build receipt and selected template must use separate files.");
-  const context = await prepareTemplateContext(args["server-archive"], args["server-sha256"]);
+  const context = await prepareTemplateContext(
+    args["server-archive"],
+    args["server-sha256"],
+    buildTag,
+  );
   try {
     const dockerfile = await NodeFSP.readFile(
       NodePath.join(templateDirectory, "Dockerfile"),

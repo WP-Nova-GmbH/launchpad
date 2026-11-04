@@ -1,4 +1,6 @@
 import { StackActions, useNavigation } from "@react-navigation/native";
+import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { resolveThreadReferenceCopyTarget } from "@t3tools/shared/threadReference";
 import {
   createContext,
@@ -19,9 +21,11 @@ import { useThreadShell } from "../../state/entities";
 import { useRemoteEnvironmentRuntime } from "../../state/use-remote-environment-registry";
 import { resolveWorkflowResultAccess } from "../../state/workflow-result-access";
 import type { GitActionProgress } from "../../state/use-vcs-action-state";
+import { savedWorkflowDiffParams } from "../review/reviewAvailability";
 import { GitActionProgressOverlay } from "../threads/GitActionProgressOverlay";
 import { CommandPalette } from "./CommandPalette";
 import {
+  activeThreadWorkflowOrigin,
   dispatchHardwareKeyboardCommand,
   getHardwareKeyboardCommandRegistrationVersion,
   getRegisteredHardwareKeyboardCommands,
@@ -47,16 +51,22 @@ export function HardwareKeyboardCommandOverlay() {
 export function HardwareKeyboardCommandProvider({
   children,
   pathname,
-}: PropsWithChildren<{ readonly pathname: string }>) {
+  routeParams,
+}: PropsWithChildren<{ readonly pathname: string; readonly routeParams?: object | undefined }>) {
   const navigation = useNavigation();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
   const activeThreadRef = useMemo(() => parseActiveThreadPath(pathname), [pathname]);
+  const accountId = useAtomValue(managedRelaySessionAtom)?.accountId;
+  const workflowOrigin = useMemo(
+    () => activeThreadWorkflowOrigin(activeThreadRef, routeParams, accountId),
+    [activeThreadRef, routeParams, accountId],
+  );
   const activeThread = useThreadShell(activeThreadRef);
   const environment = useRemoteEnvironmentRuntime(activeThreadRef?.environmentId ?? null);
   const { workspaceEnabled } = resolveWorkflowResultAccess(
     environment?.serverConfig?.environment.capabilities ?? null,
-    undefined,
+    workflowOrigin,
     activeThreadRef?.threadId ?? null,
   );
   const copyTarget = useMemo(
@@ -189,7 +199,7 @@ export function HardwareKeyboardCommandProvider({
         return;
       }
 
-      const thread = parseActiveThreadPath(pathname);
+      const thread = activeThreadRef;
       if (!thread) return;
       if (command === "files" && !/\/files(?:\/|$)/.test(pathname)) {
         navigation.navigate("ThreadFiles", thread);
@@ -197,11 +207,22 @@ export function HardwareKeyboardCommandProvider({
       if (command === "terminal" && !/\/terminal(?:\/|$)/.test(pathname)) {
         navigation.navigate("ThreadTerminal", thread);
       }
-      if (command === "review" && !/\/review(?:\/|$)/.test(pathname)) {
-        navigation.navigate("ThreadReview", thread);
+      if (command === "review" && !/\/review(?:[/?#]|$)/.test(pathname)) {
+        navigation.navigate(
+          "ThreadReview",
+          savedWorkflowDiffParams(thread.environmentId, thread.threadId, workflowOrigin),
+        );
       }
     },
-    [activeThreadRef, copyTarget, navigation, pathname, showCopyFeedback, workspaceEnabled],
+    [
+      activeThreadRef,
+      copyTarget,
+      navigation,
+      pathname,
+      showCopyFeedback,
+      workflowOrigin,
+      workspaceEnabled,
+    ],
   );
 
   const palette = useMemo(

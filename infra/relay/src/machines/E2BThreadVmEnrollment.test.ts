@@ -58,6 +58,8 @@ const receipt = {
   threadId: "thread",
   generation: 2,
 };
+const buildTag = "build-00000000-0000-4000-8000-000000000000";
+const workflowBootstrap = { ...bootstrap, templateId: `template:${buildTag}` };
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decode = Schema.decodeUnknownSync(Schema.fromJsonString(RelayThreadVmBootstrap));
 function fixture() {
@@ -74,20 +76,43 @@ describe("non-waking E2B enrollment delivery", () => {
       Effect.gen(function* () {
         sdk.run.mockReset();
         const stdin = vi.fn(async (_bytes: string) => {});
-        sdk.run.mockResolvedValueOnce({
-          sendStdin: stdin,
-          wait: async () => ({ exitCode: 0, stdout: encode(receipt) }),
-        });
+        sdk.run
+          .mockResolvedValueOnce({ exitCode: 0, stdout: `${buildTag}\n` })
+          .mockResolvedValueOnce({
+            sendStdin: stdin,
+            wait: async () => ({ exitCode: 0, stdout: encode(receipt) }),
+          });
         const transport = vi.fn<typeof fetch>(async () => Response.json(info));
         expect(
-          yield* makeE2BThreadVmEnrollment(settings, transport)("sandbox", bootstrap, true),
+          yield* makeE2BThreadVmEnrollment(settings, transport)("sandbox", workflowBootstrap, true),
         ).toEqual(receipt);
-        expect(sdk.run).toHaveBeenCalledWith(
+        expect(sdk.run).toHaveBeenNthCalledWith(
+          1,
+          expect.stringContaining("/opt/launchpad/runner-build-tag"),
+          expect.objectContaining({ user: "root" }),
+        );
+        expect(sdk.run.mock.calls[0]![0]).not.toContain(buildTag);
+        expect(sdk.run).toHaveBeenNthCalledWith(
+          2,
           "/opt/launchpad/bin/launchpad-workload workflow-enroll",
           expect.objectContaining({ user: "root", stdin: true }),
         );
         expect(decode(stdin.mock.calls[0]![0].trim())).toEqual(bootstrap);
       }),
+  );
+  it.effect("withholds enrollment from a sandbox with a missing or different build marker", () =>
+    Effect.gen(function* () {
+      for (const stdout of ["", "build-00000000-0000-4000-8000-000000000001\n"]) {
+        sdk.run.mockReset().mockResolvedValueOnce({ exitCode: 0, stdout });
+        const f = fixture();
+        expect(yield* Effect.flip(f.enroll("sandbox", workflowBootstrap, true))).toMatchObject({
+          _tag: "ThreadVmComputeError",
+          operation: "verify runner",
+        });
+        expect(sdk.run).toHaveBeenCalledTimes(1);
+        expect(f.guest).not.toHaveBeenCalled();
+      }
+    }),
   );
   it.effect(
     "delivers a restored enrollment only to the user CLI after separate trusted bootstrap",

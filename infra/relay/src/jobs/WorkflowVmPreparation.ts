@@ -45,9 +45,11 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
         ? yield* sql<{
             capacityState: string;
             allocationState: string;
+            nativePauseConfirmed: boolean;
             setupPhase: string | null;
             blocker: string | null;
-          }>`SELECT c.state AS "capacityState",a.state AS "allocationState",s.phase AS "setupPhase",
+          }>`SELECT c.state AS "capacityState",a.state AS "allocationState",
+          a.native_paused_generation IS NOT DISTINCT FROM p.generation AS "nativePauseConfirmed",s.phase AS "setupPhase",
           COALESCE(s.error_code,p.error_code) AS blocker
         FROM relay_thread_vm_capacity c
         JOIN relay_thread_vm_provisions p ON p.operation_id=c.operation_id AND p.allocation_id=c.allocation_id
@@ -62,17 +64,26 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
         : [];
     // Setup failure and its deleting fence commit together. Later cancels cannot change that outcome.
     const checkoutFailed = job.startAttempted === false && preparation?.setupPhase === "failed";
+    const operation = row.pendingControl?.response.operation;
+    const acknowledgedCancellation =
+      job.vmCancellationConfirmed === true || job.progress?.status === "cancelling";
+    const cancelPaused =
+      preparation?.allocationState === "paused" &&
+      preparation.capacityState === "released" &&
+      preparation.nativePauseConfirmed &&
+      (acknowledgedCancellation || operation === "cancel" || operation === "retry_cancellation");
     if (
       job.status === "cancelling" &&
       job.runtime?.kind === "vm" &&
-      job.startAttempted === false &&
       !checkoutFailed &&
-      row.pendingControl?.response.operation === "cancel"
+      ((job.startAttempted === false && operation === "cancel") || cancelPaused)
     ) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const authorized =
-            job.vmCancellationConfirmed === true || (yield* store.canSettleVmCancellation(row));
+            (cancelPaused && acknowledgedCancellation) ||
+            job.vmCancellationConfirmed === true ||
+            (yield* store.canSettleVmCancellation(row));
           const [current] = yield* sql`SELECT job_id FROM relay_workflow_jobs
           WHERE job_id=${job.jobId} AND revision=${row.revision} AND lease_until=${expectedLease}
             AND lease_until::timestamptz>clock_timestamp() FOR NO KEY UPDATE`;
@@ -82,7 +93,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
               row,
               {
                 ...job,
-                status: "preparing",
+                status: cancelPaused ? (job.progress?.status ?? "preparing") : "preparing",
                 detail:
                   "Cancellation was withdrawn because the requester no longer has permission.",
                 updatedAt: DateTime.formatIso(yield* DateTime.now),
@@ -94,8 +105,13 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
           WHERE workflow_job_id=${job.jobId} AND generation=1 AND thread_id=${`workflow:${job.jobId}`} FOR NO KEY UPDATE`;
           if (!placement) return job;
-          const [allocation] = yield* sql<{ state: string; computeRef: string | null }>`
-          SELECT state,compute_ref AS "computeRef" FROM relay_thread_vm_allocations
+          const [allocation] = yield* sql<{
+            state: string;
+            computeRef: string | null;
+            nativePausedGeneration: number | null;
+          }>`
+          SELECT state,compute_ref AS "computeRef",native_paused_generation AS "nativePausedGeneration"
+          FROM relay_thread_vm_allocations
           WHERE allocation_id=${job.jobId} AND thread_id=${`workflow:${job.jobId}`}
             AND resource_kind='organization_workflow' FOR UPDATE`;
           const [provision] = yield* sql<{
@@ -103,6 +119,19 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           }>`SELECT phase FROM relay_thread_vm_provisions
           WHERE allocation_id=${job.jobId} AND operation_id=${job.jobId} AND generation=1 FOR UPDATE`;
           if (!allocation || !provision) return job;
+          if (cancelPaused) {
+            if (
+              allocation.state !== "paused" ||
+              allocation.nativePausedGeneration !== 1 ||
+              !allocation.computeRef ||
+              provision.phase !== "created"
+            )
+              return job;
+            const [released] = yield* sql`SELECT operation_id FROM relay_thread_vm_capacity
+              WHERE operation_id=${job.jobId} AND allocation_id=${job.jobId}
+                AND compute_ref=${allocation.computeRef} AND state='released' FOR SHARE`;
+            if (!released) return job;
+          }
           if (
             allocation.state !== "deleted" &&
             provision.phase === "pending" &&
@@ -121,7 +150,10 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
               {
                 ...job,
                 vmCancellationConfirmed: true,
-                detail: "Cleaning up the workflow VM before execution.",
+                ...(cancelPaused ? { queueReason: null } : {}),
+                detail: cancelPaused
+                  ? "Deleting the paused workflow VM to finish cancellation."
+                  : "Cleaning up the workflow VM before execution.",
                 updatedAt: DateTime.formatIso(yield* DateTime.now),
               },
               row.pendingControl,
@@ -149,12 +181,10 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
     if (preparation?.allocationState === "deleted" && preparation.capacityState === "released") {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
-          const operation = row.pendingControl?.response.operation;
           const cancelled =
             !checkoutFailed &&
             job.status === "cancelling" &&
-            (job.vmCancellationConfirmed === true ||
-              job.progress?.status === "cancelling" ||
+            (acknowledgedCancellation ||
               ((operation === "cancel" || operation === "retry_cancellation") &&
                 (yield* store.canSettleVmCancellation(row))));
           const status = cancelled ? "cancelled" : "failed";
@@ -238,6 +268,10 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           code = "vm_waiting_capacity";
           detail = queueReasonText[code];
         }
+      } else if (preparation.blocker === "enrollment_build_mismatch") {
+        code = "target_invalid";
+        detail =
+          "This VM booted an unverified build. Cancel the run and check the selected runner.";
       } else if (preparation.blocker === "setup_access_denied") {
         code = "target_invalid";
         detail =

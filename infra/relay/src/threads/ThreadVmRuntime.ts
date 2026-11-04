@@ -533,7 +533,9 @@ export const reconcileThreadVmLeases = Effect.fn("relay.thread_vm.reconcile_leas
     settings.hostId,
     makeE2BThreadVmCompute(settings.compute),
   );
-  for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) return;
+  for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) break;
+  // A backlog of saved workflow VMs must not consume the running lease budget.
+  for (let index = 0; index < 2; index++) if (!(yield* worker.runOne("paused"))) break;
 });
 
 /** Default-off admission shares final-save safety; each sweep examines at most eight candidates. */

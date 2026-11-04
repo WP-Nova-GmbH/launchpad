@@ -565,7 +565,10 @@ function RootStackLayout(props: {
   const workspaceLocation = workspaceLocationFromState(props.state);
 
   return (
-    <HardwareKeyboardCommandProvider pathname={pathname}>
+    <HardwareKeyboardCommandProvider
+      pathname={pathname}
+      routeParams={props.state.routes[props.state.index]?.params}
+    >
       <ThreadOutboxDrainWorker />
       <ShowcaseCaptureCoordinator pathname={pathname} />
       <ExistingThreadSettingsRouteProvider>

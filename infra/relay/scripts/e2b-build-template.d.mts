@@ -5,7 +5,11 @@ export function writeJsonAtomically(
   value: unknown,
   options?: { ifAbsent?: boolean },
 ): Promise<boolean>;
-export function prepareTemplateContext(archive: string, expectedSha256: string): Promise<string>;
+export function prepareTemplateContext(
+  archive: string,
+  expectedSha256: string,
+  buildTag: string,
+): Promise<string>;
 export function validateBuildTarget(apiUrl: string, name: string): string;
 export function buildTemplate(
   args: {

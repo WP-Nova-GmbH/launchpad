@@ -297,16 +297,13 @@ it.effect("signals workflow PTYs through their registered guest workload", () =>
       rows: 24,
       env: { LD_PRELOAD: "/workspace/project/untrusted.so", PORT: "4000" },
     });
-    const [, args, options] = spawn.mock.calls.at(-1)! as unknown as [
-      string,
-      string[],
-      { env: NodeJS.ProcessEnv },
-    ];
-    assert.deepEqual(args.slice(2), ["terminal", "--", "/bin/bash"]);
+    const [, args, options] = spawn.mock.calls.at(-1)!;
+    assert.deepEqual(args.slice(2), ["terminal", "/workspace/project", "--", "/bin/bash"]);
     assert.equal(args[0], "run-workflow");
-    assert.equal(options.env.LD_PRELOAD, undefined);
-    assert.equal(options.env.PORT, "4000");
-    assert.equal(options.env.HOME, "/home/launchpad-workflow");
+    assert.equal(options.cwd, "/");
+    assert.equal(options.env?.LD_PRELOAD, undefined);
+    assert.equal(options.env?.PORT, "4000");
+    assert.equal(options.env?.HOME, "/home/launchpad-workflow");
     yield* Effect.promise(async () => terminal.kill("SIGTERM"));
     assert.deepEqual(signals, [["signal-workflow", args[1]!, "42", "TERM"]]);
     assert.deepEqual(spawn.mock.results.at(-1)!.value.kill.mock.calls, []);
@@ -322,20 +319,18 @@ it.effect("signals workflow PTYs through their registered guest workload", () =>
       env: { LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN: "supplied-by-workload" },
     };
     const owned = yield* adapter.spawn(ownerInput);
-    const [, ownerArgs, ownerOptions] = spawn.mock.calls.at(-1)! as unknown as [
-      string,
-      string[],
-      { env: NodeJS.ProcessEnv },
-    ];
-    const scriptFile = ownerArgs[7]!;
-    assert.deepEqual(ownerArgs.slice(5), ["--setup-owner-v4", "--script-file-v1", scriptFile]);
+    const [, ownerArgs, ownerOptions] = spawn.mock.calls.at(-1)!;
+    const scriptFile = ownerArgs[8]!;
+    assert.deepEqual(ownerArgs.slice(6), ["--setup-owner-v4", "--script-file-v1", scriptFile]);
+    assert.equal(ownerArgs[3], ownerInput.cwd);
+    assert.equal(ownerOptions.cwd, "/");
     assert.match(scriptFile, /^\/tmp\/launchpad-workflow-setup-[0-9a-f]{32}\.sh$/u);
     assert.equal(
       yield* fs.readFileString(scriptFile),
       `${"x".repeat(192 * 1024)}\nmake setup\nexit 7\n`,
     );
     assert.equal((yield* fs.stat(scriptFile)).mode & 0o777, 0o600);
-    const token = ownerOptions.env.LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN!;
+    const token = ownerOptions.env?.LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN ?? "";
     assert.match(token, /^[0-9a-f]{32}$/u);
     assert.isFalse(ownerArgs.some((arg) => arg.includes(token)));
     const exits: PtyAdapter.PtyExitEvent[] = [];
@@ -354,7 +349,7 @@ it.effect("signals workflow PTYs through their registered guest workload", () =>
 
     let failedScriptFile: string | undefined;
     spawn.mockImplementationOnce((_command, args) => {
-      failedScriptFile = args[7];
+      failedScriptFile = args[8];
       throw new Error("native PTY spawn failed");
     });
     yield* adapter.spawn(ownerInput).pipe(Effect.flip);

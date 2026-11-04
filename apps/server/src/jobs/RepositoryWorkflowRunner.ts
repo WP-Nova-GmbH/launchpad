@@ -50,6 +50,7 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
+import { canContinueWorkflowVmInference } from "../relay/WorkflowVmAttempts.ts";
 import { TextGeneration } from "../textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -142,6 +143,23 @@ const { unknownResult, incompleteResult, stoppedTurn, missingCheckpoint, unconfi
 function canReconcileWorkflowTurn(run: WorkflowRun) {
   const status = run.progress.status;
   return status === "preparing" || status === "running" || canRecoverPausedWorkflowTurn(run);
+}
+
+function canSuperviseWorkflowTurn(run: WorkflowRun, thread: OrchestrationThread | null) {
+  if (run.progress.status === "preparing" || run.progress.status === "running") return true;
+  if (run.runtime.kind !== "vm" || !canRecoverPausedWorkflowTurn(run)) return false;
+  const queue = thread?.promptQueue;
+  const pause = queue?.pauseReason;
+  if (pause?.code !== "delivery-unknown" || !pause.resumeOnConfirmedAttemptId) return false;
+  const attemptId = pause.resumeOnConfirmedAttemptId;
+  const handoff =
+    queue?.handoff?.attemptId === attemptId
+      ? queue.handoff
+      : queue?.admissions.find((admission) => admission.attemptId === attemptId)?.handoff;
+  // The native turn can still request tools while delivery acknowledgement is uncertain.
+  return (
+    handoff?.messageId === workflowPromptId(run) && canContinueWorkflowVmInference(queue, handoff)
+  );
 }
 
 /** Read durable admission, completion and checkpoint evidence; session idle alone is insufficient. */
@@ -480,6 +498,11 @@ export const make = Effect.gen(function* () {
     );
     supervised.set(run.jobId, scope);
   });
+  const detachSupervisor = (jobId: string) => {
+    const scope = supervised.get(jobId);
+    supervised.delete(jobId);
+    return scope;
+  };
   const requireExecution = (run: WorkflowRun) =>
     workflowRunOrigin(run).kind === "automation"
       ? access.requireWorkflowProject({
@@ -1341,7 +1364,11 @@ export const make = Effect.gen(function* () {
     run: WorkflowRun,
     recovering = false,
   ): Effect.fn.Return<WorkflowRun, Error> {
-    if (isTerminalWorkflowJob(run.progress.status)) return run;
+    if (isTerminalWorkflowJob(run.progress.status)) {
+      const scope = detachSupervisor(run.jobId);
+      if (scope) yield* Scope.close(scope, Exit.void);
+      return run;
+    }
     let retry = run.pendingPreparationRetry;
     if (retry && workflowRunOrigin(run).kind === "automation") {
       const receipt = yield* commandReceipts
@@ -1476,7 +1503,13 @@ export const make = Effect.gen(function* () {
         return yield* withExecutionAccess(run, Effect.succeed);
       }
     }
-    if (run.progress.status === "cancelling") run = yield* reconcileCancellation(run, recovering);
+    if (run.progress.status === "cancelling") {
+      if (run.runtime.kind === "vm") {
+        const scope = detachSupervisor(run.jobId);
+        if (scope) yield* Scope.close(scope, Exit.void);
+      }
+      run = yield* reconcileCancellation(run, recovering);
+    }
     const thread = yield* readReconciliationThread(run);
     if (
       run.progress.status === "cancelling" &&
@@ -1597,11 +1630,8 @@ export const make = Effect.gen(function* () {
       next.sequence?.cursor !== run.sequence?.cursor ||
       next.sequence?.generation !== run.sequence?.generation
     ) {
-      const previousScope = supervised.get(run.jobId);
-      if (previousScope) {
-        supervised.delete(run.jobId);
-        yield* Scope.close(previousScope, Exit.void);
-      }
+      const scope = detachSupervisor(run.jobId);
+      if (scope) yield* Scope.close(scope, Exit.void);
     }
     if (!equivalentRuns(next, run)) yield* store.save(next);
     if (
@@ -1656,12 +1686,10 @@ export const make = Effect.gen(function* () {
       });
       next = yield* reconcileApproval(next);
     }
-    if (!["preparing", "running"].includes(next.progress.status)) {
-      const scope = supervised.get(next.jobId);
-      if (scope) {
-        supervised.delete(next.jobId);
-        yield* Scope.close(scope, Exit.void);
-      }
+    const superviseTurn = canSuperviseWorkflowTurn(next, thread);
+    if (!superviseTurn) {
+      const scope = detachSupervisor(next.jobId);
+      if (scope) yield* Scope.close(scope, Exit.void);
     }
     if (
       !next.promptDispatched &&
@@ -1672,7 +1700,7 @@ export const make = Effect.gen(function* () {
           !(yield* store.isExecuting(next.jobId))))
     )
       return (yield* dispatchPrompt(next)) ?? next;
-    if (thread && ["preparing", "running"].includes(next.progress.status)) yield* supervise(next);
+    if (thread && superviseTurn) yield* supervise(next);
     return isTerminalWorkflowJob(next.progress.status) || next.progress.status === "cancelling"
       ? next
       : yield* withExecutionAccess(next, Effect.succeed);

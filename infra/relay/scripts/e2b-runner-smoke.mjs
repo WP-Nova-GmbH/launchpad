@@ -14,6 +14,7 @@ import {
   workflowVmModelProofPath,
 } from "../src/threads/ThreadVmWorkflowModelProof.ts";
 import { writeJsonAtomically } from "./e2b-build-template.mjs";
+import { matchesWorkflowRunnerBuild } from "../src/machines/E2BThreadVmEnrollment.ts";
 const { values } = NodeUtil.parseArgs({
   options: {
     receipt: { type: "string" },
@@ -72,6 +73,10 @@ try {
   });
   sandboxId = vm.sandboxId;
   await save("allocation.json", { proof, sandboxId: vm.sandboxId });
+  if (values["workflow-isolation"]) {
+    stage = "boot-build";
+    NodeAssert.ok(await matchesWorkflowRunnerBuild(vm, receipt.templateRef), "Wrong runner build.");
+  }
   stage = "runner";
   const script = await NodeFSP.readFile(
     new URL("../../e2b/runner-guest-proof.py", import.meta.url),

@@ -297,7 +297,12 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
             ]
           : (input.args ?? []);
       const workload = trackWorkloads
-        ? vmWorkloadCommand(ownedCommand, ownedArgs, "terminal", workflowGuest)
+        ? vmWorkloadCommand(
+            ownedCommand,
+            ownedArgs,
+            "terminal",
+            workflowGuest ? input.cwd : undefined,
+          )
         : null;
       const launch = workload ?? { command: ownedCommand, args: ownedArgs };
       const ptyProcess = yield* Effect.gen(function* () {
@@ -312,7 +317,7 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
         const process = yield* Effect.try({
           try: () =>
             nodePty.spawn(launch.command, launch.args, {
-              cwd: input.cwd,
+              cwd: workflowGuest && input.cwd ? "/" : input.cwd,
               cols: input.cols,
               rows: input.rows,
               env: protectedOwner ? { ...env, LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN: token } : env,

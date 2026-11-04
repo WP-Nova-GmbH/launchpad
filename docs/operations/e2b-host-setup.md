@@ -224,10 +224,13 @@ managed default while an explicit model catalog is unavailable when authoring.
 
 Manual workflow VM runs require credential isolation proof for the selected build and
 `RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true`. Add `--workflow-isolation` to the smoke command to
-verify the installed workflow launcher and its access boundaries in the disposable VM. The smoke
-publishes the isolation proof for that exact build after verification and native VM deletion
-succeed. A model-only check preserves an existing proof for the build. If the existing local proof
-is invalid, remove it before repeating the model check or run the isolation check again.
+verify the installed workflow launcher and its access boundaries in the disposable VM. Rebuild
+the runner with the Launchpad builder before regenerating an older isolation proof. The builder
+bakes a fresh marker into each image. The smoke and workflow enrollment both check that marker
+on the booted VM. The smoke publishes the proof after
+verification and native VM deletion succeed. A model-only check preserves an existing proof for
+the build. If the existing local proof is invalid, remove it before repeating the model check or
+run the isolation check again.
 
 For a deployed test relay with workflow execution enabled, set `E2B_WORKFLOW_MODEL_PROOF` to the
 contents of `workflow-models.json` from the successful isolation check for its selected build.

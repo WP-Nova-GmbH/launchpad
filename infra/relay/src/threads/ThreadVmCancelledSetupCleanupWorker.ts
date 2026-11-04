@@ -3,6 +3,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { SandboxInfo } from "e2b";
 import * as Effect from "effect/Effect";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import {
   makeThreadVmAllocationStore,
   type ThreadVmResourceKind,
@@ -14,7 +15,7 @@ interface CleanupCompute {
   readonly destroy: (sandboxId: string) => Effect.Effect<void, ThreadVmComputeError>;
 }
 
-/** Tear down a known VM after an unactivated setup is cancelled or fails. */
+/** Tear down a known VM after setup failure or an authorized offline cancellation. */
 export function makeThreadVmCancelledSetupCleanupWorker(
   sql: PgClient,
   compute: CleanupCompute,
@@ -46,10 +47,13 @@ export function makeThreadVmCancelledSetupCleanupWorker(
             AND (t.operation_id=p.operation_id OR t.operation_id IS NULL)
             AND EXISTS (SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id
               AND j.organization_id=t.organization_id AND j.repository_id=t.repository_id
-              AND j.record#>>'{runtime,threadId}'=t.thread_id AND j.record->>'startAttempted'='false'
+              AND j.record#>>'{runtime,threadId}'=t.thread_id
               AND (
-                (j.status='cancelling' AND j.record->>'vmCancellationConfirmed'='true')
-                OR (j.status IN ('preparing','cancelling') AND t.operation_id=p.operation_id
+                (j.status='cancelling' AND j.record->>'vmCancellationConfirmed'='true'
+                  AND (j.record->>'startAttempted'='false'
+                    OR (a.native_paused_generation=p.generation AND c.state='released')))
+                OR (j.record->>'startAttempted'='false' AND j.status IN ('preparing','cancelling')
+                  AND t.operation_id=p.operation_id
                   AND EXISTS (SELECT 1 FROM relay_thread_vm_setups s
                     WHERE s.allocation_id=a.allocation_id AND s.environment_id=t.environment_id AND s.phase='failed'))
               ))))
@@ -63,17 +67,17 @@ export function makeThreadVmCancelledSetupCleanupWorker(
       // A missing catalog entry still requires exact native DELETE reconciliation,
       // including after a previous acknowledgement was lost.
       yield* compute.destroy(row.computeRef);
-      yield* sql.withTransaction(
+      const deleted = yield* sql.withTransaction(
         Effect.gen(function* () {
           const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
           WHERE thread_id = ${row.threadId} AND generation = 1 AND
             (operation_id = ${row.operationId} OR (${row.resourceKind === "organization_workflow"} AND operation_id IS NULL))
           FOR UPDATE`;
-          if (!placement) return;
+          if (!placement) return false;
           const [current] = yield* sql<{ computeRef: string | null; state: string }>`
           SELECT compute_ref AS "computeRef", state FROM relay_thread_vm_allocations
           WHERE allocation_id = ${row.allocationId} FOR UPDATE`;
-          if (current?.state !== "deleting" || current.computeRef !== row.computeRef) return;
+          if (current?.state !== "deleting" || current.computeRef !== row.computeRef) return false;
           yield* sql`UPDATE relay_environment_credentials SET revoked_at = COALESCE(revoked_at,
           to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
           WHERE credential_id IN (SELECT credential_id FROM relay_thread_vm_bindings
@@ -85,8 +89,10 @@ export function makeThreadVmCancelledSetupCleanupWorker(
             computeRef: row.computeRef,
             resourceKind: row.resourceKind,
           });
+          return true;
         }),
       );
+      if (deleted && row.resourceKind === "organization_workflow") yield* wakeWorkflows();
     });
     yield* attempt.pipe(Effect.catchTag("ThreadVmComputeError", () => Effect.void));
     return true;

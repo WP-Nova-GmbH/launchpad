@@ -1,5 +1,5 @@
 import { sendThreadVmCommandInput } from "./E2BThreadVmGuestCommand.ts";
-import { inspectE2BThreadVmConnection } from "./E2BThreadVmConnection.ts";
+import { inspectE2BThreadVmConnection, type E2BThreadVmIdentity } from "./E2BThreadVmConnection.ts";
 import { Sandbox } from "e2b";
 import { RelayThreadVmBootstrap, RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
@@ -12,6 +12,23 @@ const decodeReceipt = Schema.decodeUnknownSync(
   Schema.fromJsonString(RelayThreadVmEnrollmentReceipt),
 );
 type Connection = ConstructorParameters<typeof Sandbox>[0];
+
+/** Compare the baked marker without passing the expected identity to the guest. */
+export async function matchesWorkflowRunnerBuild(
+  vm: Pick<Sandbox, "commands">,
+  templateRef: string | undefined,
+  signal?: AbortSignal,
+) {
+  const tag = /^[a-zA-Z0-9][a-zA-Z0-9_-]*:(build-[a-f0-9-]{36})$/u.exec(templateRef ?? "")?.[1];
+  if (!tag) return false;
+  const marker = "/opt/launchpad/runner-build-tag";
+  const result = await vm.commands.run(
+    `if [ ! -L ${marker} ] && [ -f ${marker} ] && [ "$(/usr/bin/stat -c '%u:%g:%a:%h:%s' -- ${marker})" = 0:0:444:1:${tag.length + 1} ]; then /usr/bin/cat -- ${marker}; fi`,
+    { user: "root", timeoutMs: 10_000, ...(signal ? { signal } : {}) },
+  );
+  return result.exitCode === 0 && result.stdout === `${tag}\n`;
+}
+
 type GuestEnroll = (
   connection: Connection,
   payload: Redacted.Redacted<string>,
@@ -45,7 +62,7 @@ export function makeE2BThreadVmEnrollment(
 ) {
   return Effect.fn("relay.thread_vm.deliver_enrollment")(function* (
     sandboxId: string,
-    bootstrap: RelayThreadVmBootstrap,
+    bootstrap: RelayThreadVmBootstrap & E2BThreadVmIdentity,
     workflow?: boolean,
   ) {
     const payload = yield* encodeBootstrap(bootstrap).pipe(
@@ -58,7 +75,7 @@ export function makeE2BThreadVmEnrollment(
           }),
       ),
     );
-    return yield* Effect.tryPromise({
+    const receipt = yield* Effect.tryPromise({
       try: async (signal) => {
         const connection = await inspectE2BThreadVmConnection(
           settings,
@@ -67,6 +84,11 @@ export function makeE2BThreadVmEnrollment(
           transport,
           signal,
         );
+        if (
+          workflow &&
+          !(await matchesWorkflowRunnerBuild(new Sandbox(connection), bootstrap.templateId, signal))
+        )
+          return null;
         const output = await guest(connection, payload, workflow);
         const receipt = decodeReceipt(output.trim());
         if (
@@ -85,5 +107,11 @@ export function makeE2BThreadVmEnrollment(
           message: "VM enrollment is unconfirmed. Retry the same allocation and identity.",
         }),
     });
+    if (!receipt)
+      return yield* new ThreadVmComputeError({
+        operation: "verify runner",
+        message: "The running workflow VM does not match the verified build.",
+      });
+    return receipt;
   });
 }

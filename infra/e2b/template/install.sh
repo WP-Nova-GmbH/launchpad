@@ -64,6 +64,8 @@ cloudflared --version
 # The explicit build context contains only the verified server and image helpers.
 cd /opt/launchpad-package
 sha256sum --check --strict server.sha256
+install -m0444 -o root -g root runner-build-tag /opt/launchpad/runner-build-tag
+rm runner-build-tag
 mkdir -p /opt/launchpad/server
 tar -xzf server.tar.gz --strip-components=1 --no-same-owner -C /opt/launchpad/server
 chmod -R a+rX /opt/launchpad/server

@@ -415,7 +415,10 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     function* (input: {
       allocationId: string;
       claimId: string;
-      errorCode: "enrollment_unconfirmed" | "enrollment_access_denied";
+      errorCode:
+        | "enrollment_unconfirmed"
+        | "enrollment_access_denied"
+        | "enrollment_build_mismatch";
     }) {
       const rows =
         yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = NULL, claim_until = NULL,

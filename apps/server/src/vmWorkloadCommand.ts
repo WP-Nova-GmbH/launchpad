@@ -77,6 +77,9 @@ export const workflowVmGitEnvironment = (env: NodeJS.ProcessEnv | undefined) => 
   SSH_ASKPASS: "",
   SSH_ASKPASS_REQUIRE: "never",
 });
+const absoluteWorkflowCwd = (cwd: string) =>
+  cwd && !cwd.startsWith("/") ? `${process.cwd()}/${cwd}` : cwd;
+
 /** exec preserves stdio, cwd and environment; forked and detached children inherit
  * the kernel group. The group ID is created before the requested command runs.
  */
@@ -84,13 +87,24 @@ export function vmWorkloadCommand(
   command: string,
   args: ReadonlyArray<string>,
   kind: "process" | "provider" | "terminal",
-  isolated = false,
+  workflowCwd?: string,
 ) {
   const workloadId = NodeCrypto.randomBytes(16).toString("hex");
   return {
     workloadId,
     command: helper,
-    args: [isolated ? "run-workflow" : "run", workloadId, kind, "--", command, ...args],
+    args:
+      workflowCwd === undefined
+        ? ["run", workloadId, kind, "--", command, ...args]
+        : [
+            "run-workflow",
+            workloadId,
+            kind,
+            absoluteWorkflowCwd(workflowCwd),
+            "--",
+            command,
+            ...args,
+          ],
     shell: false,
   };
 }
@@ -215,17 +229,24 @@ export function makeVmWorkloadSpawner(
       command.command === helper
         ? command
         : vmWorkloadCommand(command.command, command.args, "process");
-    if ((workflow && !trusted) || launch.args[0] === "run-workflow") {
+    const [action, workloadId, kind] = launch.args;
+    if ((workflow && !trusted) || action === "run-workflow") {
       if (admission) throw new Error("Workflow VM workload admission is sealed");
+      const explicitWorkflowLaunch = action === "run-workflow";
+      const cwd = explicitWorkflowLaunch
+        ? launch.args[3]
+        : absoluteWorkflowCwd(command.options.cwd ?? "");
+      const [separator, executable, ...args] = launch.args.slice(explicitWorkflowLaunch ? 4 : 3);
       if (
-        (launch.args[0] !== "run" && launch.args[0] !== "run-workflow") ||
-        !/^[a-f0-9]{32}$/u.test(launch.args[1] ?? "") ||
-        launch.args[3] !== "--" ||
-        !launch.args[4] ||
+        (action !== "run" && !explicitWorkflowLaunch) ||
+        !/^[a-f0-9]{32}$/u.test(workloadId ?? "") ||
+        cwd === undefined ||
+        (cwd !== "" && !cwd.startsWith("/")) ||
+        separator !== "--" ||
+        !executable ||
         command.options.additionalFds
       )
         throw new Error("Unsupported workflow workload launch");
-      const [, workloadId, kind, , executable, ...args] = launch.args;
       const git = executable === "git" || executable === "/usr/bin/git";
       return ChildProcess.make(
         helper,
@@ -233,12 +254,15 @@ export function makeVmWorkloadSpawner(
           "run-workflow",
           workloadId!,
           kind!,
+          cwd,
           "--",
           executable,
           ...(git ? ["-c", "credential.helper=", ...args] : args),
         ],
         {
           ...command.options,
+          // The coordinator may lack traversal on a workload-owned directory.
+          cwd: cwd ? "/" : undefined,
           env: workflowVmProcessEnvironment(
             git ? workflowVmGitEnvironment(command.options.env) : command.options.env,
           ),
@@ -246,9 +270,9 @@ export function makeVmWorkloadSpawner(
         },
       );
     }
-    if (!admission || launch.args[0] !== "run")
+    if (!admission || action !== "run")
       return ChildProcess.make(helper, launch.args, command.options);
-    const [, workloadId, , separator, ...args] = launch.args;
+    const [, , , separator, ...args] = launch.args;
     if (!workloadId || separator !== "--") throw new Error("Invalid sealed workload launch");
     return ChildProcess.make(
       helper,

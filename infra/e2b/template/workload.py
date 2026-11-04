@@ -746,6 +746,10 @@ def main(args):
             _, boot_id, operation_id, epoch, work_id, separator, *command = args
             identifier(operation_id)
             kind = "transfer"
+        elif workflow:
+            _, work_id, kind, cwd, separator, *command = args
+            if cwd and not os.path.isabs(cwd):
+                raise ValueError('Invalid workflow working directory')
         else:
             _, work_id, kind, separator, *command = args
         identifier(work_id)
@@ -776,23 +780,23 @@ def main(args):
                 **({"setupOwner": True} if setup_owner else {}),
             })
             (group / "cgroup.procs").write_text(str(os.getpid()))
-        # No shell interpolation; cwd, environment, pipes and PTY survive exec.
+        # The native helper enters the requested workflow directory after dropping UID.
         if workflow:
             if setup_owner:
                 require_workflow_dump_policy()
                 require_workflow_executable(immutable(WORKFLOW_SETUP_OWNER))
-                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-setup-owner', command[3]])
+                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-setup-owner', cwd, command[3]])
             if kind == 'process' and command[0] in {'git', '/usr/bin/git'}:
                 require_workflow_dump_policy()
                 require_workflow_executable(immutable(WORKFLOW_GIT))
-                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-git', '--', *command[1:]])
+                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-git', cwd, '--', *command[1:]])
             if kind == 'process' and command[:3] == ['/usr/bin/python3', '-IS', str(CHECKPOINT_READER)]:
                 require_workflow_dump_policy()
                 if len(command) != 4 or command[3] not in {'capture', 'exclude'}:
                     raise RuntimeError('Invalid workflow checkpoint reader launch')
                 require_workflow_executable(immutable(CHECKPOINT_PYTHON))
                 immutable(CHECKPOINT_READER)
-                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-checkpoint-reader', command[3]])
+                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-checkpoint-reader', cwd, command[3]])
             if kind == 'provider':
                 require_workflow_dump_policy()
                 _, executable, _ = workflow_native()
@@ -800,8 +804,8 @@ def main(args):
                     raise RuntimeError('Workflow providers require the packaged native Codex')
                 # No readable shell shim may run as the workload UID before
                 # the execute-only native binary takes over the tracked PID.
-                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-provider', '--', str(executable), *command[1:]])
-            os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec', '--', *command])
+                os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-provider', cwd, '--', str(executable), *command[1:]])
+            os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec', cwd, '--', *command])
         os.execvpe(command[0], command, os.environ)
     if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'verify-workflow-provider-peer', 'workflow-setup-control'} and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, *args])

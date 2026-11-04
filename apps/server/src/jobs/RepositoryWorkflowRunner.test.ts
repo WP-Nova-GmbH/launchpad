@@ -1394,6 +1394,106 @@ const prepareVmWorkflow = Effect.fnUntraced(function* (h: Effect.Success<typeof 
   return { fence, binding, workflowVm, start };
 });
 
+it.effect.each(["live", "restarted", "unrelated-attempt"] as const)(
+  "answers a VM tool request while the current Agent handoff is uncertain (%s)",
+  (mode) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+        yield* fence.activate(binding);
+        assert.equal((yield* runner.handle(start)).outcome, "accepted");
+
+        let current = (yield* Ref.get(h.currentThread))!;
+        const apply = Effect.fnUntraced(function* (
+          command: Parameters<typeof decidePromptQueueCommand>[1],
+        ) {
+          let state: OrchestrationReadModel = { ...createEmptyReadModel(NOW), threads: [current] };
+          for (const event of yield* decidePromptQueueCommand(current, command, false))
+            state = yield* projectEvent(state, { ...event, sequence: state.snapshotSequence + 1 });
+          current = state.threads[0]!;
+        });
+        const [prompt] = yield* h.starts;
+        yield* apply(prompt!);
+        current = {
+          ...current,
+          promptQueue: {
+            ...current.promptQueue!,
+            preparation: { ...current.promptQueue!.preparation!, state: "ready", settled: true },
+          },
+        };
+        const attemptId = CommandId.make("vm-approval-uncertain-handoff");
+        yield* apply({
+          type: "thread.prompt.claim",
+          commandId: attemptId,
+          threadId: binding.threadId,
+          messageId: prompt!.message.messageId,
+          expectedRevision: current.promptQueue!.entries[0]!.revision,
+          expectedControlRevision: current.promptQueue!.revision,
+          createdAt: NOW,
+        });
+        yield* apply({
+          type: "thread.prompt.unknown",
+          commandId: CommandId.make("vm-approval-lost-ack"),
+          threadId: binding.threadId,
+          attemptId,
+          detail: "Native turn acknowledgement was lost",
+          createdAt: NOW,
+        });
+        yield* Ref.set(h.currentThread, current);
+        const status = { ...control("status"), workflowVm };
+        assert.equal((yield* runner.handle(status)).progress?.status, "paused");
+        if (mode === "restarted") {
+          yield* Scope.close(scope, Exit.void);
+          runner = yield* h.newRunner;
+          assert.equal((yield* runner.handle(status)).progress?.status, "paused");
+        }
+        if (mode === "unrelated-attempt") {
+          const queue = current.promptQueue!;
+          const pause = queue.pauseReason;
+          assert(pause?.code === "delivery-unknown");
+          yield* Ref.set(h.currentThread, {
+            ...current,
+            promptQueue: {
+              ...queue,
+              pauseReason: {
+                ...pause,
+                resumeOnConfirmedAttemptId: CommandId.make("other-attempt"),
+              },
+            },
+          });
+          assert.equal((yield* runner.handle(status)).progress?.status, "paused");
+          yield* h.emit(
+            approvalRequested(binding.threadId, "unrelated-approval", "file_read_approval"),
+          );
+          yield* Ref.set(h.currentThread, current);
+          assert.equal((yield* runner.handle(status)).progress?.status, "paused");
+        }
+
+        yield* h.emit(
+          approvalRequested(binding.threadId, "recovering-approval", "file_read_approval"),
+        );
+        const response = yield* h.awaitCommand(
+          (command) =>
+            command.type === "thread.approval.respond" &&
+            command.requestId === "recovering-approval",
+        );
+        assert.include(response, { decision: "accept" });
+        assert.isFalse(
+          (yield* Ref.get(h.commands)).some(
+            (command) =>
+              command.type === "thread.approval.respond" &&
+              command.requestId === "unrelated-approval",
+          ),
+        );
+        assert.lengthOf(yield* h.starts, 1);
+        yield* Scope.close(scope, Exit.void);
+      }),
+    ),
+);
+
 it.effect.each(["escalates", "unavailable"] as const)(
   "declines a VM tool approval when the supervisor %s",
   (outcome) =>

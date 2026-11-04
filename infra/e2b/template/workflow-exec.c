@@ -122,7 +122,7 @@ static int protect_dumpability(void) {
     return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program);
 }
 
-static int exec_workload(char **command, enum workload_kind kind) {
+static int exec_workload(const char *cwd, char **command, enum workload_kind kind) {
     int protected = kind != ordinary;
     if (setgroups(0, NULL) != 0 ||
         setresgid(WORKFLOW_ID, WORKFLOW_ID, WORKFLOW_ID) != 0 ||
@@ -130,8 +130,12 @@ static int exec_workload(char **command, enum workload_kind kind) {
         (protected && prctl(PR_SET_DUMPABLE, 0L, 0L, 0L, 0L) != 0) ||
         prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0 ||
         (protected && protect_dumpability() != 0) ||
-        close_range(kind == setup_owner ? 4 : 3, UINT_MAX, 0) != 0 ||
-        setenv("HOME", WORKFLOW_HOME, 1) != 0 ||
+        close_range(kind == setup_owner ? 4 : 3, UINT_MAX, 0) != 0)
+        return -1;
+    // Resolve and enter the requested directory with only workload privileges.
+    if (*cwd && (*cwd != '/' || chdir(cwd) != 0 || setenv("PWD", cwd, 1) != 0))
+        return -1;
+    if (setenv("HOME", WORKFLOW_HOME, 1) != 0 ||
         setenv("CODEX_HOME", WORKFLOW_HOME "/.codex", 1) != 0 ||
         setenv("USER", "launchpad-workflow", 1) != 0 ||
         setenv("LOGNAME", "launchpad-workflow", 1) != 0 ||
@@ -262,22 +266,22 @@ int main(int argc, char **argv) {
     } else if (getuid() == COORDINATOR_ID && geteuid() == 0 && workflow_enabled()) {
         if (argc == 2 && strcmp(argv[1], "prepare-workspace") == 0 && prepare_workspace() == 0)
             return 0;
-        if (argc >= 4 && strcmp(argv[2], "--") == 0) {
-            if (strcmp(argv[1], "exec") == 0) exec_workload(argv + 3, ordinary);
-            if (strcmp(argv[1], "exec-provider") == 0) exec_workload(argv + 3, provider);
+        if (argc >= 5 && strcmp(argv[3], "--") == 0) {
+            if (strcmp(argv[1], "exec") == 0) exec_workload(argv[2], argv + 4, ordinary);
+            if (strcmp(argv[1], "exec-provider") == 0) exec_workload(argv[2], argv + 4, provider);
         }
-        if (argc == 3 && strcmp(argv[1], "exec-checkpoint-reader") == 0 &&
-            (strcmp(argv[2], "capture") == 0 || strcmp(argv[2], "exclude") == 0)) {
-            char *command[] = {CHECKPOINT_PYTHON, "-IS", CHECKPOINT_READER, argv[2], NULL};
-            exec_workload(command, checkpoint_reader);
+        if (argc == 4 && strcmp(argv[1], "exec-checkpoint-reader") == 0 &&
+            (strcmp(argv[3], "capture") == 0 || strcmp(argv[3], "exclude") == 0)) {
+            char *command[] = {CHECKPOINT_PYTHON, "-IS", CHECKPOINT_READER, argv[3], NULL};
+            exec_workload(argv[2], command, checkpoint_reader);
         }
-        if (argc >= 3 && strcmp(argv[1], "exec-git") == 0 && strcmp(argv[2], "--") == 0) {
-            argv[2] = WORKFLOW_GIT;
-            exec_workload(argv + 2, workflow_git);
+        if (argc >= 4 && strcmp(argv[1], "exec-git") == 0 && strcmp(argv[3], "--") == 0) {
+            argv[3] = WORKFLOW_GIT;
+            exec_workload(argv[2], argv + 3, workflow_git);
         }
-        if (argc == 3 && strcmp(argv[1], "exec-setup-owner") == 0 && open_setup_script(argv[2]) == 0) {
+        if (argc == 4 && strcmp(argv[1], "exec-setup-owner") == 0 && open_setup_script(argv[3]) == 0) {
             char *command[] = {SETUP_OWNER, "--workflow-setup-owner-v4", "--script-fd-v1", NULL};
-            exec_workload(command, setup_owner);
+            exec_workload(argv[2], command, setup_owner);
         }
         if ((argc == 4 && strcmp(argv[1], "provider-identity") == 0) ||
             (argc == 5 && (strcmp(argv[1], "stop-idle-provider") == 0 ||

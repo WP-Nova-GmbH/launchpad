@@ -44,12 +44,14 @@ it.effect("uses the registered workload identity and escalates if the leader sta
           workloadId = command.args[1]!;
           assert.deepEqual(command.args.slice(2), [
             "process",
+            "/workspace/project/private",
             "--",
             "git",
             "-c",
             "credential.helper=",
             "status",
           ]);
+          assert.equal(command.options.cwd, "/");
           assert.equal(command.options.extendEnv, false);
           assert.equal(command.options.env?.GIT_INDEX_FILE, "/tmp/index");
           assert.equal(command.options.env?.GIT_CONFIG_GLOBAL, "/dev/null");
@@ -76,6 +78,7 @@ it.effect("uses the registered workload identity and escalates if the leader sta
     );
     const child = yield* makeVmWorkloadSpawner(raw, true).spawn(
       ChildProcess.make("git", ["status"], {
+        cwd: "/workspace/project/private",
         env: { GIT_INDEX_FILE: "/tmp/index", GIT_CONFIG_PARAMETERS: "test", GH_TOKEN: "test" },
       }),
     );
@@ -92,8 +95,11 @@ it.effect("uses the registered workload identity and escalates if the leader sta
 it.effect("keeps detached workloads when the isolated command leader already exited", () =>
   Effect.gen(function* () {
     let spawns = 0;
-    const raw = ChildProcessSpawner.make(() =>
+    const raw = ChildProcessSpawner.make((command) =>
       Effect.sync(() => {
+        if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipeline.");
+        assert.deepEqual(command.args.slice(2), ["process", "", "--", "/bin/true"]);
+        assert.equal(command.options.cwd, undefined);
         spawns++;
         return handle(42, Effect.succeed(ChildProcessSpawner.ExitCode(0)), Effect.succeed(false));
       }),

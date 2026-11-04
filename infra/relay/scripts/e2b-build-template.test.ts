@@ -534,12 +534,14 @@ describe("E2B runner build inputs", () => {
       await NodeFSP.writeFile(archive, payload);
       await NodeFSP.writeFile(NodePath.join(source, ".env"), "must stay on host");
       const hash = NodeCrypto.createHash("sha256").update(payload).digest("hex");
-      context = await prepareTemplateContext(archive, hash);
+      const buildTag = "build-00000000-0000-4000-8000-000000000000";
+      context = await prepareTemplateContext(archive, hash, buildTag);
       await NodeFSP.writeFile(archive, "replaced after staging");
       expect((await NodeFSP.readdir(context)).sort()).toEqual([
         "activity.py",
         "install.sh",
         "launchpad-workloads.service",
+        "runner-build-tag",
         "server.sha256",
         "server.tar.gz",
         "workflow-checkpoint-reader.py",
@@ -547,13 +549,18 @@ describe("E2B runner build inputs", () => {
         "workload.py",
       ]);
       expect(await NodeFSP.readFile(NodePath.join(context, "server.tar.gz"))).toEqual(payload);
+      expect(await NodeFSP.readFile(NodePath.join(context, "runner-build-tag"), "utf8")).toBe(
+        `${buildTag}\n`,
+      );
       expect(await NodeFSP.readFile(NodePath.join(context, "install.sh"))).toEqual(
         await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
       );
       expect(await NodeFSP.readFile(NodePath.join(context, "server.sha256"), "utf8")).toBe(
         `${hash}  server.tar.gz\n`,
       );
-      await expect(prepareTemplateContext(archive, hash)).rejects.toThrow("does not match");
+      await expect(prepareTemplateContext(archive, hash, buildTag)).rejects.toThrow(
+        "does not match",
+      );
     } finally {
       if (context) await NodeFSP.rm(context, { recursive: true, force: true });
       await NodeFSP.rm(source, { recursive: true, force: true });

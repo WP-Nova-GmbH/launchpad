@@ -115,7 +115,12 @@ export function makeThreadVmEnrollmentWorker(
           ),
       );
     });
-    const defer = (errorCode: "enrollment_unconfirmed" | "enrollment_access_denied") =>
+    const defer = (
+      errorCode:
+        | "enrollment_unconfirmed"
+        | "enrollment_access_denied"
+        | "enrollment_build_mismatch",
+    ) =>
       provisions
         .deferEnrollment({ ...claim, errorCode })
         .pipe(Effect.catchTag("ThreadVmProvisionConflict", () => Effect.void));
@@ -123,7 +128,12 @@ export function makeThreadVmEnrollmentWorker(
       Effect.catchTags({
         RelayTenancyNotFoundError: () => defer("enrollment_access_denied"),
         ThreadVmEnrollmentInvalid: () => defer("enrollment_unconfirmed"),
-        ThreadVmComputeError: () => defer("enrollment_unconfirmed"),
+        ThreadVmComputeError: (error) =>
+          defer(
+            error.operation === "verify runner"
+              ? "enrollment_build_mismatch"
+              : "enrollment_unconfirmed",
+          ),
         SecretBoxError: () => defer("enrollment_unconfirmed"),
         PlatformError: () => defer("enrollment_unconfirmed"),
         RelayInternalError: () => defer("enrollment_unconfirmed"),

@@ -5,6 +5,7 @@ import * as PgClient from "@effect/sql-pg/PgClient";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import { DateTime, Deferred, Effect, Fiber, FileSystem, Layer, Redacted } from "effect";
+import type { SandboxInfo } from "e2b";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeCrypto from "node:crypto";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
@@ -159,6 +160,31 @@ const services = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
   ),
 );
 
+const pausedSandbox = (
+  computeRef: string,
+  allocationId: string,
+  operationId: string,
+  threadId: string,
+): SandboxInfo => ({
+  sandboxId: computeRef,
+  templateId: "template",
+  network: { allowPublicTraffic: false },
+  lifecycle: { onTimeout: "pause", autoResume: false },
+  metadata: {
+    "launchpad.managed": "thread-vm-v1",
+    "launchpad.allocation_id": allocationId,
+    "launchpad.operation_id": operationId,
+    "launchpad.thread_id": threadId,
+    "launchpad.generation": "1",
+  },
+  startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+  endAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+  state: "paused",
+  cpuCount: 2,
+  memoryMB: 4096,
+  envdVersion: "test",
+});
+
 describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Postgres)", () => {
   it.layer(services)((it) => {
     for (const [index, outcome] of [
@@ -169,6 +195,9 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       "stopped-after-cancellation-acknowledged",
       "stopped-after-cancellation-revoked",
       "cancelled",
+      "cancelled-after-native-pause",
+      "cancel-revoked-after-native-pause",
+      "acknowledged-cancel-after-native-pause",
       "stale-build-reserved",
       "stale-template-waiting",
       "stale-build-cancelled",
@@ -630,6 +659,7 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
             expect((yield* advance).status).toBe(checkoutFailed ? "failed" : "cancelled");
             return;
           }
+          yield* sql`UPDATE relay_thread_vm_provisions SET phase='created' WHERE allocation_id=${jobId}`;
           yield* sql`UPDATE relay_thread_vm_capacity SET state='released',compute_ref=${sandboxId} WHERE operation_id=${jobId}`;
           yield* sql`UPDATE relay_thread_vm_allocations SET state='paused',compute_ref=${sandboxId}
           WHERE allocation_id=${jobId}`;
@@ -706,8 +736,15 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
                 yield* sql`DELETE FROM relay_organization_members WHERE organization_id=${organizationId}
                   AND user_id=${ownerUserId}`;
             }
-            yield* sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at='2026'
-            WHERE allocation_id=${jobId}`;
+            // A later definitive 404 after native pause is observed by the lease worker.
+            expect(
+              yield* makeThreadVmLeaseWorker(
+                sql,
+                () => Effect.die("A paused workflow must not renew or wake."),
+                hostId,
+                { inspect: () => Effect.succeed(null) },
+              ).runOne("paused"),
+            ).toBe(true);
             const status =
               acknowledged || outcome === "stopped-while-cancelling" ? "cancelled" : "failed";
             expect(yield* advance).toMatchObject({
@@ -729,42 +766,128 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
             expect((yield* advance).status).toBe(status);
             expect((yield* store.getJob(jobId))?.revision).toBe(settled.revision);
           } else {
-            yield* sql`UPDATE relay_thread_vm_provisions SET phase='created' WHERE allocation_id=${jobId}`;
+            const afterPause = outcome.endsWith("native-pause");
+            const acknowledged = outcome === "acknowledged-cancel-after-native-pause";
+            const revoked = outcome === "cancel-revoked-after-native-pause";
             const before = (yield* store.getJob(jobId))!;
             yield* store.updateJob(
               before,
-              { ...before.record, status: "cancelling" },
               {
-                userId: ownerUserId,
-                response: { operation: "cancel" },
+                ...before.record,
+                status: "cancelling",
+                ...(afterPause
+                  ? {
+                      startAttempted: true,
+                      progress: {
+                        threadId: ThreadId.make(threadId),
+                        revision: 5,
+                        status: acknowledged ? "cancelling" : "awaiting_review",
+                        detail: null,
+                        checkpoint: acknowledged
+                          ? null
+                          : {
+                              checkpointId: "review",
+                              checkpointRef: "refs/checkpoint",
+                              turnId: "turn",
+                              checkpointTurnCount: 1,
+                            },
+                        retryableCancellation: false,
+                      },
+                    }
+                  : {}),
               },
+              acknowledged ? null : { userId: ownerUserId, response: { operation: "cancel" } },
             );
+            const revokeMembership = sql`DELETE FROM relay_organization_members
+              WHERE organization_id=${organizationId} AND user_id=${ownerUserId}`;
+            if (afterPause) {
+              // Older paused rows only gain authority after native identity is verified.
+              expect(yield* advance).toMatchObject({
+                status: "cancelling",
+                queueReason: { code: "environment_offline" },
+              });
+              expect(
+                yield* makeThreadVmLeaseWorker(
+                  sql,
+                  () => Effect.die("A paused workflow must not renew or wake."),
+                  hostId,
+                  {
+                    inspect: () => Effect.succeed(pausedSandbox(sandboxId, jobId, jobId, threadId)),
+                  },
+                ).runOne("paused"),
+              ).toBe(true);
+              if (revoked) {
+                yield* revokeMembership;
+                expect(yield* advance).toMatchObject({
+                  status: "awaiting_review",
+                  detail: expect.stringContaining("no longer has permission"),
+                });
+                expect((yield* store.getJob(jobId))?.pendingControl).toBeNull();
+                expect(yield* makeThreadVmAllocationStore(sql).getAny(jobId)).toMatchObject({
+                  state: "paused",
+                });
+                return;
+              }
+            }
             expect(yield* advance).toMatchObject({
               status: "cancelling",
               vmCancellationConfirmed: true,
             });
-            yield* sql`DELETE FROM relay_organization_members WHERE organization_id=${organizationId}
-            AND user_id=${ownerUserId}`;
+            yield* revokeMembership;
             expect((yield* advance).status).toBe("cancelling");
             const destroys: string[] = [];
+            const retryDelete = outcome === "cancelled-after-native-pause";
+            const matching: SandboxInfo = {
+              ...pausedSandbox(sandboxId, jobId, jobId, threadId),
+              state: "running",
+            };
+            let inspected: SandboxInfo | null = retryDelete
+              ? {
+                  ...matching,
+                  metadata: { ...matching.metadata, "launchpad.generation": "2" },
+                }
+              : null;
+            let acknowledgedDelete = !retryDelete;
             const worker = makeThreadVmCancelledSetupCleanupWorker(
               sql,
               {
                 inspect: (id) =>
                   Effect.sync(() => {
                     expect(id).toBe(sandboxId);
-                    return null;
+                    return inspected;
                   }),
                 destroy: (id) =>
-                  Effect.sync(() => {
+                  Effect.gen(function* () {
                     destroys.push(id);
+                    if (!acknowledgedDelete)
+                      return yield* new ThreadVmComputeError({
+                        operation: "destroy",
+                        message: "Native deletion acknowledgement was lost",
+                      });
                   }),
               },
               hostId,
             );
+            if (retryDelete) {
+              expect(yield* worker.runOne()).toBe(true);
+              expect(destroys).toEqual([]);
+              const retryDue = sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp()-interval '1 second'
+                WHERE allocation_id=${jobId}`;
+              yield* retryDue;
+              // An out-of-band resume does not renew this VM or change its identity.
+              inspected = matching;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(destroys).toEqual([sandboxId]);
+              expect((yield* advance).status).toBe("cancelling");
+              expect(yield* first.capacity.get(jobId)).toMatchObject({ state: "released" });
+              yield* retryDue;
+              inspected = null;
+              acknowledgedDelete = true;
+            }
             expect(yield* worker.runOne()).toBe(true);
-            expect(destroys).toEqual([sandboxId]);
+            expect(destroys).toEqual(retryDelete ? [sandboxId, sandboxId] : [sandboxId]);
             expect((yield* advance).status).toBe("cancelled");
+            expect(yield* first.capacity.get(jobId)).toMatchObject({ state: "released" });
           }
         }).pipe(Effect.provide(workflows)),
       );
@@ -980,25 +1103,7 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
                 Effect.succeed(
                   nativeState === "deleted"
                     ? null
-                    : {
-                        sandboxId: computeRef,
-                        templateId: "template",
-                        network: { allowPublicTraffic: false },
-                        lifecycle: { onTimeout: "pause", autoResume: false },
-                        metadata: {
-                          "launchpad.managed": "thread-vm-v1",
-                          "launchpad.allocation_id": f.allocationId,
-                          "launchpad.operation_id": f.operationId,
-                          "launchpad.thread_id": f.threadId,
-                          "launchpad.generation": "1",
-                        },
-                        startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
-                        endAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
-                        state: "paused",
-                        cpuCount: 2,
-                        memoryMB: 4096,
-                        envdVersion: "test",
-                      },
+                    : pausedSandbox(computeRef, f.allocationId, f.operationId, f.threadId),
                 ),
             },
           );
@@ -1007,6 +1112,28 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect((yield* makeThreadVmAllocationStore(f.sql).getAny(f.allocationId))?.state).toBe(
             nativeState,
           );
+          if (nativeState === "paused") {
+            yield* f.sql`UPDATE relay_thread_vm_leases SET attempted_at=clock_timestamp()-interval '2 minutes'
+              WHERE allocation_id=${f.allocationId}`;
+            expect(
+              yield* makeThreadVmLeaseWorker(
+                f.sql,
+                () => Effect.die("A paused workflow must not renew or wake."),
+                f.hostId,
+                {
+                  inspect: () =>
+                    Effect.succeed(
+                      pausedSandbox(computeRef, f.allocationId, f.operationId, f.threadId),
+                    ),
+                },
+              ).runOne("paused"),
+            ).toBe(true);
+            expect((yield* f.capacity.get(f.operationId))?.state).toBe("released");
+            expect(yield* makeThreadVmAllocationStore(f.sql).getAny(f.allocationId)).toMatchObject({
+              state: "paused",
+              computeRef,
+            });
+          }
         }),
       );
     }

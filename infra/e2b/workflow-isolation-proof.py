@@ -155,6 +155,7 @@ def workload_probe(pid, credential_fd, work_id, target, *hosts):
     assert os.environ.get("CODEX_HOME") == "/home/launchpad-workflow/.codex"
     assert "T3CODE_HOME" not in os.environ and "LAUNCHPAD_WORKFLOW_GUEST" not in os.environ
     assert Path.cwd() == CHECKOUT
+    assert os.environ["PWD"] == str(CHECKOUT)
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
     assert status["NoNewPrivs"].strip() == "1"
     assert all(int(status[name].strip(), 16) == 0 for name in ("CapPrm", "CapEff", "CapAmb"))
@@ -219,10 +220,10 @@ signal.pause()
         for kind in ("process", "terminal"):
             work_id = uuid.uuid4().hex
             process = subprocess.Popen(
-                [WORKLOAD, "run-workflow", work_id, kind, "--",
+                [WORKLOAD, "run-workflow", work_id, kind, str(CHECKOUT), "--",
                  "/usr/bin/python3", "-c", fixture],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                cwd=CHECKOUT, text=True, user=1000, group=1000, extra_groups=[],
+                cwd="/", text=True, user=1000, group=1000, extra_groups=[],
             )
             launched.append((work_id, process))
         (provider, first), (terminal, second) = launched
@@ -264,7 +265,7 @@ signal.pause()
 
 def workload_command(kind, *command):
     work_id = uuid.uuid4().hex
-    return work_id, [WORKLOAD, "run-workflow", work_id, kind, "--", *command]
+    return work_id, [WORKLOAD, "run-workflow", work_id, kind, str(CHECKOUT), "--", *command]
 
 
 def prove_setup_owner():
@@ -286,6 +287,7 @@ else:
 """
     script = '\n'.join([
         '#' + 'x' * (192 * 1024),
+        'test "$PWD" = ' + shlex.quote(str(CHECKOUT)) + ' || exit 90',
         'test -z "${LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN+x}" || exit 91',
         'IFS= read -r input && test "$input" = "from the PTY" || exit 93',
         'printf "__T3_SETUP_DONE___forged:0\\n"',
@@ -308,7 +310,7 @@ else:
         raise
     if pid == 0:
         try:
-            os.chdir(CHECKOUT)
+            os.chdir("/")
             os.setgroups([])
             os.setgid(1000)
             os.setuid(1000)
@@ -348,7 +350,7 @@ with socket.socket(socket.AF_UNIX) as peer:
     except (ConnectionResetError, BrokenPipeError, PermissionError):
         pass
 """, str(pid))
-        run(spoof, cwd=CHECKOUT, user=1000, group=1000, extra_groups=[])
+        run(spoof, cwd="/", user=1000, group=1000, extra_groups=[])
         receipt = control("arm", identity)
         assert receipt["launch"]["selectedShell"] == "/bin/bash" and receipt["identity"] == identity
         os.write(terminal, b"from the PTY\n")
@@ -386,7 +388,7 @@ def prove_private_checkpoint_reader():
     ]
     git_info = WORKFLOW_GIT.stat()
     assert (git_info.st_uid, git_info.st_gid, stat.S_IMODE(git_info.st_mode)) == (0, 1000, 0o751)
-    options = dict(cwd=CHECKOUT, user=1000, group=1000, extra_groups=[])
+    options = dict(cwd="/", user=1000, group=1000, extra_groups=[])
     _, setup = workload_command("process", "/usr/bin/python3", "-c", """
 from pathlib import Path
 import os
@@ -400,7 +402,7 @@ Path('ignored').touch()
 """)
     run(setup, **options)
     for path in ("private/proof.txt", ".git/info/exclude"):
-        denied_read = subprocess.run(["/usr/bin/cat", path], capture_output=True, **options)
+        denied_read = subprocess.run(["/usr/bin/cat", str(CHECKOUT / path)], capture_output=True, **options)
         assert denied_read.returncode != 0, "Coordinator could read private workload data"
 
     def read(action, data=b""):
@@ -420,7 +422,7 @@ Path('ignored').touch()
 
 
 def prove_native_codex_peer():
-    options = dict(cwd=CHECKOUT, user=1000, group=1000, extra_groups=[])
+    options = dict(cwd="/", user=1000, group=1000, extra_groups=[])
     permit = uuid.uuid4().hex
     recognized = threading.Event()
     rejected_plugin = threading.Event()
@@ -581,6 +583,12 @@ def proof():
     workspace_info = CHECKOUT.stat()
     assert (workspace_info.st_uid, workspace_info.st_gid) == (10001, 1000)
     assert stat.S_IMODE(workspace_info.st_mode) == 0o2770
+    # A setup script may make its checkout private. From here, every workload
+    # below must enter it after changing to the workflow UID.
+    _, make_private = workload_command("process", "/usr/bin/chmod", "0700", ".")
+    run([*COORDINATOR, *make_private], cwd="/")
+    cannot_enter = subprocess.run([*COORDINATOR, "/usr/bin/test", "-x", str(CHECKOUT)], timeout=10)
+    assert cannot_enter.returncode == 1, "The checkout is still traversable by the coordinator"
     target = Path("/run") / ("workflow-isolation-envd-" + uuid.uuid4().hex)
     hosts = {"127.0.0.1", "::1", *run(["/bin/hostname", "-I"]).stdout.split()}
     # Keep a real coordinator-UID process with live credentials to probe. The
@@ -595,14 +603,14 @@ def proof():
             pid, fd = wait_for_line(coordinator)
             assert Path(f"/proc/{pid}").stat().st_uid == 1000
             work_id = uuid.uuid4().hex
-            options = dict(cwd=CHECKOUT, user=1000, group=1000, extra_groups=[], env={
+            options = dict(cwd="/", user=1000, group=1000, extra_groups=[], env={
                 **os.environ,
                 "T3CODE_HOME": "/home/user/.launchpad",
                 "CODEX_HOME": "/home/user/.codex",
                 "LAUNCHPAD_WORKFLOW_GUEST": "1",
             })
             try:
-                result = run([WORKLOAD, "run-workflow", work_id, "process", "--",
+                result = run([WORKLOAD, "run-workflow", work_id, "process", str(CHECKOUT), "--",
                               "/usr/bin/python3", "-", pid, fd, work_id, str(target),
                               *sorted(hosts)], input=Path(__file__).read_text(), **options)
             except subprocess.CalledProcessError as error:
