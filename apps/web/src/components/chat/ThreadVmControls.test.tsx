@@ -67,12 +67,13 @@ const fixture = vi.hoisted(() => ({
   signedIn: false,
   session: { accountId: "owner" },
   checkLocation: vi.fn(),
+  openThread: vi.fn(),
   location: null as {
     placement?: RelayPortableThreadPlacement;
     recoveryRequested: boolean;
     isPending: boolean;
     movePending: boolean;
-    destination: null;
+    destination: { environmentId: string; generation: number } | null;
     error: string | null;
   } | null,
   readMove: vi.fn(),
@@ -116,7 +117,9 @@ vi.mock("../../state/use-atom-command", () => ({
             ? fixture.checkLocation
             : command === "enqueue"
               ? fixture.enqueue
-              : vi.fn(),
+              : command === "open"
+                ? fixture.openThread
+                : vi.fn(),
 }));
 vi.mock("../../state/threads", async () => {
   const { deriveThreadVmProviderAuthDialog, threadVmPresentation } =
@@ -527,6 +530,32 @@ async function openConfirmation(kind: "reset" | "delete" | "backup", chat = fals
 }
 
 describe("simplified VM controls", () => {
+  it("does not reopen the same destination or show a second notice while opening a moved thread", async () => {
+    fixture.signedIn = true;
+    fixture.location = {
+      recoveryRequested: false,
+      isPending: false,
+      movePending: false,
+      destination: { environmentId: env, generation: 3 },
+      error: null,
+    };
+
+    await act(async () => {
+      renderer = create(
+        <CurrentThreadLocation
+          environmentId={env}
+          threadId={thread}
+          recoverUnavailable
+          observeOnly
+        />,
+      );
+    });
+
+    expect(renderer!.root.findAllByType("section")).toHaveLength(0);
+    expect(fixture.openThread).not.toHaveBeenCalled();
+    expect(fixture.navigate).not.toHaveBeenCalled();
+  });
+
   it("shows a real location retry as checking, then lets the user retry a failed check", async () => {
     fixture.signedIn = true;
     fixture.location = {

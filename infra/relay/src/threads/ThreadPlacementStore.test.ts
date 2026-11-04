@@ -37,7 +37,10 @@ import { threadArtifactsApi } from "../http/ThreadArtifactsApi.ts";
 import { RELAY_HTTP_ROUTER_CONFIG } from "../http/Api.ts";
 import { uploadPortableThreadArtifact } from "../http/ThreadArtifactsApi.ts";
 import { recoverThreadVmEndpoint, releaseThreadVmEndpoint } from "../http/ThreadEnvironmentApi.ts";
-import { ManagedEndpointProvider } from "../environments/ManagedEndpointProvider.ts";
+import {
+  ManagedEndpointProvider,
+  ManagedEndpointProvisioningFailed,
+} from "../environments/ManagedEndpointProvider.ts";
 import {
   ManagedEndpointAllocations,
   make as makeManagedEndpointAllocations,
@@ -2249,7 +2252,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
     const encodeInitialReceipt = Schema.encodeEffect(
       Schema.fromJsonString(RelayThreadVmSetupReceipt),
     );
-    const initialSetupFixture = Effect.gen(function* () {
+    const makeInitialSetupFixture = Effect.fnUntraced(function* (hostId?: string) {
       const sql = yield* PgClient.PgClient;
       const setup = makeThreadVmSetupStore(sql);
       const input = {
@@ -2258,7 +2261,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         organizationId: NodeCrypto.randomUUID(),
         repositoryId: NodeCrypto.randomUUID(),
         ownerUserId: NodeCrypto.randomUUID(),
-        hostId: NodeCrypto.randomUUID(),
+        hostId: hostId ?? NodeCrypto.randomUUID(),
         canonicalKey: `github.com/acme/project-${NodeCrypto.randomUUID()}`,
         branch: "main",
         revision: "a".repeat(40),
@@ -2328,13 +2331,19 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         owner: { environmentId, threadId: input.threadId, generation: 1 },
       };
     });
+    const initialSetupFixture = makeInitialSetupFixture();
 
-    it.effect("releases a cancelled first setup only after a matching physical stop receipt", () =>
+    it.effect("rotates past blocked setup cleanup and releases only confirmed deletions", () =>
       Effect.gen(function* () {
         const f = yield* initialSetupFixture;
+        const next = yield* makeInitialSetupFixture(f.input.hostId);
+        const capacity = makeThreadVmCapacityStore(f.sql);
+        yield* capacity.configure(f.input.hostId, 2);
         yield* f.prepare;
+        yield* next.prepare;
         const allocations = makeThreadVmAllocationStore(f.sql);
         const allocation = (yield* allocations.get(f.input.allocationId))!;
+        const nextComputeRef = (yield* allocations.get(next.input.allocationId))!.computeRef!;
         const cancel = (userId: string) =>
           cancelInitialThreadVmSetup(f.input.threadId).pipe(
             Effect.provideService(RelayClientPrincipal, { userId, token: "test" }),
@@ -2350,6 +2359,14 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           allocationId: f.input.allocationId,
           status: "pending_cleanup",
         });
+        yield* cancelInitialThreadVmSetup(next.input.threadId).pipe(
+          Effect.provideService(RelayClientPrincipal, {
+            userId: next.input.ownerUserId,
+            token: "test",
+          }),
+        );
+        const retryNow = f.sql`UPDATE relay_thread_vm_provisions SET retry_at = clock_timestamp()
+          WHERE allocation_id = ${f.input.allocationId}`;
         const info: SandboxInfo = {
           sandboxId: allocation.computeRef!,
           templateId: f.input.templateId,
@@ -2367,45 +2384,66 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           memoryMB: 4096,
           envdVersion: "test",
         };
-        let stops = 0;
+        const inspections: string[] = [];
+        const stops: string[] = [];
+        let loseAcknowledgement = true;
         let validIdentity = false;
         const worker = makeThreadVmCancelledSetupCleanupWorker(
           f.sql,
           {
-            inspect: () =>
-              Effect.succeed({
-                ...info,
-                metadata: {
-                  ...info.metadata,
-                  "launchpad.thread_id": validIdentity ? f.input.threadId : "another-thread",
-                },
+            inspect: (id) =>
+              Effect.sync(() => {
+                inspections.push(id);
+                if (id === nextComputeRef) return null;
+                return {
+                  ...info,
+                  metadata: {
+                    ...info.metadata,
+                    "launchpad.thread_id": validIdentity ? f.input.threadId : "another-thread",
+                  },
+                };
               }),
-            destroy: () =>
+            destroy: (id) =>
               Effect.gen(function* () {
-                stops++;
-                if (stops === 1)
+                stops.push(id);
+                if (id === info.sandboxId && loseAcknowledgement) {
+                  loseAcknowledgement = false;
                   return yield* new ThreadVmComputeError({
                     operation: "destroy",
                     message: "Physical stop reply was lost",
                   });
+                }
               }),
           },
           f.input.hostId,
         );
         expect(yield* worker.runOne()).toBe(true);
-        expect(stops).toBe(0);
+        expect(inspections).toEqual([info.sandboxId]);
+        expect(stops).toEqual([]);
+        // Even when the first retry comes due again, untouched work takes precedence.
+        yield* retryNow;
+        expect(yield* worker.runOne()).toBe(true);
+        expect(stops).toEqual([nextComputeRef]);
+        expect((yield* capacity.get(next.input.allocationId))?.state).toBe("released");
+        expect((yield* capacity.get(f.input.allocationId))?.state).toBe("started");
+
         validIdentity = true;
+        yield* f.sql`UPDATE relay_thread_vm_provisions
+          SET claim_id = 'fixture-setup', claim_until = clock_timestamp() + interval '1 day'
+          WHERE allocation_id = ${f.input.allocationId}`;
+        expect(yield* worker.runOne()).toBe(false);
+        yield* f.sql`UPDATE relay_thread_vm_provisions SET claim_until = clock_timestamp()
+          WHERE allocation_id = ${f.input.allocationId}`;
         expect(yield* worker.runOne()).toBe(true);
+        expect(stops).toEqual([nextComputeRef, info.sandboxId]);
         expect((yield* allocations.get(f.input.allocationId))?.state).toBe("deleting");
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.input.allocationId))?.state).toBe(
-          "started",
-        );
+        expect((yield* capacity.get(f.input.allocationId))?.state).toBe("started");
+        expect(yield* worker.runOne()).toBe(false);
+        yield* retryNow;
         expect(yield* worker.runOne()).toBe(true);
-        expect(stops).toBe(2);
+        expect(stops).toEqual([nextComputeRef, info.sandboxId, info.sandboxId]);
         expect((yield* allocations.get(f.input.allocationId))?.state).toBe("deleted");
-        expect((yield* makeThreadVmCapacityStore(f.sql).get(f.input.allocationId))?.state).toBe(
-          "released",
-        );
+        expect((yield* capacity.get(f.input.allocationId))?.state).toBe("released");
         const [credential] = yield* f.sql<{
           revoked: boolean;
         }>`SELECT revoked_at IS NOT NULL AS revoked
@@ -3857,7 +3895,8 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           };
           const expectedOwner = `thread-vm:${f.input.allocationId}`;
           let provisions = 0,
-            revoke = false;
+            revoke = false,
+            providerUnavailable = false;
           const releases: string[] = [];
           const endpoint = {
             providerKind: "cloudflare_tunnel" as const,
@@ -3873,6 +3912,12 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
                   environmentId: f.environmentId,
                   origin: { localHttpHost: "127.0.0.1", localHttpPort: 3773 },
                 });
+                if (providerUnavailable)
+                  return yield* new ManagedEndpointProvisioningFailed({
+                    stage: "ensure-tunnel",
+                    userId: input.userId,
+                    environmentId: input.environmentId,
+                  });
                 if (revoke)
                   yield* f.sql`DELETE FROM relay_organization_members WHERE organization_id = ${f.input.organizationId} AND user_id = ${f.input.ownerUserId}`.pipe(
                     Effect.orDie,
@@ -3902,7 +3947,9 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               Effect.provideService(ManagedEndpointProvider, provider),
               Effect.provideService(RelayEnvironmentPrincipal, principal),
             );
-          yield* provide(recoverThreadVmEndpoint(f.owner)).pipe(Effect.flip);
+          const recover = provide(recoverThreadVmEndpoint(f.owner));
+          const notFound = { _tag: "RelayTenancyNotFoundError", reason: "thread_not_found" };
+          expect(yield* Effect.flip(recover)).toMatchObject(notFound);
           expect(provisions).toBe(0);
           yield* f.setup.begin({
             allocationId: f.input.allocationId,
@@ -3913,14 +3960,30 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             environmentId: f.environmentId,
             receiptSha256: "a".repeat(64),
           });
-          const result = yield* provide(recoverThreadVmEndpoint(f.owner));
+          // Ownership can already point to the VM while the move still awaits activation.
+          yield* f.sql`UPDATE relay_thread_placements SET operation_id=${f.input.allocationId}
+            WHERE thread_id=${f.input.threadId}`;
+          expect(yield* Effect.flip(recover)).toMatchObject(notFound);
+          expect(provisions).toBe(0);
+          yield* f.sql`UPDATE relay_thread_placements SET operation_id=NULL
+            WHERE thread_id=${f.input.threadId}`;
+          const result = yield* recover;
           expect(result.runtime.connectorToken).toBe("vm-only-token");
           for (const input of [
             { ...f.owner, threadId: "other" },
             { ...f.owner, environmentId: "other" },
-            { ...f.owner, generation: 2 },
           ])
-            yield* provide(recoverThreadVmEndpoint(input)).pipe(Effect.flip);
+            expect(yield* provide(recoverThreadVmEndpoint(input)).pipe(Effect.flip)).toMatchObject(
+              notFound,
+            );
+          expect(
+            yield* provide(recoverThreadVmEndpoint({ ...f.owner, generation: 2 })).pipe(
+              Effect.flip,
+            ),
+          ).toMatchObject({
+            _tag: "RelayTenancyConflictError",
+            reason: "thread_placement_changed",
+          });
           expect(provisions).toBe(1);
           expect(
             yield* provide(releaseThreadVmEndpoint({ ...f.owner, tunnelId: "stale-tunnel" })),
@@ -3929,11 +3992,17 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             yield* provide(releaseThreadVmEndpoint({ ...f.owner, tunnelId: "own-tunnel" })),
           ).toEqual({ released: true });
           expect(releases).toEqual(["stale-tunnel", "own-tunnel"]);
+          providerUnavailable = true;
+          expect(yield* Effect.flip(recover)).toMatchObject({
+            _tag: "RelayInternalError",
+            reason: "upstream_unavailable",
+          });
+          providerUnavailable = false;
           revoke = true;
-          yield* provide(recoverThreadVmEndpoint(f.owner)).pipe(Effect.flip);
-          expect(provisions).toBe(2);
-          yield* provide(recoverThreadVmEndpoint(f.owner)).pipe(Effect.flip);
-          expect(provisions).toBe(2);
+          expect(yield* Effect.flip(recover)).toMatchObject(notFound);
+          expect(provisions).toBe(3);
+          expect(yield* Effect.flip(recover)).toMatchObject(notFound);
+          expect(provisions).toBe(3);
         }),
     );
 

@@ -56,6 +56,7 @@ export interface WorkflowProjectBinding {
 export interface RepositoryAccessShape {
   /** When present, even another thread in the same project is outside the audience. */
   readonly threadId?: ThreadId;
+  readonly workflowVm?: boolean;
   /** Internal execution only. Callers supply a verified dispatch or a durable accepted run. */
   readonly requireWorkflowProject: (
     binding: WorkflowProjectBinding,
@@ -99,7 +100,10 @@ export interface RepositoryAccessShape {
   ) => Effect.Effect<number, EnvironmentAuthorizationError>;
   readonly withFence: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   /** Closed and drained before a policy update is acknowledged. */
-  readonly registerConnection: (close: Effect.Effect<void>) => Effect.Effect<() => void>;
+  readonly registerConnection: (
+    close: Effect.Effect<void>,
+    actor?: RepositoryActor,
+  ) => Effect.Effect<() => void>;
 }
 
 // Reference keeps standalone personal-server fixtures usable; production always provides layer.
@@ -128,7 +132,11 @@ export const make = Effect.gen(function* () {
   const vm = yield* readInstalledThreadVm().pipe(Effect.orDie);
   if (vm) {
     const initial = yield* readThreadVmInitialState().pipe(Effect.orDie);
-    return yield* makeThreadVmRepositoryAccess(vm, initial?.receipt ?? null).pipe(Effect.orDie);
+    return yield* makeThreadVmRepositoryAccess(
+      vm,
+      initial?.receipt ?? null,
+      Boolean(initial?.input.workflow),
+    ).pipe(Effect.orDie);
   }
   const sql = yield* SqlClient.SqlClient;
   const query = yield* ProjectionSnapshotQuery;

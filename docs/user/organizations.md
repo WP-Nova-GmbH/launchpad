@@ -191,8 +191,13 @@ same view. For a Machine workflow, choose an enrolled organization machine and a
 that repository. You can also create and save a VM workflow without an enrolled machine or a
 Codex connection. VM workflows use the repository's default branch unless you enter a base
 branch override, and use the organization's Codex connection when execution is available.
-Manual runs and automatic triggering currently require a Machine target. To switch a Machine
-workflow with automation On to VM, turn automation Off, choose VM, and save.
+On development relays with VM workflow execution enabled, you can run a VM workflow manually.
+Connect the organization's Codex account and give its GitHub App read access to the repository.
+VM runs use a read-only checkout and support Agent, Review, and Input steps. Automatic triggering
+uses a Machine target. To switch a workflow with automation On to VM, turn automation Off,
+choose VM, and save.
+Only repository maintainers and organization admins can manually start a VM workflow that uses
+repository secrets.
 
 Add and order Agent, Review, Input, Push branch, and Open PR steps. Human zones show where work
 waits for a response. Each checkpoint can require a repository maintainer or allow anyone with

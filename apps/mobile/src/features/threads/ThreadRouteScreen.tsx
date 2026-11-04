@@ -82,6 +82,7 @@ import { useSelectedThreadGitActions } from "../../state/use-selected-thread-git
 import { useSelectedThreadGitState } from "../../state/use-selected-thread-git-state";
 import { useSelectedThreadRequests } from "../../state/use-selected-thread-requests";
 import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
+import { resolveWorkflowResultAccess } from "../../state/workflow-result-access";
 import { useThreadComposerState } from "../../state/use-thread-composer-state";
 import { threadEnvironment } from "../../state/threads";
 import { projectThreadContentPresentation } from "./threadContentPresentation";
@@ -97,6 +98,7 @@ import {
   type ThreadInspectorMode,
 } from "./thread-inspector-content-stack";
 import { threadRouteIsHydrating } from "./thread-route-hydration";
+import { savedWorkflowDiffParams } from "../review/reviewAvailability";
 
 function ThreadHeader(
   props: Parameters<typeof useThreadHeaderOptions>[0] & {
@@ -107,6 +109,7 @@ function ThreadHeader(
     readonly onToggleInspector: () => void;
     readonly onOpenGitInspector: () => void;
     readonly onOpenFilesInspector: () => void;
+    readonly onOpenSavedDiff?: () => void;
   },
 ) {
   const navigation = useNavigation();
@@ -138,11 +141,13 @@ function ThreadHeader(
         onPress: () => onOpenTerminal(null),
       });
     }
-    actions.push({
-      accessibilityLabel: "Open git controls",
-      icon: "point.topleft.down.curvedto.point.bottomright.up",
-      onPress: props.onOpenGitInspector,
-    });
+    if (props.workspaceEnabled) {
+      actions.push({
+        accessibilityLabel: "Open git controls",
+        icon: "point.topleft.down.curvedto.point.bottomright.up",
+        onPress: props.onOpenGitInspector,
+      });
+    }
     return actions;
   }, [
     props.inspectorMode,
@@ -154,6 +159,7 @@ function ThreadHeader(
     props.onReturnToThread,
     props.hasThreadCwd,
     props.hasWorkspaceRoot,
+    props.workspaceEnabled,
   ]);
 
   return (
@@ -163,9 +169,16 @@ function ThreadHeader(
         subtitle={props.subtitle}
         sidebar={native.sidebar}
         options={native.options}
-        optionsVersion={props.gitControls.projectScripts}
+        optionsVersion={[props.workspaceEnabled, props.gitControls.projectScripts]}
         trailing={
-          props.fileInspectorSupported && props.hasThreadCwd ? (
+          props.onOpenSavedDiff ? (
+            <ScreenHeaderButton
+              accessibilityLabel="View saved diffs"
+              icon="doc.text"
+              onPress={props.onOpenSavedDiff}
+              separateBackground
+            />
+          ) : props.fileInspectorSupported && props.hasThreadCwd ? (
             <ScreenHeaderButton
               accessibilityLabel={
                 props.inspectorMode !== null && panes.auxiliaryPaneVisible
@@ -188,7 +201,7 @@ function ThreadHeader(
                 else navigation.dispatch(StackActions.replace("Home"));
               }
         }
-        actions={androidHeaderActions}
+        actions={Platform.OS === "android" ? androidHeaderActions : undefined}
         hideBottomBorder
       />
       {native.fallback}
@@ -264,6 +277,11 @@ function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const threadIdRaw = firstRouteParam(params.threadId);
   const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
   const routeEnvironmentRuntime = useRemoteEnvironmentRuntime(environmentId);
+  const { readOnly, workspaceEnabled } = resolveWorkflowResultAccess(
+    routeEnvironmentRuntime?.serverConfig?.environment.capabilities ?? null,
+    params.workflowOrigin,
+    threadIdRaw,
+  );
   const routeEnvironmentShellState = useEnvironmentShellState(environmentId);
   const { connectedEnvironments, onReconnectEnvironment } = useRemoteConnections();
   const navigation = useNavigation();
@@ -299,18 +317,25 @@ function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
 
   return (
     <>
-      <CurrentThreadLocation
-        key={routeThreadKey}
-        environmentId={environmentId}
-        threadId={ThreadId.make(threadIdRaw)}
-        recoverUnavailable={
-          selectedThreadKey !== routeThreadKey &&
-          !workspaceState.isLoadingConnections &&
-          (routeEnvironmentRuntime === null || !stillHydrating)
-        }
-      />
+      {!readOnly && (
+        <CurrentThreadLocation
+          key={routeThreadKey}
+          environmentId={environmentId}
+          threadId={ThreadId.make(threadIdRaw)}
+          recoverUnavailable={
+            selectedThreadKey !== routeThreadKey &&
+            !workspaceState.isLoadingConnections &&
+            (routeEnvironmentRuntime === null || !stillHydrating)
+          }
+        />
+      )}
       {selectedThread !== null && selectedThreadKey === routeThreadKey ? (
-        <ThreadRouteContent {...props} selectedThreadDetailState={selectedThreadDetailState} />
+        <ThreadRouteContent
+          {...props}
+          readOnlyWorkflowVm={readOnly}
+          workspaceEnabled={workspaceEnabled}
+          selectedThreadDetailState={selectedThreadDetailState}
+        />
       ) : routeEnvironmentRuntime !== null &&
         routeConnectionState !== "connected" &&
         selectedThreadDetailState.status !== "deleted" ? (
@@ -354,9 +379,12 @@ function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
 
 function ThreadRouteContent(
   props: ThreadRouteScreenProps & {
+    readonly readOnlyWorkflowVm: boolean;
+    readonly workspaceEnabled: boolean;
     readonly selectedThreadDetailState: ReturnType<typeof useSelectedThreadDetailState>;
   },
 ) {
+  const { readOnlyWorkflowVm, workspaceEnabled } = props;
   const { themeVariables } = useAppearancePreferences();
   const headerColor = themeVariables["--color-header"];
   const { fileInspector, layout, panes, showAuxiliaryPane, toggleAuxiliaryPane } =
@@ -386,9 +414,9 @@ function ThreadRouteContent(
     };
   }, [selectedThread, selectedThreadDetailState]);
   const { selectedThreadCwd } = useSelectedThreadWorktree();
-  const composer = useThreadComposerState();
-  const gitState = useSelectedThreadGitState();
-  const gitActions = useSelectedThreadGitActions();
+  const composer = useThreadComposerState(readOnlyWorkflowVm);
+  const gitState = useSelectedThreadGitState(workspaceEnabled);
+  const gitActions = useSelectedThreadGitActions(workspaceEnabled);
   const requests = useSelectedThreadRequests();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
   const pauseSharedQueue = useAtomCommand(threadEnvironment.pauseQueue, "pause shared queue");
@@ -399,11 +427,18 @@ function ThreadRouteContent(
   const threadId = firstRouteParam(params.threadId);
   const routeThreadIdentity =
     environmentIdRaw !== null && threadId !== null ? `${environmentIdRaw}:${threadId}` : null;
+  const handleOpenSavedDiff = useCallback(() => {
+    if (!readOnlyWorkflowVm || environmentId === null || threadId === null) return;
+    navigation.navigate(
+      "ThreadReview",
+      savedWorkflowDiffParams(environmentId, ThreadId.make(threadId), params.workflowOrigin),
+    );
+  }, [environmentId, navigation, params.workflowOrigin, readOnlyWorkflowVm, threadId]);
   const [inspectorSelection, setInspectorSelection] = useState<ThreadInspectorSelection | null>(
     () => (props.renderInspector ? { routeThreadIdentity, mode: "route" } : null),
   );
   const inspectorMode = (() => {
-    if (inspectorSelection?.routeThreadIdentity === routeThreadIdentity) {
+    if (workspaceEnabled && inspectorSelection?.routeThreadIdentity === routeThreadIdentity) {
       if (inspectorSelection.mode === "files" && selectedThreadCwd === null) {
         return null;
       }
@@ -484,7 +519,7 @@ function ThreadRouteContent(
     .join(" · ");
   /* ─── Git status for native header trigger ───────────────────────── */
   const gitStatus = useEnvironmentQuery(
-    selectedThread !== null && selectedThreadCwd !== null
+    workspaceEnabled && selectedThread !== null && selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
           input: { cwd: selectedThreadCwd },
@@ -492,7 +527,7 @@ function ThreadRouteContent(
       : null,
   );
   const knownTerminalSessions = useKnownTerminalSessions({
-    environmentId: selectedThread?.environmentId ?? null,
+    environmentId: workspaceEnabled ? (selectedThread?.environmentId ?? null) : null,
     threadId: selectedThread?.id ?? null,
   });
   const terminalMenuSessions = useMemo(
@@ -522,6 +557,7 @@ function ThreadRouteContent(
   const gitActionProgress = useGitActionProgress(gitActionProgressTarget);
 
   const handleOpenGitInspector = useCallback(() => {
+    if (!workspaceEnabled) return;
     if (!fileInspector.supported) {
       if (selectedThread === null) {
         return;
@@ -534,9 +570,16 @@ function ThreadRouteContent(
     }
     setInspectorSelection({ routeThreadIdentity, mode: "git" });
     showAuxiliaryPane("inspector");
-  }, [fileInspector.supported, navigation, routeThreadIdentity, selectedThread, showAuxiliaryPane]);
+  }, [
+    fileInspector.supported,
+    navigation,
+    routeThreadIdentity,
+    selectedThread,
+    showAuxiliaryPane,
+    workspaceEnabled,
+  ]);
   const handleOpenFilesInspector = useCallback(() => {
-    if (selectedThread === null || selectedThreadCwd === null) {
+    if (!workspaceEnabled || selectedThread === null || selectedThreadCwd === null) {
       return;
     }
     if (!fileInspector.supported) {
@@ -559,6 +602,7 @@ function ThreadRouteContent(
     selectedThread,
     selectedThreadCwd,
     showAuxiliaryPane,
+    workspaceEnabled,
   ]);
   const inspectorToggleActionRef = useRef({
     inspectorMode,
@@ -869,7 +913,7 @@ function ThreadRouteContent(
     );
   }, [navigation, routeThreadIdentity, selectedThreadCreation, selectedThreadProject]);
   const worktreeSetup = useWorktreeSetup({
-    environmentId: selectedThread?.environmentId ?? null,
+    environmentId: workspaceEnabled ? (selectedThread?.environmentId ?? null) : null,
     threadId: selectedThread?.id ?? null,
     activities: selectedThreadDetail?.activities ?? [],
     preparation: selectedThreadDetail?.promptQueue?.preparation,
@@ -1029,6 +1073,8 @@ function ThreadRouteContent(
 
       <View className="flex-1 bg-screen android:overflow-hidden android:rounded-t-[28px] android:bg-thread-canvas">
         <ThreadDetailScreen
+          readOnlyWorkflowVm={readOnlyWorkflowVm}
+          workspaceFilesAvailable={workspaceEnabled}
           promptQueue={selectedThreadDetail?.promptQueue}
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
           contentPresentation={contentPresentation}
@@ -1121,13 +1167,15 @@ function ThreadRouteContent(
         headerColor={headerColor}
         usesNativeHeaderGlass={usesNativeHeaderGlass}
         gitControls={threadGitControlProps}
-        hasThreadCwd={selectedThreadCwd !== null}
-        hasWorkspaceRoot={Boolean(selectedThreadProject?.workspaceRoot)}
+        workspaceEnabled={workspaceEnabled}
+        hasThreadCwd={workspaceEnabled && selectedThreadCwd !== null}
+        hasWorkspaceRoot={workspaceEnabled && Boolean(selectedThreadProject?.workspaceRoot)}
         fileInspectorSupported={fileInspector.supported}
         inspectorMode={inspectorMode}
         onToggleInspector={handleToggleInspector}
         onOpenGitInspector={handleOpenGitInspector}
         onOpenFilesInspector={handleOpenFilesInspector}
+        {...(readOnlyWorkflowVm ? { onOpenSavedDiff: handleOpenSavedDiff } : {})}
         onReturnToThread={props.onReturnToThread}
       />
 

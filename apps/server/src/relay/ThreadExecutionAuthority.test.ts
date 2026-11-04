@@ -61,6 +61,64 @@ const uploadAuthority = (client: HttpClient.HttpClient, credential = () => "curr
     Effect.provideService(HttpClient.HttpClient, client),
   );
 describe("thread execution authority transport", () => {
+  for (const [status, retryable] of [
+    [401, false],
+    [403, false],
+    [404, false],
+    [500, false],
+    [502, true],
+    [503, true],
+    [504, true],
+  ] as const) {
+    it.effect(`classifies admission HTTP ${status} without exposing the response`, () =>
+      Effect.gen(function* () {
+        const authority = yield* uploadAuthority(
+          HttpClient.make((request) =>
+            Effect.succeed(
+              HttpClientResponse.fromWeb(request, Response.json({ private: "detail" }, { status })),
+            ),
+          ),
+        );
+        const error = yield* Effect.flip(authority.admit(work));
+        assert.equal(error.retryableAdmission === true, retryable);
+        assert.notInclude(error.detail, "private");
+      }),
+    );
+  }
+
+  it.effect("retries a structured unavailable admission and a transport failure", () =>
+    Effect.gen(function* () {
+      const unavailable = yield* uploadAuthority(
+        HttpClient.make((request) =>
+          Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json(
+                {
+                  _tag: "RelayInternalError",
+                  code: "internal_error",
+                  reason: "database_unavailable",
+                  traceId: "trace",
+                },
+                { status: 500 },
+              ),
+            ),
+          ),
+        ),
+      );
+      assert.isTrue((yield* Effect.flip(unavailable.admit(work))).retryableAdmission);
+      const disconnected = yield* uploadAuthority(
+        HttpClient.make(
+          (request) =>
+            new HttpClientError.HttpClientError({
+              reason: new HttpClientError.TransportError({ request }),
+            }),
+        ),
+      );
+      assert.isTrue((yield* Effect.flip(disconnected.admit(work))).retryableAdmission);
+    }),
+  );
+
   it.effect(
     "replays only the failed artifact after an HTTP/2 GOAWAY with current credentials",
     () =>

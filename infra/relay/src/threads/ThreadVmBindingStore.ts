@@ -11,6 +11,7 @@ export function makeThreadVmBindingStore(sql: PgClient) {
     environmentId: string;
     environmentPublicKey: string;
     credentialId: string;
+    workflowConnectionId?: string;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -24,7 +25,12 @@ export function makeThreadVmBindingStore(sql: PgClient) {
         FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING (allocation_id)
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
         WHERE a.allocation_id = ${input.allocationId} AND p.operation_id = ${input.operationId}
-        AND a.resource_kind='personal' AND t.audience='private'
+        AND ${
+          input.workflowConnectionId
+            ? sql`a.resource_kind='organization_workflow' AND t.audience='repository' AND t.operation_id=p.operation_id
+            AND p.workflow_snapshot IS NOT NULL AND t.generation=p.generation`
+            : sql`a.resource_kind='personal' AND t.audience='private'`
+        }
         AND a.state = 'running' AND a.deleted_at IS NULL AND p.phase = 'created' AND a.compute_ref IS NOT NULL
         FOR UPDATE OF a`;
         if (!allocation)
@@ -57,17 +63,32 @@ export function makeThreadVmBindingStore(sql: PgClient) {
           return yield* new ThreadVmProvisionConflict({
             message: "Environment already has a different or revoked VM binding",
           });
-        yield* makeThreadVmCodexAuthStore(sql)
-          .inheritBinding({ ...allocation, ...input })
-          .pipe(
-            Effect.catchTag(
-              "CodexVmConnectionError",
-              () =>
-                new ThreadVmProvisionConflict({
-                  message: "VM provider authentication source is unavailable.",
-                }),
-            ),
-          );
+        if (input.workflowConnectionId) {
+          const [auth] = yield* sql`INSERT INTO relay_thread_vm_codex_auth
+            (allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id)
+            VALUES (${input.allocationId},${input.environmentId},${allocation.generation},${allocation.threadId},
+              ${allocation.organizationId},'organization',${input.workflowConnectionId})
+            ON CONFLICT (allocation_id,environment_id,generation) DO UPDATE SET connection_id=EXCLUDED.connection_id
+            WHERE relay_thread_vm_codex_auth.thread_id=EXCLUDED.thread_id
+              AND relay_thread_vm_codex_auth.organization_id=EXCLUDED.organization_id
+              AND relay_thread_vm_codex_auth.mode='organization'
+              AND relay_thread_vm_codex_auth.connection_id=EXCLUDED.connection_id RETURNING allocation_id`;
+          if (!auth)
+            return yield* new ThreadVmProvisionConflict({
+              message: "Workflow VM Codex identity changed",
+            });
+        } else
+          yield* makeThreadVmCodexAuthStore(sql)
+            .inheritBinding({ ...allocation, ...input })
+            .pipe(
+              Effect.catchTag(
+                "CodexVmConnectionError",
+                () =>
+                  new ThreadVmProvisionConflict({
+                    message: "VM provider authentication source is unavailable.",
+                  }),
+              ),
+            );
         return {
           allocationId: input.allocationId,
           threadId: allocation.threadId,

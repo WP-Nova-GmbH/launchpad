@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { loadThreadVmRuntimeSettings } from "./ThreadVmRuntime.ts";
+import { WORKFLOW_VM_ISOLATION_VERSION } from "./ThreadVmWorkflowModelProof.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -43,6 +44,7 @@ it.effect("uses only valid model proof for the explicitly configured template bu
     };
     const verified = yield* load({
       ...configured,
+      RELAY_WORKFLOW_VM_EXECUTION_ENABLED: "true",
       E2B_WORKFLOW_MODEL_PROOF: encodeJson({
         ...proof,
         auth: { command: "fixture-command" },
@@ -53,12 +55,31 @@ it.effect("uses only valid model proof for the explicitly configured template bu
       }),
     });
     expect(verified?.workflowModelCatalog).toEqual(catalog);
+    expect(verified?.workflowExecutionEnabled).toBeUndefined();
+    expect(
+      (yield* load({
+        ...configured,
+        RELAY_WORKFLOW_VM_EXECUTION_ENABLED: "true",
+        E2B_WORKFLOW_MODEL_PROOF: encodeJson({
+          ...proof,
+          isolationVersion: WORKFLOW_VM_ISOLATION_VERSION,
+        }),
+      }))?.workflowExecutionEnabled,
+    ).toBe(true);
     for (const value of [
       "",
       "{broken",
       encodeJson({ ...proof, schemaVersion: 1 }),
-      encodeJson({ ...proof, templateRef: "different:build-same" }),
-      encodeJson({ ...proof, buildId: "different-build" }),
+      encodeJson({
+        ...proof,
+        isolationVersion: WORKFLOW_VM_ISOLATION_VERSION,
+        templateRef: "different:build-same",
+      }),
+      encodeJson({
+        ...proof,
+        isolationVersion: WORKFLOW_VM_ISOLATION_VERSION,
+        buildId: "different-build",
+      }),
       encodeJson({ ...proof, catalog: { ...catalog, models: [] } }),
       encodeJson({
         ...proof,
@@ -72,9 +93,14 @@ it.effect("uses only valid model proof for the explicitly configured template bu
       }),
       encodeJson({ ...proof, unused: "x".repeat(64 * 1024) }),
     ]) {
-      const settings = yield* load({ ...configured, E2B_WORKFLOW_MODEL_PROOF: value });
+      const settings = yield* load({
+        ...configured,
+        RELAY_WORKFLOW_VM_EXECUTION_ENABLED: "true",
+        E2B_WORKFLOW_MODEL_PROOF: value,
+      });
       expect(settings?.templateBuildId).toBe(configured.E2B_TEMPLATE_BUILD_ID);
       expect(settings?.workflowModelCatalog).toBeUndefined();
+      expect(settings?.workflowExecutionEnabled).toBeUndefined();
     }
   }),
 );

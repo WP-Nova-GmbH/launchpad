@@ -32,6 +32,7 @@ export type ThreadActionMenuId =
 
 export interface ThreadActionMenuState {
   readonly branch: string | null;
+  readonly readOnly?: boolean;
   readonly canCreateThread?: boolean;
   /**
    * Project scoping for the thread list. Null on surfaces with no scoped
@@ -70,7 +71,7 @@ export interface ThreadActionMenuState {
 export function buildThreadActionMenuItems(
   state: ThreadActionMenuState,
 ): ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> {
-  return [
+  const items: ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> = [
     ...(state.branch && state.canCreateThread !== false
       ? [
           {
@@ -197,4 +198,7 @@ export function buildThreadActionMenuItems(
       icon: "trash",
     },
   ];
+  return state.readOnly
+    ? items.filter(({ id }) => id === "mark-unread" || id === "filter-by-project" || id === "copy")
+    : items;
 }

@@ -17,6 +17,9 @@ import { makeThreadVmReplacementCoordinator } from "./ThreadVmReplacementCoordin
 import { makeThreadVmIdleDeletionWorker } from "./ThreadVmIdleDeletionWorker.ts";
 import { makeThreadVmMoveServerWorker } from "./ThreadVmMoveServerWorker.ts";
 import { makeE2BThreadVmServer } from "../machines/E2BThreadVmServer.ts";
+import { makeE2BThreadVmSetup } from "../machines/E2BThreadVmSetup.ts";
+import { makeThreadVmSetupWorker } from "./ThreadVmSetupWorker.ts";
+import { makeThreadVmServerWorker } from "./ThreadVmServerWorker.ts";
 import { makeThreadVmMoveCleanupWorker } from "./ThreadVmMoveCleanupWorker.ts";
 import { Template } from "e2b";
 import { parse as parseDomain } from "tldts";
@@ -55,7 +58,10 @@ import { makeThreadVmSavedDiskWorker } from "./ThreadVmSavedDiskWorker.ts";
 import { makeThreadVmCancelledSetupCleanupWorker } from "./ThreadVmCancelledSetupCleanupWorker.ts";
 import { ThreadArtifactObjectStorage } from "./ThreadArtifactObjects.ts";
 import { makeThreadArtifactTransfer } from "./ThreadArtifactTransfer.ts";
-import { verifiedWorkflowVmModelCatalog } from "./ThreadVmWorkflowModelProof.ts";
+import {
+  verifiedWorkflowVmModelProof,
+  WORKFLOW_VM_ISOLATION_VERSION,
+} from "./ThreadVmWorkflowModelProof.ts";
 
 export class ThreadVmRuntimeConfigurationError extends Schema.TaggedError<ThreadVmRuntimeConfigurationError>()(
   "ThreadVmRuntimeConfigurationError",
@@ -125,14 +131,18 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
   const workflowModelProof = yield* Config.String("E2B_WORKFLOW_MODEL_PROOF").pipe(
     Config.withDefault(""),
   );
-  const workflowModelCatalog = verifiedWorkflowVmModelCatalog(
+  const workflowProof = verifiedWorkflowVmModelProof(
     workflowModelProof,
     templateId,
     templateBuildId,
   );
-  const workflowExecutionEnabled = yield* Config.Boolean(
+  const workflowModelCatalog = workflowProof?.catalog;
+  const workflowExecutionRequested = yield* Config.Boolean(
     "RELAY_WORKFLOW_VM_EXECUTION_ENABLED",
   ).pipe(Config.withDefault(false));
+  // The model-only proof remains sufficient for authoring.
+  const workflowExecutionEnabled =
+    workflowExecutionRequested && workflowProof?.isolationVersion === WORKFLOW_VM_ISOLATION_VERSION;
   const hostId = yield* Config.String("E2B_HOST_ID");
   const maxRunningVms = yield* Config.Number("E2B_MAX_RUNNING_VMS");
   const publicRelayUrl = yield* Config.String("E2B_PUBLIC_RELAY_URL");
@@ -331,7 +341,13 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
       AND retry_at<=clock_timestamp() LIMIT 1`;
   if (restoring.length) {
     const objects = yield* ThreadArtifactObjectStorage;
-    yield* makeThreadVmRestoreWorker(sql, objects, compute.restore, settings.hostId).runOne();
+    yield* makeThreadVmRestoreWorker(
+      sql,
+      objects,
+      compute.restore,
+      settings.hostId,
+      settings.workflowExecutionEnabled === true,
+    ).runOne();
   }
   yield* makeThreadVmRestoreServingWorker(
     sql,
@@ -371,17 +387,18 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     WHERE c.host_id = ${settings.hostId} AND p.retry_at <= clock_timestamp()
       AND p.ingress_recovery_claim_id IS NULL
       AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
-      AND (p.phase = 'creating' OR (p.phase = 'created' AND a.state = 'running' AND (e.installed_at IS NULL OR (d.operation_id IS NOT NULL AND m.phase IN ('frozen','ready','committed','completed') AND t.generation IN (p.generation-1,p.generation)) OR s.phase IN ('pending','running') OR (s.phase = 'ready' AND t.environment_id = s.environment_id AND t.generation = p.generation AND t.operation_id IS NULL)))
+      AND (p.phase = 'creating' OR (p.phase = 'created' AND a.state = 'running' AND (e.installed_at IS NULL OR (d.operation_id IS NOT NULL AND m.phase IN ('frozen','ready','committed','completed') AND t.generation IN (p.generation-1,p.generation)) OR s.phase IN ('pending','running') OR (s.phase = 'ready' AND t.environment_id = s.environment_id AND t.generation = p.generation
+        AND (t.operation_id IS NULL OR (p.workflow_snapshot IS NOT NULL AND t.operation_id=p.operation_id)))))
         OR (p.phase = 'pending' AND (a.state = 'deleting' OR c.state = 'reserved'
           OR (c.state = 'waiting' AND (SELECT count(*) FROM relay_thread_vm_capacity used
             WHERE used.host_id = c.host_id AND used.state IN ('reserved', 'started')) < ${settings.maxRunningVms}))))
     LIMIT 1`;
   if (!pending.length) return;
   const relay = yield* RelayConfiguration;
-  const verifyTemplate = Effect.gen(function* () {
-    const separator = settings.compute.templateId.indexOf(":");
-    const templateId = settings.compute.templateId.slice(0, separator);
-    const tag = settings.compute.templateId.slice(separator + 1);
+  const verifyTemplate = Effect.fnUntraced(function* (templateRef: string, buildId: string) {
+    const separator = templateRef.indexOf(":");
+    const templateId = templateRef.slice(0, separator);
+    const tag = templateRef.slice(separator + 1);
     const tags = yield* Effect.tryPromise({
       try: (signal) =>
         Template.getTags(templateId, {
@@ -396,7 +413,7 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
           message: "Runner build verification is unavailable.",
         }),
     });
-    if (!tags.some((entry) => entry.tag === tag && entry.buildId === settings.templateBuildId))
+    if (!tags.some((entry) => entry.tag === tag && entry.buildId === buildId))
       return yield* new ThreadVmComputeError({
         operation: "verify runner",
         message: "Runner template no longer resolves to the verified build.",
@@ -407,23 +424,41 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     compute,
     settings.compute.templateId,
     settings.hostId,
-    verifyTemplate,
+    verifyTemplate(settings.compute.templateId, settings.templateBuildId),
+    { enabled: settings.workflowExecutionEnabled === true, verifyTemplate },
   );
   const enrollment = makeThreadVmEnrollmentWorker(
     sql,
     makeE2BThreadVmEnrollment(settings.compute),
     { url: settings.publicRelayUrl, issuer: relay.relayIssuer },
     settings.hostId,
+    true,
+  );
+  const guestSetup = makeE2BThreadVmSetup(settings.compute);
+  const setup = makeThreadVmSetupWorker(
+    sql,
+    guestSetup.prepare,
+    settings.hostId,
+    "organization_workflow",
+    guestSetup.recoverCheckoutFailure,
+  );
+  const startup = makeThreadVmServerWorker(
+    sql,
+    makeE2BThreadVmServer(settings.compute),
+    settings.hostId,
+    "organization_workflow",
   );
   for (let index = 0; index < 8; index++) {
     const provisioned = yield* provision.runOne();
     const enrolled = yield* enrollment.runOne();
+    const prepared = yield* setup.runOne();
+    const started = yield* startup.runOne();
     const moveStarted = yield* makeThreadVmMoveServerWorker(
       sql,
       makeE2BThreadVmServer(settings.compute),
       settings.hostId,
     ).runOne();
-    if (!provisioned && !enrolled && !moveStarted) return;
+    if (!provisioned && !enrolled && !prepared && !started && !moveStarted) return;
   }
 });
 
@@ -475,6 +510,7 @@ export const reconcileThreadVmResumes = Effect.fn("relay.thread_vm.reconcile_res
     makeE2BThreadVmCompute(settings.compute),
     makeE2BThreadVmPause(settings.compute),
     settings.hostId,
+    settings.workflowExecutionEnabled === true,
   );
   for (let index = 0; index < 4; index++) if (!(yield* worker.runOne())) return;
 });

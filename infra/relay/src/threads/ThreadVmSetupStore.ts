@@ -5,7 +5,10 @@ import {
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
+import {
+  makeThreadVmAllocationStore,
+  type ThreadVmResourceKind,
+} from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 
 export class ThreadVmSetupConflict extends Schema.TaggedError<ThreadVmSetupConflict>()(
@@ -32,6 +35,9 @@ export interface ThreadVmSetup {
   readonly errorCode: string | null;
   readonly receiptSha256: string | null;
 }
+type ScopedSetup<Kind extends ThreadVmResourceKind> = Omit<ThreadVmSetup, "ownerUserId"> & {
+  readonly ownerUserId: Kind extends "personal" ? string : null;
+};
 type Intent = Pick<
   ThreadVmSetup,
   | "allocationId"
@@ -51,9 +57,11 @@ type Intent = Pick<
 
 /** Internal storage: the caller holds current owner/repository access for every mutation. */
 export function makeThreadVmSetupStore(sql: PgClient) {
-  const get = Effect.fn("relay.thread_vm_setup.get")(function* (allocationId: string) {
+  const getFor = Effect.fn("relay.thread_vm_setup.get")(function* <
+    Kind extends ThreadVmResourceKind,
+  >(allocationId: string, resourceKind: Kind) {
     const [row] = yield* sql<
-      Omit<ThreadVmSetup, "initialState"> & { initialState: string | null }
+      Omit<ScopedSetup<Kind>, "initialState"> & { initialState: string | null }
     >`SELECT s.allocation_id AS "allocationId", a.thread_id AS "threadId",
       a.organization_id AS "organizationId", t.repository_id AS "repositoryId", a.owner_user_id AS "ownerUserId",
       s.initial_state AS "initialState", s.canonical_key AS "canonicalKey", s.branch, s.revision, s.phase, s.environment_id AS "environmentId",
@@ -61,7 +69,8 @@ export function makeThreadVmSetupStore(sql: PgClient) {
       FROM relay_thread_vm_setups s JOIN relay_thread_vm_allocations a USING (allocation_id)
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-      WHERE s.allocation_id = ${allocationId} AND a.resource_kind='personal' AND t.audience='private'`;
+      WHERE s.allocation_id = ${allocationId} AND a.resource_kind=${resourceKind}
+        AND t.audience=${resourceKind === "personal" ? "private" : "repository"}`;
     return row
       ? {
           ...row,
@@ -74,6 +83,7 @@ export function makeThreadVmSetupStore(sql: PgClient) {
         }
       : null;
   });
+  const get = (allocationId: string) => getFor(allocationId, "personal");
   const enqueue = Effect.fn("relay.thread_vm_setup.enqueue")(function* (input: Intent) {
     if (
       !/^github\.com\/[a-z0-9-]+\/[a-z0-9_.-]+$/.test(input.canonicalKey) ||
@@ -137,17 +147,23 @@ export function makeThreadVmSetupStore(sql: PgClient) {
       }),
     );
   });
-  const lock = Effect.fnUntraced(function* (allocationId: string) {
-    const setup = yield* get(allocationId);
+  const lock = Effect.fnUntraced(function* (
+    allocationId: string,
+    resourceKind: ThreadVmResourceKind,
+  ) {
+    const setup = yield* getFor(allocationId, resourceKind);
     if (!setup) return yield* conflict("Initial VM setup does not exist");
     yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id = ${setup.threadId} FOR UPDATE`;
     const [allocation] = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
       WHERE allocation_id = ${allocationId} AND state = 'running' AND deleted_at IS NULL FOR UPDATE`;
     if (!allocation) return yield* conflict("Setup VM is not running or is being deleted");
     yield* sql`SELECT allocation_id FROM relay_thread_vm_setups WHERE allocation_id = ${allocationId} FOR UPDATE`;
-    return (yield* get(allocationId))!;
+    return (yield* getFor(allocationId, resourceKind))!;
   });
-  const requireBinding = Effect.fnUntraced(function* (setup: ThreadVmSetup, environmentId: string) {
+  const requireBinding = Effect.fnUntraced(function* (
+    setup: ScopedSetup<ThreadVmResourceKind>,
+    environmentId: string,
+  ) {
     const [binding] = yield* sql`SELECT b.environment_id FROM relay_thread_vm_bindings b
       JOIN relay_thread_vm_enrollments e ON e.allocation_id = b.allocation_id
       JOIN relay_environment_credentials c ON c.credential_id = b.credential_id
@@ -160,25 +176,28 @@ export function makeThreadVmSetupStore(sql: PgClient) {
   });
   const requireServerStart = Effect.fn("relay.thread_vm_setup.require_server_start")(function* (
     allocationId: string,
+    resourceKind: ThreadVmResourceKind = "personal",
   ) {
-    const setup = yield* lock(allocationId);
+    const setup = yield* lock(allocationId, resourceKind);
     if (setup.phase !== "ready" || !setup.environmentId || !setup.receiptSha256)
       return yield* conflict("VM preparation is not confirmed");
     yield* requireBinding(setup, setup.environmentId);
     const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
       WHERE thread_id = ${setup.threadId} AND environment_id = ${setup.environmentId}
       AND project_id = ${`vm:${setup.threadId}`} AND repository_id = ${setup.repositoryId}
-      AND generation = 1 AND operation_id IS NULL`;
+      AND generation = 1 AND ${resourceKind === "personal" ? sql`operation_id IS NULL` : sql`operation_id=${allocationId}`}`;
     if (!placement) return yield* conflict("VM no longer owns the prepared thread");
     return { ...setup, environmentId: setup.environmentId, receiptSha256: setup.receiptSha256 };
   });
   const begin = Effect.fn("relay.thread_vm_setup.begin")(function* (input: {
     allocationId: string;
     environmentId: string;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const setup = yield* lock(input.allocationId);
+        const kind = input.resourceKind ?? "personal";
+        const setup = yield* lock(input.allocationId, kind);
         yield* requireBinding(setup, input.environmentId);
         if (
           setup.phase === "failed" ||
@@ -193,7 +212,7 @@ export function makeThreadVmSetupStore(sql: PgClient) {
         if (!rows.length) return yield* conflict("Thread no longer belongs to this setup");
         yield* sql`UPDATE relay_thread_vm_setups SET phase = 'running', environment_id = ${input.environmentId}
         WHERE allocation_id = ${setup.allocationId}`;
-        return (yield* get(input.allocationId))!;
+        return (yield* getFor(input.allocationId, kind))!;
       }),
     );
   });
@@ -201,12 +220,14 @@ export function makeThreadVmSetupStore(sql: PgClient) {
     allocationId: string;
     environmentId: string;
     receiptSha256: string;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     if (!/^[0-9a-f]{64}$/.test(input.receiptSha256))
       return yield* conflict("Invalid setup receipt digest");
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const setup = yield* lock(input.allocationId);
+        const kind = input.resourceKind ?? "personal";
+        const setup = yield* lock(input.allocationId, kind);
         yield* requireBinding(setup, input.environmentId);
         if (
           setup.phase === "ready" &&
@@ -216,13 +237,18 @@ export function makeThreadVmSetupStore(sql: PgClient) {
           return setup;
         if (setup.phase !== "running" || setup.environmentId !== input.environmentId)
           return yield* conflict("Setup has not completed at this environment");
-        const rows = yield* sql`UPDATE relay_thread_placements SET operation_id = NULL
-        WHERE thread_id = ${setup.threadId} AND environment_id = ${input.environmentId} AND generation = 1
-        AND operation_id = ${setup.allocationId} RETURNING thread_id`;
+        const rows =
+          kind === "personal"
+            ? yield* sql`UPDATE relay_thread_placements SET operation_id = NULL
+            WHERE thread_id=${setup.threadId} AND environment_id=${input.environmentId} AND generation=1
+              AND operation_id=${setup.allocationId} RETURNING thread_id`
+            : yield* sql`SELECT thread_id FROM relay_thread_placements
+            WHERE thread_id=${setup.threadId} AND environment_id=${input.environmentId} AND generation=1
+              AND operation_id=${setup.allocationId}`;
         if (!rows.length) return yield* conflict("Setup no longer owns the placement hold");
         yield* sql`UPDATE relay_thread_vm_setups SET phase = 'ready', receipt_sha256 = ${input.receiptSha256}, error_code = NULL
         WHERE allocation_id = ${setup.allocationId}`;
-        return (yield* get(input.allocationId))!;
+        return (yield* getFor(input.allocationId, kind))!;
       }),
     );
   });
@@ -230,16 +256,26 @@ export function makeThreadVmSetupStore(sql: PgClient) {
     allocationId: string;
     environmentId: string;
     errorCode: RelayThreadVmSetupErrorCode;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const setup = yield* lock(input.allocationId);
+        const kind = input.resourceKind ?? "personal";
+        const setup = yield* lock(input.allocationId, kind);
         if (setup.phase !== "running" || setup.environmentId !== input.environmentId)
           return yield* conflict("Setup is not running here");
         yield* sql`UPDATE relay_thread_vm_setups SET phase = 'failed', error_code = ${input.errorCode} WHERE allocation_id = ${setup.allocationId}`;
-        return (yield* get(input.allocationId))!;
+        if (kind === "organization_workflow") {
+          // The worker holds the workflow job and placement locks while recording this receipt.
+          yield* makeThreadVmAllocationStore(sql)
+            .requestDeletion(setup.allocationId, kind)
+            .pipe(
+              Effect.catchTag("ThreadVmAllocationConflict", ({ message }) => conflict(message)),
+            );
+        }
+        return (yield* getFor(input.allocationId, kind))!;
       }),
     );
   });
-  return { get, enqueue, begin, finish, fail, requireServerStart };
+  return { get, getFor, enqueue, begin, finish, fail, requireServerStart };
 }

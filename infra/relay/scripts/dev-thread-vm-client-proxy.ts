@@ -241,11 +241,15 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
           await run(verify, { signal });
           const token = await run(
             Effect.gen(function* () {
-              return yield* readThreadVmTrafficAccessToken((yield* RelayDb).$client, {
-                ...target.identity.scope,
-                computeRef: target.sandboxId,
-                operationId: target.identity.operationId,
-              });
+              return yield* readThreadVmTrafficAccessToken(
+                (yield* RelayDb).$client,
+                {
+                  ...target.identity.scope,
+                  computeRef: target.sandboxId,
+                  operationId: target.identity.operationId,
+                },
+                target.identity.resourceKind,
+              );
             }),
             { signal },
           );

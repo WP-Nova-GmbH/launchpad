@@ -51,8 +51,8 @@ function fixture(local: boolean, initialState: "running" | "paused" = "running")
     (strings: TemplateStringsArray, ...values: ReadonlyArray<unknown>) =>
       Effect.sync(() => {
         const query = strings.join("?").replace(/\s+/gu, " ").trim();
-        if (query.includes("FROM relay_thread_vm_bindings WHERE environment_id"))
-          return [{ threadId: "thread" }];
+        if (query.includes("WHERE b.environment_id = ?"))
+          return [{ threadId: "thread", workflow: false }];
         if (query.includes("FROM relay_thread_placements")) {
           if (query.startsWith("SELECT thread_id FROM")) return [{ thread_id: "thread" }];
           return [
@@ -61,6 +61,8 @@ function fixture(local: boolean, initialState: "running" | "paused" = "running")
               organizationId: "org",
               repositoryId: "repo",
               ownerUserId: "owner",
+              audience: "private",
+              workflowJobId: null,
               environmentId: "env",
               projectId: "project",
               generation: 1,

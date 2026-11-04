@@ -25,6 +25,7 @@ import {
   type ThreadVmControlAction,
 } from "@t3tools/client-runtime/relay/threadVmControls";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import * as Atom from "effect/unstable/reactivity/Atom";
 import {
   Children,
   createContext,
@@ -119,16 +120,21 @@ function Field({
   );
 }
 
+const emptyThreadLocationAtom = Atom.make(null);
+
 export function useThreadMovePlacement(
-  environmentId: EnvironmentId,
+  environmentId: EnvironmentId | null,
   threadId: ThreadId,
   recoverUnavailable = false,
 ) {
   const session = useAtomValue(managedRelaySessionAtom);
   const proofs = useAtomValue(portableThreadPlacementsAtom);
   const location = useAtomValue(
-    threadVmControls.locationViewAtom(environmentId, threadId, recoverUnavailable),
+    environmentId === null
+      ? emptyThreadLocationAtom
+      : threadVmControls.locationViewAtom(environmentId, threadId, recoverUnavailable),
   );
+  if (environmentId === null) return undefined;
   return proofs?.session === session && proofs.relayUrl === threadMoveRelayUrl()
     ? (proofs.placements.get(threadId) ?? location?.placement)
     : location?.placement;

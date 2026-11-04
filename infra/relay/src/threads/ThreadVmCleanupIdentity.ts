@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import type { SqlError } from "effect/unstable/sql/SqlError";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import { threadVmOperationMatches } from "../machines/E2BThreadVmRestoreAttempt.ts";
+import type { ThreadVmResourceKind } from "./ThreadVmAllocationStore.ts";
 
 export interface ThreadVmCleanupCompute {
   readonly inspect: (id: string) => Effect.Effect<SandboxInfo | null, ThreadVmComputeError>;
@@ -25,17 +26,18 @@ export const confirmThreadVmCleanupIdentity = Effect.fn("relay.thread_vm.cleanup
       readonly operationId: string;
       readonly generation: number;
       readonly computeRef: string;
+      readonly resourceKind?: ThreadVmResourceKind;
     },
   ) {
     const pending = yield* sql.unsafe(
-      `SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations WHERE allocation_id=$1 AND runtime_protocol='native-v1' AND resource_kind='personal')
+      `SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations WHERE allocation_id=$1 AND runtime_protocol='native-v1' AND resource_kind=$2)
        UNION ALL SELECT 1 FROM relay_thread_vm_provisions WHERE allocation_id=$1 AND (phase IN ('pending','creating') OR ingress_recovery_claim_id IS NOT NULL)
        UNION ALL SELECT 1 FROM relay_thread_vm_pauses WHERE allocation_id=$1 AND pause_dispatch_claim_id IS NOT NULL
        UNION ALL SELECT 1 FROM relay_thread_vm_resumes WHERE allocation_id=$1 AND connect_claim_id IS NOT NULL
        UNION ALL SELECT 1 FROM relay_thread_vm_restores WHERE allocation_id=$1 AND
          (boot_ingress_recovery_claim_id IS NOT NULL OR (boot_create_started_at IS NOT NULL AND
            (boot_receipt IS NULL OR boot_receipt->>'kind' IS DISTINCT FROM 'native-restore-boot-v1')))`,
-      [input.allocationId],
+      [input.allocationId, input.resourceKind ?? "personal"],
     );
     if (pending.length) return false;
     const inspection = yield* compute.inspect(input.computeRef).pipe(Effect.result);

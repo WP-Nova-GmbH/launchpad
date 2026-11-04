@@ -36,6 +36,7 @@ import {
 } from "@t3tools/client-runtime/environment";
 import {
   resolveEnvironmentMachineKind,
+  type EnvironmentId,
   type EnvironmentMachineKind,
   type ProjectIconOverride,
   type ScopedThreadRef,
@@ -103,6 +104,7 @@ import { isModelPickerOpen } from "../modelPickerVisibility";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { isMacPlatform } from "~/lib/utils";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
+import { workflowResultGitAccess } from "../lib/workflowResultGitAccess";
 import { releaseComposerDraftUploads } from "../lib/composerDraftUploads";
 import { readLocalApi } from "../localApi";
 import {
@@ -136,7 +138,11 @@ import {
   useProjects,
   useThreadShells,
 } from "../state/entities";
-import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
+import {
+  environmentServerConfigsAtom,
+  primaryServerKeybindingsAtom,
+  serverEnvironment,
+} from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
 import { useEnvironmentQuery } from "../state/query";
@@ -1049,8 +1055,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   const lastVisitedAt = useUiStateStore((state) => state.threadLastVisitedAtById[threadKey]);
   const isSelected = useThreadSelectionStore((state) => state.selectedThreadKeys.has(threadKey));
   const openPrLink = useOpenPrLink();
+  const canUseLiveWorkspace = useSidebarWorkspaceAccess(thread);
   const runningTerminalIds = useThreadRunningTerminalIds({
-    environmentId: thread.environmentId,
+    environmentId: canUseLiveWorkspace ? thread.environmentId : null,
     threadId: thread.id,
   });
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
@@ -1073,21 +1080,14 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   const linkedPullRequestStatus = useLinkedThreadPullRequest(
     thread.environmentId,
     thread.linkedPullRequest,
-    leaseLiveStatus,
+    canUseLiveWorkspace && leaseLiveStatus,
     thread.pullRequests,
     thread.branchPullRequest,
   );
-  const gitStatus = useEnvironmentQuery(
-    leaseLiveStatus && (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
-      ? vcsEnvironment.status({
-          environmentId: thread.environmentId,
-          input: { cwd: gitCwd },
-        })
-      : null,
-  );
-  const visibleGitStatus = useRetainedValue(
-    JSON.stringify([thread.environmentId, gitCwd]),
-    gitStatus.data,
+  const visibleGitStatus = useSidebarThreadGitStatus(
+    thread,
+    canUseLiveWorkspace ? gitCwd : null,
+    leaseLiveStatus,
   );
   const pr = linkedPullRequestStatus?.pr ?? null;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
@@ -1252,19 +1252,26 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   );
   const handleDoubleClick = useCallback(
     (event: ReactMouseEvent) => {
-      if (isRenaming || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      if (
+        !canUseLiveWorkspace ||
+        isRenaming ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      ) {
         return;
       }
       if ((event.target as HTMLElement).closest("button, a, input")) return;
       event.preventDefault();
       onStartRename(threadRef, thread.title);
     },
-    [isRenaming, onStartRename, thread.title, threadRef],
+    [canUseLiveWorkspace, isRenaming, onStartRename, thread.title, threadRef],
   );
   const [isFileDragOver, setIsFileDragOver] = useState(false);
   const fileDropHandlers = useMemo(
     () =>
-      onFileDropThreads
+      canUseLiveWorkspace && onFileDropThreads
         ? makeWorkspaceFileDropHandlers({
             setDragActive: setIsFileDragOver,
             addFiles: (files) => {
@@ -1273,7 +1280,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
             addFolders: () => {},
           })
         : null,
-    [onFileDropThreads, threadRef],
+    [canUseLiveWorkspace, onFileDropThreads, threadRef],
   );
   // A drop lands on a child or outside the window entirely, so dragend is
   // the reset of last resort for the row's highlight.
@@ -1634,7 +1641,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                 <span
                   className={cn(
                     "inline-flex justify-end tabular-nums text-secondary-label transition-opacity",
-                    !isWoke && "group-hover/sidebar-row:opacity-0",
+                    !isWoke && canUseLiveWorkspace && "group-hover/sidebar-row:opacity-0",
                   )}
                 >
                   {variantAction === "unsnooze" && props.snoozeWakeLabelText !== null ? (
@@ -1790,7 +1797,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                     className={cn(
                       isWokeStatus
                         ? "pointer-events-auto"
-                        : "pointer-events-none group-has-[:focus-visible]/sidebar-status-slot:absolute group-has-[:focus-visible]/sidebar-status-slot:right-0 group-has-[:focus-visible]/sidebar-status-slot:opacity-0 group-hover/sidebar-row:absolute group-hover/sidebar-row:right-0 group-hover/sidebar-row:opacity-0",
+                        : canUseLiveWorkspace &&
+                            "pointer-events-none group-has-[:focus-visible]/sidebar-status-slot:absolute group-has-[:focus-visible]/sidebar-status-slot:right-0 group-has-[:focus-visible]/sidebar-status-slot:opacity-0 group-hover/sidebar-row:absolute group-hover/sidebar-row:right-0 group-hover/sidebar-row:opacity-0",
                       "flex items-center self-center justify-self-end tabular-nums text-secondary-label transition-opacity",
                       snoozeMenuOpen && "pointer-events-none absolute right-0 opacity-0",
                     )}
@@ -1991,6 +1999,30 @@ function latestTurnDiff(
   return null;
 }
 
+function useSidebarWorkspaceAccess(thread: SidebarThreadSummary) {
+  return useAtomValue(
+    serverEnvironment.configValueAtom(thread.environmentId),
+    (config) =>
+      workflowResultGitAccess({
+        capabilities: config?.environment.capabilities,
+        threadId: thread.id,
+      }).canReadCheckoutGit,
+  );
+}
+
+function useSidebarThreadGitStatus(
+  thread: SidebarThreadSummary,
+  cwd: string | null,
+  leaseLiveStatus: boolean,
+) {
+  const gitStatus = useEnvironmentQuery(
+    leaseLiveStatus && cwd !== null && (thread.branch != null || thread.worktreePath !== null)
+      ? vcsEnvironment.status({ environmentId: thread.environmentId, input: { cwd } })
+      : null,
+  );
+  return useRetainedValue(JSON.stringify([thread.environmentId, cwd]), gitStatus.data);
+}
+
 const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   thread: SidebarThreadSummary;
   project: EnvironmentProject | null;
@@ -2018,17 +2050,11 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
   // Same details tooltip as the regular rows: a search hit is still a thread,
   // and the hover card is how you disambiguate identically-titled results.
   const gitCwd = thread.worktreePath ?? props.project?.workspaceRoot ?? null;
-  const gitStatus = useEnvironmentQuery(
-    leaseLiveStatus && (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
-      ? vcsEnvironment.status({
-          environmentId: thread.environmentId,
-          input: { cwd: gitCwd },
-        })
-      : null,
-  );
-  const visibleGitStatus = useRetainedValue(
-    JSON.stringify([thread.environmentId, gitCwd]),
-    gitStatus.data,
+  const canUseLiveWorkspace = useSidebarWorkspaceAccess(thread);
+  const visibleGitStatus = useSidebarThreadGitStatus(
+    thread,
+    canUseLiveWorkspace ? gitCwd : null,
+    leaseLiveStatus,
   );
   const branchMismatch = resolveLocalCheckoutBranchMismatch({
     effectiveEnvMode: thread.worktreePath === null ? "local" : "worktree",
@@ -2048,21 +2074,24 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
     ? getTriggerDisplayModelLabel(selectedModel)
     : thread.modelSelection.model;
   const runningTerminalIds = useThreadRunningTerminalIds({
-    environmentId: thread.environmentId,
+    environmentId: canUseLiveWorkspace ? thread.environmentId : null,
     threadId: thread.id,
   });
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);
   const [isFileDragOver, setIsFileDragOver] = useState(false);
+  const onFileDropThreads = props.onFileDropThreads;
   const fileDropHandlers = useMemo(
     () =>
-      makeWorkspaceFileDropHandlers({
-        setDragActive: setIsFileDragOver,
-        addFiles: (files) => {
-          props.onFileDropThreads(threadRef, files);
-        },
-        addFolders: () => {},
-      }),
-    [props.onFileDropThreads, threadRef],
+      canUseLiveWorkspace
+        ? makeWorkspaceFileDropHandlers({
+            setDragActive: setIsFileDragOver,
+            addFiles: (files) => {
+              onFileDropThreads(threadRef, files);
+            },
+            addFolders: () => {},
+          })
+        : null,
+    [canUseLiveWorkspace, onFileDropThreads, threadRef],
   );
   useEffect(() => {
     if (!isFileDragOver) return;
@@ -2071,7 +2100,7 @@ const SidebarSearchResultRow = memo(function SidebarSearchResultRow(props: {
     return () => window.removeEventListener("dragend", clearFileDrag);
   }, [isFileDragOver]);
   return (
-    <li role="presentation" className="list-none" {...fileDropHandlers}>
+    <li role="presentation" className="list-none" {...(fileDropHandlers ?? {})}>
       <Tooltip>
         <TooltipTrigger
           render={
@@ -2323,6 +2352,14 @@ export default function Sidebar() {
   const projectGroupsRef = useRef(projectGroups);
   projectGroupsRef.current = projectGroups;
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
+  const canMutateThread = useCallback(
+    (environmentId: EnvironmentId, threadId: ThreadId) =>
+      workflowResultGitAccess({
+        capabilities: serverConfigs.get(environmentId)?.environment.capabilities,
+        threadId,
+      }).canReadCheckoutGit,
+    [serverConfigs],
+  );
   // Threads on non-primary environments (T3 Connect, hosted) resolve their
   // provider entry from their own environment's config: default instance ids
   // are driver slugs, so a flat map would collide across environments.
@@ -2554,7 +2591,9 @@ export default function Sidebar() {
     const draggable = new Set<string>();
     const activeReorderable = new Set<string>();
     for (const thread of visible) {
-      const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
+      const capabilities = canMutateThread(thread.environmentId, thread.id)
+        ? serverConfigs.get(thread.environmentId)?.environment.capabilities
+        : undefined;
       // Threads on servers without the settlement capability (old server,
       // or descriptor not loaded yet) never classify as settled: the user
       // could neither un-settle nor pin them, so auto-settling them would
@@ -2631,7 +2670,15 @@ export default function Sidebar() {
       settledThreads: sortSettledThreadsForSidebar(settled),
       snoozeNow: preciseNow,
     };
-  }, [nowMinute, optimisticDrop, scopedProjectKeys, serverConfigs, snoozeWakeTick, threads]);
+  }, [
+    canMutateThread,
+    nowMinute,
+    optimisticDrop,
+    scopedProjectKeys,
+    serverConfigs,
+    snoozeWakeTick,
+    threads,
+  ]);
 
   const threadSearchInputRef = useRef<HTMLInputElement>(null);
   const [threadSearchQuery, setThreadSearchQuery] = useState("");
@@ -2875,6 +2922,7 @@ export default function Sidebar() {
   const clearPendingFileDrop = useSidebarPendingFileDropStore((s) => s.clearPendingFileDrop);
   const handleThreadFileDrop = useCallback(
     async (threadRef: ScopedThreadRef, files: File[]) => {
+      if (!canMutateThread(threadRef.environmentId, threadRef.threadId)) return;
       // Queued, not replaced: a second drop before the thread opens keeps
       // both files, and the id lets cleanup below touch only this drop.
       const dropId = queuePendingFileDrop({ threadRef, files });
@@ -2905,7 +2953,7 @@ export default function Sidebar() {
         clearPendingFileDrop(dropId);
       }
     },
-    [clearPendingFileDrop, navigateToThread, queuePendingFileDrop, router],
+    [canMutateThread, clearPendingFileDrop, navigateToThread, queuePendingFileDrop, router],
   );
 
   const navigateToDraft = useCallback(
@@ -3799,6 +3847,9 @@ export default function Sidebar() {
         const thread = threadByKeyRef.current.get(threadKey);
         return thread ? [thread] : [];
       });
+      const canMutateSelection = selectedThreads.every((thread) =>
+        canMutateThread(thread.environmentId, thread.id),
+      );
       const canSnoozeSelection = selectedThreads.every(
         (thread) =>
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
@@ -3828,34 +3879,38 @@ export default function Sidebar() {
         pinnedCount: pinnedSelectedThreads.length,
       });
       const snoozePresets = resolveSnoozePresets(new Date(), timestampFormat);
+      const markUnreadItem = { id: "mark-unread", label: `Mark unread (${count})` };
       const clicked = await settlePromise(() =>
         api.contextMenu.show(
-          [
-            ...(unpinMenuItem ? [unpinMenuItem] : []),
-            { id: "settle", label: `Settle (${count})` },
-            ...(canSnoozeSelection
-              ? [
-                  {
-                    id: "snooze",
-                    label: `Snooze (${count})`,
-                    children: [
-                      ...snoozePresets.map((preset) => ({
-                        id: `snooze:${preset.id}`,
-                        label: `${preset.label} (${preset.whenLabel})`,
-                      })),
-                      { id: "snooze:custom", label: "Custom…", separatorBefore: true },
-                    ],
-                  },
-                ]
-              : []),
-            ...(titleRegenerationMenuItem ? [titleRegenerationMenuItem] : []),
-            { id: "mark-unread", label: `Mark unread (${count})` },
-            { id: "delete", label: `Delete (${count})`, destructive: true },
-          ],
+          canMutateSelection
+            ? [
+                ...(unpinMenuItem ? [unpinMenuItem] : []),
+                { id: "settle", label: `Settle (${count})` },
+                ...(canSnoozeSelection
+                  ? [
+                      {
+                        id: "snooze",
+                        label: `Snooze (${count})`,
+                        children: [
+                          ...snoozePresets.map((preset) => ({
+                            id: `snooze:${preset.id}`,
+                            label: `${preset.label} (${preset.whenLabel})`,
+                          })),
+                          { id: "snooze:custom", label: "Custom…", separatorBefore: true },
+                        ],
+                      },
+                    ]
+                  : []),
+                ...(titleRegenerationMenuItem ? [titleRegenerationMenuItem] : []),
+                markUnreadItem,
+                { id: "delete", label: `Delete (${count})`, destructive: true },
+              ]
+            : [markUnreadItem],
           position,
         ),
       );
       if (clicked._tag === "Failure") return;
+      if (!canMutateSelection && clicked.value !== "mark-unread") return;
       if (clicked.value?.startsWith("snooze:")) {
         const preset =
           clicked.value === "snooze:custom"
@@ -3995,6 +4050,7 @@ export default function Sidebar() {
     [
       attemptSettle,
       attemptUnpin,
+      canMutateThread,
       clearSelection,
       confirmThreadDelete,
       deleteThread,
@@ -4020,6 +4076,7 @@ export default function Sidebar() {
         }
         const thread = threadByKeyRef.current.get(threadKey);
         if (!thread) return;
+        const readOnly = !canMutateThread(thread.environmentId, thread.id);
         const threadWorkspacePath =
           thread.worktreePath ??
           projectByKey.get(`${thread.environmentId}:${thread.projectId}`)?.workspaceRoot ??
@@ -4057,6 +4114,7 @@ export default function Sidebar() {
         const clicked = await settlePromise(() =>
           api.contextMenu.show(
             buildThreadActionMenuItems({
+              readOnly,
               canCreateThread: canCreateThreadInEnvironment(
                 serverConfigs.get(thread.environmentId),
               ),
@@ -4277,6 +4335,7 @@ export default function Sidebar() {
       attemptUnpin,
       attemptUnsettle,
       attemptUnsnooze,
+      canMutateThread,
       confirmThreadArchive,
       confirmThreadDelete,
       copyBranchToClipboard,
@@ -4694,6 +4753,9 @@ export default function Sidebar() {
                         // not from the sidebar second-guessing what still matters.
                         const isCard = section === "active" || section === "pinned";
                         const rowVariant = isCard ? "card" : "slim";
+                        const canMutate = canMutateThread(thread.environmentId, thread.id);
+                        const capabilities = serverConfigs.get(thread.environmentId)?.environment
+                          .capabilities;
                         return (
                           <SidebarThreadRow
                             // Fade between card and compact rows while the outer
@@ -4710,17 +4772,10 @@ export default function Sidebar() {
                                   : "settle"
                             }
                             settlementSupported={
-                              serverConfigs.get(thread.environmentId)?.environment.capabilities
-                                .threadSettlement === true
+                              canMutate && capabilities?.threadSettlement === true
                             }
-                            snoozeSupported={
-                              serverConfigs.get(thread.environmentId)?.environment.capabilities
-                                .threadSnooze === true
-                            }
-                            pinningSupported={
-                              serverConfigs.get(thread.environmentId)?.environment.capabilities
-                                .threadPinning === true
-                            }
+                            snoozeSupported={canMutate && capabilities?.threadSnooze === true}
+                            pinningSupported={canMutate && capabilities?.threadPinning === true}
                             isPinned={thread.pinnedAt != null}
                             sortable={sortable}
                             dropVerb={
@@ -4779,7 +4834,7 @@ export default function Sidebar() {
                             onRenameTitleChange={setRenamingTitle}
                             onCommitRename={commitThreadRename}
                             onCancelRename={cancelThreadRename}
-                            isRenaming={renamingThreadKey === threadKey}
+                            isRenaming={canMutate && renamingThreadKey === threadKey}
                             renamingTitle={renamingThreadKey === threadKey ? renamingTitle : ""}
                             onContextMenu={handleThreadContextMenu}
                             onSettle={attemptSettle}

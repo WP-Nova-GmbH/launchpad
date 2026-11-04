@@ -25,6 +25,7 @@ const denied = () =>
 export const makeThreadVmRepositoryAccess = Effect.fn("ThreadVmRepositoryAccess.make")(function* (
   vm: InstalledThreadVm,
   receipt: RelayThreadVmSetupReceipt | null,
+  workflowVm = false,
 ) {
   const environmentId = yield* (yield* ServerEnvironmentIdentity).getEnvironmentId;
   const url = normalizeSecureRelayUrl(vm.relayUrl);
@@ -52,46 +53,52 @@ export const makeThreadVmRepositoryAccess = Effect.fn("ThreadVmRepositoryAccess.
     environmentCredential: vm.environmentCredential,
   });
   const fence = yield* Semaphore.make(1);
-  const refresh = yield* Semaphore.make(1);
-  const connections = new Set<Effect.Effect<void>>();
+  const refresh = new Map<string, Semaphore.Semaphore>();
+  const connections = new Map<Effect.Effect<void>, string | undefined>();
+  const validThrough = new Map<string, number>();
   let ownerUserId: string | undefined;
-  let validUntil = 0;
   // Coalesce stream checks for five seconds. Idle connections also renew, and a
   // failed renewal drains them within one interval plus the five-second timeout.
   const authorize = (userId: string, force = false) =>
-    refresh.withPermits(1)(
-      Effect.gen(function* () {
-        if (ownerUserId !== undefined && userId !== ownerUserId) return yield* denied();
-        const startedAt = (yield* DateTime.now).epochMilliseconds;
-        if (!force && ownerUserId === userId && startedAt < validUntil) return;
-        yield* Effect.gen(function* () {
-          const access = yield* client.threadEnvironment.checkClientAccess({
-            params: { environmentId, threadId: vm.scope.threadId },
-            payload: { generation: vm.scope.generation, userId },
-          });
-          if (
-            access.environmentId !== environmentId ||
-            access.threadId !== vm.scope.threadId ||
-            access.projectId !== projectId ||
-            access.repositoryId !== vm.scope.repositoryId ||
-            access.generation !== vm.scope.generation ||
-            access.userId !== userId ||
-            (yield* DateTime.now).epochMilliseconds >= startedAt + 5000
-          )
+    Effect.suspend(() => {
+      const key = workflowVm ? userId : "owner";
+      const gate = refresh.get(key) ?? Semaphore.makeUnsafe(1);
+      refresh.set(key, gate);
+      return gate.withPermits(1)(
+        Effect.gen(function* () {
+          if (!workflowVm && ownerUserId !== undefined && userId !== ownerUserId)
             return yield* denied();
-          ownerUserId = userId;
-          validUntil = startedAt + 5000;
-        }).pipe(
-          Effect.timeout("5 seconds"),
-          Effect.mapError(denied),
-          Effect.tapError(() =>
-            Effect.sync(() => {
-              validUntil = 0;
-            }),
-          ),
-        );
-      }),
-    );
+          const startedAt = (yield* DateTime.now).epochMilliseconds;
+          if (!force && startedAt < (validThrough.get(userId) ?? 0)) return;
+          yield* Effect.gen(function* () {
+            const access = yield* client.threadEnvironment.checkClientAccess({
+              params: { environmentId, threadId: vm.scope.threadId },
+              payload: { generation: vm.scope.generation, userId },
+            });
+            if (
+              access.environmentId !== environmentId ||
+              access.threadId !== vm.scope.threadId ||
+              access.projectId !== projectId ||
+              access.repositoryId !== vm.scope.repositoryId ||
+              access.generation !== vm.scope.generation ||
+              access.userId !== userId ||
+              (yield* DateTime.now).epochMilliseconds >= startedAt + 5000
+            )
+              return yield* denied();
+            if (!workflowVm) ownerUserId = userId;
+            validThrough.set(userId, startedAt + 5000);
+          }).pipe(
+            Effect.timeout("5 seconds"),
+            Effect.mapError(denied),
+            Effect.tapError(() =>
+              Effect.sync(() => {
+                validThrough.delete(userId);
+              }),
+            ),
+          );
+        }),
+      );
+    });
   const requireMember = (actor: RepositoryActor) =>
     actor.user ? authorize(actor.user.userId) : Effect.fail(denied());
   const requireProject = (actor: RepositoryActor, requestedProjectId: ProjectId) =>
@@ -103,19 +110,27 @@ export const makeThreadVmRepositoryAccess = Effect.fn("ThreadVmRepositoryAccess.
       Effect.sleep("5 seconds").pipe(
         Effect.andThen(
           Effect.gen(function* () {
-            if (connections.size === 0 || ownerUserId === undefined) return;
-            const allowed = yield* authorize(ownerUserId, true).pipe(Effect.isSuccess);
-            if (allowed) return;
-            const closing = yield* fence.withPermits(1)(
-              Effect.sync(() => {
-                const closing = [...connections];
-                connections.clear();
-                return closing;
+            yield* Effect.forEach(
+              new Set(connections.values()),
+              Effect.fnUntraced(function* (userId) {
+                if (userId === undefined || (yield* authorize(userId, true).pipe(Effect.isSuccess)))
+                  return;
+                const closing = yield* fence.withPermits(1)(
+                  Effect.sync(() => {
+                    const closing = [];
+                    for (const [close, actor] of connections) {
+                      if (actor !== userId) continue;
+                      connections.delete(close);
+                      closing.push(close);
+                    }
+                    return closing;
+                  }),
+                );
+                // A slow old connection cannot hold the admission fence while it drains.
+                yield* Effect.forkScoped(Effect.all(closing, { concurrency: "unbounded" }));
               }),
+              { concurrency: "unbounded", discard: true },
             );
-            // Release the admission fence before draining. A slow old connection
-            // must not prevent revalidation of clients that reconnect meanwhile.
-            yield* Effect.forkScoped(Effect.all(closing, { concurrency: "unbounded" }));
           }),
         ),
       ),
@@ -123,10 +138,11 @@ export const makeThreadVmRepositoryAccess = Effect.fn("ThreadVmRepositoryAccess.
   );
   const access: RepositoryAccessShape = {
     threadId: vm.scope.threadId,
+    ...(workflowVm ? { workflowVm } : {}),
     status: DateTime.now.pipe(
       Effect.map((now) => ({
         enabled: true,
-        ready: now.epochMilliseconds < validUntil,
+        ready: [...validThrough.values()].some((expiry) => now.epochMilliseconds < expiry),
         revision: vm.scope.generation,
       })),
     ),
@@ -149,9 +165,9 @@ export const makeThreadVmRepositoryAccess = Effect.fn("ThreadVmRepositoryAccess.
       ),
     apply: () => Effect.fail(denied()),
     withFence: fence.withPermits(1),
-    registerConnection: (close) =>
+    registerConnection: (close, actor) =>
       Effect.sync(() => {
-        connections.add(close);
+        connections.set(close, actor?.user?.userId ?? ownerUserId);
         return () => {
           connections.delete(close);
         };

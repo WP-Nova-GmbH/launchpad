@@ -7,8 +7,10 @@ import type { SandboxInfo } from "e2b";
 import { threadVmOperationMatches } from "../machines/E2BThreadVmRestoreAttempt.ts";
 import { makeThreadVmResumeStore } from "./ThreadVmResumeStore.ts";
 import { wakeQueuedThreadVm } from "./ThreadVmWakeAdmission.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 
 interface LeaseCandidate {
+  readonly resourceKind: "personal" | "organization_workflow";
   readonly allocationId: string;
   readonly computeRef: string;
   readonly operationId: string;
@@ -47,13 +49,16 @@ export function makeThreadVmLeaseWorker(
   const runOne = Effect.fn("relay.thread_vm.lease.run_one")(function* () {
     const [row] = yield* sql<LeaseCandidate>`SELECT a.allocation_id AS "allocationId",
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
-      a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation,c.operation_id AS "capacityOperationId"
+      a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation,c.operation_id AS "capacityOperationId",
+      a.resource_kind AS "resourceKind"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id AND c.state = 'started'
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
       LEFT JOIN relay_thread_vm_leases l ON l.allocation_id = a.allocation_id
-      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND c.state = 'started'
+      WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'started'
+        AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow'
+          AND p.workflow_snapshot IS NOT NULL AND t.audience='repository' AND t.generation=p.generation))
         AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
         AND p.phase = 'created'
         AND (l.renewed_at IS NULL OR l.renewed_at < clock_timestamp() - interval '4 minutes')
@@ -89,19 +94,54 @@ export function makeThreadVmLeaseWorker(
       // Native paused state releases power capacity, without claiming a sealed
       // source or an independently recoverable backup. GET never wakes it.
       const info = yield* compute.inspect(row.computeRef).pipe(Effect.option);
-      if (info._tag === "Some" && info.value?.state === "paused") {
-        const paused = info.value;
-        if (
-          paused.sandboxId === row.computeRef &&
-          paused.templateId === row.templateId.split(":")[0] &&
-          paused.network?.allowPublicTraffic === false &&
-          paused.lifecycle?.autoResume === false &&
-          paused.metadata["launchpad.managed"] === "thread-vm-v1" &&
-          paused.metadata["launchpad.allocation_id"] === row.allocationId &&
-          threadVmOperationMatches(paused.metadata, row.operationId) &&
-          paused.metadata["launchpad.thread_id"] === row.threadId &&
-          paused.metadata["launchpad.generation"] === String(row.generation)
-        )
+      if (info._tag === "Some") {
+        const sandbox = info.value;
+        const paused =
+          sandbox?.state === "paused" &&
+          sandbox.sandboxId === row.computeRef &&
+          sandbox.templateId === row.templateId.split(":")[0] &&
+          sandbox.network?.allowPublicTraffic === false &&
+          sandbox.lifecycle?.autoResume === false &&
+          sandbox.metadata["launchpad.managed"] === "thread-vm-v1" &&
+          sandbox.metadata["launchpad.allocation_id"] === row.allocationId &&
+          threadVmOperationMatches(sandbox.metadata, row.operationId) &&
+          sandbox.metadata["launchpad.thread_id"] === row.threadId &&
+          sandbox.metadata["launchpad.generation"] === String(row.generation);
+        if (row.resourceKind === "organization_workflow" && (paused || sandbox === null)) {
+          // A successful native lookup returns null only for a definitive sandbox-not-found.
+          const changed = yield* sql.withTransaction(
+            Effect.gen(function* () {
+              const [allocation] = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+                WHERE allocation_id=${row.allocationId} AND resource_kind='organization_workflow'
+                  AND compute_ref=${row.computeRef} AND state='running' AND deleted_at IS NULL FOR UPDATE`;
+              if (!allocation) return false;
+              const [capacity] = yield* sql`UPDATE relay_thread_vm_capacity c SET state='released'
+                WHERE c.operation_id=${row.capacityOperationId} AND c.allocation_id=${row.allocationId}
+                  AND c.compute_ref=${row.computeRef} AND c.host_id=${hostId} AND c.state='started'
+                  AND EXISTS (SELECT 1 FROM relay_thread_vm_provisions p JOIN relay_thread_placements t
+                    ON t.thread_id=${row.threadId} AND t.generation=p.generation
+                    WHERE p.allocation_id=c.allocation_id AND p.operation_id=${row.operationId}
+                      AND p.generation=${row.generation} AND p.workflow_snapshot IS NOT NULL)
+                RETURNING c.operation_id`;
+              if (!capacity) return false;
+              if (paused) {
+                yield* sql`UPDATE relay_thread_vm_allocations SET state='paused' WHERE allocation_id=${row.allocationId}`;
+              } else {
+                yield* sql`UPDATE relay_environment_credentials SET revoked_at=COALESCE(revoked_at,
+                    to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+                    WHERE credential_id IN (SELECT credential_id FROM relay_thread_vm_bindings
+                      WHERE allocation_id=${row.allocationId} AND generation=${row.generation})`;
+                yield* sql`UPDATE relay_thread_vm_bindings SET revoked_at=COALESCE(revoked_at,clock_timestamp())
+                    WHERE allocation_id=${row.allocationId} AND generation=${row.generation}`;
+                yield* sql`UPDATE relay_thread_vm_allocations SET state='deleted',sealed_traffic_access_token=NULL,
+                    deleted_at=to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                    WHERE allocation_id=${row.allocationId}`;
+              }
+              return true;
+            }),
+          );
+          if (changed) yield* wakeWorkflows();
+        } else if (paused)
           yield* sql.withTransaction(
             Effect.gen(function* () {
               if (yield* makeThreadVmResumeStore(sql).reconcileNativePause({ ...row, hostId }))
@@ -116,7 +156,7 @@ export function makeThreadVmLeaseWorker(
         SELECT 1 FROM relay_thread_vm_allocations a
         JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
         JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind=${row.resourceKind} AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
           AND a.state = 'running' AND a.deleted_at IS NULL AND p.phase = 'created'
           AND p.operation_id = ${row.operationId} AND p.generation = ${row.generation}
           AND c.host_id = ${hostId} AND c.state = 'started')`;

@@ -70,6 +70,7 @@ vi.mock("@clerk/react", () => ({
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
+  useLocation: () => undefined,
   useParams: () => ({ repositoryId: "repository", workflowId: fixture.workflowId }),
   useSearch: () => ({ tab: fixture.tab }),
 }));

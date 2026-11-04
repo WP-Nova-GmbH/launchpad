@@ -60,6 +60,26 @@ it("reuses unchanged parsed diffs and replaces changed sections", () => {
   assert.strictEqual(getCachedReviewParsedDiff(changed), updated);
 });
 
+it("keeps workflow review results separate and keys them by the exact patch", () => {
+  const preview = getCachedReviewParsedDiff(reviewInput);
+  const strictInput = { ...reviewInput, strictWorkflowReview: true };
+  const strict = getCachedReviewParsedDiff(strictInput);
+  assert.notStrictEqual(strict, preview);
+  assert.strictEqual(getCachedReviewParsedDiff(strictInput), strict);
+
+  const withWhitespace = getCachedReviewParsedDiff({
+    ...strictInput,
+    diff: `${strictInput.diff}\t `,
+  });
+  assert.notStrictEqual(withWhitespace, strict);
+  if (strict.kind !== "files" || withWhitespace.kind !== "files") {
+    assert.fail("Expected both workflow patches to parse");
+  }
+  assert.notEqual(withWhitespace.files[0]?.cacheKey, strict.files[0]?.cacheKey);
+  assert.equal(withWhitespace.files[0]?.additionLines[0], "export const value = 1;\t ");
+  assert.strictEqual(getCachedReviewParsedDiff(reviewInput), preview);
+});
+
 it("evicts the least recently used section across threads without changing live results or IDs", () => {
   const recentInput = { ...reviewInput, threadKey: "env-local:thread-recent" };
   const oldestInput = { ...reviewInput, threadKey: "env-remote:thread-oldest" };

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -42,12 +43,7 @@ const harness = Effect.fnUntraced(function* (
   fetchFn: typeof fetch,
   initial: ReadonlyArray<ConnectionCatalogEntry> = [],
   expectedPlacement?: { environmentId: EnvironmentId; generation: number },
-  workflowResult?: {
-    accountId: string;
-    organizationId: string;
-    repositoryId: string;
-    originalEnvironmentId: EnvironmentId;
-  },
+  workflowResult?: Parameters<typeof openPortableThreadChat>[0]["workflowResult"],
 ) {
   const registry = AtomRegistry.make();
   yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
@@ -285,6 +281,77 @@ const workflowResult = {
   repositoryId: "repo",
   originalEnvironmentId: EnvironmentId.make("original-machine"),
 };
+const workflowVmResult = {
+  accountId: "owner",
+  organizationId: "org",
+  repositoryId: RelayRepositoryId.make("repo"),
+  jobId: "workflow-job",
+};
+const workflowVmPlacement = {
+  ...placement,
+  audience: "repository",
+  ownerUserId: null,
+  workflowJobId: workflowVmResult.jobId,
+};
+
+it.effect("opens a workflow VM only through its job-scoped ready placement", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const calls: string[] = [];
+      const h = yield* harness(
+        (url, init) => {
+          const request = new Request(url, init);
+          calls.push(new URL(request.url).pathname);
+          expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+          return Promise.resolve(Response.json(workflowVmPlacement));
+        },
+        [],
+        undefined,
+        workflowVmResult,
+      );
+      expect(yield* h.open).toEqual({ environmentId, threadId, workflowVmGeneration: 2 });
+      expect(h.registered).toHaveLength(1);
+      expect(
+        h.registry.get(portableThreadClientRouteAtom(environmentId, threadId))?.generation,
+      ).toBe(2);
+      expect(calls).toEqual([
+        "/v1/repositories/repo/workflow-jobs/workflow-job/result",
+        "/v1/repositories/repo/workflow-jobs/workflow-job/result",
+      ]);
+    }),
+  ),
+);
+
+it.effect("does not connect to an offline or changed workflow VM result", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const invalid of [
+        Response.json(
+          { _tag: "WorkflowInvalidError", message: "The workflow VM is offline." },
+          { status: 400 },
+        ),
+        Response.json({ ...workflowVmPlacement, repositoryId: "other-repo" }),
+        Response.json({ ...workflowVmPlacement, workflowJobId: "other-job" }),
+        Response.json({ ...workflowVmPlacement, generation: 3 }),
+      ]) {
+        let first = true;
+        const h = yield* harness(
+          () => {
+            const response = first ? Response.json(workflowVmPlacement) : invalid;
+            first = false;
+            return Promise.resolve(response);
+          },
+          [],
+          undefined,
+          workflowVmResult,
+        );
+        expect((yield* Effect.result(h.open))._tag).toBe("Failure");
+        expect(h.registered).toEqual([]);
+        expect(h.registry.get(portableThreadClientRouteAtom(environmentId, threadId))).toBeNull();
+      }
+    }),
+  ),
+);
 it.effect("opens a moved workflow result at its verified current environment", () =>
   Effect.scoped(
     Effect.gen(function* () {

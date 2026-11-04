@@ -15,6 +15,7 @@ import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import {
   PUBLISH_AGENT_ACTIVITY_SECRET,
   RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
@@ -228,16 +229,23 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
           getOrCreateRandom: () => Effect.succeed(new Uint8Array()),
           remove: () => Effect.void,
         });
-        const descriptor = yield* Effect.gen(function* () {
+        const readDescriptor = Effect.gen(function* () {
           return yield* (yield* ServerEnvironment.ServerEnvironment).getDescriptor;
         }).pipe(
           Effect.provide(ServerEnvironment.layer),
           Effect.provideService(ServerSecretStore.ServerSecretStore, secrets),
           Effect.provideService(ServerConfig.ServerConfig, config),
         );
+        const descriptor = yield* readDescriptor;
         expect(descriptor.environmentId).toBe(environmentId);
         expect(descriptor.threadVm).toEqual({ threadId: "private-thread" });
+        expect(descriptor.capabilities.workflowVmResultReader).toBe(false);
         expect(encodeTestJson(descriptor)).not.toContain("test-only-credential");
+        const access = yield* RepositoryAccess;
+        const workflow = yield* readDescriptor.pipe(
+          Effect.provideService(RepositoryAccess, { ...access, workflowVm: true }),
+        );
+        expect(workflow.capabilities.workflowVmResultReader).toBe(true);
       }),
   );
 

@@ -31,7 +31,10 @@ export function WorkflowResultReturn({
             screen: "SettingsContent",
             params: {
               screen: "SettingsWorkflowJobs",
-              params: { repositoryId: origin.repositoryId, jobId: origin.jobId },
+              params: {
+                repositoryId: origin.repositoryId,
+                jobId: origin.jobId,
+              },
             },
           })
         }

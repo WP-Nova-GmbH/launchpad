@@ -7,6 +7,7 @@ import { withThreadMoveParticipant } from "./ThreadMovesApi.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { tenancyNotFound, tenancyConflict } from "./tenancyErrors.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
+import { authorizeWorkflowVmGuest, isWorkflowVmThread } from "../jobs/WorkflowVmBinding.ts";
 
 type Owner = { threadId: string; environmentId: string; generation: number };
 /** A quarantined move guest can use its one repository for setup, without execution ownership. */
@@ -57,6 +58,31 @@ export const getThreadVmRepositoryBinding = Effect.fn("relay.api.thread_vm.repos
   function* (input: Owner) {
     const principal = yield* RelayEnvironmentPrincipal,
       sql = (yield* RelayDb).$client;
+    if (yield* isWorkflowVmThread(sql, input.threadId)) {
+      const first = yield* authorizeWorkflowVmGuest(input);
+      const git = yield* (yield* GithubApp).gitMetadata.pipe(
+        Effect.timeoutOrElse({
+          duration: "7 seconds",
+          orElse: () => Effect.succeed({ status: "unknown" as const }),
+        }),
+      );
+      const current = yield* authorizeWorkflowVmGuest(input);
+      if (
+        current.binding.operationId !== first.binding.operationId ||
+        current.snapshot.canonicalKey !== first.snapshot.canonicalKey ||
+        current.snapshot.installationId !== first.snapshot.installationId
+      )
+        return yield* tenancyConflict("thread_placement_changed");
+      return {
+        ...input,
+        environmentId: current.binding.environmentId,
+        threadId: current.binding.threadId,
+        repositoryId: RelayRepositoryId.make(current.binding.repositoryId),
+        operationId: current.binding.operationId,
+        canonicalKey: current.snapshot.canonicalKey,
+        git,
+      };
+    }
     const authorize = withThreadVmRepositoryScope(
       input,
       Effect.gen(function* () {

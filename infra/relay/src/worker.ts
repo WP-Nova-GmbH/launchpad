@@ -26,6 +26,7 @@ import { threadVmPolicyApi } from "./http/ThreadVmPolicyApi.ts";
 
 import * as AutomaticOffers from "./workflowEvents/AutomaticOffer.ts";
 import * as WorkflowWake from "./jobs/WorkflowWake.ts";
+import { workflowVmPreparationLayer } from "./jobs/WorkflowVmPreparation.ts";
 import { workflowEventsRoute } from "./http/WorkflowEventsRoute.ts";
 import { repositoryAccessServerApi } from "./http/RepositoryAccessApi.ts";
 import * as RepositoryPolicies from "./tenancy/RepositoryPolicies.ts";
@@ -317,7 +318,11 @@ export const ApiLive = Api.make(
     const alchemyRuntimeContext: Alchemy.BaseRuntimeContext = yield* Cloudflare.Worker;
     const artifactBucket = yield* Cloudflare.R2.ReadWriteBucket(ThreadArtifactsBucket);
 
-    const threadVmSettings = yield* loadThreadVmRuntimeSettings;
+    const vmSettings = yield* loadThreadVmRuntimeSettings;
+    const threadVmSettings =
+      vmSettings && stage === "prod"
+        ? { ...vmSettings, workflowExecutionEnabled: false }
+        : vmSettings;
     const loadSettings = Effect.gen(function* () {
       return RelayConfiguration.RelayConfiguration.of({
         relayIssuer: relayPublicOrigin,
@@ -370,11 +375,14 @@ export const ApiLive = Api.make(
       }).pipe(Effect.map(makeRelayTraceLayer)),
     );
 
-    const runtimeLayer = Layer.merge(
-      WorkflowWake.layer,
-      Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings }),
-    )
-      .pipe(Layer.provideMerge(AutomaticOffers.layer))
+    const runtimeLayer = WorkflowWake.layer
+      .pipe(
+        Layer.provideMerge(AutomaticOffers.layer),
+        Layer.provideMerge(workflowVmPreparationLayer),
+        Layer.provideMerge(
+          Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings }),
+        ),
+      )
       .pipe(
         Layer.provideMerge(MobileRegistrations.layer),
         Layer.provideMerge(AgentActivityPublisher.layer),

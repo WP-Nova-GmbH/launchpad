@@ -1,4 +1,5 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
+import { DEFAULT_WORKFLOW_VM_LIMIT } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { lockWorkflowVmOrganization } from "./WorkflowVmPolicyLock.ts";
@@ -14,6 +15,10 @@ interface CapacityRequest {
   readonly kind: "create" | "resume";
   readonly state: "waiting" | "reserved" | "started" | "released";
   readonly computeRef: string | null;
+}
+interface OrderedCapacityAdmission {
+  readonly workflowEnabled: boolean;
+  readonly workflowOperationId?: string;
 }
 const conflict = (message: string) => new ThreadVmCapacityConflict({ message });
 
@@ -80,10 +85,26 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
       }),
     );
   });
+  /** Cheap preflight only. Admission repeats both limits under their locks. */
+  const hasWorkflowSlot = Effect.fnUntraced(function* (hostId: string, organizationId: string) {
+    const [capacity] = yield* sql<{ available: boolean }>`SELECT EXISTS (
+      SELECT 1 FROM relay_thread_vm_hosts h WHERE h.host_id=${hostId}
+        AND h.max_running_vms>(SELECT count(*) FROM relay_thread_vm_capacity c
+          WHERE c.host_id=h.host_id AND c.state IN ('reserved','started'))
+    ) AND COALESCE((SELECT max_running_workflow_vms FROM relay_thread_vm_policies
+      WHERE organization_id=${organizationId}),${DEFAULT_WORKFLOW_VM_LIMIT}) > (
+        SELECT count(*) FROM relay_thread_vm_capacity c JOIN relay_thread_vm_allocations a USING(allocation_id)
+        WHERE a.organization_id=${organizationId} AND a.resource_kind='organization_workflow'
+          AND c.state IN ('reserved','started')
+    ) AS available`;
+    return capacity?.available === true;
+  });
   const admitNext = Effect.fn("relay.vm_capacity.admit_next")(function* (
     hostId: string,
-    scope: "personal" | "all" = "personal",
+    scope: "personal" | "all" | OrderedCapacityAdmission = "personal",
   ) {
+    const ordered = typeof scope === "object" ? scope : null;
+    const workflowOperationId = ordered?.workflowOperationId;
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         // Serializes admission and limit edits across relay instances. No expiring
@@ -102,24 +123,55 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
           operationId: string;
           organizationId: string;
           resourceKind: "personal" | "organization_workflow";
+          requiresFreeze: boolean;
         }>`SELECT c.operation_id AS "operationId", a.organization_id AS "organizationId",
-          a.resource_kind AS "resourceKind" FROM relay_thread_vm_capacity c
+          a.resource_kind AS "resourceKind", ${
+            ordered
+              ? sql`EXISTS (
+            SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+            WHERE t.thread_id=a.thread_id AND j.status='queued')`
+              : sql`false`
+          } AS "requiresFreeze"
+          FROM relay_thread_vm_capacity c
         JOIN relay_thread_vm_allocations a USING (allocation_id)
         WHERE a.runtime_protocol='native-v1' AND c.host_id = ${hostId} AND c.state = 'waiting' AND a.state IN ('creating', 'paused')
-          AND (a.resource_kind='personal' OR (${scope === "all"} AND a.resource_kind='organization_workflow'
+          AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow'
+            AND ${
+              scope === "all"
+                ? sql`true`
+                : ordered?.workflowEnabled
+                  ? sql`EXISTS (
+              SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j
+                ON j.job_id=t.workflow_job_id AND j.organization_id=t.organization_id AND j.repository_id=t.repository_id
+              JOIN relay_codex_vm_connections x ON x.organization_id=j.organization_id
+                AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND x.status='connected'
+                AND (x.refresh_started_at IS NULL OR x.refresh_started_at::timestamptz > clock_timestamp() - interval '6 seconds')
+              LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
+              WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND t.operation_id=c.operation_id
+                AND j.pending_control IS NULL AND ((j.status='queued' AND p.allocation_id IS NULL
+                  AND j.record#>>'{queueReason,code}'='vm_waiting_capacity') OR
+                  (j.status='preparing' AND p.phase='pending' AND p.workflow_snapshot IS NOT NULL
+                    AND p.retry_at<=clock_timestamp())))`
+                  : sql`false`
+            }
             AND (SELECT count(*) FROM relay_thread_vm_capacity occupied
               JOIN relay_thread_vm_allocations charged ON charged.allocation_id=occupied.allocation_id
               WHERE charged.organization_id=a.organization_id AND charged.resource_kind='organization_workflow'
                 AND occupied.state IN ('reserved','started')) < COALESCE((
                   SELECT max_running_workflow_vms FROM relay_thread_vm_policies
-                  WHERE organization_id=a.organization_id),10)))
+                  WHERE organization_id=a.organization_id),${DEFAULT_WORKFLOW_VM_LIMIT})))
         ORDER BY c.position LIMIT 1`;
-        if (!row) return null;
+        if (
+          !row ||
+          (workflowOperationId !== undefined && row.operationId !== workflowOperationId) ||
+          (row.requiresFreeze && row.operationId !== workflowOperationId)
+        )
+          return null;
         if (row.resourceKind === "organization_workflow") {
           yield* lockWorkflowVmOrganization(sql, row.organizationId);
           const [organization] = yield* sql<{ limit: number; used: number }>`SELECT
             COALESCE((SELECT max_running_workflow_vms FROM relay_thread_vm_policies
-              WHERE organization_id=${row.organizationId}),10) AS "limit",
+              WHERE organization_id=${row.organizationId}),${DEFAULT_WORKFLOW_VM_LIMIT}) AS "limit",
             (SELECT count(*)::int FROM relay_thread_vm_capacity c
               JOIN relay_thread_vm_allocations a USING(allocation_id)
               WHERE a.organization_id=${row.organizationId} AND a.resource_kind='organization_workflow'
@@ -179,6 +231,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
     get,
     configure,
     request,
+    hasWorkflowSlot,
     admitNext,
     beginExecution,
     recordCreated,

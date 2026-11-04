@@ -11,6 +11,7 @@ import {
 import {
   RepositoryWorkflow,
   WorkflowMachineTarget,
+  WorkflowVmDispatchBinding,
   WorkflowJobProgress,
   WorkflowReviewCheckpoint,
   WorkflowResponseSummary,
@@ -25,9 +26,15 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { getPromptQueue } from "../persistence/ProjectionPromptQueues.ts";
 import { BootEvidence } from "../terminal/SetupProcessAdapter.ts";
 import { ownershipReleased } from "./workflowOwnership.ts";
 import { classifyApprovalRequest } from "./approvalClassification.ts";
+import {
+  admittedWorkflowTurnId,
+  canRecoverPausedWorkflowTurn,
+  workflowPromptId,
+} from "./workflowSequence.ts";
 
 const decodeOrigin = Schema.decodeUnknownSync(WorkflowOrigin);
 
@@ -63,6 +70,7 @@ export const WorkflowActionRecord = Schema.Struct({
   parent: Schema.String,
   tree: Schema.String,
   checkpointRef: Schema.String,
+  checkpointTurnId: Schema.optional(Schema.String),
   commitMessage: Schema.NullOr(Schema.String),
   commitSha: Schema.NullOr(Schema.String),
   oldRemoteSha: Schema.NullOr(Schema.String),
@@ -84,6 +92,10 @@ export const WorkflowActionRecord = Schema.Struct({
   ),
 });
 export type WorkflowActionRecord = typeof WorkflowActionRecord.Type;
+const WorkflowRunRuntime = Schema.Union([
+  WorkflowMachineTarget,
+  Schema.Struct({ ...WorkflowVmDispatchBinding.fields, kind: Schema.Literal("vm") }),
+]);
 export const WorkflowRun = Schema.Struct({
   actions: Schema.optional(Schema.Array(WorkflowActionRecord)),
   publication: Schema.optional(
@@ -117,7 +129,7 @@ export const WorkflowRun = Schema.Struct({
   repositoryCanonicalKey: Schema.String,
   instruction: Schema.String,
   workflow: RepositoryWorkflow,
-  runtime: WorkflowMachineTarget,
+  runtime: WorkflowRunRuntime,
   progress: WorkflowJobProgress,
   modelSelection: ModelSelection,
   baseBranch: Schema.String,
@@ -194,7 +206,7 @@ const readStoredRun = Schema.decodeUnknownSync(
     Schema.Struct({
       ...WorkflowRun.fields,
       workflow: Schema.Unknown,
-      runtime: Schema.optional(WorkflowMachineTarget),
+      runtime: Schema.optional(WorkflowRunRuntime),
     }),
   ),
 );
@@ -203,8 +215,17 @@ const decode = (json: string): WorkflowRun => {
   const stored = readStoredRun(json);
   const workflow = normalizeStoredWorkflow(stored.workflow);
   const runtime = stored.runtime ?? workflow.definition.target;
-  if (runtime.kind !== "machine") throw new Error("Unsupported persisted workflow runtime.");
+  if (runtime.kind === "vm" && !("threadId" in runtime))
+    throw new Error("Incomplete persisted workflow VM binding.");
   const run = decodeRun({ ...stored, workflow, runtime });
+  if (
+    run.runtime.kind === "vm" &&
+    (run.runtime.jobId !== run.jobId ||
+      run.runtime.threadId !== run.progress.threadId ||
+      run.runtime.organizationId !== workflow.organizationId ||
+      run.runtime.repositoryId !== workflow.repositoryId)
+  )
+    throw new Error("Invalid persisted workflow VM binding.");
   const origin = workflowRunOrigin(run);
   if (
     origin.kind === "manual"
@@ -219,10 +240,54 @@ const decode = (json: string): WorkflowRun => {
 };
 const encode = Schema.encodeSync(Schema.fromJsonString(WorkflowRun));
 
+export interface WorkflowCheckpointPin {
+  readonly checkpointRef: string;
+  readonly commitId: string;
+  readonly treeId: string;
+  readonly baselineCommitId: string;
+}
+
+export type LegacyWorkflowTurnOutcome = "completed" | "failed" | "checkpoint-error";
+
 export const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const activeVmFence = (binding: WorkflowVmDispatchBinding) => sql`EXISTS (
+    SELECT 1 FROM thread_execution_fences f WHERE f.thread_id=${binding.threadId}
+      AND f.environment_id=${binding.environmentId} AND f.generation=${binding.generation}
+      AND f.operation_id=${binding.operationId} AND f.project_id=${binding.projectId}
+      AND f.phase='active' AND NOT EXISTS (
+        SELECT 1 FROM thread_move_source_reopens r WHERE r.operation_id=f.operation_id
+          AND r.thread_id=f.thread_id AND r.relay_url=f.relay_url
+          AND r.environment_id=f.environment_id AND r.generation=f.generation))`;
+  const pinColumns = sql`p.checkpoint_ref AS "checkpointRef", p.commit_id AS "commitId",
+    p.tree_id AS "treeId", p.baseline_commit_id AS "baselineCommitId"`;
+  const pinBinding = (binding: WorkflowVmDispatchBinding) => sql`
+    p.job_id=${binding.jobId} AND p.thread_id=${binding.threadId}
+    AND p.allocation_id=${binding.allocationId} AND p.operation_id=${binding.operationId}
+    AND p.environment_id=${binding.environmentId} AND p.generation=${binding.generation}`;
+  const getCheckpointPinForRun = (
+    binding: WorkflowVmDispatchBinding,
+    turnId: string,
+    checkpointRef: string,
+    preparationAttemptId?: string | null,
+  ) =>
+    sql<WorkflowCheckpointPin>`SELECT ${pinColumns} FROM workflow_vm_checkpoint_pins p
+      WHERE ${pinBinding(binding)} AND p.turn_id=${turnId} AND p.checkpoint_ref=${checkpointRef}
+        AND ${
+          preparationAttemptId === undefined
+            ? sql`TRUE`
+            : sql`p.preparation_attempt_id IS ${preparationAttemptId}`
+        }`.pipe(
+      Effect.map((rows) => rows[0] ?? null),
+      Effect.orDie,
+    );
+  const noPromptHandoff = (threadId: string) => sql`NOT EXISTS (
+    SELECT 1 FROM orchestration_events
+    WHERE aggregate_kind='thread' AND stream_id=${threadId}
+      AND event_type='thread.prompt-queue-changed'
+      AND json_extract(payload_json, '$.handoff.attemptId') IS NOT NULL)`;
   const canonicalPath = (cwd: string) =>
     fs.realPath(path.resolve(cwd)).pipe(Effect.orElseSucceed(() => path.resolve(cwd)));
   const get = (jobId: string) =>
@@ -290,7 +355,146 @@ export const make = Effect.gen(function* () {
   });
   return {
     get,
+    getLegacyTurnOutcome: (threadId: string, turnId: string) =>
+      sql<{ pauseCode: string | null; wasEnabled: number }>`
+        SELECT json_extract(e.payload_json, '$.control.pauseReason.code') AS "pauseCode",
+          COALESCE((
+            SELECT json_extract(previous.payload_json, '$.control.enabled')
+            FROM orchestration_events previous
+            WHERE previous.aggregate_kind = 'thread' AND previous.stream_id = e.stream_id
+              AND previous.event_type = 'thread.prompt-queue-changed'
+              AND previous.sequence < e.sequence
+              AND json_type(previous.payload_json, '$.control.enabled') IN ('true', 'false')
+            ORDER BY previous.sequence DESC LIMIT 1
+          ), 1) AS "wasEnabled"
+        FROM orchestration_events e
+        WHERE e.aggregate_kind = 'thread' AND e.stream_id = ${threadId}
+          AND e.event_type = 'thread.prompt-queue-changed'
+          AND json_extract(e.payload_json, '$.finalizedTurnId') = ${turnId}
+          AND instr(e.event_id, e.command_id || ':thread.queue.finalize:queue:') = 1
+        ORDER BY e.sequence DESC LIMIT 1`.pipe(
+        Effect.map(([event]): LegacyWorkflowTurnOutcome | null => {
+          if (!event) return null;
+          if (event.pauseCode === "checkpoint-error") return "checkpoint-error";
+          if (event.pauseCode === "failed" || event.pauseCode === "usage-limit") return "failed";
+          // An old disabled queue could finalize a failure without a control delta.
+          if (event.pauseCode === "stopped" || (event.pauseCode === null && event.wasEnabled === 1))
+            return "completed";
+          return null;
+        }),
+        Effect.orDie,
+      ),
+    getCheckpointPinForRun,
+    getWorkflowIgnoreRules: (binding: WorkflowVmDispatchBinding) =>
+      sql<{ workflowIgnoreRules: Uint8Array | null }>`
+        SELECT p.workflow_ignore_rules AS "workflowIgnoreRules" FROM workflow_vm_checkpoint_pins p
+        WHERE ${pinBinding(binding)} AND p.turn_id=''`.pipe(
+        Effect.map((rows) => {
+          const rules = rows[0]?.workflowIgnoreRules;
+          return rules ? new Uint8Array(rules) : null;
+        }),
+        Effect.orDie,
+      ),
+    canPinInitialCheckpoint: (binding: WorkflowVmDispatchBinding) =>
+      sql`SELECT 1 WHERE ${activeVmFence(binding)} AND ${noPromptHandoff(binding.threadId)}`.pipe(
+        Effect.map((rows) => rows.length > 0),
+        Effect.orDie,
+      ),
+    getCheckpointPinForTurn: (threadId: string, turnId: string, turnCount: number) =>
+      sql<WorkflowCheckpointPin>`SELECT ${pinColumns} FROM workflow_vm_checkpoint_pins p
+        JOIN repository_workflow_jobs j ON j.job_id=p.job_id AND j.thread_id=p.thread_id
+        WHERE p.thread_id=${threadId} AND p.turn_id=${turnId} AND p.turn_count=${turnCount}
+          AND json_extract(j.record_json,'$.runtime.kind')='vm'
+          AND json_extract(j.record_json,'$.runtime.allocationId')=p.allocation_id
+          AND json_extract(j.record_json,'$.runtime.operationId')=p.operation_id
+          AND json_extract(j.record_json,'$.runtime.environmentId')=p.environment_id
+          AND json_extract(j.record_json,'$.runtime.generation')=p.generation`.pipe(
+        Effect.map((rows) => (rows.length === 1 ? rows[0]! : null)),
+        Effect.orDie,
+      ),
+    saveCheckpointPin: (
+      binding: WorkflowVmDispatchBinding,
+      turnId: string,
+      turnCount: number,
+      pin: WorkflowCheckpointPin,
+      preparationAttemptId: string | null = null,
+      expectedPreparationRevision?: number | null,
+      workflowIgnoreRules?: Uint8Array,
+    ) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const [job] = yield* sql<{ status: string; record_json: string }>`
+            SELECT j.status, j.record_json FROM repository_workflow_jobs j
+            WHERE j.job_id=${binding.jobId} AND j.thread_id=${binding.threadId}
+              AND j.execution_reserved=1
+              AND (j.status IN ('preparing', 'running') OR (${turnId !== ""} AND j.status='paused'))
+              AND json_extract(j.record_json,'$.runtime.kind')='vm'
+              AND json_extract(j.record_json,'$.runtime.allocationId')=${binding.allocationId}
+              AND json_extract(j.record_json,'$.runtime.operationId')=${binding.operationId}
+              AND json_extract(j.record_json,'$.runtime.environmentId')=${binding.environmentId}
+              AND json_extract(j.record_json,'$.runtime.generation')=${binding.generation}
+              AND ${activeVmFence(binding)}
+              AND ${turnId === "" ? noPromptHandoff(binding.threadId) : sql`TRUE`}
+              AND ${
+                expectedPreparationRevision === undefined
+                  ? sql`TRUE`
+                  : sql`EXISTS (
+                SELECT 1 FROM projection_thread_prompt_queues q WHERE q.thread_id=j.thread_id
+                AND json_extract(q.state_json,'$.preparation.attemptId') IS ${preparationAttemptId}
+                AND json_extract(q.state_json,'$.preparation.revision') IS ${expectedPreparationRevision}
+                AND (${expectedPreparationRevision === null} OR json_extract(q.state_json,'$.preparation.state')='ready')
+              )`
+              }`;
+            if (!job) return null;
+            if (job.status === "paused") {
+              const run = decode(job.record_json);
+              if (!canRecoverPausedWorkflowTurn(run)) return null;
+              const queue = yield* getPromptQueue(sql, binding.threadId);
+              if (
+                queue?.awaitingTurnId !== turnId ||
+                queue.finalizedTurnId === turnId ||
+                admittedWorkflowTurnId(queue, workflowPromptId(run)) !== turnId
+              )
+                return null;
+            }
+            yield* sql`INSERT INTO workflow_vm_checkpoint_pins (
+            job_id, thread_id, allocation_id, operation_id, environment_id, generation,
+            turn_id, turn_count, preparation_attempt_id, checkpoint_ref, commit_id, tree_id,
+            baseline_commit_id, workflow_ignore_rules
+          ) VALUES (
+            ${binding.jobId}, ${binding.threadId}, ${binding.allocationId}, ${binding.operationId},
+            ${binding.environmentId}, ${binding.generation}, ${turnId}, ${turnCount},
+            ${preparationAttemptId}, ${pin.checkpointRef}, ${pin.commitId}, ${pin.treeId},
+            ${pin.baselineCommitId}, ${turnId === "" ? (workflowIgnoreRules ?? null) : null}
+          ) ON CONFLICT DO UPDATE SET
+            preparation_attempt_id=excluded.preparation_attempt_id,
+            checkpoint_ref=excluded.checkpoint_ref, commit_id=excluded.commit_id,
+            tree_id=excluded.tree_id, baseline_commit_id=excluded.baseline_commit_id,
+            workflow_ignore_rules=excluded.workflow_ignore_rules
+          WHERE ${turnId === "" && expectedPreparationRevision !== undefined}
+            AND workflow_vm_checkpoint_pins.preparation_attempt_id IS NOT excluded.preparation_attempt_id`;
+            return yield* getCheckpointPinForRun(
+              binding,
+              turnId,
+              pin.checkpointRef,
+              preparationAttemptId,
+            );
+          }),
+        )
+        .pipe(Effect.orDie),
     getCancellation,
+    isWorkflowVmThread: (threadId: string) =>
+      sql`SELECT 1 FROM repository_workflow_jobs
+      WHERE thread_id=${threadId} AND json_extract(record_json, '$.runtime.kind')='vm' LIMIT 1`.pipe(
+        Effect.orDie,
+        Effect.map((rows) => rows.length > 0),
+      ),
+    isVmFenceActive: (binding: WorkflowVmDispatchBinding) =>
+      sql`SELECT 1 WHERE ${activeVmFence(binding)}`.pipe(
+        Effect.orDie,
+        Effect.map((rows) => rows.length > 0),
+      ),
     cancelBeforeAcceptance: (cancellation: WorkflowCancellation) =>
       sql
         .withTransaction(
@@ -312,6 +516,7 @@ export const make = Effect.gen(function* () {
       sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json)
         SELECT ${run.jobId}, ${run.progress.threadId}, ${run.progress.status}, ${run.executionReserved ? 1 : 0}, ${encode({ ...run, origin: workflowRunOrigin(run) })}
         WHERE NOT EXISTS (SELECT 1 FROM repository_workflow_cancellations WHERE job_id = ${run.jobId})
+          AND ${run.runtime.kind === "vm" ? activeVmFence(run.runtime) : sql`TRUE`}
         ON CONFLICT DO NOTHING RETURNING job_id`.pipe(
         Effect.orDie,
         Effect.map((rows) => rows.length > 0),
@@ -324,6 +529,15 @@ export const make = Effect.gen(function* () {
         Effect.map((rows) => {
           const run = rows[0] ? decode(rows[0].record_json) : null;
           return run && !ownershipReleased(run) ? run : null;
+        }),
+      ),
+    getVmBindingForThread: (threadId: string) =>
+      sql<{ record_json: string }>`SELECT record_json FROM repository_workflow_jobs
+        WHERE thread_id=${threadId} AND json_extract(record_json, '$.runtime.kind')='vm'`.pipe(
+        Effect.orDie,
+        Effect.map(([row]) => {
+          const runtime = row ? decode(row.record_json).runtime : null;
+          return runtime?.kind === "vm" ? runtime : null;
         }),
       ),
     isExecuting: (exceptJobId = "") =>
@@ -450,9 +664,18 @@ export class WorkflowRunStore extends Context.Reference<WorkflowRunStoreShape>(
   {
     defaultValue: () => ({
       get: () => Effect.succeed(null),
+      getLegacyTurnOutcome: () => Effect.succeed(null),
+      getCheckpointPinForRun: () => Effect.succeed(null),
+      getWorkflowIgnoreRules: () => Effect.succeed(null),
+      canPinInitialCheckpoint: () => Effect.succeed(false),
+      getCheckpointPinForTurn: () => Effect.succeed(null),
+      saveCheckpointPin: () => Effect.succeed(null),
       getCancellation: () => Effect.succeed(null),
+      isWorkflowVmThread: () => Effect.succeed(false),
+      isVmFenceActive: () => Effect.succeed(false),
       cancelBeforeAcceptance: () => Effect.succeed({ run: null, cancellation: null }),
       getByThread: () => Effect.succeed(null),
+      getVmBindingForThread: () => Effect.succeed(null),
       active: () => Effect.succeed([]),
       owners: () => Effect.succeed([]),
       isExecuting: () => Effect.succeed(false),

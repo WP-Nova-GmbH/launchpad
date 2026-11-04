@@ -2,6 +2,7 @@ import { parsePatchFiles } from "@pierre/diffs/utils/parsePatchFiles";
 import type { ChangeTypes, FileDiffMetadata } from "@pierre/diffs/types";
 import type { OrchestrationCheckpointSummary, ReviewDiffPreviewSource } from "@t3tools/contracts";
 import { unquoteGitPatchPath } from "@t3tools/shared/gitPatchPath";
+import { strictGitPatchFallbackReason } from "@t3tools/shared/gitPatchReview";
 import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
 import * as Order from "effect/Order";
@@ -219,14 +220,9 @@ function fnv1a32(input: string, seed: number, multiplier: number): number {
 }
 
 function buildPatchCacheKey(patch: string, scope: string): string {
-  const normalizedPatch = patch.trim();
-  const primary = fnv1a32(normalizedPatch, FNV_OFFSET_BASIS_32, FNV_PRIME_32).toString(36);
-  const secondary = fnv1a32(
-    normalizedPatch,
-    SECONDARY_HASH_SEED,
-    SECONDARY_HASH_MULTIPLIER,
-  ).toString(36);
-  return `${scope}:${normalizedPatch.length}:${primary}:${secondary}`;
+  const primary = fnv1a32(patch, FNV_OFFSET_BASIS_32, FNV_PRIME_32).toString(36);
+  const secondary = fnv1a32(patch, SECONDARY_HASH_SEED, SECONDARY_HASH_MULTIPLIER).toString(36);
+  return `${scope}:${patch.length}:${primary}:${secondary}`;
 }
 
 function getFileExtension(path: string): string | null {
@@ -470,13 +466,11 @@ export function getDefaultReviewSectionId(
 export function buildReviewParsedDiff(
   diff: string | null | undefined,
   cacheScope: string,
+  strictWorkflowReview = false,
 ): ReviewParsedDiff {
-  const normalized = diff?.trim();
-  if (!normalized) {
-    return { kind: "empty" };
-  }
-
-  const { text, truncated } = splitTruncationMarker(normalized);
+  const { text, truncated } = strictWorkflowReview
+    ? { text: diff ?? "", truncated: false }
+    : splitTruncationMarker(diff?.trim() ?? "");
   if (text.length === 0) {
     return { kind: "empty" };
   }
@@ -484,16 +478,28 @@ export function buildReviewParsedDiff(
   const notice = truncated
     ? "Diff output hit the server size cap. Showing the available excerpt."
     : null;
+  const fallbackReason = strictWorkflowReview ? strictGitPatchFallbackReason(text) : null;
+  if (fallbackReason) return { kind: "raw", text, reason: fallbackReason, notice };
 
   try {
     const parsedPatches = runDiffParserSilently(() =>
-      parsePatchFiles(text, buildPatchCacheKey(text, cacheScope)),
+      parsePatchFiles(text, buildPatchCacheKey(text, cacheScope), strictWorkflowReview),
     );
-    const files = pipe(
-      parsedPatches,
-      Arr.flatMap((patch) => patch.files),
-      Arr.map(mapRenderableFile),
-    );
+    const parsedFiles = parsedPatches.flatMap((patch) => patch.files);
+    if (
+      strictWorkflowReview &&
+      parsedFiles.some((file) =>
+        file.hunks.some((hunk) => hunk.noEOFCRAdditions || hunk.noEOFCRDeletions),
+      )
+    ) {
+      return {
+        kind: "raw",
+        text,
+        reason: "Showing the raw patch to include changes to the final newline.",
+        notice,
+      };
+    }
+    const files = parsedFiles.map(mapRenderableFile);
 
     if (files.length === 0) {
       return {

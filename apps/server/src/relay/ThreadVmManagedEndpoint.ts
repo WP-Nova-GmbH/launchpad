@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { CloudManagedEndpointRuntime } from "../cloud/ManagedEndpointRuntime.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
@@ -61,12 +62,26 @@ export const runThreadVmManagedEndpointWith = <E, R>(input: {
   });
 
 export const runThreadVmManagedEndpoint = Effect.gen(function* () {
+  if (yield* managedTunnelsDisabled) return;
   const vm = yield* readInstalledThreadVm();
   const environmentId = yield* (yield* ServerEnvironmentIdentity).getEnvironmentId;
   if (!vm || vm.environmentId !== environmentId) return yield* new ThreadVmManagedEndpointError();
   const url = normalizeSecureRelayUrl(vm.relayUrl),
     issuer = normalizeSecureRelayUrl(vm.relayIssuer);
   if (!url || !issuer) return yield* new ThreadVmManagedEndpointError();
+  const sql = yield* SqlClient.SqlClient;
+  // Opening a cancelled source's local fence precedes its relay acknowledgement.
+  // Read the fence and pending acknowledgement in one snapshot before the first recovery.
+  yield* sql<{ relayUrl: string }>`SELECT f.relay_url AS "relayUrl"
+    FROM thread_execution_fences f WHERE f.thread_id=${vm.scope.threadId}
+    AND f.environment_id=${environmentId} AND f.generation=${vm.scope.generation} AND f.phase='active'
+    AND NOT EXISTS (SELECT 1 FROM thread_move_source_reopens r
+      WHERE r.operation_id=f.operation_id AND r.thread_id=f.thread_id AND r.relay_url=f.relay_url
+      AND r.environment_id=f.environment_id AND r.generation=f.generation)`.pipe(
+    Effect.map(([fence]) => !!fence && normalizeSecureRelayUrl(fence.relayUrl) === url),
+    Effect.orElseSucceed(() => false),
+    Effect.repeat({ until: (ready: boolean) => ready, schedule: Schedule.spaced("500 millis") }),
+  );
   const client = yield* makeExecutorRelayApiClient({
     url,
     issuer,

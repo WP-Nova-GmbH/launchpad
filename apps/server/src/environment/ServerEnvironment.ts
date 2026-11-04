@@ -283,6 +283,7 @@ export const make = Effect.gen(function* () {
           threadMoves: policy.enabled || relayLinked,
           organizationRepositoryAccess: policy.enabled,
           repositoryPolicyReady: policy.ready,
+          workflowVmResultReader: repositoryAccess.workflowVm === true,
         },
       };
     }),

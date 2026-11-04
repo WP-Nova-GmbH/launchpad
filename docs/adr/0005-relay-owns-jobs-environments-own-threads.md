@@ -22,15 +22,19 @@ thread**. The relay never models a turn.
 A pipeline step compiles down to: _create thread T in project P on executor E, with these
 instructions, this provider instance, this runtime mode — report when it settles._
 
-A repository workflow selects its execution environment explicitly. V1 targets enrolled
-organization environments, including self-hosted machines, so jobs and human checkpoints use
-repository-shared access. Owner-only personal environments would require a separate sharing
-policy before they can host repository workflows. Event-triggered jobs stay
-queued at the relay while that environment is offline, rather than being routed to another
-machine. This keeps the chosen checkout and execution context predictable, and lets the relay
-accept external events independently of environment availability. Queued jobs use the workflow's
-current definition when dispatched. Once execution starts, that definition stays fixed through
-human checkpoints and rework; later workflow edits apply to queued and future jobs.
+A repository workflow selects its execution target explicitly. Enrolled organization environments,
+including self-hosted machines, retain their existing execution path. VM-backed jobs obtain a
+dedicated thread VM and use repository-shared access for their work and human checkpoints;
+allocation ownership does not grant access to private content. Unfinished VM-backed jobs remain
+in VM execution through human waits and rework. Normal environment moves become available only
+after completion or cancellation and confirmed cleanup releases workflow ownership.
+
+Machine-targeted jobs stay queued at the relay while their selected environment is offline;
+VM-backed jobs wait for execution capacity. Event admission remains independent of environment
+availability. Jobs that have not begun preparation use the workflow's current definition.
+VM-backed jobs fix that definition and their starting Git commit when VM preparation begins,
+preserving them through human checkpoints and rework. Later edits apply to jobs whose preparation
+has not begun.
 
 Withdrawing an automation connection or its repository authorization stops new event admission
 and queued jobs that have not entered a job handoff. A job already being offered may finish

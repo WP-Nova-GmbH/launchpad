@@ -1,6 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
-import { RelayThreadVmSetupInput } from "@t3tools/contracts/relay";
+import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  RelayThreadVmCheckoutFailureProbe,
+  RelayThreadVmSetupInput,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
@@ -60,14 +63,52 @@ const receipt = {
 };
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeInput = Schema.decodeUnknownSync(Schema.fromJsonString(RelayThreadVmSetupInput));
+const decodeProbe = Schema.decodeUnknownSync(
+  Schema.fromJsonString(RelayThreadVmCheckoutFailureProbe),
+);
 const fixture = () => {
   const transport = vi.fn<typeof fetch>(async () => Response.json(info));
-  const guest = vi.fn(async (_connection: unknown, _payload: Redacted.Redacted<string>) =>
-    encode({ status: "prepared", receipt }),
+  const guest = vi.fn(
+    async (
+      _connection: unknown,
+      _payload: Redacted.Redacted<string>,
+      _probe?: { readonly signal: AbortSignal },
+    ) => encode({ status: "prepared", receipt }),
   );
-  return { transport, guest, prepare: makeE2BThreadVmSetup(settings, transport, guest) };
+  return { transport, guest, ...makeE2BThreadVmSetup(settings, transport, guest) };
 };
 describe("E2B guest preparation delivery", () => {
+  it.effect("uses the private read-only recovery mode with no credentials in its payload", () =>
+    Effect.gen(function* () {
+      const f = fixture();
+      const request = {
+        environmentId: EnvironmentId.make("environment"),
+        workspace: input.workspace,
+      };
+      const probe = f.recoverCheckoutFailure("sandbox", {
+        ...request,
+        templateId: settings.templateId,
+      });
+      f.guest.mockResolvedValueOnce(encode({ failureCode: "repository_unavailable" }));
+      expect(yield* probe).toBe("repository_unavailable");
+      const [, payload, mode] = f.guest.mock.calls[0]!;
+      expect(mode?.signal).toBeInstanceOf(AbortSignal);
+      expect(decodeProbe(Redacted.value(payload))).toEqual(request);
+      expect(Redacted.value(payload)).not.toContain("secret");
+
+      f.guest.mockResolvedValueOnce(encode({ failureCode: null }));
+      expect(yield* probe).toBeNull();
+      for (const reply of [
+        { status: "blocked", code: "repository_unavailable" },
+        { failureCode: "setup_unconfirmed" },
+        { status: "prepared", receipt },
+      ]) {
+        f.guest.mockResolvedValueOnce(encode(reply));
+        expect(yield* Effect.isFailure(probe)).toBe(true);
+      }
+    }),
+  );
+
   it.effect(
     "uses non-waking discovery, delivers the exact intent and accepts only frozen readiness",
     () =>

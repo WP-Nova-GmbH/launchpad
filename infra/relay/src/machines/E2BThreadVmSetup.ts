@@ -1,29 +1,47 @@
 import { Sandbox } from "e2b";
-import { RelayThreadVmSetupInput, RelayThreadVmSetupReply } from "@t3tools/contracts/relay";
+import {
+  RelayThreadVmCheckoutFailureProbe,
+  RelayThreadVmCheckoutFailureReply,
+  RelayThreadVmSetupInput,
+  RelayThreadVmSetupReply,
+  RelayThreadVmWorkflowSetupEnvelope,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { ThreadVmComputeError, type E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
-import { inspectE2BThreadVmConnection } from "./E2BThreadVmConnection.ts";
+import { inspectE2BThreadVmConnection, type E2BThreadVmIdentity } from "./E2BThreadVmConnection.ts";
 
 const encodeInput = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmSetupInput));
+const encodeWorkflowInput = Schema.encodeEffect(
+  Schema.fromJsonString(RelayThreadVmWorkflowSetupEnvelope),
+);
 const decodeReply = Schema.decodeUnknownSync(Schema.fromJsonString(RelayThreadVmSetupReply));
+const encodeCheckoutProbe = Schema.encodeEffect(
+  Schema.fromJsonString(RelayThreadVmCheckoutFailureProbe),
+);
+const decodeCheckoutFailure = Schema.decodeUnknownSync(
+  Schema.fromJsonString(RelayThreadVmCheckoutFailureReply),
+);
 type GuestSetup = (
   connection: ConstructorParameters<typeof Sandbox>[0],
   payload: Redacted.Redacted<string>,
+  probe?: { readonly signal: AbortSignal },
 ) => Promise<string>;
-const runGuest: GuestSetup = async (connection, payload) => {
+const runGuest: GuestSetup = async (connection, payload, probe) => {
   const vm = new Sandbox(connection);
   const command = await vm.commands.run(
-    "/opt/launchpad/server/t3 __thread-vm-setup --base-dir /home/user/.launchpad",
+    "/opt/launchpad/server/t3 __thread-vm-setup --base-dir /home/user/.launchpad" +
+      (probe ? " --recover-checkout-failure" : ""),
     {
       user: "user",
       background: true,
       stdin: true,
-      timeoutMs: 20 * 60_000,
+      timeoutMs: probe ? 5_000 : 20 * 60_000,
+      ...(probe ? { signal: probe.signal } : {}),
     },
   );
-  await command.sendStdin(Redacted.value(payload) + "\n");
+  await command.sendStdin(Redacted.value(payload) + "\n", probe);
   const result = await command.wait();
   if (result.exitCode !== 0) throw new Error("VM preparation did not return a receipt");
   return result.stdout;
@@ -35,31 +53,47 @@ export function makeE2BThreadVmSetup(
   transport: typeof fetch = fetch,
   guest: GuestSetup = runGuest,
 ) {
-  return Effect.fn("relay.thread_vm.prepare_guest")(function* (
+  const invalidInput = () =>
+    new ThreadVmComputeError({ operation: "setup", message: "Invalid VM preparation request." });
+  const invoke = <A>(
     sandboxId: string,
-    environmentId: string,
-    input: RelayThreadVmSetupInput & { readonly templateId?: string },
-  ) {
-    const payload = yield* encodeInput(input).pipe(
-      Effect.map(Redacted.make),
-      Effect.mapError(
-        () =>
-          new ThreadVmComputeError({
-            operation: "setup",
-            message: "Invalid VM preparation request.",
-          }),
-      ),
-    );
-    return yield* Effect.tryPromise({
+    identity: E2BThreadVmIdentity,
+    payload: Redacted.Redacted<string>,
+    decode: (stdout: string) => A,
+    probe = false,
+  ) =>
+    Effect.tryPromise({
       try: async (signal) => {
         const connection = await inspectE2BThreadVmConnection(
           settings,
           sandboxId,
-          { ...input.workspace, ...(input.templateId ? { templateId: input.templateId } : {}) },
+          identity,
           transport,
           signal,
         );
-        const reply = decodeReply((await guest(connection, payload)).trim());
+        return decode((await guest(connection, payload, probe ? { signal } : undefined)).trim());
+      },
+      catch: () =>
+        new ThreadVmComputeError({
+          operation: "setup",
+          message: "VM preparation is unconfirmed. The allocation remains held.",
+        }),
+    });
+  const prepare = Effect.fn("relay.thread_vm.prepare_guest")(function* (
+    sandboxId: string,
+    environmentId: string,
+    input: RelayThreadVmSetupInput & { readonly templateId?: string },
+    gitToken?: Redacted.Redacted<string>,
+  ) {
+    const payload = yield* (
+      gitToken ? encodeWorkflowInput({ input, gitToken }) : encodeInput(input)
+    ).pipe(Effect.map(Redacted.make), Effect.mapError(invalidInput));
+    return yield* invoke(
+      sandboxId,
+      { ...input.workspace, ...(input.templateId ? { templateId: input.templateId } : {}) },
+      payload,
+      (stdout) => {
+        const reply = decodeReply(stdout);
         if (reply.status === "prepared") {
           const { receipt } = reply;
           const { scope } = input.workspace;
@@ -78,11 +112,23 @@ export function makeE2BThreadVmSetup(
         }
         return reply;
       },
-      catch: () =>
-        new ThreadVmComputeError({
-          operation: "setup",
-          message: "VM preparation is unconfirmed. The allocation remains held.",
-        }),
-    });
+    );
   });
+  const recoverCheckoutFailure = Effect.fn("relay.thread_vm.recover_checkout_failure")(function* (
+    sandboxId: string,
+    { templateId, ...request }: RelayThreadVmCheckoutFailureProbe & { readonly templateId: string },
+  ) {
+    const payload = yield* encodeCheckoutProbe(request).pipe(
+      Effect.map(Redacted.make),
+      Effect.mapError(invalidInput),
+    );
+    return yield* invoke(
+      sandboxId,
+      { ...request.workspace, templateId },
+      payload,
+      (stdout) => decodeCheckoutFailure(stdout).failureCode,
+      true,
+    );
+  });
+  return { prepare, recoverCheckoutFailure };
 }

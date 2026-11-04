@@ -11,11 +11,12 @@ for thread access, allocation limits, lifecycle policy and durable conversation 
 maintaining the old provisioning paths as parallel product options would preserve a second
 execution model that does not meet the per-thread isolation requirement.
 
-The first version starts from an existing local thread. Its environment uploads the repository
-and conversation during the queued move; VM provisioning does not clone or fetch from GitHub.
-Direct creation against a repository remote is outside this version. This keeps source-control
-authentication on the source machine and avoids making the organization's GitHub App installation
-a prerequisite for VM isolation or transfer.
+Ordinary threads start VM execution by moving an existing local thread. Its environment uploads
+the repository and conversation during the queued move. Repository workflows additionally
+support unattended VM creation from a GitHub repository: they pin a starting commit and prepare
+the checkout through the organization's GitHub App installation. This lets workflows start without
+an online developer machine while keeping the App installation optional for ordinary isolation
+and local-thread transfers.
 
 Existing provisioned executors contain only disposable test data, so this replacement does
 not require legacy executor-data migration or continued support for the old provisioning

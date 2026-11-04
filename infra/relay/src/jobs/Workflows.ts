@@ -186,6 +186,22 @@ export const make = Effect.gen(function* () {
     if (hasSecrets && !canUseSecrets) return yield* tenancyForbidden("not_a_maintainer");
     return hasSecrets;
   });
+  const canSettleVmCancellation = Effect.fnUntraced(function* (row: WorkflowJobRecord) {
+    const requester = row.pendingControl?.userId;
+    if (!requester || !row.record.vmAdmission) return false;
+    const canManage = yield* requireVisibleVmRepository(row, requester, true).pipe(
+      Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
+    );
+    if (canManage === null || canManage || requester !== row.submitterUserId)
+      return canManage === true;
+    if (row.record.workflow === null) return row.record.vmAdmission.hasSecrets === false;
+    const [configuration] = yield* persist(db.$client<{
+      hasSecrets: boolean;
+    }>`SELECT has_secrets AS "hasSecrets"
+      FROM relay_workflow_run_configurations WHERE job_id=${row.jobId} AND organization_id=${row.organizationId}
+        AND repository_id=${row.repositoryId} FOR SHARE`);
+    return configuration?.hasSecrets === false;
+  });
   const getWorkflowVmLimit = Effect.fn("Workflows.getWorkflowVmLimit")(function* (
     organizationId: string,
   ) {
@@ -585,6 +601,7 @@ export const make = Effect.gen(function* () {
       return row;
     }),
     updateJob,
+    canSettleVmCancellation,
     settleQueuedVmCancellation: Effect.fn("Workflows.settleQueuedVmCancellation")(function* (
       previous: WorkflowJobRecord,
       expectedLease: string,
@@ -599,20 +616,11 @@ export const make = Effect.gen(function* () {
         pending?.response.operation !== "cancel"
       )
         return previous;
-      const ownSecretFreeRun =
-        job.vmAdmission.hasSecrets === false && previous.submitterUserId === pending.userId;
       return yield* db.$client
         .withTransaction(
           Effect.gen(function* () {
-            const authorized = yield* requireVisibleVmRepository(
-              previous,
-              pending.userId,
-              true,
-            ).pipe(
-              Effect.map((canManage) => canManage || ownSecretFreeRun),
-              Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(false)),
-            );
-            return yield* updateJob(
+            const authorized = yield* canSettleVmCancellation(previous);
+            const settled = yield* updateJob(
               previous,
               {
                 ...job,
@@ -633,6 +641,22 @@ export const make = Effect.gen(function* () {
               false,
               expectedLease,
             );
+            if (authorized) {
+              const sql = db.$client;
+              const [allocation] = yield* sql`UPDATE relay_thread_vm_allocations a
+                SET state='deleted',deleted_at=clock_timestamp()
+                FROM relay_thread_placements t
+                WHERE a.thread_id=t.thread_id AND t.workflow_job_id=${previous.jobId}
+                  AND t.organization_id=${previous.organizationId} AND t.repository_id=${previous.repositoryId}
+                  AND a.allocation_id=${previous.jobId} AND a.resource_kind='organization_workflow'
+                  AND a.state='creating' AND a.compute_ref IS NULL AND t.environment_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_provisions p WHERE p.allocation_id=a.allocation_id)
+                RETURNING a.allocation_id`;
+              if (allocation)
+                yield* sql`UPDATE relay_thread_vm_capacity SET state='released'
+                  WHERE operation_id=${previous.jobId} AND allocation_id=${previous.jobId} AND state='waiting'`;
+            }
+            return settled;
           }),
         )
         .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));

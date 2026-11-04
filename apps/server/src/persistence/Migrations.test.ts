@@ -16,6 +16,23 @@ import {
 import MigrationAuthSessionUser from "./Migrations/055_AuthSessionUser.ts";
 import MigrationProjectionThreadMessageAuthor from "./Migrations/056_ProjectionThreadMessageAuthor.ts";
 
+it.effect("keeps a legacy workflow baseline without inventing frozen ignore rules", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* runMigrations({ toMigrationInclusive: 92 });
+    yield* sql`INSERT INTO workflow_vm_checkpoint_pins
+      (job_id, thread_id, allocation_id, operation_id, environment_id, generation, turn_id,
+       turn_count, checkpoint_ref, commit_id, tree_id, baseline_commit_id)
+      VALUES ('job','thread','allocation','operation','environment',1,'',0,
+              'refs/t3/base','commit','tree','commit')`;
+    assert.deepStrictEqual(yield* runMigrations(), [[93, "WorkflowCheckpointIgnoreRules"]]);
+    assert.deepStrictEqual(
+      yield* sql`SELECT commit_id, workflow_ignore_rules FROM workflow_vm_checkpoint_pins`,
+      [{ commit_id: "commit", workflow_ignore_rules: null }],
+    );
+  }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+);
+
 it.effect(
   "upgrades settled native and chat checkpoints without losing files, receipts or foreign keys",
   () =>
@@ -324,6 +341,8 @@ it.effect("upgrades workflow ownership without changing accepted jobs", () =>
       [89, "WorkflowExecutionBinding"],
       [90, "ThreadMoveSourceReopens"],
       [91, "ThreadMoveHistoryRecovery"],
+      [92, "WorkflowCheckpointPins"],
+      [93, "WorkflowCheckpointIgnoreRules"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT * FROM repository_workflow_jobs`, [
       {
@@ -398,6 +417,8 @@ it.effect(
         [89, "WorkflowExecutionBinding"],
         [90, "ThreadMoveSourceReopens"],
         [91, "ThreadMoveHistoryRecovery"],
+        [92, "WorkflowCheckpointPins"],
+        [93, "WorkflowCheckpointIgnoreRules"],
       ]);
       const rows = yield* sql<{
         state: string;
@@ -454,6 +475,8 @@ it.effect("V4 upgrade preserves cleanup proof and blocks old PID-only fence read
       [89, "WorkflowExecutionBinding"],
       [90, "ThreadMoveSourceReopens"],
       [91, "ThreadMoveHistoryRecovery"],
+      [92, "WorkflowCheckpointPins"],
+      [93, "WorkflowCheckpointIgnoreRules"],
     ]);
     assert.deepStrictEqual(yield* sql`SELECT record_json FROM setup_processes`, [
       { record_json: record },
@@ -490,6 +513,8 @@ it.effect(
         [89, "WorkflowExecutionBinding"],
         [90, "ThreadMoveSourceReopens"],
         [91, "ThreadMoveHistoryRecovery"],
+        [92, "WorkflowCheckpointPins"],
+        [93, "WorkflowCheckpointIgnoreRules"],
       ]);
       assert.deepStrictEqual(yield* sql`SELECT record_json FROM repository_workflow_jobs`, [
         { record_json: record },

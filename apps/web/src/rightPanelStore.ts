@@ -113,6 +113,21 @@ export interface ThreadRightPanelState {
   dismissedDeviceSurfaceIds?: string[];
 }
 
+export function workflowResultRightPanelState(state: ThreadRightPanelState): ThreadRightPanelState {
+  const surfaces = state.surfaces.filter(
+    (surface) => surface.kind === "diff" || surface.kind === "agents",
+  );
+  return {
+    ...state,
+    surfaces,
+    isOpen: state.isOpen && surfaces.length > 0,
+    activeSurfaceId:
+      surfaces.find((surface) => surface.id === state.activeSurfaceId)?.id ??
+      surfaces[0]?.id ??
+      null,
+  };
+}
+
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
   /** Session-only count of user panel choices per thread. Automatic updates do not advance it. */

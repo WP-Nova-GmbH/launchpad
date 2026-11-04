@@ -163,14 +163,19 @@ export function makeThreadPlacementStore(sql: PgClient) {
     organizationId: string;
     repositoryId: string;
     operationId: string;
+    waiting?: boolean;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const jobs = yield* sql`SELECT job_id FROM relay_workflow_jobs
           WHERE job_id=${input.workflowJobId} AND organization_id=${input.organizationId}
-            AND repository_id=${input.repositoryId} AND record#>>'{workflow,definition,target,kind}'='vm'
-            AND status='preparing' AND record#>>'{runtime,kind}'='vm'
-            AND record#>>'{runtime,threadId}'=${input.threadId}
+            AND repository_id=${input.repositoryId} AND ${
+              input.waiting
+                ? sql`status='queued' AND pending_control IS NULL AND record ? 'vmAdmission'
+                AND record->'runtime'='null'::jsonb AND record->'workflow'='null'::jsonb`
+                : sql`status='preparing' AND record#>>'{workflow,definition,target,kind}'='vm'
+                AND record#>>'{runtime,kind}'='vm' AND record#>>'{runtime,threadId}'=${input.threadId}`
+            }
           FOR SHARE`;
         if (!jobs.length)
           return yield* conflict("Workflow preparation has no matching accepted VM job");
@@ -246,12 +251,23 @@ export function makeThreadPlacementStore(sql: PgClient) {
       }),
     );
   });
-  const lock = Effect.fnUntraced(function* (threadId: string) {
+  const lockPlacement = Effect.fnUntraced(function* (threadId: string) {
     const rows =
       yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id = ${threadId} FOR UPDATE`;
     if (!rows.length) return yield* conflict("Portable thread does not exist");
+  });
+  const lock = Effect.fnUntraced(function* (threadId: string) {
+    yield* lockPlacement(threadId);
     const placement = yield* get(threadId);
     if (!placement) return yield* conflict("Portable thread does not exist");
+    return placement;
+  });
+  const lockWorkPlacement = Effect.fnUntraced(function* (threadId: string, workflowJobId?: string) {
+    if (workflowJobId === undefined) return yield* lock(threadId);
+    yield* lockPlacement(threadId);
+    const placement = yield* getAny(threadId);
+    if (placement?.audience !== "repository" || placement.workflowJobId !== workflowJobId)
+      return yield* conflict("Workflow no longer owns this portable thread");
     return placement;
   });
   const findMove = Effect.fn("relay.thread_placement.find_move")(function* (input: MoveIdentity) {
@@ -271,7 +287,10 @@ export function makeThreadPlacementStore(sql: PgClient) {
     const move = yield* findMove(input);
     return move ?? (yield* conflict("Move does not exist for this thread"));
   });
-  const requireOwner = (placement: Placement, input: Owner) =>
+  const requireOwner = (
+    placement: Pick<RelayThreadPlacement, "environmentId" | "generation">,
+    input: Owner,
+  ) =>
     placement.environmentId === input.environmentId && placement.generation === input.generation
       ? Effect.void
       : Effect.fail(conflict("Environment no longer owns this thread generation"));
@@ -304,10 +323,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
 
   const admit = Effect.fn("relay.thread_placement.admit")(function* (
     input: Owner & { readonly workId: string },
+    workflowJobId?: string,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const placement = yield* lock(input.threadId);
+        const placement = yield* lockWorkPlacement(input.threadId, workflowJobId);
         yield* requireOwner(placement, input);
         const [existing] =
           yield* sql<Admission>`SELECT environment_id AS "environmentId", generation, completed
@@ -336,10 +356,11 @@ export function makeThreadPlacementStore(sql: PgClient) {
 
   const completeWork = Effect.fn("relay.thread_placement.complete_work")(function* (
     input: Owner & { readonly workId: string },
+    workflowJobId?: string,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const placement = yield* lock(input.threadId);
+        const placement = yield* lockWorkPlacement(input.threadId, workflowJobId);
         yield* requireOwner(placement, input);
         const rows = yield* sql`UPDATE relay_thread_execution_admissions SET completed = true
         WHERE thread_id = ${input.threadId} AND work_id = ${input.workId} AND environment_id = ${input.environmentId}

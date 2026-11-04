@@ -4,12 +4,14 @@ import {
   EventId,
   worktreeSetupActivityId,
   WORKTREE_SETUP_ACTIVITY_KIND,
+  T3_PROJECT_FILE_NAME,
   WorktreeSetupSnapshot,
   type ThreadId,
   type ThreadPreparation,
 } from "@t3tools/contracts";
 import { resolveProjectScripts, setupProjectScript } from "@t3tools/shared/projectScripts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -29,6 +31,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
+import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
+import { WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
+import { activeWorkflowStep } from "../jobs/workflowSequence.ts";
+import { WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
 import { ServerConfig } from "../config.ts";
 import { ProjectSetupScriptRunner } from "../project/ProjectSetupScriptRunner.ts";
 import { WorktreeSetupTracker } from "../project/WorktreeSetupTracker.ts";
@@ -173,6 +179,9 @@ const make = Effect.gen(function* () {
   const engine = yield* OrchestrationEngineService;
   const query = yield* ProjectionSnapshotQuery;
   const git = yield* GitWorkflowService;
+  const gitDriver = yield* Effect.serviceOption(GitVcsDriver);
+  const workflows = yield* WorkflowRunStore;
+  const attempts = yield* WorkflowVmAttempts;
   const runner = yield* ProjectSetupScriptRunner;
   const tracker = yield* WorktreeSetupTracker;
   const journal = yield* SetupProcessJournal;
@@ -332,6 +341,8 @@ const make = Effect.gen(function* () {
           detail: "The preparation recipe or project is unavailable. Review the workspace.",
         });
       const recipe = preparation.recipe;
+      const workflow = yield* workflows.getByThread(threadId);
+      const vm = workflow?.runtime.kind === "vm" ? workflow.runtime : null;
       const settings = yield* settingsService.getSettings;
       const requested = recipe.prepareWorktree;
       const branch = requested?.branch ?? `t3code/${thread.id}`;
@@ -350,12 +361,45 @@ const make = Effect.gen(function* () {
                 .worktreeSubmodules,
             }
           : { branch: thread.branch, worktreePath: thread.worktreePath });
-      const selected =
-        preparation.script === undefined
-          ? recipe.runSetupScript && target.worktreePath
-            ? setupProjectScript(resolveProjectScripts(settings, project.value))
-            : null
-          : preparation.script;
+      const scriptCwd = target.worktreePath ?? (vm ? recipe.projectCwd : null);
+      let selected = preparation.script;
+      if (selected === undefined && recipe.runSetupScript && scriptCwd) {
+        if (vm && workflow) {
+          if (Option.isNone(gitDriver))
+            return yield* new PreparationError({
+              detail: "Git is unavailable for workflow setup.",
+            });
+          const { stdout: entries } = yield* gitDriver.value.execute({
+            operation: "workflow-setup-file",
+            cwd: scriptCwd,
+            args: ["ls-tree", workflow.baseSha, "--", T3_PROJECT_FILE_NAME],
+          });
+          if (entries.trim()) {
+            const { stdout } = yield* gitDriver.value.execute({
+              operation: "workflow-setup-file",
+              cwd: scriptCwd,
+              args: ["show", `${workflow.baseSha}:${T3_PROJECT_FILE_NAME}`],
+            });
+            const file = parseT3ProjectFile(stdout);
+            if (!file)
+              return yield* new PreparationError({
+                detail: "The starting commit has an invalid launchpad.json.",
+              });
+            const setup = file.scripts?.find((entry) => entry.runOnWorktreeCreate);
+            selected = setup
+              ? {
+                  id: "workflow-setup",
+                  name: setup.name,
+                  command: setup.command,
+                  async: setup.async !== false,
+                }
+              : null;
+          }
+        } else {
+          const setup = setupProjectScript(resolveProjectScripts(settings, project.value));
+          selected = setup ? { ...setup, async: setup.async !== false } : null;
+        }
+      }
       const script = selected
         ? {
             id: selected.id,
@@ -429,7 +473,7 @@ const make = Effect.gen(function* () {
         settled: false,
         revision: preparation.revision + 1,
       };
-      if (script && target.worktreePath) {
+      if (script && scriptCwd) {
         terminalId = `setup-${running.attemptId}`;
         yield* journal.begin({ threadId, attemptId: running.attemptId, terminalId });
       }
@@ -540,18 +584,55 @@ const make = Effect.gen(function* () {
       if (sourceRoot !== targetRoot) yield* captures.complete(sourceAdmission);
       // TerminalManager.open takes the workspace lease itself. Never hold it across this call.
       yield* assertCurrent;
-      if (script && target.worktreePath) {
+      if (script && scriptCwd) {
         terminalId = `setup-${running.attemptId}`;
+        const step = workflow && activeWorkflowStep(workflow);
+        const stillOwnsSetup =
+          vm && workflow
+            ? Effect.gen(function* () {
+                const current = yield* workflows.get(workflow.jobId);
+                const thread = yield* read(threadId).pipe(Effect.orDie);
+                return (
+                  current?.runtime.kind === "vm" &&
+                  current.progress.status === "preparing" &&
+                  current.sequence?.generation === workflow.sequence?.generation &&
+                  activeWorkflowStep(current)?.id === step?.id &&
+                  thread?.promptQueue?.preparation?.state === "running" &&
+                  thread.promptQueue.preparation.attemptId === running.attemptId &&
+                  (yield* workflows.isVmFenceActive(vm))
+                );
+              })
+            : undefined;
+        let runEnvironment;
+        if (vm && workflow) {
+          if (step?.kind !== "agent" || !stillOwnsSetup || !(yield* stillOwnsSetup))
+            return yield* new PreparationError({
+              detail: "The workflow no longer owns this setup attempt.",
+            });
+          runEnvironment = yield* attempts.resolve(vm, {
+            purpose: "setup",
+            attemptId: running.attemptId,
+            commandId: running.attemptId,
+            stepId: step.id,
+            stepGeneration: workflow.sequence?.generation ?? 0,
+          });
+          if (!(yield* stillOwnsSetup))
+            return yield* new PreparationError({
+              detail: "The workflow no longer owns this setup attempt.",
+            });
+        }
         yield* tracker.stageStatus(threadId, "setup-script", "running");
         const launched = yield* runner
           .runForThread({
             threadId,
             projectId: thread.projectId,
             projectCwd: recipe.projectCwd,
-            worktreePath: target.worktreePath,
+            worktreePath: scriptCwd,
             resolvedScript: script,
             preferredTerminalId: terminalId,
             preparationAttemptId: running.attemptId,
+            ...(runEnvironment ? { runEnvironment } : {}),
+            ...(stillOwnsSetup ? { authorizeDelivery: stillOwnsSetup } : {}),
             observeCompletion: {
               onOutputLine: (line) => tracker.appendTail(threadId, "setup-script", line),
             },

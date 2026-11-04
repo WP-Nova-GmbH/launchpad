@@ -38,7 +38,7 @@ function approvalRequestedEvent(input: {
   readonly detail?: string;
   readonly threadId?: ThreadId;
   readonly payloadOverride?: unknown;
-}): OrchestrationEvent {
+}): Extract<OrchestrationEvent, { readonly type: "thread.activity-appended" }> {
   nextSequence += 1;
   const threadId = input.threadId ?? THREAD_ID;
   return {
@@ -542,9 +542,56 @@ it.effect("ignores approvals on other threads", () =>
   }),
 );
 
-it.effect("recovers a persisted verdict without another model decision or response identity", () =>
+it.effect.each(["deny", "escalate"] as const)(
+  "recovers a persisted %s without another model decision or response identity",
+  (verdict) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* attachApprovalSupervisor({
+        engine: harness.engine,
+        textGeneration: harness.textGeneration,
+        crypto: yield* Crypto.Crypto,
+        threadId: THREAD_ID,
+        stepInstruction: "Implement",
+        cwd: "/tmp/worktree",
+        modelSelection: MODEL_SELECTION,
+        workflowVm: verdict === "escalate",
+        replayEvents: Stream.fromIterable([
+          approvalRequestedEvent({ requestId: "resolved" }),
+          approvalRequestedEvent({ requestId: "pending" }),
+        ]),
+        resolvedRequestIds: new Set(["resolved"]),
+        recordedVerdicts: new Map([["pending", verdict]]),
+      });
+      const response = yield* harness.awaitDispatch(isApprovalResponse);
+      assert.strictEqual(
+        response.type === "thread.approval.respond" ? response.decision : null,
+        "decline",
+      );
+      assert.strictEqual(response.commandId, `server:supervisor:${THREAD_ID}:pending:respond`);
+      assert.strictEqual((yield* Ref.get(harness.modelCalls)).length, 0);
+      assert.strictEqual((yield* Ref.get(harness.dispatched)).length, 1);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("replays only the unresolved blocking questions on a read-only VM", () =>
   Effect.gen(function* () {
     const harness = yield* makeHarness();
+    const question = (requestId: string, async = false) => {
+      const event = approvalRequestedEvent({ requestId });
+      return {
+        ...event,
+        payload: {
+          ...event.payload,
+          activity: {
+            ...event.payload.activity,
+            kind: "user-input.requested",
+            payload: { requestId, ...(async ? { responseMode: "message" } : {}) },
+          },
+        },
+      };
+    };
+    const pending = question("pending");
     yield* attachApprovalSupervisor({
       engine: harness.engine,
       textGeneration: harness.textGeneration,
@@ -553,20 +600,24 @@ it.effect("recovers a persisted verdict without another model decision or respon
       stepInstruction: "Implement",
       cwd: "/tmp/worktree",
       modelSelection: MODEL_SELECTION,
+      workflowVm: true,
+      resolvedUserInputIds: new Set(["resolved"]),
       replayEvents: Stream.fromIterable([
-        approvalRequestedEvent({ requestId: "resolved" }),
-        approvalRequestedEvent({ requestId: "pending" }),
+        question("resolved"),
+        question("async", true),
+        pending,
+        pending,
+        approvalRequestedEvent({ requestId: "after", requestType: "file_read_approval" }),
       ]),
-      resolvedRequestIds: new Set(["resolved"]),
-      recordedVerdicts: new Map([["pending", "deny"]]),
     });
-    const response = yield* harness.awaitDispatch(isApprovalResponse);
-    assert.strictEqual(
-      response.type === "thread.approval.respond" ? response.decision : null,
-      "decline",
+    yield* harness.awaitDispatch(isApprovalResponse);
+    assert.deepEqual(
+      (yield* Ref.get(harness.dispatched)).flatMap((command) =>
+        command.type === "thread.user-input.respond"
+          ? [[String(command.requestId), command.answers, String(command.commandId)]]
+          : [],
+      ),
+      [["pending", {}, `server:supervisor:${THREAD_ID}:pending:user-input`]],
     );
-    assert.strictEqual(response.commandId, `server:supervisor:${THREAD_ID}:pending:respond`);
-    assert.strictEqual((yield* Ref.get(harness.modelCalls)).length, 0);
-    assert.strictEqual((yield* Ref.get(harness.dispatched)).length, 1);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

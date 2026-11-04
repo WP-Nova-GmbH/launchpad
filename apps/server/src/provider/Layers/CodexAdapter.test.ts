@@ -31,6 +31,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -408,6 +409,43 @@ validationLayer("CodexAdapterLive validation", (it) => {
         NodeAssert.equal(dispatched, 1);
         NodeAssert.equal(factory.factory.mock.calls.length, 1);
       }).pipe(Effect.scoped),
+  );
+
+  it.effect("passes frozen workflow values only in a managed Agent subprocess environment", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const factory = makeRuntimeFactory();
+        const adapter = yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: factory.factory,
+          environment: { PATH: "/usr/bin", T3_MCP_BEARER_TOKEN: "internal-only" },
+          managedAuth: {
+            connectionId: "connection",
+            label: "Organization account",
+            status: Effect.die("No status probe required"),
+            preflight: Effect.void,
+          },
+        });
+        const secret = "runtime-private-canary";
+        yield* adapter
+          .startSession({ threadId: asThreadId("workflow:run"), runtimeMode: "approval-required" })
+          .pipe(
+            Effect.provideService(CurrentWorkflowVmAttemptEnvironment, {
+              hasSecrets: true,
+              secretNames: ["NPM_TOKEN"],
+              environment: { NPM_TOKEN: secret, PUBLIC_VALUE: "value" },
+            }),
+          );
+        const runtime = factory.lastRuntime!.options;
+        NodeAssert.equal(runtime.environment?.NPM_TOKEN, secret);
+        NodeAssert.equal(runtime.environment?.PUBLIC_VALUE, "value");
+        NodeAssert.match(runtime.appServerArgs!.join(" "), /include_only=.*NPM_TOKEN/u);
+        NodeAssert.doesNotMatch(
+          runtime.appServerArgs!.join(" "),
+          /runtime-private-canary|internal-only|T3_MCP_BEARER_TOKEN/u,
+        );
+        NodeAssert.equal(process.env.NPM_TOKEN === secret, false);
+      }),
+    ),
   );
 
   it.effect("isolates precommit native resume notifications and closes the probe runtime", () =>

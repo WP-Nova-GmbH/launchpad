@@ -23,12 +23,14 @@ export const validateThreadQueueProviders = Effect.fn("validateThreadQueueProvid
     if (vm && id !== "codex")
       return yield* new OrchestrationCommandInvariantError({
         commandType,
+        reason: "queue-provider",
         detail: "Private VMs currently require the default Codex provider.",
       });
     if (checked.has(id)) return;
     if (!(yield* supportsTransfer(id)))
       return yield* new OrchestrationCommandInvariantError({
         commandType,
+        reason: "queue-provider",
         detail:
           "VM work and conversation moves require an enabled Codex provider. Change the queued provider or the move order first.",
       });

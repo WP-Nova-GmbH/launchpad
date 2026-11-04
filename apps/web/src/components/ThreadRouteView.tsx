@@ -1,10 +1,11 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { useAtomValue } from "@effect/atom-react";
 import type { ScopedThreadRef } from "@t3tools/contracts";
-import { useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useLocation, useNavigate } from "@tanstack/react-router";
+import { useCallback, useEffect, useState } from "react";
 
 import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
@@ -13,6 +14,7 @@ import { SidebarInset } from "./ui/sidebar";
 import { WorkflowResultReturn } from "./workflows/WorkflowNavigation";
 import { Button } from "./ui/button";
 import { environmentCatalog } from "../connection/catalog";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import { useAtomCommand } from "../state/use-atom-command";
 import { CurrentThreadLocation } from "./chat/ThreadMoveControls";
 import {
@@ -33,9 +35,13 @@ import {
 import { useEnvironmentQuery } from "../state/query";
 import { useEnvironments } from "../state/environments";
 import { environmentShell } from "../state/shell";
+import { threadMoveRelayUrl } from "../state/thread-move-submissions";
+import { threadVmControls, useEnvironmentThread } from "../state/threads";
 import {
   buildThreadRouteParams,
+  isCurrentThreadMoveHandoff,
   resolveThreadRouteRenderState,
+  threadMoveHandoffPhase,
   type ThreadRouteTarget,
 } from "../threadRoutes";
 import { resolveThreadSyncPhase } from "../threadSync";
@@ -55,6 +61,7 @@ import { resolveThreadSyncPhase } from "../threadSync";
  */
 export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const navigate = useNavigate();
+  const handoff = useLocation({ select: (location) => location.state.threadMoveHandoff });
   const environments = useEnvironments();
   const reconnect = useAtomCommand(environmentCatalog.retryNow);
   const relaySession = useAtomValue(managedRelaySessionAtom);
@@ -98,6 +105,49 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const connection = serverThreadRef
     ? environments.presentationById.get(serverThreadRef.environmentId)?.connection
     : undefined;
+  const relayUrl = handoff ? threadMoveRelayUrl() : null;
+  const handoffCurrent = useAtomValue(
+    portableThreadPlacementsAtom,
+    useCallback(
+      (proofs) =>
+        !!handoff &&
+        target.kind === "server" &&
+        !!relaySession &&
+        proofs?.session === relaySession &&
+        proofs.relayUrl === relayUrl &&
+        isCurrentThreadMoveHandoff(
+          handoff,
+          target.threadRef,
+          relaySession.accountId,
+          relayUrl,
+          proofs.placements.get(target.threadRef.threadId),
+        ),
+      [handoff, target, relaySession, relayUrl],
+    ),
+  );
+  const [openedHandoff, setOpenedHandoff] = useState<typeof handoff>(undefined);
+  const openingHandoff = handoff && handoffCurrent && openedHandoff !== handoff ? handoff : null;
+  const handoffThread = useEnvironmentThread(
+    openingHandoff?.environmentId ?? null,
+    openingHandoff?.threadId ?? null,
+  );
+  const handoffReadError = handoffThread.error._tag === "Some" ? handoffThread.error.value : null;
+  const handoffPhase = openingHandoff
+    ? threadMoveHandoffPhase({
+        handoff: openingHandoff,
+        connection: connection?.phase,
+        liveRouting: shell.data?.status === "live" ? serverThreadShell?.relayRouting : undefined,
+        liveArchivedThread:
+          serverThreadShell === null &&
+          handoffThread.status === "live" &&
+          handoffThread.data._tag === "Some" &&
+          handoffThread.data.value.archivedAt !== null,
+        deleted: handoffThread.status === "deleted",
+        readFailed: handoffReadError !== null,
+      })
+    : null;
+  if (handoffPhase === "opened") setOpenedHandoff(handoff);
+  const handoffOwnsNotice = handoffPhase !== null && handoffPhase !== "opened";
   const draftThread = useComposerDraftStore((store) =>
     serverThreadRef ? store.getDraftThreadByRef(serverThreadRef) : null,
   );
@@ -138,6 +188,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const serverThreadStarted = threadHasStarted(serverThreadDetail);
   const environmentHasAnyThreads = environmentThreadRefs.length > 0 || environmentHasDraftThreads;
   const recoverUnavailable =
+    !handoffOwnsNotice &&
     target.kind === "server" &&
     relaySession !== null &&
     serverThreadShell === null &&
@@ -180,7 +231,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   }, [canonicalThreadRef, draftSession, navigate, target.kind]);
 
   useEffect(() => {
-    if (target.kind !== "server" || !bootstrapComplete) {
+    if (target.kind !== "server" || !bootstrapComplete || handoffOwnsNotice) {
       return;
     }
     // Navigation already resolved onto this path, so a drop aimed here
@@ -196,6 +247,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   }, [
     bootstrapComplete,
     environmentHasAnyThreads,
+    handoffOwnsNotice,
     navigate,
     recoverUnavailable,
     renderState,
@@ -223,7 +275,10 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         />
       );
     }
-  } else if (renderState === "ready" || (renderState === "loading" && serverThreadShell !== null)) {
+  } else if (
+    !handoffOwnsNotice &&
+    (renderState === "ready" || (renderState === "loading" && serverThreadShell !== null))
+  ) {
     view = (
       <ChatView
         {...(nextChatViewKey ? { key: nextChatViewKey.key } : {})}
@@ -234,23 +289,63 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
       />
     );
   } else {
-    const error = connection?.error ?? shell.error;
+    const opening = handoffPhase === "opening";
+    const unavailable = handoffPhase === "unavailable";
+    const error =
+      connection?.error ??
+      handoffReadError ??
+      shell.error ??
+      (handoffOwnsNotice && shell.data?.error._tag === "Some" ? shell.data.error.value : null);
     view = (
       <div className="flex flex-1 items-center justify-center px-6">
         <div role="status" className="max-w-md space-y-3 text-center">
           <h2 className="text-sm font-medium">
-            {error ? "Could not connect to this thread" : "Loading thread…"}
+            {opening
+              ? "Opening thread…"
+              : unavailable
+                ? "Thread unavailable"
+                : handoffPhase === "unreadable"
+                  ? "Could not open this thread"
+                  : error || handoffPhase === "blocked"
+                    ? "Could not connect to this thread"
+                    : "Loading thread…"}
           </h2>
           <p className="text-sm text-muted-foreground">
-            {error ??
-              (connection ? connectionStatusText(connection) : "Connecting to its environment…")}
+            {opening
+              ? "Connecting to the thread’s current location."
+              : unavailable
+                ? "The thread is unavailable at its current location."
+                : (error ??
+                  (connection
+                    ? connectionStatusText(connection)
+                    : "Connecting to its environment…"))}
           </p>
-          {connection &&
-          (error || connection.phase === "offline" || connection.phase === "available") ? (
+          {opening && error ? (
+            <details className="text-xs text-muted-foreground">
+              <summary className="cursor-pointer">Details</summary>
+              <p className="mt-1 break-words">{error}</p>
+            </details>
+          ) : null}
+          {!unavailable &&
+          connection &&
+          (error ||
+            connection.phase === "offline" ||
+            connection.phase === "available" ||
+            (opening && connection.phase === "reconnecting")) ? (
             <Button
               size="sm"
               variant="secondary"
-              onClick={() => void reconnect(target.threadRef.environmentId)}
+              onClick={() => {
+                if (openingHandoff)
+                  appAtomRegistry.refresh(
+                    threadVmControls.locationQueryAtom(
+                      target.threadRef.environmentId,
+                      target.threadRef.threadId,
+                      true,
+                    ),
+                  );
+                void reconnect(target.threadRef.environmentId);
+              }}
             >
               Reconnect
             </Button>
@@ -268,7 +363,8 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
           key={scopedThreadKey(target.threadRef)}
           environmentId={target.threadRef.environmentId}
           threadId={target.threadRef.threadId}
-          recoverUnavailable={recoverUnavailable}
+          recoverUnavailable={recoverUnavailable || handoffOwnsNotice}
+          observeOnly={handoffOwnsNotice}
         />
       ) : null}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">{view}</div>

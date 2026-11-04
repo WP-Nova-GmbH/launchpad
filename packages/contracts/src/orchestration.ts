@@ -916,6 +916,8 @@ export const ThreadPreparationSummary = Schema.Struct({
 
 export const ThreadPromptPauseReason = Schema.Struct({
   messageId: Schema.optional(MessageId),
+  /** An explicit Stop removes this marker while retaining the uncertainty. */
+  resumeOnConfirmedAttemptId: Schema.optional(CommandId),
   code: Schema.Literals([
     "stopped",
     "failed",
@@ -999,6 +1001,11 @@ export const ThreadPromptAdmission = Schema.Struct({
   turnId: TurnId,
   evidence: Schema.Literals(["provider-ack", "harness-dispatch", "local-command"]),
 });
+const ThreadQueueFinalization = Schema.Struct({
+  turnId: TurnId,
+  outcome: Schema.Literals(["completed", "failed", "interrupted"]),
+  checkpoint: Schema.Literals(["ready", "skipped", "error"]),
+});
 export const ThreadPromptQueue = Schema.Struct({
   preparation: Schema.optional(ThreadPreparation),
   ...ThreadPromptQueueControl.fields,
@@ -1007,6 +1014,7 @@ export const ThreadPromptQueue = Schema.Struct({
   awaitingTurnId: Schema.NullOr(TurnId),
   admissions: Schema.Array(ThreadPromptAdmission),
   finalizedTurnId: Schema.NullOr(TurnId),
+  finalization: Schema.optional(Schema.NullOr(ThreadQueueFinalization)),
 });
 export type ThreadPromptQueue = typeof ThreadPromptQueue.Type;
 export const ThreadPromptQueueSummary = Schema.Struct({
@@ -1027,6 +1035,7 @@ export const ThreadPromptQueueChangedPayload = Schema.Struct({
   awaitingTurnId: Schema.optional(Schema.NullOr(TurnId)),
   admission: Schema.optional(ThreadPromptAdmission),
   finalizedTurnId: Schema.optional(Schema.NullOr(TurnId)),
+  finalization: Schema.optional(Schema.NullOr(ThreadQueueFinalization)),
   updatedAt: IsoDateTime,
 });
 export type ThreadPromptQueueChangedPayload = typeof ThreadPromptQueueChangedPayload.Type;
@@ -1712,6 +1721,18 @@ const ThreadPromptClaimCommand = Schema.Struct({
   messageId: MessageId,
   expectedRevision: NonNegativeInt,
   expectedControlRevision: NonNegativeInt,
+  expectedPreparation: Schema.optional(
+    Schema.NullOr(Schema.Struct({ attemptId: CommandId, revision: NonNegativeInt })),
+  ),
+});
+const ThreadPromptRejectCommand = Schema.Struct({
+  type: Schema.Literal("thread.prompt.reject"),
+  ...PromptCommandFields,
+  messageId: MessageId,
+  expectedRevision: NonNegativeInt,
+  expectedControlRevision: NonNegativeInt,
+  expectedPreparation: ThreadPromptClaimCommand.fields.expectedPreparation,
+  detail: Schema.String,
 });
 const ThreadPromptAdmitCommand = Schema.Struct({
   type: Schema.Literal("thread.prompt.admit"),
@@ -1736,10 +1757,10 @@ const ThreadPromptUnknownCommand = Schema.Struct({
 const ThreadQueueFinalizeCommand = Schema.Struct({
   type: Schema.Literal("thread.queue.finalize"),
   ...PromptCommandFields,
-  turnId: TurnId,
-  outcome: Schema.Literals(["completed", "failed", "interrupted"]),
-  checkpoint: Schema.Literals(["ready", "skipped", "error"]),
+  ...ThreadQueueFinalization.fields,
   detail: Schema.optional(Schema.String),
+  /** Server-verified Agent admission eligible to reopen the workflow queue. */
+  resumeWorkflowAttemptId: Schema.optional(CommandId),
 });
 
 export const ThreadTurnStartCommand = Schema.Struct({
@@ -2168,6 +2189,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadMoveFinishCommand,
   ThreadPreparationUpdateCommand,
   ThreadPromptClaimCommand,
+  ThreadPromptRejectCommand,
   ThreadPromptAdmitCommand,
   ThreadPromptReleaseCommand,
   ThreadPromptUnknownCommand,
@@ -2813,12 +2835,20 @@ export const OrchestrationGetTurnDiffInput = TurnCountRange.mapFields(
   Struct.assign({
     threadId: ThreadId,
     ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+    strictWorkflowReview: Schema.optionalKey(Schema.Boolean),
+    expectedTurnId: Schema.optionalKey(TurnId),
   }),
   { unsafePreserveChecks: true },
 );
 export type OrchestrationGetTurnDiffInput = typeof OrchestrationGetTurnDiffInput.Type;
 
-export const OrchestrationGetTurnDiffResult = ThreadTurnDiff;
+export const OrchestrationGetTurnDiffResult = ThreadTurnDiff.mapFields(
+  Struct.assign({
+    completeWorkflowReview: Schema.optionalKey(Schema.Literal(true)),
+    targetTurnId: Schema.optionalKey(TurnId),
+  }),
+  { unsafePreserveChecks: true },
+);
 export type OrchestrationGetTurnDiffResult = typeof OrchestrationGetTurnDiffResult.Type;
 
 export const OrchestrationGetFullThreadDiffInput = Schema.Struct({

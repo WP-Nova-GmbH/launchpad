@@ -13,6 +13,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import {
   GitCommandError,
   VcsProcessExitError,
+  VcsProcessOutputReadError,
   type VcsSwitchRefInput,
   type VcsSwitchRefResult,
   type VcsCreateRefInput,
@@ -39,6 +40,7 @@ import {
 } from "./GitVcsDriverCore.ts";
 import * as VcsDriver from "./VcsDriver.ts";
 import * as VcsProcess from "./VcsProcess.ts";
+import { readWorkflowIgnoreRules } from "./WorkflowCheckpointIgnore.ts";
 
 export interface ExecuteGitInput {
   readonly operation: string;
@@ -394,12 +396,34 @@ const CHECKPOINT_RECOVERY_MAX_CANDIDATES = 64;
 const CHECKPOINT_RECOVERY_TIMEOUT = "5 seconds";
 const GIT_CHECK_IGNORE_MAX_STDIN_BYTES = 256 * 1024;
 const CHECKPOINT_DIFF_MAX_OUTPUT_BYTES = 10_000_000;
+// Git hunk lines carry an addition, deletion, or context prefix. Match only whole LF lines.
+const GIT_BINARY_DIFF_SUMMARY = /(?:^|\n)Binary files [^\n]+ differ(?:\n|$)/;
 const WORKSPACE_GIT_HARDENED_CONFIG_ARGS = [
   "-c",
   "core.fsmonitor=false",
   "-c",
   "core.untrackedCache=false",
 ] as const;
+export const workflowGitEnvironment = {
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_COUNT: "0",
+  GIT_CONFIG: undefined,
+  GIT_CONFIG_PARAMETERS: undefined,
+  GIT_ATTR_NOSYSTEM: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
+  GIT_GRAFT_FILE: "",
+  GIT_ALLOW_PROTOCOL: "",
+  GIT_DIR: undefined,
+  GIT_WORK_TREE: undefined,
+  GIT_COMMON_DIR: undefined,
+  GIT_INDEX_FILE: undefined,
+  GIT_OBJECT_DIRECTORY: undefined,
+  GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
+  GIT_NAMESPACE: undefined,
+  GIT_ATTR_SOURCE: undefined,
+  LC_ALL: "C",
+} as const satisfies NodeJS.ProcessEnv;
 
 const nowFreshness = Effect.fn("GitVcsDriver.nowFreshness")(function* () {
   const now = yield* DateTime.now;
@@ -775,8 +799,232 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     "core.fsyncMethod=fsync",
   ] as const;
 
+  const writeCheckpoint = Effect.fnUntraced(function* (
+    input: VcsDriver.VcsCaptureCheckpointInput,
+    git: (args: ReadonlyArray<string>) => ReturnType<typeof execute>,
+    updateRef: (args: ReadonlyArray<string>) => ReturnType<typeof execute>,
+  ) {
+    const operation = VcsProcess.CHECKPOINT_CAPTURE_OPERATION;
+    const treeOid = (yield* git([...durableWrite, "write-tree"])).stdout.trim();
+    if (treeOid.length === 0) {
+      return yield* new VcsProcessExitError({
+        operation,
+        command: "git write-tree",
+        cwd: input.cwd,
+        exitCode: 0,
+        detail: "git write-tree returned an empty tree oid.",
+      });
+    }
+    const commitOid = (yield* git([
+      ...durableWrite,
+      "commit-tree",
+      treeOid,
+      "-m",
+      `t3 checkpoint ref=${input.checkpointRef}`,
+    ])).stdout.trim();
+    if (commitOid.length === 0) {
+      return yield* new VcsProcessExitError({
+        operation,
+        command: "git commit-tree",
+        cwd: input.cwd,
+        exitCode: 0,
+        detail: "git commit-tree returned an empty commit oid.",
+      });
+    }
+    yield* updateRef([...durableWrite, "update-ref", "--no-deref", input.checkpointRef, commitOid]);
+    return { commitId: commitOid, treeId: treeOid };
+  });
+
+  const captureStrictWorkflowCheckpoint = Effect.fn("GitVcsDriver.captureStrictWorkflowCheckpoint")(
+    function* (input: VcsDriver.VcsCaptureCheckpointInput) {
+      const operation = VcsProcess.CHECKPOINT_CAPTURE_OPERATION;
+      const unavailable = (detail: string) =>
+        new VcsProcessExitError({
+          operation,
+          command: "git checkpoint",
+          cwd: input.cwd,
+          exitCode: 1,
+          detail,
+        });
+      const localPathError = () =>
+        unavailable("The workflow Git checkpoint metadata is unavailable.");
+      const cwd = yield* fileSystem.realPath(input.cwd).pipe(Effect.mapError(localPathError));
+      const gitDir = path.join(cwd, ".git");
+      const objectDir = path.join(gitDir, "objects");
+      if (
+        (yield* fileSystem.realPath(gitDir).pipe(Effect.mapError(localPathError))) !== gitDir ||
+        (yield* fileSystem.realPath(objectDir).pipe(Effect.mapError(localPathError))) !== objectDir
+      )
+        return yield* localPathError();
+
+      const env = workflowGitEnvironment;
+      const sourceGit = (args: ReadonlyArray<string>, allowNonZeroExit = false) =>
+        execute({
+          operation,
+          cwd,
+          args: [
+            "--git-dir",
+            gitDir,
+            "--work-tree",
+            cwd,
+            "-c",
+            "core.hooksPath=/dev/null",
+            ...args,
+          ],
+          env,
+          allowNonZeroExit,
+        });
+      const objectFormat = (yield* sourceGit(["rev-parse", "--show-object-format"])).stdout.trim();
+      if (objectFormat !== "sha1" && objectFormat !== "sha256")
+        return yield* unavailable("The workflow Git object format is unsupported.");
+      const head = (yield* sourceGit(["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+      const sparse = yield* sourceGit(["config", "--bool", "--get", "core.sparseCheckout"], true);
+      if (sparse.exitCode !== 0 && (sparse.exitCode !== 1 || sparse.stderr.trim() !== ""))
+        return yield* unavailable("The workflow Git sparse checkout setting is invalid.");
+      // Workflow VMs start with a full checkout. Workload-owned sparse rules could
+      // hide deletions by making absent paths look like intentional exclusions.
+      if (sparse.stdout.trim() === "true")
+        return yield* unavailable("The workflow Git checkpoint requires a full checkout.");
+      const requireLocalIgnoreRules = Effect.gen(function* () {
+        const configured = yield* sourceGit(["config", "--get", "core.excludesFile"], true);
+        if (configured.exitCode === 0)
+          return yield* unavailable(
+            "The workflow Git checkpoint does not support custom exclude files.",
+          );
+        if (configured.exitCode !== 1 || configured.stderr.trim() !== "")
+          return yield* unavailable("The workflow Git exclude settings could not be checked.");
+        return yield* readWorkflowIgnoreRules(cwd).pipe(
+          Effect.mapError(() => unavailable("The workflow Git ignore rules are unavailable.")),
+        );
+      });
+      const localIgnoreRules = yield* requireLocalIgnoreRules;
+      const workflowIgnoreRules = input.workflowIgnoreRules ?? localIgnoreRules;
+      const ignoreRulesChanged = () =>
+        unavailable("The workflow Git ignore rules changed after preparation.");
+      if (Buffer.compare(workflowIgnoreRules, localIgnoreRules) !== 0)
+        return yield* ignoreRulesChanged();
+
+      // A fresh Git directory ignores the workload's index stat cache, hooks, clean
+      // filters, worktree settings and attributes outside the checkout.
+      const scratch = yield* fileSystem
+        .makeTempDirectoryScoped({ prefix: "workflow-checkpoint-" })
+        .pipe(Effect.mapError(localPathError));
+      yield* execute({
+        operation,
+        cwd,
+        args: ["init", "--bare", "--template=", `--object-format=${objectFormat}`, "--", scratch],
+        env,
+      });
+      if (workflowIgnoreRules.byteLength > 0) {
+        const info = path.join(scratch, "info");
+        yield* fileSystem
+          .makeDirectory(info, { recursive: true })
+          .pipe(Effect.mapError(localPathError));
+        yield* fileSystem
+          .writeFile(path.join(info, "exclude"), workflowIgnoreRules, { mode: 0o600 })
+          .pipe(Effect.mapError(localPathError));
+      }
+      const checkpointGit = (args: ReadonlyArray<string>, stdin?: string) =>
+        execute({
+          operation,
+          cwd,
+          args: [
+            "--git-dir",
+            scratch,
+            "--work-tree",
+            cwd,
+            "-c",
+            "core.bare=false",
+            "-c",
+            "core.filemode=true",
+            "-c",
+            "core.symlinks=true",
+            "-c",
+            "core.ignorecase=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.excludesFile=/dev/null",
+            ...args,
+          ],
+          env: {
+            ...env,
+            GIT_OBJECT_DIRECTORY: objectDir,
+            GIT_AUTHOR_NAME: "Launchpad",
+            GIT_AUTHOR_EMAIL: "t3code@users.noreply.github.com",
+            GIT_COMMITTER_NAME: "Launchpad",
+            GIT_COMMITTER_EMAIL: "t3code@users.noreply.github.com",
+          },
+          ...(stdin === undefined ? {} : { stdin }),
+          maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+          outputMode: "error",
+        });
+      const requireReviewableIgnoreFiles = Effect.gen(function* () {
+        const ignored = yield* checkpointGit([
+          "ls-files",
+          "--others",
+          "--ignored",
+          "--exclude-standard",
+          "--directory",
+          "-z",
+          "--",
+          ":(glob)**/.gitignore",
+        ]);
+        // Git can report a pruned directory instead of its files. An ignored
+        // rule file in a scanned directory can hide other paths while staying
+        // out of the checkpoint itself.
+        if (
+          ignored.stdout
+            .split("\0")
+            .some((entry) => entry === ".gitignore" || entry.endsWith("/.gitignore"))
+        )
+          return yield* unavailable(
+            "The workflow Git checkpoint cannot verify an ignored .gitignore file.",
+          );
+      });
+      yield* checkpointGit(["read-tree", head]);
+      yield* requireReviewableIgnoreFiles;
+      yield* checkpointGit([...durableWrite, "add", "-A", "--", "."]);
+      yield* requireReviewableIgnoreFiles;
+      const attributeFiles = yield* checkpointGit([
+        "ls-files",
+        "-z",
+        "--",
+        ":(glob)**/.gitattributes",
+      ]);
+      if (attributeFiles.stdout.length > 0) {
+        const paths = yield* checkpointGit(["ls-files", "-z"]);
+        if (paths.stdoutInvalidUtf8)
+          return yield* unavailable("The workflow Git filter attributes could not be checked.");
+        // Inspect the captured index, since the working-tree attributes can change
+        // while the checkpoint is being made.
+        const filters = yield* checkpointGit(
+          ["check-attr", "--cached", "-z", "--stdin", "filter"],
+          paths.stdout,
+        );
+        const fields = filters.stdout.split("\0");
+        if (filters.stdoutInvalidUtf8 || fields.pop() !== "" || fields.length % 3 !== 0)
+          return yield* unavailable("The workflow Git filter attributes could not be checked.");
+        if (
+          fields.some(
+            (value, index) => index % 3 === 2 && value !== "unspecified" && value !== "unset",
+          )
+        )
+          return yield* unavailable(
+            "The workflow Git checkpoint does not support checkout filters.",
+          );
+      }
+      if (Buffer.compare(workflowIgnoreRules, yield* requireLocalIgnoreRules) !== 0)
+        return yield* ignoreRulesChanged();
+      const checkpoint = yield* writeCheckpoint(input, checkpointGit, sourceGit);
+      return { ...checkpoint, workflowIgnoreRules };
+    },
+    Effect.scoped,
+  );
+
   const checkpoints: VcsDriver.VcsCheckpointOps = {
     captureCheckpoint: Effect.fn("GitVcsDriver.checkpoints.captureCheckpoint")(function* (input) {
+      if (input.strictWorkflowCapture) return yield* captureStrictWorkflowCheckpoint(input);
       const operation = VcsProcess.CHECKPOINT_CAPTURE_OPERATION;
       const indexConfig = [
         "-c",
@@ -805,7 +1053,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         { discard: true },
       );
 
-      yield* Effect.gen(function* () {
+      return yield* Effect.gen(function* () {
         const headExists = yield* hasHeadCommit(input.cwd);
         const sparseConfig = yield* execute({
           operation,
@@ -1001,46 +1249,12 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           }),
         );
 
-        const writeTreeResult = yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: [...indexConfig, ...durableWrite, "write-tree"],
-          env: commitEnv,
-        });
-        const treeOid = writeTreeResult.stdout.trim();
-        if (treeOid.length === 0) {
-          return yield* new VcsProcessExitError({
-            operation,
-            command: "git write-tree",
-            cwd: input.cwd,
-            exitCode: 0,
-            detail: "git write-tree returned an empty tree oid.",
-          });
-        }
-
-        const message = `t3 checkpoint ref=${input.checkpointRef}`;
-        const commitTreeResult = yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: [...durableWrite, "commit-tree", treeOid, "-m", message],
-          env: commitEnv,
-        });
-        const commitOid = commitTreeResult.stdout.trim();
-        if (commitOid.length === 0) {
-          return yield* new VcsProcessExitError({
-            operation,
-            command: "git commit-tree",
-            cwd: input.cwd,
-            exitCode: 0,
-            detail: "git commit-tree returned an empty commit oid.",
-          });
-        }
-
-        yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: [...durableWrite, "update-ref", input.checkpointRef, commitOid],
-        });
+        return yield* writeCheckpoint(
+          input,
+          (args) =>
+            execute({ operation, cwd: input.cwd, args: [...indexConfig, ...args], env: commitEnv }),
+          (args) => execute({ operation, cwd: input.cwd, args }),
+        );
       }).pipe(Effect.ensuring(cleanupTempIndex));
     }),
 
@@ -1127,6 +1341,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
 
     diffCheckpoints: Effect.fn("GitVcsDriver.checkpoints.diffCheckpoints")(function* (input) {
       const operation = "GitVcsDriver.checkpoints.diffCheckpoints";
+      const strictPatch = input.requireComplete === true && input.format !== "numstat";
       yield* Effect.annotateCurrentSpan({
         "checkpoint.cwd": input.cwd,
         "checkpoint.from_ref": input.fromCheckpointRef,
@@ -1163,19 +1378,25 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         operation,
         cwd: input.cwd,
         args: [
+          ...(input.requireComplete || input.pinned ? ["--no-replace-objects"] : []),
           "diff",
           ...(input.format === "numstat" ? ["--numstat", "-z"] : ["--patch"]),
           "--no-color",
           "--no-ext-diff",
           "--no-textconv",
+          ...(input.requireComplete ? ["--ignore-submodules=none", "--submodule=short"] : []),
           ...PATCH_RENDER_PREFIX_ARGS,
           ...(input.ignoreWhitespace ? ["--ignore-all-space"] : []),
           `${fromRevision}^{commit}`,
           `${input.toCheckpointRef}^{commit}`,
         ],
+        ...(strictPatch ? { env: { LC_ALL: "C" } } : {}),
         allowNonZeroExit: true,
         maxOutputBytes: CHECKPOINT_DIFF_MAX_OUTPUT_BYTES,
-        outputMode: input.format === "numstat" ? "error" : "truncate",
+        outputMode:
+          input.format === "numstat" || input.requireComplete || input.pinned
+            ? "error"
+            : "truncate",
       });
 
       if (result.exitCode !== 0) {
@@ -1186,6 +1407,31 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           exitCode: result.exitCode,
           detail: result.stderr.trim() || "Checkpoint ref is unavailable for diff operation.",
         });
+      }
+
+      if (strictPatch) {
+        const reason = result.stdoutInvalidUtf8
+          ? "invalid_utf8"
+          : result.stdout.includes("\0")
+            ? "nul_byte"
+            : GIT_BINARY_DIFF_SUMMARY.test(result.stdout)
+              ? "binary_summary"
+              : null;
+        if (reason)
+          return yield* new VcsProcessOutputReadError({
+            operation,
+            command: "git diff",
+            cwd: input.cwd,
+            stream: "stdout",
+            reason,
+            cause: new Error(
+              reason === "invalid_utf8"
+                ? "The patch contains invalid UTF-8."
+                : reason === "nul_byte"
+                  ? "The textual patch contains a NUL byte."
+                  : "Git supplied a binary summary without the change contents.",
+            ),
+          });
       }
 
       return result.stdout;
@@ -1199,7 +1445,14 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             execute({
               operation: "GitVcsDriver.checkpoints.deleteCheckpointRefs",
               cwd: input.cwd,
-              args: ["update-ref", "-d", checkpointRef],
+              args: [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "--no-deref",
+                "-d",
+                checkpointRef,
+              ],
               allowNonZeroExit: true,
             }),
           { discard: true },

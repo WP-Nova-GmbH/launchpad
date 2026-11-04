@@ -3,7 +3,7 @@ import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
-import { workflowRunOrigin } from "./WorkflowRunStore.ts";
+import { WorkflowRunStore, workflowRunOrigin } from "./WorkflowRunStore.ts";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
@@ -13,7 +13,7 @@ import * as Schema from "effect/Schema";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { GitManager } from "../git/GitManager.ts";
-import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
+import { GitVcsDriver, workflowGitEnvironment } from "../vcs/GitVcsDriver.ts";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
 import {
@@ -65,6 +65,45 @@ const error = (cause: unknown) =>
     message: cause instanceof Error ? cause.message : "Workflow publishing could not be confirmed.",
   });
 
+export const readWorkflowTree = (git: GitVcsDriver["Service"], cwd: string, revision: string) =>
+  git
+    .execute({
+      operation: "WorkflowCheckpoint.tree",
+      cwd,
+      args: [
+        "--no-replace-objects",
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        `${revision}^{tree}`,
+      ],
+      env: workflowGitEnvironment,
+    })
+    .pipe(Effect.map((result) => result.stdout.trim()));
+
+/** Verify the job branch without reading worktree files or invoking clean filters. */
+export const readWorkflowHead = Effect.fn("WorkflowCheckout.head")(function* (
+  git: GitVcsDriver["Service"],
+  cwd: string,
+  branch: string,
+) {
+  const read = (args: ReadonlyArray<string>) =>
+    git.execute({
+      operation: "WorkflowCheckout.head",
+      cwd,
+      args: ["--no-replace-objects", ...args],
+      allowNonZeroExit: true,
+      env: workflowGitEnvironment,
+    });
+  const expectedRef = `refs/heads/${branch}`;
+  const ref = yield* read(["symbolic-ref", "--quiet", "--no-recurse", "HEAD"]);
+  if (ref.exitCode !== 0 || ref.stdout.trim() !== expectedRef) return null;
+  const alias = yield* read(["symbolic-ref", "--quiet", "--no-recurse", expectedRef]);
+  if (alias.exitCode !== 1) return null;
+  const head = yield* read(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]);
+  return head.exitCode === 0 ? head.stdout.trim() || null : null;
+});
+
 export class WorkflowActions extends Context.Reference<{
   readonly available: Effect.Effect<boolean>;
   readonly canOpenPullRequest?: (input: {
@@ -101,6 +140,7 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver;
   const manager = yield* GitManager;
   const checkpoints = yield* CheckpointStore;
+  const workflowRuns = yield* WorkflowRunStore;
   const access = yield* RepositoryAccess;
   const crypto = yield* Crypto.Crypto;
   const providers = yield* Effect.serviceOption(SourceControlProviderRegistry);
@@ -310,53 +350,96 @@ export const make = Effect.gen(function* () {
       if (!action)
         return yield* new WorkflowActionError({ message: "The publishing action changed." });
       const cwd = run.worktreePath!;
-      const executeGit = (args: ReadonlyArray<string>, allowNonZeroExit = false) =>
+      const executeGit = (
+        args: ReadonlyArray<string>,
+        options?: { readonly allowNonZeroExit?: boolean; readonly env?: NodeJS.ProcessEnv },
+      ) =>
         git
-          .execute({ operation: "WorkflowActions", cwd, args, allowNonZeroExit })
+          .execute({ operation: "WorkflowActions", cwd, args, ...options })
           .pipe(Effect.mapError(error));
       const text = (args: ReadonlyArray<string>) =>
         executeGit(args).pipe(Effect.map((result) => result.stdout.trim()));
+      const originalHistory = (args: ReadonlyArray<string>, allowNonZeroExit = false) =>
+        executeGit(["--no-replace-objects", ...args], {
+          allowNonZeroExit,
+          env: workflowGitEnvironment,
+        });
+      const readCommitField = (revision: string, format: "%P" | "%B") =>
+        originalHistory(["show", "-s", "--no-show-signature", `--format=${format}`, revision]).pipe(
+          Effect.map((result) => result.stdout.trim()),
+        );
+      const readTree = (revision: string) =>
+        readWorkflowTree(git, cwd, revision).pipe(Effect.mapError(error));
+      const readHead = () =>
+        readWorkflowHead(git, cwd, jobBranchName(run.jobId)).pipe(Effect.mapError(error));
       const verify = Effect.fn("WorkflowActions.verify")(function* () {
         run = yield* requireRun(io);
         action = get(run, id)!;
-        if (
-          (yield* git.statusDetailsLocal(cwd).pipe(Effect.mapError(error))).branch !==
-          jobBranchName(run.jobId)
-        )
+        let workflowIgnoreRules: Uint8Array | undefined;
+        if (run.runtime.kind === "vm") {
+          const pin = action.checkpointTurnId
+            ? yield* workflowRuns.getCheckpointPinForRun(
+                run.runtime,
+                action.checkpointTurnId,
+                action.checkpointRef,
+              )
+            : null;
+          if (
+            !pin ||
+            pin.treeId !== action.tree ||
+            (yield* readTree(pin.commitId).pipe(Effect.orElseSucceed(() => null))) !== pin.treeId
+          )
+            return yield* new WorkflowActionError({
+              message:
+                "The saved workflow VM result is unavailable. Cancel the job and run it again.",
+            });
+          const ignoreRules = yield* workflowRuns.getWorkflowIgnoreRules(run.runtime);
+          if (ignoreRules === null)
+            return yield* new WorkflowActionError({
+              message: "The saved workflow Git ignore rules are unavailable. Start a new job.",
+            });
+          workflowIgnoreRules = ignoreRules;
+        }
+        const head = yield* readHead();
+        if (head === null)
           return yield* new WorkflowActionError({ message: "The prepared job branch changed." });
         const verificationRef = CheckpointRef.make(`refs/t3/workflow-publishing/${run.jobId}`);
-        yield* owned(
+        const { treeId: currentTree } = yield* owned(
           id,
           io,
-          checkpoints.captureCheckpoint({ cwd, checkpointRef: verificationRef }),
-        );
-        const diff = yield* checkpoints
-          .diffCheckpoints({
+          checkpoints.captureCheckpoint({
             cwd,
-            fromCheckpointRef: CheckpointRef.make(action.checkpointRef),
-            toCheckpointRef: verificationRef,
-            ignoreWhitespace: false,
-          })
-          .pipe(Effect.mapError(error));
-        yield* owned(
-          id,
-          io,
-          checkpoints.deleteCheckpointRefs({ cwd, checkpointRefs: [verificationRef] }),
+            checkpointRef: verificationRef,
+            strictWorkflowCapture: run.runtime.kind === "vm",
+            ...(workflowIgnoreRules === undefined ? {} : { workflowIgnoreRules }),
+          }),
+        ).pipe(
+          Effect.tap(() =>
+            owned(
+              id,
+              io,
+              checkpoints.deleteCheckpointRefs({ cwd, checkpointRefs: [verificationRef] }),
+            ),
+          ),
         );
-        if (diff)
+        if ((yield* readHead()) !== head)
+          return yield* new WorkflowActionError({ message: "The prepared job branch changed." });
+        if (currentTree !== action.tree)
           return yield* new WorkflowActionError({
             message:
               "Prepared files changed after the saved result. Cancel this job before running again.",
           });
+        return head;
       });
-      yield* verify();
+      const verifiedHead = yield* verify();
       if (action.operation === "open_pull_request") {
         const publication = run.publication!;
         const head = run.preparedHead;
         if (
           !head ||
           publication.publishedHead !== head ||
-          (yield* text(["rev-parse", "HEAD"])) !== head
+          verifiedHead !== head ||
+          (yield* readTree(head)) !== action.tree
         )
           return yield* new WorkflowActionError({
             message: "Push the current saved result before opening its PR.",
@@ -474,8 +557,7 @@ export const make = Effect.gen(function* () {
             }));
             action = get(run, id)!;
           }
-          yield* verify();
-          if ((yield* text(["rev-parse", "HEAD"])) !== head)
+          if ((yield* verify()) !== head)
             return yield* new WorkflowActionError({
               message: "The prepared commit changed before PR creation.",
             });
@@ -551,11 +633,11 @@ export const make = Effect.gen(function* () {
         }));
         return;
       }
-      let head = yield* text(["rev-parse", "HEAD"]);
+      let head = verifiedHead;
       if (head !== action.parent && head !== action.commitSha) {
-        const parent = yield* text(["show", "-s", "--format=%P", "HEAD"]);
-        const message = yield* text(["show", "-s", "--format=%B", "HEAD"]);
-        const tree = yield* text(["rev-parse", "HEAD^{tree}"]);
+        const parent = yield* readCommitField(head, "%P");
+        const message = yield* readCommitField(head, "%B");
+        const tree = yield* readTree(head);
         if (
           action.phase !== "commit" ||
           parent !== action.parent ||
@@ -567,8 +649,13 @@ export const make = Effect.gen(function* () {
           });
       }
       if (!action.commitSha) {
-        const status = yield* git.statusDetailsLocal(cwd).pipe(Effect.mapError(error));
-        if (head === action.parent && status.hasWorkingTreeChanges) {
+        const hasWorkingTreeChanges =
+          head === action.parent &&
+          (run.runtime.kind === "vm"
+            ? (yield* readTree(head)) !== action.tree
+            : (yield* git.statusDetailsLocal(cwd).pipe(Effect.mapError(error)))
+                .hasWorkingTreeChanges);
+        if (hasWorkingTreeChanges) {
           if (!action.commitMessage) {
             if (!manager.prepareWorkflowCommit)
               return yield* new WorkflowActionError({
@@ -590,15 +677,23 @@ export const make = Effect.gen(function* () {
             }));
             action = get(run, id)!;
           }
-          yield* verify();
+          if ((yield* verify()) !== head)
+            return yield* new WorkflowActionError({
+              message: "The prepared commit changed before committing the result.",
+            });
           if ((yield* text(["write-tree"])) !== action.tree)
             return yield* new WorkflowActionError({
               message: "Staged files do not match the saved result.",
             });
           yield* owned(id, io, git.commit(cwd, action.commitMessage!, ""), "commit");
-          head = yield* text(["rev-parse", "HEAD"]);
+          const committedHead = yield* readHead();
+          if (!committedHead || (yield* readCommitField(committedHead, "%P")) !== action.parent)
+            return yield* new WorkflowActionError({
+              message: "Commit hooks changed the prepared commit's parent; nothing was pushed.",
+            });
+          head = committedHead;
         }
-        if ((yield* text(["rev-parse", "HEAD^{tree}"])) !== action.tree)
+        if ((yield* readTree(head)) !== action.tree)
           return yield* new WorkflowActionError({
             message: "Commit hooks changed the saved result; nothing was pushed.",
           });
@@ -611,16 +706,22 @@ export const make = Effect.gen(function* () {
           preparedHead: head,
         }));
         action = get(run, id)!;
+      } else if (
+        action.commitSha !== action.parent &&
+        (yield* readCommitField(action.commitSha, "%P")) !== action.parent
+      ) {
+        return yield* new WorkflowActionError({
+          message:
+            "The recorded commit's parent does not match the prepared job; nothing was pushed.",
+        });
       }
-      yield* verify();
-      if ((yield* text(["rev-parse", "HEAD"])) !== action.commitSha)
+      const currentHead = yield* verify();
+      const commitSha = action.commitSha;
+      if (!commitSha || currentHead !== commitSha || (yield* readTree(commitSha)) !== action.tree)
         return yield* new WorkflowActionError({
           message: "The prepared commit changed before Push.",
         });
-      if (
-        (yield* text(["rev-parse", `${run.baseSha}^{tree}`])) === action.tree &&
-        !run.publication!.publishedHead
-      )
+      if ((yield* readTree(run.baseSha!)) === action.tree && !run.publication!.publishedHead)
         return yield* new WorkflowActionError({ message: "No changes to publish." });
       const ref = `refs/heads/${jobBranchName(run.jobId)}`;
       const remoteHead = () =>
@@ -634,7 +735,7 @@ export const make = Effect.gen(function* () {
             message: "The remote job branch changed; no update was attempted.",
           });
         if (observed) {
-          const ancestor = yield* executeGit(
+          const ancestor = yield* originalHistory(
             ["merge-base", "--is-ancestor", observed, action.commitSha!],
             true,
           );

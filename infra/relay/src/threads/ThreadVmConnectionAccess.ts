@@ -2,6 +2,7 @@ import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { RelayDb } from "../db.ts";
 import { withPrivateThreadOwnerAccess } from "../http/privateThreadAccess.ts";
+import { readWorkflowVmBinding, requireWorkflowVmViewer } from "../jobs/WorkflowVmBinding.ts";
 import {
   ThreadVmConnectionUnavailable,
   type ThreadVmConnectionTarget,
@@ -82,3 +83,38 @@ export const authorizeThreadVmConnection = (userId: string, threadId: ThreadId) 
   readThreadVmTarget(userId, threadId, false);
 export const authorizeThreadVmStatus = (userId: string, threadId: ThreadId) =>
   readThreadVmTarget(userId, threadId, true);
+
+/** Workflow viewer credentials are separate from personal VM owner controls. */
+export const authorizeWorkflowVmViewerConnection = Effect.fnUntraced(
+  function* (userId: string, threadId: ThreadId) {
+    const sql = (yield* RelayDb).$client;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const current = yield* readWorkflowVmBinding(sql, { threadId });
+        yield* requireWorkflowVmViewer(sql, current.binding, userId);
+        const { binding, sandboxId, templateId, environmentPublicKey, credentialId } =
+          yield* readWorkflowVmBinding(sql, current.binding);
+        return {
+          state: "running" as const,
+          environmentId: binding.environmentId,
+          projectId: binding.projectId,
+          sandboxId,
+          environmentPublicKey,
+          credentialId,
+          identity: {
+            operationId: binding.operationId,
+            templateId,
+            resourceKind: "organization_workflow",
+            scope: {
+              threadId,
+              allocationId: binding.allocationId,
+              generation: binding.generation,
+              repositoryId: binding.repositoryId,
+            },
+          },
+        } satisfies ThreadVmConnectionTarget & { state: "running" };
+      }),
+    );
+  },
+  Effect.mapError(() => new ThreadVmConnectionUnavailable()),
+);

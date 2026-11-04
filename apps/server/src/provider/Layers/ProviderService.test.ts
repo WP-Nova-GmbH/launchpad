@@ -6890,6 +6890,7 @@ function continuityWorkflow(threadId: ThreadId, instanceId = codexInstanceId): W
     worktreePath: null,
     preparedHead: null,
     approvedBy: null,
+    runtime: { kind: "machine", environmentId: "env", projectId: "project" },
     workflow: {
       workflowId: "workflow",
       organizationId: "org",
@@ -6900,8 +6901,7 @@ function continuityWorkflow(threadId: ThreadId, instanceId = codexInstanceId): W
       updatedAt: now,
       definition: {
         name: "Workflow",
-        environmentId: "env",
-        projectId: "project",
+        target: { kind: "machine", environmentId: "env", projectId: "project" },
         steps: [
           { id: "agent", kind: "agent", title: "Work", instruction: "Work", modelSelection: null },
           { id: "review", kind: "review", title: "Review", role: "maintainer" },

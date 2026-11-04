@@ -11,6 +11,7 @@ import * as Encoding from "effect/Encoding";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
+import type { ThreadVmResourceKind } from "./ThreadVmAllocationStore.ts";
 
 export class ThreadVmEnrollmentInvalid extends Schema.TaggedError<ThreadVmEnrollmentInvalid>()(
   "ThreadVmEnrollmentInvalid",
@@ -55,12 +56,13 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
   const lockAllocation = Effect.fnUntraced(function* (input: {
     allocationId: string;
     operationId: string;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     const rows = yield* sql`SELECT a.allocation_id FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p USING (allocation_id)
       WHERE a.allocation_id = ${input.allocationId} AND p.operation_id = ${input.operationId}
       AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
-      AND a.runtime_protocol='native-v1' AND a.resource_kind='personal' FOR UPDATE OF a`;
+      AND a.runtime_protocol='native-v1' AND a.resource_kind=${input.resourceKind ?? "personal"} FOR UPDATE OF a`;
     if (!rows.length) return yield* new ThreadVmEnrollmentInvalid();
     // Read after the allocation lock is acquired: an exchange already waiting on
     // that lock must see a recovery fence committed by the stop worker.
@@ -72,6 +74,7 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
   const prepare = Effect.fn("relay.thread_vm_enrollment.prepare")(function* (input: {
     allocationId: string;
     operationId: string;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     const box = yield* RelaySecretBox;
     const crypto = yield* Crypto.Crypto;
@@ -109,6 +112,7 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
       environmentId: string;
       environmentPublicKey: string;
       threadTransferFormats?: readonly ThreadTransferFormat[];
+      resourceKind?: ThreadVmResourceKind;
     },
     issue: Effect.Effect<{ credentialId: string; response: Redacted.Redacted<string> }, E, R>,
   ) =>
@@ -159,10 +163,11 @@ export function makeThreadVmEnrollmentStore(sql: PgClient) {
     });
   const confirmInstalled = Effect.fn("relay.thread_vm_enrollment.confirm_installed")(function* (
     receipt: RelayThreadVmEnrollmentReceipt,
+    resourceKind: ThreadVmResourceKind = "personal",
   ) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* lockAllocation(receipt);
+        yield* lockAllocation({ ...receipt, resourceKind });
         const rows = yield* sql<{
           threadTransferFormats: readonly ThreadTransferFormat[] | null;
         }>`SELECT e.thread_transfer_formats_json AS "threadTransferFormats" FROM relay_thread_vm_enrollments e

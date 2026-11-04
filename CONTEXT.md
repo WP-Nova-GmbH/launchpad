@@ -96,7 +96,19 @@ A distinct external event that matches a workflow's event trigger. Several occur
 refer to the same issue.
 
 **Workflow execution environment**:
-The environment selected to run a repository workflow's jobs.
+The actual environment running a particular workflow job, including a thread VM allocated for it.
+
+**Workflow execution target**:
+A workflow's configured choice of where jobs run, such as an enrolled organization environment or
+a dedicated thread VM. It is separate from the environment allocated to a particular job.
+
+**Repository workflow configuration**:
+A repository's application settings and secrets, managed by repository maintainers and organization
+admins and supplied to job setup and agent commands. Each run keeps its starting values;
+GitHub repository authorization and the Codex account are separate.
+
+**Secret-bearing workflow run**:
+A workflow VM run whose starting repository workflow configuration includes at least one secret.
 
 **Workflow zone**:
 A visual grouping derived from a workflow's steps that distinguishes automatic work from
@@ -123,8 +135,8 @@ earlier agent step. The revised work requires a fresh review.
 ## Issue trackers
 
 **Integration application**:
-Launchpad's registered identity with an external service, through which individual users can
-independently authorize their own connections.
+Launchpad's registered identity with an external service, through which users authorize personal
+connections or administrators authorize organization automation.
 _Avoid_: Organization connection
 
 **Issue-tracker connection**:
@@ -133,8 +145,9 @@ Several users may connect to the same workspace or site without sharing their au
 _Avoid_: Organization connection, shared company account
 
 **Automation connection**:
-An authorization to use an external workspace or site as an event source for repository workflows.
-It can be reused by repositories explicitly allowed by the connection's owner.
+An organization-managed authorization to use an external workspace or site for repository workflow
+events and issue context. Organization admins manage connection, reconnection, disconnection and
+explicit repository access; the allowed repositories' maintainers configure workflow triggers.
 
 **Write approver**:
 The owner of the personal issue-tracker connection used for a proposed change.
@@ -149,6 +162,14 @@ _Avoid_: Workspace when referring to Linear without qualification
 A group within a Linear workspace that owns issues and their workflow. It is distinct from a
 Launchpad organization or repository.
 _Avoid_: Team when referring to Linear without qualification
+
+**Linear automation installation**:
+Launchpad's app identity installed in a Linear workspace for organization-managed workflow automation.
+It uses the access granted to the app rather than the installing administrator's personal Linear access.
+
+**Jira automation authorization**:
+An organization's workflow access to a Jira Cloud site, authorized through a Jira account.
+Its access remains bounded by that account's Jira permissions even though organization admins manage the connection.
 
 **Issue context**:
 The details, comment discussion, and embedded images from an external issue used to inform work
@@ -174,14 +195,21 @@ _Avoid_: Project VM
 **VM mode**:
 The execution choice in which a thread uses its own thread VM. It is separate from the thread's
 provider permission mode and does not by itself mean the thread is shared.
-The first version enters VM mode by moving a local thread and uploading its checkout; the VM
-does not obtain the repository from its remote.
 _Avoid_: Remote mode, sandbox permission mode
 
 **VM allocation owner**:
-The person whose VM allowance includes a particular thread VM. Allocation ownership is separate
-from ownership or visibility of the thread and from the agent account used for that work.
+The person or organization whose VM allowance includes a particular thread VM. Allocation ownership
+is separate from ownership or visibility of the thread and from the agent account used for that work.
 _Avoid_: Thread owner, billing account
+
+**Workflow VM allowance**:
+An organization's separate limit on workflow VMs that are starting or running, for both manual
+and event-triggered jobs. Paused or saved VMs do not consume it; it is independent of personal VM
+allowances and the selected Codex account's usage allowance.
+
+**Workflow VM follow-up window**:
+At least ten idle minutes given to an already-running VM after its workflow releases the workspace,
+keeping it warm for follow-up work. New work resets idleness; reclaiming capacity waits for that window to end.
 
 **Environment move**:
 A transfer of a thread's active execution location and working state from one environment to

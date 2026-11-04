@@ -2,9 +2,10 @@ import { makeThreadVmResetEnrollmentStore } from "./ThreadVmResetEnrollmentStore
 import { makeThreadVmRestoreEnrollmentStore } from "./ThreadVmRestoreEnrollmentStore.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import { ThreadId } from "@t3tools/contracts";
-import type {
-  RelayThreadVmBootstrap,
-  RelayThreadVmEnrollmentReceipt,
+import {
+  RelayRepositoryId,
+  type RelayThreadVmBootstrap,
+  type RelayThreadVmEnrollmentReceipt,
 } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -17,6 +18,8 @@ import {
 } from "./ThreadVmEnrollmentStore.ts";
 import { makeThreadVmMoveDestinationStore } from "./ThreadVmMoveDestinationStore.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
+import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
+import { withPreparingWorkflowVm } from "./ThreadVmWorkflowAccess.ts";
 
 type Deliver = (
   sandboxId: string,
@@ -28,17 +31,51 @@ export function makeThreadVmEnrollmentWorker(
   deliver: Deliver,
   relay: { url: string; issuer: string },
   hostId: string,
+  includeWorkflow = false,
 ) {
   const provisions = makeThreadVmProvisionStore(sql);
   const enrollments = makeThreadVmEnrollmentStore(sql);
   const runOne = Effect.fn("relay.thread_vm_enrollment.run_one")(function* () {
     const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
-    const row = yield* provisions.claimEnrollment(claimId, hostId);
+    const row = yield* provisions.claimEnrollment(claimId, hostId, includeWorkflow);
     if (!row) return false;
     const claim = { allocationId: row.allocationId, claimId };
     const attempt = Effect.gen(function* () {
-      const allocation = yield* makeThreadVmAllocationStore(sql).get(row.allocationId);
-      if (!allocation || !row.computeRef) return yield* new ThreadVmEnrollmentInvalid();
+      const allocation = yield* makeThreadVmAllocationStore(sql).getAny(row.allocationId);
+      if (!allocation || allocation.resourceKind !== row.resourceKind || !row.computeRef)
+        return yield* new ThreadVmEnrollmentInvalid();
+      if (allocation.resourceKind === "organization_workflow") {
+        const bootstrap = yield* withPreparingWorkflowVm(sql, row, (scope) =>
+          Effect.gen(function* () {
+            return {
+              version: 1 as const,
+              operationId: row.operationId,
+              templateId: row.templateId,
+              scope: {
+                allocationId: row.allocationId,
+                threadId: ThreadId.make(row.threadId),
+                repositoryId: RelayRepositoryId.make(scope.repositoryId),
+                generation: row.generation,
+              },
+              relayUrl: relay.url,
+              relayIssuer: relay.issuer,
+              seed: yield* enrollments.prepare(row),
+            };
+          }),
+        );
+        const receipt = yield* deliver(row.computeRef, bootstrap);
+        yield* withPreparingWorkflowVm(sql, row, (scope) =>
+          Effect.gen(function* () {
+            yield* provisions.finishEnrollment({ ...claim, receipt });
+            yield* makeThreadPlacementStore(sql).assignWorkflow({
+              ...row,
+              workflowJobId: scope.workflowJobId,
+              environmentId: receipt.environmentId,
+            });
+          }),
+        );
+        return;
+      }
       const bootstrap = yield* withPrivateThreadOwnerAccess(
         row.threadId,
         "read",

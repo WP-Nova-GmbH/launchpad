@@ -47,6 +47,19 @@ losing that host's disk can lose both running VM data and saved copies.
 ## Consequences
 
 Saved disks have a configurable expiry after routine VM deletion, without advance expiry warnings.
+
+VM-backed workflow jobs retain a recoverable workspace while workflow ownership remains,
+including long Review and Input waits or a failure with unresolved cleanup. Automatic pause and
+saving may reclaim compute, but saved-disk expiry must neither remove that workspace nor prevent
+its restoration until completion, cancellation or failure has safely released ownership.
+
+After a workflow releases ownership and confirms cleanup, an already-running VM stays warm for
+follow-up work; a paused or saved VM is not woken solely to provide that window.
+Allow at least ten idle minutes from that release before reclaiming it for queued demand; new
+work resets idleness and active or uncertain work remains protected. Otherwise the normal idle
+timeout applies, with the follow-up window as a minimum. An old Review wait cannot make a newly
+finished VM immediately eligible for pausing.
+
 Explicitly deleting the thread instead stops its work and removes its dedicated VM and saved
 disks without that retention period or a final recovery save. Its confirmation must explain
 that VM-only work is lost; retaining a recoverable conversation is the purpose of archive.
@@ -57,8 +70,9 @@ readable under its access rules after disk expiry; keeping only message text wou
 conversation incomplete. This requires independent attachment storage as well as verified
 provider-specific transfer support; existing resume
 cursors alone do not establish portability. Workspace data stored only on the saved disk is
-no longer recoverable after expiry. The original uploaded Git bundle has independent thread-lifetime
-retention, so Reset VM can use that commit without fetching the repository or reaching the local machine.
+no longer recoverable after expiry. The initial Git baseline has independent thread-lifetime
+retention: an uploaded bundle for a local move, or the pinned starting commit retained for a fresh
+workflow VM. Reset VM can use that baseline without fetching the repository or reaching a local machine.
 Changes made in the VM are not added to this reset baseline. A subsequent successful local-to-VM move
 replaces the baseline only after its ownership cutover completes.
 Reading the conversation does not renew retention; restoring its VM

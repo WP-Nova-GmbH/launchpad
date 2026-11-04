@@ -13,6 +13,7 @@ import {
   workflowDraftAtom,
   workflowSessionKey,
   updateWorkflowDrafts,
+  beginWorkflowReview,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
@@ -28,11 +29,13 @@ import type {
 const fixture = vi.hoisted(() => ({
   accountId: "account",
   focused: true,
+  projectsAvailable: true,
   getToken: vi.fn().mockResolvedValue("fixture-token"),
   list: vi.fn<(repositoryId: string) => Promise<ReadonlyArray<RepositoryWorkflowJobSummary>>>(),
   page: vi.fn<(repositoryId: string, query: WorkflowJobPageQuery) => Promise<WorkflowJobPage>>(),
   navigate: vi.fn(),
   openResult: vi.fn(),
+  alert: vi.fn(),
   review: vi.fn(),
   job: vi.fn<() => RepositoryWorkflowJob>(),
   respond: vi.fn<(payload: typeof RespondToWorkflowJob.Type) => RepositoryWorkflowJob>(),
@@ -68,7 +71,7 @@ vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   Pressable: host("button"),
   Linking: { openURL: vi.fn() },
   Platform: { OS: "ios" },
-  Alert: { alert: vi.fn() },
+  Alert: { alert: fixture.alert },
   AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
 }));
 vi.mock("../../../../mobile/node_modules/@clerk/expo/dist/index.js", () => ({
@@ -149,7 +152,10 @@ const detail: RepositoryWorkflowJob = {
 const client = {
   listRepositories: () => Effect.succeed([repository("A"), repository("B")]),
   getOrganization: () => Effect.succeed({ role: "admin" }),
-  listOrganizationProjects: () => Effect.succeed([]),
+  listOrganizationProjects: () =>
+    fixture.projectsAvailable
+      ? Effect.succeed([])
+      : Effect.fail(new FixtureReadError({ message: "Machine checkout catalog unavailable" })),
   pageWorkflowJobs: ({
     repositoryId,
     query,
@@ -191,6 +197,7 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
 }
 const content = () => text(renderer!.toJSON());
 async function mount(params: Params | undefined, waitForList = true) {
+  const start = deliveries.length;
   await act(async () => {
     renderer = create(
       <AppAtomRegistryProvider>
@@ -200,11 +207,11 @@ async function mount(params: Params | undefined, waitForList = true) {
   });
   // The catalog owns three receipts; selected-job reads stay independent of a delayed list.
   await act(async () => {
-    await Promise.all(deliveries.slice(0, 3));
+    await Promise.all(deliveries.slice(start, start + 3));
   });
   await act(async () => {
-    if (waitForList) await deliveries[3];
-    if (params?.jobId) await deliveries[4];
+    if (waitForList) await deliveries[start + 3];
+    if (params?.jobId) await deliveries[start + 4];
   });
 }
 async function press(label: string, waitForRead = true) {
@@ -224,11 +231,17 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   fixture.accountId = "account";
   fixture.focused = true;
+  fixture.projectsAvailable = true;
   fixture.navigate.mockReset();
+  fixture.alert.mockReset();
   fixture.review.mockReset();
   fixture.openResult.mockReset().mockResolvedValue({
     _tag: "Success",
-    value: { environmentId: EnvironmentId.make("moved-vm"), threadId: ThreadId.make("thread") },
+    value: {
+      environmentId: EnvironmentId.make("moved-vm"),
+      threadId: ThreadId.make("thread"),
+      workflowVmGeneration: 1,
+    },
   });
   fixture.job.mockReset().mockReturnValue(detail);
   fixture.respond.mockReset();
@@ -285,6 +298,111 @@ effectIt.layer(
       },
     },
   };
+  const vmReview = {
+    ...resultJob,
+    runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+    status: "awaiting_review",
+    progress: { ...resultJob.progress!, status: "awaiting_review" },
+    viewerControls: { canApprove: true, canRespond: false, canCancel: true },
+  } satisfies RepositoryWorkflowJob;
+
+  screenTest(
+    "opens the exact VM Review and blocks approval after returning from a stale checkpoint",
+    async () => {
+      fixture.job.mockReturnValue(vmReview);
+      beginWorkflowReview(
+        appAtomRegistry,
+        {
+          accountId: fixture.accountId,
+          organizationId: "organization",
+          repositoryId: RelayRepositoryId.make("A"),
+        },
+        vmReview.jobId,
+        "old-visit",
+        { checkpointId: "old-checkpoint", turnId: "old-turn", checkpointTurnCount: 2 },
+      );
+      await mount({
+        repositoryId: "A",
+        jobId: vmReview.jobId,
+      });
+      expect(content()).toContain("Review changed");
+      expect(content()).toContain("Cancel job");
+      expect(content()).not.toContain("Request changes");
+      const approval = renderer!.root
+        .findAll((node) => String(node.type) === "action")
+        .find((node) => node.props.label === "Approve result")!;
+      expect(approval.props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.respond).not.toHaveBeenCalled();
+      await press("Inspect agent result");
+      expect(fixture.navigate.mock.lastCall![1].workflowOrigin.reviewCheckpoint).toBeUndefined();
+      await act(() => renderer!.unmount());
+      await mount({ repositoryId: "A", jobId: vmReview.jobId });
+      expect(content()).toContain("Review changed");
+      await press("Inspect live diff");
+      expect(fixture.review).not.toHaveBeenCalled();
+      expect(fixture.openResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workflowResult: expect.objectContaining({ jobId: vmReview.jobId, repositoryId: "A" }),
+        }),
+      );
+      expect(fixture.navigate).toHaveBeenCalledWith(
+        "ThreadReview",
+        expect.objectContaining({
+          workflowOrigin: expect.objectContaining({
+            reviewCheckpoint: {
+              checkpointId: "checkpoint",
+              turnId: "turn",
+              checkpointTurnCount: 3,
+            },
+          }),
+        }),
+      );
+    },
+  );
+
+  screenTest("shows a durable offline approval as pending on mobile", async () => {
+    fixture.projectsAvailable = false;
+    fixture.job.mockReturnValue({
+      ...vmReview,
+      responsePending: true,
+      pendingResponseOperation: "approve",
+    });
+    await mount({ repositoryId: "A", jobId: vmReview.jobId });
+    expect(content()).toContain("Approval pending");
+    expect(content()).not.toContain("Approve result");
+  });
+
+  screenTest("cancels a queued VM run when the viewer has permission", async () => {
+    const queued = {
+      ...vmReview,
+      runtime: null,
+      progress: null,
+      status: "queued",
+      vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
+      viewerControls: { canCancel: true, canApprove: false, canRespond: false },
+    } satisfies RepositoryWorkflowJob;
+    fixture.job.mockReturnValue(queued);
+    fixture.respond.mockImplementation(() => {
+      const cancelled = { ...queued, status: "cancelled" as const };
+      fixture.job.mockReturnValue(cancelled);
+      return cancelled;
+    });
+    await mount({ repositoryId: "A", jobId: queued.jobId });
+    await press("Cancel job");
+    expect(fixture.respond).not.toHaveBeenCalled();
+    const actions = fixture.alert.mock.calls[0]![2] as ReadonlyArray<{
+      text: string;
+      onPress?: () => void;
+    }>;
+    const before = deliveries.length;
+    await act(() => actions.find((action) => action.text === "Cancel run")?.onPress?.());
+    await act(async () => {
+      await Promise.all(deliveries.slice(before));
+    });
+    expect(fixture.respond).toHaveBeenCalledExactlyOnceWith({ operation: "cancel" });
+    expect(content()).toContain("Cancelled");
+  });
   screenTest(
     "opens a completed workflow result and its saved diff at the moved location",
     async () => {

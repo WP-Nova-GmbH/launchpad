@@ -91,6 +91,18 @@ export const WorkflowRuntime = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("vm"), threadId: ThreadId }),
 ]);
 export type WorkflowRuntime = typeof WorkflowRuntime.Type;
+export const WorkflowVmDispatchBinding = Schema.Struct({
+  jobId: TrimmedNonEmptyString,
+  organizationId: TrimmedNonEmptyString,
+  repositoryId: TrimmedNonEmptyString,
+  threadId: ThreadId,
+  allocationId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  operationId: TrimmedNonEmptyString,
+  projectId: ProjectId,
+});
+export type WorkflowVmDispatchBinding = typeof WorkflowVmDispatchBinding.Type;
 export const WORKFLOW_PROTOCOL = 9;
 
 export const WorkflowDefinition = Schema.Struct({
@@ -307,6 +319,7 @@ export const RepositoryWorkflowJob = Schema.Struct({
   ),
   /** Marked before sending: absent on legacy offers means delivery may already have happened. */
   startAttempted: Schema.optional(Schema.Boolean),
+  vmCancellationConfirmed: Schema.optional(Schema.Boolean),
   offerAuthority: Schema.optional(
     Schema.Struct({ authorizationEpoch: Revision, grantGeneration: Revision }),
   ),
@@ -341,6 +354,16 @@ export const RepositoryWorkflowJob = Schema.Struct({
   progress: Schema.NullOr(WorkflowJobProgress),
   /** Relay response awaiting executor acknowledgement; derived from the durable pending control. */
   responsePending: Schema.optional(Schema.Boolean),
+  pendingResponseOperation: Schema.optional(
+    Schema.Literals(["approve", "input", "request_changes"]),
+  ),
+  viewerControls: Schema.optional(
+    Schema.Struct({
+      canCancel: Schema.Boolean,
+      canApprove: Schema.Boolean,
+      canRespond: Schema.Boolean,
+    }),
+  ),
   pendingManualControl: Schema.optional(Schema.NullOr(WorkflowManualControl)),
   createdAt: Schema.String,
   updatedAt: Schema.String,

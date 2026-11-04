@@ -28,6 +28,7 @@ export type ThreadVmAllocation = ThreadVmAllocationState &
     | { readonly resourceKind: "organization_workflow"; readonly ownerUserId: null }
   );
 export type PersonalThreadVmAllocation = Extract<ThreadVmAllocation, { resourceKind: "personal" }>;
+export type ThreadVmResourceKind = ThreadVmAllocation["resourceKind"];
 type AllocationIntent = Omit<
   PersonalThreadVmAllocation,
   "computeRef" | "state" | "deletedAt" | "runtimeProtocol" | "resourceKind"
@@ -56,6 +57,18 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
       return yield* conflict(
         "This VM belongs to an earlier runtime. Preserve it and complete manual migration before changing it.",
       );
+    return row;
+  });
+  const lockProvisionAllocation = Effect.fnUntraced(function* (
+    allocationId: string,
+    resourceKind: ThreadVmResourceKind,
+  ) {
+    if (resourceKind === "personal") return yield* lock(allocationId);
+    yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+      WHERE allocation_id=${allocationId} AND resource_kind='organization_workflow' FOR UPDATE`;
+    const row = yield* getAny(allocationId);
+    if (row?.resourceKind !== resourceKind || row.runtimeProtocol !== "native-v1")
+      return yield* conflict("Workflow VM allocation does not exist");
     return row;
   });
   const reserve = Effect.fn("relay.thread_vm.reserve")(function* (
@@ -203,10 +216,12 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
     allocationId: string;
     computeRef: string;
     sealedTrafficAccessToken?: string;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const allocation = yield* lock(input.allocationId);
+        const kind = input.resourceKind ?? "personal";
+        const allocation = yield* lockProvisionAllocation(input.allocationId, kind);
         if (allocation.computeRef !== null && allocation.computeRef !== input.computeRef)
           return yield* conflict("Allocation already has a different compute identity");
         if (allocation.state === "deleted")
@@ -216,7 +231,7 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         sealed_traffic_access_token = COALESCE(${input.sealedTrafficAccessToken ?? null},
           CASE WHEN compute_ref = ${input.computeRef} THEN sealed_traffic_access_token END),
         state = CASE WHEN state = 'creating' THEN 'running' ELSE state END WHERE allocation_id = ${input.allocationId}`;
-        return yield* lock(input.allocationId);
+        return yield* lockProvisionAllocation(input.allocationId, kind);
       }),
     );
   });
@@ -277,10 +292,11 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
   });
   const requestDeletion = Effect.fn("relay.thread_vm.request_deletion")(function* (
     allocationId: string,
+    kind: ThreadVmResourceKind = "personal",
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const allocation = yield* lock(allocationId);
+        const allocation = yield* lockProvisionAllocation(allocationId, kind);
         if (allocation.state === "deleted") return allocation;
         const pausing = yield* sql`SELECT 1 FROM relay_thread_vm_pauses
           WHERE allocation_id = ${allocationId} AND phase IN ('pending','sealed')`;
@@ -293,7 +309,7 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
             AND phase IN ('pending','creating','captured','verifying','cleanup')`;
         if (backingUp.length) return yield* conflict("VM backup is in progress");
         yield* sql`UPDATE relay_thread_vm_allocations SET state = 'deleting' WHERE allocation_id = ${allocationId}`;
-        return yield* lock(allocationId);
+        return yield* lockProvisionAllocation(allocationId, kind);
       }),
     );
   });
@@ -301,10 +317,12 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
   const confirmDeleted = Effect.fn("relay.thread_vm.confirm_deleted")(function* (input: {
     allocationId: string;
     computeRef: string | null;
+    resourceKind?: ThreadVmResourceKind;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const allocation = yield* lock(input.allocationId);
+        const kind = input.resourceKind ?? "personal";
+        const allocation = yield* lockProvisionAllocation(input.allocationId, kind);
         if (allocation.computeRef !== input.computeRef)
           return yield* conflict("Compute identity changed during deletion");
         if (allocation.state === "deleted") return allocation;
@@ -327,7 +345,7 @@ export function makeThreadVmAllocationStore(sql: PgClient) {
         yield* sql`UPDATE relay_thread_vm_allocations SET state = 'deleted', sealed_traffic_access_token = NULL,
         deleted_at = to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
         WHERE allocation_id = ${input.allocationId}`;
-        return yield* lock(input.allocationId);
+        return yield* lockProvisionAllocation(input.allocationId, kind);
       }),
     );
   });

@@ -1,4 +1,5 @@
 import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
 /**
  * CodexAdapterLive - Scoped live implementation for the Codex provider adapter.
  *
@@ -116,6 +117,9 @@ const requiresExistingConversation = Schema.is(
 );
 
 const PROVIDER = ProviderDriverKind.make("codex");
+const encodeShellEnvironmentNames = Schema.encodeEffect(
+  Schema.fromJsonString(Schema.Array(Schema.String)),
+);
 
 export interface CodexAdapterLiveOptions {
   readonly managedAuth?: ManagedThreadVmCodexAuthContext;
@@ -2315,6 +2319,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const startSession: CodexAdapterShape["startSession"] = (input, sessionOptions) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const workflowEnvironment = yield* CurrentWorkflowVmAttemptEnvironment;
+        if (workflowEnvironment && !options?.managedAuth)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Workflow VM execution requires the organization's managed Codex connection.",
+          });
         if (input.provider !== undefined && input.provider !== PROVIDER) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
@@ -2428,6 +2439,43 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const runtimeEnvironment = workflowEnvironment
+          ? { ...options?.environment, ...workflowEnvironment.environment }
+          : options?.environment;
+        const shellEnvironmentNames = workflowEnvironment
+          ? yield* encodeShellEnvironmentNames([
+              "PATH",
+              "HOME",
+              "USER",
+              "LOGNAME",
+              "SHELL",
+              "TMPDIR",
+              "LANG",
+              "LC_*",
+              "TERM",
+              ...Object.keys(workflowEnvironment.environment),
+            ]).pipe(Effect.orDie)
+          : null;
+        const appServerArgs = [
+          ...(shellEnvironmentNames
+            ? [
+                "-c",
+                'shell_environment_policy.inherit="all"',
+                "-c",
+                "shell_environment_policy.ignore_default_excludes=true",
+                "-c",
+                `shell_environment_policy.include_only=${shellEnvironmentNames}`,
+              ]
+            : []),
+          ...(mcpSession
+            ? [
+                "-c",
+                `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
+                "-c",
+                'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+              ]
+            : []),
+        ];
 
         const runtimeInput: CodexSessionRuntimeOptions = {
           ...(sessionOptions?.requireResume !== undefined
@@ -2442,7 +2490,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             : {}),
           ...(options?.models ? { models: options.models } : {}),
           launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
-          ...(options?.environment ? { environment: options.environment } : {}),
+          ...(runtimeEnvironment ? { environment: runtimeEnvironment } : {}),
+          ...(appServerArgs.length ? { appServerArgs } : {}),
           ...((portableHome ?? codexConfig.homePath)
             ? { homePath: portableHome ?? codexConfig.homePath }
             : {}),
@@ -2458,17 +2507,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? {
                 environment: {
                   ...McpProviderSession.withAgentDeviceEnvironment(
-                    options?.environment ?? process.env,
+                    runtimeEnvironment ?? process.env,
                     mcpSession,
                   ),
                   T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
                 },
-                appServerArgs: [
-                  "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
-                  "-c",
-                  'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
-                ],
                 mcpCapabilities: mcpSession.capabilities,
               }
             : {}),

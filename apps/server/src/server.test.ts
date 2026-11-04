@@ -63,6 +63,9 @@ import {
   ThreadId,
   TurnId,
   UsageLimitSourceId,
+  VcsProcessExitError,
+  VcsProcessOutputLimitError,
+  VcsProcessOutputReadError,
   WS_METHODS,
   WsRpcGroup,
   EditorId,
@@ -143,6 +146,10 @@ import {
   resolveFileManagerRevealKindForConfig,
 } from "./ws.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
+import {
+  CheckpointWorkflowDiffRestrictedError,
+  CheckpointWorkflowPinUnavailableError,
+} from "./checkpointing/Errors.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
@@ -9198,6 +9205,277 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
       assert.equal(diffFileContents.oldContents, "before\n");
       assert.equal(diffFileContents.newContents, "after\n");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("restricts workflow VM review to checkpoint-backed results", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("workflow:review");
+      const targetTurnId = TurnId.make("workflow:review:turn");
+      const checkpoint = {
+        threadId,
+        fromTurnCount: 0,
+        toTurnCount: 1,
+        diff: "checkpoint-diff",
+        completeWorkflowReview: true as const,
+        targetTurnId,
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: { workflowVm: true, threadId },
+          checkpointDiffQuery: {
+            getTurnDiff: ({ strictWorkflowReview, toTurnCount, expectedTurnId }) => {
+              assert.equal(strictWorkflowReview, true);
+              assert.equal(expectedTurnId, targetTurnId);
+              if (toTurnCount === 1) return Effect.succeed(checkpoint);
+              if (toTurnCount === 5)
+                return Effect.fail(
+                  new CheckpointWorkflowPinUnavailableError({ threadId, turnCount: toTurnCount }),
+                );
+              const details = {
+                operation: "GitVcsDriver.checkpoints.diffCheckpoints",
+                command: "git diff",
+                cwd: "/tmp/repo",
+                stream: "stdout" as const,
+              };
+              if (toTurnCount === 6)
+                return Effect.fail(
+                  new VcsProcessExitError({
+                    ...details,
+                    exitCode: 128,
+                    detail: "Pinned commit is missing.",
+                  }),
+                );
+              if (toTurnCount === 2)
+                return Effect.fail(
+                  new VcsProcessOutputLimitError({
+                    ...details,
+                    maxBytes: 10_000_000,
+                    observedBytes: 10_000_001,
+                  }),
+                );
+              const reason =
+                toTurnCount === 3
+                  ? "invalid_utf8"
+                  : toTurnCount === 4
+                    ? "binary_summary"
+                    : "nul_byte";
+              return Effect.fail(
+                new VcsProcessOutputReadError({ ...details, reason, cause: new Error(reason) }),
+              );
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const actual = yield* client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+              threadId,
+              fromTurnCount: 0,
+              toTurnCount: 1,
+              strictWorkflowReview: true,
+              expectedTurnId: targetTurnId,
+            });
+            assert.deepEqual(actual, checkpoint);
+
+            for (const [toTurnCount, message] of [
+              [2, /too large to review/],
+              [3, /not valid UTF-8/],
+              [4, /binary summary for a changed file/],
+              [5, /saved workflow checkpoint is unavailable/],
+              [6, /saved workflow checkpoint could not be read/],
+              [7, /contains a NUL byte/],
+            ] as const) {
+              const failed = yield* Effect.flip(
+                client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+                  threadId,
+                  fromTurnCount: toTurnCount - 1,
+                  toTurnCount,
+                  strictWorkflowReview: true,
+                  expectedTurnId: targetTurnId,
+                }),
+              );
+              assert.equal(failed._tag, "OrchestrationGetTurnDiffError");
+              assert.match(failed.message, message);
+              assert.isFalse("completeWorkflowReview" in failed);
+            }
+
+            const preview = yield* Effect.flip(
+              client[WS_METHODS.reviewGetDiffPreview]({ cwd: "/tmp/repo" }),
+            );
+            assert.match(preview.message, /scoped to run results/);
+
+            const file = yield* Effect.flip(
+              client[WS_METHODS.reviewGetDiffFileContents]({
+                cwd: "/tmp/repo",
+                sourceKind: "working-tree",
+                changeType: "new",
+                baseRef: null,
+                headRef: null,
+                oldPath: ".env",
+                newPath: ".env",
+              }),
+            );
+            assert.match(file.message, /scoped to run results/);
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("opens a finished workflow VM result and fences live checkout actions", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("workflow:finished");
+      const turnId = TurnId.make("finished-turn");
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-workflow-result-" });
+      const createdAt = DateTime.formatIso(TEST_EPOCH);
+      const thread = {
+        ...makeDefaultOrchestrationReadModel().threads[0]!,
+        id: threadId,
+        workflowJob: null,
+        messages: [
+          {
+            id: MessageId.make("finished-message"),
+            role: "assistant" as const,
+            text: "Updated [README.md](README.md).",
+            turnId,
+            streaming: false,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        ],
+      };
+      const checkpoint = { threadId, fromTurnCount: 0, toTurnCount: 1, diff: "saved diff" };
+      let diffFailure: VcsProcessExitError | null = null;
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: { workflowVm: true, threadId },
+          serverEnvironment: {
+            getDescriptor: Effect.succeed({
+              ...testEnvironmentDescriptor,
+              threadVm: { threadId },
+              capabilities: {
+                ...testEnvironmentDescriptor.capabilities,
+                workflowVmResultReader: true,
+              },
+            }),
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () => Effect.succeedSome({ snapshotSequence: 1, thread }),
+          },
+          checkpointDiffQuery: {
+            getTurnDiff: () =>
+              Effect.fail(new CheckpointWorkflowDiffRestrictedError({ reason: "contains_secret" })),
+            getFullThreadDiff: () =>
+              diffFailure ? Effect.fail(diffFailure) : Effect.succeed(checkpoint),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const config = yield* client[WS_METHODS.serverGetConfig]({});
+            assert.isTrue(config.environment.capabilities.workflowVmResultReader);
+            const item = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId,
+              sharedPromptQueue: true,
+            }).pipe(Stream.runHead);
+            const snapshot = Option.getOrThrow(item);
+            assertTrue(snapshot.kind === "snapshot");
+            assert.isNull(snapshot.snapshot.thread.workflowJob);
+            assert.deepEqual(snapshot.snapshot.thread.messages, thread.messages);
+            assert.deepEqual(
+              yield* client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                threadId,
+                toTurnCount: 1,
+              }),
+              checkpoint,
+            );
+            const blocked = yield* Effect.flip(
+              client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+                threadId,
+                fromTurnCount: 0,
+                toTurnCount: 1,
+                strictWorkflowReview: true,
+                expectedTurnId: turnId,
+              }),
+            );
+            assert.match(blocked.message, /contains a workflow secret/);
+            diffFailure = new VcsProcessExitError({
+              operation: "diff",
+              command: "git diff",
+              cwd,
+              exitCode: 1,
+              detail: "credential-only-in-git-diagnostics",
+            });
+            const readFailure = yield* Effect.flip(
+              client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                threadId,
+                toTurnCount: 1,
+              }),
+            );
+            assert.equal(readFailure.message, "Failed to load full thread diff");
+            assert.notProperty(readFailure, "cause");
+
+            const message = {
+              messageId: MessageId.make("follow-up"),
+              text: "Continue",
+              attachments: [],
+            };
+            const prompt = {
+              threadId,
+              createdAt,
+              runtimeMode: "full-access" as const,
+              interactionMode: "default" as const,
+            };
+            const terminal = { threadId, terminalId: "result-terminal", cwd };
+            const liveActions: ReadonlyArray<
+              Effect.Effect<unknown, { readonly _tag: string; readonly message: string }>
+            > = [
+              client[WS_METHODS.projectsListEntries]({ cwd }),
+              client[WS_METHODS.projectsReadFile]({ cwd, relativePath: "README.md" }),
+              client[WS_METHODS.projectsWriteFile]({
+                cwd,
+                relativePath: "README.md",
+                contents: "edit",
+              }),
+              client[WS_METHODS.shellOpenInEditor]({ cwd, editor: "file-manager" }),
+              client[WS_METHODS.terminalOpen](terminal),
+              client[WS_METHODS.terminalAttach](terminal).pipe(Stream.runHead),
+              client[WS_METHODS.terminalWrite]({
+                threadId,
+                terminalId: terminal.terminalId,
+                data: "git status\n",
+              }),
+              client[WS_METHODS.vcsRefreshStatus]({ cwd }),
+              client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                ...prompt,
+                type: "thread.turn.start",
+                commandId: CommandId.make("send-follow-up"),
+                modelSelection: defaultModelSelection,
+                message: { ...message, role: "user" },
+              }),
+              client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                ...prompt,
+                type: "thread.prompt.enqueue",
+                commandId: CommandId.make("queue-follow-up"),
+                message,
+              }),
+            ];
+            for (const request of liveActions) {
+              const denied = yield* Effect.result(request);
+              assertTrue(denied._tag === "Failure");
+              assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+              assert.match(denied.failure.message, /scoped to run results/);
+            }
+          }),
+        ),
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

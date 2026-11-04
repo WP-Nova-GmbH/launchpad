@@ -99,8 +99,8 @@ at signup unless they were invited into an existing one. An organization owns
 ### Org role
 
 A member's standing in an [organization](#organization): `member` or `admin`. Organization-wide.
-Admins own members, the [credential pool](#credential-pool), [executors](#executor), org
-workflows, and quotas.
+Admins manage members, the [credential pool](#credential-pool), [executors](#executor), and org
+quotas; they can administer the organization's repository workflows. Repositories own those workflows.
 
 ### Repository role
 
@@ -258,9 +258,11 @@ done.
 ### Integration
 
 A connection to an external service. Personal Jira and Linear connections carry one user's OAuth
-permissions and grant read access to individual prompts. An **automation connection** authorizes
-an external workspace or site as a workflow event source, reusable by repositories explicitly
-allowed by its owner. Organization membership alone grants neither kind of access.
+permissions and grant read access to individual prompts. An **automation connection** is an
+organization-managed authorization to use an external workspace or site as a workflow event
+source. Organization admins manage its connection, reconnection and disconnection; repository
+use requires their explicit permission, after which repository maintainers configure workflow
+triggers. Organization membership alone grants neither kind of access.
 [Provider accounts](#provider-account) have a separate organization-sharing model.
 
 ### Mirror

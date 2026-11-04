@@ -62,6 +62,7 @@ interface ChatHeaderProps {
   activeThreadTitle: string;
   /** Drafts have no server thread yet, so the title carries no action menu. */
   isServerThread: boolean;
+  readOnly?: boolean;
   activeProject: EnvironmentProject | null;
   openInCwd: string | null;
   activeProjectScripts: ReadonlyArray<ProjectScript> | undefined;
@@ -131,6 +132,7 @@ export const ChatHeader = memo(function ChatHeader({
   draftId,
   activeThreadTitle,
   isServerThread,
+  readOnly = false,
   activeProject,
   openInCwd,
   activeProjectScripts,
@@ -197,9 +199,9 @@ export const ChatHeader = memo(function ChatHeader({
   );
   if (!actionsCollapsed && actionsOpen) setActionsOpen(false);
   const primaryEnvironmentId = usePrimaryEnvironmentId();
-  const canCreateThread = canCreateThreadInEnvironment(
-    useServerConfigs().get(activeThreadEnvironmentId),
-  );
+  const serverConfigs = useServerConfigs();
+  const canCreateThread =
+    !readOnly && canCreateThreadInEnvironment(serverConfigs.get(activeThreadEnvironmentId));
   const activeProjectName = activeProject?.title;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const projectFile = useT3ProjectFileState(
@@ -207,12 +209,14 @@ export const ChatHeader = memo(function ChatHeader({
     activeProjectScripts ? activeProjectCwd : null,
   );
   const remoteOpenState = useRemoteOpenState(activeThreadEnvironmentId);
-  const showOpenInPicker = shouldShowOpenInPicker({
-    activeProjectName,
-    activeThreadEnvironmentId,
-    primaryEnvironmentId,
-    remoteOpenMode: remoteOpenState.mode,
-  });
+  const showOpenInPicker =
+    !readOnly &&
+    shouldShowOpenInPicker({
+      activeProjectName,
+      activeThreadEnvironmentId,
+      primaryEnvironmentId,
+      remoteOpenMode: remoteOpenState.mode,
+    });
   const activeThreadRef = useMemo(
     () => scopeThreadRef(activeThreadEnvironmentId, activeThreadId),
     [activeThreadEnvironmentId, activeThreadId],
@@ -319,7 +323,7 @@ export const ChatHeader = memo(function ChatHeader({
   );
   const handleHeaderContextMenu = useCallback(
     (event: ReactMouseEvent) => {
-      if (renamingTitle !== null) return;
+      if (readOnly || renamingTitle !== null) return;
       // The right-side controls (git, scripts, open-in) keep their own
       // behavior; only the breadcrumb area opens the thread menu.
       if ((event.target as HTMLElement).closest("[data-chat-header-actions]")) return;
@@ -341,7 +345,14 @@ export const ChatHeader = memo(function ChatHeader({
       }
       openMenu({ x: event.clientX, y: event.clientY });
     },
-    [cancelPendingTitleMenu, isServerThread, onOpenProjectSettings, openMenu, renamingTitle],
+    [
+      cancelPendingTitleMenu,
+      isServerThread,
+      onOpenProjectSettings,
+      openMenu,
+      readOnly,
+      renamingTitle,
+    ],
   );
   const handleRenameKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLInputElement>) => {
@@ -446,7 +457,7 @@ export const ChatHeader = memo(function ChatHeader({
           </>
         ) : null}
         <WorkspaceBreadcrumbItem current className="min-w-10 flex-1">
-          {renamingTitle !== null ? (
+          {!readOnly && renamingTitle !== null ? (
             <input
               autoFocus
               aria-label="Thread title"
@@ -459,7 +470,7 @@ export const ChatHeader = memo(function ChatHeader({
               onFocus={(event) => event.currentTarget.select()}
               onKeyDown={handleRenameKeyDown}
             />
-          ) : isServerThread ? (
+          ) : isServerThread && !readOnly ? (
             <Tooltip>
               <TooltipTrigger
                 render={

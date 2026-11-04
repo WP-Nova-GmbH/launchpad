@@ -17,6 +17,8 @@ import { VmWorkloadError, type VmHarnessStopAdmission } from "../../vmWorkload.t
  */
 import { CodexResumeCursorSchema } from "./CodexSessionRuntime.ts";
 import { makeThreadAttachmentCheckpoint } from "../../relay/ThreadAttachmentCheckpoint.ts";
+import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
+import { workflowVmSecretMask } from "../workflowVmSecretMask.ts";
 import {
   makeThreadNativeCheckpoint,
   digestNativeCheckpointArchive,
@@ -98,6 +100,7 @@ import {
 import {
   ProviderAdapterValidationError,
   ProviderAdapterRequestError,
+  ProviderAdapterSessionNotFoundError,
   ProviderAdapterProcessError,
   ProviderExecutionError,
   type ProviderAdapterError,
@@ -1569,6 +1572,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     });
 
+  const workflowSecretMasks = new Map<ThreadId, ReturnType<typeof workflowVmSecretMask>>();
   const processRuntimeEvent = (
     source: {
       readonly instanceId: ProviderInstanceId;
@@ -1577,9 +1581,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     event: ProviderRuntimeEvent,
   ): Effect.Effect<void> =>
     Effect.gen(function* () {
-      const canonicalEvent = yield* Effect.sync(() =>
-        correlateRuntimeEventWithInstance(source, event),
-      );
+      const correlate = () => correlateRuntimeEventWithInstance(source, event);
+      const redact = workflowSecretMasks.get(event.threadId);
+      const canonicalEvent = redact ? redact(correlate()) : correlate();
+      if (!canonicalEvent) return;
       yield* increment(providerRuntimeEventsTotal, {
         provider: canonicalEvent.provider,
         eventType: canonicalEvent.type,
@@ -1907,6 +1912,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     readonly threadId: ThreadId;
     readonly operation: string;
     readonly allowRecovery: boolean;
+    readonly requireLiveSession?: boolean | undefined;
   }) {
     const bindingOption = yield* directory.getBinding(input.threadId);
     const binding = Option.getOrUndefined(bindingOption);
@@ -1937,6 +1943,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       } as const;
     }
 
+    if (input.requireLiveSession)
+      return yield* new ProviderAdapterSessionNotFoundError({
+        provider: adapter.provider,
+        threadId: input.threadId,
+      });
     if (!input.allowRecovery) {
       return {
         adapter,
@@ -2006,6 +2017,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const startSession: ProviderServiceMethod<"startSession"> = Effect.fn("startSession")(
     function* (threadId, rawInput, sessionOptions) {
+      const workflowEnvironment = yield* CurrentWorkflowVmAttemptEnvironment;
+      if (workflowEnvironment?.hasSecrets)
+        workflowSecretMasks.set(threadId, workflowVmSecretMask(workflowEnvironment));
       const parsed = yield* decodeInputOrValidationError({
         operation: "ProviderService.startSession",
         schema: ProviderSessionStartInput,
@@ -2962,7 +2976,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   );
 
   const respondToRequest: ProviderServiceMethod<"respondToRequest"> = Effect.fn("respondToRequest")(
-    function* (rawInput) {
+    function* (rawInput, options) {
       const input = yield* decodeInputOrValidationError({
         operation: "ProviderService.respondToRequest",
         schema: ProviderRespondToRequestInput,
@@ -2978,7 +2992,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             resolveRoutableSession({
               threadId: input.threadId,
               operation: "ProviderService.respondToRequest",
-              allowRecovery: true,
+              allowRecovery: !options?.liveSessionOnly,
+              requireLiveSession: options?.liveSessionOnly,
             }),
           );
           metricProvider = routed.adapter.provider;
@@ -3016,7 +3031,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const respondToUserInput: ProviderServiceMethod<"respondToUserInput"> = Effect.fn(
     "respondToUserInput",
-  )(function* (rawInput) {
+  )(function* (rawInput, options) {
     const input = yield* decodeInputOrValidationError({
       operation: "ProviderService.respondToUserInput",
       schema: ProviderRespondToUserInputInput,
@@ -3032,7 +3047,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           resolveRoutableSession({
             threadId: input.threadId,
             operation: "ProviderService.respondToUserInput",
-            allowRecovery: true,
+            allowRecovery: !options?.liveSessionOnly,
+            requireLiveSession: options?.liveSessionOnly,
           }),
         );
         metricProvider = routed.adapter.provider;
@@ -3551,6 +3567,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         schema: ProviderUploadFeedbackInput,
         payload: rawInput,
       });
+      if (yield* workflows.isWorkflowVmThread(input.threadId))
+        return yield* toValidationError(
+          "ProviderService.uploadFeedback",
+          "Native provider logs are unavailable for workflow VMs.",
+        );
       let routed = yield* resolveRoutableSession({
         threadId: input.threadId,
         operation: "ProviderService.uploadFeedback",
@@ -3587,6 +3608,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const checkpointConversation: NonNullable<ProviderServiceMethod<"checkpointConversation">> =
     Effect.fn("ProviderService.checkpointConversation")(function* (input) {
+      if (yield* workflows.isWorkflowVmThread(input.threadId)) {
+        if (input.captureOperationId === undefined) return;
+        return yield* toValidationError(
+          "checkpointConversation",
+          "Native provider history cannot leave a workflow VM.",
+        );
+      }
       return yield* nativeCheckpoints
         .capture(
           { ...input, artifactRoot: pathService.join(serverConfig.stateDir, "native-checkpoints") },

@@ -3,6 +3,8 @@ import {
   WorkflowActionError,
   workflowPublishingRemote,
   changeWorkflowAction,
+  readWorkflowHead,
+  readWorkflowTree,
   type WorkflowActionIO,
 } from "./WorkflowActions.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
@@ -14,12 +16,14 @@ import {
   EventId,
   MessageId,
   ThreadId,
+  type TurnId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import {
   WORKFLOW_PROTOCOL,
   isTerminalWorkflowJob,
+  WorkflowVmDispatchBinding,
   type WorkflowControl,
   type WorkflowControlResult,
 } from "@t3tools/contracts/workflows";
@@ -52,14 +56,22 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers
 import { forkParked } from "../serverActivation.ts";
 import {
   activeWorkflowStep,
+  admittedWorkflowTurnId,
   advanceWorkflow,
+  canRecoverPausedWorkflowTurn,
   workflowProgress,
   workflowPromptId,
   workflowAllowsPrompt,
+  workflowTurnPauseDetails,
 } from "./workflowSequence.ts";
 import { workflowTask } from "./workflowTask.ts";
 import { attachApprovalSupervisor, type SupervisorVerdict } from "./supervisor.ts";
-import { WorkflowRunStore, WorkflowRun, workflowRunOrigin } from "./WorkflowRunStore.ts";
+import {
+  WorkflowRunStore,
+  WorkflowRun,
+  workflowRunOrigin,
+  type LegacyWorkflowTurnOutcome,
+} from "./WorkflowRunStore.ts";
 import {
   isOrchestrationCommandRejection,
   OrchestrationCommandPreviouslyRejectedError,
@@ -74,7 +86,14 @@ export interface WorkflowRequest {
   readonly repositoryCanonicalKey: string;
   readonly instruction: string;
   readonly control: WorkflowControl;
+  readonly workflowVm?: {
+    readonly binding: WorkflowVmDispatchBinding;
+    readonly workspaceRoot: string;
+    readonly baseBranch: string;
+    readonly baseSha: string;
+  };
 }
+const sameVmBinding = Schema.toEquivalence(WorkflowVmDispatchBinding);
 export class WorkflowRunnerError extends Schema.TaggedError<WorkflowRunnerError>()(
   "WorkflowRunnerError",
   { message: Schema.String },
@@ -99,12 +118,39 @@ export class RepositoryWorkflowRunner extends Context.Reference<RepositoryWorkfl
   },
 ) {}
 
+function currentWorkflowTurnId(thread: OrchestrationThread | null, promptId: string) {
+  const admittedTurnId = admittedWorkflowTurnId(thread?.promptQueue, promptId);
+  if (admittedTurnId) return admittedTurnId;
+  const turnId = thread?.promptQueue?.finalizedTurnId;
+  if (!thread || !turnId) return null;
+  // Admission records are transient. The admitted user message retains the exact turn.
+  return thread.messages.some(
+    (message) => message.id === promptId && message.role === "user" && message.turnId === turnId,
+  )
+    ? turnId
+    : null;
+}
+
+function resolvedWorkflowTurnId(thread: OrchestrationThread | null, promptId: string) {
+  const turnId = currentWorkflowTurnId(thread, promptId);
+  return thread?.promptQueue?.finalizedTurnId === turnId ? turnId : null;
+}
+
+const { unknownResult, incompleteResult, stoppedTurn, missingCheckpoint, unconfirmedDelivery } =
+  workflowTurnPauseDetails;
+
+function canReconcileWorkflowTurn(run: WorkflowRun) {
+  const status = run.progress.status;
+  return status === "preparing" || status === "running" || canRecoverPausedWorkflowTurn(run);
+}
+
 /** Read durable admission, completion and checkpoint evidence; session idle alone is insufficient. */
 export function reconcileWorkflowRun(
   run: WorkflowRun,
   thread: OrchestrationThread | null,
   cleanupConfirmed = false,
   providerShutdownConfirmed = false,
+  legacyFinalization: { turnId: TurnId; outcome: LegacyWorkflowTurnOutcome } | null = null,
 ): WorkflowRun {
   if (isTerminalWorkflowJob(run.progress.status) || thread === null) return run;
   const preparation = thread.promptQueue?.preparation;
@@ -150,19 +196,41 @@ export function reconcileWorkflowRun(
     )
   )
     return { ...run, worktreePath };
-  const admission = thread.promptQueue?.admissions.find(
-    (entry) => entry.messageId === workflowPromptId(run),
-  );
+  const promptId = workflowPromptId(run);
+  const turnId = currentWorkflowTurnId(thread, promptId);
+  const queueResolved = turnId !== null && thread.promptQueue?.finalizedTurnId === turnId;
+  const finalization =
+    queueResolved && thread.promptQueue?.finalization?.turnId === turnId
+      ? thread.promptQueue.finalization
+      : null;
+  const legacyOutcome =
+    queueResolved && !finalization && legacyFinalization?.turnId === turnId
+      ? legacyFinalization.outcome
+      : null;
+  const turn = thread.latestTurn?.turnId === turnId ? thread.latestTurn : null;
+  const checkpoint = queueResolved
+    ? thread.checkpoints.find((entry) => entry.turnId === turnId)
+    : undefined;
+  const completed = finalization
+    ? finalization.outcome === "completed" && finalization.checkpoint !== "error"
+    : legacyOutcome === "completed" && turn?.state === "completed";
+  if (completed && checkpoint?.status === "ready" && canReconcileWorkflowTurn(run))
+    return withProgress("awaiting_review", null, {
+      checkpointId: `${run.jobId}:${checkpoint.turnId}:${checkpoint.checkpointRef}`,
+      turnId: checkpoint.turnId,
+      checkpointRef: checkpoint.checkpointRef,
+      checkpointTurnCount: checkpoint.checkpointTurnCount,
+    });
   const unknown = thread.promptQueue?.pauseReason?.code === "delivery-unknown";
   if (
-    !admission &&
+    !queueResolved &&
     unknown &&
-    (thread.promptQueue?.handoff?.messageId === workflowPromptId(run) ||
+    (thread.promptQueue?.handoff?.messageId === promptId ||
       thread.promptQueue.entries.some(
-        (entry) => entry.messageId === workflowPromptId(run) && entry.state === "unknown",
+        (entry) => entry.messageId === promptId && entry.state === "unknown",
       ))
   ) {
-    const detail = "Prompt delivery could not be confirmed. Cancel this job before starting again.";
+    const detail = unconfirmedDelivery;
     return run.progress.status === "paused" &&
       run.progress.detail === detail &&
       !run.progress.retryablePreparation
@@ -179,7 +247,7 @@ export function reconcileWorkflowRun(
         };
   }
   const rejection = thread.promptQueue?.pauseReason;
-  if (!admission && rejection?.code === "failed" && rejection.messageId === workflowPromptId(run)) {
+  if (!turnId && rejection?.code === "failed" && rejection.messageId === promptId) {
     const detail = `${rejection.detail} Cancel this job before starting again.`;
     return run.progress.status === "paused" &&
       run.progress.detail === detail &&
@@ -216,45 +284,22 @@ export function reconcileWorkflowRun(
       progress: { ...paused.progress, retryablePreparation: !unknown && preparation.settled },
     };
   }
-  if (!admission) return worktreePath === run.worktreePath ? run : { ...run, worktreePath };
-  const turn = thread.latestTurn;
-  if (turn?.turnId !== admission.turnId)
-    return withProgress(
-      "paused",
-      "The admitted turn could not be reconciled. Cancel this job before starting again.",
-    );
-  if (turn.state === "interrupted" || turn.state === "error")
-    return withProgress(
-      "paused",
-      "The agent turn stopped without a complete result. Cancel this job before starting again.",
-    );
+  if (!turnId) return worktreePath === run.worktreePath ? run : { ...run, worktreePath };
+  if (queueResolved) {
+    if ((finalization && finalization.outcome !== "completed") || legacyOutcome === "failed")
+      return withProgress("paused", incompleteResult);
+    if (finalization || legacyOutcome === "checkpoint-error" || completed)
+      return withProgress("paused", missingCheckpoint);
+    return withProgress("paused", unknownResult);
+  }
+  if (turn?.state === "interrupted" || turn?.state === "error")
+    return withProgress("paused", incompleteResult);
   if (
-    turn.state === "running" &&
+    turn?.state === "running" &&
     thread.session &&
     ["stopped", "error", "interrupted"].includes(thread.session.status)
   )
-    return withProgress(
-      "paused",
-      "The admitted turn could not be reattached after stopping. Cancel this job before starting again.",
-    );
-  const checkpoint = thread.checkpoints.find((entry) => entry.turnId === admission.turnId);
-  if (
-    turn.state === "completed" &&
-    thread.promptQueue?.finalizedTurnId === admission.turnId &&
-    checkpoint
-  ) {
-    if (checkpoint.status !== "ready")
-      return withProgress(
-        "paused",
-        "The result checkpoint could not be saved. Cancel this job before starting again.",
-      );
-    return withProgress("awaiting_review", null, {
-      checkpointId: `${run.jobId}:${admission.turnId}:${checkpoint.checkpointRef}`,
-      turnId: admission.turnId,
-      checkpointRef: checkpoint.checkpointRef,
-      checkpointTurnCount: checkpoint.checkpointTurnCount,
-    });
-  }
+    return withProgress("paused", stoppedTurn);
   return run.progress.status === "running"
     ? { ...run, worktreePath }
     : withProgress("running", null);
@@ -349,6 +394,36 @@ export const make = Effect.gen(function* () {
     query
       .getThreadDetailById(run.progress.threadId)
       .pipe(Effect.orDie, Effect.map(Option.getOrNull));
+  const readReconciliationThread = Effect.fnUntraced(function* (run: WorkflowRun) {
+    const thread = yield* readThread(run);
+    if (!canReconcileWorkflowTurn(run)) return thread;
+    const promptId = workflowPromptId(run);
+    const turnId = resolvedWorkflowTurnId(thread, promptId);
+    if (!thread || !turnId) return thread;
+    if (
+      (thread.promptQueue?.finalization !== undefined ||
+        (thread.latestTurn?.turnId === turnId && thread.latestTurn.state === "completed")) &&
+      thread.checkpoints.some(
+        (checkpoint) => checkpoint.turnId === turnId && checkpoint.status === "ready",
+      )
+    )
+      return thread;
+    // Thread detail reads checkpoints before the queue. Confirm missing evidence
+    // after observing finalization, which is written after the checkpoint.
+    const confirmed = yield* readThread(run);
+    return resolvedWorkflowTurnId(confirmed, promptId) === turnId ? confirmed : null;
+  });
+  const readLegacyFinalization = Effect.fnUntraced(function* (
+    run: WorkflowRun,
+    thread: OrchestrationThread | null,
+  ) {
+    if (!canReconcileWorkflowTurn(run)) return null;
+    if (thread?.promptQueue?.finalization !== undefined) return null;
+    const turnId = resolvedWorkflowTurnId(thread, workflowPromptId(run));
+    if (!turnId) return null;
+    const outcome = yield* store.getLegacyTurnOutcome(run.progress.threadId, turnId);
+    return outcome === null ? null : { turnId, outcome };
+  });
   const supervise = Effect.fn("RepositoryWorkflowRunner.supervise")(function* (run: WorkflowRun) {
     if (supervised.has(run.jobId)) return;
     const scope = yield* Scope.make();
@@ -361,10 +436,13 @@ export const make = Effect.gen(function* () {
         .getThreadDetailById(run.progress.threadId)
         .pipe(Effect.orDie, Effect.map(Option.getOrNull));
       const resolvedRequestIds = new Set<string>();
+      const resolvedUserInputIds = new Set<string>();
       const recordedVerdicts = new Map<string, SupervisorVerdict>();
       for (const activity of thread?.activities ?? []) {
         if (activity.kind === "approval.resolved" && isApprovalRequestId(activity.payload))
           resolvedRequestIds.add(activity.payload.requestId);
+        if (activity.kind === "user-input.resolved" && isApprovalRequestId(activity.payload))
+          resolvedUserInputIds.add(activity.payload.requestId);
         if (activity.kind === "job.supervisor.verdict" && isRecordedVerdict(activity.payload))
           recordedVerdicts.set(activity.payload.requestId, activity.payload.verdict);
       }
@@ -377,11 +455,15 @@ export const make = Effect.gen(function* () {
         cwd: "",
         resolveCwd: readThread(run).pipe(
           Effect.map((current) =>
-            current?.projectId === run.runtime.projectId ? current.worktreePath : null,
+            current?.projectId === run.runtime.projectId
+              ? (current.worktreePath ?? (run.runtime.kind === "vm" ? run.worktreePath : null))
+              : null,
           ),
         ),
         modelSelection: run.modelSelection,
+        workflowVm: run.runtime.kind === "vm",
         resolvedRequestIds,
+        resolvedUserInputIds,
         recordedVerdicts,
         liveEvents,
         replayEvents: engine
@@ -418,36 +500,40 @@ export const make = Effect.gen(function* () {
     work: (run: WorkflowRun) => Effect.Effect<WorkflowRun, E, R>,
   ) =>
     access.withFence(
-      workflowRunOrigin(run).kind !== "automation"
-        ? work(run)
-        : requireExecution(run).pipe(
-            Effect.matchEffect({
-              onFailure: () =>
-                run.progress.detail && run.progress.detail !== "Waiting for executor capacity."
-                  ? Effect.succeed(run)
-                  : store.save({
-                      ...run,
-                      progress: {
-                        ...run.progress,
-                        revision: run.progress.revision + 1,
-                        detail: blockedExecutionDetail,
-                      },
-                    }),
-              onSuccess: () =>
-                Effect.gen(function* () {
-                  if (run.progress.detail === blockedExecutionDetail)
-                    run = yield* store.save({
-                      ...run,
-                      progress: {
-                        ...run.progress,
-                        revision: run.progress.revision + 1,
-                        detail: null,
-                      },
-                    });
-                  return yield* work(run);
-                }),
-            }),
-          ),
+      run.runtime.kind === "vm"
+        ? Effect.flatMap(store.isVmFenceActive(run.runtime), (active) =>
+            active ? work(run) : Effect.succeed(run),
+          )
+        : workflowRunOrigin(run).kind !== "automation"
+          ? work(run)
+          : requireExecution(run).pipe(
+              Effect.matchEffect({
+                onFailure: () =>
+                  run.progress.detail && run.progress.detail !== "Waiting for executor capacity."
+                    ? Effect.succeed(run)
+                    : store.save({
+                        ...run,
+                        progress: {
+                          ...run.progress,
+                          revision: run.progress.revision + 1,
+                          detail: blockedExecutionDetail,
+                        },
+                      }),
+                onSuccess: () =>
+                  Effect.gen(function* () {
+                    if (run.progress.detail === blockedExecutionDetail)
+                      run = yield* store.save({
+                        ...run,
+                        progress: {
+                          ...run.progress,
+                          revision: run.progress.revision + 1,
+                          detail: null,
+                        },
+                      });
+                    return yield* work(run);
+                  }),
+              }),
+            ),
     );
   const dispatchPrompt = Effect.fn("RepositoryWorkflowRunner.dispatchPrompt")(function* (
     run: WorkflowRun,
@@ -554,30 +640,32 @@ export const make = Effect.gen(function* () {
                   },
                 }
               : { author: { userId: run.userId!, displayName: null, imageUrl: null } }),
-            ...(!run.sequence?.started
-              ? {
-                  bootstrap: {
-                    createThread: {
-                      projectId: project.value.id,
-                      title: run.workflow.definition.name,
-                      modelSelection: run.modelSelection,
-                      runtimeMode: "approval-required",
-                      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-                      branch: null,
-                      worktreePath: null,
-                      createdAt: run.createdAt,
+            ...(!run.sequence?.started && run.runtime.kind === "vm"
+              ? { bootstrap: { runSetupScript: true } }
+              : !run.sequence?.started
+                ? {
+                    bootstrap: {
+                      createThread: {
+                        projectId: project.value.id,
+                        title: run.workflow.definition.name,
+                        modelSelection: run.modelSelection,
+                        runtimeMode: "approval-required",
+                        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                        branch: null,
+                        worktreePath: null,
+                        createdAt: run.createdAt,
+                      },
+                      prepareWorktree: {
+                        projectCwd: project.value.workspaceRoot,
+                        baseBranch: run.baseSha,
+                        branch: jobBranchName(run.jobId),
+                        startFromOrigin: false,
+                        requireWorktree: true,
+                      },
+                      runSetupScript: true,
                     },
-                    prepareWorktree: {
-                      projectCwd: project.value.workspaceRoot,
-                      baseBranch: run.baseSha,
-                      branch: jobBranchName(run.jobId),
-                      startFromOrigin: false,
-                      requireWorktree: true,
-                    },
-                    runSetupScript: true,
-                  },
-                }
-              : {}),
+                  }
+                : {}),
           })
           .pipe(Effect.result);
         if (acknowledgement._tag === "Failure") {
@@ -609,31 +697,56 @@ export const make = Effect.gen(function* () {
     if (!run.worktreePath || !run.progress.checkpoint || run.progress.checkpoint.kind === "input")
       return "The saved result is unavailable. Cancel the job and run it again.";
     if (
-      (yield* git.resolveCommit({ cwd: run.worktreePath, revision: "HEAD" })).commitSha !==
-        run.preparedHead ||
-      (yield* git.statusDetailsLocal(run.worktreePath)).branch !== jobBranchName(run.jobId)
+      (yield* readWorkflowHead(git, run.worktreePath, jobBranchName(run.jobId))) !==
+      run.preparedHead
     )
       return "The prepared branch changed after this review was created. Cancel the job and run it again.";
+    const cwd = run.worktreePath;
+    const reviewedRef = CheckpointRef.make(run.progress.checkpoint.checkpointRef);
+    let reviewedTree: string;
+    let workflowIgnoreRules: Uint8Array | undefined;
+    if (run.runtime.kind === "vm") {
+      const pin = yield* persistence.getCheckpointPinForRun(
+        run.runtime,
+        run.progress.checkpoint.turnId,
+        reviewedRef,
+      );
+      if (
+        !pin ||
+        (yield* readWorkflowTree(git, cwd, pin.commitId).pipe(Effect.orElseSucceed(() => null))) !==
+          pin.treeId ||
+        (yield* readWorkflowTree(git, cwd, pin.baselineCommitId).pipe(Effect.isSuccess)) === false
+      )
+        return "The saved workflow checkpoint is unavailable. Cancel the run and start again.";
+      const ignoreRules = yield* persistence.getWorkflowIgnoreRules(run.runtime);
+      if (ignoreRules === null)
+        return "The saved workflow Git ignore rules are unavailable. Cancel the run and start again.";
+      workflowIgnoreRules = ignoreRules;
+      reviewedTree = pin.treeId;
+    } else {
+      reviewedTree = yield* readWorkflowTree(git, cwd, reviewedRef);
+    }
     const verificationRef = CheckpointRef.make(`refs/t3/workflow-verification/${run.jobId}`);
-    yield* checkpoints.captureCheckpoint({ cwd: run.worktreePath, checkpointRef: verificationRef });
-    const difference = yield* checkpoints
-      .diffCheckpoints({
-        cwd: run.worktreePath,
-        fromCheckpointRef: CheckpointRef.make(run.progress.checkpoint.checkpointRef),
-        toCheckpointRef: verificationRef,
-        ignoreWhitespace: false,
+    const current = yield* checkpoints
+      .captureCheckpoint({
+        cwd,
+        checkpointRef: verificationRef,
+        strictWorkflowCapture: run.runtime.kind === "vm",
+        ...(workflowIgnoreRules === undefined ? {} : { workflowIgnoreRules }),
       })
       .pipe(
         Effect.ensuring(
           checkpoints
             .deleteCheckpointRefs({
-              cwd: run.worktreePath,
+              cwd,
               checkpointRefs: [verificationRef],
             })
             .pipe(Effect.ignoreCause({ log: true })),
         ),
       );
-    return difference.length > 0
+    if ((yield* readWorkflowHead(git, cwd, jobBranchName(run.jobId))) !== run.preparedHead)
+      return "The prepared branch changed after this review was created. Cancel the job and run it again.";
+    return current.treeId !== reviewedTree
       ? "Prepared files changed after this review was created. Cancel the job and run it again."
       : null;
   });
@@ -711,16 +824,17 @@ export const make = Effect.gen(function* () {
       const attempt = run.approvalAttempt!;
       const cleanup = attempt.setupCleanup;
       if (!cleanup) return null;
+      const preparationPath = run.runtime.kind === "vm" ? null : run.worktreePath;
       for (let retry = 0; retry < 8; retry++) {
         const thread = yield* readThread(run);
         const preparation = thread?.promptQueue?.preparation;
         if (
           !thread ||
           thread.projectId !== run.runtime.projectId ||
-          thread.worktreePath !== run.worktreePath ||
+          thread.worktreePath !== preparationPath ||
           !preparation ||
           preparation.attemptId !== cleanup.attemptId ||
-          preparation.target?.worktreePath !== run.worktreePath ||
+          preparation.target?.worktreePath !== preparationPath ||
           !["ready", "failed"].includes(preparation.state)
         )
           return "The original preparation changed or is unavailable. Cancel the job and run it again.";
@@ -762,9 +876,9 @@ export const make = Effect.gen(function* () {
         }
         if (
           projected?.projectId !== run.runtime.projectId ||
-          projected.worktreePath !== run.worktreePath ||
+          projected.worktreePath !== preparationPath ||
           current?.attemptId !== cleanup.attemptId ||
-          current.target?.worktreePath !== run.worktreePath
+          current.target?.worktreePath !== preparationPath
         )
           return "The original preparation changed or is unavailable. Cancel the job and run it again.";
         if (current.settled && ["ready", "failed"].includes(current.state)) return null;
@@ -1130,11 +1244,21 @@ export const make = Effect.gen(function* () {
         return yield* new WorkflowRunnerError({
           message: "The publishing step has no prepared result.",
         });
-      const tree = yield* git.execute({
-        operation: "WorkflowAction.tree",
-        cwd: run.worktreePath,
-        args: ["rev-parse", `${result.checkpoint.checkpointRef}^{tree}`],
-      });
+      const pin =
+        run.runtime.kind === "vm"
+          ? yield* persistence.getCheckpointPinForRun(
+              run.runtime,
+              result.checkpoint.turnId,
+              result.checkpoint.checkpointRef,
+            )
+          : null;
+      if (run.runtime.kind === "vm" && !pin)
+        return yield* new WorkflowRunnerError({
+          message: "The saved workflow checkpoint is unavailable. Cancel the run and start again.",
+        });
+      const tree =
+        pin?.treeId ??
+        (yield* readWorkflowTree(git, run.worktreePath, result.checkpoint.checkpointRef));
       action = {
         actionId: id,
         stepId: step.id,
@@ -1143,8 +1267,9 @@ export const make = Effect.gen(function* () {
         state: "running",
         phase: "prepare",
         parent: run.preparedHead,
-        tree: tree.stdout.trim(),
+        tree,
         checkpointRef: result.checkpoint.checkpointRef,
+        ...(pin ? { checkpointTurnId: result.checkpoint.turnId } : {}),
         commitMessage: null,
         commitSha: null,
         oldRemoteSha: run.publication.publishedHead,
@@ -1348,7 +1473,7 @@ export const make = Effect.gen(function* () {
       }
     }
     if (run.progress.status === "cancelling") run = yield* reconcileCancellation(run, recovering);
-    const thread = yield* readThread(run);
+    const thread = yield* readReconciliationThread(run);
     if (
       run.progress.status === "cancelling" &&
       thread === null &&
@@ -1387,19 +1512,49 @@ export const make = Effect.gen(function* () {
         jobId: run.jobId,
         threadId: run.progress.threadId,
       }));
-    let next = reconcileWorkflowRun(run, thread, cleanupConfirmed, providerShutdownConfirmed);
+    const legacyFinalization = yield* readLegacyFinalization(run, thread);
+    let next = reconcileWorkflowRun(
+      run,
+      thread,
+      cleanupConfirmed,
+      providerShutdownConfirmed,
+      legacyFinalization,
+    );
     if (
+      run.runtime.kind === "vm" &&
       run.progress.status !== "awaiting_review" &&
       next.progress.status === "awaiting_review" &&
-      next.worktreePath !== null
+      next.progress.checkpoint &&
+      next.progress.checkpoint.kind !== "input" &&
+      !(yield* store.getCheckpointPinForRun(
+        run.runtime,
+        next.progress.checkpoint.turnId,
+        CheckpointRef.make(next.progress.checkpoint.checkpointRef),
+      ))
     ) {
-      const head = yield* git.resolveCommit({ cwd: next.worktreePath, revision: "HEAD" });
-      const status = yield* git.statusDetailsLocal(next.worktreePath);
       next =
-        status.branch === jobBranchName(next.jobId)
-          ? { ...next, preparedHead: head.commitSha }
+        run.progress.status === "paused" && run.progress.detail === missingCheckpoint
+          ? run
+          : {
+              ...run,
+              progress: {
+                ...run.progress,
+                revision: run.progress.revision + 1,
+                status: "paused",
+                detail: missingCheckpoint,
+              },
+            };
+    }
+    if (run.progress.status !== "awaiting_review" && next.progress.status === "awaiting_review") {
+      const head = next.worktreePath
+        ? yield* readWorkflowHead(git, next.worktreePath, jobBranchName(next.jobId))
+        : null;
+      next =
+        head !== null
+          ? { ...next, preparedHead: head }
           : {
               ...next,
+              executionReserved: run.executionReserved,
               progress: {
                 ...next.progress,
                 status: "paused",
@@ -1528,27 +1683,38 @@ export const make = Effect.gen(function* () {
   });
   const handle = Effect.fn("RepositoryWorkflowRunner.handle")(
     function* (request: WorkflowRequest) {
+      const vm = request.workflowVm;
       const result = (
         run: WorkflowRun | null,
         outcome: WorkflowControlResult["outcome"] = run ? "accepted" : "missing",
         detail: string | null = null,
       ): WorkflowControlResult => ({
         protocol: WORKFLOW_PROTOCOL,
-        actions: publishingSupported
-          ? actions.canOpenPullRequest
-            ? ["push", "open_pull_request"]
-            : ["push"]
-          : [],
+        actions:
+          !vm && publishingSupported
+            ? actions.canOpenPullRequest
+              ? ["push", "open_pull_request"]
+              : ["push"]
+            : [],
         outcome,
         detail,
         progress: run ? workflowProgress(run) : null,
       });
       if (
-        request.control.operation === "start" &&
-        (request.control.workflow.definition.target.kind !== "machine" ||
-          request.control.runtime.kind !== "machine")
+        vm &&
+        (vm.binding.jobId !== request.jobId ||
+          vm.binding.organizationId !== request.control.organizationId ||
+          vm.binding.repositoryId !== request.control.repositoryId ||
+          vm.binding.projectId !== request.control.projectId ||
+          !(yield* store.isVmFenceActive(vm.binding)))
       )
-        return result(null, "unavailable", "VM workflows are not available yet.");
+        return result(null, "unavailable", "The VM does not own the workflow thread.");
+      if (
+        request.control.operation === "start" &&
+        (request.control.workflow.definition.target.kind !== (vm ? "vm" : "machine") ||
+          request.control.runtime.kind !== (vm ? "vm" : "machine"))
+      )
+        return result(null, "unavailable", "Invalid workflow execution binding.");
       let run = yield* store.get(request.jobId);
       const savedCancellation = yield* store.getCancellation(request.jobId);
       const requestedBy = request.requestedBy ?? request.userId;
@@ -1576,6 +1742,7 @@ export const make = Effect.gen(function* () {
         return result(null, "conflict", "A human requester is required for this control.");
       // Keep legacy requesters separate from the original execution identity.
       if (
+        !vm &&
         requestedBy &&
         !["start", "status", "cancel", "retry_cancellation"].includes(request.control.operation)
       )
@@ -1586,6 +1753,7 @@ export const make = Effect.gen(function* () {
           )
           .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
       if (
+        !vm &&
         !run &&
         !savedCancellation &&
         origin.kind === "automation" &&
@@ -1634,7 +1802,10 @@ export const make = Effect.gen(function* () {
         run &&
         (run.workflow.organizationId !== request.control.organizationId ||
           run.workflow.repositoryId !== request.control.repositoryId ||
-          run.runtime.projectId !== request.control.projectId)
+          run.runtime.projectId !== request.control.projectId ||
+          (run.runtime.kind === "vm"
+            ? !vm || !sameVmBinding(run.runtime, vm.binding)
+            : vm !== undefined))
       )
         return result(null, "unavailable", "The job binding does not match this request.");
       // Cancellation wins over an undispatched retry intent, including after restart.
@@ -1671,12 +1842,13 @@ export const make = Effect.gen(function* () {
       }
       if (request.control.operation === "pause" || request.control.operation === "resume") {
         if (!run) return result(null, "conflict", "Wait for the environment to accept this job.");
-        yield* access
-          .requireProject(
-            { user: { userId: requestedBy!, displayName: null, imageUrl: null } },
-            run.runtime.projectId,
-          )
-          .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
+        if (!vm)
+          yield* access
+            .requireProject(
+              { user: { userId: requestedBy!, displayName: null, imageUrl: null } },
+              run.runtime.projectId,
+            )
+            .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
         if (isTerminalWorkflowJob(run.progress.status) || run.progress.status === "cancelling")
           return result(run, "conflict", "This job is cancelling or has finished.");
         if (!run.sequence || !run.providerContinuation)
@@ -1741,6 +1913,7 @@ export const make = Effect.gen(function* () {
       if (run) run = yield* reconcile(run);
       if (request.control.operation === "status") return result(run);
       if (
+        !vm &&
         run &&
         request.control.operation !== "cancel" &&
         request.control.operation !== "start" &&
@@ -1755,16 +1928,24 @@ export const make = Effect.gen(function* () {
       if (request.control.operation === "start") {
         if (run) return result(run);
         const workflow = request.control.workflow;
-        const runtime = request.control.runtime;
-        if (workflow.definition.target.kind !== "machine" || runtime.kind !== "machine")
-          return result(null, "unavailable", "VM workflows are not available yet.");
+        const target = workflow.definition.target;
+        const offered = request.control.runtime;
+        const runtime = vm ? { kind: "vm" as const, ...vm.binding } : offered;
         if (
-          runtime.environmentId !== workflow.definition.target.environmentId ||
-          runtime.projectId !== workflow.definition.target.projectId
+          !(vm
+            ? offered.kind === "vm" &&
+              offered.threadId === vm.binding.threadId &&
+              target.kind === "vm" &&
+              (target.baseBranch === null || target.baseBranch === vm.baseBranch)
+            : offered.kind === "machine" &&
+              target.kind === "machine" &&
+              offered.environmentId === target.environmentId &&
+              offered.projectId === target.projectId) ||
+          !("projectId" in runtime)
         )
           return result(null, "unavailable", "Invalid workflow execution binding.");
         const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
-        if (publishing.length && !publishingSupported)
+        if (publishing.length && (vm || !publishingSupported))
           return result(
             null,
             "unavailable",
@@ -1778,21 +1959,22 @@ export const make = Effect.gen(function* () {
           return result(null, "unavailable", "Invalid workflow target binding.");
         if (yield* store.isExecuting())
           return result(null, "busy", "Another workflow is executing on this environment.");
-        yield* (
-          origin.kind === "automation"
-            ? access.requireWorkflowProject({
-                ...request.control,
-                repositoryCanonicalKey: request.repositoryCanonicalKey,
-              })
-            : access.requireProject(
-                { user: { userId: origin.userId, displayName: null, imageUrl: null } },
-                request.control.projectId,
-              )
-        ).pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
+        if (!vm)
+          yield* (
+            origin.kind === "automation"
+              ? access.requireWorkflowProject({
+                  ...request.control,
+                  repositoryCanonicalKey: request.repositoryCanonicalKey,
+                })
+              : access.requireProject(
+                  { user: { userId: origin.userId, displayName: null, imageUrl: null } },
+                  request.control.projectId,
+                )
+          ).pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
         const project = yield* query
           .getProjectShellById(request.control.projectId)
           .pipe(Effect.orDie);
-        if (Option.isNone(project))
+        if (Option.isNone(project) || (vm && project.value.workspaceRoot !== vm.workspaceRoot))
           return result(null, "unavailable", "The selected project no longer exists.");
         const identity = yield* identities.resolve(project.value.workspaceRoot);
         if (identity?.canonicalKey !== request.repositoryCanonicalKey)
@@ -1846,7 +2028,9 @@ export const make = Effect.gen(function* () {
             !selected?.enabled ||
             !selected.installed ||
             selected.availability === "unavailable" ||
-            !["codex", "claudeAgent"].includes(selected.driver)
+            !(vm
+              ? selected.driver === "codex" && selection.instanceId === "codex"
+              : ["codex", "claudeAgent"].includes(selected.driver))
           )
             return result(
               null,
@@ -1897,15 +2081,36 @@ export const make = Effect.gen(function* () {
         if (!modelSelection || !providerContinuation)
           return result(null, "unavailable", "Select a provider for an Agent step.");
         const remote = identity.locator.remoteName;
-        yield* git.fetchRemote({ cwd: project.value.workspaceRoot, remoteName: remote });
-        const baseBranch = yield* git.resolveDefaultBranchName(project.value.workspaceRoot, remote);
-        if (baseBranch === null)
-          return result(null, "unavailable", "The remote default branch could not be resolved.");
-        const base = yield* git.resolveRemoteTrackingCommit({
-          cwd: project.value.workspaceRoot,
-          refName: baseBranch,
-          fallbackRemoteName: remote,
-        });
+        let baseBranch: string;
+        let baseSha: string;
+        if (vm) {
+          const thread = yield* query.getThreadDetailById(vm.binding.threadId).pipe(Effect.orDie);
+          if (
+            Option.isNone(thread) ||
+            thread.value.projectId !== vm.binding.projectId ||
+            thread.value.worktreePath !== null ||
+            thread.value.branch !== jobBranchName(request.jobId) ||
+            (yield* readWorkflowHead(git, vm.workspaceRoot, thread.value.branch)) !== vm.baseSha
+          )
+            return result(
+              null,
+              "unavailable",
+              "The VM checkout no longer matches its starting commit.",
+            );
+          baseBranch = vm.baseBranch;
+          baseSha = vm.baseSha;
+        } else {
+          yield* git.fetchRemote({ cwd: project.value.workspaceRoot, remoteName: remote });
+          const branch = yield* git.resolveDefaultBranchName(project.value.workspaceRoot, remote);
+          if (branch === null)
+            return result(null, "unavailable", "The remote default branch could not be resolved.");
+          baseBranch = branch;
+          baseSha = (yield* git.resolveRemoteTrackingCommit({
+            cwd: project.value.workspaceRoot,
+            refName: baseBranch,
+            fallbackRemoteName: remote,
+          })).commitSha;
+        }
         run = {
           jobId: request.jobId,
           origin,
@@ -1943,17 +2148,17 @@ export const make = Effect.gen(function* () {
           },
           modelSelection,
           baseBranch,
-          baseSha: base.commitSha,
+          baseSha,
           createdAt: yield* timestamp,
           promptDispatched: false,
           executionReserved: true,
-          worktreePath: null,
+          worktreePath: vm?.workspaceRoot ?? null,
           preparedHead: null,
           approvedBy: null,
           progress: {
             revision: 0,
             status: "preparing",
-            threadId: ThreadId.make(`workflow:${request.jobId}:agent`),
+            threadId: vm?.binding.threadId ?? ThreadId.make(`workflow:${request.jobId}:agent`),
             detail: null,
             checkpoint: null,
           },
@@ -1962,7 +2167,7 @@ export const make = Effect.gen(function* () {
         if (
           !(yield* access.withFence(
             Effect.gen(function* () {
-              if (origin.kind === "automation") yield* requireExecution(run!);
+              if (!vm && origin.kind === "automation") yield* requireExecution(run!);
               return yield* store.tryAccept(run!);
             }),
           ))
@@ -2162,9 +2367,8 @@ export const make = Effect.gen(function* () {
           if (control.operation === "request_changes" && step?.kind === "review") {
             if (
               !run.worktreePath ||
-              (yield* git.statusDetailsLocal(run.worktreePath)).branch !==
-                jobBranchName(run.jobId) ||
-              (yield* git.resolveCommit({ cwd: run.worktreePath, revision: "HEAD" })).commitSha !==
+              !run.preparedHead ||
+              (yield* readWorkflowHead(git, run.worktreePath, jobBranchName(run.jobId))) !==
                 run.preparedHead
             )
               return result(

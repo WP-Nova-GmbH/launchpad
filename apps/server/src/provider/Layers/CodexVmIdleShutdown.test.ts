@@ -26,6 +26,7 @@ const packet = Schema.decodeSync(
     Schema.Struct({
       id: Schema.optionalKey(Schema.Int),
       method: Schema.optionalKey(Schema.String),
+      result: Schema.optionalKey(Schema.Unknown),
     }),
   ),
 );
@@ -33,6 +34,7 @@ const fixture = Effect.gen(function* () {
   const output = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
   const stopRequested = yield* Queue.unbounded<void>();
+  const responses = yield* Queue.unbounded<{ readonly id: number; readonly result: unknown }>();
   const encoder = new TextEncoder(),
     decoder = new TextDecoder();
   const send = (value: unknown) => Queue.offer(output, encoder.encode(encode(value) + "\n"));
@@ -58,7 +60,11 @@ const fixture = Effect.gen(function* () {
     stdin: Sink.forEach((bytes: Uint8Array) =>
       Effect.gen(function* () {
         const message = packet(decoder.decode(bytes));
-        if (!message.method) return;
+        if (!message.method) {
+          if (message.id !== undefined)
+            yield* Queue.offer(responses, { id: message.id, result: message.result });
+          return;
+        }
         methods.push(message.method);
         if (message.id === undefined) return;
         const result =
@@ -143,6 +149,7 @@ const fixture = Effect.gen(function* () {
     send,
     end,
     stopRequested,
+    responses,
     methods,
     get processOnly() {
       return processOnly;
@@ -163,6 +170,34 @@ const fixture = Effect.gen(function* () {
 });
 
 it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
+  it.effect("settles a blocking native question with no answers", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const requested = yield* f.runtime.events.pipe(
+          Stream.filter((event) => event.method === "item/tool/requestUserInput"),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* f.send({
+          id: 91,
+          method: "item/tool/requestUserInput",
+          params: {
+            isBlocking: true,
+            threadId: nativeId,
+            turnId: "test-turn",
+            itemId: "test-item",
+            questions: [{ id: "scope", header: "Scope", question: "Which scope?", options: [] }],
+          },
+        });
+        const request = (yield* Fiber.join(requested))[0]!;
+        NodeAssert.ok(request.requestId);
+        yield* f.runtime.respondToUserInput(request.requestId, {});
+        NodeAssert.deepEqual(yield* Queue.take(f.responses), { id: 91, result: { answers: {} } });
+      }),
+    ),
+  );
   it.effect(
     "drains final native output and rejects new dispatch after root-only stop admission",
     () =>

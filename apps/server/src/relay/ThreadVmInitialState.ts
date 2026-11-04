@@ -5,8 +5,10 @@ import {
 } from "./ThreadVmInitialStateRecord.ts";
 import { CommandId, ProjectId } from "@t3tools/contracts";
 import { RelayThreadVmSetupInput, RelayThreadVmSetupReceipt } from "@t3tools/contracts/relay";
+import { jobBranchName } from "@t3tools/shared/workflowStorage";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import type * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
@@ -46,7 +48,11 @@ const fail = (code: ThreadVmInitialStateError["code"]) => new ThreadVmInitialSta
 
 /** Offline guest bootstrap only: no provider/terminal reactors may be running in this process. */
 export const prepareThreadVmInitialState = Effect.fn("ThreadVmInitialState.prepare")(
-  function* (input: ThreadVmInitialStateInput, workspaceRoot = "/workspace/project") {
+  function* (
+    input: ThreadVmInitialStateInput,
+    workspaceRoot = "/workspace/project",
+    gitToken?: Redacted.Redacted<string>,
+  ) {
     // The first template has one known Codex instance. Other providers need their own portability proof.
     if (input.modelSelection.instanceId !== "codex") return yield* fail("unsupported_provider");
     const vm = yield* readInstalledThreadVm();
@@ -58,7 +64,11 @@ export const prepareThreadVmInitialState = Effect.fn("ThreadVmInitialState.prepa
       vm.scope.allocationId !== input.workspace.scope.allocationId ||
       vm.scope.threadId !== input.workspace.scope.threadId ||
       vm.scope.repositoryId !== input.workspace.scope.repositoryId ||
-      input.workspace.scope.generation !== 1
+      input.workspace.scope.generation !== 1 ||
+      (input.workflow &&
+        (input.workspace.scope.threadId !== `workflow:${input.workflow.jobId}` ||
+          input.workspace.branch !== jobBranchName(input.workflow.jobId))) ||
+      (!input.workflow && gitToken !== undefined)
     )
       return yield* fail("identity_changed");
     const secrets = yield* ServerSecretStore;
@@ -95,7 +105,14 @@ export const prepareThreadVmInitialState = Effect.fn("ThreadVmInitialState.prepa
         return yield* fail("identity_changed");
       return state.receipt;
     }
-    const workspace = yield* prepareThreadVmWorkspace(input.workspace, workspaceRoot);
+    if (input.workflow && !gitToken) return yield* fail("baseline_import_failed");
+    const workspace = yield* prepareThreadVmWorkspace(
+      input.workspace,
+      workspaceRoot,
+      "initial",
+      undefined,
+      gitToken,
+    );
     const snapshot = yield* (yield* ProjectionSnapshotQuery).getSnapshot();
     if (snapshot.projects.length || snapshot.threads.length || (yield* fence.get(owner.threadId)))
       return yield* fail("identity_changed");
@@ -112,6 +129,7 @@ export const prepareThreadVmInitialState = Effect.fn("ThreadVmInitialState.prepa
       projectId,
       title: input.workspace.canonicalKey.split("/").at(-1)!,
       workspaceRoot,
+      ...(input.workflow ? { defaultModelSelection: input.modelSelection } : {}),
       createdAt: input.createdAt,
     });
     const thread = yield* engine.dispatch({

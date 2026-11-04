@@ -21,6 +21,7 @@ export {
 import { ThreadMoveParticipantState } from "./threadMoveProgress.ts";
 import {
   RelayPortableThreadPlacement,
+  RelayAssignedWorkflowThreadPlacement,
   RelayThreadActiveMove,
   RelayThreadCurrentQueue,
   ThreadVmCapabilities,
@@ -51,6 +52,7 @@ import {
   WorkflowConflictError,
   WorkflowInvalidError,
   WorkflowSubmissionPendingError,
+  WorkflowVmDispatchBinding,
 } from "./workflows.ts";
 import {
   RepositoryPolicyProof,
@@ -2023,8 +2025,37 @@ export const RelayThreadVmWorkspaceInput = Schema.Struct({
 export const RelayThreadVmSetupInput = Schema.Struct({
   workspace: RelayThreadVmWorkspaceInput,
   ...RelayThreadVmInitialThread.fields,
+  workflow: Schema.optionalKey(
+    Schema.Struct({
+      jobId: TrimmedNonEmptyString,
+      organizationId: RelayOrganizationId,
+      installationId: TrimmedNonEmptyString,
+      baseBranch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+    }),
+  ),
 });
 export type RelayThreadVmSetupInput = typeof RelayThreadVmSetupInput.Type;
+/** Private stdin handoff. Only input is stored by the guest. */
+export const RelayThreadVmWorkflowSetupEnvelope = Schema.Struct({
+  input: RelayThreadVmSetupInput,
+  gitToken: Schema.RedactedFromValue(TrimmedNonEmptyString),
+});
+export type RelayThreadVmWorkflowSetupEnvelope = typeof RelayThreadVmWorkflowSetupEnvelope.Type;
+export const RelayThreadVmCheckoutFailureCode = Schema.Literals([
+  "repository_unavailable",
+  "unsupported_git_dependencies",
+  "setup_failed",
+]);
+export type RelayThreadVmCheckoutFailureCode = typeof RelayThreadVmCheckoutFailureCode.Type;
+/** Read-only private stdin handoff for a previously attempted workflow checkout. */
+export const RelayThreadVmCheckoutFailureProbe = Schema.Struct({
+  environmentId: EnvironmentId,
+  workspace: RelayThreadVmWorkspaceInput,
+});
+export type RelayThreadVmCheckoutFailureProbe = typeof RelayThreadVmCheckoutFailureProbe.Type;
+export const RelayThreadVmCheckoutFailureReply = Schema.Struct({
+  failureCode: Schema.NullOr(RelayThreadVmCheckoutFailureCode),
+});
 export const RelayThreadVmSetupReceipt = Schema.Struct({
   version: Schema.Literal(1),
   operationId: TrimmedNonEmptyString,
@@ -2482,6 +2513,7 @@ export type RelayJob = typeof RelayJob.Type;
 export const RelayCloudDispatchJobProofPayload = Schema.Struct({
   workflowOrigin: Schema.optional(WorkflowOrigin),
   requestedBy: Schema.optional(TrimmedNonEmptyString),
+  workflowVmBinding: Schema.optional(WorkflowVmDispatchBinding),
   ...RelaySignedJwtRegisteredClaims,
   environmentId: EnvironmentId,
   jobId: RelayJobId,
@@ -2518,6 +2550,9 @@ export const RelayEnvironmentDispatchJobResponse = Schema.Struct({
   workflowResult: Schema.optional(WorkflowControlResult),
 });
 export type RelayEnvironmentDispatchJobResponse = typeof RelayEnvironmentDispatchJobResponse.Type;
+
+/** Private VM workflow control carries both progress and its signed proof. */
+export const WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES = 1024 * 1024;
 
 export const RelayDeliveryKind = Schema.Literals([
   "live_activity_start",
@@ -3546,6 +3581,41 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       },
     ),
     HttpApiEndpoint.post(
+      "resolveWorkflowVmAttempt",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/attempt",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          jobId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+          purpose: Schema.Literals(["setup", "agent"]),
+          attemptId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+          stepId: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
+          stepGeneration: NonNegativeInt,
+          commandId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+        }),
+        success: Schema.Struct({
+          environment: Schema.Record(Schema.String, Schema.String),
+          hasSecrets: Schema.Boolean,
+          secretNames: Schema.Array(Schema.String),
+        }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "readWorkflowVmReviewSecrets",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/review-secrets",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          jobId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+        }),
+        success: Schema.RedactedFromValue(Schema.Array(Schema.NonEmptyString)),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
       "repositoryBinding",
       "/v1/environments/:environmentId/threads/:threadId/repository/binding",
       {
@@ -4259,6 +4329,16 @@ const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
       success: RepositoryWorkflowJob,
       error: WorkflowErrors,
     }),
+    HttpApiEndpoint.get(
+      "getJobResult",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/result",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+        success: RelayAssignedWorkflowThreadPlacement,
+        error: WorkflowErrors,
+      },
+    ),
     HttpApiEndpoint.post("respond", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
       headers: RelayBearerRequestHeaders,
       params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),

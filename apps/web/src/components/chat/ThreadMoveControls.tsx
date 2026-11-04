@@ -78,10 +78,12 @@ function FollowThreadLocation({
   environmentId,
   threadId,
   recoverUnavailable = false,
+  observeOnly = false,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
   recoverUnavailable?: boolean;
+  observeOnly?: boolean;
 }) {
   const state = useAtomValue(
     threadVmControls.locationViewAtom(environmentId, threadId, recoverUnavailable),
@@ -112,7 +114,7 @@ function FollowThreadLocation({
   }, []);
   useEffect(() => {
     let cancelled = false;
-    if (!destinationId || generation === undefined || !session || checking) {
+    if (observeOnly || !destinationId || generation === undefined || !session || checking) {
       void Promise.resolve().then(() => {
         if (!cancelled) setBusy(false);
       });
@@ -176,6 +178,17 @@ function FollowThreadLocation({
             replace: true,
             state: (previous) => ({
               ...previous,
+              ...(destinationId !== environmentId && relayUrl
+                ? {
+                    threadMoveHandoff: {
+                      environmentId: destinationId,
+                      threadId,
+                      accountId: session.accountId,
+                      relayUrl,
+                      generation,
+                    },
+                  }
+                : {}),
               workflowOrigin:
                 workflowResultOrigin(location.state, session.accountId, threadId) ?? undefined,
             }),
@@ -209,9 +222,11 @@ function FollowThreadLocation({
     threadId,
     attempt,
     checking,
+    observeOnly,
     open,
     navigate,
   ]);
+  if (observeOnly) return null;
   if (recoverUnavailable && activeThreadMove(placement))
     return (
       <div className="mx-3">
@@ -364,11 +379,14 @@ export function CurrentThreadLocation(props: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
   recoverUnavailable?: boolean;
+  observeOnly?: boolean;
 }) {
   const session = useAtomValue(managedRelaySessionAtom);
   return (
     <>
-      <MovedThreadDraftRecovery environmentId={props.environmentId} threadId={props.threadId} />
+      {props.observeOnly ? null : (
+        <MovedThreadDraftRecovery environmentId={props.environmentId} threadId={props.threadId} />
+      )}
       <FollowThreadLocation
         key={`${session?.accountId ?? "signed-out"}:${threadMoveRelayUrl()}:${props.environmentId}:${props.threadId}:${props.recoverUnavailable === true}`}
         {...props}

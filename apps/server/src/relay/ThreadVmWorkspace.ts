@@ -1,14 +1,24 @@
-import { RelayThreadVmWorkspaceInput } from "@t3tools/contracts/relay";
+import {
+  RelayThreadVmCheckoutFailureCode,
+  type RelayThreadVmCheckoutFailureProbe,
+  RelayThreadVmWorkspaceInput,
+} from "@t3tools/contracts/relay";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
-import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
+import { readExistingServerSecret, ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { ProcessRunner } from "../processRunner.ts";
-import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
+import {
+  decodeInstalledThreadVm,
+  readInstalledThreadVm,
+  THREAD_VM_IDENTITY_SECRET,
+} from "./ThreadVmEnrollment.ts";
 
 export const ThreadVmWorkspaceInput = RelayThreadVmWorkspaceInput;
 export type ThreadVmWorkspaceInput = typeof ThreadVmWorkspaceInput.Type;
@@ -25,6 +35,7 @@ const decodeRecord = Schema.decodeUnknownEffect(Schema.fromJsonString(WorkspaceR
 const encodeRecord = Schema.encodeEffect(Schema.fromJsonString(WorkspaceRecord));
 const encodeInput = Schema.encodeSync(Schema.fromJsonString(ThreadVmWorkspaceInput));
 export const THREAD_VM_WORKSPACE_SECRET = "thread-vm-workspace";
+const BASELINE_REF = "refs/t3/transfer/head";
 export class ThreadVmWorkspaceError extends Schema.TaggedError<ThreadVmWorkspaceError>()(
   "ThreadVmWorkspaceError",
   {
@@ -44,6 +55,46 @@ export class ThreadVmWorkspaceError extends Schema.TaggedError<ThreadVmWorkspace
 }
 const isWorkspaceError = Schema.is(ThreadVmWorkspaceError);
 const failure = (code: ThreadVmWorkspaceError["code"]) => new ThreadVmWorkspaceError({ code });
+const isCheckoutFailureCode = Schema.is(RelayThreadVmCheckoutFailureCode);
+const decodeSecret = (bytes: Uint8Array) =>
+  Effect.try(() => new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+
+/** Read the outcome of a previously attempted checkout without opening the server state. */
+export const readThreadVmCheckoutFailure = Effect.fn("ThreadVmWorkspace.readCheckoutFailure")(
+  function* (
+    { environmentId, workspace }: RelayThreadVmCheckoutFailureProbe,
+    paths: { readonly secretsDir: string; readonly environmentIdPath: string },
+    workspaceRoot = "/workspace/project",
+  ) {
+    const fs = yield* FileSystem.FileSystem;
+    const existingId = yield* decodeSecret(yield* fs.readFile(paths.environmentIdPath));
+    if (existingId.trim() !== environmentId || workspace.scope.generation !== 1) return null;
+    const enrollment = yield* readExistingServerSecret(paths.secretsDir, THREAD_VM_IDENTITY_SECRET);
+    if (Option.isNone(enrollment)) return null;
+    const vm = yield* decodeInstalledThreadVm(yield* decodeSecret(enrollment.value));
+    if (
+      vm.environmentId !== environmentId ||
+      vm.operationId !== workspace.operationId ||
+      vm.scope.allocationId !== workspace.scope.allocationId ||
+      vm.scope.threadId !== workspace.scope.threadId ||
+      vm.scope.repositoryId !== workspace.scope.repositoryId ||
+      vm.scope.generation !== workspace.scope.generation
+    )
+      return null;
+    const prior = yield* readExistingServerSecret(paths.secretsDir, THREAD_VM_WORKSPACE_SECRET);
+    if (Option.isNone(prior)) return null;
+    const record = yield* decodeRecord(yield* decodeSecret(prior.value));
+    return record.state === "failed" &&
+      record.purpose === "initial" &&
+      record.repositoryBundleSha256 === undefined &&
+      record.workspaceRoot === workspaceRoot &&
+      encodeInput(record.input) === encodeInput(workspace) &&
+      isCheckoutFailureCode(record.errorCode)
+      ? record.errorCode
+      : null;
+  },
+  Effect.orElseSucceed(() => null),
+);
 
 /** Called by the isolated guest bootstrap, before the server or any provider session starts. */
 export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
@@ -56,6 +107,7 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
       readonly objectFormat: "sha1" | "sha256";
       readonly sha256: string;
     },
+    workflowGitToken?: Redacted.Redacted<string>,
   ) {
     const vm = yield* readInstalledThreadVm().pipe(
       Effect.mapError(() => failure("identity_changed")),
@@ -99,8 +151,13 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
       if (record.state !== "ready") return yield* failure("setup_unconfirmed");
       return record;
     }
-    // Legacy ready checkouts remain usable; fresh VMs can only receive an upload.
-    if (purpose !== "reset" || !repository) return yield* failure("repository_unavailable");
+    // The workflow-only credential permits fresh checkout; reset still consumes a bundle.
+    if (
+      purpose === "initial"
+        ? !workflowGitToken || !/^github\.com\/[a-z0-9-]+\/[a-z0-9_.-]+$/iu.test(input.canonicalKey)
+        : !repository || workflowGitToken
+    )
+      return yield* failure("repository_unavailable");
     // A fresh allocation has no inherited checkout. Never clean or overwrite a path on retry.
     if (yield* fs.exists(workspaceRoot)) return yield* failure("workspace_not_empty");
     const runner = yield* ProcessRunner;
@@ -133,12 +190,10 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
           ),
         );
     yield* run("git", ["check-ref-format", "--branch", input.branch], "repository_unavailable");
-    // Reset restores local data while the prompt queue remains paused. Provider
-    // sign-in can happen through the fresh environment's normal settings later.
     const record = {
       input,
       purpose,
-      repositoryBundleSha256: repository.sha256,
+      ...(repository ? { repositoryBundleSha256: repository.sha256 } : {}),
       workspaceRoot,
       createdAt: DateTime.formatIso(yield* DateTime.now),
       state: "started" as const,
@@ -160,34 +215,55 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
       yield* fs.makeDirectory(path.dirname(workspaceRoot), { recursive: true });
       yield* run(
         "git",
-        ["init", `--object-format=${repository.objectFormat}`, "--", workspaceRoot],
+        [
+          "init",
+          `--object-format=${repository?.objectFormat ?? (input.revision.length === 40 ? "sha1" : "sha256")}`,
+          "--",
+          workspaceRoot,
+        ],
         "repository_unavailable",
         { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_COUNT: "0" },
       );
-      const git = (args: ReadonlyArray<string>) =>
+      const git = (args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
         run("git", ["-C", workspaceRoot, ...args], "repository_unavailable", {
           GIT_TERMINAL_PROMPT: "0",
           GIT_LFS_SKIP_SMUDGE: "1",
           GIT_CONFIG_NOSYSTEM: "1",
           GIT_CONFIG_GLOBAL: "/dev/null",
           GIT_CONFIG_COUNT: "0",
+          ...env,
         });
-      yield* git(["bundle", "verify", repository.bundlePath]);
-      const head = (yield* git([
-        "bundle",
-        "list-heads",
-        repository.bundlePath,
-        "refs/t3/transfer/head",
-      ])).trim();
-      if (head !== `${input.revision} refs/t3/transfer/head`)
-        return yield* failure("repository_unavailable");
-      yield* git([
-        "fetch",
-        "--no-tags",
-        "--no-write-fetch-head",
-        repository.bundlePath,
-        `refs/t3/transfer/head:refs/heads/${input.branch}`,
-      ]);
+      if (repository) {
+        yield* git(["bundle", "verify", repository.bundlePath]);
+        const head = (yield* git([
+          "bundle",
+          "list-heads",
+          repository.bundlePath,
+          BASELINE_REF,
+        ])).trim();
+        if (head !== `${input.revision} ${BASELINE_REF}`)
+          return yield* failure("repository_unavailable");
+        yield* git([
+          "fetch",
+          "--no-tags",
+          "--no-write-fetch-head",
+          repository.bundlePath,
+          `${BASELINE_REF}:refs/heads/${input.branch}`,
+        ]);
+      } else if (workflowGitToken) {
+        yield* git(["remote", "add", "origin", `https://${input.canonicalKey}.git`]);
+        yield* git(["fetch", "--no-tags", "--no-write-fetch-head", "origin", input.revision], {
+          GIT_CONFIG_COUNT: "2",
+          GIT_CONFIG_KEY_0: "http.https://github.com/.extraHeader",
+          GIT_CONFIG_VALUE_0: `Authorization: Basic ${Encoding.encodeBase64(`x-access-token:${Redacted.value(workflowGitToken)}`)}`,
+          GIT_CONFIG_KEY_1: "http.followRedirects",
+          GIT_CONFIG_VALUE_1: "false",
+          GIT_TRACE_CURL: "0",
+          GIT_CURL_VERBOSE: "0",
+        });
+        // Retain the initial commit independently of later changes to the run branch.
+        yield* git(["update-ref", BASELINE_REF, input.revision]);
+      }
       yield* git(["fsck", "--full", "--strict", "--no-reflogs"]);
       const tree = yield* git(["ls-tree", "-r", input.revision]);
       if (/^160000 /m.test(tree)) return yield* failure("unsupported_git_dependencies");

@@ -16,6 +16,8 @@ import {
 import { tryCopyTextWithHaptic } from "../../lib/copyTextWithHaptic";
 import { T3KeyboardCommands } from "../../native/T3KeyboardCommands";
 import { useThreadShell } from "../../state/entities";
+import { useRemoteEnvironmentRuntime } from "../../state/use-remote-environment-registry";
+import { resolveWorkflowResultAccess } from "../../state/workflow-result-access";
 import type { GitActionProgress } from "../../state/use-vcs-action-state";
 import { GitActionProgressOverlay } from "../threads/GitActionProgressOverlay";
 import { CommandPalette } from "./CommandPalette";
@@ -51,6 +53,12 @@ export function HardwareKeyboardCommandProvider({
   const closePalette = useCallback(() => setPaletteOpen(false), []);
   const activeThreadRef = useMemo(() => parseActiveThreadPath(pathname), [pathname]);
   const activeThread = useThreadShell(activeThreadRef);
+  const environment = useRemoteEnvironmentRuntime(activeThreadRef?.environmentId ?? null);
+  const { workspaceEnabled } = resolveWorkflowResultAccess(
+    environment?.serverConfig?.environment.capabilities ?? null,
+    undefined,
+    activeThreadRef?.threadId ?? null,
+  );
   const copyTarget = useMemo(
     () =>
       activeThreadRef === null
@@ -107,14 +115,20 @@ export function HardwareKeyboardCommandProvider({
       }
     }
     if (pathname !== "/" || navigation.canGoBack()) commands.add("back");
+    if (!workspaceEnabled && activeThreadRef !== null) {
+      commands.delete("files");
+      commands.delete("terminal");
+    }
     if (activeThreadRef !== null) {
-      commands.add("files");
-      commands.add("terminal");
+      if (workspaceEnabled) {
+        commands.add("files");
+        commands.add("terminal");
+      }
       commands.add("review");
       if (pathname.split("/")[4] !== "terminal") commands.add("copyThreadReference");
     }
     return [...commands];
-  }, [activeThreadRef, pathname, registrationVersion, navigation]);
+  }, [activeThreadRef, pathname, registrationVersion, navigation, workspaceEnabled]);
 
   const onCommand = useCallback(
     (command: HardwareKeyboardCommand) => {
@@ -130,6 +144,12 @@ export function HardwareKeyboardCommandProvider({
         setPaletteOpen(true);
         return;
       }
+      if (
+        activeThreadRef !== null &&
+        !workspaceEnabled &&
+        (command === "files" || command === "terminal")
+      )
+        return;
       if (dispatchHardwareKeyboardCommand(command)) return;
 
       if (command === "copyThreadReference") {
@@ -181,15 +201,20 @@ export function HardwareKeyboardCommandProvider({
         navigation.navigate("ThreadReview", thread);
       }
     },
-    [copyTarget, navigation, pathname, showCopyFeedback],
+    [activeThreadRef, copyTarget, navigation, pathname, showCopyFeedback, workspaceEnabled],
   );
 
   const palette = useMemo(
     () =>
       paletteOpen ? (
-        <CommandPalette pathname={pathname} onClose={closePalette} onCommand={onCommand} />
+        <CommandPalette
+          pathname={pathname}
+          onClose={closePalette}
+          onCommand={onCommand}
+          workspaceEnabled={workspaceEnabled}
+        />
       ) : null,
-    [closePalette, onCommand, paletteOpen, pathname],
+    [closePalette, onCommand, paletteOpen, pathname, workspaceEnabled],
   );
 
   return (

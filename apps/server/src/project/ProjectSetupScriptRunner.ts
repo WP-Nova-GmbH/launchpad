@@ -64,6 +64,8 @@ export interface ProjectSetupScriptRunnerInput {
   readonly preparationAttemptId?: string;
   /** A durable preparation executes the script selected before the attempt began. */
   readonly resolvedScript?: ThreadPreparation["script"];
+  readonly runEnvironment?: import("../relay/WorkflowVmAttempts.ts").WorkflowVmAttemptEnvironment;
+  readonly authorizeDelivery?: Effect.Effect<boolean>;
   /**
    * Wrap the command so the shell reports its exit code back through the
    * terminal stream, and forward cleaned output lines while it runs. The
@@ -144,6 +146,18 @@ function completionSentinel(token: string): string {
 function completionSentinelPattern(token: string): RegExp {
   return new RegExp(`${COMPLETION_SENTINEL_PREFIX}_${token}:(-?\\d+)`);
 }
+
+/** Keep only the synthetic exit receipt, even when a PTY splits it across chunks. */
+const filterPrivateSetupOutput = (token: string) => {
+  const pattern = completionSentinelPattern(token);
+  let pending = "";
+  return (chunk: string) => {
+    const lines = `${pending}${chunk}`.split(/\r\n|\r|\n/u);
+    pending = (lines.pop() ?? "").slice(-PARTIAL_LINE_MAX_LENGTH);
+    const receipt = lines.map((line) => pattern.exec(line)?.[1]).find((code) => code !== undefined);
+    return receipt === undefined ? "" : `\n${completionSentinel(token)}${receipt}\n`;
+  };
+};
 
 /** Removes ANSI escape sequences and cursor controls so lines can be shown as plain text. */
 function stripTerminalControl(text: string): string {
@@ -383,9 +397,16 @@ export const make = Effect.gen(function* () {
     const env = projectScriptRuntimeEnv({
       project: { cwd: project.workspaceRoot },
       worktreePath: input.worktreePath,
+      ...(input.runEnvironment ? { extraEnv: input.runEnvironment.environment } : {}),
     });
     const observe = input.observeCompletion;
     const completionToken = observe ? NodeCrypto.randomUUID().replaceAll("-", "") : null;
+    if (input.runEnvironment?.hasSecrets && !completionToken)
+      return yield* new ProjectSetupScriptOperationError({
+        ...errorContext,
+        operation: "recordProcess",
+        cause: new Error("Secret-bearing setup requires a tracked completion receipt."),
+      });
 
     const setupProcessOwner = input.preparationAttemptId
       ? yield* journal.launcher.pipe(
@@ -409,6 +430,9 @@ export const make = Effect.gen(function* () {
           ? { setupProcessOwner, setupAttemptId: input.preparationAttemptId }
           : {}),
         ...(script.async === false ? { waitForProcessExitOnClose: true } : {}),
+        ...(input.runEnvironment?.hasSecrets && completionToken
+          ? { filterSetupOutput: filterPrivateSetupOutput(completionToken) }
+          : {}),
         // Setup may run before a terminal client attaches to answer color probes.
         env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" },
       })
@@ -485,6 +509,14 @@ export const make = Effect.gen(function* () {
       terminalId,
       data: `${commandLine}\r`,
     };
+    if (input.authorizeDelivery && !(yield* input.authorizeDelivery)) {
+      observed?.unsubscribe();
+      return yield* new ProjectSetupScriptOperationError({
+        ...errorContext,
+        operation: "writeCommand",
+        cause: new Error("The workflow no longer owns this setup attempt."),
+      });
+    }
     yield* (
       input.preparationAttemptId
         ? terminalManager.writeSetup({

@@ -51,10 +51,14 @@ export function makeThreadVmResumeWorker(
   compute: ResumeCompute,
   guest: ResumeGuest,
   hostId: string,
+  workflowEnabled?: boolean,
 ) {
   const store = makeThreadVmResumeStore(sql);
   const runOne = Effect.fn("relay.thread_vm.resume.run_one")(function* () {
-    yield* makeThreadVmCapacityStore(sql).admitNext(hostId);
+    yield* makeThreadVmCapacityStore(sql).admitNext(
+      hostId,
+      workflowEnabled === undefined ? "personal" : { workflowEnabled },
+    );
     const claim = yield* store.claim(hostId);
     if (!claim) return false;
     const identity: Identity = {

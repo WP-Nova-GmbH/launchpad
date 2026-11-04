@@ -1,12 +1,15 @@
 import { act, createElement, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
-import { setWorkflowSessionAccount } from "@t3tools/client-runtime/relay/workflow-session";
+import {
+  recordWorkflowReviewDiff,
+  setWorkflowSessionAccount,
+} from "@t3tools/client-runtime/relay/workflow-session";
 import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry";
 
 const fixture = vi.hoisted(() => ({
@@ -76,14 +79,14 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
   if (typeof node === "string") return node;
   return Array.isArray(node) ? node.map(text).join(" ") : (node.children ?? []).map(text).join(" ");
 }
-const view = (jobId = "job") => (
+const view = (jobId = "job", canConfigure = true) => (
   <AppAtomRegistryProvider>
-    <WorkflowJob scope={scope} jobId={jobId} projects={[]} canConfigure />
+    <WorkflowJob scope={scope} jobId={jobId} projects={[]} canConfigure={canConfigure} />
   </AppAtomRegistryProvider>
 );
-async function mount() {
+async function mount(canConfigure = true) {
   await act(async () => {
-    renderer = create(view());
+    renderer = create(view("job", canConfigure));
   });
 }
 function deferred() {
@@ -124,7 +127,7 @@ beforeEach(() => {
   fixture.call.mockReset().mockResolvedValue(job);
   fixture.open.mockReset().mockResolvedValue({
     _tag: "Success",
-    value: { environmentId: "moved-vm", threadId: "thread" },
+    value: { environmentId: "moved-vm", threadId: "thread", workflowVmGeneration: 1 },
   });
   fixture.navigate.mockReset();
   fixture.select.mockReset();
@@ -137,6 +140,133 @@ afterEach(async () => {
 });
 
 describe("workflow result location navigation", () => {
+  const vmReview = {
+    ...job,
+    runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+    status: "awaiting_review",
+    progress: { ...job.progress!, status: "awaiting_review" },
+    viewerControls: { canApprove: true, canRespond: false, canCancel: true },
+  } satisfies RepositoryWorkflowJob;
+
+  it("opens the exact VM checkpoint and carries its identity back to the run", async () => {
+    fixture.call.mockResolvedValue(vmReview);
+    await mount(false);
+    expect(text(renderer!.toJSON())).toContain("Approve result");
+    expect(text(renderer!.toJSON())).toContain("Cancel run");
+    expect(text(renderer!.toJSON())).not.toContain("Request changes");
+    await press("Inspect live diff");
+    expect(fixture.open).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowResult: { ...scope, jobId: job.jobId },
+      }),
+    );
+    expect(fixture.select).toHaveBeenCalledWith(
+      { environmentId: "moved-vm", threadId: "thread" },
+      "saved-turn",
+      undefined,
+      3,
+    );
+    const destination = fixture.navigate.mock.calls[0]![0];
+    expect(destination.state({}).workflowOrigin.reviewCheckpoint).toEqual({
+      checkpointId: "checkpoint",
+      turnId: "saved-turn",
+      checkpointTurnCount: 3,
+    });
+  });
+
+  it("keeps stale approval blocked after opening the conversation and returning", async () => {
+    fixture.call.mockResolvedValue({
+      ...vmReview,
+      progress: {
+        ...vmReview.progress,
+        checkpoint: {
+          checkpointId: "previous",
+          turnId: "old-turn",
+          checkpointTurnCount: 2,
+          checkpointRef: "old-ref",
+        },
+      },
+    });
+    await mount(false);
+    await press("Inspect live diff");
+    await act(() => renderer!.unmount());
+    fixture.call.mockResolvedValue(vmReview);
+    await mount(false);
+    expect(text(renderer!.toJSON())).toContain("Review changed");
+    const approval = renderer!.root
+      .findAllByType("button")
+      .find((button) => button.props.children === "Approve result")!;
+    expect(approval.props.disabled).toBe(true);
+    const before = fixture.call.mock.calls.length;
+    await press("Approve result");
+    expect(fixture.call).toHaveBeenCalledTimes(before);
+    await press("Open conversation");
+    expect(
+      fixture.navigate.mock.lastCall![0].state({}).workflowOrigin.reviewCheckpoint,
+    ).toBeUndefined();
+    await act(() => renderer!.unmount());
+    await mount(false);
+    expect(text(renderer!.toJSON())).toContain("Review changed");
+    await press("Inspect live diff");
+    expect(fixture.select).toHaveBeenCalledWith(expect.anything(), "saved-turn", undefined, 3);
+  });
+
+  it("shows a queued VM approval as pending before the guest acknowledges it", async () => {
+    fixture.call.mockResolvedValue({
+      ...vmReview,
+      responsePending: true,
+      pendingResponseOperation: "approve",
+    });
+    await mount(false);
+    const approval = renderer!.root
+      .findAllByType("button")
+      .find((button) => button.props.children === "Approval pending")!;
+    expect(approval.props.disabled).toBe(true);
+  });
+
+  it("refreshes a cached matching checkpoint before enabling approval on return", async () => {
+    fixture.call.mockResolvedValue(vmReview);
+    await mount(false);
+    await press("Inspect live diff");
+    const origin = fixture.navigate.mock.lastCall![0].state({}).workflowOrigin;
+    await act(() => {
+      expect(
+        recordWorkflowReviewDiff(
+          appAtomRegistry,
+          origin,
+          {
+            environmentId: EnvironmentId.make("moved-vm"),
+            threadId: ThreadId.make("thread"),
+            generation: 1,
+          },
+          {
+            threadId: ThreadId.make("thread"),
+            fromTurnCount: 2,
+            toTurnCount: 3,
+            diff: "",
+            completeWorkflowReview: true,
+            targetTurnId: TurnId.make("saved-turn"),
+          },
+        ),
+      ).toBe(true);
+    });
+    await act(() => renderer!.unmount());
+    const reply = deferred();
+    fixture.call.mockReturnValue(reply.promise);
+    await mount(false);
+    const approval = () =>
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => button.props.children === "Approve result")!;
+    expect(approval().props.disabled).toBe(true);
+    expect(text(renderer!.toJSON())).toContain("Checking the current review");
+    await act(async () => {
+      reply.resolve(vmReview);
+      await reply.promise;
+    });
+    expect(approval().props.disabled).toBe(false);
+  });
+
   it("opens conversation and the original saved turn at the current destination", async () => {
     await mount();
     await press("Inspect saved diff");
@@ -154,6 +284,7 @@ describe("workflow result location navigation", () => {
       ...scope,
       jobId: "job",
       threadId: "thread",
+      workflowVmResultReader: true,
     });
     expect(fixture.open).toHaveBeenCalledWith(
       expect.objectContaining({ workflowResult: { ...scope, originalEnvironmentId: "original" } }),

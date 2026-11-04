@@ -40,10 +40,14 @@ export const sealThreadVmTrafficAccessToken = Effect.fnUntraced(
 
 /** Native GET cannot recover this credential. Missing or invalid storage never wakes compute. */
 export const readThreadVmTrafficAccessToken = Effect.fnUntraced(
-  function* (sql: PgClient, identity: ThreadVmTrafficAccessTokenIdentity) {
+  function* (
+    sql: PgClient,
+    identity: ThreadVmTrafficAccessTokenIdentity,
+    resourceKind: "personal" | "organization_workflow" = "personal",
+  ) {
     const [row] = yield* sql<{ sealed: string | null }>`
       SELECT sealed_traffic_access_token AS sealed FROM relay_thread_vm_allocations
-      WHERE allocation_id = ${identity.allocationId} AND thread_id = ${identity.threadId} AND runtime_protocol='native-v1' AND resource_kind='personal'
+      WHERE allocation_id = ${identity.allocationId} AND thread_id = ${identity.threadId} AND runtime_protocol='native-v1' AND resource_kind=${resourceKind}
         AND compute_ref = ${identity.computeRef} AND state = 'running' AND deleted_at IS NULL`;
     if (!row?.sealed) return yield* new ThreadVmIngressTokenUnavailable();
     const box = yield* RelaySecretBox;

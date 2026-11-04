@@ -111,6 +111,8 @@ import Migration0088 from "./Migrations/088_CheckoutOperationBoot.ts";
 import Migration0089 from "./Migrations/089_WorkflowExecutionBinding.ts";
 import Migration0090 from "./Migrations/090_ThreadMoveSourceReopens.ts";
 import Migration0091 from "./Migrations/091_ThreadMoveHistoryRecovery.ts";
+import Migration0092 from "./Migrations/092_WorkflowCheckpointPins.ts";
+import Migration0093 from "./Migrations/093_WorkflowCheckpointIgnoreRules.ts";
 /**
  * Migration loader with all migrations defined inline.
  *
@@ -213,6 +215,8 @@ const migrationEntries = [
   [89, "WorkflowExecutionBinding", Migration0089],
   [90, "ThreadMoveSourceReopens", Migration0090],
   [91, "ThreadMoveHistoryRecovery", Migration0091],
+  [92, "WorkflowCheckpointPins", Migration0092],
+  [93, "WorkflowCheckpointIgnoreRules", Migration0093],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

@@ -11,7 +11,16 @@ import { useManagedRelayOrganizationCatalog } from "../../cloud/managedRelayStat
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { Button } from "../ui/button";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
-import { workflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
+import {
+  workflowResultOrigin,
+  type WorkflowResultOrigin,
+} from "@t3tools/client-runtime/relay/workflow-result";
+
+declare module "@tanstack/react-router" {
+  interface HistoryState {
+    workflowOrigin?: WorkflowResultOrigin | undefined;
+  }
+}
 
 /** Mounted with the application shell so draft protection also covers result inspection. */
 export function WorkflowDraftUnloadGuard() {

@@ -239,7 +239,7 @@ export const environmentAuthenticatedAuthLayer = Layer.effect(
             access.withFence(
               access.requireMember(session).pipe(
                 Effect.catch(() => failEnvironmentAuthInvalid("invalid_credential")),
-                Effect.andThen(access.registerConnection(Fiber.interrupt(requestFiber))),
+                Effect.andThen(access.registerConnection(Fiber.interrupt(requestFiber), session)),
               ),
             ),
             (unregister) => Effect.sync(unregister),

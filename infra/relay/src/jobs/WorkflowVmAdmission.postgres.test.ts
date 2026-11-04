@@ -56,6 +56,20 @@ const setup = Effect.gen(function* () {
     workflow_policy_revision integer NOT NULL DEFAULT 1,
     max_running_workflow_vms integer NOT NULL DEFAULT 10
   )`;
+  // This admission fixture omits the native VM migration chain. The queued Cancel
+  // path can retire an unused preparation, so provide its four empty lookup tables.
+  yield* sql`CREATE TABLE relay_thread_placements (
+    thread_id text PRIMARY KEY, workflow_job_id text, organization_id text,
+    repository_id text, environment_id text
+  )`;
+  yield* sql`CREATE TABLE relay_thread_vm_allocations (
+    allocation_id text PRIMARY KEY, thread_id text, resource_kind text,
+    state text, compute_ref text, deleted_at text
+  )`;
+  yield* sql`CREATE TABLE relay_thread_vm_provisions (allocation_id text PRIMARY KEY)`;
+  yield* sql`CREATE TABLE relay_thread_vm_capacity (
+    operation_id text PRIMARY KEY, allocation_id text, state text
+  )`;
   yield* sql`
     INSERT INTO relay_github_installations VALUES ('org','42','example','Organization','owner','2026','2026')
   `;
@@ -378,6 +392,11 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
         Effect.gen(function* () {
           const queued = yield* runRepositoryWorkflow("repo", request);
           const sql = (yield* RelayDb).$client;
+          const threadId = `workflow:${queued.jobId}`;
+          yield* sql`INSERT INTO relay_thread_placements VALUES (${threadId},${queued.jobId},'org','repo',NULL)`;
+          yield* sql`INSERT INTO relay_thread_vm_allocations VALUES
+            (${queued.jobId},${threadId},'organization_workflow','creating',NULL,NULL)`;
+          yield* sql`INSERT INTO relay_thread_vm_capacity VALUES (${queued.jobId},${queued.jobId},'waiting')`;
           yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role)
           VALUES ('org','another-developer','member')`;
           yield* sql`INSERT INTO relay_repository_access(repository_id,user_id,organization_id,role)
@@ -399,6 +418,12 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
           expect(denied._tag).toBe("RelayTenancyForbiddenError");
           const result = yield* cancel;
           expect(result.status).toBe("cancelled");
+          expect(
+            yield* sql`SELECT state FROM relay_thread_vm_allocations WHERE allocation_id=${queued.jobId}`,
+          ).toEqual([{ state: "deleted" }]);
+          expect(
+            yield* sql`SELECT state FROM relay_thread_vm_capacity WHERE operation_id=${queued.jobId}`,
+          ).toEqual([{ state: "released" }]);
         }),
       ),
   );

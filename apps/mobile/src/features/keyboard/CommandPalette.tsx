@@ -23,7 +23,12 @@ import { SymbolView, type AppSymbolName } from "../../components/AppSymbol";
 import { cn } from "../../lib/cn";
 import { scopedProjectKey, scopedThreadKey } from "../../lib/scopedEntities";
 import { T3KeyboardCommands } from "../../native/T3KeyboardCommands";
-import { useProjects, useThreadShell, useThreadShells } from "../../state/entities";
+import {
+  useProjects,
+  useServerConfigs,
+  useThreadShell,
+  useThreadShells,
+} from "../../state/entities";
 import { useThreadSearch } from "../../state/queries";
 import { useWorkspaceState } from "../../state/workspace";
 import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
@@ -133,6 +138,7 @@ function PaletteRow(props: {
 /** Mounted only while open, so the app root does not subscribe to the full thread catalog. */
 export function CommandPalette(props: {
   readonly pathname: string;
+  readonly workspaceEnabled: boolean;
   readonly onClose: () => void;
   readonly onCommand: (command: HardwareKeyboardCommand) => void;
 }) {
@@ -141,6 +147,7 @@ export function CommandPalette(props: {
   const { selectThread } = useAdaptiveWorkspaceLayout();
   const runCommand = props.onCommand;
   const projects = useProjects();
+  const serverConfigs = useServerConfigs();
   const threads = useThreadShells();
   const activeThreadRef = useMemo(() => parseActiveThreadPath(props.pathname), [props.pathname]);
   const activeThread = useThreadShell(activeThreadRef);
@@ -157,9 +164,14 @@ export function CommandPalette(props: {
   const searchEnvironmentIds = useMemo(
     () =>
       environments
-        .filter((environment) => environment.connectionState === "connected")
+        .filter(
+          (environment) =>
+            environment.connectionState === "connected" &&
+            serverConfigs.get(environment.environmentId)?.environment.capabilities
+              .workflowVmResultReader !== true,
+        )
         .map((environment) => environment.environmentId),
-    [environments],
+    [environments, serverConfigs],
   );
   const search = useThreadSearch(searchEnvironmentIds, query.startsWith(">") ? "" : query);
   const matchedThreadKeys = useMemo(
@@ -265,7 +277,7 @@ export function CommandPalette(props: {
     const activeProject = activeThread
       ? projectByKey.get(scopedProjectKey(activeThread.environmentId, activeThread.projectId))
       : null;
-    if (activeProject) {
+    if (activeProject && props.workspaceEnabled) {
       actions.unshift({
         key: "newThread",
         kind: "action",
@@ -290,31 +302,42 @@ export function CommandPalette(props: {
         ["copyThreadReference", "Copy PR link or thread ID", ["reference", "clipboard"]],
       ] as const;
       actions.push(
-        ...threadActions.map(([command, title, searchTerms]) => ({
-          key: command,
-          kind: "action" as const,
-          title,
-          searchTerms,
-          run: () => runCommand(command),
-        })),
+        ...threadActions
+          .filter(
+            ([command]) =>
+              props.workspaceEnabled || (command !== "files" && command !== "terminal"),
+          )
+          .map(([command, title, searchTerms]) => ({
+            key: command,
+            kind: "action" as const,
+            title,
+            searchTerms,
+            run: () => runCommand(command),
+          })),
       );
     }
-    const projectItems: CommandPaletteItem[] = projects.map((project) => ({
-      key: `project:${scopedProjectKey(project.environmentId, project.id)}`,
-      kind: "project",
-      title: project.title,
-      detail: `New thread · ${savedConnectionsById[project.environmentId]?.environmentLabel ?? project.environmentId}`,
-      searchTerms: [project.workspaceRoot, "new thread", "project"],
-      run: () =>
-        navigation.navigate("NewTaskSheet", {
-          screen: "NewTaskDraft",
-          params: {
-            environmentId: project.environmentId,
-            projectId: project.id,
-            title: project.title,
-          },
-        }),
-    }));
+    const projectItems: CommandPaletteItem[] = projects
+      .filter(
+        (project) =>
+          serverConfigs.get(project.environmentId)?.environment.capabilities
+            .workflowVmResultReader !== true,
+      )
+      .map((project) => ({
+        key: `project:${scopedProjectKey(project.environmentId, project.id)}`,
+        kind: "project",
+        title: project.title,
+        detail: `New thread · ${savedConnectionsById[project.environmentId]?.environmentLabel ?? project.environmentId}`,
+        searchTerms: [project.workspaceRoot, "new thread", "project"],
+        run: () =>
+          navigation.navigate("NewTaskSheet", {
+            screen: "NewTaskDraft",
+            params: {
+              environmentId: project.environmentId,
+              projectId: project.id,
+              title: project.title,
+            },
+          }),
+      }));
     const threadItems: CommandPaletteItem[] = threads
       .filter((thread) => thread.archivedAt === null)
       .sort((left, right) =>
@@ -342,6 +365,8 @@ export function CommandPalette(props: {
       });
     return [...actions, ...projectItems, ...threadItems];
   }, [
+    props.workspaceEnabled,
+    serverConfigs,
     activeThread,
     activeThreadRef,
     navigation,

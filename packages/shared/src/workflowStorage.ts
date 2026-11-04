@@ -6,6 +6,12 @@ import {
 } from "@t3tools/contracts/workflows";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 
+/** Use a stable branch name outside the auto-renamed t3code namespace. */
+export function jobBranchName(jobId: string): string {
+  const sanitized = jobId.replaceAll(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return `t3-job/${sanitized.length > 0 ? sanitized : "job"}`;
+}
+
 const LegacyDefinition = Schema.Struct({
   name: WorkflowDefinition.fields.name,
   steps: WorkflowDefinition.fields.steps,

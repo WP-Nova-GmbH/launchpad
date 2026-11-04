@@ -797,6 +797,71 @@ const armedJournal = {
   capture: () => Effect.succeed("/bin/sh"),
 };
 
+it.effect.each([0, 7])(
+  "withholds private setup output and preserves the exit receipt %s",
+  (exitCode) =>
+    Effect.gen(function* () {
+      let listener: ((event: TerminalEvent) => Effect.Effect<void>) | undefined;
+      let filter: ((chunk: string) => string) | undefined;
+      const canary = "secret-start\nsecret-finish";
+      const layer = testLayer(makeProject([]), {
+        open: (input) =>
+          Effect.sync(() => {
+            expect(input.env?.PRIVATE_SETUP_KEY).toBe(canary);
+            filter = input.filterSetupOutput;
+            return managedSnapshot;
+          }),
+        write: () => Effect.die("unexpected untracked setup write"),
+        writeSetup: (input) =>
+          Effect.gen(function* () {
+            expect(input.data).not.toContain(canary);
+            const sentinel = /__T3_SETUP_DONE___[a-f0-9]+:/u.exec(input.data)?.[0];
+            expect(sentinel).toBeDefined();
+            expect(filter!("secret-start\r\nsecret-")).toBe("");
+            expect(filter!(`finish\r\n${sentinel!.slice(0, 20)}`)).toBe("");
+            const filtered = filter!(`${sentinel!.slice(20)}${exitCode}\r\n`);
+            yield* listener!({
+              type: "output",
+              threadId: "thread-1",
+              terminalId: "setup-attempt",
+              data: filtered,
+              sequence: 1,
+            });
+          }),
+        subscribe: (next) =>
+          Effect.sync(() => {
+            listener = next;
+            return () => {
+              listener = undefined;
+            };
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+        const result = yield* runner.runForThread({
+          threadId: "thread-1",
+          projectId: "project-1",
+          worktreePath: "/repo/worktrees/a",
+          preparationAttemptId: "attempt",
+          preferredTerminalId: "setup-attempt",
+          resolvedScript: { id: "setup", name: "Setup", command: "make setup", async: false },
+          runEnvironment: {
+            environment: { PRIVATE_SETUP_KEY: canary },
+            hasSecrets: true,
+            secretNames: ["PRIVATE_SETUP_KEY"],
+          },
+          authorizeDelivery: Effect.succeed(true),
+          observeCompletion: {
+            onOutputLine: () => Effect.die("private setup output reached the tail"),
+          },
+        });
+        expect(result.status).toBe("started");
+        if (result.status === "started")
+          expect((yield* result.completion!).exitCode).toBe(exitCode);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provideService(SetupProcessJournal, armedJournal)),
+);
+
 it.effect.each([
   [false, true],
   [false, false],

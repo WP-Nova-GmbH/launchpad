@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { AtomRegistry } from "effect/unstable/reactivity";
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
 import { RelayTenancyForbiddenError, RelayRepositoryId } from "@t3tools/contracts/relay";
 import type { RepositoryWorkflowJob, WorkflowDefinition } from "@t3tools/contracts/workflows";
 import {
@@ -21,10 +21,15 @@ import {
   workflowDraftIssue,
   workflowStepState,
   startNewWorkflowDraft,
-  workflowJobPageAccessLost,
+  workflowJobAccessLost,
   emptyWorkflowJobPageRead,
   beginWorkflowJobPage,
   settleWorkflowJobPage,
+  beginWorkflowReview,
+  bindWorkflowReviewPlacement,
+  recordWorkflowReviewDiff,
+  requireFreshWorkflowReviewRead,
+  workflowReviewApprovalState,
 } from "./workflowSession.ts";
 
 const scope = {
@@ -83,6 +88,74 @@ afterEach(() => {
 });
 
 describe("workflow session and request ownership", () => {
+  it("requires a current exact VM diff and a job read started after returning", () => {
+    const registry = setup();
+    const key = workflowSessionKey(scope, "job");
+    const state = () =>
+      workflowReviewApprovalState(
+        registry.get(workflowDraftAtom).reviews[key],
+        registry.get(workflowJobReadAtom).jobs[key]!,
+      );
+    const threadId = ThreadId.make("thread");
+    const placement = { environmentId: EnvironmentId.make("vm"), threadId, generation: 2 };
+    const checkpoint = { checkpointId: "current", turnId: "turn-2", checkpointTurnCount: 2 };
+    const current = {
+      ...job(2),
+      runtime: { kind: "vm", threadId },
+      progress: { ...job(2).progress!, checkpoint: { ...checkpoint, checkpointRef: "ref" } },
+    } satisfies RepositoryWorkflowJob;
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, current);
+    expect(state()).toBe("allowed");
+
+    beginWorkflowReview(registry, scope, "job", "old", checkpoint);
+    bindWorkflowReviewPlacement(registry, scope, "job", "old", placement);
+    beginWorkflowReview(registry, scope, "job", "new", checkpoint);
+    bindWorkflowReviewPlacement(registry, scope, "job", "new", placement);
+    const origin = {
+      ...scope,
+      jobId: "job",
+      threadId,
+      reviewVisitId: "new",
+      reviewCheckpoint: checkpoint,
+    };
+    const diff = { threadId, fromTurnCount: 1, toTurnCount: 2, diff: "" };
+    const oldDiff = { ...diff, completeWorkflowReview: true } as const;
+    const completeDiff = { ...oldDiff, targetTurnId: TurnId.make(checkpoint.turnId) };
+    expect(recordWorkflowReviewDiff(registry, origin, placement, diff)).toBe(false);
+    expect(recordWorkflowReviewDiff(registry, origin, placement, oldDiff)).toBe(false);
+    expect(
+      recordWorkflowReviewDiff(registry, origin, placement, {
+        ...completeDiff,
+        targetTurnId: TurnId.make("reused-count"),
+      }),
+    ).toBe(false);
+    expect(
+      recordWorkflowReviewDiff(
+        registry,
+        { ...origin, reviewVisitId: "old" },
+        placement,
+        completeDiff,
+      ),
+    ).toBe(false);
+    expect(
+      recordWorkflowReviewDiff(registry, origin, { ...placement, generation: 1 }, completeDiff),
+    ).toBe(false);
+    expect(
+      recordWorkflowReviewDiff(registry, origin, placement, { ...completeDiff, fromTurnCount: 0 }),
+    ).toBe(false);
+    expect(recordWorkflowReviewDiff(registry, origin, placement, completeDiff)).toBe(true);
+
+    const previousRead = beginWorkflowJobRequest(registry, scope, "job")!;
+    requireFreshWorkflowReviewRead(registry, scope, "job");
+    expect(settleWorkflowJobRequest(registry, previousRead, current)).toBe(false);
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, "offline");
+    expect(state()).toBe("checking");
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, current);
+    expect(state()).toBe("allowed");
+    clearWorkflowScope(registry, scope);
+    expect(registry.get(workflowDraftAtom).reviews[key]).toBeUndefined();
+  });
+
   it("resumes one new workflow slot without allocating another editor", () => {
     const registry = setup();
     let allocations = 0;
@@ -210,6 +283,21 @@ describe("workflow session and request ownership", () => {
     expect(
       registry.get(workflowJobReadAtom).jobs[workflowSessionKey(scope, "job")]?.job?.status,
     ).toBe("cancelled");
+  });
+  it("drops a cached run on an authoritative access loss", () => {
+    const registry = setup();
+    const key = workflowSessionKey(scope, "job");
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, job(4));
+    settleWorkflowJobRequest(
+      registry,
+      beginWorkflowJobRequest(registry, scope, "job")!,
+      "Repository access revoked",
+      true,
+    );
+    expect(registry.get(workflowJobReadAtom).jobs[key]).toMatchObject({
+      job: null,
+      error: "Repository access revoked",
+    });
   });
   it("clears a lost-reply response only after a later read proves exact acceptance", () => {
     const registry = setup();
@@ -460,13 +548,13 @@ it("clears list rows and cursors after a definite repository access rejection", 
       traceId: "trace",
     }),
   };
-  expect(workflowJobPageAccessLost(cause)).toBe(true);
-  expect(workflowJobPageAccessLost(new Error("Offline"))).toBe(false);
+  expect(workflowJobAccessLost(cause)).toBe(true);
+  expect(workflowJobAccessLost(new Error("Offline"))).toBe(false);
   read = settleWorkflowJobPage(
     beginWorkflowJobPage(read, refresh),
     refresh,
     "Access removed",
-    workflowJobPageAccessLost(cause),
+    workflowJobAccessLost(cause),
   );
   expect(read.jobs).toBeNull();
   expect(read.nextCursor).toBeNull();

@@ -19,13 +19,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import type { CheckpointStoreError } from "./Errors.ts";
-import type { VcsCheckpointOps } from "../vcs/VcsDriver.ts";
+import type {
+  CapturedCheckpoint,
+  VcsCaptureCheckpointInput,
+  VcsCheckpointOps,
+} from "../vcs/VcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
-export interface CaptureCheckpointInput {
-  readonly cwd: string;
-  readonly checkpointRef: CheckpointRef;
-}
+export type CaptureCheckpointInput = VcsCaptureCheckpointInput;
 
 export interface RestoreCheckpointInput {
   readonly cwd: string;
@@ -40,6 +41,8 @@ export interface DiffCheckpointsInput {
   readonly fallbackFromToHead?: boolean;
   readonly ignoreWhitespace: boolean;
   readonly format?: "patch" | "numstat";
+  readonly requireComplete?: boolean;
+  readonly pinned?: boolean;
 }
 
 export interface DeleteCheckpointRefsInput {
@@ -61,7 +64,7 @@ export class CheckpointStore extends Context.Service<
      */
     readonly captureCheckpoint: (
       input: CaptureCheckpointInput,
-    ) => Effect.Effect<void, CheckpointStoreError>;
+    ) => Effect.Effect<CapturedCheckpoint, CheckpointStoreError>;
 
     /** Check whether a checkpoint ref exists. */
     readonly hasCheckpointRef: (
@@ -105,16 +108,20 @@ export const make = Effect.gen(function* () {
   const resolveCheckpoints = Effect.fn("CheckpointStore.resolveCheckpoints")(function* (
     operation: string,
     cwd: string,
+    strictWorkflowCapture = false,
   ) {
-    const handle = yield* vcsRegistry.resolve({ cwd });
-    if (!handle.driver.checkpoints) {
+    const driver = strictWorkflowCapture
+      ? yield* vcsRegistry.get("git")
+      : (yield* vcsRegistry.resolve({ cwd })).driver;
+    const kind = driver.capabilities.kind;
+    if (!driver.checkpoints) {
       return yield* new VcsUnsupportedOperationError({
         operation,
-        kind: handle.kind,
-        detail: `${handle.kind} driver does not implement checkpoint operations.`,
+        kind,
+        detail: `${kind} driver does not implement checkpoint operations.`,
       });
     }
-    return handle.driver.checkpoints satisfies VcsCheckpointOps;
+    return driver.checkpoints satisfies VcsCheckpointOps;
   });
 
   const isGitRepository: CheckpointStore["Service"]["isGitRepository"] = (cwd) =>
@@ -125,7 +132,11 @@ export const make = Effect.gen(function* () {
   const captureCheckpoint: CheckpointStore["Service"]["captureCheckpoint"] = Effect.fn(
     "captureCheckpoint",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.captureCheckpoint", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(
+      "CheckpointStore.captureCheckpoint",
+      input.cwd,
+      input.strictWorkflowCapture,
+    );
     return yield* checkpoints.captureCheckpoint(input);
   });
 

@@ -1793,6 +1793,13 @@ export const relayThreadVmProvisions = pgTable(
       .references(() => relayThreadVmAllocations.allocationId),
     operationId: varchar("operation_id", { length: 64 }).notNull().unique(),
     generation: integer("generation").notNull(),
+    workflowSnapshot: jsonb("workflow_snapshot").$type<{
+      readonly canonicalKey: string;
+      readonly installationId: string;
+      readonly branch: string;
+      readonly commitSha: string;
+      readonly templateBuildId: string;
+    }>(),
     creationIdentityFenced: boolean("creation_identity_fenced").notNull().default(false),
     ingressRecoveryClaimId: varchar("ingress_recovery_claim_id", { length: 64 }),
     position: bigserial("position", { mode: "number" }).notNull(),
@@ -1820,6 +1827,16 @@ export const relayThreadVmProvisions = pgTable(
       .on(table.position)
       .where(sql`${table.phase} IN ('pending', 'creating')`),
   ],
+);
+
+export const relayWorkflowVmAttempts = pgTable(
+  "relay_workflow_vm_attempts",
+  {
+    jobId: text("job_id").notNull(),
+    attemptId: text("attempt_id").notNull(),
+    identity: jsonb("identity").notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.jobId, table.attemptId] })],
 );
 
 /** One standard VM profile per host; reservation leases never expire with a worker claim. */

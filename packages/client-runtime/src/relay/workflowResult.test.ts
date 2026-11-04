@@ -28,4 +28,9 @@ describe("workflow result return ownership", () => {
       ),
     ).toBeNull();
   });
+  it("keeps the VM reader hint for the matching result route", () => {
+    const workflowOrigin = { ...origin, workflowVmResultReader: true };
+    expect(workflowResultOrigin({ workflowOrigin }, "account", "thread")).toEqual(workflowOrigin);
+    expect(workflowResultOrigin({ workflowOrigin }, "other", "thread")).toBeNull();
+  });
 });

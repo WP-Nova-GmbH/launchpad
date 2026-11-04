@@ -3,13 +3,29 @@ import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence
 import { CheckoutAdmission, makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
 import { notifyCheckoutCaptureReleased } from "../../workspace/CheckoutCaptureSignals.ts";
 import * as WorkspaceLease from "../../workspace/workspaceLease.ts";
-import { reconcileWorkflowRun } from "../../jobs/RepositoryWorkflowRunner.ts";
+import {
+  RepositoryWorkflowRunner,
+  layer as WorkflowRunnerLayer,
+  reconcileWorkflowRun,
+} from "../../jobs/RepositoryWorkflowRunner.ts";
 import {
   WorkflowRun,
   WorkflowRunStore,
   layer as WorkflowRunStoreLayer,
 } from "../../jobs/WorkflowRunStore.ts";
 import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
+import { WorkflowVmAttempts } from "../../relay/WorkflowVmAttempts.ts";
+import { ThreadExecution } from "../../relay/ThreadExecution.ts";
+import {
+  makeThreadExecutionRelay,
+  type ThreadExecutionAuthority,
+  ThreadExecutionRelayError,
+} from "../../relay/ThreadExecutionRelay.ts";
+import { workflowPromptId } from "../../jobs/workflowSequence.ts";
+import { TerminalManager } from "../../terminal/Manager.ts";
+import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
+import { GitVcsDriver } from "../../vcs/GitVcsDriver.ts";
+import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
 import {
   setMcpProviderSession,
   clearAllMcpProviderSessions,
@@ -29,6 +45,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
+  ServerProvider,
   VcsProcessSpawnError,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -55,10 +72,12 @@ import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Redacted from "effect/Redacted";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -84,6 +103,7 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const decodeWorkflowRun = Schema.decodeUnknownEffect(WorkflowRun);
 const decodeContinuityWorkflowRun = Schema.decodeUnknownSync(WorkflowRun);
+const decodeServerProvider = Schema.decodeUnknownEffect(ServerProvider);
 
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "@t3tools/contracts";
@@ -229,6 +249,9 @@ describe("ProviderCommandReactor", () => {
   });
 
   async function createHarness(input?: {
+    readonly threadId?: ThreadId;
+    readonly withWorkflowVmAuthority?: boolean;
+    readonly workflowVmAuthority?: ThreadExecutionAuthority;
     readonly adapterRegistry?: ProviderAdapterRegistryShape;
     readonly withRuntimeIngestion?: boolean;
     readonly baseDir?: string;
@@ -254,6 +277,8 @@ describe("ProviderCommandReactor", () => {
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderServiceError>;
+    readonly captureCheckpoint?: CheckpointStore["Service"]["captureCheckpoint"];
+    readonly hasCheckpointRef?: CheckpointStore["Service"]["hasCheckpointRef"];
     readonly tryHandlePromptCommandEffect?: ProviderAuthService["Service"]["tryHandlePromptCommand"];
   }) {
     const now = "2026-01-01T00:00:00.000Z";
@@ -543,7 +568,19 @@ describe("ProviderCommandReactor", () => {
             drain: Effect.void,
           }),
     ).pipe(
-      Layer.provide(Layer.mock(CheckpointStore, { isGitRepository: () => Effect.succeed(false) })),
+      Layer.provide(
+        Layer.mock(CheckpointStore, {
+          isGitRepository: () => Effect.succeed(false),
+          hasCheckpointRef: input?.hasCheckpointRef ?? (() => Effect.succeed(true)),
+          ...(input?.captureCheckpoint ? { captureCheckpoint: input.captureCheckpoint } : {}),
+        }),
+      ),
+      Layer.provide(
+        Layer.succeed(WorkflowVmAttempts, {
+          resolve: () => Effect.succeed({ environment: {}, hasSecrets: false, secretNames: [] }),
+          readReviewSecrets: () => Effect.succeed(Redacted.make([])),
+        }),
+      ),
       Layer.provideMerge(ThreadBackgroundLiveness.layer),
       Layer.provideMerge(ThreadPlanProgress.layer),
       Layer.provide(
@@ -557,7 +594,22 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(
         input?.adapterRegistry
           ? ProviderServiceLive.pipe(
-              Layer.provide(threadExecutionTestLayer),
+              Layer.provide(
+                input.withWorkflowVmAuthority || input.workflowVmAuthority
+                  ? Layer.effect(
+                      ThreadExecution,
+                      Effect.map(SqlClient.SqlClient, (sql) =>
+                        makeThreadExecutionRelay(
+                          sql,
+                          input.workflowVmAuthority ?? {
+                            admit: () => Effect.succeed({ newlyAdmitted: true, completed: false }),
+                            complete: () => Effect.void,
+                          },
+                        ),
+                      ),
+                    ).pipe(Layer.provide(SqlitePersistenceMemory))
+                  : threadExecutionTestLayer,
+              ),
               Layer.provide(projectionSnapshotLayer),
               Layer.provide(Layer.succeed(ProviderAdapterRegistry, input.adapterRegistry)),
               Layer.provideMerge(
@@ -639,7 +691,7 @@ describe("ProviderCommandReactor", () => {
       engine.dispatch({
         type: "thread.create",
         commandId: CommandId.make("cmd-thread-create"),
-        threadId: ThreadId.make("thread-1"),
+        threadId: input?.threadId ?? ThreadId.make("thread-1"),
         projectId: asProjectId("project-1"),
         title: input?.initialTitle ?? "Thread",
         modelSelection: modelSelection,
@@ -1913,38 +1965,43 @@ describe("ProviderCommandReactor", () => {
             });
           const preparing = yield* Deferred.make<void>();
           const releaseRead = yield* Deferred.make<void>();
-          const read = harness.snapshotQuery.getThreadDetailById;
-          let handoffReads = 0;
-          const spy = vi
-            .spyOn(harness.snapshotQuery, "getThreadDetailById")
-            .mockImplementation((id, query) =>
-              read(id, query).pipe(
-                Effect.tap((thread) =>
-                  Effect.gen(function* () {
-                    if (
-                      Option.isSome(thread) &&
-                      thread.value.promptQueue?.handoff?.mode ===
-                        (kind === "Steer" ? "steer" : "next-turn") &&
-                      ++handoffReads === 2
-                    ) {
-                      yield* Deferred.succeed(preparing, undefined);
-                      yield* Deferred.await(releaseRead);
-                    }
-                  }),
-                ),
+          const workflows = yield* Effect.promise(() => harness.runEffect(WorkflowRunStore));
+          const lookup = workflows.getByThread;
+          yield* Effect.acquireRelease(
+            Effect.sync(() =>
+              vi.spyOn(workflows, "getByThread").mockImplementation((id) =>
+                Effect.gen(function* () {
+                  const thread = yield* harness.snapshotQuery
+                    .getThreadDetailById(ThreadId.make(id))
+                    .pipe(Effect.orDie);
+                  // The pre-claim lookup sees a pending prompt. The delivery
+                  // lookup runs after the handoff and before any provider call.
+                  if (
+                    Option.isSome(thread) &&
+                    thread.value.promptQueue?.handoff?.mode ===
+                      (kind === "Steer" ? "steer" : "next-turn") &&
+                    (yield* Deferred.succeed(preparing, undefined))
+                  )
+                    yield* Deferred.await(releaseRead);
+                  return yield* lookup(id);
+                }),
               ),
-            );
+            ),
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
           const stream = yield* harness.engine.subscribeDomainEvents;
           const released = yield* stream.pipe(
             Stream.filter(
               (event) =>
                 event.type === "thread.prompt-queue-changed" &&
+                event.commandId?.endsWith(":release") === true &&
                 event.payload.handoff === null &&
-                event.payload.entry?.state === "pending",
+                event.payload.entry?.state === "pending" &&
+                event.payload.entry.messageId === "steer-message",
             ),
             Stream.take(1),
             Stream.runDrain,
-            Effect.forkScoped,
+            Effect.forkScoped({ startImmediately: true }),
           );
           yield* harness.engine.dispatch({
             type: "thread.prompt.enqueue",
@@ -1978,7 +2035,6 @@ describe("ProviderCommandReactor", () => {
           });
           yield* Deferred.succeed(releaseRead, undefined);
           yield* Fiber.join(released);
-          spy.mockRestore();
           const thread = (yield* Effect.promise(() => harness.readModel())).threads[0]!;
           expect(thread.promptQueue?.enabled).toBe(false);
           expect(thread.promptQueue?.entries[0]?.state).toBe("pending");
@@ -2270,6 +2326,7 @@ describe("ProviderCommandReactor", () => {
                         cwd: "/tmp/provider-project",
                         cause: "test capture failure",
                       });
+                    return { commitId: "captured-commit", treeId: "captured-tree" };
                   }),
                 diffCheckpoints: () => Effect.succeed(""),
               }),
@@ -2620,6 +2677,38 @@ describe("ProviderCommandReactor", () => {
           snapshot.threads.find((thread) => thread.id === other)?.promptQueue?.entries[0]?.state,
         ).toBe("unknown");
         expect(harness.sendTurn).not.toHaveBeenCalled();
+
+        const healthyQueue = snapshot.threads.find((thread) => thread.id === other)!.promptQueue!;
+        yield* harness.engine.dispatch({
+          type: "thread.queue.resolve",
+          commandId: CommandId.make("dismiss-other"),
+          threadId: other,
+          expectedRevision: healthyQueue.revision,
+          resolution: "dismiss",
+          createdAt,
+        });
+        const livePrompt = MessageId.make("after-recovery");
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.enqueue",
+          commandId: CommandId.make("enqueue-after-recovery"),
+          threadId: other,
+          message: { messageId: livePrompt, text: "New work", attachments: [] },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+          createdAt,
+        });
+        const admitted = yield* queueMilestone(harness, livePrompt, "admitted");
+        const current = yield* Effect.promise(harness.readModel);
+        yield* harness.engine.dispatch({
+          type: "thread.queue.resume",
+          commandId: CommandId.make("resume-other"),
+          threadId: other,
+          expectedRevision: current.threads.find((thread) => thread.id === other)!.promptQueue!
+            .revision,
+          createdAt,
+        });
+        yield* Fiber.join(admitted);
+        expect(harness.sendTurn.mock.calls.map(([request]) => request.threadId)).toEqual([other]);
       }),
     ),
   );
@@ -7144,6 +7233,7 @@ describe("ProviderCommandReactor", () => {
           worktreePath: null,
           preparedHead: null,
           approvedBy: null,
+          runtime: { kind: "machine", environmentId: "env", projectId: "project-1" },
           providerContinuation: { driver: "codex", continuationKey: "codex-home" },
           sequence: {
             cursor: 1,
@@ -7164,8 +7254,7 @@ describe("ProviderCommandReactor", () => {
             updatedAt: createdAt,
             definition: {
               name: "Workflow",
-              environmentId: "env",
-              projectId: "project-1",
+              target: { kind: "machine", environmentId: "env", projectId: "project-1" },
               steps: [
                 {
                   id: "first",
@@ -7324,6 +7413,7 @@ describe("ProviderCommandReactor", () => {
       worktreePath: null,
       preparedHead: null,
       approvedBy: null,
+      runtime: { kind: "machine", environmentId: "env", projectId: "project-1" },
       workflow: {
         workflowId: "workflow",
         organizationId: "org",
@@ -7334,8 +7424,7 @@ describe("ProviderCommandReactor", () => {
         updatedAt: "2026-10-12T10:00:00.000Z",
         definition: {
           name: "Workflow",
-          environmentId: "env",
-          projectId: "project-1",
+          target: { kind: "machine", environmentId: "env", projectId: "project-1" },
           steps: [
             {
               id: "first",
@@ -7409,6 +7498,188 @@ describe("ProviderCommandReactor", () => {
       interactionMode: "default",
       createdAt: "2026-10-12T10:00:00.000Z",
     });
+  effectIt.effect.each([
+    { kind: "approval", outcome: "recovered" },
+    { kind: "user-input", outcome: "recovered" },
+    { kind: "approval", outcome: "runtime stopped" },
+  ] as const)(
+    "retries a workflow VM supervisor $kind through the original execution fence: $outcome",
+    ({ kind, outcome }) =>
+      Effect.gen(function* () {
+        const requestId = ApprovalRequestId.make(`supervisor-${kind}`);
+        const workId = `provider:${kind}:${requestId}`;
+        const template = continuityQueueRun(`supervisor-${kind}`);
+        const threadId = ThreadId.make(`workflow:${template.jobId}`);
+        const instanceId = template.modelSelection.instanceId;
+        const original = yield* continuityQueueAdapter(instanceId);
+        const response = vi.fn();
+        const delivered = yield* Deferred.make<void>();
+        const retryRequested = yield* Deferred.make<void>();
+        const releaseGrant = yield* Deferred.make<void>();
+        const attempts: string[] = [];
+        const respond = (...args: unknown[]) =>
+          Effect.sync(() => void response(...args)).pipe(
+            Effect.andThen(Deferred.succeed(delivered, undefined)),
+            Effect.asVoid,
+          );
+        const adapter = {
+          ...original.adapter,
+          respondToRequest: respond,
+          respondToUserInput: respond,
+        };
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            threadId,
+            threadModelSelection: template.modelSelection,
+            workflowVmAuthority: {
+              admit: (work) =>
+                Effect.gen(function* () {
+                  if (work.workId !== workId) return { newlyAdmitted: true, completed: false };
+                  attempts.push(work.workId);
+                  if (attempts.length === 1)
+                    return yield* new ThreadExecutionRelayError({
+                      threadId,
+                      operation: "admit",
+                      detail: "Temporary relay failure",
+                      retryableAdmission: true,
+                    });
+                  if (outcome === "runtime stopped") {
+                    yield* Deferred.succeed(retryRequested, undefined);
+                    yield* Deferred.await(releaseGrant);
+                  }
+                  return { newlyAdmitted: false, completed: false };
+                }),
+              complete: () => Effect.void,
+            },
+            adapterRegistry: queueRegistry(
+              new Map([[instanceId, { adapter, key: "codex:shared-queue-home" }]]),
+            ),
+          }),
+        );
+        const runtime = {
+          kind: "vm" as const,
+          jobId: template.jobId,
+          threadId,
+          organizationId: template.workflow.organizationId,
+          repositoryId: template.workflow.repositoryId,
+          allocationId: "allocation",
+          operationId: "operation",
+          environmentId: EnvironmentId.make("workflow-vm"),
+          projectId: ProjectId.make("project-1"),
+          generation: 1,
+        };
+        yield* harness.sql`INSERT INTO thread_execution_fences
+          (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+          VALUES (${threadId}, 'https://relay.example', ${runtime.environmentId},
+            ${runtime.projectId}, ${runtime.generation}, ${runtime.operationId}, 'active')`;
+        const store = yield* Effect.promise(() => harness.runEffect(WorkflowRunStore));
+        yield* store.save({
+          ...template,
+          runtime,
+          workflow: {
+            ...template.workflow,
+            definition: {
+              ...template.workflow.definition,
+              target: { kind: "vm", baseBranch: null },
+            },
+          },
+          progress: { ...template.progress, threadId, status: "running" },
+        });
+        yield* harness.providerService.startSession(threadId, {
+          threadId,
+          providerInstanceId: instanceId,
+          runtimeMode: "approval-required",
+        });
+        const createdAt = template.createdAt;
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("supervisor-retry-session"),
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            providerInstanceId: instanceId,
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+        if (kind === "user-input")
+          yield* harness.engine.dispatch({
+            type: "thread.activity.append",
+            commandId: CommandId.make("supervisor-retry-question"),
+            threadId,
+            activity: {
+              id: EventId.make("supervisor-retry-question"),
+              kind: "user-input.requested",
+              tone: "info",
+              summary: "Question",
+              turnId: null,
+              createdAt,
+              payload: {
+                requestId,
+                questions: [{ id: "context", header: "Context", question: "More?", options: [] }],
+              },
+            },
+            createdAt,
+          });
+        const command = {
+          commandId: CommandId.make(`server:supervisor:${threadId}:${requestId}:respond`),
+          threadId,
+          requestId,
+          createdAt,
+          ...(kind === "approval"
+            ? { type: "thread.approval.respond" as const, decision: "decline" as const }
+            : { type: "thread.user-input.respond" as const, answers: {} }),
+        };
+        const failed =
+          outcome === "runtime stopped"
+            ? yield* harness.engine.subscribeDomainEvents.pipe(
+                Effect.flatMap((events) =>
+                  events.pipe(
+                    Stream.filter(
+                      (event) =>
+                        event.type === "thread.activity-appended" &&
+                        event.payload.activity.kind === "provider.approval.respond.failed",
+                    ),
+                    Stream.runHead,
+                  ),
+                ),
+                Effect.forkScoped({ startImmediately: true }),
+              )
+            : undefined;
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(harness.drain);
+        expect(attempts).toContain(workId);
+        if (failed) {
+          yield* Deferred.await(retryRequested);
+          yield* original.adapter.stopSession(threadId);
+          yield* Deferred.succeed(releaseGrant, undefined);
+          expect(Option.getOrUndefined(yield* Fiber.join(failed))).toMatchObject({
+            payload: {
+              activity: {
+                payload: { detail: expect.stringContaining("Unknown codex adapter thread") },
+              },
+            },
+          });
+          expect(attempts).toEqual([workId, workId]);
+          expect(original.starts).toHaveLength(1);
+          expect(response).not.toHaveBeenCalled();
+          return;
+        }
+        yield* Deferred.await(delivered);
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(harness.drain);
+        expect(attempts).toEqual([workId, workId]);
+        expect(response.mock.calls).toEqual([
+          [threadId, requestId, kind === "approval" ? "decline" : {}],
+        ]);
+      }),
+  );
+
   effectIt.effect.each(["input-first", "before-native-start"] as const)(
     "confirms safe no-native cancellation from durable evidence: %s",
     (mode) =>
@@ -7725,6 +7996,560 @@ describe("ProviderCommandReactor", () => {
           expect(final.progress.status).toBe("cancelled");
           expect(final.executionReserved).toBe(false);
         }
+      }),
+  );
+
+  effectIt.effect.each([
+    "first",
+    "overlapping-wakes",
+    "setup-retried",
+    "provider-drift",
+    "capture-failed",
+    "recovered-pinned",
+    "recovered-legacy-ignore-rules",
+    "recovered-unpinned",
+    "recovered-missing-object",
+  ] as const)("workflow VM starts Codex only after a trusted baseline: %s", (mode) =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-1");
+      const checkpointRef = checkpointRefForThreadTurn(threadId, 0);
+      const baseline = {
+        checkpointRef,
+        commitId: "baseline-commit",
+        treeId: "baseline-tree",
+        baselineCommitId: "baseline-commit",
+      };
+      const workflowIgnoreRules =
+        mode === "first" ? new Uint8Array() : new TextEncoder().encode("setup-local.txt\n");
+      const overlap =
+        mode === "overlapping-wakes"
+          ? {
+              firstCapture: yield* Deferred.make<void>(),
+              competingWake: yield* Deferred.make<void>(),
+              releaseFirstCapture: yield* Deferred.make<void>(),
+              firstClaim: yield* Deferred.make<void>(),
+              captureCount: 0,
+              writtenCommit: null as string | null,
+            }
+          : null;
+      const capture = vi.fn(() => {
+        if (overlap) {
+          const first = overlap.captureCount++ === 0;
+          return Effect.gen(function* () {
+            yield* Deferred.succeed(
+              first ? overlap.firstCapture : overlap.competingWake,
+              undefined,
+            );
+            yield* Deferred.await(first ? overlap.releaseFirstCapture : overlap.firstClaim);
+            const commitId = first ? baseline.commitId : "later-baseline-commit";
+            overlap.writtenCommit = commitId;
+            return { ...baseline, commitId, workflowIgnoreRules };
+          });
+        }
+        return mode === "capture-failed"
+          ? Effect.fail(
+              new VcsProcessSpawnError({
+                operation: "captureCheckpoint",
+                command: "git",
+                cwd: "/tmp/provider-project",
+                cause: "test capture failure",
+              }),
+            )
+          : Effect.succeed({ ...baseline, workflowIgnoreRules });
+      });
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          deferReactorStart: true,
+          captureCheckpoint: capture,
+          hasCheckpointRef: () => Effect.succeed(mode !== "recovered-missing-object"),
+          startSessionEffect: (session) =>
+            Effect.sync(() => {
+              if (!overlap)
+                expect(capture).toHaveBeenCalledTimes(
+                  mode === "first" || mode === "setup-retried" ? 1 : 0,
+                );
+              return session;
+            }),
+        }),
+      );
+      const template = continuityQueueRun("pin-test");
+      const runtime = {
+        kind: "vm" as const,
+        jobId: template.jobId,
+        threadId,
+        organizationId: "org",
+        repositoryId: "repo",
+        allocationId: "allocation",
+        operationId: "operation",
+        environmentId: EnvironmentId.make("workflow-vm"),
+        projectId: ProjectId.make("project-1"),
+        generation: 1,
+      };
+      const run: WorkflowRun = {
+        ...template,
+        runtime,
+        worktreePath: harness.stateDir,
+        providerContinuation: {
+          driver: ProviderDriverKind.make("codex"),
+          continuationKey:
+            mode === "provider-drift" ? "codex:old-home" : "codex:home:/shared-codex",
+        },
+      };
+      yield* harness.sql`INSERT INTO thread_execution_fences
+          (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+          VALUES (${threadId}, 'https://relay.example', ${runtime.environmentId},
+            ${runtime.projectId}, ${runtime.generation}, ${runtime.operationId}, 'active')`;
+      const store = yield* Effect.promise(() => harness.runEffect(WorkflowRunStore));
+      yield* store.save(run);
+      const recoveredMode = mode.startsWith("recovered");
+      const savedPin =
+        mode === "recovered-pinned" ||
+        mode === "recovered-legacy-ignore-rules" ||
+        mode === "recovered-missing-object";
+      const capturesBaseline = mode === "first" || mode === "setup-retried" || overlap !== null;
+      if (overlap) {
+        const originalLease = WorkspaceLease.withWorkspaceLease;
+        const observeLease = <A, E, R>(cwd: string, effect: Effect.Effect<A, E, R>) =>
+          (cwd === harness.stateDir && overlap.captureCount > 0
+            ? Deferred.succeed(overlap.competingWake, undefined)
+            : Effect.void
+          ).pipe(Effect.andThen(originalLease(cwd, effect)));
+        const spy = vi.spyOn(WorkspaceLease, "withWorkspaceLease").mockImplementation(observeLease);
+        yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+      }
+      if (savedPin)
+        expect(
+          yield* store.saveCheckpointPin(
+            runtime,
+            "",
+            0,
+            baseline,
+            null,
+            undefined,
+            mode === "recovered-legacy-ignore-rules" ? undefined : workflowIgnoreRules,
+          ),
+        ).toEqual(baseline);
+      if (mode === "setup-retried") {
+        yield* store.saveCheckpointPin(
+          runtime,
+          "",
+          0,
+          { ...baseline, commitId: "old-baseline", baselineCommitId: "old-baseline" },
+          "old-setup",
+          undefined,
+          new TextEncoder().encode("old-setup.txt\n"),
+        );
+      }
+      const prompt = `workflow:${run.jobId}:prompt`;
+      yield* enqueueContinuity(harness, prompt, run.modelSelection);
+      if (mode === "setup-retried") {
+        const attemptId = CommandId.make("new-setup");
+        yield* harness.engine.dispatch({
+          type: "thread.preparation.update",
+          threadId,
+          commandId: CommandId.make("new-setup-ready"),
+          expectedRevision: null,
+          preparation: {
+            originalCommandId: attemptId,
+            attemptId,
+            revision: 0,
+            state: "ready",
+            settled: true,
+            recipe: null,
+          },
+          createdAt: run.createdAt,
+        });
+      }
+      if (recoveredMode) {
+        yield* harness.engine.dispatch({
+          type: "thread.prompt.claim",
+          commandId: CommandId.make("before-restart"),
+          threadId,
+          messageId: MessageId.make(prompt),
+          expectedRevision: 1,
+          expectedControlRevision: 0,
+          createdAt: run.createdAt,
+        });
+        const recovered = yield* harness.engine.subscribeDomainEvents.pipe(
+          Effect.flatMap((events) =>
+            events.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "thread.prompt-queue-changed" &&
+                  event.payload.control?.pauseReason?.code === "delivery-unknown",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+            ),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* Effect.promise(harness.startReactor);
+        yield* Fiber.join(recovered);
+        const queue = (yield* Effect.promise(harness.readModel)).threads[0]!.promptQueue!;
+        yield* harness.engine.dispatch({
+          type: "thread.queue.resolve",
+          commandId: CommandId.make("resolve-restart"),
+          threadId,
+          expectedRevision: queue.revision,
+          resolution: "retry",
+          createdAt: run.createdAt,
+        });
+      }
+      const rejected = !capturesBaseline && mode !== "recovered-pinned";
+      const milestone = yield* queueMilestone(harness, prompt, rejected ? "rejected" : "admitted");
+      if (!recoveredMode) {
+        yield* Effect.promise(harness.startReactor);
+        if (overlap) {
+          yield* Deferred.await(overlap.firstCapture);
+          yield* harness.engine.dispatch({
+            type: "thread.activity.append",
+            commandId: CommandId.make("overlapping-live-wake"),
+            threadId,
+            activity: {
+              id: EventId.make("overlapping-live-wake"),
+              kind: "approval.resolved",
+              tone: "info",
+              summary: "A live queue wake while startup captures the baseline",
+              payload: {},
+              turnId: null,
+              createdAt: run.createdAt,
+            },
+            createdAt: run.createdAt,
+          });
+          yield* Deferred.await(overlap.competingWake);
+          const claimed = yield* harness.engine.subscribeDomainEvents.pipe(
+            Effect.flatMap((events) =>
+              events.pipe(
+                Stream.filter(
+                  (event) =>
+                    event.type === "thread.prompt-queue-changed" &&
+                    event.payload.handoff?.messageId === prompt,
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+              ),
+            ),
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* Deferred.succeed(overlap.releaseFirstCapture, undefined);
+          yield* Fiber.join(claimed);
+          yield* Deferred.succeed(overlap.firstClaim, undefined);
+        }
+      } else {
+        const queue = (yield* Effect.promise(harness.readModel)).threads[0]!.promptQueue!;
+        yield* harness.engine.dispatch({
+          type: "thread.queue.resume",
+          commandId: CommandId.make("resume-after-restart"),
+          threadId,
+          expectedRevision: queue.revision,
+          createdAt: run.createdAt,
+        });
+      }
+      yield* Fiber.join(milestone);
+      yield* Effect.promise(harness.drain);
+      expect(capture).toHaveBeenCalledTimes(capturesBaseline || mode === "capture-failed" ? 1 : 0);
+      if (overlap) expect(overlap.writtenCommit).toBe(baseline.commitId);
+      expect(harness.startSession).toHaveBeenCalledTimes(rejected ? 0 : 1);
+      expect(harness.sendTurn).toHaveBeenCalledTimes(rejected ? 0 : 1);
+      expect(yield* store.getCheckpointPinForRun(runtime, "", checkpointRef)).toEqual(
+        capturesBaseline || savedPin ? baseline : null,
+      );
+      expect(yield* store.getWorkflowIgnoreRules(runtime)).toEqual(
+        capturesBaseline || (savedPin && mode !== "recovered-legacy-ignore-rules")
+          ? workflowIgnoreRules
+          : null,
+      );
+      if (mode === "setup-retried")
+        expect(
+          yield* store.getCheckpointPinForRun(runtime, "", checkpointRef, "old-setup"),
+        ).toBeNull();
+      if (rejected) {
+        const thread = (yield* Effect.promise(harness.readModel)).threads[0]!;
+        expect(thread.promptQueue?.handoff).toBeNull();
+        expect(thread.promptQueue?.pauseReason?.detail).toContain(
+          mode === "provider-drift"
+            ? "continuation identity changed"
+            : "no trusted review baseline",
+        );
+        expect(
+          reconcileWorkflowRun(
+            {
+              ...run,
+              progress: { ...run.progress, status: "cancelling" },
+            },
+            thread,
+            false,
+            true,
+          ).progress.status,
+        ).toBe("cancelled");
+      }
+    }),
+  );
+
+  effectIt.effect.each(["automatic", "manual hold"] as const)(
+    "a late workflow result recovers uncertainty and reaches Done after %s continuation",
+    (continuation) =>
+      Effect.gen(function* () {
+        const template = continuityQueueRun("late-workflow-delivery");
+        const threadId = ThreadId.make(`workflow:${template.jobId}`);
+        const instanceId = template.modelSelection.instanceId;
+        const adapter = yield* continuityQueueAdapter(instanceId);
+        const workspace = NodeFS.realpathSync(
+          NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-late-workflow-")),
+        );
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            baseDir: workspace,
+            threadId,
+            withWorkflowVmAuthority: true,
+            threadModelSelection: template.modelSelection,
+            withRuntimeIngestion: true,
+            adapterRegistry: queueRegistry(
+              new Map([[instanceId, { adapter: adapter.adapter, key: "codex:shared-queue-home" }]]),
+            ),
+          }),
+        );
+        const runtime = {
+          kind: "vm" as const,
+          jobId: template.jobId,
+          threadId,
+          organizationId: template.workflow.organizationId,
+          repositoryId: template.workflow.repositoryId,
+          allocationId: "allocation",
+          operationId: "operation",
+          environmentId: EnvironmentId.make("workflow-vm"),
+          projectId: ProjectId.make("project-1"),
+          generation: 1,
+        };
+        const first = template.workflow.definition.steps[0]!;
+        if (first.kind !== "agent") throw new Error("Expected an Agent fixture.");
+        const run: WorkflowRun = {
+          ...template,
+          runtime,
+          worktreePath: workspace,
+          promptDispatched: false,
+          workflow: {
+            ...template.workflow,
+            definition: {
+              ...template.workflow.definition,
+              target: { kind: "vm", baseBranch: null },
+              steps: [first, { ...first, id: "second", instruction: "Continue the saved work" }],
+            },
+          },
+          sequence: {
+            cursor: 0,
+            generation: 0,
+            started: true,
+            stepStartedAt: template.createdAt,
+            completed: [],
+            responses: [],
+            feedback: null,
+          },
+          progress: { ...template.progress, threadId },
+        };
+        yield* harness.sql`INSERT INTO thread_execution_fences
+          (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+          VALUES (${threadId}, 'https://relay.example', ${runtime.environmentId},
+            ${runtime.projectId}, ${runtime.generation}, ${runtime.operationId}, 'active')`;
+        const store = yield* Effect.promise(() => harness.runEffect(WorkflowRunStore));
+        yield* store.save(run);
+        const baselineRef = checkpointRefForThreadTurn(threadId, 0);
+        expect(
+          yield* store.saveCheckpointPin(
+            runtime,
+            "",
+            0,
+            {
+              checkpointRef: baselineRef,
+              commitId: "baseline-commit",
+              treeId: "baseline-tree",
+              baselineCommitId: "baseline-commit",
+            },
+            null,
+            undefined,
+            new Uint8Array(),
+          ),
+        ).not.toBeNull();
+
+        const provider = yield* decodeServerProvider({
+          instanceId,
+          driver: "codex",
+          enabled: true,
+          installed: true,
+          version: "1",
+          status: "ready",
+          auth: { status: "authenticated" },
+          checkedAt: run.createdAt,
+          models: [],
+          slashCommands: [],
+          skills: [],
+        });
+        const reactors = Layer.merge(CheckpointReactorLive, WorkflowRunnerLayer).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(OrchestrationEngineService, harness.engine),
+              Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery),
+              Layer.succeed(ProviderService, harness.providerService),
+              Layer.succeed(SqlClient.SqlClient, harness.sql),
+              Layer.succeed(WorkflowRunStore, store),
+              Layer.mock(CheckpointStore, {
+                isGitRepository: () => Effect.succeed(true),
+                captureCheckpoint: () =>
+                  Effect.succeed({ commitId: "result-commit", treeId: "result-tree" }),
+                diffCheckpoints: () => Effect.succeed(""),
+                deleteCheckpointRefs: () => Effect.void,
+              }),
+              Layer.mock(WorkspaceEntries, { refresh: () => Effect.void }),
+              Layer.mock(PullRequestService, { refreshAfterTurn: () => Effect.void }),
+              Layer.mock(VcsStatusBroadcaster, {}),
+              Layer.mock(SetupProcessJournal, {}),
+              Layer.mock(TerminalManager, {}),
+              Layer.mock(TextGeneration, {}),
+              Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver, {}),
+              Layer.mock(GitVcsDriver, {
+                execute: ({ args }) => {
+                  const symbolicRef = args[1] === "symbolic-ref";
+                  const alias = symbolicRef && args.at(-1) !== "HEAD";
+                  return Effect.succeed({
+                    exitCode: ChildProcessSpawner.ExitCode(alias ? 1 : 0),
+                    stdout: symbolicRef
+                      ? `refs/heads/t3-job/${run.jobId}`
+                      : args.at(-1)?.endsWith("^{tree}")
+                        ? "result-tree"
+                        : run.baseSha!,
+                    stderr: "",
+                    stdoutTruncated: false,
+                    stderrTruncated: false,
+                  });
+                },
+              }),
+              makeProviderRegistryLayer([provider]),
+              RuntimeReceiptBusLive,
+              NodeServices.layer,
+            ),
+          ),
+        );
+        const firstPrompt = workflowPromptId(run);
+        const firstAdmission = yield* queueMilestone(harness, firstPrompt, "admitted");
+        const secondPrompt = `workflow:${run.jobId}:step:second:0:prompt`;
+        const secondAdmission = yield* queueMilestone(harness, secondPrompt, "admitted");
+        yield* Effect.gen(function* () {
+          const checkpoints = yield* CheckpointReactor;
+          const runner = yield* RepositoryWorkflowRunner;
+          yield* checkpoints.start();
+          yield* Fiber.join(firstAdmission);
+          const [thread] = (yield* Effect.promise(harness.readModel)).threads;
+          const admission = thread!.promptQueue!.admissions[0]!;
+          expect(admission.messageId).toBe(firstPrompt);
+          const request = {
+            jobId: run.jobId,
+            userId: run.userId!,
+            repositoryCanonicalKey: run.repositoryCanonicalKey,
+            instruction: run.instruction,
+            workflowVm: {
+              binding: runtime,
+              workspaceRoot: workspace,
+              baseBranch: run.baseBranch,
+              baseSha: run.baseSha!,
+            },
+            control: {
+              operation: "status" as const,
+              organizationId: runtime.organizationId,
+              repositoryId: runtime.repositoryId,
+              projectId: runtime.projectId,
+            },
+          };
+          const manualControl = (operation: "pause" | "resume", expectedRevision: number) =>
+            runner.handle({
+              ...request,
+              control: { ...request.control, operation, expectedRevision, controlId: operation },
+            });
+          if (continuation === "manual hold") {
+            const active = yield* runner.handle(request);
+            const held = yield* manualControl("pause", active.progress!.revision);
+            expect(held.progress?.manualPause?.state).toBe("requested");
+          }
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.unknown",
+            commandId: CommandId.make("late-workflow-uncertain"),
+            threadId,
+            attemptId: admission.attemptId,
+            detail: "Waiting for a terminal result",
+            createdAt: run.createdAt,
+          });
+          expect((yield* runner.handle(request)).progress?.status).toBe("paused");
+          const completeTurn = (turnId: TurnId) =>
+            adapter.emit({
+              type: "turn.completed",
+              eventId: EventId.make(`late-workflow-completion:${turnId}`),
+              provider: ProviderDriverKind.make("codex"),
+              threadId,
+              turnId,
+              createdAt: run.createdAt,
+              payload: { state: "completed" },
+            });
+          if (continuation === "manual hold") {
+            const events = yield* harness.engine.subscribeDomainEvents;
+            const finalized = yield* events.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "thread.prompt-queue-changed" &&
+                  event.payload.finalization?.turnId === admission.turnId,
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped({ startImmediately: true }),
+            );
+            yield* completeTurn(admission.turnId);
+            yield* Fiber.join(finalized);
+            const held = yield* runner.handle(request);
+            expect(held.progress?.manualPause?.state).toBe("paused");
+            expect(adapter.nativePrompts).toHaveLength(1);
+            yield* manualControl("resume", held.progress!.revision);
+          } else yield* completeTurn(admission.turnId);
+          yield* Fiber.join(secondAdmission);
+          yield* Effect.promise(harness.drain);
+          const [continued] = (yield* Effect.promise(harness.readModel)).threads;
+          expect(continued?.promptQueue?.finalization).toEqual({
+            turnId: admission.turnId,
+            outcome: "completed",
+            checkpoint: "ready",
+          });
+          expect(continued?.promptQueue?.enabled).toBe(true);
+          const second = continued?.promptQueue?.admissions[0];
+          expect(second?.messageId).toBe(secondPrompt);
+          expect((yield* store.get(run.jobId))?.sequence?.cursor).toBe(1);
+          expect(adapter.nativePrompts).toHaveLength(2);
+          expect(adapter.nativePrompts[1]).toContain("Continue the saved work");
+          const events = yield* harness.engine.subscribeDomainEvents;
+          const done = yield* events.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "thread.activity-appended" &&
+                event.payload.activity.kind === "workflow.progress" &&
+                event.payload.activity.summary === "Workflow done",
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* completeTurn(second!.turnId);
+          yield* Fiber.join(done);
+          const [finished] = (yield* Effect.promise(harness.readModel)).threads;
+          expect(finished?.promptQueue?.finalization).toEqual({
+            turnId: second!.turnId,
+            outcome: "completed",
+            checkpoint: "ready",
+          });
+          expect(finished?.checkpoints.map((checkpoint) => checkpoint.turnId)).toEqual([
+            admission.turnId,
+            second!.turnId,
+          ]);
+          const saved = yield* store.get(run.jobId);
+          expect(saved?.progress.status).toBe("done");
+          expect(saved?.executionReserved).toBe(false);
+        }).pipe(Effect.provide(reactors));
       }),
   );
 

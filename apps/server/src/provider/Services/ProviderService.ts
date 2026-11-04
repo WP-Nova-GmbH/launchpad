@@ -97,6 +97,7 @@ export interface ProviderServiceShape {
    */
   readonly respondToRequest: (
     input: ProviderRespondToRequestInput,
+    options?: { readonly liveSessionOnly: boolean },
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**
@@ -104,6 +105,7 @@ export interface ProviderServiceShape {
    */
   readonly respondToUserInput: (
     input: ProviderRespondToUserInputInput,
+    options?: { readonly liveSessionOnly: boolean },
   ) => Effect.Effect<void, ProviderServiceError>;
 
   /**

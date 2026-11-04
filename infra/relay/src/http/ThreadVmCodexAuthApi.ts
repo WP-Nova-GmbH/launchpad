@@ -27,6 +27,7 @@ import { authorizeThreadEnvironment } from "./ThreadEnvironmentApi.ts";
 import { withPrivateThreadOwnerAccess, withPrivateThreadAccess } from "./privateThreadAccess.ts";
 import { tenancyConflict, tenancyNotFound } from "./tenancyErrors.ts";
 import { appendRelayCredentialResponseHeaders } from "./Api.ts";
+import { authorizeWorkflowVmGuest, isWorkflowVmThread } from "../jobs/WorkflowVmBinding.ts";
 import {
   codexVmConnectionMetadata,
   makeCodexVmConnectionActions,
@@ -70,6 +71,23 @@ export const withThreadVmCodexAuthScope = <A, E, R>(
     )
       return yield* tenancyNotFound("thread_not_found");
     const vm = principal.threadVm;
+    if (yield* isWorkflowVmThread(sql, input.threadId)) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const { binding } = yield* authorizeWorkflowVmGuest(input, "enrolled");
+          const [pinned] = yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth x
+            JOIN relay_workflow_jobs j ON j.job_id=${binding.jobId}
+            WHERE x.allocation_id=${binding.allocationId} AND x.environment_id=${binding.environmentId}
+              AND x.generation=${binding.generation} AND x.thread_id=${binding.threadId}
+              AND x.organization_id=${binding.organizationId} AND x.mode='organization'
+              AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
+              AND j.status NOT IN ('cancelled','failed')
+              AND (j.pending_control IS NULL OR j.pending_control#>>'{response,operation}' IS DISTINCT FROM 'cancel')`;
+          if (!pinned) return yield* tenancyNotFound("thread_not_found");
+          return yield* use(binding);
+        }),
+      );
+    }
     const [owner] = yield* sql<{
       userId: string;
     }>`SELECT owner_user_id AS "userId" FROM relay_thread_placements WHERE thread_id=${input.threadId}`;

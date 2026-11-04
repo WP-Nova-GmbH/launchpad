@@ -13,9 +13,11 @@ import {
   type ThreadRelayRouting,
 } from "@t3tools/contracts";
 import { RelayTenancyConflictError, RelayTenancyNotFoundError } from "@t3tools/contracts/relay";
-import { ManagedRelayRequestFailedError } from "./managedRelay.ts";
+import { ManagedRelayRequestFailedError, type ManagedRelayClientError } from "./managedRelay.ts";
 import type {
   RelayPortableThreadPlacement,
+  RelayAssignedThreadPlacement,
+  RelayRepositoryId,
   RelayPortableThreadSummary,
   RelayThreadCurrentQueue,
   RelayThreadVmAllowance,
@@ -692,8 +694,10 @@ type PortableThreadChatInput = {
     accountId: string;
     organizationId: string;
     repositoryId: string;
-    originalEnvironmentId: EnvironmentId;
-  };
+  } & (
+    | { originalEnvironmentId: EnvironmentId }
+    | { jobId: string; repositoryId: RelayRepositoryId }
+  );
 };
 const isRequestFailed = Schema.is(ManagedRelayRequestFailedError);
 const isNotFound = Schema.is(RelayTenancyNotFoundError);
@@ -712,10 +716,19 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
   if (input.workflowResult && input.workflowResult.accountId !== session.accountId)
     return yield* changed();
   const auth = { clerkToken, threadId: input.threadId };
-  const placement = yield* relay.getPortableThreadPlacement(auth).pipe(
+  const vm = input.workflowResult && "jobId" in input.workflowResult ? input.workflowResult : null;
+  const machine =
+    input.workflowResult && "originalEnvironmentId" in input.workflowResult
+      ? input.workflowResult
+      : null;
+  const readPlacement = (): Effect.Effect<RelayAssignedThreadPlacement, ManagedRelayClientError> =>
+    vm
+      ? relay.getWorkflowJobResult({ clerkToken, repositoryId: vm.repositoryId, jobId: vm.jobId })
+      : relay.getPortableThreadPlacement(auth);
+  const placement = yield* readPlacement().pipe(
     Effect.catchIf(
       (error) =>
-        Boolean(input.workflowResult) &&
+        machine !== null &&
         isRequestFailed(error) &&
         isNotFound(error.cause) &&
         error.cause.reason === "thread_not_found",
@@ -725,13 +738,16 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
   if (!currentAccount()) return yield* changed();
   // An enrolled-machine workflow has no portable placement until its first move.
   // Only an explicit missing record permits the immutable original location.
-  if (placement === null)
-    return { environmentId: input.workflowResult!.originalEnvironmentId, threadId: input.threadId };
-  const matchesRepository = (value: RelayPortableThreadPlacement) =>
-    !input.workflowResult ||
-    (value.organizationId === input.workflowResult.organizationId &&
-      value.repositoryId === input.workflowResult.repositoryId);
-  if (!matchesRepository(placement)) return yield* changed();
+  if (placement === null && machine)
+    return { environmentId: machine.originalEnvironmentId, threadId: input.threadId };
+  const matchesRepository = (value: RelayAssignedThreadPlacement) =>
+    (!input.workflowResult ||
+      (value.organizationId === input.workflowResult.organizationId &&
+        value.repositoryId === input.workflowResult.repositoryId)) &&
+    (vm
+      ? value.audience === "repository" && value.workflowJobId === vm.jobId
+      : value.audience !== "repository");
+  if (!placement || !matchesRepository(placement)) return yield* changed();
   if (
     !currentAccount() ||
     !isPortableThreadPlacementReadCurrent(
@@ -748,39 +764,41 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
         placement.generation !== input.expectedPlacement.generation))
   )
     return yield* changed();
-  const status = yield* relay.getThreadVmStatus(auth);
-  if (
-    !currentAccount() ||
-    status.threadId !== input.threadId ||
-    status.generation !== placement.generation
-  )
-    return yield* changed();
-  if (status.allocation?.state === "running" && status.sourceActivationPending)
-    return yield* new OrchestrationDispatchCommandError({
-      message: "The VM is still reopening this conversation. Try again once it is ready.",
-    });
-  if (
-    status.allocation &&
-    (status.allocation.state !== "running" ||
-      status.setupPhase !== "ready" ||
-      status.finalSave ||
-      status.restore ||
-      status.reset ||
-      status.pausePhase === "pending" ||
-      status.pausePhase === "sealed")
-  )
-    return yield* new OrchestrationDispatchCommandError({
-      message: "Resume or restore this VM and let setup finish before opening chat.",
-    });
-  if (!status.allocation && status.savedDisk)
-    return yield* new OrchestrationDispatchCommandError({
-      message: "Restore or reset the saved workspace before opening chat.",
-    });
+  if (!vm) {
+    const status = yield* relay.getThreadVmStatus(auth);
+    if (
+      !currentAccount() ||
+      status.threadId !== input.threadId ||
+      status.generation !== placement.generation
+    )
+      return yield* changed();
+    if (status.allocation?.state === "running" && status.sourceActivationPending)
+      return yield* new OrchestrationDispatchCommandError({
+        message: "The VM is still reopening this conversation. Try again once it is ready.",
+      });
+    if (
+      status.allocation &&
+      (status.allocation.state !== "running" ||
+        status.setupPhase !== "ready" ||
+        status.finalSave ||
+        status.restore ||
+        status.reset ||
+        status.pausePhase === "pending" ||
+        status.pausePhase === "sealed")
+    )
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Resume or restore this VM and let setup finish before opening chat.",
+      });
+    if (!status.allocation && status.savedDisk)
+      return yield* new OrchestrationDispatchCommandError({
+        message: "Restore or reset the saved workspace before opening chat.",
+      });
+  }
   // Reads can overlap a move. Never register the stale source from the library row.
   if (!isPortableThreadPlacementReadScopeCurrent(registry, session, relay.relayUrl))
     return yield* changed();
   const request = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
-  const latest = yield* relay.getPortableThreadPlacement(auth);
+  const latest = yield* readPlacement();
   if (
     !currentAccount() ||
     !isPortableThreadPlacementReadCurrent(
@@ -812,6 +830,7 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
   }
   if (!currentAccount()) return yield* changed();
   if (
+    latest.audience !== "repository" &&
     !rememberPortableThreadPlacement(registry, session, relay.relayUrl, latest, undefined, request)
   )
     return yield* changed();
@@ -820,7 +839,11 @@ export const openPortableThreadChat = Effect.fnUntraced(function* (
     relayUrl: relay.relayUrl,
     generation: latest.generation,
   });
-  return { environmentId, threadId: input.threadId };
+  return {
+    environmentId,
+    threadId: input.threadId,
+    ...(vm ? { workflowVmGeneration: latest.generation } : {}),
+  };
 });
 
 export function createPortableThreadChatCommand<R, E>(

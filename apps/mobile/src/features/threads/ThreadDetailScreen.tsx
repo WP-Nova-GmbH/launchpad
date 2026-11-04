@@ -127,6 +127,8 @@ import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
 
 export interface ThreadDetailScreenProps {
+  readonly readOnlyWorkflowVm: boolean;
+  readonly workspaceFilesAvailable: boolean;
   readonly promptQueue?: ThreadPromptQueue;
   readonly worktreeSetup?: WorktreeSetupCardProps | null;
   readonly setupWorkingStartedAt?: string | null;
@@ -281,8 +283,12 @@ const USER_INPUT_TOGGLE_TIMING = {
 };
 
 export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: ThreadDetailScreenProps) {
+  const { readOnlyWorkflowVm } = props;
   const sharedQueueRef = useRef<SharedPromptQueueHandle>(null);
-  const placement = useThreadMovePlacement(props.environmentId, props.selectedThread.id);
+  const placement = useThreadMovePlacement(
+    readOnlyWorkflowVm ? null : props.environmentId,
+    props.selectedThread.id,
+  );
   const queueUnavailable =
     props.connectionStateLabel !== "connected" || props.threadSyncStatus !== "live";
   const queuePresentation = useMemo(
@@ -340,7 +346,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   );
   const navigation = useNavigation();
   const deviceState = useEnvironmentQuery(
-    deviceEnvironment.state({ environmentId: props.environmentId, input: {} }),
+    readOnlyWorkflowVm
+      ? null
+      : deviceEnvironment.state({ environmentId: props.environmentId, input: {} }),
   );
   const devicePreviews = useMemo(
     () => threadDevicePreviews(deviceState.data, props.selectedThread.id),
@@ -491,7 +499,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     props.connectionStateLabel !== "connected" ||
     pendingFeed.hasPending;
   const selectedThreadFeed = props.selectedThreadFeed;
-  useThreadPresenceReporter(props.environmentId, props.selectedThread.id, props.draftMessage);
+  useThreadPresenceReporter(
+    readOnlyWorkflowVm ? null : props.environmentId,
+    props.selectedThread.id,
+    props.draftMessage,
+  );
 
   const hasCompactableConversation =
     selectedThreadFeed.some(
@@ -601,7 +613,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     // bottom inset still overlaps.
     composerOverlapHeight: composerBottomInset,
   });
-  const estimatedOverlayHeight = composerOverlapHeight;
+  const estimatedOverlayHeight = readOnlyWorkflowVm ? insets.bottom : composerOverlapHeight;
   // The overlay's measured height includes the home-indicator inset (the
   // composer pads it), but contentInsetAdjustmentBehavior="automatic" makes
   // UIKit add the safe-area bottom to the content inset AGAIN — leaving a
@@ -946,6 +958,19 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const handleFeedTouchCancel = useCallback(() => {
     feedTouchStartRef.current = null;
   }, []);
+  const floatingControls = (
+    <FloatingWorkingControl
+      colorScheme={isDarkMode ? "dark" : "light"}
+      status={floatingStatus}
+      devicePreview={
+        devicePreviews.length > 0
+          ? { count: devicePreviews.length, onPress: openDevicePreview }
+          : null
+      }
+      showScrollToEnd={showScrollToEndButton}
+      onScrollToEnd={handleScrollToEnd}
+    />
+  );
 
   return (
     <View className="flex-1">
@@ -979,6 +1004,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
             <ThreadFeed
               environmentId={props.environmentId}
               threadId={props.selectedThread.id}
+              workspaceFilesAvailable={props.workspaceFilesAvailable}
               workspaceRoot={props.threadCwd}
               feed={props.selectedThreadFeed}
               worktreeSetup={props.worktreeSetup}
@@ -991,7 +1017,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onRemoveSharedPrompt={removeSharedPrompt}
               onPauseSharedPrompt={props.onStopThread}
               sharedPromptActionsDisabled={
-                queueUnavailable || props.selectedThread.workflowJob != null
+                readOnlyWorkflowVm || queueUnavailable || props.selectedThread.workflowJob != null
               }
               contentPresentation={props.contentPresentation}
               agentLabel={agentLabel}
@@ -1013,7 +1039,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onHeaderMaterialVisibilityChange={props.onHeaderMaterialVisibilityChange}
               onEndFollowEnabledChange={setEndFollowEnabled}
               skills={selectedProviderSkills}
-              onUseArtifactTemplate={handleUseArtifactTemplate}
+              {...(!readOnlyWorkflowVm ? { onUseArtifactTemplate: handleUseArtifactTemplate } : {})}
               loadEarlier={props.loadEarlier ?? null}
             />
           </RenderErrorBoundary>
@@ -1022,8 +1048,20 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
         <View className="flex-1" />
       )}
 
+      {showContent && readOnlyWorkflowVm ? (
+        <View
+          ref={composerOverlayRef}
+          onLayout={onComposerLayout}
+          pointerEvents="box-none"
+          className="absolute inset-x-0 bottom-0"
+          style={{ height: insets.bottom }}
+        >
+          {floatingControls}
+        </View>
+      ) : null}
+
       {/* Floating composer — sticks to keyboard via KeyboardStickyView */}
-      {showContent ? (
+      {showContent && !readOnlyWorkflowVm ? (
         <KeyboardStickyView
           // iOS emits a native animated height target on both will-show and
           // will-hide, so stay subscribed for the full transition. Android
@@ -1045,17 +1083,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 list's bottom inset, so any padding above the pill/composer
                 pushes the resting content floor up by the same amount. */}
             <View ref={composerOverlayRef} onLayout={onComposerLayout} className="w-full">
-              <FloatingWorkingControl
-                colorScheme={isDarkMode ? "dark" : "light"}
-                status={floatingStatus}
-                devicePreview={
-                  devicePreviews.length > 0
-                    ? { count: devicePreviews.length, onPress: openDevicePreview }
-                    : null
-                }
-                showScrollToEnd={showScrollToEndButton}
-                onScrollToEnd={handleScrollToEnd}
-              />
+              {floatingControls}
               <View className="w-full self-center" style={{ maxWidth: contentMaxWidth }}>
                 {props.feedbackSubmissions.map((submission) => (
                   <ComposerFeedback

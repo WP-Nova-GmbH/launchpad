@@ -38,6 +38,7 @@ import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEn
 import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { ProviderCommandReactorLive } from "../orchestration/Layers/ProviderCommandReactor.ts";
+import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { ThreadDeletionReactor } from "../orchestration/Services/ThreadDeletionReactor.ts";
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
@@ -916,7 +917,11 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
         const harness = yield* makeTestProviderAdapterHarness({ provider });
         const importSettled = yield* Deferred.make<void>();
         const turnSent = yield* Deferred.make<void>();
-        const startSession = vi.fn(harness.adapter.startSession);
+        const startSession = vi.fn<typeof harness.adapter.startSession>((input, options) =>
+          (options?.beforeStart?.(`import-test:${input.threadId}`) ?? Effect.void).pipe(
+            Effect.andThen(harness.adapter.startSession(input)),
+          ),
+        );
         const sendTurn = vi.fn((input: ProviderSendTurnInput) =>
           harness.adapter
             .sendTurn(input)
@@ -940,6 +945,7 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
           Layer.provide(AnalyticsService.layerTest),
         );
         const reactorLayer = ProviderCommandReactorLive.pipe(
+          Layer.provide(Layer.mock(CheckpointStore, {})),
           Layer.provide(Layer.mock(ThreadDeletionReactor, { drainThrough: () => Effect.void })),
           Layer.provideMerge(providerLayer),
           Layer.provide(
@@ -1021,9 +1027,11 @@ it.layer(integrationLayer)("AgentSessionImporter integration", (it) => {
               resumeCursor,
               cwd: workspaceRoot,
             }),
+            expect.objectContaining({ beforeStart: expect.any(Function) }),
           );
           expect(sendTurn).toHaveBeenCalledExactlyOnceWith(
             expect.objectContaining({ threadId, input: "Continue this session" }),
+            expect.objectContaining({ onAdmitted: expect.any(Function) }),
           );
           expect(Option.getOrThrow(yield* directory.getBinding(threadId))).toMatchObject({
             provider,

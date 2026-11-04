@@ -29,6 +29,7 @@ import {
 } from "../threads/ThreadVmEnrollmentStore.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
+import { withPreparingWorkflowVm } from "../threads/ThreadVmWorkflowAccess.ts";
 
 const invalid = () => new ThreadVmEnrollmentInvalid();
 const decodeProof = Schema.decodeUnknownEffect(RelayThreadVmEnrollProofPayload);
@@ -64,38 +65,44 @@ export const enrollThreadVm = Effect.fn("relay.api.thread_vm.enroll")(
       verified.exp - verified.iat > 300
     )
       return yield* invalid();
-    const allocation = yield* makeThreadVmAllocationStore(sql).get(verified.allocationId);
+    const allocation = yield* makeThreadVmAllocationStore(sql).getAny(verified.allocationId);
     if (!allocation) return yield* invalid();
-    const input = { ...verified, seed: Redacted.make(verified.seed) };
-    const response = yield* withPrivateThreadOwnerAccess(
-      allocation.threadId,
-      "read",
-      allocation.ownerUserId,
-      () =>
-        makeThreadVmEnrollmentStore(sql).exchange(
-          input,
-          Effect.gen(function* () {
-            const environmentCredential = yield* credentials.create(input);
-            const credentialId = environmentCredential.split("_")[1];
-            if (!credentialId) return yield* invalid();
-            const scope = yield* makeThreadVmBindingStore(sql).bind({ ...input, credentialId });
-            const response = {
-              environmentId: input.environmentId,
-              threadTransferFormats: normalizeThreadTransferFormats(input.threadTransferFormats),
-              scope: { ...scope, threadId: ThreadId.make(scope.threadId) },
-              relayIssuer,
-              cloudMintPublicKey: config.cloudMintPublicKey,
-              environmentCredential,
-            };
-            return {
-              credentialId,
-              response: Redacted.make(
-                yield* encodeResponse(response).pipe(Effect.mapError(invalid)),
-              ),
-            };
-          }),
-        ),
-    );
+    const input = {
+      ...verified,
+      seed: Redacted.make(verified.seed),
+      resourceKind: allocation.resourceKind,
+    };
+    const exchange = (workflowConnectionId?: string) =>
+      makeThreadVmEnrollmentStore(sql).exchange(
+        input,
+        Effect.gen(function* () {
+          const environmentCredential = yield* credentials.create(input);
+          const credentialId = environmentCredential.split("_")[1];
+          if (!credentialId) return yield* invalid();
+          const scope = yield* makeThreadVmBindingStore(sql).bind({
+            ...input,
+            credentialId,
+            ...(workflowConnectionId ? { workflowConnectionId } : {}),
+          });
+          const response = {
+            environmentId: input.environmentId,
+            threadTransferFormats: normalizeThreadTransferFormats(input.threadTransferFormats),
+            scope: { ...scope, threadId: ThreadId.make(scope.threadId) },
+            relayIssuer,
+            cloudMintPublicKey: config.cloudMintPublicKey,
+            environmentCredential,
+          };
+          return {
+            credentialId,
+            response: Redacted.make(yield* encodeResponse(response).pipe(Effect.mapError(invalid))),
+          };
+        }),
+      );
+    const response = yield* allocation.resourceKind === "organization_workflow"
+      ? withPreparingWorkflowVm(sql, input, (scope) => exchange(scope.codexConnectionId))
+      : withPrivateThreadOwnerAccess(allocation.threadId, "read", allocation.ownerUserId, () =>
+          exchange(),
+        );
     return yield* decodeResponse(Redacted.value(response)).pipe(Effect.mapError(invalid));
   },
   Effect.catchTags({

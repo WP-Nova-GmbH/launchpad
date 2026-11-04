@@ -3,8 +3,10 @@ import { CommandId, EnvironmentId, ProjectId, ThreadId } from "@t3tools/contract
 import type { RelayThreadVmSetupReceipt } from "@t3tools/contracts/relay";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/unstable/http/HttpClient";
+import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import type { InstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
@@ -44,9 +46,13 @@ const grant = {
   generation: 1,
   userId: owner.user.userId,
 };
+const decodeAccessRequest = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Struct({ userId: Schema.String })),
+);
 const fixture = () => {
   const calls: string[] = [];
-  let response: Effect.Effect<Response> = Effect.sync(() => Response.json(grant));
+  let response: (request: HttpClientRequest.HttpClientRequest) => Effect.Effect<Response> = () =>
+    Effect.sync(() => Response.json(grant));
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(
       Effect.provideService(ServerEnvironmentIdentity, {
@@ -59,7 +65,7 @@ const fixture = () => {
             calls.push(request.url);
             assert.equal(request.headers.authorization, `Bearer ${vm.environmentCredential}`);
             assert.equal(request.method, "POST");
-            return HttpClientResponse.fromWeb(request, yield* response);
+            return HttpClientResponse.fromWeb(request, yield* response(request));
           }),
         ),
       ),
@@ -68,6 +74,9 @@ const fixture = () => {
     calls,
     provide,
     setResponse: (next: Effect.Effect<Response>) => {
+      response = () => next;
+    },
+    setResponder: (next: typeof response) => {
       response = next;
     },
     make: makeThreadVmRepositoryAccess(vm, receipt).pipe(provide),
@@ -75,6 +84,42 @@ const fixture = () => {
 };
 
 describe("private VM client access", () => {
+  it.effect("renews a workflow viewer independently and drains only the revoked viewer", () =>
+    Effect.gen(function* () {
+      const f = fixture();
+      const second = { user: { ...owner.user, userId: "second" } };
+      let revoked = false;
+      f.setResponder((request) =>
+        Effect.sync(() => {
+          if (request.body._tag !== "Uint8Array") throw new Error("Expected request body");
+          const { userId } = decodeAccessRequest(new TextDecoder().decode(request.body.body));
+          return revoked && userId === owner.user.userId
+            ? new Response("denied", { status: 403 })
+            : Response.json({ ...grant, userId });
+        }),
+      );
+      const access = yield* makeThreadVmRepositoryAccess(vm, receipt, true).pipe(f.provide);
+      const ownerClosed = yield* Deferred.make<void>();
+      const secondClosed = yield* Deferred.make<void>();
+      yield* access.requireMember(owner);
+      yield* access.requireMember(second);
+      yield* access.registerConnection(
+        Deferred.succeed(ownerClosed, undefined).pipe(Effect.asVoid),
+        owner,
+      );
+      yield* access.registerConnection(
+        Deferred.succeed(secondClosed, undefined).pipe(Effect.asVoid),
+        second,
+      );
+      revoked = true;
+      yield* TestClock.adjust("5 seconds");
+      yield* Deferred.await(ownerClosed);
+      assert.isFalse(yield* Deferred.isDone(secondClosed));
+      yield* Effect.flip(access.requireMember(owner));
+      yield* access.requireThread(second, vm.scope.threadId);
+    }),
+  );
+
   it.effect("keeps a move guest confined to its assigned project before and after cutover", () =>
     Effect.gen(function* () {
       const f = fixture(),

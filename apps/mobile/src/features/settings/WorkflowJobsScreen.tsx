@@ -14,7 +14,11 @@ import {
   emptyWorkflowJobRead,
   workflowStepState,
   workflowStatusLabel,
-  workflowJobPageAccessLost,
+  workflowJobAccessLost,
+  beginWorkflowReview,
+  bindWorkflowReviewPlacement,
+  requireFreshWorkflowReviewRead,
+  workflowReviewApprovalState,
   emptyWorkflowJobPageRead,
   beginWorkflowJobPage,
   settleWorkflowJobPage,
@@ -29,7 +33,10 @@ import {
   workflowManualControlState,
   workflowActionState,
   workflowManualSubmission,
+  workflowViewerControls,
+  workflowApprovalPending,
 } from "@t3tools/client-runtime/relay/workflow-responses";
+import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
 import type {
   RelayRepositorySummary,
   RelayOrganizationMembership,
@@ -62,7 +69,13 @@ import { setReviewSelectedSectionId } from "../review/reviewState";
 
 type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
 
-type Props = StaticScreenProps<{ repositoryId?: string; jobId?: string } | undefined>;
+type Props = StaticScreenProps<
+  | {
+      repositoryId?: string;
+      jobId?: string;
+    }
+  | undefined
+>;
 export function WorkflowJobsScreen(props: Props) {
   return hasCloudPublicConfig() ? (
     <ConfiguredWorkflowJobsScreen {...props} />
@@ -129,8 +142,11 @@ function WorkflowJobsContent(props: Props) {
   const listKey = scope ? workflowSessionKey(scope, `runs:${listView}`) : "";
   const jobs = recent.key === listKey ? recent.jobs : null;
   const read = reads.jobs[jobKey] ?? emptyWorkflowJobRead;
+  const reviewApproval = workflowReviewApprovalState(drafts.reviews[jobKey], read);
+  const checkingReturnedReview = reviewApproval === "checking";
   const selectedJob = read.job;
   const manualState = workflowManualControlState(selectedJob);
+  const approvalPending = workflowApprovalPending(selectedJob);
   const actionState = workflowActionState(selectedJob);
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
@@ -184,7 +200,9 @@ function WorkflowJobsContent(props: Props) {
     void Promise.all([
       call((client, clerkToken) => client.listRepositories({ clerkToken })),
       call((client, clerkToken) => client.getOrganization({ clerkToken })),
-      call((client, clerkToken) => client.listOrganizationProjects({ clerkToken })),
+      call((client, clerkToken) =>
+        client.listOrganizationProjects({ clerkToken }).pipe(Effect.orElseSucceed(() => [])),
+      ),
     ]).then(
       ([entries, member, organizationProjects]) => {
         if (!disposed) {
@@ -231,7 +249,7 @@ function WorkflowJobsContent(props: Props) {
               previous,
               request,
               cause instanceof Error ? cause.message : "Could not load runs.",
-              workflowJobPageAccessLost(cause),
+              workflowJobAccessLost(cause),
             ),
           );
       }
@@ -266,12 +284,15 @@ function WorkflowJobsContent(props: Props) {
         appAtomRegistry,
         request,
         cause instanceof Error ? cause.message : "Could not refresh this run.",
+        workflowJobAccessLost(cause),
       );
     }
   }, [call, scope, selectedJobId]);
-  useEffect(() => {
-    if (scope && selectedJobId && focused)
+  useLayoutEffect(() => {
+    if (scope && selectedJobId && focused) {
       activateWorkflowJobView(appAtomRegistry, scope, selectedJobId);
+      requireFreshWorkflowReviewRead(appAtomRegistry, scope, selectedJobId);
+    }
   }, [scope, selectedJobId, focused]);
   useEffect(() => {
     if (!scope || !selectedJobId || read.mutation || !focused) return;
@@ -281,6 +302,7 @@ function WorkflowJobsContent(props: Props) {
       if (AppState.currentState === "active") void refreshJob();
     }, 5000);
     const subscription = AppState.addEventListener("change", (state) => {
+      requireFreshWorkflowReviewRead(appAtomRegistry, scope, selectedJobId);
       if (state === "active") void refreshJob();
     });
     return () => {
@@ -297,7 +319,9 @@ function WorkflowJobsContent(props: Props) {
           project.projectId === machine.projectId,
       )
     : undefined;
-  const canRespond = membership?.role === "admin" || selectedRepository?.role === "maintainer";
+  const canConfigure = membership?.role === "admin" || selectedRepository?.role === "maintainer";
+  const viewerControls = workflowViewerControls(selectedJob, canConfigure);
+  const reviewChanged = reviewApproval === "inspect";
   const respond = (
     operation:
       | "approve"
@@ -319,6 +343,20 @@ function WorkflowJobsContent(props: Props) {
       )
         return;
       const checkpoint = selectedJob.progress?.checkpoint;
+      const currentRead =
+        appAtomRegistry.get(workflowJobReadAtom).jobs[jobKey] ?? emptyWorkflowJobRead;
+      const currentReview = appAtomRegistry.get(workflowDraftAtom).reviews[jobKey];
+      if (
+        (operation === "approve" &&
+          (!viewerControls.canApprove ||
+            currentRead.job !== selectedJob ||
+            workflowReviewApprovalState(currentReview, currentRead) !== "allowed")) ||
+        ((operation === "input" || operation === "request_changes") &&
+          !viewerControls.canRespond) ||
+        ((operation === "cancel" || operation === "retry_cancellation") &&
+          !viewerControls.canCancel)
+      )
+        return;
       if (["approve", "input", "request_changes"].includes(operation) && !checkpoint) return;
       const request = beginWorkflowJobRequest(appAtomRegistry, scope, selectedJob.jobId, uuidv4());
       if (!request) return;
@@ -385,7 +423,8 @@ function WorkflowJobsContent(props: Props) {
       !selectedJob?.progress ||
       selectedJob.progress.hasThread === false ||
       !scope ||
-      resultRequest.current
+      resultRequest.current ||
+      (diff && checkingReturnedReview)
     )
       return;
     const request = { key: jobKey };
@@ -394,12 +433,20 @@ function WorkflowJobsContent(props: Props) {
     setError(null);
     const session = appAtomRegistry.get(managedRelaySessionAtom);
     try {
-      if (selectedJob.runtime?.kind !== "machine")
-        throw new Error("This run has no available machine execution binding.");
+      const runtime = selectedJob.runtime;
+      if (!runtime) throw new Error("This run has no available execution binding.");
+      const checkpoint = workflowResultCheckpoint(selectedJob.progress.checkpoint);
+      const exactReview = diff && runtime.kind === "vm" ? checkpoint : undefined;
+      const reviewVisitId = exactReview ? uuidv4() : undefined;
+      if (exactReview && reviewVisitId)
+        beginWorkflowReview(appAtomRegistry, scope, selectedJob.jobId, reviewVisitId, exactReview);
       const result = await openPortableResult({
         threadId: selectedJob.progress.threadId,
         title: selectedJob.workflow?.definition.name ?? "Workflow result",
-        workflowResult: { ...scope, originalEnvironmentId: selectedJob.runtime.environmentId },
+        workflowResult:
+          runtime.kind === "vm"
+            ? { ...scope, jobId: selectedJob.jobId }
+            : { ...scope, originalEnvironmentId: runtime.environmentId },
       });
       if (
         resultRequest.current !== request ||
@@ -407,19 +454,30 @@ function WorkflowJobsContent(props: Props) {
       )
         return;
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      const { environmentId, threadId, workflowVmGeneration } = result.value;
+      if (reviewVisitId && workflowVmGeneration !== undefined)
+        bindWorkflowReviewPlacement(appAtomRegistry, scope, selectedJob.jobId, reviewVisitId, {
+          environmentId,
+          threadId,
+          generation: workflowVmGeneration,
+        });
       const params = {
-        ...result.value,
-        workflowOrigin: { ...scope, jobId: selectedJob.jobId, threadId: result.value.threadId },
+        environmentId,
+        threadId,
+        workflowOrigin: {
+          ...scope,
+          jobId: selectedJob.jobId,
+          threadId: result.value.threadId,
+          ...(workflowVmGeneration === undefined ? {} : { workflowVmResultReader: true as const }),
+          ...(exactReview && reviewVisitId ? { reviewCheckpoint: exactReview, reviewVisitId } : {}),
+        },
       };
-      if (
-        diff &&
-        selectedJob.progress.checkpoint &&
-        selectedJob.progress.checkpoint.kind !== "input"
-      ) {
-        setReviewSelectedSectionId(
-          scopedThreadKey(params.environmentId, params.threadId),
-          `turn:${selectedJob.progress.checkpoint.checkpointTurnCount}`,
-        );
+      if (diff && checkpoint) {
+        if (!exactReview)
+          setReviewSelectedSectionId(
+            scopedThreadKey(params.environmentId, params.threadId),
+            `turn:${checkpoint.checkpointTurnCount}`,
+          );
         navigation.navigate("ThreadReview", params);
       } else navigation.navigate("Thread", params);
     } catch (cause) {
@@ -464,7 +522,9 @@ function WorkflowJobsContent(props: Props) {
                 {workflowStatusLabel(selectedJob.status)} ·{" "}
                 {target
                   ? target.machineLabel + " · " + target.title
-                  : "Organization execution target"}
+                  : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
+                    ? "Workflow VM"
+                    : "Organization execution target"}
               </Text>
               {manualState.message ? (
                 <Text className="text-foreground-muted">{manualState.message}</Text>
@@ -478,6 +538,21 @@ function WorkflowJobsContent(props: Props) {
             </View>
           </SettingsSection>
           <SettingsSection title="Current task">
+            {checkingReturnedReview && read.error ? (
+              <SettingsActionRow
+                icon="arrow.clockwise"
+                label="Refresh run"
+                disabled={read.reading}
+                onPress={() => void refreshJob()}
+              />
+            ) : null}
+            {reviewChanged || (checkingReturnedReview && !read.error) ? (
+              <Text accessibilityRole="alert" className="text-foreground-muted">
+                {reviewChanged
+                  ? "Review changed. Inspect the current diff before approving."
+                  : "Checking the current review…"}
+              </Text>
+            ) : null}
             {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
               <SettingsActionRow
                 icon="text.bubble"
@@ -486,29 +561,32 @@ function WorkflowJobsContent(props: Props) {
                 onPress={() => openResult(false)}
               />
             ) : null}
-            {selectedJob.progress?.checkpoint &&
+            {selectedJob.progress?.hasThread !== false &&
+            selectedJob.progress?.checkpoint &&
             selectedJob.progress.checkpoint.kind !== "input" ? (
               <SettingsActionRow
                 icon="doc.text"
-                label="Inspect saved diff"
-                disabled={busy || openingResult === jobKey}
+                label={
+                  selectedJob.runtime?.kind === "vm" ? "Inspect live diff" : "Inspect saved diff"
+                }
+                disabled={busy || openingResult === jobKey || checkingReturnedReview}
                 onPress={() => openResult(true)}
               />
             ) : null}
             {!terminal &&
             selectedJob.progress?.checkpoint &&
-            (canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
+            viewerControls.canApprove &&
             (manualState.status === "awaiting_review" ||
-              (canRespond &&
+              (canConfigure &&
                 selectedJob.status === "finishing" &&
                 selectedJob.progress?.retryableApproval)) ? (
               <SettingsActionRow
                 icon="checkmark.circle"
                 label={
-                  manualState.responsePending
-                    ? "Response pending"
-                    : selectedJob.progress?.approvalPending
-                      ? "Approval pending"
+                  approvalPending
+                    ? "Approval pending"
+                    : manualState.responsePending
+                      ? "Response pending"
                       : selectedJob.progress?.retryableApproval
                         ? selectedJob.status === "finishing"
                           ? "Retry completion"
@@ -516,14 +594,18 @@ function WorkflowJobsContent(props: Props) {
                         : "Approve result"
                 }
                 disabled={
-                  busy || manualState.checkpointBlocked || selectedJob.progress?.approvalPending
+                  busy ||
+                  reviewChanged ||
+                  checkingReturnedReview ||
+                  manualState.checkpointBlocked ||
+                  approvalPending
                 }
                 onPress={() => respond("approve")}
               />
             ) : null}
             {manualState.status === "awaiting_review" &&
-            (canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
-            !selectedJob.progress?.approvalPending ? (
+            viewerControls.canRespond &&
+            !approvalPending ? (
               <SettingsActionRow
                 icon="pencil"
                 label="Request changes"
@@ -534,9 +616,9 @@ function WorkflowJobsContent(props: Props) {
           </SettingsSection>
           {!terminal &&
           (manualState.status === "awaiting_input" || manualState.status === "awaiting_review") &&
-          (canRespond || selectedJob.progress?.checkpoint?.role === "member") &&
+          viewerControls.canRespond &&
           selectedJob.progress?.checkpoint &&
-          !selectedJob.progress.approvalPending &&
+          !approvalPending &&
           (manualState.status === "awaiting_input" ||
             feedbackOpen ||
             !!responseDrafts[selectedJob.progress.checkpoint.checkpointId]) ? (
@@ -593,7 +675,8 @@ function WorkflowJobsContent(props: Props) {
           {Object.entries(responseDrafts).some(
             ([id, text]) =>
               (terminal ||
-                selectedJob.progress?.approvalPending ||
+                !viewerControls.canRespond ||
+                approvalPending ||
                 !["awaiting_review", "awaiting_input"].includes(manualState.status ?? "") ||
                 id !== selectedJob.progress?.checkpoint?.checkpointId) &&
               !!text.trim(),
@@ -603,7 +686,8 @@ function WorkflowJobsContent(props: Props) {
                 .filter(
                   ([id, text]) =>
                     (terminal ||
-                      selectedJob.progress?.approvalPending ||
+                      !viewerControls.canRespond ||
+                      approvalPending ||
                       !["awaiting_review", "awaiting_input"].includes(manualState.status ?? "") ||
                       id !== selectedJob.progress?.checkpoint?.checkpointId) &&
                     !!text.trim(),
@@ -637,7 +721,7 @@ function WorkflowJobsContent(props: Props) {
             </SettingsSection>
           ) : null}
           <SettingsSection title="Run controls">
-            {canRespond && actionState.canRetry ? (
+            {canConfigure && actionState.canRetry ? (
               <SettingsActionRow
                 icon="arrow.clockwise"
                 label="Retry publishing action"
@@ -653,7 +737,7 @@ function WorkflowJobsContent(props: Props) {
                 onPress={() => void Linking.openURL(selectedJob.progress!.pullRequestUrl!)}
               />
             ) : null}
-            {canRespond &&
+            {canConfigure &&
             manualState.status === "paused" &&
             selectedJob.progress?.retryablePreparation ? (
               <SettingsActionRow
@@ -663,7 +747,7 @@ function WorkflowJobsContent(props: Props) {
                 onPress={() => respond("retry_preparation")}
               />
             ) : null}
-            {canRespond && (manualState.canPause || manualState.canResume) ? (
+            {canConfigure && (manualState.canPause || manualState.canResume) ? (
               <SettingsActionRow
                 icon={manualState.canResume ? "play" : "pause"}
                 label={manualState.canResume ? "Resume workflow" : "Pause workflow"}
@@ -671,7 +755,7 @@ function WorkflowJobsContent(props: Props) {
                 onPress={() => respond(manualState.canResume ? "resume" : "pause")}
               />
             ) : null}
-            {canRespond && !isTerminalWorkflowJob(selectedJob.status) ? (
+            {viewerControls.canCancel && !terminal ? (
               <SettingsActionRow
                 icon="xmark.circle.fill"
                 label={

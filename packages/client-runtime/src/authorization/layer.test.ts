@@ -1,4 +1,8 @@
-import { AuthStandardClientScopes, EnvironmentId } from "@t3tools/contracts";
+import {
+  AuthOrchestrationReadScope,
+  AuthStandardClientScopes,
+  EnvironmentId,
+} from "@t3tools/contracts";
 import {
   RelayEnvironmentConnectScope,
   type RelayEnvironmentConnectResponse,
@@ -65,13 +69,13 @@ const websocketTicket = (ticket: string) =>
     expiresAt: "2026-06-06T01:00:00.000Z",
   });
 
-const accessToken = (token: string) =>
+const accessToken = (token: string, scope = AuthStandardClientScopes.join(" ")) =>
   Response.json({
     access_token: token,
     issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
     token_type: "DPoP",
     expires_in: 3_600,
-    scope: AuthStandardClientScopes.join(" "),
+    scope,
   });
 
 const authInvalid = () =>
@@ -523,6 +527,31 @@ describe("RemoteEnvironmentAuthorization", () => {
       expect(harness.fetch.calls).toHaveLength(0);
       expect(yield* Ref.get(harness.bootstrapCalls)).toBe(0);
       expect(yield* Ref.get(harness.proofInputs)).toEqual([]);
+    }),
+  );
+
+  it.effect("exchanges a relay reviewer credential without requesting broader scopes", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        responses: [
+          Response.json(DESCRIPTOR),
+          accessToken("review-access-token", AuthOrchestrationReadScope),
+        ],
+      });
+      const authorized = yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        return yield* remote.authorizeDpopHttp({ expectedEnvironmentId: ENVIRONMENT_ID });
+      }).pipe(Effect.provide(harness.layer));
+      expect(authorized.httpAuthorization.accessToken).toBe("review-access-token");
+
+      const [url, request] = harness.fetch.calls[1]!;
+      expect(String(url)).toBe(`${ENDPOINT.httpBaseUrl}/oauth/token`);
+      expect(new Headers(request.headers).get("dpop")).toBe(`proof:${url}`);
+      const body = new URLSearchParams(String(request.body));
+      expect(body.has("scope")).toBe(false);
+      expect(body.get("subject_token")).toBe(BOOTSTRAP.credential);
+      expect(body.get("client_label")).toBe("Launchpad Test");
+      expect(body.get("client_device_type")).toBe("mobile");
     }),
   );
 

@@ -40,6 +40,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ExitCode } from "effect/unstable/process/ChildProcessSpawner";
 import { TestClock } from "effect/testing";
 import { describe, expect, it, vi } from "vite-plus/test";
 
@@ -4838,24 +4839,22 @@ effectIt.effect(
         Effect.provide(
           Layer.mergeAll(
             Layer.mock(GitVcsDriver, {
-              resolveCommit: () => Effect.succeed({ commitSha: "saved-head" }),
-              statusDetailsLocal: () =>
+              execute: ({ args }) =>
                 Effect.succeed({
-                  isRepo: true,
-                  hasOriginRemote: true,
-                  isDefaultBranch: false,
-                  branch: "t3-job/recovered",
-                  upstreamRef: null,
-                  hasWorkingTreeChanges: false,
-                  workingTree: { files: [], insertions: 0, deletions: 0 },
-                  hasUpstream: false,
-                  aheadCount: 0,
-                  behindCount: 0,
-                  aheadOfDefaultCount: 0,
+                  exitCode: ExitCode(args[1] === "symbolic-ref" && args.at(-1) !== "HEAD" ? 1 : 0),
+                  stdout:
+                    args[1] === "symbolic-ref"
+                      ? "refs/heads/t3-job/recovered"
+                      : args.at(-1) === "HEAD^{commit}"
+                        ? "saved-head"
+                        : "tree",
+                  stderr: "",
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
                 }),
             }),
             Layer.mock(CheckpointStore, {
-              captureCheckpoint: () => Effect.void,
+              captureCheckpoint: () => Effect.succeed({ commitId: "checkpoint", treeId: "tree" }),
               diffCheckpoints: () => Effect.succeed(""),
               deleteCheckpointRefs: () => Effect.void,
             }),

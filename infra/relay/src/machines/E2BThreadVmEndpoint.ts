@@ -1,17 +1,25 @@
 import { EnvironmentHttpApi } from "@t3tools/contracts";
 import {
   RelayCloudMintCredentialRequest,
+  RelayEnvironmentDispatchJobResponse,
   RelayEnvironmentMintResponse,
   RelayEnvironmentHealthResponse,
+  WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES,
   type RelayThreadVmBootstrap,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import type { E2BThreadVmSettings } from "./E2BThreadVmCompute.ts";
-import { inspectE2BThreadVmIngress } from "./E2BThreadVmConnection.ts";
+import { inspectE2BThreadVmIngress, type E2BThreadVmIdentity } from "./E2BThreadVmConnection.ts";
 import { RelayDb } from "../db.ts";
 import { readThreadVmTrafficAccessToken } from "../threads/ThreadVmIngressToken.ts";
+
+export const WorkflowVmPrivateIngress = Context.Reference<E2BThreadVmSettings | undefined>(
+  "launchpad-relay/WorkflowVmPrivateIngress",
+  { defaultValue: () => undefined },
+);
 
 const encodeRequest = Schema.encodeSync(Schema.fromJsonString(RelayCloudMintCredentialRequest));
 const decodeResponse = Schema.decodeUnknownSync(
@@ -21,8 +29,12 @@ const decodeResponse = Schema.decodeUnknownSync(
 const decodeHealthResponse = Schema.decodeUnknownSync(
   Schema.fromJsonString(RelayEnvironmentHealthResponse),
 );
+const decodeDispatchResponse = Schema.decodeUnknownSync(
+  Schema.fromJsonString(RelayEnvironmentDispatchJobResponse),
+);
+const workflowDispatchPath = EnvironmentHttpApi.groups.connect.endpoints.t3WorkflowJob.path;
 
-async function readBoundedResponse(response: Response) {
+async function readBoundedResponse(response: Response, maxBytes: number) {
   if (!response.body) throw new ThreadVmEndpointError();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -33,7 +45,7 @@ async function readBoundedResponse(response: Response) {
       const chunk = await reader.read();
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
-      if (bytes > 65536) throw new ThreadVmEndpointError();
+      if (bytes > maxBytes) throw new ThreadVmEndpointError();
       text += decoder.decode(chunk.value, { stream: true });
     }
     return text + decoder.decode();
@@ -71,7 +83,10 @@ async function postProof(
     await response.body?.cancel();
     throw new ThreadVmEndpointError();
   }
-  return readBoundedResponse(response);
+  return readBoundedResponse(
+    response,
+    path === workflowDispatchPath ? WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES : 64 * 1024,
+  );
 }
 
 function managedOrigin(origin: string) {
@@ -122,16 +137,21 @@ const privateProof = Effect.fnUntraced(
     settings: E2BThreadVmSettings,
     transport: typeof fetch,
     sandboxId: string,
-    identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId">,
+    identity: E2BThreadVmIdentity,
     proof: string,
     path?: string,
+    resourceKind?: "organization_workflow",
   ) {
     const sql = (yield* RelayDb).$client;
-    const token = yield* readThreadVmTrafficAccessToken(sql, {
-      ...identity.scope,
-      computeRef: sandboxId,
-      operationId: identity.operationId,
-    });
+    const token = yield* readThreadVmTrafficAccessToken(
+      sql,
+      {
+        ...identity.scope,
+        computeRef: sandboxId,
+        operationId: identity.operationId,
+      },
+      resourceKind,
+    );
     return yield* Effect.tryPromise({
       try: async (signal) => {
         const ingress = await inspectE2BThreadVmIngress(
@@ -167,12 +187,43 @@ export const makeE2BThreadVmEndpoint = (
   settings: E2BThreadVmSettings,
   transport: typeof fetch = fetch,
 ) => ({
-  mintCredential: (
+  dispatchWorkflow: (
     sandboxId: string,
-    identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId">,
+    identity: E2BThreadVmIdentity & { readonly templateId: string },
     proof: string,
   ) =>
-    privateProof(settings, transport, sandboxId, identity, proof).pipe(
+    privateProof(
+      settings,
+      transport,
+      sandboxId,
+      identity,
+      proof,
+      workflowDispatchPath,
+      "organization_workflow",
+    ).pipe(
+      Effect.flatMap((body) =>
+        Effect.try({
+          try: () => decodeDispatchResponse(body),
+          catch: () => new ThreadVmEndpointError(),
+        }),
+      ),
+    ),
+  mintCredential: (
+    sandboxId: string,
+    identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId"> & {
+      readonly resourceKind?: "organization_workflow";
+    },
+    proof: string,
+  ) =>
+    privateProof(
+      settings,
+      transport,
+      sandboxId,
+      identity,
+      proof,
+      undefined,
+      identity.resourceKind,
+    ).pipe(
       Effect.flatMap((text) =>
         Effect.try({ try: () => decodeResponse(text), catch: () => new ThreadVmEndpointError() }),
       ),
@@ -184,7 +235,9 @@ export const makeE2BThreadVmHealth =
   (settings: E2BThreadVmSettings, transport: typeof fetch = fetch) =>
   (
     sandboxId: string,
-    identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId">,
+    identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId"> & {
+      readonly resourceKind?: "organization_workflow";
+    },
     proof: string,
   ) =>
     privateProof(
@@ -194,6 +247,7 @@ export const makeE2BThreadVmHealth =
       identity,
       proof,
       EnvironmentHttpApi.groups.connect.endpoints.health.path,
+      identity.resourceKind,
     ).pipe(
       Effect.flatMap((text) =>
         Effect.try({

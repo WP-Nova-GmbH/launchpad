@@ -82,6 +82,29 @@ export class CheckpointRefUnavailableError extends Schema.TaggedError<Checkpoint
   }
 }
 
+export class CheckpointWorkflowPinUnavailableError extends Schema.TaggedError<CheckpointWorkflowPinUnavailableError>()(
+  "CheckpointWorkflowPinUnavailableError",
+  {
+    threadId: ThreadId,
+    turnCount: NonNegativeInt,
+  },
+) {
+  override get message(): string {
+    return "The saved workflow checkpoint is unavailable. Refresh the run, or cancel it and start again.";
+  }
+}
+
+export class CheckpointWorkflowDiffRestrictedError extends Schema.TaggedError<CheckpointWorkflowDiffRestrictedError>()(
+  "CheckpointWorkflowDiffRestrictedError",
+  { reason: Schema.Literals(["contains_secret", "verification_unavailable"]) },
+) {
+  override get message() {
+    return this.reason === "contains_secret"
+      ? "This saved diff contains a workflow secret and cannot be displayed. Cancel the run and start again with the secret kept out of tracked files."
+      : "Could not check the saved diff for workflow secrets. Refresh the run and try again.";
+  }
+}
+
 export type CheckpointStoreError = VcsError;
 
 export type CheckpointServiceError =
@@ -91,4 +114,6 @@ export type CheckpointServiceError =
   | CheckpointThreadNotFoundError
   | CheckpointWorkspacePathMissingError
   | CheckpointTurnRangeUnavailableError
+  | CheckpointWorkflowPinUnavailableError
+  | CheckpointWorkflowDiffRestrictedError
   | CheckpointRefUnavailableError;

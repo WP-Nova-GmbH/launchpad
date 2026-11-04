@@ -1,18 +1,42 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as EffectNodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as PgClient from "@effect/sql-pg/PgClient";
+import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import { Deferred, Effect, Fiber, FileSystem, Layer, Redacted, Schema } from "effect";
 import * as NodeCrypto from "node:crypto";
-import type { RelayUpdateRepositoryWorkflowConfiguration } from "@t3tools/contracts/relay";
+import {
+  RelayClientPrincipal,
+  RelayEnvironmentPrincipal,
+  RelayRepositoryId,
+  type RelayUpdateRepositoryWorkflowConfiguration,
+} from "@t3tools/contracts/relay";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { WORKFLOW_PROTOCOL, type WorkflowJobProgress } from "@t3tools/contracts/workflows";
+import { RelayDb, RelayTransactions } from "../db.ts";
+import {
+  EnvironmentConnector,
+  EnvironmentMintRequestFailed,
+} from "../environments/EnvironmentConnector.ts";
+import { respondToWorkflowJob } from "../http/WorkflowsApi.ts";
+import { readThreadVmReviewSecrets } from "../http/ThreadEnvironmentApi.ts";
+import { layer as machines } from "../machines/Machines.ts";
+import { layer as catalog } from "../projects/OrganizationProjectCatalog.ts";
+import { layer as organizations } from "../tenancy/Organizations.ts";
+import { layer as repositories } from "../tenancy/Repositories.ts";
 import { RelaySecretBox, layer as secretBox } from "../auth/SecretBox.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { configLayer } from "../workflowSources/test-fixture.ts";
 import { updateRepositoryWorkflowConfiguration } from "./RepositoryWorkflowConfiguration.ts";
 import {
   resolveWorkflowRunSetupConfiguration,
+  resolveWorkflowRunAttemptConfiguration,
   withFrozenWorkflowRunConfiguration,
   type WorkflowRunSetupClaim,
 } from "./WorkflowRunConfiguration.ts";
+import { readWorkflowVmBinding, requireWorkflowVmViewer } from "./WorkflowVmBinding.ts";
+import { refreshWorkflowJob } from "./WorkflowDispatcher.ts";
+import { layer as workflows } from "./Workflows.ts";
 
 const databaseUrl = process.env.LAUNCHPAD_WORKFLOW_RUN_CONFIG_TEST_DATABASE_URL;
 const database = Layer.effectDiscard(
@@ -116,7 +140,26 @@ const fixture = Effect.fnUntraced(function* (role: "admin" | "member" = "admin")
         archived: false,
         createdAt: "2026",
         updatedAt: "2026",
-        definition: { name: "VM test", target: { kind: "vm", baseBranch: null }, steps: [] },
+        definition: {
+          name: "VM test",
+          target: { kind: "vm", baseBranch: null },
+          steps: [
+            {
+              kind: "agent",
+              id: "implement",
+              title: "Implement",
+              instruction: "Edit the repository",
+              modelSelection: null,
+            },
+            {
+              kind: "review",
+              id: "review",
+              title: "Review",
+              role: "member",
+              reworkStepId: "implement",
+            },
+          ],
+        },
       },
     })} WHERE job_id=${jobId}`.pipe(Effect.asVoid);
     const freeze = withFrozenWorkflowRunConfiguration(sql, box, identity, accept);
@@ -331,6 +374,236 @@ describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
         expect(
           yield* Effect.flip(resolveWorkflowRunSetupConfiguration(f.sql, f.box, claim)),
         ).toMatchObject({ reason: "unavailable" });
+      }),
+    );
+
+    it.effect("binds viewer access and frozen values to the exact active VM and attempt", () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const viewer = NodeCrypto.randomUUID();
+        yield* f.sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
+          VALUES (${f.scope.organizationId},${viewer},'member','2026','2026')`;
+        yield* f.sql`INSERT INTO relay_repository_access(repository_id,organization_id,user_id,role,created_at,updated_at)
+          VALUES (${f.scope.repositoryId},${f.scope.organizationId},${viewer},'developer','2026','2026')`;
+        yield* f.write(0, { kind: "setVariable", name: "APP_MODE", value: "test" });
+        yield* f.write(1, secret("initial-canary"));
+        const run = yield* f.queue();
+        yield* run.freeze;
+        const { claim } = yield* run.install();
+        yield* f.write(2, { kind: "setVariable", name: "APP_MODE", value: "changed" });
+        yield* f.write(3, secret("rotated-canary"));
+        const {
+          jobId,
+          organizationId,
+          repositoryId,
+          threadId,
+          allocationId,
+          operationId,
+          environmentId,
+          generation,
+        } = claim;
+        const expected = {
+          jobId,
+          organizationId,
+          repositoryId,
+          allocationId,
+          operationId,
+          generation,
+          threadId: ThreadId.make(threadId),
+          environmentId: EnvironmentId.make(environmentId),
+          projectId: ProjectId.make(`vm:${threadId}`),
+        };
+        const snapshot = {
+          canonicalKey: "github.com/test/repo",
+          installationId: "42",
+          branch: "main",
+          commitSha: "a".repeat(40),
+          templateBuildId: "build",
+        };
+        yield* f.sql`UPDATE relay_thread_vm_provisions SET workflow_snapshot=${f.sql.json(snapshot)}
+          WHERE allocation_id=${allocationId}`;
+        yield* f.sql`UPDATE relay_thread_vm_setups SET phase='ready',
+          environment_id=${environmentId},receipt_sha256=${"a".repeat(64)}
+          WHERE allocation_id=${allocationId}`;
+        yield* f.sql`UPDATE relay_workflow_jobs SET record=record || ${f.sql.json({
+          vmAdmission: { codexConnectionId: "codex", hasSecrets: true },
+          startAttempted: true,
+        })}
+          WHERE job_id=${jobId}`;
+        const resolveBinding = readWorkflowVmBinding(f.sql, expected);
+        expect((yield* resolveBinding.pipe(Effect.flip))._tag).toBe("RelayTenancyNotFoundError");
+        yield* f.sql`INSERT INTO relay_thread_vm_codex_auth
+          (allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id,acknowledged_connection_id)
+          VALUES (${allocationId},${environmentId},1,${threadId},${organizationId},'organization','codex','codex')`;
+        yield* f.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${threadId}`;
+        expect(yield* resolveBinding).toMatchObject({ binding: expected, snapshot });
+        expect(
+          (yield* readWorkflowVmBinding(f.sql, {
+            ...expected,
+            generation: 2,
+          }).pipe(Effect.flip))._tag,
+        ).toBe("RelayTenancyNotFoundError");
+        yield* requireWorkflowVmViewer(f.sql, expected, viewer);
+        const principal = {
+          environmentId,
+          credentialId: claim.credentialId,
+          environmentPublicKey: "key",
+          threadVm: {
+            threadId: expected.threadId,
+            allocationId,
+            repositoryId: RelayRepositoryId.make(repositoryId),
+            generation,
+          },
+        };
+        const reviewSecrets = (guest = principal, requested = expected) =>
+          readThreadVmReviewSecrets(requested).pipe(
+            Effect.provideService(RelayEnvironmentPrincipal, guest),
+            Effect.provide(Layer.effect(RelayDb, PgDrizzle.makeWithDefaults())),
+          );
+        expect(Redacted.value(yield* reviewSecrets())).toEqual(["initial-canary"]);
+        expect(
+          yield* reviewSecrets({ ...principal, credentialId: "other-guest" }).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
+        expect(
+          yield* reviewSecrets(principal, { ...expected, jobId: "other-run" }).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "RelayTenancyNotFoundError" });
+
+        const setupId = `workflow:${jobId}:start`;
+        const agentId = `server:prompt-claim:${NodeCrypto.randomUUID()}`;
+        const setupAttempt = {
+          purpose: "setup" as const,
+          attemptId: setupId,
+          commandId: setupId,
+          stepId: "implement",
+          stepGeneration: 0,
+        };
+        const agentAttempt = {
+          ...setupAttempt,
+          purpose: "agent" as const,
+          attemptId: agentId,
+          commandId: agentId,
+        };
+        const resolve = (attempt: typeof setupAttempt | typeof agentAttempt) =>
+          resolveWorkflowRunAttemptConfiguration(f.sql, f.box, expected, attempt);
+        for (const attempt of [setupAttempt, setupAttempt, agentAttempt])
+          expect(yield* resolve(attempt)).toEqual({
+            environment: { APP_MODE: "test", NPM_TOKEN: "initial-canary" },
+            hasSecrets: true,
+            secretNames: ["NPM_TOKEN"],
+          });
+        expect(
+          yield* resolve({ ...agentAttempt, stepGeneration: 1 }).pipe(Effect.flip),
+        ).toMatchObject({ reason: "not_allowed" });
+        yield* f.sql`UPDATE relay_workflow_jobs SET pending_control='{"response":{"operation":"cancel"}}'
+          WHERE job_id=${jobId}`;
+        expect(yield* resolve(setupAttempt).pipe(Effect.flip)).toMatchObject({
+          reason: "not_allowed",
+        });
+        const progress: WorkflowJobProgress = {
+          status: "awaiting_review",
+          threadId: expected.threadId,
+          revision: 1,
+          detail: null,
+          checkpoint: {
+            kind: "review",
+            role: "member",
+            checkpointId: "review",
+            turnId: "turn",
+            checkpointRef: "head",
+            checkpointTurnCount: 1,
+          },
+        };
+        yield* f.sql`UPDATE relay_workflow_jobs SET status='awaiting_review',pending_control=NULL,
+          record=record || ${f.sql.json({ status: "awaiting_review", progress })}
+          WHERE job_id=${jobId}`;
+        let offline = true;
+        let revokeDuringProbe = false;
+        let approvals = 0;
+        const revokeViewer = f.sql`DELETE FROM relay_repository_access
+          WHERE repository_id=${repositoryId} AND user_id=${viewer}`;
+        const connector = Layer.mock(EnvironmentConnector)({
+          dispatchJob: (input) =>
+            Effect.gen(function* () {
+              expect(input.workflowVmBinding).toEqual(expected);
+              expect(input.repositoryCanonicalKey).toBe(snapshot.canonicalKey);
+              expect(input.baseBranch).toBe(snapshot.branch);
+              if (offline)
+                return yield* new EnvironmentMintRequestFailed({
+                  environmentId,
+                  operation: "dispatch-job",
+                  cause: "Offline fixture",
+                });
+              if (revokeDuringProbe && input.workflowControl?.operation === "status")
+                yield* revokeViewer.pipe(Effect.orDie);
+              const approved = input.workflowControl?.operation === "approve";
+              if (approved) approvals += 1;
+              return {
+                accepted: true,
+                workflowResult: {
+                  protocol: WORKFLOW_PROTOCOL,
+                  outcome: "accepted",
+                  detail: null,
+                  progress: approved
+                    ? { ...progress, status: "done", revision: 2, checkpoint: null }
+                    : progress,
+                },
+              };
+            }),
+        });
+        yield* Effect.gen(function* () {
+          const scope = { repositoryId, jobId };
+          const response = { checkpointId: "review", expectedRevision: 1 };
+          expect(
+            (yield* respondToWorkflowJob(scope, {
+              operation: "request_changes",
+              ...response,
+              text: "Try again",
+            }).pipe(Effect.flip))._tag,
+          ).toBe("RelayTenancyForbiddenError");
+          expect(
+            yield* respondToWorkflowJob(scope, { operation: "approve", ...response }),
+          ).toMatchObject({ responsePending: true, pendingResponseOperation: "approve" });
+          expect(approvals).toBe(0);
+          offline = false;
+          revokeDuringProbe = true;
+          expect((yield* refreshWorkflowJob(jobId))?.detail).toContain("no longer has permission");
+          expect(approvals).toBe(0);
+          revokeDuringProbe = false;
+          yield* f.sql`INSERT INTO relay_repository_access(repository_id,organization_id,user_id,role,created_at,updated_at)
+            VALUES (${repositoryId},${organizationId},${viewer},'developer','2026','2026')`;
+          expect(
+            (yield* respondToWorkflowJob(scope, { operation: "approve", ...response })).status,
+          ).toBe("done");
+          expect((yield* refreshWorkflowJob(jobId))?.status).toBe("done");
+          expect((yield* refreshWorkflowJob(jobId))?.status).toBe("done");
+          expect(approvals).toBe(1);
+        }).pipe(
+          Effect.provideService(RelayClientPrincipal, { userId: viewer, token: "viewer" }),
+          Effect.provide(
+            Layer.mergeAll(
+              organizations,
+              repositories,
+              machines,
+              catalog,
+              workflows,
+              connector,
+              EffectNodeCrypto.layer,
+            ).pipe(
+              Layer.provideMerge(RelayTransactions.layer),
+              Layer.provideMerge(Layer.effect(RelayDb, PgDrizzle.makeWithDefaults())),
+            ),
+          ),
+        );
+        expect(Redacted.value(yield* reviewSecrets())).toEqual(["initial-canary"]);
+        yield* f.sql`UPDATE relay_environment_credentials SET revoked_at='2026'
+          WHERE credential_id=${claim.credentialId}`;
+        expect(yield* reviewSecrets().pipe(Effect.flip)).toMatchObject({
+          _tag: "RelayTenancyNotFoundError",
+        });
+        yield* revokeViewer;
+        expect(
+          (yield* requireWorkflowVmViewer(f.sql, expected, viewer).pipe(Effect.flip))._tag,
+        ).toBe("RelayTenancyNotFoundError");
       }),
     );
 

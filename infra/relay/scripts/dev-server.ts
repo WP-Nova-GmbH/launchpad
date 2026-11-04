@@ -3,7 +3,12 @@ import {
   makeDevThreadVmClientProxy,
 } from "./dev-thread-vm-client-proxy.ts";
 import { DevThreadVmClientEndpoint } from "../src/threads/ThreadVmClientConnection.ts";
-import { authorizeThreadVmConnection } from "../src/threads/ThreadVmConnectionAccess.ts";
+import {
+  authorizeThreadVmConnection,
+  authorizeWorkflowVmViewerConnection,
+} from "../src/threads/ThreadVmConnectionAccess.ts";
+import { isWorkflowVmThread } from "../src/jobs/WorkflowVmBinding.ts";
+import { WorkflowVmPrivateIngress } from "../src/machines/E2BThreadVmEndpoint.ts";
 import { threadVmPreviewRoutes } from "../src/http/ThreadVmPreviewProxy.ts";
 import { threadVmPreviewNode } from "../src/http/ThreadVmPreviewNode.ts";
 import { threadMovesApi } from "../src/http/ThreadMovesApi.ts";
@@ -114,6 +119,7 @@ import { sourceControlServerApi } from "../src/http/SourceControlApi.ts";
 import { organizationApi, repositoriesApi } from "../src/http/TenancyApi.ts";
 import * as Workflows from "../src/jobs/Workflows.ts";
 import { workflowsApi } from "../src/http/WorkflowsApi.ts";
+import { workflowVmPreparationLayer } from "../src/jobs/WorkflowVmPreparation.ts";
 import { deliverPendingWorkflowJobs } from "../src/jobs/WorkflowDispatcher.ts";
 import * as AgentActivityPublisher from "../src/agentActivity/AgentActivityPublisher.ts";
 import * as AgentActivityRows from "../src/agentActivity/AgentActivityRows.ts";
@@ -362,6 +368,7 @@ const managedEndpointClientsLayer =
       ).pipe(Layer.provide(FetchHttpClient.layer));
 
 const runtimeLayerBase = WorkflowWake.layer
+  .pipe(Layer.provideMerge(workflowVmPreparationLayer))
   .pipe(Layer.provideMerge(AutomaticOffers.layer), Layer.provideMerge(MobileRegistrations.layer))
   .pipe(
     Layer.provideMerge(AgentActivityPublisher.layer),
@@ -479,7 +486,13 @@ const runtimeLayer = localVmConnections
             );
           return yield* makeDevThreadVmClientProxy({
             compute: settings.compute,
-            authorize: authorizeThreadVmConnection,
+            authorize: (userId, threadId) =>
+              Effect.gen(function* () {
+                const sql = (yield* RelayDb.RelayDb).$client;
+                return yield* (yield* isWorkflowVmThread(sql, threadId))
+                  ? authorizeWorkflowVmViewerConnection(userId, threadId)
+                  : authorizeThreadVmConnection(userId, threadId);
+              }),
           });
         }),
       ),
@@ -700,6 +713,12 @@ const main = Effect.gen(function* () {
       // Delegated thread ids exceed the router's default path parameter limit.
       Layer.provide(Layer.succeed(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG)),
       Layer.provide(runtimeLayer),
+      Layer.provide(
+        Layer.succeed(
+          WorkflowVmPrivateIngress,
+          localVmConnections ? threadVmSettings?.compute : undefined,
+        ),
+      ),
       Layer.provide(Layer.succeed(ThreadVmRuntimeConfiguration, { settings: threadVmSettings })),
     ),
   );

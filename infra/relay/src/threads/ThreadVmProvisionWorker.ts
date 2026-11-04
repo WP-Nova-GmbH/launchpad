@@ -12,10 +12,14 @@ import type {
 } from "../machines/E2BThreadVmCompute.ts";
 import { sealThreadVmTrafficAccessToken } from "./ThreadVmIngressToken.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
+import { withPreparingWorkflowVm } from "./ThreadVmWorkflowAccess.ts";
+import type { RelayInternalError, RelayTenancyNotFoundError } from "@t3tools/contracts/relay";
+import type { RelayDb } from "../db.ts";
 
 interface ProvisionCompute {
   readonly create: (
     input: ThreadVmCreateInput,
+    templateId?: string,
   ) => Effect.Effect<ThreadVmCreated, ThreadVmComputeError>;
   readonly recoverIngress: (
     sandboxId: string,
@@ -36,13 +40,23 @@ export function makeThreadVmProvisionWorker(
   templateId: string,
   hostId: string,
   verifyTemplate: Effect.Effect<void, ThreadVmComputeError> = Effect.void,
+  workflow?: {
+    readonly enabled: boolean;
+    readonly verifyTemplate: (
+      templateId: string,
+      buildId: string,
+    ) => Effect.Effect<void, ThreadVmComputeError>;
+  },
 ) {
   const store = makeThreadVmProvisionStore(sql);
   const allocations = makeThreadVmAllocationStore(sql);
   const runOne = Effect.fn("relay.thread_vm_provision.run_one")(function* () {
     const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
-    yield* makeThreadVmCapacityStore(sql).admitNext(hostId);
-    const row = yield* store.claim(claimId, hostId);
+    yield* makeThreadVmCapacityStore(sql).admitNext(
+      hostId,
+      workflow ? { workflowEnabled: workflow.enabled } : "personal",
+    );
+    const row = yield* store.claim(claimId, hostId, workflow !== undefined);
     if (!row) return false;
     const claim = { allocationId: row.allocationId, claimId };
     if (row.phase === "pending" && row.allocationState === "deleting") {
@@ -50,10 +64,19 @@ export function makeThreadVmProvisionWorker(
       return true;
     }
     const reconcile = Effect.gen(function* () {
-      const allocation = yield* allocations.get(row.allocationId);
-      if (!allocation) return;
-      const ownerAccess = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-        withPrivateThreadOwnerAccess(row.threadId, "read", allocation.ownerUserId, () => effect);
+      const allocation = yield* allocations.getAny(row.allocationId);
+      if (!allocation || allocation.resourceKind !== row.resourceKind) return;
+      const ownerAccess = <A, E, R>(
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | RelayInternalError | RelayTenancyNotFoundError, R | RelayDb> =>
+        allocation.resourceKind === "organization_workflow"
+          ? withPreparingWorkflowVm(sql, row, () => effect)
+          : withPrivateThreadOwnerAccess(
+              row.threadId,
+              "read",
+              allocation.ownerUserId,
+              () => effect,
+            );
       const finish = Effect.fnUntraced(function* (created: ThreadVmCreated) {
         const known = yield* store.recordObserved({ ...claim, computeRef: created.sandboxId });
         const discard = Effect.gen(function* () {
@@ -72,13 +95,16 @@ export function makeThreadVmProvisionWorker(
           templateId: known.templateId,
         };
         const recovery = { ...claim, computeRef: created.sandboxId, hostId };
+        const noAccess = row.workflowSnapshot
+          ? store.defer({ ...claim, errorCode: "compute_unavailable" })
+          : discard;
         const admitted = yield* ownerAccess(
           created.trafficAccessToken
             ? store.admitIngressRecovery(recovery)
             : store.beginIngressRecovery(recovery),
         ).pipe(
           Effect.as(true),
-          Effect.catchTag("RelayTenancyNotFoundError", () => discard.pipe(Effect.as(false))),
+          Effect.catchTag("RelayTenancyNotFoundError", () => noAccess.pipe(Effect.as(false))),
         );
         if (!admitted) return;
         const connected = created.trafficAccessToken
@@ -114,10 +140,10 @@ export function makeThreadVmProvisionWorker(
             });
           }),
         ).pipe(
-          Effect.catchTag("RelayTenancyNotFoundError", () => discard),
+          Effect.catchTag("RelayTenancyNotFoundError", () => noAccess),
           Effect.catchTag("ThreadVmProvisionConflict", (error) =>
             Effect.gen(function* () {
-              const current = yield* store.get(claim.allocationId);
+              const current = yield* store.get(claim.allocationId, row.resourceKind);
               if (
                 current?.claimId === claimId &&
                 current.phase === "creating" &&
@@ -133,23 +159,66 @@ export function makeThreadVmProvisionWorker(
       if (row.phase === "pending") {
         // Base-image availability concerns a new dispatch only; a known or
         // uncertain existing VM must reconcile using its own immutable image.
-        yield* verifyTemplate;
+        const snapshot = row.workflowSnapshot;
+        if (snapshot && !workflow?.enabled) {
+          yield* store.returnWorkflowReservation({ ...claim, errorCode: "workflow_disabled" });
+          return;
+        }
+        if (snapshot && workflow) {
+          const verified = yield* workflow
+            .verifyTemplate(row.templateId, snapshot.templateBuildId)
+            .pipe(Effect.result);
+          if (verified._tag === "Failure") {
+            yield* store.returnWorkflowReservation({
+              ...claim,
+              errorCode: "workflow_template_unverified",
+            });
+            return;
+          }
+        } else yield* verifyTemplate;
+        const selectedTemplate = snapshot ? row.templateId : templateId;
+        const begin = snapshot
+          ? withPreparingWorkflowVm(sql, row, (scope) =>
+              Effect.gen(function* () {
+                const [codex] = yield* sql`SELECT connection_id FROM relay_codex_vm_connections
+                WHERE organization_id=${scope.organizationId} AND connection_id=${scope.codexConnectionId}
+                  AND status='connected' AND (refresh_started_at IS NULL
+                    OR refresh_started_at::timestamptz > clock_timestamp()-interval '6 seconds') FOR SHARE`;
+                if (!codex) {
+                  yield* store.returnWorkflowReservation({
+                    ...claim,
+                    errorCode: "workflow_codex_unavailable",
+                  });
+                  return false;
+                }
+                yield* store.beginCreate({ ...claim, templateId: selectedTemplate });
+                return true;
+              }),
+            )
+          : ownerAccess(store.beginCreate({ ...claim, templateId: selectedTemplate })).pipe(
+              Effect.as(true),
+            );
         // A lost reply or expired worker claim must never repeat creation.
-        const admitted = yield* ownerAccess(store.beginCreate({ ...claim, templateId })).pipe(
-          Effect.as(true),
+        const admitted = yield* begin.pipe(
           Effect.catchTag("RelayTenancyNotFoundError", () =>
-            store.rejectUnstarted(claim).pipe(Effect.as(false)),
+            (snapshot
+              ? store.defer({ ...claim, errorCode: "compute_unavailable" })
+              : store.rejectUnstarted(claim)
+            ).pipe(Effect.as(false)),
           ),
         );
         if (!admitted) return;
         yield* finish(
-          yield* compute.create({
-            allocationId: row.allocationId,
-            operationId: row.operationId,
-            threadId: row.threadId,
-            generation: row.generation,
-            environment: {},
-          }),
+          yield* compute.create(
+            {
+              allocationId: row.allocationId,
+              operationId: row.operationId,
+              threadId: row.threadId,
+              generation: row.generation,
+              environment: {},
+            },
+            selectedTemplate,
+          ),
         );
         return;
       }

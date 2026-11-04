@@ -32,6 +32,7 @@ import {
 import {
   authorizeThreadVmConnection,
   authorizeThreadVmStatus,
+  authorizeWorkflowVmViewerConnection,
 } from "./ThreadVmConnectionAccess.ts";
 import { threadVmEndpointOwner } from "./threadVmEndpointOwner.ts";
 
@@ -59,12 +60,18 @@ const resolveThreadVmEndpoint = Effect.fn("relay.thread_vm_client.resolve")(func
   const sql = (yield* RelayDb).$client;
   const [binding] = yield* sql<{
     threadId: string;
-  }>`SELECT thread_id AS "threadId" FROM relay_thread_vm_bindings WHERE environment_id = ${input.environmentId}`;
+    workflow: boolean;
+  }>`SELECT b.thread_id AS "threadId", coalesce(t.audience='repository',false) AS workflow
+    FROM relay_thread_vm_bindings b LEFT JOIN relay_thread_placements t ON t.thread_id=b.thread_id
+    WHERE b.environment_id = ${input.environmentId}`;
   if (!binding) return null;
   const threadId = ThreadId.make(binding.threadId);
   const settings = yield* RelayConfiguration;
-  const readTarget =
-    operation === "connect" ? authorizeThreadVmConnection : authorizeThreadVmStatus;
+  const readTarget = binding.workflow
+    ? authorizeWorkflowVmViewerConnection
+    : operation === "connect"
+      ? authorizeThreadVmConnection
+      : authorizeThreadVmStatus;
   const target = yield* readTarget(input.userId, threadId);
   if (target.environmentId !== input.environmentId)
     return yield* new ThreadVmConnectionUnavailable();

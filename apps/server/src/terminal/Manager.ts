@@ -150,9 +150,14 @@ class TerminalProcessSignalError extends Schema.TaggedError<TerminalProcessSigna
   }
 }
 
-/**
- * TerminalManager - Service tag for terminal session orchestration.
- */
+type InternalTerminalOpenInput = TerminalOpenInput & {
+  readonly waitForProcessExitOnClose?: boolean;
+  readonly setupProcessOwner?: string;
+  readonly setupAttemptId?: string;
+  readonly filterSetupOutput?: (chunk: string) => string;
+};
+
+/** TerminalManager - Service tag for terminal session orchestration. */
 export class TerminalManager extends Context.Service<
   TerminalManager,
   {
@@ -163,11 +168,7 @@ export class TerminalManager extends Context.Service<
      * persisted history on first open.
      */
     readonly open: (
-      input: TerminalOpenInput & {
-        readonly waitForProcessExitOnClose?: boolean;
-        readonly setupProcessOwner?: string;
-        readonly setupAttemptId?: string;
-      },
+      input: InternalTerminalOpenInput,
     ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
 
     /**
@@ -309,6 +310,7 @@ interface TerminalSessionState {
   waitForProcessExitOnClose?: boolean;
   setupProcessOwner?: string;
   setupAttemptId?: string;
+  filterSetupOutput?: (chunk: string) => string;
   threadId: string;
   terminalId: string;
   cwd: string;
@@ -346,6 +348,7 @@ type PendingProcessEvent =
 
 type DrainProcessEventAction =
   | { type: "idle" }
+  | { type: "discard-output" }
   | {
       type: "output";
       threadId: string;
@@ -2210,9 +2213,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         }
 
         if (nextEvent.type === "output") {
+          const output = session.filterSetupOutput?.(nextEvent.data) ?? nextEvent.data;
+          if (!output) return { type: "discard-output" } as const;
           const sanitized = sanitizeTerminalHistoryChunk(
             session.pendingHistoryControlSequence,
-            nextEvent.data,
+            output,
           );
           session.pendingHistoryControlSequence = sanitized.pendingControlSequence;
           if (sanitized.visibleText.length > 0) {
@@ -2226,7 +2231,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             terminalId: session.terminalId,
             sequence: eventStamp.sequence,
             history: sanitized.visibleText.length > 0 ? session.history : null,
-            data: nextEvent.data,
+            data: output,
           } as const;
         }
 
@@ -2263,6 +2268,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       if (action.type === "idle") {
         return;
       }
+      if (action.type === "discard-output") continue;
 
       if (action.type === "output") {
         if (action.history !== null) {
@@ -2928,11 +2934,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   );
 
   const openWithWorkspaceLease = Effect.fn("terminal.openLocked")(function* (
-    input: TerminalOpenInput & {
-      readonly waitForProcessExitOnClose?: boolean;
-      readonly setupProcessOwner?: string;
-      readonly setupAttemptId?: string;
-    },
+    input: InternalTerminalOpenInput,
   ) {
     const terminalId = input.terminalId;
     yield* options.execution
@@ -2952,6 +2954,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       const rows = input.rows ?? DEFAULT_OPEN_ROWS;
       const session: TerminalSessionState = {
         ...(input.waitForProcessExitOnClose ? { waitForProcessExitOnClose: true } : {}),
+        ...(input.filterSetupOutput ? { filterSetupOutput: input.filterSetupOutput } : {}),
         threadId: input.threadId,
         terminalId,
         cwd: input.cwd,
@@ -3004,6 +3007,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     const liveSession = existing.value;
+    if (input.filterSetupOutput) liveSession.filterSetupOutput = input.filterSetupOutput;
     if (input.waitForProcessExitOnClose) liveSession.waitForProcessExitOnClose = true;
     const nextRuntimeEnv = normalizedRuntimeEnv(input.env);
     const currentRuntimeEnv = liveSession.runtimeEnv;
@@ -3072,13 +3076,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     return snapshot(liveSession);
   });
 
-  const openLocked = (
-    input: TerminalOpenInput & {
-      readonly waitForProcessExitOnClose?: boolean;
-      readonly setupProcessOwner?: string;
-      readonly setupAttemptId?: string;
-    },
-  ) =>
+  const openLocked = (input: InternalTerminalOpenInput) =>
     withWorkspaceLease(
       path.resolve(input.worktreePath ?? input.cwd),
       openWithWorkspaceLease(input),

@@ -69,7 +69,9 @@ export function applyThreadPromptQueueChange(
     entries,
     ...(change.handoff !== undefined ? { handoff: change.handoff } : {}),
     ...(change.awaitingTurnId !== undefined ? { awaitingTurnId: change.awaitingTurnId } : {}),
-    ...(change.finalizedTurnId !== undefined ? { finalizedTurnId: change.finalizedTurnId } : {}),
+    ...(change.finalizedTurnId !== undefined
+      ? { finalizedTurnId: change.finalizedTurnId, finalization: change.finalization }
+      : {}),
     admissions: change.finalizedTurnId
       ? queue.admissions.filter((admission) => admission.turnId !== change.finalizedTurnId)
       : change.admission

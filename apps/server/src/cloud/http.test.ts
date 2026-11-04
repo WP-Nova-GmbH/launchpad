@@ -1,4 +1,9 @@
-import type { WorkflowControl } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_PROTOCOL,
+  type WorkflowControl,
+  type WorkflowControlResult,
+  type WorkflowVmDispatchBinding,
+} from "@t3tools/contracts/workflows";
 import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -56,8 +61,15 @@ import { CLOUD_CLI_DESIRED_LINK_SECRET } from "./CliState.ts";
 import * as CliTokenManager from "./CliTokenManager.ts";
 import {
   RelayManagedEndpointRecoveryRegistrationRequest,
+  RelayOrganizationId,
+  WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES,
   type RelayLinkProofRequest,
 } from "@t3tools/contracts/relay";
+import { THREAD_VM_IDENTITY_SECRET } from "../relay/ThreadVmEnrollment.ts";
+import {
+  encodeThreadVmInitialState,
+  THREAD_VM_INITIAL_STATE_SECRET,
+} from "../relay/ThreadVmInitialStateRecord.ts";
 import {
   CLOUD_MACHINE_IDENTITY,
   encodeCloudMachineIdentityJson,
@@ -1395,6 +1407,7 @@ describe("cloudDispatchJobHandler", () => {
   });
 
   const encode = (value: string) => new TextEncoder().encode(value);
+  const encodeSecretRecord = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
   function makeDispatchSecretStore(): ServerSecretStore.ServerSecretStore["Service"] {
     const values = new Map<string, Uint8Array>([
@@ -1516,6 +1529,7 @@ describe("cloudDispatchJobHandler", () => {
     readonly subject?: string;
     readonly workflowControl?: WorkflowControl;
     readonly workflowOrigin?: unknown;
+    readonly workflowVmBinding?: WorkflowVmDispatchBinding;
     readonly requestedBy?: string;
   }) =>
     Effect.gen(function* () {
@@ -1538,6 +1552,7 @@ describe("cloudDispatchJobHandler", () => {
           baseBranch: "main",
           instruction: "Add a health check endpoint",
           ...(options?.workflowControl ? { workflowControl: options.workflowControl } : {}),
+          ...(options?.workflowVmBinding ? { workflowVmBinding: options.workflowVmBinding } : {}),
           ...(options?.workflowOrigin === undefined
             ? {}
             : { workflowOrigin: options.workflowOrigin }),
@@ -1559,6 +1574,195 @@ describe("cloudDispatchJobHandler", () => {
       Effect.scoped,
       Effect.provide(NodeServices.layer),
     );
+
+  it.effect("signs bounded workflow controls only for the guest's exact setup binding", () =>
+    Effect.gen(function* () {
+      const h = yield* makeDispatchHarness();
+      const binding = {
+        jobId: "job-1",
+        organizationId: "org-1",
+        repositoryId: "repo-1",
+        threadId: ThreadId.make("workflow:job-1"),
+        allocationId: "allocation-1",
+        environmentId: ENVIRONMENT_ID,
+        generation: 1,
+        operationId: "operation-1",
+        projectId: PROJECT_ID,
+      };
+      const { threadId, allocationId, repositoryId, generation, operationId } = binding;
+      const scope = { threadId, allocationId, repositoryId, generation };
+      const revision = "a".repeat(40);
+      yield* h.dependencies.secrets.set(
+        THREAD_VM_IDENTITY_SECRET,
+        encode(
+          yield* encodeSecretRecord({
+            scope,
+            operationId,
+            environmentId: ENVIRONMENT_ID,
+            relayUrl: RELAY_ISSUER,
+            relayIssuer: RELAY_ISSUER,
+            environmentCredential: "guest-credential",
+            cloudMintPublicKey: relayKeyPair.publicKey,
+          }),
+        ),
+      );
+      yield* h.dependencies.secrets.set(
+        THREAD_VM_INITIAL_STATE_SECRET,
+        encode(
+          yield* encodeThreadVmInitialState({
+            input: {
+              title: "VM job",
+              modelSelection: projectShell.defaultModelSelection!,
+              createdAt: NOW,
+              workflow: {
+                jobId: binding.jobId,
+                organizationId: RelayOrganizationId.make(binding.organizationId),
+                installationId: "github-app",
+                baseBranch: "main",
+              },
+              workspace: {
+                operationId,
+                scope,
+                canonicalKey: REPOSITORY_CANONICAL_KEY,
+                branch: "t3-job/job-1",
+                revision,
+              },
+            },
+            workspaceRoot: WORKSPACE_ROOT,
+            receipt: {
+              version: 1,
+              operationId,
+              scope,
+              environmentId: ENVIRONMENT_ID,
+              projectId: PROJECT_ID,
+              workspaceRoot: WORKSPACE_ROOT,
+              revision,
+              sequence: 1,
+              execution: "frozen",
+            },
+          }),
+        ),
+      );
+      const calls: unknown[] = [];
+      let workflowResult: WorkflowControlResult = {
+        protocol: WORKFLOW_PROTOCOL,
+        outcome: "missing",
+        detail: null,
+        progress: null,
+      };
+      const dependencies = {
+        ...h.dependencies,
+        workflowRunner: {
+          handle: (request: import("../jobs/RepositoryWorkflowRunner.ts").WorkflowRequest) => {
+            calls.push(request);
+            return Effect.succeed(workflowResult);
+          },
+        },
+      } satisfies CloudDispatchJobDependencies;
+      const workflowControl: WorkflowControl = {
+        operation: "status",
+        organizationId: binding.organizationId,
+        repositoryId: binding.repositoryId,
+        projectId: binding.projectId,
+      };
+      for (const candidate of [
+        undefined,
+        { ...binding, allocationId: "another-allocation" },
+        { ...binding, generation: 2 },
+      ]) {
+        const proof = yield* signDispatchProof({
+          workflowControl,
+          workflowOrigin: { kind: "manual", userId: LINKED_CLOUD_USER_ID },
+          ...(candidate ? { workflowVmBinding: candidate } : {}),
+        });
+        expect(
+          (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof }, true)))._tag,
+        ).toBe("EnvironmentHttpUnauthorizedError");
+      }
+      expect(calls).toEqual([]);
+      const proof = yield* signDispatchProof({
+        workflowControl,
+        workflowVmBinding: binding,
+        workflowOrigin: { kind: "manual", userId: LINKED_CLOUD_USER_ID },
+      });
+      expect(
+        (yield* cloudDispatchJobHandler(dependencies, { proof }, true)).workflowResult?.outcome,
+      ).toBe("missing");
+      expect(calls).toEqual([
+        expect.objectContaining({
+          workflowVm: {
+            binding,
+            workspaceRoot: WORKSPACE_ROOT,
+            baseBranch: "main",
+            baseSha: revision,
+          },
+        }),
+      ]);
+
+      const responses = Array.from({ length: 100 }, (_, index) => ({
+        checkpointId: `answered-${index}`,
+        stepId: "input",
+        generation: index,
+        operation: "input" as const,
+        userId: LINKED_CLOUD_USER_ID,
+        createdAt: NOW,
+        text: index === 0 ? "Original reply" : `${"\u0001".repeat(490)}🧪`,
+      }));
+      const checkpoint = {
+        checkpointId: "current-checkpoint",
+        kind: "input" as const,
+        stepId: "input",
+        generation: 100,
+        role: "member" as const,
+        question: `é${"\u0001".repeat(31_997)}🧪`,
+      };
+      const detail = "界".repeat(64 * 1024);
+      workflowResult = {
+        protocol: WORKFLOW_PROTOCOL,
+        outcome: "accepted",
+        detail,
+        progress: {
+          threadId,
+          revision: 100,
+          status: "awaiting_input",
+          detail,
+          checkpoint,
+          responses,
+        },
+      };
+      const retry = yield* signDispatchProof({
+        workflowControl: {
+          ...workflowControl,
+          operation: "input",
+          checkpointId: responses[0]!.checkpointId,
+          expectedRevision: 1,
+          text: responses[0]!.text,
+        },
+        workflowVmBinding: binding,
+        workflowOrigin: { kind: "manual", userId: LINKED_CLOUD_USER_ID },
+      });
+      const bounded = yield* cloudDispatchJobHandler(dependencies, { proof: retry }, true);
+      const now = yield* DateTime.now;
+      const signed = yield* verifyRelayJwt({
+        publicKey: environmentKeyPair.publicKey,
+        token: bounded.proof,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        issuer: `t3-env:${ENVIRONMENT_ID}`,
+        audience: normalizeRelayIssuer(RELAY_ISSUER),
+        nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
+      });
+      expect(
+        (yield* Effect.promise(() => Response.json(bounded).arrayBuffer())).byteLength,
+      ).toBeLessThanOrEqual(WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES);
+      expect(signed.workflowResult).toEqual(bounded.workflowResult);
+      expect(bounded.workflowResult?.detail?.length).toBeLessThan(detail.length);
+      expect(bounded.workflowResult?.progress).toMatchObject({ checkpoint, revision: 100 });
+      const retained = bounded.workflowResult?.progress?.responses ?? [];
+      expect(retained.length).toBeLessThan(responses.length);
+      expect(retained.at(0)).toEqual(responses.at(0));
+      expect(retained.at(-1)).toEqual(responses.at(-1));
+    }).pipe(provideDispatchHarness),
+  );
 
   it.effect("accepts a job for a repository this environment already holds", () =>
     Effect.gen(function* () {

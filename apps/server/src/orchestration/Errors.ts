@@ -11,6 +11,7 @@ export class OrchestrationCommandInvariantError extends Schema.TaggedError<Orche
   {
     commandType: Schema.String,
     detail: Schema.String,
+    reason: Schema.optional(Schema.Literal("queue-provider")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

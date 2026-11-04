@@ -231,6 +231,35 @@ it.layer(NodeServices.layer)("shared prompt queue", (it) => {
         expect(state.threads[0]!.messages).toEqual([]);
       }),
   );
+  it.effect("fences a pre-claim rejection and claim to the same preparation", () =>
+    Effect.gen(function* () {
+      const state = yield* apply(yield* readModelWithThread, enqueue("first"));
+      const stalePreparation = { attemptId: CommandId.make("previous-setup"), revision: 1 };
+      expect(
+        (yield* Effect.flip(
+          apply(state, {
+            ...claim,
+            expectedPreparation: stalePreparation,
+          }),
+        ))._tag,
+      ).toBe("OrchestrationCommandInvariantError");
+      const rejection = {
+        ...claim,
+        type: "thread.prompt.reject" as const,
+        commandId: CommandId.make("reject"),
+        detail: "Provider unavailable",
+      };
+      const stale = yield* apply(state, { ...rejection, expectedPreparation: stalePreparation });
+      expect(queue(stale).enabled).toBe(true);
+      const rejected = yield* apply(state, { ...rejection, expectedPreparation: null });
+      expect(queue(rejected)).toMatchObject({
+        enabled: false,
+        handoff: null,
+        pauseReason: { code: "failed", messageId: "first", detail: "Provider unavailable" },
+      });
+      expect(queue(rejected).entries[0]?.state).toBe("pending");
+    }),
+  );
   it.effect("keeps author and editor through admission and waits for matching finalization", () =>
     Effect.gen(function* () {
       let state = yield* apply(yield* readModelWithThread, enqueue("first"));
@@ -350,9 +379,17 @@ it.layer(NodeServices.layer)("shared prompt queue", (it) => {
         expect(state.threads[0]!.messages).toHaveLength(1);
       }),
   );
-  it.effect.each(["failed", "completed"] as const)(
-    "finalization reconciles late %s evidence for an uncertain admitted turn",
-    (outcome) =>
+  it.effect.each([
+    ["failed", "personal"],
+    ["completed", "personal"],
+    ["completed", "workflow"],
+    ["completed", "stopped-before-uncertainty"],
+    ["completed", "stopped-during-uncertainty"],
+    ["completed", "wrong-attempt"],
+    ["completed", "no-checkpoint"],
+  ] as const)(
+    "finalization reconciles late %s evidence for an uncertain %s turn",
+    ([outcome, scenario]) =>
       Effect.gen(function* () {
         let state = yield* apply(yield* readModelWithThread, enqueue("first"));
         state = yield* apply(state, claim);
@@ -366,14 +403,24 @@ it.layer(NodeServices.layer)("shared prompt queue", (it) => {
           evidence: "provider-ack",
           createdAt,
         });
-        state = yield* apply(state, {
+        const stop = {
+          type: "thread.queue.pause" as const,
+          commandId: CommandId.make("explicit-stop"),
+          threadId,
+          createdAt,
+        };
+        if (scenario === "stopped-before-uncertainty") state = yield* apply(state, stop);
+        const unknown = {
           type: "thread.prompt.unknown",
           commandId: CommandId.make("unknown"),
           threadId,
           attemptId: claim.commandId,
           detail: "Transport failed before terminal processing",
           createdAt,
-        });
+        } as const;
+        state = yield* apply(state, unknown);
+        if (scenario === "stopped-during-uncertainty") state = yield* apply(state, stop);
+        state = yield* apply(state, { ...unknown, commandId: CommandId.make("repeated-unknown") });
         expect(queue(state).entries[0]?.state).toBe("unknown");
         state = yield* apply(state, {
           type: "thread.queue.finalize",
@@ -391,14 +438,22 @@ it.layer(NodeServices.layer)("shared prompt queue", (it) => {
           threadId,
           turnId,
           outcome,
-          checkpoint: "ready",
+          checkpoint: scenario === "no-checkpoint" ? "skipped" : "ready",
+          ...(scenario === "personal"
+            ? {}
+            : {
+                resumeWorkflowAttemptId:
+                  scenario === "wrong-attempt" ? CommandId.make("other-attempt") : claim.commandId,
+              }),
           createdAt,
         });
         expect(queue(state).entries).toEqual([]);
         expect(queue(state).handoff).toBe(null);
         expect(queue(state).awaitingTurnId).toBe(null);
-        expect(queue(state).pauseReason?.code).toBe(outcome === "failed" ? "failed" : "stopped");
-        expect(queue(state).enabled).toBe(false);
+        expect(queue(state).enabled).toBe(scenario === "workflow");
+        expect(queue(state).pauseReason?.code).toBe(
+          scenario === "workflow" ? undefined : outcome === "failed" ? "failed" : "stopped",
+        );
         state = yield* apply(state, {
           type: "thread.queue.resume",
           commandId: CommandId.make("resume"),

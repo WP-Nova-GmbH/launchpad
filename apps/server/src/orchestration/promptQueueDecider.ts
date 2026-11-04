@@ -70,6 +70,14 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
     entry.revision === command.expectedRevision;
   const busy = thread.session?.status === "running" || thread.session?.status === "starting";
   const preparation = queue.preparation;
+  const preparationMatches = () => {
+    if (!("expectedPreparation" in command) || command.expectedPreparation === undefined)
+      return true;
+    const expected = command.expectedPreparation;
+    return expected === null
+      ? preparation === undefined
+      : preparation?.attemptId === expected.attemptId && preparation.revision === expected.revision;
+  };
   const initialQueueState = !thread.promptQueue
     ? {
         control:
@@ -420,9 +428,33 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
       if (!validEntry())
         return yield* fail("Prompt conflict: this entry changed or began delivery.");
       return [change({ removedMessageId: command.messageId })];
+    case "thread.prompt.reject":
+      if (
+        thread.archivedAt !== null ||
+        busy ||
+        blocked ||
+        !validEntry() ||
+        queue.handoff ||
+        queue.awaitingTurnId ||
+        !queue.enabled ||
+        queue.entries[0]?.messageId !== command.messageId ||
+        queue.revision !== command.expectedControlRevision ||
+        !preparationMatches() ||
+        (preparation && preparation.state !== "ready")
+      )
+        return [];
+      return [
+        change({
+          control: pause({
+            code: "failed",
+            detail: command.detail,
+            messageId: command.messageId,
+          }),
+        }),
+      ];
     case "thread.prompt.claim":
     case "thread.prompt.steer": {
-      if (preparation && preparation.state !== "ready")
+      if ((preparation && preparation.state !== "ready") || !preparationMatches())
         return yield* fail("Required preparation has not succeeded.");
       if (!validEntry() || !entry || queue.handoff)
         return yield* fail("Prompt conflict: another delivery or edit already won.");
@@ -572,9 +604,16 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         ? queue.entries.find((item) => item.messageId === handoff.messageId)
         : admission?.prompt;
       if (prompt?.kind === "move") return yield* fail("A move cannot be a prompt delivery.");
+      const resumable =
+        ((handoff ?? admission?.handoff)?.mode === "next-turn" && queue.enabled) ||
+        queue.pauseReason?.resumeOnConfirmedAttemptId === command.attemptId;
       return [
         change({
-          control: pause({ code: "delivery-unknown", detail: command.detail }),
+          control: pause({
+            code: "delivery-unknown",
+            detail: command.detail,
+            ...(resumable ? { resumeOnConfirmedAttemptId: command.attemptId } : {}),
+          }),
           ...(prompt ? { entry: { ...prompt, state: "unknown" } } : {}),
           // A late uncertain admission was removed from the queue already. Put
           // recovery before every remaining entry, especially a queued move.
@@ -607,7 +646,7 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
             : {}),
           control: pause(
             queue.pauseReason?.code === "delivery-unknown"
-              ? queue.pauseReason
+              ? { code: "delivery-unknown", detail: queue.pauseReason.detail }
               : { code: "stopped", detail: "Stopped by a teammate. Resume the queue to continue." },
           ),
         }),
@@ -639,7 +678,9 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         change({
           control: { enabled: true, revision: queue.revision + 1, pauseReason: null },
           awaitingTurnId: null,
-          ...(queue.awaitingTurnId ? { finalizedTurnId: queue.awaitingTurnId } : {}),
+          ...(queue.awaitingTurnId
+            ? { finalizedTurnId: queue.awaitingTurnId, finalization: null }
+            : {}),
         }),
       ];
     case "thread.queue.resolve": {
@@ -665,7 +706,9 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         change({
           handoff: null,
           awaitingTurnId: null,
-          ...(queue.awaitingTurnId ? { finalizedTurnId: queue.awaitingTurnId } : {}),
+          ...(queue.awaitingTurnId
+            ? { finalizedTurnId: queue.awaitingTurnId, finalization: null }
+            : {}),
           control: pause({
             code: "stopped",
             detail: "Delivery uncertainty acknowledged. Resume to continue.",
@@ -696,20 +739,32 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         !queue.entries.some(
           (entry) => entry.state === "unknown" && !confirmedIds.has(entry.messageId),
         );
+      const resumeWorkflow =
+        command.checkpoint === "ready" &&
+        command.resumeWorkflowAttemptId !== undefined &&
+        queue.pauseReason?.resumeOnConfirmedAttemptId === command.resumeWorkflowAttemptId &&
+        confirmed.some((admission) => admission.attemptId === command.resumeWorkflowAttemptId);
       return [
         ...uncertain.map((entry) => change({ removedMessageId: entry.messageId })),
         change({
           ...(confirmedHandoff ? { handoff: null } : {}),
           ...(resolvedUnknown && !failure
             ? {
-                control: pause({
-                  code: "stopped",
-                  detail: "Turn delivery confirmed. Resume the queue to continue.",
-                }),
+                control: resumeWorkflow
+                  ? { enabled: true, revision: queue.revision + 1, pauseReason: null }
+                  : pause({
+                      code: "stopped",
+                      detail: "Turn delivery confirmed. Resume the queue to continue.",
+                    }),
               }
             : {}),
           awaitingTurnId: null,
           finalizedTurnId: command.turnId,
+          finalization: {
+            turnId: command.turnId,
+            outcome: command.outcome,
+            checkpoint: command.checkpoint,
+          },
           ...(failure && (queue.enabled || resolvedUnknown)
             ? {
                 control: pause({

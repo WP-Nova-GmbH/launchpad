@@ -32,6 +32,13 @@ import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { resolveWorkflowVmGitHub } from "../jobs/WorkflowVmGithub.ts";
 import {
+  readWorkflowVmBinding,
+  requireWorkflowVmViewer,
+  workflowVmHasSecrets,
+} from "../jobs/WorkflowVmBinding.ts";
+import { RelayDb } from "../db.ts";
+import { Repositories } from "../tenancy/Repositories.ts";
+import {
   resolveMembership,
   requireVisibleRepository,
   requireMaintainableRepository,
@@ -39,9 +46,54 @@ import {
 import { tenancyNotFound } from "./tenancyErrors.ts";
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
 
-const jobForClient = (row: WorkflowJobRecord) => ({
-  ...row.record,
-  responsePending: row.pendingControl !== null && !isTerminalWorkflowJob(row.record.status),
+const jobForClient = (row: WorkflowJobRecord) => {
+  const operation = row.pendingControl?.response.operation;
+  return {
+    ...row.record,
+    responsePending: row.pendingControl !== null && !isTerminalWorkflowJob(row.record.status),
+    ...(operation === "approve" || operation === "input" || operation === "request_changes"
+      ? { pendingResponseOperation: operation }
+      : {}),
+  };
+};
+
+const hasFrozenVmSecrets = Effect.fnUntraced(function* (jobId: string) {
+  const db = yield* Effect.serviceOption(RelayDb);
+  if (Option.isNone(db)) return true;
+  return yield* workflowVmHasSecrets(db.value.$client, jobId).pipe(
+    Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })),
+  );
+});
+
+const mayCancelOwnVm = Effect.fnUntraced(function* (row: WorkflowJobRecord, userId: string) {
+  const job = row.record;
+  if (!job.vmAdmission || row.submitterUserId !== userId || job.origin?.kind !== "manual")
+    return false;
+  if (job.runtime?.kind === "vm") return !(yield* hasFrozenVmSecrets(row.jobId));
+  return job.runtime === null && job.workflow === null && !job.vmAdmission.hasSecrets;
+});
+
+const withViewerControls = Effect.fnUntraced(function* (
+  row: WorkflowJobRecord,
+  membership: Effect.Success<ReturnType<typeof authorizeWorkflowRepository>>,
+) {
+  const job = jobForClient(row);
+  if (!job.vmAdmission) return job;
+  const canManage =
+    membership.role === "admin" ||
+    (yield* (yield* Repositories).getAccess({
+      repositoryId: row.repositoryId,
+      userId: membership.userId,
+    })) === "maintainer";
+  const memberCheckpoint = job.progress?.checkpoint?.role === "member";
+  return {
+    ...job,
+    viewerControls: {
+      canCancel: canManage || (yield* mayCancelOwnVm(row, membership.userId)),
+      canApprove: canManage || memberCheckpoint,
+      canRespond: canManage || (memberCheckpoint && !(yield* hasFrozenVmSecrets(row.jobId))),
+    },
+  };
 });
 
 export const refreshWorkflowJobForClient = Effect.fn("WorkflowsApi.refreshForClient")(function* (
@@ -88,18 +140,26 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     payload.operation === "approve" ||
     payload.operation === "input" ||
     payload.operation === "request_changes";
-  const ownQueuedVmCancel =
-    payload.operation === "cancel" &&
-    row.record.vmAdmission?.hasSecrets === false &&
-    row.record.runtime === null &&
-    row.record.workflow === null &&
-    row.submitterUserId === membership.userId &&
-    (row.status === "queued" || row.status === "cancelling" || row.status === "cancelled");
-  if (
-    !ownQueuedVmCancel &&
-    (!checkpointResponse || row.record.progress?.checkpoint?.role !== "member")
-  )
+  const ownCancel =
+    (payload.operation === "cancel" || payload.operation === "retry_cancellation") &&
+    (yield* mayCancelOwnVm(row, membership.userId));
+  const memberResponse =
+    checkpointResponse &&
+    row.record.progress?.checkpoint?.role === "member" &&
+    (payload.operation === "approve" ||
+      row.record.runtime?.kind !== "vm" ||
+      !(yield* hasFrozenVmSecrets(row.jobId)));
+  if (!ownCancel && !memberResponse)
     yield* requireMaintainableRepository({ membership, repositoryId: params.repositoryId });
+  const refreshForViewer = Effect.gen(function* () {
+    const job = (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
+    if (!job.vmAdmission) return job;
+    const latestMembership = yield* authorizeWorkflowRepository(params.repositoryId);
+    const latestRow = (yield* store.getJob(params.jobId)) ?? row;
+    if (latestRow.organizationId !== latestMembership.organization.organizationId)
+      return yield* tenancyNotFound("repository_not_found");
+    return yield* withViewerControls(latestRow, latestMembership);
+  });
   if (payload.operation === "retry_action") {
     const pending = row.pendingControl;
     if (
@@ -173,8 +233,9 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     return yield* new WorkflowConflictError({
       message: "Resume the manual pause before responding or retrying.",
     });
-  if (isTerminalWorkflowJob(row.status)) return jobForClient(row);
-  if (payload.operation === "cancel" && row.status === "cancelling") return jobForClient(row);
+  if (isTerminalWorkflowJob(row.status)) return yield* withViewerControls(row, membership);
+  if (payload.operation === "cancel" && row.status === "cancelling")
+    return yield* withViewerControls(row, membership);
   if (
     (row.pendingControl &&
       !(payload.operation === "cancel" && row.pendingControl.response.operation !== "cancel")) ||
@@ -267,7 +328,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     },
     { userId: membership.userId, response: payload },
   );
-  return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
+  return yield* refreshForViewer;
 });
 const errors = mapRelayCommonApiErrors("not_authorized");
 const sameDefinition = Schema.toEquivalence(WorkflowDefinition);
@@ -566,11 +627,36 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
     )
     .handle("getJob", ({ params }) =>
       Effect.gen(function* () {
-        yield* authorizeWorkflowRepository(params.repositoryId);
+        const membership = yield* authorizeWorkflowRepository(params.repositoryId);
         const row = yield* (yield* Workflows).getJob(params.jobId);
-        if (!row || row.repositoryId !== params.repositoryId)
+        if (
+          !row ||
+          row.repositoryId !== params.repositoryId ||
+          row.organizationId !== membership.organization.organizationId
+        )
           return yield* tenancyNotFound("repository_not_found");
-        return (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
+        const job = (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
+        if (!job.vmAdmission) return job;
+        const latestMembership = yield* authorizeWorkflowRepository(params.repositoryId);
+        const latestRow = (yield* (yield* Workflows).getJob(params.jobId)) ?? row;
+        if (latestRow.organizationId !== latestMembership.organization.organizationId)
+          return yield* tenancyNotFound("repository_not_found");
+        return yield* withViewerControls(latestRow, latestMembership);
+      }).pipe(errors),
+    )
+    .handle("getJobResult", ({ params }) =>
+      Effect.gen(function* () {
+        const membership = yield* authorizeWorkflowRepository(params.repositoryId);
+        const sql = (yield* RelayDb).$client;
+        const scope = { ...params, organizationId: membership.organization.organizationId };
+        return yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* requireWorkflowVmViewer(sql, scope, membership.userId);
+              return (yield* readWorkflowVmBinding(sql, scope)).placement;
+            }),
+          )
+          .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
       }).pipe(errors),
     )
     .handle("respond", ({ params, payload }) => respondToWorkflowJob(params, payload).pipe(errors)),

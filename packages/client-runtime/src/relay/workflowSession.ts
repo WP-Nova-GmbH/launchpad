@@ -7,6 +7,7 @@ import type {
   RepositoryWorkflowJobSummary,
   WorkflowVmTarget,
 } from "@t3tools/contracts/workflows";
+import type { EnvironmentId, ThreadId, OrchestrationGetTurnDiffResult } from "@t3tools/contracts";
 import {
   WorkflowDefinition as WorkflowDefinitionSchema,
   WorkflowAutomation as WorkflowAutomationSchema,
@@ -27,6 +28,13 @@ import {
   RelayTenancyNotFoundError,
   type RelayRepositoryId,
 } from "@t3tools/contracts/relay";
+import {
+  sameWorkflowResultCheckpoint,
+  workflowResultCheckpoint,
+  type WorkflowResultCheckpoint,
+  type WorkflowResultOrigin,
+} from "./workflowResult.ts";
+import { isCompleteWorkflowReviewDiff } from "../state/checkpointDiff.ts";
 
 export interface WorkflowScope {
   readonly accountId: string;
@@ -80,12 +88,28 @@ export interface WorkflowDraftState {
   readonly responses: Record<string, Record<string, string>>;
   readonly manual: Record<string, WorkflowManualSubmission>;
   readonly submitted: Record<string, Record<string, WorkflowDraftSubmission>>;
+  readonly reviews: Record<string, WorkflowReviewVisit>;
+}
+
+interface WorkflowReviewPlacement {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly generation: number;
+}
+
+interface WorkflowReviewVisit {
+  readonly id: string;
+  readonly checkpoint: WorkflowResultCheckpoint;
+  readonly placement: WorkflowReviewPlacement | null;
+  readonly verified: boolean;
+  readonly readAfterEpoch: number;
 }
 
 export interface WorkflowJobRead {
   readonly job: RepositoryWorkflowJob | null;
   readonly highestRevision: number;
   readonly epoch: number;
+  readonly acceptedReadEpoch: number;
   readonly reading: boolean;
   readonly mutation: string | null;
   readonly error: string | null;
@@ -105,6 +129,7 @@ const emptyDrafts = (accountId: string | null): WorkflowDraftState => ({
   responses: {},
   manual: {},
   submitted: {},
+  reviews: {},
 });
 export const workflowDraftAtom = Atom.make(emptyDrafts(null)).pipe(Atom.keepAlive);
 export const workflowJobReadAtom = Atom.make<WorkflowReadState>({
@@ -123,6 +148,7 @@ export const emptyWorkflowJobRead: WorkflowJobRead = {
   job: null,
   highestRevision: -1,
   epoch: 0,
+  acceptedReadEpoch: 0,
   reading: false,
   mutation: null,
   error: null,
@@ -171,10 +197,126 @@ export function clearWorkflowScope(registry: AtomRegistry.AtomRegistry, scope: W
     responses: remove(state.responses),
     manual: remove(state.manual),
     submitted: remove(state.submitted),
+    reviews: remove(state.reviews),
   }));
   const reads = registry.get(workflowJobReadAtom);
   if (reads.accountId === scope.accountId)
     registry.set(workflowJobReadAtom, { ...reads, jobs: remove(reads.jobs) });
+}
+
+/** A failed or abandoned diff visit must still prevent approving without its result. */
+export function beginWorkflowReview(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  jobId: string,
+  id: string,
+  checkpoint: WorkflowResultCheckpoint,
+) {
+  const key = workflowSessionKey(scope, jobId);
+  updateWorkflowDrafts(registry, scope.accountId, (state) => ({
+    ...state,
+    reviews: {
+      ...state.reviews,
+      [key]: {
+        id,
+        checkpoint,
+        placement: null,
+        verified: false,
+        readAfterEpoch: registry.get(workflowJobReadAtom).sequence,
+      },
+    },
+  }));
+}
+
+export function bindWorkflowReviewPlacement(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  jobId: string,
+  id: string,
+  placement: WorkflowReviewPlacement,
+) {
+  const key = workflowSessionKey(scope, jobId);
+  const state = registry.get(workflowDraftAtom);
+  const review = state.reviews[key];
+  if (state.accountId !== scope.accountId || review?.id !== id || review.placement) return;
+  registry.set(workflowDraftAtom, {
+    ...state,
+    reviews: { ...state.reviews, [key]: { ...review, placement } },
+  });
+}
+
+/** Called only by the current visible diff query, never by result navigation alone. */
+export function recordWorkflowReviewDiff(
+  registry: AtomRegistry.AtomRegistry,
+  origin: WorkflowResultOrigin,
+  placement: WorkflowReviewPlacement,
+  diff: OrchestrationGetTurnDiffResult,
+) {
+  const key = workflowSessionKey(origin, origin.jobId);
+  const state = registry.get(workflowDraftAtom);
+  const review = state.reviews[key];
+  if (
+    state.accountId !== origin.accountId ||
+    !review ||
+    review.id !== origin.reviewVisitId ||
+    !origin.reviewCheckpoint ||
+    !sameWorkflowResultCheckpoint(review.checkpoint, origin.reviewCheckpoint) ||
+    origin.threadId !== placement.threadId ||
+    review.verified ||
+    review.placement?.environmentId !== placement.environmentId ||
+    review.placement.threadId !== placement.threadId ||
+    review.placement.generation !== placement.generation ||
+    !isCompleteWorkflowReviewDiff(diff, review.checkpoint.turnId) ||
+    diff.threadId !== placement.threadId ||
+    diff.toTurnCount !== review.checkpoint.checkpointTurnCount ||
+    diff.fromTurnCount !== diff.toTurnCount - 1
+  )
+    return false;
+  registry.set(workflowDraftAtom, {
+    ...state,
+    reviews: {
+      ...state.reviews,
+      [key]: {
+        ...review,
+        verified: true,
+        readAfterEpoch: registry.get(workflowJobReadAtom).sequence,
+      },
+    },
+  });
+  return true;
+}
+
+export function requireFreshWorkflowReviewRead(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  jobId: string,
+) {
+  const key = workflowSessionKey(scope, jobId);
+  const state = registry.get(workflowDraftAtom);
+  const review = state.reviews[key];
+  if (state.accountId !== scope.accountId || !review) return;
+  invalidateWorkflowJobRead(registry, scope, jobId);
+  registry.set(workflowDraftAtom, {
+    ...state,
+    reviews: {
+      ...state.reviews,
+      [key]: { ...review, readAfterEpoch: registry.get(workflowJobReadAtom).sequence },
+    },
+  });
+}
+
+export function workflowReviewApprovalState(
+  review: WorkflowReviewVisit | undefined,
+  read: WorkflowJobRead,
+) {
+  if (!review) return "allowed";
+  if (read.acceptedReadEpoch <= review.readAfterEpoch) return "checking";
+  const checkpoint = workflowResultCheckpoint(read.job?.progress?.checkpoint);
+  return review.verified &&
+    checkpoint &&
+    sameWorkflowResultCheckpoint(review.checkpoint, checkpoint)
+    ? "allowed"
+    : "inspect";
 }
 
 /** The new route and the saved route share one editor from its first allocation. */
@@ -402,6 +544,7 @@ export function settleWorkflowJobRequest(
   registry: AtomRegistry.AtomRegistry,
   request: JobRequest,
   result: RepositoryWorkflowJob | string,
+  accessLost = false,
 ) {
   const state = registry.get(workflowJobReadAtom);
   const previous = state.jobs[request.key];
@@ -410,6 +553,7 @@ export function settleWorkflowJobRequest(
     typeof result !== "string" &&
     result.progress !== null &&
     result.progress.revision < previous.highestRevision;
+  const accepted = typeof result !== "string" && !lowerRevision;
   registry.set(workflowJobReadAtom, {
     ...state,
     jobs: {
@@ -418,13 +562,17 @@ export function settleWorkflowJobRequest(
         ...previous,
         reading: false,
         mutation: null,
+        acceptedReadEpoch:
+          accepted && previous.reading && state.activeKey === request.key
+            ? request.epoch
+            : previous.acceptedReadEpoch,
         error: typeof result === "string" ? result : null,
         highestRevision:
           typeof result === "string"
             ? previous.highestRevision
             : Math.max(previous.highestRevision, result.progress?.revision ?? -1),
         job:
-          state.activeKey !== request.key
+          state.activeKey !== request.key || accessLost
             ? null
             : typeof result === "string" || lowerRevision
               ? previous.job
@@ -432,7 +580,6 @@ export function settleWorkflowJobRequest(
       },
     },
   });
-  const accepted = typeof result !== "string" && !lowerRevision;
   if (accepted)
     updateWorkflowDrafts(registry, request.accountId, (drafts) => {
       let responses = drafts.responses[request.key] ?? {};
@@ -556,8 +703,8 @@ export function settleWorkflowJobPage(
   };
 }
 
-/** A definite access rejection must not keep repository summaries visible as offline data. */
-export const workflowJobPageAccessLost = Schema.is(
+/** A definite access rejection must not keep run data visible as offline data. */
+export const workflowJobAccessLost = Schema.is(
   Schema.Struct({
     cause: Schema.Union([
       RelayAuthInvalidError,

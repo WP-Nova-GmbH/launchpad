@@ -1,4 +1,5 @@
 import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
+import { readThreadVmInitialState } from "../relay/ThreadVmInitialStateRecord.ts";
 import { applyRepositoryPolicyProof } from "./repositoryPolicy.ts";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import * as NodeCrypto from "node:crypto";
@@ -6,6 +7,7 @@ import {
   AuthRelayReadScope,
   AuthRelayWriteScope,
   AuthStandardClientScopes,
+  AuthOrchestrationReadScope,
   EnvironmentCloudEndpointUnavailableError,
   EnvironmentCloudLinkStateResult,
   EnvironmentCloudRelayConfigResult,
@@ -42,7 +44,9 @@ import {
   RelayManagedEndpointRecoveryResponse,
   type RelayManagedEndpointRuntimeConfig,
   RelayOkResponse,
+  WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES,
 } from "@t3tools/contracts/relay";
+import type { WorkflowControlResult } from "@t3tools/contracts/workflows";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import {
   normalizeRelayIssuer,
@@ -1704,7 +1708,7 @@ export const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCrede
     // The relay vouched for `sub`; carrying the person into the session is
     // what lets a shared executor say who wrote what.
     const issued = yield* dependencies.environmentAuth.createPairingLink({
-      scopes: AuthStandardClientScopes,
+      scopes: repositoryAccess.workflowVm ? [AuthOrchestrationReadScope] : AuthStandardClientScopes,
       subject: "cloud-connect",
       ttl: Duration.minutes(2),
       label: "Launchpad Connect connect",
@@ -1810,6 +1814,62 @@ const resolveDispatchJobProject = Effect.fn("environment.cloud.resolveDispatchJo
   },
 );
 
+const encodeWorkflowResponseClaims = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+// The outer JSON repeats the result, and base64url expands the JWT claims by 4/3.
+// Reserve room for the EdDSA header/signature and the remaining response framing.
+const workflowResponseClaimsMaxBytes = Math.floor(
+  ((WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES - 1024) * 3) / 7,
+);
+const workflowResponseTextEncoder = new TextEncoder();
+const workflowResponseTooLarge = () =>
+  new EnvironmentHttpInternalServerError({ message: "Workflow response exceeds its byte budget." });
+const boundWorkflowResponseDetail = (detail: string | null) =>
+  detail !== null && detail.length > 2000 ? `${detail.slice(0, 1999)}…` : detail;
+
+const boundWorkflowVmResponseClaims = Effect.fnUntraced(function* (
+  claims: RelayEnvironmentDispatchJobResponseProofPayload & {
+    readonly workflowResult: WorkflowControlResult;
+  },
+  addressedCheckpoint?: string,
+) {
+  const result = claims.workflowResult;
+  const progress = result.progress
+    ? { ...result.progress, detail: boundWorkflowResponseDetail(result.progress.detail) }
+    : null;
+  const bounded = {
+    ...claims,
+    workflowResult: { ...result, detail: boundWorkflowResponseDetail(result.detail), progress },
+  };
+  const fits = (candidate: typeof bounded) =>
+    encodeWorkflowResponseClaims(candidate).pipe(
+      Effect.map(
+        (json) =>
+          workflowResponseTextEncoder.encode(json).byteLength <= workflowResponseClaimsMaxBytes,
+      ),
+      Effect.mapError(workflowResponseTooLarge),
+    );
+  if (yield* fits(bounded)) return bounded;
+  if (!progress) return yield* workflowResponseTooLarge();
+
+  const responses = progress.responses ?? [];
+  const addressedIndex = responses.findLastIndex(
+    (item) => item.checkpointId === addressedCheckpoint,
+  );
+  // ponytail: trim older previews in batches rather than packing every last entry.
+  for (let keep = responses.length; keep > 1;) {
+    keep = Math.ceil(keep / 2);
+    const start = responses.length - keep;
+    const recent = responses.slice(start);
+    if (addressedIndex >= 0 && addressedIndex < start) recent.unshift(responses[addressedIndex]!);
+    const candidate = {
+      ...bounded,
+      workflowResult: { ...bounded.workflowResult, progress: { ...progress, responses: recent } },
+    };
+    if (yield* fits(candidate)) return candidate;
+  }
+  return yield* workflowResponseTooLarge();
+});
+
 /**
  * Relay → environment job dispatch (ADR-0005: the relay triggers, the executor
  * orchestrates).
@@ -1826,10 +1886,19 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
     request: RelayCloudDispatchJobRequest,
     workflowOnly = false,
   ) {
-    const cloudMintPublicKey = yield* readCloudMintPublicKey(dependencies.secrets);
-    const relayIssuer = yield* readCloudRelayIssuer(dependencies.secrets);
+    const invalidWorkflow = () =>
+      new EnvironmentHttpUnauthorizedError({
+        message: "This workflow request is not bound to the enrolled environment.",
+      });
+    const vm = yield* readInstalledThreadVm().pipe(
+      Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+      Effect.mapError(invalidWorkflow),
+    );
+    const cloudMintPublicKey =
+      vm?.cloudMintPublicKey ?? (yield* readCloudMintPublicKey(dependencies.secrets));
+    const relayIssuer = vm?.relayIssuer ?? (yield* readCloudRelayIssuer(dependencies.secrets));
     const environmentId = yield* dependencies.environment.getEnvironmentId;
-    const principal = yield* readInstalledCloudPrincipal(dependencies.secrets);
+    const principal = vm ? null : yield* readInstalledCloudPrincipal(dependencies.secrets);
     const now = yield* DateTime.now;
     const nowSeconds = Math.floor(now.epochMilliseconds / 1_000);
     const proofOption = yield* verifyRelayJwt({
@@ -1849,7 +1918,7 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
       // enrolled machine every organization member may dispatch; the relay
       // resolved that membership before signing, so the signature carries the
       // authorization.
-      (principal.kind === "user" && proofOption.value.sub !== principal.userId) ||
+      (principal?.kind === "user" && proofOption.value.sub !== principal.userId) ||
       !hasBoundedCloudProofLifetime({ ...proofOption.value, nowSeconds })
     ) {
       return yield* new EnvironmentHttpUnauthorizedError({
@@ -1858,11 +1927,66 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
     }
     const proof = proofOption.value;
     const origin = proof.workflowOrigin;
+    const binding = proof.workflowVmBinding;
+    let workflowVm: import("../jobs/RepositoryWorkflowRunner.ts").WorkflowRequest["workflowVm"];
+    if (vm || binding) {
+      const control = proof.workflowControl;
+      if (
+        !workflowOnly ||
+        !vm ||
+        !binding ||
+        !control ||
+        !origin ||
+        binding.jobId !== proof.jobId ||
+        binding.organizationId !== control.organizationId ||
+        binding.repositoryId !== control.repositoryId ||
+        binding.projectId !== control.projectId ||
+        binding.environmentId !== environmentId ||
+        binding.environmentId !== vm.environmentId ||
+        binding.threadId !== vm.scope.threadId ||
+        binding.allocationId !== vm.scope.allocationId ||
+        binding.repositoryId !== vm.scope.repositoryId ||
+        binding.generation !== vm.scope.generation ||
+        binding.operationId !== vm.operationId ||
+        (control.operation === "start" &&
+          (control.runtime.kind !== "vm" ||
+            control.runtime.threadId !== binding.threadId ||
+            control.workflow.definition.target.kind !== "vm"))
+      )
+        return yield* invalidWorkflow();
+      const state = yield* readThreadVmInitialState().pipe(
+        Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+        Effect.mapError(invalidWorkflow),
+      );
+      const receipt = state?.receipt;
+      if (
+        !state?.input.workflow ||
+        !receipt ||
+        state.input.workflow.jobId !== binding.jobId ||
+        state.input.workflow.organizationId !== binding.organizationId ||
+        state.input.workspace.canonicalKey !== proof.repositoryCanonicalKey ||
+        receipt.projectId !== binding.projectId ||
+        receipt.environmentId !== binding.environmentId ||
+        receipt.operationId !== binding.operationId ||
+        receipt.scope.generation !== binding.generation ||
+        receipt.scope.threadId !== binding.threadId ||
+        receipt.scope.repositoryId !== binding.repositoryId ||
+        receipt.scope.allocationId !== binding.allocationId ||
+        receipt.workspaceRoot !== state.workspaceRoot
+      )
+        return yield* invalidWorkflow();
+      workflowVm = {
+        binding,
+        workspaceRoot: state.workspaceRoot,
+        baseBranch: state.input.workflow.baseBranch,
+        baseSha: receipt.revision,
+      };
+    }
     if (
       (origin === undefined && proof.sub.startsWith("workflow:")) ||
       (origin !== undefined && !proof.workflowControl) ||
       (origin?.kind === "automation" &&
-        (principal.kind !== "machine" ||
+        ((!workflowVm && principal?.kind !== "machine") ||
           proof.sub !== `workflow:${proof.jobId}` ||
           origin.organizationId !== proof.workflowControl?.organizationId ||
           origin.repositoryId !== proof.workflowControl?.repositoryId ||
@@ -1878,8 +2002,9 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
       });
     if (
       workflowOnly !== (proof.workflowControl !== undefined) ||
-      (proof.workflowControl !== undefined &&
-        (principal.kind !== "machine" ||
+      (!workflowVm &&
+        proof.workflowControl !== undefined &&
+        (principal?.kind !== "machine" ||
           principal.organizationId !== proof.workflowControl.organizationId ||
           (proof.workflowControl.operation === "start" &&
             (proof.workflowControl.runtime.kind !== "machine" ||
@@ -1924,6 +2049,7 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
                 repositoryCanonicalKey: proof.repositoryCanonicalKey,
                 instruction: proof.instruction,
                 control: proof.workflowControl,
+                ...(workflowVm ? { workflowVm } : {}),
               })
               .pipe(
                 Effect.catch(
@@ -1945,15 +2071,23 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
         workflowResult,
         requestId: proof.jti,
       } satisfies RelayEnvironmentDispatchJobResponseProofPayload;
+      const signedPayload = workflowVm
+        ? yield* boundWorkflowVmResponseClaims(
+            responsePayload,
+            "checkpointId" in proof.workflowControl
+              ? proof.workflowControl.checkpointId
+              : undefined,
+          )
+        : responsePayload;
       const responseProof = yield* signRelayJwt({
         privateKey: keyPair.privateKey,
         typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
-        payload: responsePayload,
+        payload: signedPayload,
       });
       yield* appendCloudCredentialResponseHeaders;
       return {
         accepted,
-        workflowResult,
+        workflowResult: signedPayload.workflowResult,
         proof: responseProof,
       } satisfies RelayEnvironmentDispatchJobResponseShape;
     }

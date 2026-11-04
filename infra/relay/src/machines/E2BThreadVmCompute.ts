@@ -235,7 +235,7 @@ export const makeE2BThreadVmCompute = (
   return {
     restore,
     pausedSnapshotsSupported: Effect.succeed(true),
-    create: (input: ThreadVmCreateInput) => create(input),
+    create: (input: ThreadVmCreateInput, templateId?: string) => create(input, templateId),
     /** Native restore starts executing immediately; callers must commit ownership first. */
     createFromSnapshot: Effect.fn("E2BThreadVmCompute.createFromSnapshot")(function* (
       input: ThreadVmSnapshotCreateInput,

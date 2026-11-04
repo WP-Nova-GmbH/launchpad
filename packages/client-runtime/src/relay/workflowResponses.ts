@@ -14,6 +14,18 @@ export interface WorkflowDraftSubmission {
   readonly text: string | null;
 }
 
+export function workflowViewerControls(job: RepositoryWorkflowJob | null, canConfigure: boolean) {
+  if (job?.viewerControls) return job.viewerControls;
+  if (!job || job.vmAdmission || job.runtime?.kind === "vm")
+    return { canCancel: false, canApprove: false, canRespond: false };
+  const checkpointAllowed = canConfigure || job.progress?.checkpoint?.role === "member";
+  return { canCancel: canConfigure, canApprove: checkpointAllowed, canRespond: checkpointAllowed };
+}
+
+export function workflowApprovalPending(job: RepositoryWorkflowJob | null): boolean {
+  return job?.pendingResponseOperation === "approve" || job?.progress?.approvalPending === true;
+}
+
 /** Clear only the submitted draft, after exact durable evidence; edits made during delivery survive. */
 export function clearAcknowledgedWorkflowDraft(
   drafts: Record<string, string>,
@@ -51,6 +63,8 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
   const hold = progress?.manualPause;
   const pending = job?.pendingManualControl;
   const responsePending = job?.responsePending === true && !isTerminalWorkflowJob(job.status);
+  const approvalPending =
+    !!job && !isTerminalWorkflowJob(job.status) && workflowApprovalPending(job);
   const status = progress?.underlyingStatus ?? progress?.status;
   const eligible =
     progress?.manualPauseSupported === true &&
@@ -74,15 +88,17 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
     status,
     message: pending
       ? `${pending.operation === "pause" ? "Pause" : "Resume"} requested; waiting for the environment.`
-      : responsePending
-        ? "Response pending; waiting for the environment."
-        : hold?.state === "paused"
-          ? "Paused. Setup and previews remain running."
-          : hold?.state === "requested"
-            ? status === "paused"
-              ? "Pause is waiting for recovery. Resume preserves the existing failure."
-              : "Pausing after the current automatic step, including its preparation."
-            : null,
+      : approvalPending
+        ? "Approval pending; waiting for the environment."
+        : responsePending
+          ? "Response pending; waiting for the environment."
+          : hold?.state === "paused"
+            ? "Paused. Setup and previews remain running."
+            : hold?.state === "requested"
+              ? status === "paused"
+                ? "Pause is waiting for recovery. Resume preserves the existing failure."
+                : "Pausing after the current automatic step, including its preparation."
+              : null,
   };
 }
 

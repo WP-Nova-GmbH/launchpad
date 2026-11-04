@@ -1,4 +1,12 @@
-import { WorkflowControlResult } from "@t3tools/contracts/workflows";
+import { WorkflowControlResult, WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import { RelayDb } from "../db.ts";
+import { RelaySecretBox } from "../auth/SecretBox.ts";
+import { readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
+import {
+  makeE2BThreadVmEndpoint,
+  WorkflowVmPrivateIngress,
+} from "../machines/E2BThreadVmEndpoint.ts";
+import { threadVmEndpointOwner } from "../threads/threadVmEndpointOwner.ts";
 import * as RepositoryPolicies from "../tenancy/RepositoryPolicies.ts";
 import {
   EnvironmentHttpBadRequestError,
@@ -210,6 +218,7 @@ export class EnvironmentConnector extends Context.Service<
       readonly baseBranch: string;
       readonly instruction: string;
       readonly workflowControl?: import("@t3tools/contracts/workflows").WorkflowControl;
+      readonly workflowVmBinding?: WorkflowVmDispatchBinding;
     }) => Effect.Effect<EnvironmentDispatchJobResult, EnvironmentConnectorError>;
   }
 >()("launchpad-relay/environments/EnvironmentConnector") {}
@@ -397,6 +406,9 @@ export function verifyEnvironmentHealthResponse(input: {
 }
 
 const make = Effect.gen(function* () {
+  const db = yield* Effect.serviceOption(RelayDb);
+  const box = yield* Effect.serviceOption(RelaySecretBox);
+  const workflowIngress = yield* WorkflowVmPrivateIngress;
   const repositoryPolicies = yield* RepositoryPolicies.RepositoryPolicyControl;
   const links = yield* EnvironmentLinks.EnvironmentLinks;
   const allocations = yield* ManagedEndpointAllocations.ManagedEndpointAllocations;
@@ -915,54 +927,173 @@ const make = Effect.gen(function* () {
         "relay.operation": "dispatch-job",
         "relay.job_id": input.jobId,
       });
-      const { access: link, allocation } = yield* input.workflowControl === undefined
-        ? resolveAccessAndAllocation({
-            userId: input.userId!,
-            environmentId: input.environmentId,
-            operation: "dispatch-job",
-          })
-        : Effect.gen(function* () {
-            const machine = yield* machines.getActiveByEnvironmentId({
-              environmentId: input.environmentId,
-            });
-            const identity = machine === null ? null : Machines.enrolledMachineIdentity(machine);
+      const vm = input.workflowVmBinding;
+      const mapDeliveryFailure = (cause: unknown) =>
+        new EnvironmentMintRequestFailed({
+          environmentId: input.environmentId,
+          operation: "dispatch-job",
+          cause,
+        });
+      const destination = yield* vm
+        ? Effect.gen(function* () {
+            const control = input.workflowControl;
             if (
-              machine === null ||
-              identity === null ||
-              machine.organizationId !== input.workflowControl!.organizationId
-            ) {
-              return yield* new EnvironmentConnectNotAuthorized({
+              Option.isNone(db) ||
+              !control ||
+              vm.environmentId !== input.environmentId ||
+              vm.jobId !== input.jobId ||
+              vm.organizationId !== control.organizationId ||
+              vm.repositoryId !== control.repositoryId ||
+              vm.projectId !== control.projectId
+            )
+              return yield* new EnvironmentMintResponseInvalid({
                 environmentId: input.environmentId,
                 operation: "dispatch-job",
-                reason: "environment_link_not_found",
               });
+            const resolved = yield* readWorkflowVmBinding(db.value.$client, vm).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new EnvironmentMintRequestFailed({
+                    environmentId: input.environmentId,
+                    operation: "dispatch-job",
+                    cause,
+                  }),
+              ),
+            );
+            if (
+              !Schema.toEquivalence(WorkflowVmDispatchBinding)(resolved.binding, vm) ||
+              resolved.snapshot.canonicalKey !== input.repositoryCanonicalKey ||
+              resolved.snapshot.branch !== input.baseBranch
+            )
+              return yield* new EnvironmentMintResponseInvalid({
+                environmentId: input.environmentId,
+                operation: "dispatch-job",
+              });
+            if (!workflowIngress) {
+              const allocation = yield* allocations.get({
+                userId: threadVmEndpointOwner(vm.allocationId),
+                environmentId: vm.environmentId,
+              });
+              const endpoint =
+                allocation &&
+                ManagedEndpointAllocations.resolveReadyManagedEndpoint({
+                  allocation,
+                  baseDomain: settings.managedEndpointBaseDomain,
+                });
+              if (
+                !endpoint ||
+                allocation.origin?.localHttpHost !== "127.0.0.1" ||
+                allocation.origin.localHttpPort !== 3773
+              )
+                return yield* new EnvironmentConnectNotAuthorized({
+                  environmentId: input.environmentId,
+                  operation: "dispatch-job",
+                  reason: "managed_endpoint_allocation_not_ready",
+                });
+              const client = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
+              return {
+                environmentId: vm.environmentId,
+                environmentPublicKey: resolved.environmentPublicKey,
+                deliver: (proof: string) =>
+                  client.connect
+                    .t3WorkflowJob({ payload: { proof } })
+                    .pipe(withoutRedirects, Effect.mapError(mapDeliveryFailure)),
+              };
             }
-            const access = {
-              environmentId: EnvironmentId.make(identity.environmentId),
-              environmentPublicKey: identity.environmentPublicKey,
-              endpoint: identity.endpoint,
-              allocationOwnerKey: Machines.machineEndpointOwnerKey(machine.organizationId),
-              source: "machine",
-            } satisfies EnvironmentAccess;
-            const allocation = yield* allocations.get({
-              userId: access.allocationOwnerKey,
-              environmentId: input.environmentId,
+            if (Option.isNone(box))
+              return yield* new EnvironmentMintResponseInvalid({
+                environmentId: input.environmentId,
+                operation: "dispatch-job",
+              });
+            const endpoint = makeE2BThreadVmEndpoint(workflowIngress);
+            return {
+              environmentId: vm.environmentId,
+              environmentPublicKey: resolved.environmentPublicKey,
+              deliver: (proof: string) =>
+                endpoint
+                  .dispatchWorkflow(
+                    resolved.sandboxId,
+                    {
+                      operationId: vm.operationId,
+                      templateId: resolved.templateId,
+                      scope: {
+                        allocationId: vm.allocationId,
+                        threadId: vm.threadId,
+                        generation: vm.generation,
+                        repositoryId: vm.repositoryId,
+                      },
+                    },
+                    proof,
+                  )
+                  .pipe(
+                    Effect.provideService(RelayDb, db.value),
+                    Effect.provideService(RelaySecretBox, box.value),
+                    Effect.mapError(mapDeliveryFailure),
+                  ),
+            };
+          })
+        : Effect.gen(function* () {
+            const { access: link, allocation } = yield* input.workflowControl === undefined
+              ? resolveAccessAndAllocation({
+                  userId: input.userId!,
+                  environmentId: input.environmentId,
+                  operation: "dispatch-job",
+                })
+              : Effect.gen(function* () {
+                  const machine = yield* machines.getActiveByEnvironmentId({
+                    environmentId: input.environmentId,
+                  });
+                  const identity =
+                    machine === null ? null : Machines.enrolledMachineIdentity(machine);
+                  if (
+                    machine === null ||
+                    identity === null ||
+                    machine.organizationId !== input.workflowControl!.organizationId
+                  ) {
+                    return yield* new EnvironmentConnectNotAuthorized({
+                      environmentId: input.environmentId,
+                      operation: "dispatch-job",
+                      reason: "environment_link_not_found",
+                    });
+                  }
+                  const access = {
+                    environmentId: EnvironmentId.make(identity.environmentId),
+                    environmentPublicKey: identity.environmentPublicKey,
+                    endpoint: identity.endpoint,
+                    allocationOwnerKey: Machines.machineEndpointOwnerKey(machine.organizationId),
+                    source: "machine",
+                  } satisfies EnvironmentAccess;
+                  const allocation = yield* allocations.get({
+                    userId: access.allocationOwnerKey,
+                    environmentId: input.environmentId,
+                  });
+                  return { access, allocation };
+                });
+            const endpoint = yield* resolveManagedEndpoint({
+              operation: "dispatch-job",
+              link,
+              allocation,
             });
-            return { access, allocation };
+            const client = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
+            return {
+              environmentId: link.environmentId,
+              environmentPublicKey: link.environmentPublicKey,
+              deliver: (proof: string) =>
+                (input.workflowControl === undefined
+                  ? client.connect.t3DispatchJob({ payload: { proof } })
+                  : client.connect.t3WorkflowJob({ payload: { proof } })
+                ).pipe(withoutRedirects, Effect.mapError(mapDeliveryFailure)),
+            };
           });
-      const endpoint = yield* resolveManagedEndpoint({
-        operation: "dispatch-job",
-        link,
-        allocation,
-      });
       const now = yield* DateTime.now;
       const expiresAt = DateTime.add(now, { minutes: 2 });
       const payload = {
         iss: relayIssuer,
-        aud: `t3-env:${link.environmentId}`,
+        aud: `t3-env:${destination.environmentId}`,
         sub: subject,
         ...(origin === undefined ? {} : { workflowOrigin: origin }),
         ...(input.requestedBy === undefined ? {} : { requestedBy: input.requestedBy }),
+        ...(vm === undefined ? {} : { workflowVmBinding: vm }),
         jti: yield* crypto.randomUUIDv4.pipe(
           Effect.mapError(
             (cause) =>
@@ -975,7 +1106,7 @@ const make = Effect.gen(function* () {
         ),
         iat: Math.floor(now.epochMilliseconds / 1_000),
         exp: Math.floor(expiresAt.epochMilliseconds / 1_000),
-        environmentId: link.environmentId,
+        environmentId: destination.environmentId,
         jobId: input.jobId,
         repositoryCanonicalKey: input.repositoryCanonicalKey,
         baseBranch: input.baseBranch,
@@ -996,23 +1127,9 @@ const make = Effect.gen(function* () {
             }),
         ),
       );
-      const environmentClient = yield* makeEnvironmentClient(endpoint.httpBaseUrl);
       // Returns when the environment has *accepted* the job, never when the job
       // is done: a run takes minutes and this request has seconds.
-      const decoded = yield* (
-        input.workflowControl === undefined
-          ? environmentClient.connect.t3DispatchJob({ payload: { proof } })
-          : environmentClient.connect.t3WorkflowJob({ payload: { proof } })
-      ).pipe(
-        withoutRedirects,
-        Effect.mapError(
-          (cause) =>
-            new EnvironmentMintRequestFailed({
-              environmentId: input.environmentId,
-              operation: "dispatch-job",
-              cause,
-            }),
-        ),
+      const decoded = yield* destination.deliver(proof).pipe(
         Effect.timeoutOption(Duration.millis(ENVIRONMENT_DISPATCH_JOB_REQUEST_TIMEOUT_MS)),
         Effect.flatMap(
           Option.match({
@@ -1032,7 +1149,7 @@ const make = Effect.gen(function* () {
         response: decoded,
         environmentId: input.environmentId,
         jobId: input.jobId,
-        environmentPublicKeys: [link.environmentPublicKey],
+        environmentPublicKeys: [destination.environmentPublicKey],
         ...(input.workflowControl === undefined ? {} : { requestId: payload.jti }),
         relayIssuer,
         nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),

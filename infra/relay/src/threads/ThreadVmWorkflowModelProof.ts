@@ -4,12 +4,14 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 export const WORKFLOW_VM_MODEL_PROOF_VERSION = 2;
+export const WORKFLOW_VM_ISOLATION_VERSION = 1;
 
 export const WorkflowVmModelProof = Schema.Struct({
   schemaVersion: Schema.Literal(WORKFLOW_VM_MODEL_PROOF_VERSION),
   templateRef: TrimmedNonEmptyString,
   buildId: TrimmedNonEmptyString,
   catalog: WorkflowVmModelCatalog,
+  isolationVersion: Schema.optional(Schema.Int),
 }).check(
   Schema.makeFilter(({ catalog }) => {
     const slugs = new Set(catalog.models.map(({ slug }) => slug));
@@ -31,14 +33,12 @@ const decodeProof = Schema.decodeUnknownOption(Schema.fromJsonString(WorkflowVmM
 export const workflowVmModelProofPath = (selectionPath: string, buildId: string) =>
   `${selectionPath}.workflow-models.${buildId}.json`;
 
-export function verifiedWorkflowVmModelCatalog(
+export function verifiedWorkflowVmModelProof(
   content: string,
   templateRef: string,
   buildId: string,
 ) {
   if (content.length > 64 * 1024) return undefined;
   const proof = Option.getOrUndefined(decodeProof(content));
-  return proof?.templateRef === templateRef && proof.buildId === buildId
-    ? proof.catalog
-    : undefined;
+  return proof?.templateRef === templateRef && proof.buildId === buildId ? proof : undefined;
 }

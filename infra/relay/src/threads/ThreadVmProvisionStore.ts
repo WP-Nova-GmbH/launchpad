@@ -4,13 +4,19 @@ import { makeThreadVmEnrollmentStore } from "./ThreadVmEnrollmentStore.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
+import {
+  makeThreadVmAllocationStore,
+  type ThreadVmResourceKind,
+} from "./ThreadVmAllocationStore.ts";
+import type { relayThreadVmProvisions } from "../persistence/schema.ts";
 
 export class ThreadVmProvisionConflict extends Schema.TaggedError<ThreadVmProvisionConflict>()(
   "ThreadVmProvisionConflict",
   { message: Schema.String },
 ) {}
 export interface ThreadVmProvision {
+  readonly resourceKind: ThreadVmResourceKind;
+  readonly workflowSnapshot: (typeof relayThreadVmProvisions.$inferSelect)["workflowSnapshot"];
   readonly allocationId: string;
   readonly operationId: string;
   readonly generation: number;
@@ -29,13 +35,18 @@ const conflict = (message: string) => new ThreadVmProvisionConflict({ message })
 export function makeThreadVmProvisionStore(sql: PgClient) {
   const allocations = makeThreadVmAllocationStore(sql);
   const capacity = makeThreadVmCapacityStore(sql);
-  const get = Effect.fn("relay.thread_vm_provision.get")(function* (allocationId: string) {
+  const get = Effect.fn("relay.thread_vm_provision.get")(function* (
+    allocationId: string,
+    resourceKind?: ThreadVmResourceKind,
+  ) {
     const [row] =
       yield* sql<ThreadVmProvision>`SELECT p.allocation_id AS "allocationId", p.operation_id AS "operationId", p.generation,
       a.thread_id AS "threadId", a.template_id AS "templateId", a.compute_ref AS "computeRef", a.state AS "allocationState",
+      a.resource_kind AS "resourceKind", p.workflow_snapshot AS "workflowSnapshot",
       p.phase, p.claim_id AS "claimId", p.ingress_recovery_claim_id AS "ingressRecoveryClaimId", p.error_code AS "errorCode"
       FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
-      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND p.allocation_id = ${allocationId}`;
+      WHERE a.runtime_protocol='native-v1' AND p.allocation_id = ${allocationId}
+        AND a.resource_kind=${resourceKind ?? "personal"}`;
     return row ?? null;
   });
   const enqueue = Effect.fn("relay.thread_vm_provision.enqueue")(function* (input: {
@@ -72,15 +83,19 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   const claim = Effect.fn("relay.thread_vm_provision.claim")(function* (
     claimId: string,
     hostId: string,
+    includeWorkflow = false,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const [candidate] = yield* sql<{
           allocationId: string;
-        }>`SELECT p.allocation_id AS "allocationId" FROM relay_thread_vm_provisions p
+          resourceKind: ThreadVmResourceKind;
+        }>`SELECT p.allocation_id AS "allocationId",a.resource_kind AS "resourceKind" FROM relay_thread_vm_provisions p
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id = p.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (${includeWorkflow}
+          AND a.resource_kind='organization_workflow' AND p.workflow_snapshot IS NOT NULL))
+        AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
         AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         AND p.ingress_recovery_claim_id IS NULL
         AND (c.state IN ('reserved', 'started') OR a.state = 'deleting')
@@ -88,14 +103,15 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         if (!candidate) return null;
         yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1
         WHERE allocation_id = ${candidate.allocationId}`;
-        return yield* get(candidate.allocationId);
+        return yield* get(candidate.allocationId, candidate.resourceKind);
       }),
     );
   });
   const locked = Effect.fnUntraced(function* (input: { allocationId: string; claimId: string }) {
     // All writers take allocation then operation, including cancellation and late create receipts.
-    const [allocation] =
-      yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' AND resource_kind='personal' FOR UPDATE`;
+    const [allocation] = yield* sql<{ resourceKind: ThreadVmResourceKind }>`
+      SELECT resource_kind AS "resourceKind" FROM relay_thread_vm_allocations
+      WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
     if (!allocation)
       return yield* conflict(
         "This VM belongs to an earlier runtime and requires manual migration.",
@@ -103,7 +119,9 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     const rows = yield* sql`SELECT allocation_id FROM relay_thread_vm_provisions
       WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp() FOR UPDATE`;
     if (!rows.length) return yield* conflict("Provisioning worker claim expired or changed");
-    const row = (yield* get(input.allocationId))!;
+    const row = yield* get(input.allocationId, allocation.resourceKind);
+    if (!row || (row.resourceKind === "organization_workflow" && !row.workflowSnapshot))
+      return yield* conflict("Workflow provisioning has no frozen intent");
     if (row.ingressRecoveryClaimId !== null)
       return yield* conflict("VM ingress recovery is in flight or unconfirmed; retain capacity");
     return row;
@@ -119,8 +137,11 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         if (row.phase !== "pending" || row.allocationState !== "creating")
           return yield* conflict("VM creation is already attempted or cancelled");
         // Choose the current image at first creation, then retain it for recovery and enrollment.
-        yield* sql`UPDATE relay_thread_vm_allocations SET template_id = ${input.templateId}
-          WHERE allocation_id = ${input.allocationId}`;
+        if (row.workflowSnapshot && row.templateId !== input.templateId)
+          return yield* conflict("Workflow provisioning template changed");
+        if (!row.workflowSnapshot)
+          yield* sql`UPDATE relay_thread_vm_allocations SET template_id = ${input.templateId}
+            WHERE allocation_id = ${input.allocationId}`;
         yield* capacity.beginExecution(row.operationId);
         yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating' WHERE allocation_id = ${input.allocationId}`;
         return {
@@ -150,7 +171,29 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         yield* capacity.recordCreated(row.operationId, input.computeRef);
         yield* sql`UPDATE relay_thread_vm_allocations SET compute_ref=${input.computeRef}
         WHERE allocation_id=${input.allocationId}`;
-        return (yield* get(input.allocationId))!;
+        return (yield* get(input.allocationId, row.resourceKind))!;
+      }),
+    );
+  });
+  const returnWorkflowReservation = Effect.fn(
+    "relay.thread_vm_provision.return_workflow_reservation",
+  )(function* (input: {
+    allocationId: string;
+    claimId: string;
+    errorCode: "workflow_disabled" | "workflow_codex_unavailable" | "workflow_template_unverified";
+  }) {
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (!row.workflowSnapshot || row.phase !== "pending" || row.computeRef !== null)
+          return yield* conflict("Workflow creation may already have started");
+        const released = yield* sql`UPDATE relay_thread_vm_capacity SET state='waiting'
+            WHERE allocation_id=${row.allocationId} AND operation_id=${row.operationId}
+              AND state='reserved' AND compute_ref IS NULL RETURNING operation_id`;
+        if (!released.length) return yield* conflict("Workflow reservation is no longer unused");
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id=NULL,claim_until=NULL,
+            error_code=${input.errorCode},retry_at=clock_timestamp()+interval '30 seconds'
+            WHERE allocation_id=${row.allocationId}`;
       }),
     );
   });
@@ -228,7 +271,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         const row = yield* locked(input);
         if (row.phase !== "creating" || row.computeRef !== input.computeRef)
           return yield* conflict("Cancellation requires the current known compute identity");
-        yield* allocations.requestDeletion(row.allocationId);
+        yield* allocations.requestDeletion(row.allocationId, row.resourceKind);
       }),
     );
   });
@@ -246,9 +289,9 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         if (row.allocationState !== "deleting" && !input.sealedTrafficAccessToken)
           return yield* conflict("Provisioning requires its private ingress credential");
         yield* capacity.recordCreated(row.operationId, input.computeRef);
-        yield* allocations.recordCreated(input);
+        yield* allocations.recordCreated({ ...input, resourceKind: row.resourceKind });
         yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'created', claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
-        return (yield* get(input.allocationId))!;
+        return (yield* get(input.allocationId, row.resourceKind))!;
       }),
     );
   });
@@ -275,7 +318,11 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
           )
             return yield* conflict("External VM creation may already have started");
           yield* capacity.cancelUnstarted(row.operationId);
-          yield* allocations.confirmDeleted({ allocationId: input.allocationId, computeRef: null });
+          yield* allocations.confirmDeleted({
+            allocationId: input.allocationId,
+            computeRef: null,
+            resourceKind: row.resourceKind,
+          });
           yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'cancelled', claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
         }),
       );
@@ -287,7 +334,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         Effect.gen(function* () {
           const row = yield* locked(input);
           if (row.phase !== "pending") return yield* conflict("Creation may already have started");
-          yield* allocations.requestDeletion(row.allocationId);
+          yield* allocations.requestDeletion(row.allocationId, row.resourceKind);
           yield* cancelUnstarted(input);
           yield* sql`UPDATE relay_thread_vm_provisions SET error_code = 'access_denied' WHERE allocation_id = ${row.allocationId}`;
         }),
@@ -297,22 +344,28 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   const claimEnrollment = Effect.fn("relay.thread_vm_provision.claim_enrollment")(function* (
     claimId: string,
     hostId: string,
+    includeWorkflow = false,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const [candidate] = yield* sql<{
           allocationId: string;
-        }>`SELECT p.allocation_id AS "allocationId"
+          resourceKind: ThreadVmResourceKind;
+        }>`SELECT p.allocation_id AS "allocationId",a.resource_kind AS "resourceKind"
         FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         LEFT JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (${includeWorkflow}
+          AND a.resource_kind='organization_workflow' AND p.workflow_snapshot IS NOT NULL
+          AND EXISTS (SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+            WHERE t.thread_id=a.thread_id AND t.operation_id=p.operation_id AND j.status='preparing' AND j.pending_control IS NULL)))
+          AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
           AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
         yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1
         WHERE allocation_id = ${candidate.allocationId}`;
-        return yield* get(candidate.allocationId);
+        return yield* get(candidate.allocationId, candidate.resourceKind);
       }),
     );
   });
@@ -331,7 +384,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
             row.operationId !== input.receipt.operationId
           )
             return yield* conflict("Enrollment reply belongs to a different operation");
-          yield* makeThreadVmEnrollmentStore(sql).confirmInstalled(input.receipt);
+          yield* makeThreadVmEnrollmentStore(sql).confirmInstalled(input.receipt, row.resourceKind);
           yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
         }),
       );
@@ -354,6 +407,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   const claimSetup = Effect.fn("relay.thread_vm_provision.claim_setup")(function* (
     claimId: string,
     hostId: string,
+    resourceKind: ThreadVmResourceKind = "personal",
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -364,19 +418,32 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
       JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
       JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
-      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind=${resourceKind} AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
       AND e.installed_at IS NOT NULL AND s.phase IN ('pending','running')
+      AND ${
+        resourceKind === "personal"
+          ? sql`true`
+          : sql`p.workflow_snapshot IS NOT NULL
+        AND EXISTS (SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+          WHERE t.thread_id=a.thread_id AND t.operation_id=p.operation_id AND j.status='preparing' AND j.pending_control IS NULL)`
+      }
       AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
-      ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
+      ORDER BY ${resourceKind === "organization_workflow" ? sql`p.retry_at,p.position` : sql`p.position`}
+      FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
-        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1 WHERE allocation_id = ${candidate.allocationId}`;
-        return yield* get(candidate.allocationId);
+        const deadline = sql`statement_timestamp() + interval '2 minutes'`;
+        // An interrupted workflow attempt should rejoin the queue after untouched work.
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = ${deadline},
+          retry_at = ${resourceKind === "organization_workflow" ? deadline : sql`retry_at`},
+          revision = revision + 1 WHERE allocation_id = ${candidate.allocationId}`;
+        return yield* get(candidate.allocationId, resourceKind);
       }),
     );
   });
   const claimStartup = Effect.fn("relay.thread_vm_provision.claim_startup")(function* (
     claimId: string,
     hostId: string,
+    resourceKind: ThreadVmResourceKind = "personal",
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -387,14 +454,21 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
         JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind=${resourceKind} AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
         AND p.generation=1 AND s.phase = 'ready' AND s.receipt_sha256 IS NOT NULL
-        AND t.environment_id = s.environment_id AND t.generation = p.generation AND t.operation_id IS NULL
+        AND t.environment_id = s.environment_id AND t.generation = p.generation
+        AND ${
+          resourceKind === "personal"
+            ? sql`t.operation_id IS NULL`
+            : sql`t.operation_id=p.operation_id
+          AND p.workflow_snapshot IS NOT NULL AND EXISTS (SELECT 1 FROM relay_workflow_jobs j
+            WHERE j.job_id=t.workflow_job_id AND j.status='preparing' AND j.pending_control IS NULL)`
+        }
         AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         ORDER BY p.retry_at,p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
         yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1 WHERE allocation_id = ${candidate.allocationId}`;
-        return yield* get(candidate.allocationId);
+        return yield* get(candidate.allocationId, resourceKind);
       }),
     );
   });
@@ -472,6 +546,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     enqueue,
     claim,
     beginCreate,
+    returnWorkflowReservation,
     recordObserved,
     admitIngressRecovery,
     beginIngressRecovery,

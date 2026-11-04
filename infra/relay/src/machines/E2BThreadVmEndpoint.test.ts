@@ -1,5 +1,17 @@
 import { describe, expect, it, layer } from "@effect/vitest";
-import { ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  RelayEnvironmentDispatchJobResponseProofPayload,
+  RelayJobId,
+  WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES,
+} from "@t3tools/contracts/relay";
+import { WORKFLOW_PROTOCOL, type WorkflowControlResult } from "@t3tools/contracts/workflows";
+import {
+  RELAY_DISPATCH_JOB_RESPONSE_TYP,
+  signRelayJwt,
+  verifyRelayJwt,
+} from "@t3tools/shared/relayJwt";
+import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Layer from "effect/Layer";
@@ -53,6 +65,9 @@ const response = {
   expiresAt: "2099-01-01T00:00:00Z",
 };
 const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const decodeWorkflowReceipt = Schema.decodeUnknownEffect(
+  RelayEnvironmentDispatchJobResponseProofPayload,
+);
 const ingressTestLayer = Layer.mergeAll(
   Layer.succeed(RelayDb, {
     $client: () =>
@@ -71,6 +86,29 @@ const ingressTestLayer = Layer.mergeAll(
   Layer.succeed(RelaySecretBox, { seal: Effect.succeed, open: Effect.succeed }),
 );
 layer(ingressTestLayer)("private VM endpoint transport", (it) => {
+  it.effect("dispatches against the allocation's template after the relay selects another", () =>
+    Effect.gen(function* () {
+      const reply = { accepted: false, proof: "signed-reply" };
+      const transport = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(Response.json(info))
+        .mockResolvedValueOnce(Response.json(reply));
+      const endpoint = makeE2BThreadVmEndpoint(
+        { ...settings, templateId: "another-template:build-new" },
+        transport,
+      );
+
+      expect(
+        yield* endpoint.dispatchWorkflow(
+          "sandbox",
+          { ...identity, templateId: settings.templateId },
+          "signed-request",
+        ),
+      ).toEqual(reply);
+      expect(transport).toHaveBeenCalledTimes(2);
+    }),
+  );
+
   it.effect(
     "retains an unavailable stored token without attempting native connect or traffic",
     () =>
@@ -90,28 +128,117 @@ layer(ingressTestLayer)("private VM endpoint transport", (it) => {
       }),
   );
 
-  it.effect("cancels an oversized guest response before buffering more data", () =>
+  it.effect("keeps the 64 KiB limit for mint and health and stops reading oversized replies", () =>
     Effect.gen(function* () {
-      let cancelled = false;
-      let chunks = 0;
-      const body = new ReadableStream<Uint8Array>({
-        pull(controller) {
-          chunks++;
-          controller.enqueue(new Uint8Array(32768));
-        },
-        cancel() {
-          cancelled = true;
-        },
+      for (const operation of ["mint", "health"] as const) {
+        let cancelled = false;
+        let chunks = 0;
+        const body = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            chunks++;
+            controller.enqueue(new Uint8Array(32768));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        });
+        const transport = vi
+          .fn<typeof fetch>()
+          .mockResolvedValueOnce(Response.json(info))
+          .mockResolvedValueOnce(new Response(body));
+        if (operation === "mint") {
+          yield* makeE2BThreadVmEndpoint(settings, transport)
+            .mintCredential("sandbox", identity, "proof")
+            .pipe(Effect.flip);
+        } else {
+          yield* makeE2BThreadVmHealth(settings, transport)("sandbox", identity, "proof").pipe(
+            Effect.flip,
+          );
+        }
+        expect(cancelled).toBe(true);
+        expect(chunks).toBeLessThanOrEqual(4);
+      }
+    }),
+  );
+
+  it.effect("reads and verifies a signed multibyte workflow reply up to its byte ceiling", () =>
+    Effect.gen(function* () {
+      const key = NodeCrypto.generateKeyPairSync("ed25519", {
+        privateKeyEncoding: { format: "pem", type: "pkcs8" },
+        publicKeyEncoding: { format: "pem", type: "spki" },
       });
+      const workflowResult = {
+        protocol: WORKFLOW_PROTOCOL,
+        outcome: "accepted",
+        detail: null,
+        progress: {
+          revision: 4,
+          status: "awaiting_input",
+          threadId: identity.scope.threadId,
+          detail: null,
+          checkpoint: {
+            checkpointId: "checkpoint",
+            kind: "input",
+            stepId: "review",
+            generation: 1,
+            role: "member",
+            question: "界".repeat(32_000),
+          },
+        },
+      } satisfies WorkflowControlResult;
+      const iss = "t3-env:environment";
+      const aud = "https://relay.test";
+      const iat = 1_790_000_000;
+      const payload = {
+        iss,
+        aud,
+        sub: "environment",
+        jti: "receipt",
+        iat,
+        exp: iat + 300,
+        environmentId: EnvironmentId.make("environment"),
+        jobId: RelayJobId.make("job"),
+        requestId: "request",
+        accepted: true,
+        workflowResult,
+      } satisfies RelayEnvironmentDispatchJobResponseProofPayload;
+      const proof = yield* signRelayJwt({
+        privateKey: key.privateKey,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        payload,
+      });
+      const body = yield* Effect.promise(() =>
+        Response.json({ accepted: true, workflowResult, proof }).text(),
+      );
+      const byteLength = new TextEncoder().encode(body).byteLength;
+      expect(byteLength).toBeGreaterThan(64 * 1024);
+      const atCeiling = body + " ".repeat(WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES - byteLength);
       const transport = vi
         .fn<typeof fetch>()
         .mockResolvedValueOnce(Response.json(info))
-        .mockResolvedValueOnce(new Response(body));
-      yield* makeE2BThreadVmEndpoint(settings, transport)
-        .mintCredential("sandbox", identity, "proof")
+        .mockResolvedValueOnce(new Response(atCeiling))
+        .mockResolvedValueOnce(Response.json(info))
+        .mockResolvedValueOnce(new Response(atCeiling + " "));
+      const endpoint = makeE2BThreadVmEndpoint(settings, transport);
+      const target = { ...identity, templateId: settings.templateId };
+      const reply = yield* endpoint.dispatchWorkflow("sandbox", target, "signed-request");
+      const signed = yield* verifyRelayJwt({
+        publicKey: key.publicKey,
+        token: reply.proof,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        issuer: iss,
+        audience: aud,
+        nowEpochSeconds: iat,
+      });
+      expect(reply.workflowResult).toEqual(workflowResult);
+      expect(yield* decodeWorkflowReceipt(signed)).toEqual({
+        ...payload,
+        workflowResult: reply.workflowResult,
+      });
+      const oversized = yield* endpoint
+        .dispatchWorkflow("sandbox", target, "signed-request")
         .pipe(Effect.flip);
-      expect(cancelled).toBe(true);
-      expect(chunks).toBeLessThanOrEqual(4);
+      expect(oversized._tag).toBe("ThreadVmEndpointError");
     }),
   );
 

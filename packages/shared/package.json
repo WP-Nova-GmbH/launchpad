@@ -307,6 +307,10 @@
       "types": "./src/testing/longTempDir.ts",
       "import": "./src/testing/longTempDir.ts"
     },
+    "./testing/gitReviewPatch": {
+      "types": "./src/testing/gitReviewPatch.ts",
+      "import": "./src/testing/gitReviewPatch.ts"
+    },
     "./testing/symlinks": {
       "types": "./src/testing/symlinks.ts",
       "import": "./src/testing/symlinks.ts"
@@ -366,6 +370,10 @@
     "./gitPatchPath": {
       "types": "./src/gitPatchPath.ts",
       "import": "./src/gitPatchPath.ts"
+    },
+    "./gitPatchReview": {
+      "types": "./src/gitPatchReview.ts",
+      "import": "./src/gitPatchReview.ts"
     },
     "./nativeCheckpointFiles": {
       "types": "./src/nativeCheckpointFiles.ts",

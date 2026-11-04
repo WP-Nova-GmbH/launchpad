@@ -222,7 +222,9 @@ restart the dev relay to load the proof alongside the template selection. If you
 alternate selection file, set `E2B_TEMPLATE_FILE` for the check too. For a deployed relay,
 set `E2B_WORKFLOW_MODEL_PROOF` to the contents of the output directory's `workflow-models.json`
 when deploying the matching template. Workflows can still use the managed default while an
-explicit model catalog is unavailable.
+explicit model catalog is unavailable when authoring. Manual VM runs require credential isolation
+proof for the selected build as well as `RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true` on the
+development relay. The model smoke check above supplies the authoring catalog.
 
 For relay authentication, database migrations, Cloudflare and app startup, continue
 with [VM development](vm-development.md). The E2B management API and proxy must stay

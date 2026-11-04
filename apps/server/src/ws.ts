@@ -557,6 +557,20 @@ const makeWsRpcLayer = (
       // a client cannot claim to be someone else.
       const access = yield* RepositoryAccess;
       const workflowJobs = yield* WorkflowRunStore;
+      // The live workflow VM is a result reader. Generic read scopes also cover
+      // filesystem browsing and native session discovery, so keep this list explicit.
+      const workflowVmResultMethods = new Set<string>([
+        ORCHESTRATION_WS_METHODS.subscribeShell,
+        ORCHESTRATION_WS_METHODS.subscribeThread,
+        ORCHESTRATION_WS_METHODS.getTurnDiff,
+        ORCHESTRATION_WS_METHODS.getFullThreadDiff,
+        WS_METHODS.serverProbe,
+        WS_METHODS.serverGetConfig,
+        WS_METHODS.serverReportClientActivity,
+        WS_METHODS.subscribeServerConfig,
+        WS_METHODS.subscribeServerLifecycle,
+        WS_METHODS.subscribeAuthSession,
+      ]);
       const workflowMutationMethods = new Set<string>([
         WS_METHODS.vcsPull,
         WS_METHODS.gitRunStackedAction,
@@ -589,6 +603,11 @@ const makeWsRpcLayer = (
       });
       const authorizeRepositoryInput = (input: unknown, method?: string) =>
         Effect.gen(function* () {
+          if (access.workflowVm && method && !workflowVmResultMethods.has(method))
+            return yield* new EnvironmentAuthorizationError({
+              message: "Workflow VM connections are read-only and scoped to run results.",
+              requiredScope: AuthOrchestrationReadScope,
+            });
           const resource = yield* Schema.decodeUnknownEffect(repositoryInputSchema)(input).pipe(
             Effect.orDie,
           );
@@ -2423,13 +2442,42 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getTurnDiff,
             checkpointDiffQuery.getTurnDiff(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationGetTurnDiffError({
-                    message: "Failed to load turn diff",
-                    cause,
-                  }),
-              ),
+              Effect.mapError((cause) => {
+                let message = "Failed to load turn diff";
+                if (
+                  cause._tag === "CheckpointWorkflowDiffRestrictedError" ||
+                  cause._tag === "CheckpointWorkflowPinUnavailableError"
+                ) {
+                  message = cause.message;
+                } else if (input.strictWorkflowReview || access.workflowVm) {
+                  if (cause._tag === "VcsProcessExitError") {
+                    message =
+                      "The saved workflow checkpoint could not be read. Refresh the run, or cancel it and start again.";
+                  } else if (cause._tag === "VcsProcessOutputLimitError") {
+                    message =
+                      "This checkpoint diff is too large to review. Request a smaller change or cancel the run.";
+                  } else if (cause._tag === "VcsProcessOutputReadError") {
+                    switch (cause.reason) {
+                      case "invalid_utf8":
+                        message =
+                          "This checkpoint diff contains text that is not valid UTF-8. Request a UTF-8 change or cancel the run.";
+                        break;
+                      case "binary_summary":
+                        message =
+                          "Git only provided a binary summary for a changed file. Request a change with a text diff or cancel the run.";
+                        break;
+                      case "nul_byte":
+                        message =
+                          "This checkpoint diff contains a NUL byte. Request a change with a text diff or cancel the run.";
+                        break;
+                    }
+                  }
+                }
+                return new OrchestrationGetTurnDiffError({
+                  message,
+                  ...(access.workflowVm ? {} : { cause }),
+                });
+              }),
             ),
             { "rpc.aggregate": "orchestration" },
             input,
@@ -2441,8 +2489,14 @@ const makeWsRpcLayer = (
               Effect.mapError(
                 (cause) =>
                   new OrchestrationGetFullThreadDiffError({
-                    message: "Failed to load full thread diff",
-                    cause,
+                    message:
+                      cause._tag === "CheckpointWorkflowDiffRestrictedError" ||
+                      cause._tag === "CheckpointWorkflowPinUnavailableError"
+                        ? cause.message
+                        : access.workflowVm && cause._tag === "VcsProcessOutputLimitError"
+                          ? "This checkpoint diff is too large to display."
+                          : "Failed to load full thread diff",
+                    ...(access.workflowVm ? {} : { cause }),
                   }),
               ),
             ),
@@ -5136,6 +5190,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                 Deferred.succeed(policyClosed, undefined).pipe(
                   Effect.andThen(Deferred.await(policyDrained)),
                 ),
+                session,
               ),
             ),
             Effect.catch(() => failEnvironmentAuthInvalid("invalid_credential")),

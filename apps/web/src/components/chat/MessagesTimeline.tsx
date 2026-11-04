@@ -157,6 +157,7 @@ import {
 } from "./SnapShotAttachmentDetails";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesCard } from "./ChangedFilesTree";
+import { LiveWorkspaceContext } from "../../lib/workflowResultGitAccess";
 import { useAtomValue } from "@effect/atom-react";
 import { useFileContextMenuHandler } from "../../fileContextMenu";
 import { useProject, useThread } from "../../state/entities";
@@ -400,6 +401,7 @@ const TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH = {
 // ---------------------------------------------------------------------------
 
 interface MessagesTimelineProps {
+  canUseLiveWorkspace?: boolean;
   citationRequest?: AssistantCitationRequest | null;
   citationHistoryLoading?: boolean;
   onCiteAssistantText?: (
@@ -482,6 +484,7 @@ interface MessagesTimelineProps {
 // ---------------------------------------------------------------------------
 
 export const MessagesTimeline = memo(function MessagesTimeline({
+  canUseLiveWorkspace = true,
   citationRequest = null,
   citationHistoryLoading = false,
   onCiteAssistantText,
@@ -1278,7 +1281,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     );
   }
 
-  return (
+  const timeline = (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
         <div
@@ -1366,6 +1369,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       </TimelineRowActivityCtx>
     </TimelineRowCtx>
   );
+  return <LiveWorkspaceContext value={canUseLiveWorkspace}>{timeline}</LiveWorkspaceContext>;
 });
 
 function keyExtractor(item: MessagesTimelineRow) {
@@ -3485,6 +3489,7 @@ function AssistantChangedFilesSectionInner({
     serverEnvironment.configValueAtom(ctx.activeThreadEnvironmentId),
   );
   const onFileContextMenu = useFileContextMenuHandler(ctx.activeThreadEnvironmentId);
+  const canUseLiveWorkspace = use(LiveWorkspaceContext);
 
   return (
     <ChangedFilesCard
@@ -3496,19 +3501,22 @@ function AssistantChangedFilesSectionInner({
         setExpanded(routeThreadKey, turnSummary.turnId, !allDirectoriesExpanded)
       }
       onOpenTurnDiff={onOpenTurnDiff}
-      onFileContextMenu={(filePath, event) =>
-        onFileContextMenu(
-          {
-            environmentId: ctx.activeThreadEnvironmentId,
-            filePath,
-            workspaceRoot: ctx.workspaceRoot,
-            repositoryRoot:
-              thread?.worktreePath == null
-                ? activeProject?.repositoryIdentity?.rootPath
-                : undefined,
-          },
-          event,
-        )
+      onFileContextMenu={
+        canUseLiveWorkspace
+          ? (filePath, event) =>
+              onFileContextMenu(
+                {
+                  environmentId: ctx.activeThreadEnvironmentId,
+                  filePath,
+                  workspaceRoot: ctx.workspaceRoot,
+                  repositoryRoot:
+                    thread?.worktreePath == null
+                      ? activeProject?.repositoryIdentity?.rootPath
+                      : undefined,
+                },
+                event,
+              )
+          : undefined
       }
     />
   );
@@ -3523,17 +3531,18 @@ function UserMessageMentionChip(props: {
   copyMarkdown: string;
 }) {
   const ctx = use(TimelineRowCtx);
+  const canUseLiveWorkspace = use(LiveWorkspaceContext);
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <ContextChip
             kind="mention"
-            render={<button type="button" />}
-            aria-label={`Preview ${props.record.path}`}
+            render={canUseLiveWorkspace ? <button type="button" /> : <span />}
+            aria-label={canUseLiveWorkspace ? `Preview ${props.record.path}` : props.record.path}
             data-markdown-copy={props.copyMarkdown}
             onClick={() => {
-              if (ctx.threadRef)
+              if (canUseLiveWorkspace && ctx.threadRef)
                 useRightPanelStore.getState().openFile(ctx.threadRef, props.record.path);
             }}
           >

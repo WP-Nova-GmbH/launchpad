@@ -10,9 +10,13 @@ import {
   workflowManualControlState,
   workflowActionState,
   workflowManualSubmission,
+  workflowViewerControls,
+  workflowApprovalPending,
 } from "@t3tools/client-runtime/relay/workflow-responses";
+import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
 import {
   workflowDraftAtom,
+  workflowJobReadAtom,
   workflowSessionKey,
   updateWorkflowDrafts,
   activateWorkflowJobView,
@@ -22,6 +26,11 @@ import {
   invalidateWorkflowJobRead,
   emptyWorkflowJobRead,
   workflowStatusLabel,
+  workflowJobAccessLost,
+  beginWorkflowReview,
+  bindWorkflowReviewPlacement,
+  requireFreshWorkflowReviewRead,
+  workflowReviewApprovalState,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { isTerminalWorkflowJob, type WorkflowControl } from "@t3tools/contracts/workflows";
@@ -79,11 +88,15 @@ export function WorkflowJob({
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const checkpoint = selectedJob?.progress?.checkpoint;
+  const reviewApproval = workflowReviewApprovalState(drafts.reviews[key], read);
+  const reviewChanged = reviewApproval === "inspect";
+  const checkingReturnedReview = reviewApproval === "checking";
+  const viewerControls = workflowViewerControls(selectedJob, canConfigure);
+  const approvalPending = workflowApprovalPending(selectedJob);
   const responseDrafts = drafts.responses[key] ?? {};
   const response = checkpoint ? (responseDrafts[checkpoint.checkpointId] ?? "") : "";
   const busy = !!read.mutation;
   const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
-  const allowed = canConfigure || checkpoint?.role === "member";
   const refresh = useCallback(async () => {
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId);
     if (!request) return;
@@ -96,11 +109,17 @@ export function WorkflowJob({
         ),
       );
     } catch (cause) {
-      settleWorkflowJobRequest(appAtomRegistry, request, workflowError(cause));
+      settleWorkflowJobRequest(
+        appAtomRegistry,
+        request,
+        workflowError(cause),
+        workflowJobAccessLost(cause),
+      );
     }
   }, [call, scope, jobId]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     activateWorkflowJobView(appAtomRegistry, scope, jobId);
+    requireFreshWorkflowReviewRead(appAtomRegistry, scope, jobId);
   }, [scope, jobId]);
   useEffect(() => {
     if (read.mutation) return;
@@ -110,6 +129,7 @@ export function WorkflowJob({
       if (document.visibilityState !== "hidden") void refresh();
     }, 5000);
     const focus = () => {
+      requireFreshWorkflowReviewRead(appAtomRegistry, scope, jobId);
       if (document.visibilityState !== "hidden") void refresh();
     };
     window.addEventListener("focus", focus);
@@ -123,6 +143,17 @@ export function WorkflowJob({
   }, [refresh, terminal, read.mutation, scope, jobId]);
   const respond = async (operation: Operation) => {
     if (!selectedJob || busy || (manualState.responsePending && operation !== "cancel")) return;
+    const currentRead = appAtomRegistry.get(workflowJobReadAtom).jobs[key] ?? emptyWorkflowJobRead;
+    const currentReview = appAtomRegistry.get(workflowDraftAtom).reviews[key];
+    if (
+      (operation === "approve" &&
+        (!viewerControls.canApprove ||
+          currentRead.job !== selectedJob ||
+          workflowReviewApprovalState(currentReview, currentRead) !== "allowed")) ||
+      ((operation === "input" || operation === "request_changes") && !viewerControls.canRespond) ||
+      ((operation === "cancel" || operation === "retry_cancellation") && !viewerControls.canCancel)
+    )
+      return;
     if (
       ["approve", "input", "request_changes"].includes(operation) &&
       (!selectedJob.progress?.checkpoint || isTerminalWorkflowJob(selectedJob.status))
@@ -187,7 +218,12 @@ export function WorkflowJob({
     }
   };
   const inspect = async (diff: boolean) => {
-    if (!selectedJob?.progress || selectedJob.progress.hasThread === false || resultRequest.current)
+    if (
+      !selectedJob?.progress ||
+      selectedJob.progress.hasThread === false ||
+      resultRequest.current ||
+      (diff && checkingReturnedReview)
+    )
       return;
     const session = appAtomRegistry.get(managedRelaySessionAtom);
     const request = { key };
@@ -197,18 +233,40 @@ export function WorkflowJob({
     setOpeningResult(true);
     setResultError(null);
     try {
-      if (selectedJob.runtime?.kind !== "machine")
-        throw new Error("This run has no available machine execution binding.");
+      const runtime = selectedJob.runtime;
+      if (!runtime) throw new Error("This run has no available execution binding.");
+      const exactReview =
+        diff && runtime.kind === "vm" ? workflowResultCheckpoint(checkpoint) : undefined;
+      const reviewVisitId = exactReview ? randomUUID() : undefined;
+      if (exactReview && reviewVisitId)
+        beginWorkflowReview(appAtomRegistry, scope, jobId, reviewVisitId, exactReview);
       const result = await openResult({
         threadId: selectedJob.progress.threadId,
         title: selectedJob.workflow?.definition.name ?? "Workflow result",
-        workflowResult: { ...scope, originalEnvironmentId: selectedJob.runtime.environmentId },
+        workflowResult:
+          runtime.kind === "vm"
+            ? { ...scope, jobId }
+            : { ...scope, originalEnvironmentId: runtime.environmentId },
       });
       if (!owns()) return;
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      const params = result.value;
+      const { environmentId, threadId, workflowVmGeneration } = result.value;
+      const params = { environmentId, threadId };
+      if (reviewVisitId && workflowVmGeneration !== undefined)
+        bindWorkflowReviewPlacement(appAtomRegistry, scope, jobId, reviewVisitId, {
+          ...params,
+          generation: workflowVmGeneration,
+        });
       if (diff && checkpoint && checkpoint.kind !== "input") {
-        useDiffPanelStore.getState().selectTurn(params, TurnId.make(checkpoint.turnId));
+        const panel = useDiffPanelStore.getState();
+        if (exactReview)
+          panel.selectTurn(
+            params,
+            TurnId.make(checkpoint.turnId),
+            undefined,
+            exactReview.checkpointTurnCount,
+          );
+        else panel.selectTurn(params, TurnId.make(checkpoint.turnId));
         useRightPanelStore.getState().open(params, "diff");
       }
       await navigate({
@@ -216,7 +274,15 @@ export function WorkflowJob({
         params,
         state: (previous) => ({
           ...previous,
-          workflowOrigin: { ...scope, jobId, threadId: params.threadId },
+          workflowOrigin: {
+            ...scope,
+            jobId,
+            threadId: params.threadId,
+            ...(workflowVmGeneration !== undefined ? { workflowVmResultReader: true } : {}),
+            ...(exactReview && reviewVisitId
+              ? { reviewCheckpoint: exactReview, reviewVisitId }
+              : {}),
+          },
         }),
       });
     } catch (cause) {
@@ -263,7 +329,7 @@ export function WorkflowJob({
   const approval =
     !terminal &&
     !!checkpoint &&
-    allowed &&
+    viewerControls.canApprove &&
     (manualState.status === "awaiting_review" ||
       (canConfigure &&
         selectedJob.status === "finishing" &&
@@ -271,8 +337,8 @@ export function WorkflowJob({
   const oldDrafts = Object.entries(responseDrafts).filter(
     ([id, text]) =>
       (!waiting ||
-        !allowed ||
-        selectedJob.progress?.approvalPending ||
+        !viewerControls.canRespond ||
+        approvalPending ||
         id !== checkpoint?.checkpointId) &&
       !!text.trim(),
   );
@@ -293,7 +359,9 @@ export function WorkflowJob({
           {workflowStatusLabel(selectedJob.status)} ·{" "}
           {target
             ? target.machineLabel + (selectedJob.workflow ? " · " + target.title : "")
-            : "Organization execution target"}
+            : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
+              ? "Workflow VM"
+              : "Organization execution target"}
         </p>
       </header>
       {read.error ? (
@@ -319,15 +387,24 @@ export function WorkflowJob({
               <p className="text-sm text-warning">{manualState.message}</p>
             ) : null}
             {detail ? <p className="text-sm text-muted-foreground">{detail}</p> : null}
+            {reviewChanged || (checkingReturnedReview && !read.error) ? (
+              <p role="status" className="text-sm text-warning">
+                {reviewChanged
+                  ? "Review changed. Inspect the current diff before approving."
+                  : "Checking the current review…"}
+              </p>
+            ) : null}
             {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
               <div className="flex flex-wrap gap-2">
                 {checkpoint && checkpoint.kind !== "input" ? (
                   <Button
                     variant="outline"
-                    disabled={openingResult}
+                    disabled={openingResult || checkingReturnedReview}
                     onClick={() => void inspect(true)}
                   >
-                    Inspect saved diff
+                    {selectedJob.runtime?.kind === "vm"
+                      ? "Inspect live diff"
+                      : "Inspect saved diff"}
                   </Button>
                 ) : null}
                 <Button
@@ -348,21 +425,25 @@ export function WorkflowJob({
               <div className="flex flex-wrap gap-2">
                 <Button
                   disabled={
-                    busy || manualState.checkpointBlocked || selectedJob.progress?.approvalPending
+                    busy ||
+                    reviewChanged ||
+                    checkingReturnedReview ||
+                    manualState.checkpointBlocked ||
+                    approvalPending
                   }
                   onClick={() => void respond("approve")}
                 >
-                  {manualState.responsePending
-                    ? "Response pending"
-                    : selectedJob.progress?.approvalPending
-                      ? "Approval pending"
+                  {approvalPending
+                    ? "Approval pending"
+                    : manualState.responsePending
+                      ? "Response pending"
                       : selectedJob.progress?.retryableApproval
                         ? selectedJob.status === "finishing"
                           ? "Retry completion"
                           : "Retry approval"
                         : "Approve result"}
                 </Button>
-                {waiting && !selectedJob.progress?.approvalPending ? (
+                {waiting && viewerControls.canRespond && !approvalPending ? (
                   <Button
                     variant="outline"
                     disabled={busy || manualState.checkpointBlocked}
@@ -375,8 +456,8 @@ export function WorkflowJob({
             ) : null}
             {waiting &&
             checkpoint &&
-            allowed &&
-            !selectedJob.progress?.approvalPending &&
+            viewerControls.canRespond &&
+            !approvalPending &&
             (input || feedbackOpen || !!response) ? (
               <form
                 className="space-y-3"
@@ -411,7 +492,7 @@ export function WorkflowJob({
                       : "Send requested changes"}
                 </Button>
               </form>
-            ) : waiting && !allowed ? (
+            ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
               <p className="text-sm text-muted-foreground">
                 This checkpoint requires a repository maintainer.
               </p>
@@ -484,7 +565,7 @@ export function WorkflowJob({
             <Button variant="ghost" disabled={read.reading} onClick={() => void refresh()}>
               Refresh
             </Button>
-            {canConfigure && !isTerminalWorkflowJob(selectedJob.status) ? (
+            {viewerControls.canCancel && !terminal ? (
               <details>
                 <summary className="cursor-pointer text-sm text-muted-foreground">
                   More controls

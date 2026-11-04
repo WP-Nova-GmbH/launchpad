@@ -4,6 +4,7 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import type { RelaySecretBox } from "../auth/SecretBox.ts";
 import { readWorkflowConfigurationForFreeze } from "./RepositoryWorkflowConfiguration.ts";
+import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
 
 const identityFields = {
   jobId: Schema.NonEmptyString,
@@ -35,6 +36,18 @@ const envelope = Schema.fromJsonString(
 );
 const encodeEnvelope = Schema.encodeEffect(envelope);
 const decodeEnvelope = Schema.decodeUnknownEffect(envelope);
+const encodeAttemptIdentity = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      binding: WorkflowVmDispatchBinding,
+      purpose: Schema.Literals(["setup", "agent"]),
+      attemptId: Schema.String,
+      stepId: Schema.String,
+      stepGeneration: Schema.Int,
+      commandId: Schema.String,
+    }),
+  ),
+);
 
 export class WorkflowRunConfigurationError extends Schema.TaggedError<WorkflowRunConfigurationError>()(
   "WorkflowRunConfigurationError",
@@ -73,6 +86,27 @@ const readSnapshot = (sql: PgClient, identity: RunIdentity) =>
       has_secrets AS "hasSecrets",sealed_payload AS "sealedPayload"
     FROM relay_workflow_run_configurations WHERE job_id=${identity.jobId}
       AND organization_id=${identity.organizationId} AND repository_id=${identity.repositoryId} FOR SHARE`;
+
+const openSnapshot = Effect.fnUntraced(function* (
+  sql: PgClient,
+  box: RelaySecretBox["Service"],
+  identity: RunIdentity,
+) {
+  const [snapshot] = yield* readSnapshot(sql, identity);
+  if (!snapshot || snapshot.threadId !== identity.threadId) return yield* unavailable();
+  const opened = yield* decodeEnvelope(yield* box.open(snapshot.sealedPayload));
+  if (
+    opened.jobId !== identity.jobId ||
+    opened.organizationId !== identity.organizationId ||
+    opened.repositoryId !== identity.repositoryId ||
+    opened.threadId !== identity.threadId ||
+    opened.sourceRevision !== snapshot.sourceRevision ||
+    opened.hasSecrets !== snapshot.hasSecrets ||
+    opened.hasSecrets !== opened.values.some((entry) => entry.kind === "secret")
+  )
+    return yield* unavailable();
+  return opened;
+});
 
 const requirePreparingJob = Effect.fnUntraced(function* (sql: PgClient, identity: RunIdentity) {
   const [job] = yield* sql`SELECT job_id FROM relay_workflow_jobs WHERE job_id=${identity.jobId}
@@ -229,19 +263,7 @@ export const resolveWorkflowRunSetupConfiguration = Effect.fnUntraced(function* 
           AND e.credential_id=b.credential_id AND c.environment_id=b.environment_id
           AND c.environment_public_key=b.environment_public_key AND c.revoked_at IS NULL FOR SHARE OF b,e,c`;
       if (!binding) return yield* unavailable();
-      const [snapshot] = yield* readSnapshot(sql, claim);
-      if (!snapshot || snapshot.threadId !== threadId) return yield* unavailable();
-      const opened = yield* decodeEnvelope(yield* box.open(snapshot.sealedPayload));
-      if (
-        opened.jobId !== jobId ||
-        opened.organizationId !== organizationId ||
-        opened.repositoryId !== repositoryId ||
-        opened.threadId !== threadId ||
-        opened.sourceRevision !== snapshot.sourceRevision ||
-        opened.hasSecrets !== snapshot.hasSecrets ||
-        opened.hasSecrets !== opened.values.some((entry) => entry.kind === "secret")
-      )
-        return yield* unavailable();
+      const opened = yield* openSnapshot(sql, box, claim);
       // A claim can age out even though its row is still locked.
       const [current] = yield* sql`SELECT allocation_id FROM relay_thread_vm_provisions
         WHERE allocation_id=${allocationId} AND claim_until>clock_timestamp()`;
@@ -252,5 +274,108 @@ export const resolveWorkflowRunSetupConfiguration = Effect.fnUntraced(function* 
         values: Redacted.make(opened.values),
       };
     }),
+  );
+}, Effect.mapError(safeError));
+
+/** Caller owns the live guest and job locks. Attempts never persist plaintext. */
+export const resolveWorkflowRunAttemptConfiguration = Effect.fnUntraced(function* (
+  sql: PgClient,
+  box: RelaySecretBox["Service"],
+  binding: WorkflowVmDispatchBinding,
+  attempt: {
+    purpose: "setup" | "agent";
+    attemptId: string;
+    stepId: string;
+    stepGeneration: number;
+    commandId: string;
+  },
+) {
+  const identity = {
+    jobId: binding.jobId,
+    organizationId: binding.organizationId,
+    repositoryId: binding.repositoryId,
+    threadId: binding.threadId,
+  };
+  const { jobId, organizationId, repositoryId, threadId } = identity;
+  if (attempt.attemptId !== attempt.commandId) return yield* denied();
+  const setupPrefix = `workflow:${jobId}:`;
+  const validCommand =
+    attempt.purpose === "setup"
+      ? attempt.commandId === `${setupPrefix}start` ||
+        (attempt.commandId.startsWith(`${setupPrefix}retry:`) &&
+          /^\d{1,16}$/u.test(attempt.commandId.slice(`${setupPrefix}retry:`.length)))
+      : /^server:prompt-claim:[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(
+          attempt.commandId,
+        );
+  if (!validCommand) return yield* denied();
+  const retryRevision =
+    attempt.purpose === "setup" && attempt.commandId !== `${setupPrefix}start`
+      ? attempt.commandId.slice(`${setupPrefix}retry:`.length)
+      : null;
+  const [job] = yield* sql`SELECT job_id FROM relay_workflow_jobs j
+    WHERE j.job_id=${jobId} AND j.organization_id=${organizationId} AND j.repository_id=${repositoryId}
+      AND j.record#>>'{runtime,threadId}'=${threadId} AND j.record->>'startAttempted'='true'
+      AND j.status IN ('dispatching','preparing','running','awaiting_review','awaiting_input','paused','waiting_capacity','finishing')
+      AND (j.pending_control#>>'{response,operation}') IS DISTINCT FROM 'cancel'
+      AND EXISTS (SELECT 1 FROM jsonb_array_elements(j.record#>'{workflow,definition,steps}') step
+        WHERE step->>'kind'='agent' AND step->>'id'=${attempt.stepId})
+      AND coalesce((j.record#>>'{progress,generation}')::int, 0)<=${attempt.stepGeneration}
+      AND ${attempt.stepGeneration}<=coalesce((j.record#>>'{progress,generation}')::int, 0)
+        + CASE WHEN j.pending_control#>>'{response,operation}'='request_changes' THEN 1 ELSE 0 END
+      ${
+        attempt.purpose === "setup"
+          ? sql`
+        AND ${attempt.stepGeneration}=0
+        AND ${attempt.stepId}=(SELECT step->>'id'
+          FROM jsonb_array_elements(j.record#>'{workflow,definition,steps}') WITH ORDINALITY AS steps(step,n)
+          WHERE step->>'kind'='agent' ORDER BY n LIMIT 1)
+      `
+          : sql``
+      }
+      ${
+        retryRevision === null
+          ? sql``
+          : sql`
+        AND (
+          (j.pending_control#>>'{response,operation}'='retry_preparation'
+            AND j.pending_control#>>'{response,expectedRevision}'=${retryRevision})
+          OR (j.record#>>'{progress,status}'='preparing'
+            AND j.record#>>'{progress,revision}'=(${retryRevision}::bigint+1)::text)
+          OR EXISTS (SELECT 1 FROM relay_workflow_vm_attempts prior
+            WHERE prior.job_id=j.job_id AND prior.attempt_id=${attempt.attemptId})
+        )
+      `
+      }
+    FOR SHARE`;
+  if (!job) return yield* denied();
+  const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
+    WHERE thread_id=${threadId} AND workflow_job_id=${jobId} AND audience='repository'
+      AND organization_id=${organizationId} AND repository_id=${repositoryId}
+      AND environment_id=${binding.environmentId} AND generation=${binding.generation}
+      AND operation_id IS NULL FOR SHARE`;
+  if (!placement) return yield* denied();
+  const attemptIdentity = yield* encodeAttemptIdentity({ binding, ...attempt });
+  yield* sql`INSERT INTO relay_workflow_vm_attempts(job_id,attempt_id,identity)
+    VALUES (${jobId},${attempt.attemptId},${attemptIdentity}::jsonb) ON CONFLICT DO NOTHING`;
+  const [registration] = yield* sql`SELECT attempt_id FROM relay_workflow_vm_attempts
+    WHERE job_id=${jobId} AND attempt_id=${attempt.attemptId} AND identity=${attemptIdentity}::jsonb FOR SHARE`;
+  if (!registration) return yield* denied();
+  const opened = yield* openSnapshot(sql, box, identity);
+  return {
+    environment: Object.fromEntries(opened.values.map(({ name, value }) => [name, value])),
+    hasSecrets: opened.hasSecrets,
+    secretNames: opened.values.filter(({ kind }) => kind === "secret").map(({ name }) => name),
+  };
+}, Effect.mapError(safeError));
+
+/** For the exact live guest's server to check shared patches, including after completion. */
+export const readWorkflowRunReviewSecrets = Effect.fnUntraced(function* (
+  sql: PgClient,
+  box: RelaySecretBox["Service"],
+  binding: WorkflowVmDispatchBinding,
+) {
+  const opened = yield* openSnapshot(sql, box, binding);
+  return Redacted.make(
+    opened.values.filter(({ kind }) => kind === "secret").map(({ value }) => value),
   );
 }, Effect.mapError(safeError));

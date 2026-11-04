@@ -12,6 +12,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ServerProvider,
+  TextGenerationError,
   ThreadId,
   TurnId,
   CheckpointRef,
@@ -39,7 +40,10 @@ import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { ProviderUnsupportedError } from "../provider/Errors.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { TextGeneration } from "../textGeneration/TextGeneration.ts";
-import type { ApprovalVerdictGenerationInput } from "../textGeneration/TextGeneration.ts";
+import type {
+  ApprovalVerdictGenerationInput,
+  ApprovalVerdictGenerationResult,
+} from "../textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
@@ -216,6 +220,7 @@ export function completed(previous: OrchestrationThread, messageId?: string): Or
         },
       ],
       finalizedTurnId: turnId,
+      finalization: { turnId, outcome: "completed", checkpoint: "ready" },
     },
     session: {
       threadId: previous.id,
@@ -235,6 +240,7 @@ export const persistence = Store.layer.pipe(
 );
 export const harness = Effect.gen(function* () {
   const currentThread = yield* Ref.make<OrchestrationThread | null>(null);
+  const nextThreadRead = yield* Ref.make<OrchestrationThread | null>(null);
   const otherThreads = new Map<string, OrchestrationThread>();
   const prompts =
     yield* Queue.unbounded<Extract<OrchestrationCommand, { type: "thread.prompt.enqueue" }>>();
@@ -249,8 +255,13 @@ export const harness = Effect.gen(function* () {
   const finalWriteFailures = yield* Ref.make(0);
   const stored = yield* Store.WorkflowRunStore;
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]);
+  const dispatched = yield* Queue.unbounded<OrchestrationCommand>();
   const events = yield* PubSub.unbounded<OrchestrationEvent>();
   const modelCalls = yield* Queue.unbounded<ApprovalVerdictGenerationInput>();
+  const approvalVerdict = yield* Ref.make<ApprovalVerdictGenerationResult | null>({
+    verdict: "approve",
+    reasoning: "Within the task",
+  });
   const receipts = new Map<string, OrchestrationCommandInvariantError | null>();
   const retryMode = yield* Ref.make<"normal" | "before_retry" | "after_retry" | "reject_retry">(
     "normal",
@@ -258,7 +269,9 @@ export const harness = Effect.gen(function* () {
   const dismissalMode = yield* Ref.make<
     "normal" | "before_dismiss" | "after_dismiss" | "reject_dismiss" | "change_revision"
   >("normal");
-  const difference = yield* Ref.make("");
+  const workspaceTree = yield* Ref.make("prepared-tree");
+  const headAfterCapture = yield* Ref.make<string | null>(null);
+  const checkpointTrees = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
   const head = yield* Ref.make("base-sha");
   const branch = yield* Ref.make("t3-job/job-1");
   const project = yield* decodeProject({
@@ -389,6 +402,7 @@ export const harness = Effect.gen(function* () {
               issue: "Lost retry acknowledgement before acceptance",
             });
           yield* Ref.update(commands, (previous) => [...previous, command]);
+          yield* Queue.offer(dispatched, command);
           if (command.type === "thread.preparation.update") {
             const settlement = yield* Ref.get(settlementMode);
             if (settlement === "reject")
@@ -489,11 +503,14 @@ export const harness = Effect.gen(function* () {
     Layer.mock(ProjectionSnapshotQuery)({
       getProjectShellById: () => Ref.get(projectState).pipe(Effect.map(Option.some)),
       getThreadDetailById: (id) =>
-        Ref.get(currentThread).pipe(
-          Effect.map((current) =>
-            Option.fromNullishOr(current?.id === id ? current : otherThreads.get(id)),
-          ),
-        ),
+        Effect.gen(function* () {
+          const preview = yield* Ref.modify(nextThreadRead, (preview) =>
+            preview?.id === id ? [preview, null] : [null, preview],
+          );
+          if (preview) return Option.some(preview);
+          const current = yield* Ref.get(currentThread);
+          return Option.fromNullishOr(current?.id === id ? current : otherThreads.get(id));
+        }),
     }),
     Layer.mock(ProviderRegistry)({ getProviders: Ref.get(providers) }),
     Layer.mock(ProviderService)({
@@ -546,46 +563,52 @@ export const harness = Effect.gen(function* () {
         ),
     }),
     Layer.mock(GitVcsDriver)({
-      execute: () =>
-        Effect.succeed({
-          exitCode: ChildProcessSpawner.ExitCode(0),
-          stdout: "prepared-tree",
-          stderr: "",
-          stdoutTruncated: false,
-          stderrTruncated: false,
+      execute: ({ args }) =>
+        Effect.gen(function* () {
+          const revision = args.at(-1);
+          const alias = args[1] === "symbolic-ref" && revision !== "HEAD";
+          let stdout = "";
+          if (args[1] === "symbolic-ref") {
+            if (!alias) stdout = `refs/heads/${yield* Ref.get(branch)}`;
+          } else if (revision === "HEAD^{commit}") {
+            stdout = yield* Ref.get(head);
+          } else {
+            stdout = (yield* Ref.get(checkpointTrees)).get(revision ?? "") ?? "prepared-tree";
+          }
+          return {
+            exitCode: ChildProcessSpawner.ExitCode(alias ? 1 : 0),
+            stdout,
+            stderr: "",
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          };
         }),
       fetchRemote: () => Ref.update(fetches, (count) => count + 1),
       resolveDefaultBranchName: () => Effect.succeed("main"),
       resolveRemoteTrackingCommit: () =>
         Effect.succeed({ commitSha: "base-sha", remoteRefName: "origin/main" }),
-      resolveCommit: () => Ref.get(head).pipe(Effect.map((commitSha) => ({ commitSha }))),
-      statusDetailsLocal: () =>
-        Ref.get(branch).pipe(
-          Effect.map((value) => ({
-            isRepo: true,
-            hasOriginRemote: true,
-            isDefaultBranch: false,
-            branch: value,
-            upstreamRef: null,
-            hasWorkingTreeChanges: true,
-            workingTree: { files: [], insertions: 0, deletions: 0 },
-            hasUpstream: false,
-            aheadCount: 0,
-            behindCount: 0,
-            aheadOfDefaultCount: 0,
-          })),
-        ),
     }),
     Layer.mock(CheckpointStore)({
-      captureCheckpoint: () => Effect.void,
-      diffCheckpoints: () => Ref.get(difference),
+      captureCheckpoint: () =>
+        Effect.gen(function* () {
+          const changedHead = yield* Ref.get(headAfterCapture);
+          if (changedHead !== null) yield* Ref.set(head, changedHead);
+          return { commitId: "capture-commit", treeId: yield* Ref.get(workspaceTree) };
+        }),
       deleteCheckpointRefs: () => Effect.void,
     }),
     Layer.mock(TextGeneration)({
       generateApprovalVerdict: (input) =>
-        Queue.offer(modelCalls, input).pipe(
-          Effect.as({ verdict: "approve" as const, reasoning: "Within the task" }),
-        ),
+        Effect.gen(function* () {
+          yield* Queue.offer(modelCalls, input);
+          const verdict = yield* Ref.get(approvalVerdict);
+          if (!verdict)
+            return yield* new TextGenerationError({
+              operation: "generateApprovalVerdict",
+              detail: "Supervisor model unavailable",
+            });
+          return verdict;
+        }),
     }),
   );
   return {
@@ -605,6 +628,7 @@ export const harness = Effect.gen(function* () {
         }
       }),
     currentThread,
+    nextThreadRead,
     otherThreads,
     projectState,
     awaitPrompt: Queue.take(prompts),
@@ -612,12 +636,22 @@ export const harness = Effect.gen(function* () {
     providers,
     repositoryKey,
     commands,
-    difference,
+    awaitCommand: (predicate: (command: OrchestrationCommand) => boolean) =>
+      Effect.gen(function* () {
+        while (true) {
+          const command = yield* Queue.take(dispatched);
+          if (predicate(command)) return command;
+        }
+      }),
+    workspaceTree,
+    headAfterCapture,
+    checkpointTrees,
     head,
     branch,
     retryMode,
     dismissalMode,
     modelCalls,
+    approvalVerdict,
     emit: (event: OrchestrationEvent) => PubSub.publish(events, event),
     failPreparation: Ref.update(currentThread, (value) => ({
       ...value!,

@@ -12,10 +12,13 @@ import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { ThreadCommandSyncError, type ThreadCommandTransport } from "./ThreadCommandSync.ts";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { RelayInternalError } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import {
   ThreadHistorySyncError,
@@ -30,6 +33,19 @@ import {
   ThreadExecutionRelayError,
   type ThreadExecutionAuthority,
 } from "./ThreadExecutionRelay.ts";
+
+const isRelayInternalError = Schema.is(RelayInternalError);
+
+function isTemporaryAdmissionFailure(error: unknown) {
+  if (Cause.isTimeoutError(error)) return true;
+  if (isRelayInternalError(error)) return error.reason !== "internal_error";
+  if (!HttpClientError.isHttpClientError(error)) return false;
+  return (
+    error.reason._tag === "TransportError" ||
+    ((error.reason._tag === "StatusCodeError" || error.reason._tag === "DecodeError") &&
+      [408, 429, 502, 503, 504].includes(error.reason.response.status))
+  );
+}
 
 /** Credentials are loaded for each admission so unlinking/rotation takes effect immediately. */
 export const makeThreadExecutionAuthority = Effect.gen(function* () {
@@ -106,12 +122,13 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
         .pipe(
           Effect.timeout("15 seconds"),
           Effect.mapError(
-            () =>
+            (error) =>
               new ThreadExecutionRelayError({
                 threadId: work.threadId,
                 operation: "admit",
                 detail:
                   "The relay did not confirm permission to start this work. It has not been started.",
+                ...(isTemporaryAdmissionFailure(error) ? { retryableAdmission: true } : {}),
               }),
           ),
         );

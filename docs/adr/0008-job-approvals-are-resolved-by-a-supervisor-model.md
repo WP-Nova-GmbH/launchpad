@@ -21,6 +21,9 @@ is not confident, it escalates to a human instead of guessing.
 - **Escalate** pauses the job, which is already visible: the thread enters
   `waiting_for_approval`, that phase flows up the awareness feed, the relay marks the job
   paused, and a notification fires. A human resolves it through the normal steering path.
+  Workflow VM threads expose read-only results, so their supervisor declines escalated tool
+  requests. A blocking native question receives an empty answer set. The workflow's Review and
+  Input steps remain the places for human decisions.
 - **Deny** feeds back to the agent with its reasoning, exactly as a human denial does. It does
   not fail the step — a supervisor that kills the job on first denial makes pipelines brittle.
 - Every verdict is recorded as an activity on the thread, with reasoning. Per

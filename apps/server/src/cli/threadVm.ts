@@ -27,7 +27,13 @@ import {
   threadVmGitCredential,
   ThreadVmRepositoryCredentialError,
 } from "../relay/ThreadVmRepositoryCredentials.ts";
-import { RelayThreadVmEnrollmentReceipt, RelayThreadVmSetupReply } from "@t3tools/contracts/relay";
+import {
+  RelayThreadVmCheckoutFailureProbe,
+  RelayThreadVmCheckoutFailureReply,
+  RelayThreadVmEnrollmentReceipt,
+  RelayThreadVmSetupReply,
+  RelayThreadVmWorkflowSetupEnvelope,
+} from "@t3tools/contracts/relay";
 import * as ConfigProvider from "effect/ConfigProvider";
 import { runServer } from "../server.ts";
 import {
@@ -54,6 +60,7 @@ import {
   ThreadVmInitialStateInput,
   ThreadVmInitialStateError,
 } from "../relay/ThreadVmInitialState.ts";
+import { readThreadVmCheckoutFailure } from "../relay/ThreadVmWorkspace.ts";
 import { OrchestrationLayerLive } from "../orchestration/runtimeLayer.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as Sqlite from "../persistence/Layers/Sqlite.ts";
@@ -72,6 +79,9 @@ import { managedCodexModelProbePolicy } from "../provider/Layers/codexLaunchArgs
 import { resolveCliAuthConfig, resolveServerConfig } from "./config.ts";
 
 const encodeSetupReceipt = Schema.encodeEffect(Schema.fromJsonString(RelayThreadVmSetupReply));
+const encodeCheckoutFailure = Schema.encodeEffect(
+  Schema.fromJsonString(RelayThreadVmCheckoutFailureReply),
+);
 const encodeRestoreReceipt = Schema.encodeEffect(
   Schema.fromJsonString(RelayThreadVmRestoreImportReceipt),
 );
@@ -312,16 +322,31 @@ export const threadVmEnrollmentCommand = Command.make("__thread-vm-enroll", {
 /** Preparing a checkout and baseline leaves execution frozen until relay ownership is committed. */
 export const threadVmSetupCommand = Command.make("__thread-vm-setup", {
   baseDir: Flag.String("base-dir"),
+  recoverCheckoutFailure: Flag.Boolean("recover-checkout-failure").pipe(Flag.withDefault(false)),
 }).pipe(
   Command.unlisted,
   Command.withHandler(
-    Effect.fn("ThreadVmSetup.command")(function* ({ baseDir }) {
+    Effect.fn("ThreadVmSetup.command")(function* ({ baseDir, recoverCheckoutFailure }) {
       const path = yield* Path.Path;
       if (!path.isAbsolute(baseDir))
         return yield* new ThreadVmInitialStateError({ code: "identity_changed" });
-      const input = yield* readBootstrapEnvelope(ThreadVmInitialStateInput, 0, {
-        timeoutMs: 30_000,
-      }).pipe(Effect.mapError(() => new ThreadVmInitialStateError({ code: "identity_changed" })));
+      if (recoverCheckoutFailure) {
+        const request = yield* readBootstrapEnvelope(RelayThreadVmCheckoutFailureProbe, 0, {
+          timeoutMs: 5_000,
+        });
+        const paths = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
+        const failureCode = Option.isSome(request)
+          ? yield* readThreadVmCheckoutFailure(request.value, paths)
+          : null;
+        return yield* Console.log(yield* encodeCheckoutFailure({ failureCode }));
+      }
+      const input = yield* readBootstrapEnvelope(
+        Schema.Union([RelayThreadVmWorkflowSetupEnvelope, ThreadVmInitialStateInput]),
+        0,
+        {
+          timeoutMs: 30_000,
+        },
+      ).pipe(Effect.mapError(() => new ThreadVmInitialStateError({ code: "identity_changed" })));
       if (Option.isNone(input))
         return yield* new ThreadVmInitialStateError({ code: "identity_changed" });
       const config = yield* resolveCliAuthConfig(
@@ -332,7 +357,12 @@ export const threadVmSetupCommand = Command.make("__thread-vm-setup", {
       if (Option.isSome(running) && isProcessAlive(running.value.pid))
         return yield* new ThreadVmInitialStateError({ code: "identity_changed" });
       yield* inspectVmWorkloads({ type: "inspect" });
-      const reply = yield* prepareThreadVmInitialState(input.value).pipe(
+      const request = input.value;
+      const reply = yield* prepareThreadVmInitialState(
+        "input" in request ? request.input : request,
+        undefined,
+        "input" in request ? request.gitToken : undefined,
+      ).pipe(
         Effect.map((receipt) => ({ status: "prepared" as const, receipt })),
         Effect.catch((error) => Effect.succeed({ status: "blocked" as const, code: error.code })),
         Effect.provide(

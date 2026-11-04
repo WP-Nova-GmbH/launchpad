@@ -20,6 +20,7 @@ export class ThreadExecutionRelayError extends Schema.TaggedError<ThreadExecutio
     threadId: Schema.String,
     operation: Schema.Literals(["admit", "complete", "history", "inbox"]),
     detail: Schema.String,
+    retryableAdmission: Schema.optional(Schema.Literal(true)),
   },
 ) {}
 export interface ThreadWorkIdentity {

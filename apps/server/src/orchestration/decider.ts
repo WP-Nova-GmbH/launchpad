@@ -352,6 +352,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     case "thread.prompt.remove":
     case "thread.prompt.steer":
     case "thread.prompt.claim":
+    case "thread.prompt.reject":
     case "thread.prompt.admit":
     case "thread.prompt.release":
     case "thread.prompt.unknown":

@@ -11,10 +11,14 @@ export function makeThreadVmRestoreWorker(
   objects: ReturnType<typeof makeThreadArtifactObjects>,
   compute: Pick<ReturnType<typeof makeE2BRestoreClient>, "resolveSource">,
   hostId: string,
+  workflowEnabled?: boolean,
 ) {
   const store = makeThreadVmRestoreStore(sql, objects);
   const runOne = Effect.fn("relay.thread_vm.restore.prepare_one")(function* () {
-    yield* makeThreadVmCapacityStore(sql).admitNext(hostId);
+    yield* makeThreadVmCapacityStore(sql).admitNext(
+      hostId,
+      workflowEnabled === undefined ? "personal" : { workflowEnabled },
+    );
     const claim = yield* store.claim(hostId);
     if (!claim) return false;
     yield* Effect.gen(function* () {

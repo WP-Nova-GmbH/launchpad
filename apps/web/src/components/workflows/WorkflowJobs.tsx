@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { RepositoryWorkflow, WorkflowJobListView } from "@t3tools/contracts/workflows";
 import {
-  workflowJobPageAccessLost,
+  workflowJobAccessLost,
   emptyWorkflowJobPageRead,
   beginWorkflowJobPage,
   settleWorkflowJobPage,
@@ -54,7 +54,7 @@ export function WorkflowJobs({
               previous,
               request,
               workflowError(cause),
-              workflowJobPageAccessLost(cause),
+              workflowJobAccessLost(cause),
             ),
           );
       }

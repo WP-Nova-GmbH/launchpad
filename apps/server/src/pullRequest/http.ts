@@ -22,6 +22,8 @@ export const pullRequestHttpApiLayer = HttpApiBuilder.group(
       Effect.fn("environment.pullRequests.diff")(function* (args) {
         yield* annotateEnvironmentRequest(args.endpoint.name);
         const actor = yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+        // Keep workflow viewer access scoped to the run's checkpoints.
+        if (access.workflowVm) return yield* failEnvironmentNotFound("project_not_found");
         yield* access
           .requireProject(actor, args.payload.projectId)
           .pipe(Effect.catch(() => failEnvironmentNotFound("project_not_found")));

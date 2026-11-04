@@ -13,6 +13,7 @@ export function resolveMarkdownMediaPreview(
     readonly environmentId: EnvironmentId;
     readonly threadId: ThreadId;
     readonly workspaceRoot: string | null | undefined;
+    readonly workspaceFilesAvailable?: boolean;
     /** Image syntax can target an endpoint without a recognizable extension. */
     readonly imageEmbed?: boolean;
   },
@@ -21,7 +22,12 @@ export function resolveMarkdownMediaPreview(
   | { readonly kind: "video"; readonly source: MediaVideoPreviewSource }
   | null {
   const media = resolveMediaSource(href, input);
-  if (media === null || media.access === "unavailable") return null;
+  if (
+    media === null ||
+    media.access === "unavailable" ||
+    (input.workspaceFilesAvailable === false && media.access === "environment")
+  )
+    return null;
   const { kind, name, mimeType, reference, srcFragment } = media;
 
   const target =

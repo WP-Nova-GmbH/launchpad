@@ -20,7 +20,7 @@ export interface ThreadVmConnectionTarget {
   readonly environmentPublicKey: string;
   readonly credentialId: string;
   readonly sandboxId: string;
-  readonly identity: E2BThreadVmIdentity;
+  readonly identity: E2BThreadVmIdentity & { readonly resourceKind?: "organization_workflow" };
 }
 
 export class ThreadVmConnectionUnavailable extends Schema.TaggedError<ThreadVmConnectionUnavailable>()(
@@ -112,6 +112,7 @@ export function sameThreadVmTarget(
     current.environmentPublicKey !== target.environmentPublicKey ||
     current.credentialId !== target.credentialId ||
     current.sandboxId !== target.sandboxId ||
+    current.identity.resourceKind !== target.identity.resourceKind ||
     current.identity.operationId !== target.identity.operationId ||
     current.identity.scope.allocationId !== target.identity.scope.allocationId ||
     current.identity.scope.threadId !== target.identity.scope.threadId ||

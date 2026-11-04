@@ -1,3 +1,4 @@
+import type { ThreadPromptQueue } from "@t3tools/contracts";
 import { WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT } from "@t3tools/contracts/workflows";
 import type { WorkflowRun } from "./WorkflowRunStore.ts";
 
@@ -16,6 +17,42 @@ export function workflowPromptId(run: WorkflowRun) {
 export const workflowAllowsPrompt = (run: WorkflowRun, messageId: string) =>
   !run.manualPause ||
   (run.manualPause.state === "requested" && run.manualPause.promptId === messageId);
+
+export const admittedWorkflowTurnId = (queue: ThreadPromptQueue | undefined, promptId: string) =>
+  queue?.admissions.find((entry) => entry.messageId === promptId)?.turnId;
+
+export const workflowTurnPauseDetails = {
+  unknownResult:
+    "The admitted turn was resolved without a confirmed result. Cancel this job before starting again.",
+  incompleteResult:
+    "The agent turn stopped without a complete result. Cancel this job before starting again.",
+  stoppedTurn:
+    "The admitted turn could not be reattached after stopping. Cancel this job before starting again.",
+  missingCheckpoint:
+    "The result checkpoint could not be saved. Cancel this job before starting again.",
+  unconfirmedDelivery:
+    "Prompt delivery could not be confirmed. Cancel this job before starting again.",
+};
+const recoverableTurnPauses = new Set([
+  ...Object.values(workflowTurnPauseDetails),
+  "The admitted turn could not be reconciled. Cancel this job before starting again.",
+]);
+
+export function canRecoverPausedWorkflowTurn(run: WorkflowRun) {
+  return (
+    run.progress.status === "paused" &&
+    run.executionReserved &&
+    run.progress.detail !== null &&
+    recoverableTurnPauses.has(run.progress.detail) &&
+    !run.progress.retryablePreparation &&
+    !run.pendingPreparationRetry &&
+    !run.cancellationAttempt &&
+    !run.pendingQueueDismissal &&
+    !run.approvalAttempt &&
+    activeWorkflowStep(run)?.kind === "agent" &&
+    workflowAllowsPrompt(run, workflowPromptId(run))
+  );
+}
 
 /** Move only after saving the current step's result or human response. */
 export function advanceWorkflow(run: WorkflowRun): WorkflowRun {

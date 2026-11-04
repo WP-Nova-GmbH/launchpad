@@ -42,7 +42,9 @@ const InstalledThreadVm = Schema.Struct({
   threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
 });
 export type InstalledThreadVm = typeof InstalledThreadVm.Type;
-const decodeInstalled = Schema.decodeUnknownEffect(Schema.fromJsonString(InstalledThreadVm));
+export const decodeInstalledThreadVm = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(InstalledThreadVm),
+);
 const encodeInstalled = Schema.encodeEffect(Schema.fromJsonString(InstalledThreadVm));
 
 export class ThreadVmEnrollmentError extends Schema.TaggedError<ThreadVmEnrollmentError>()(
@@ -67,7 +69,7 @@ export const readInstalledThreadVm = Effect.fn("ThreadVmEnrollment.readInstalled
     .get(THREAD_VM_IDENTITY_SECRET)
     .pipe(Effect.mapError(failed("identity")));
   if (Option.isNone(raw)) return null;
-  return yield* decodeInstalled(new TextDecoder().decode(raw.value)).pipe(
+  return yield* decodeInstalledThreadVm(new TextDecoder().decode(raw.value)).pipe(
     Effect.mapError(failed("identity")),
   );
 });

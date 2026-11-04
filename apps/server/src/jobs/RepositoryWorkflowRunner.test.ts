@@ -10,12 +10,14 @@ import {
   type WorkflowOrigin,
   EnvironmentAuthorizationError,
   ApprovalRequestId,
+  CheckpointRef,
   CommandId,
   EnvironmentId,
   MessageId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
   EventId,
   type OrchestrationCommand,
   type OrchestrationReadModel,
@@ -30,6 +32,8 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import { type WorkflowRequest } from "./RepositoryWorkflowRunner.ts";
 import { decidePromptQueueCommand } from "../orchestration/promptQueueDecider.ts";
@@ -40,6 +44,7 @@ import {
   MODEL,
   PROJECT,
   workflow,
+  thread,
   request,
   control,
   retryRequest,
@@ -438,6 +443,37 @@ it.effect("atomically chooses acceptance or a cancellation fence and preserves a
   ),
 );
 
+function approvalRequested(
+  threadId: ThreadId,
+  requestId: string,
+  requestType: string,
+): OrchestrationEvent {
+  return {
+    type: "thread.activity-appended",
+    sequence: 1,
+    eventId: EventId.make(`approval-event:${requestId}`),
+    aggregateKind: "thread",
+    aggregateId: threadId,
+    occurredAt: NOW,
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    payload: {
+      threadId,
+      activity: {
+        id: EventId.make(`approval:${requestId}`),
+        kind: "approval.requested",
+        tone: "approval",
+        summary: "Run tests",
+        turnId: null,
+        createdAt: NOW,
+        payload: { requestId, requestType, detail: "pnpm test" },
+      },
+    },
+  };
+}
+
 it.effect(
   "consults with the frozen job context in the worktree prepared after supervisor attachment",
   () =>
@@ -448,35 +484,7 @@ it.effect(
         yield* runner.handle(request());
         const current = (yield* Ref.get(h.currentThread))!;
         yield* Ref.set(h.currentThread, { ...current, worktreePath: "/jobs/job-1" });
-        const event: OrchestrationEvent = {
-          type: "thread.activity-appended",
-          sequence: 1,
-          eventId: EventId.make("approval-event"),
-          aggregateKind: "thread",
-          aggregateId: current.id,
-          occurredAt: NOW,
-          commandId: null,
-          causationEventId: null,
-          correlationId: null,
-          metadata: {},
-          payload: {
-            threadId: current.id,
-            activity: {
-              id: EventId.make("approval"),
-              kind: "approval.requested",
-              tone: "approval",
-              summary: "Run tests",
-              turnId: null,
-              createdAt: NOW,
-              payload: {
-                requestId: "approval-1",
-                requestType: "command_execution_approval",
-                detail: "pnpm test",
-              },
-            },
-          },
-        };
-        yield* h.emit(event);
+        yield* h.emit(approvalRequested(current.id, "approval-1", "command_execution_approval"));
         const consultation = yield* Queue.take(h.modelCalls);
         assert.strictEqual(consultation.cwd, "/jobs/job-1");
         assert.strictEqual(
@@ -549,6 +557,311 @@ it.effect("recovers accepted work without another prompt and waits for a finaliz
   ),
 );
 
+it.effect.each([
+  "ready",
+  "previous-turn",
+  "restart",
+  "ready-only",
+  "late-confirmation",
+  "skipped-ready",
+  "missing",
+  "failed",
+  "failed-ready",
+  "interrupted-ready",
+  "mixed-read",
+  "prior-generation",
+  "previously-paused",
+  "requested-hold",
+  "manual-hold",
+  "unrelated-pause",
+  "branch-changed",
+  "resolved",
+  "legacy",
+  "legacy-failed",
+  "legacy-disabled",
+  "legacy-retained-admission",
+  "legacy-resolved",
+] as const)(
+  "reconciles the durable prompt after queue finalization clears its admission (%s)",
+  (scenario) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        yield* runner.handle(request());
+        let current = (yield* Ref.get(h.currentThread))!;
+        const history: OrchestrationEvent[] = [];
+        const apply = Effect.fnUntraced(function* (
+          command: Parameters<typeof decidePromptQueueCommand>[1],
+        ) {
+          const planned = yield* decidePromptQueueCommand(current, command, false);
+          let state: OrchestrationReadModel = { ...createEmptyReadModel(NOW), threads: [current] };
+          for (const event of planned) {
+            const stored: OrchestrationEvent = { ...event, sequence: history.length + 1 };
+            const legacyEvent =
+              scenario.startsWith("legacy") && stored.type === "thread.prompt-queue-changed"
+                ? { ...stored, payload: { ...stored.payload, finalization: undefined } }
+                : stored;
+            history.push(legacyEvent);
+            state = yield* projectEvent(state, legacyEvent);
+          }
+          current = state.threads[0]!;
+        });
+        const prompt = (yield* h.starts)[0]!;
+        const promptId =
+          scenario === "prior-generation"
+            ? MessageId.make("workflow:job-1:step:agent:1:prompt")
+            : prompt.message.messageId;
+        yield* apply({
+          ...prompt,
+          commandId: CommandId.make("finalization-fixture-enqueue"),
+          message: { ...prompt.message, messageId: promptId },
+        });
+        current = {
+          ...current,
+          branch: "t3-job/job-1",
+          worktreePath: "/jobs/job-1",
+          promptQueue: {
+            ...current.promptQueue!,
+            preparation: { ...current.promptQueue!.preparation!, state: "ready", settled: true },
+          },
+        };
+        const attemptId = CommandId.make("finalization-fixture-claim");
+        const turnId = TurnId.make("finalized-agent-turn");
+        yield* apply({
+          type: "thread.prompt.claim",
+          commandId: attemptId,
+          threadId: current.id,
+          messageId: promptId,
+          expectedRevision: current.promptQueue!.entries[0]!.revision,
+          expectedControlRevision: current.promptQueue!.revision,
+          createdAt: NOW,
+        });
+        yield* apply({
+          type: "thread.prompt.admit",
+          commandId: CommandId.make("finalization-fixture-admit"),
+          threadId: current.id,
+          attemptId,
+          turnId,
+          evidence: "provider-ack",
+          createdAt: NOW,
+        });
+        const result = completed(current);
+        if (scenario === "previous-turn") {
+          current = {
+            ...current,
+            latestTurn: { ...result.latestTurn!, state: "error" },
+            session: { ...result.session!, status: "error" },
+          };
+        }
+        yield* Ref.set(h.currentThread, current);
+        assert.equal(
+          (yield* runner.handle(control("status"))).progress?.status,
+          scenario === "prior-generation" ? "preparing" : "running",
+        );
+        const store = yield* Store.WorkflowRunStore;
+        const admission = current.promptQueue!.admissions[0]!;
+        assert.isTrue((yield* store.get("job-1"))?.executionReserved);
+        current = {
+          ...current,
+          latestTurn: {
+            ...result.latestTurn!,
+            turnId,
+            state: scenario === "restart" ? "error" : "completed",
+          },
+          checkpoints:
+            scenario === "missing"
+              ? []
+              : [
+                  {
+                    ...result.checkpoints[0]!,
+                    turnId,
+                    status: scenario === "failed" ? "error" : "ready",
+                  },
+                ],
+        };
+        if (scenario === "ready-only" || scenario === "late-confirmation") {
+          yield* Ref.set(h.currentThread, current);
+          assert.equal((yield* runner.handle(control("status"))).progress?.status, "running");
+          yield* apply({
+            type: "thread.prompt.unknown",
+            commandId: CommandId.make("finalization-fixture-unknown"),
+            threadId: current.id,
+            attemptId,
+            detail: "Restart interrupted provider delivery",
+            createdAt: NOW,
+          });
+          yield* Ref.set(h.currentThread, current);
+          const uncertain = (yield* runner.handle(control("status"))).progress;
+          assert.equal(uncertain?.status, "paused");
+          assert.include(uncertain?.detail, "Prompt delivery could not be confirmed");
+          assert.isTrue((yield* store.get("job-1"))?.executionReserved);
+          assert.lengthOf(yield* h.starts, 1);
+          if (scenario === "ready-only") return;
+        }
+        if (scenario === "legacy-disabled") {
+          yield* apply({
+            type: "thread.queue.pause",
+            commandId: CommandId.make("finalization-fixture-pause"),
+            threadId: current.id,
+            createdAt: NOW,
+          });
+        }
+        const resolved = scenario === "resolved" || scenario === "legacy-resolved";
+        if (resolved) {
+          current = {
+            ...current,
+            promptQueue: {
+              ...current.promptQueue!,
+              pauseReason: { code: "delivery-unknown", detail: "Test uncertain delivery" },
+            },
+          };
+          yield* apply({
+            type: "thread.queue.resolve",
+            commandId: CommandId.make("finalization-fixture-resolve"),
+            threadId: current.id,
+            resolution: "dismiss",
+            expectedRevision: current.promptQueue!.revision,
+            createdAt: NOW,
+          });
+        } else {
+          yield* apply({
+            type: "thread.queue.finalize",
+            commandId: CommandId.make("finalization-fixture-finalize"),
+            threadId: current.id,
+            turnId,
+            outcome:
+              scenario === "interrupted-ready" || scenario === "legacy-disabled"
+                ? "interrupted"
+                : scenario === "legacy-failed"
+                  ? "failed"
+                  : "completed",
+            checkpoint:
+              scenario === "missing" || scenario === "failed" || scenario === "failed-ready"
+                ? "error"
+                : scenario === "skipped-ready"
+                  ? "skipped"
+                  : "ready",
+            createdAt: NOW,
+          });
+        }
+        assert.isEmpty(current.promptQueue!.admissions);
+        assert.equal(current.messages.find(({ id }) => id === promptId)?.turnId, turnId);
+        if (scenario === "legacy-disabled") {
+          const finalize = history.at(-1);
+          assert.equal(current.promptQueue?.enabled, false);
+          assert.equal(finalize?.type, "thread.prompt-queue-changed");
+          assert.isUndefined(
+            finalize?.type === "thread.prompt-queue-changed" && finalize.payload.control,
+          );
+        }
+        if (scenario === "legacy-retained-admission") {
+          current = {
+            ...current,
+            messages: current.messages.filter(({ id }) => id !== promptId),
+            promptQueue: { ...current.promptQueue!, admissions: [admission] },
+          };
+        }
+        if (scenario.startsWith("legacy")) {
+          const sql = yield* SqlClient.SqlClient;
+          const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+          const preceding = scenario === "legacy" ? 1_100 : 0;
+          if (preceding) {
+            const payload = yield* encodePayload({ threadId: current.id, updatedAt: NOW });
+            yield* sql`WITH RECURSIVE indices(n) AS (
+              SELECT 1 UNION ALL SELECT n + 1 FROM indices WHERE n < ${preceding}
+            ) INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              actor_kind, payload_json, metadata_json
+            ) SELECT 'previous-event-' || n, 'thread', ${current.id}, n,
+              'thread.prompt-queue-changed', ${NOW}, 'server', ${payload}, '{}' FROM indices`;
+          }
+          for (const event of history) {
+            const payload = yield* encodePayload(event.payload);
+            yield* sql`INSERT INTO orchestration_events (
+              event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+              command_id, actor_kind, payload_json, metadata_json
+            ) VALUES (${event.eventId}, 'thread', ${current.id}, ${preceding + event.sequence},
+              ${event.type}, ${NOW}, ${event.commandId}, 'server', ${payload}, '{}')`;
+          }
+        }
+        const savedPause = [
+          "previously-paused",
+          "requested-hold",
+          "manual-hold",
+          "unrelated-pause",
+        ].includes(scenario);
+        if (savedPause) {
+          const run = (yield* store.get("job-1"))!;
+          yield* store.save({
+            ...run,
+            ...(scenario === "requested-hold"
+              ? { manualPause: { state: "requested", promptId } as const }
+              : scenario === "manual-hold"
+                ? { manualPause: { state: "paused", promptId: null } as const }
+                : {}),
+            progress: {
+              ...run.progress,
+              status: "paused",
+              detail:
+                scenario === "unrelated-pause"
+                  ? "Setup needs attention"
+                  : "The admitted turn could not be reconciled. Cancel this job before starting again.",
+            },
+          });
+        }
+        if (scenario === "branch-changed") yield* Ref.set(h.branch, "different-branch");
+        yield* Ref.set(h.currentThread, current);
+        if (scenario === "restart") {
+          yield* Scope.close(scope, Exit.void);
+          runner = yield* h.newRunner;
+        }
+        if (scenario === "mixed-read") {
+          // The queue can finalize between reading checkpoint rows and reading the queue.
+          yield* Ref.set(h.nextThreadRead, { ...current, checkpoints: [] });
+        }
+        const progress = (yield* runner.handle(control("status"))).progress!;
+        if (scenario === "missing" || scenario === "failed" || scenario === "failed-ready") {
+          assert.equal(progress.status, "paused");
+          assert.include(progress.detail!, "The result checkpoint could not be saved");
+          assert.isNull(progress.checkpoint);
+        } else if (scenario === "legacy-failed" || scenario === "interrupted-ready") {
+          assert.equal(progress.status, "paused");
+          assert.include(progress.detail!, "The agent turn stopped without a complete result");
+          assert.isNull(progress.checkpoint);
+        } else if (resolved || scenario === "legacy-disabled") {
+          assert.equal(progress.status, "paused");
+          assert.include(
+            progress.detail!,
+            "The admitted turn was resolved without a confirmed result",
+          );
+          assert.isNull(progress.checkpoint);
+        } else if (scenario === "prior-generation") {
+          assert.equal(progress.status, "preparing");
+          assert.isNull(progress.checkpoint);
+        } else if (["manual-hold", "unrelated-pause", "branch-changed"].includes(scenario)) {
+          assert.equal(progress.status, "paused");
+        } else {
+          if (scenario === "requested-hold") assert.equal(progress.status, "paused");
+          assert.equal(progress.underlyingStatus, "awaiting_review");
+          assert.equal(
+            progress.checkpoint && "turnId" in progress.checkpoint && progress.checkpoint.turnId,
+            turnId,
+          );
+        }
+        const run = (yield* store.get("job-1"))!;
+        assert.equal(run.executionReserved, run.progress.status !== "awaiting_review");
+        if (scenario === "requested-hold") assert.equal(run.manualPause?.state, "paused");
+        assert.equal(
+          (yield* runner.handle(control("status"))).progress?.revision,
+          progress.revision,
+        );
+        assert.lengthOf(yield* h.starts, 1);
+      }),
+    ),
+);
+
 it.effect(
   "requires the current checkpoint and unchanged files/head before idempotent approval",
   () =>
@@ -580,12 +893,16 @@ it.effect(
           },
         };
         assert.strictEqual((yield* runner.handle(stale)).outcome, "conflict");
-        yield* Ref.set(h.difference, "changed files");
+        yield* Ref.set(h.workspaceTree, "changed-tree");
         assert.strictEqual((yield* runner.handle(approve)).outcome, "conflict");
-        yield* Ref.set(h.difference, "");
+        yield* Ref.set(h.workspaceTree, "prepared-tree");
         yield* Ref.set(h.head, "changed-head");
         assert.strictEqual((yield* runner.handle(approve)).outcome, "conflict");
         yield* Ref.set(h.head, "base-sha");
+        yield* Ref.set(h.headAfterCapture, "changed-during-capture");
+        assert.strictEqual((yield* runner.handle(approve)).outcome, "conflict");
+        yield* Ref.set(h.head, "base-sha");
+        yield* Ref.set(h.headAfterCapture, null);
         assert.strictEqual((yield* runner.handle(approve)).progress?.status, "done");
         assert.strictEqual((yield* runner.handle(approve)).progress?.status, "done");
         assert.strictEqual((yield* runner.handle(control("cancel"))).progress?.status, "done");
@@ -954,6 +1271,7 @@ it.effect("persists one execution reservation per environment and frees it at re
         progress: { ...first.progress, threadId: ThreadId.make("workflow:job-reservation:agent") },
       };
       assert.isFalse(yield* store.tryAccept(another));
+      assert(another.runtime.kind === "machine");
       const otherEnvironment = {
         ...another,
         jobId: "other-env-job",
@@ -1033,6 +1351,183 @@ const approve = (progress: Store.WorkflowRun["progress"]): WorkflowRequest => ({
     checkpointId: progress.checkpoint!.checkpointId,
   },
 });
+
+const prepareVmWorkflow = Effect.fnUntraced(function* (h: Effect.Success<typeof harness>) {
+  const sql = yield* SqlClient.SqlClient;
+  const fence = makeThreadExecutionFence(sql);
+  const binding = {
+    jobId: "job-1",
+    organizationId: "org-1",
+    repositoryId: "repo-1",
+    threadId: ThreadId.make("workflow:job-1"),
+    allocationId: "allocation",
+    environmentId: EnvironmentId.make("guest"),
+    generation: 1,
+    operationId: "operation",
+    projectId: PROJECT,
+  };
+  const workflowVm = {
+    binding,
+    workspaceRoot: "/repo",
+    baseBranch: "main",
+    baseSha: "base-sha",
+  };
+  const original = request();
+  const start: WorkflowRequest = {
+    ...original,
+    workflowVm,
+    control: {
+      ...original.control,
+      runtime: { kind: "vm", threadId: binding.threadId },
+      workflow: {
+        ...workflow,
+        definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+      },
+    },
+  };
+  yield* Ref.set(h.currentThread, {
+    ...thread(),
+    id: binding.threadId,
+    branch: "t3-job/job-1",
+  });
+  yield* fence.prepare({ ...binding, relayUrl: "https://relay.test" });
+  return { fence, binding, workflowVm, start };
+});
+
+it.effect.each(["escalates", "unavailable"] as const)(
+  "declines a VM tool approval when the supervisor %s",
+  (outcome) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const { fence, binding, start } = yield* prepareVmWorkflow(h);
+        yield* fence.activate(binding);
+        yield* Ref.set(
+          h.approvalVerdict,
+          outcome === "escalates"
+            ? { verdict: "escalate" as const, reasoning: "Need a decision" }
+            : null,
+        );
+        assert.equal((yield* runner.handle(start)).outcome, "accepted");
+
+        const requestEvent = approvalRequested(
+          binding.threadId,
+          "approval-1",
+          "command_execution_approval",
+        );
+        yield* h.emit(requestEvent);
+        yield* h.emit(requestEvent);
+        yield* h.emit(approvalRequested(binding.threadId, "approval-after", "file_read_approval"));
+        yield* h.awaitCommand(
+          (command) =>
+            command.type === "thread.approval.respond" && command.requestId === "approval-after",
+        );
+
+        const commands = yield* Ref.get(h.commands);
+        assert.deepEqual(
+          commands.flatMap((command) =>
+            command.type === "thread.approval.respond" ? [command.decision] : [],
+          ),
+          ["decline", "accept"],
+        );
+        assert.includeDeepMembers(
+          commands.flatMap((command) =>
+            command.type === "thread.activity.append" &&
+            command.activity.kind === "job.supervisor.verdict"
+              ? [command.activity.payload]
+              : [],
+          ),
+          [
+            {
+              requestId: "approval-1",
+              requestType: "command_execution_approval",
+              verdict: "deny",
+              reasoning: `${outcome === "escalates" ? "Need a decision" : "The supervisor model could not be reached."} Workflow VM tool approvals cannot be handed to a human.`,
+              consultedModel: true,
+            },
+          ],
+        );
+      }),
+    ),
+);
+
+it.effect.each([true, false])(
+  "binds VM review to the exact saved checkpoint pin (%s)",
+  (matchingPin) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+        assert.equal((yield* runner.handle(start)).outcome, "unavailable");
+        yield* fence.activate(binding);
+        assert.equal((yield* runner.handle(start)).progress?.threadId, binding.threadId);
+        assert.equal((yield* runner.handle(start)).outcome, "accepted");
+        const prompts = yield* h.starts;
+        assert.lengthOf(prompts, 1);
+        assert.deepEqual(prompts[0]?.bootstrap, { runSetupScript: true });
+        assert.equal(yield* Ref.get(h.fetches), 0);
+        yield* Ref.update(h.currentThread, (current) => ({
+          ...completed(current!),
+          worktreePath: null,
+        }));
+        const store = yield* Store.WorkflowRunStore;
+        const checkpoint = (yield* Ref.get(h.currentThread))!.checkpoints[0]!;
+        const pin = {
+          checkpointRef: checkpoint.checkpointRef,
+          commitId: "pinned-commit",
+          treeId: "prepared-tree",
+          baselineCommitId: "pinned-baseline",
+        };
+        yield* store.saveCheckpointPin(
+          binding,
+          "",
+          0,
+          {
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/workflow-base"),
+            commitId: pin.baselineCommitId,
+            treeId: "baseline-tree",
+            baselineCommitId: pin.baselineCommitId,
+          },
+          null,
+          undefined,
+          new Uint8Array(),
+        );
+        assert.deepEqual(
+          yield* store.saveCheckpointPin(
+            binding,
+            matchingPin ? checkpoint.turnId : TurnId.make("previous-agent-turn"),
+            checkpoint.checkpointTurnCount,
+            pin,
+          ),
+          pin,
+        );
+        const review = yield* runner.handle({ ...control("status"), workflowVm });
+        if (!matchingPin) {
+          assert.equal(review.progress?.status, "paused");
+          assert.include(review.progress?.detail, "The result checkpoint could not be saved");
+          assert.isNull(review.progress?.checkpoint);
+          assert.isTrue((yield* store.get(binding.jobId))?.executionReserved);
+          return;
+        }
+        assert.equal(review.progress?.status, "awaiting_review");
+        const respond = { ...approve(review.progress!), workflowVm };
+        yield* Ref.set(
+          h.checkpointTrees,
+          new Map([[`${pin.checkpointRef}^{tree}`, "changed-tree"]]),
+        );
+        yield* Ref.set(h.workspaceTree, "changed-tree");
+        const refused = yield* runner.handle(respond);
+        assert.equal(refused.outcome, "conflict");
+        assert.include(refused.detail ?? "", "Prepared files changed");
+        yield* Ref.set(h.workspaceTree, pin.treeId);
+        const finished = yield* runner.handle(respond);
+        assert.equal(finished.progress?.status, "done");
+        assert.equal((yield* store.get(binding.jobId))?.worktreePath, "/repo");
+      }),
+    ),
+);
 const backgroundScript = {
   id: "preview",
   name: "Preview",
@@ -1075,7 +1570,7 @@ it.effect.each(["approve", "changed", "cancel"] as const)(
         yield* runner.handle(control("status"));
         assert.strictEqual(yield* Queue.size(h.cleanups), 0);
         assert.isNotNull(yield* store.getByThread(review.threadId));
-        if (action === "changed") yield* Ref.set(h.difference, "changed during cleanup");
+        if (action === "changed") yield* Ref.set(h.workspaceTree, "changed-tree");
         if (action === "cancel") {
           yield* Ref.update(h.currentThread, (current) => ({
             ...current!,
@@ -1648,7 +2143,7 @@ it.effect(
         yield* runner.handle(checkpointResponse(input, "input", "goal"));
         yield* h.completeCurrent;
         const review = (yield* runner.handle(control("status"))).progress!;
-        yield* Ref.set(h.difference, "Unexpected edits");
+        yield* Ref.set(h.workspaceTree, "changed-tree");
         assert.strictEqual((yield* runner.handle(approve(review))).outcome, "conflict");
         assert.lengthOf(yield* h.starts, 1);
         assert.strictEqual(
@@ -1680,11 +2175,11 @@ it.effect(
           },
         });
         yield* h.completeCurrent;
-        yield* Ref.set(h.difference, "changed");
+        yield* Ref.set(h.workspaceTree, "changed-tree");
         const blocked = (yield* runner.handle(control("status"))).progress!;
         assert.strictEqual(blocked.status, "finishing");
         assert.isTrue(blocked.retryableApproval);
-        yield* Ref.set(h.difference, "");
+        yield* Ref.set(h.workspaceTree, "prepared-tree");
         assert.strictEqual((yield* runner.handle(approve(blocked))).progress!.status, "done");
         assert.isNull((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.approvedBy);
       }),

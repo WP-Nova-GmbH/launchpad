@@ -387,6 +387,22 @@ describe("E2B thread VM compute", () => {
     }),
   );
 
+  it.effect("creates from the allocation's immutable template tag after a rollout", () =>
+    Effect.gen(function* () {
+      const selected = "verified-launchpad-template:build-b";
+      const pinned = "verified-launchpad-template:build-a";
+      const { client, compute } = fixture({ templateId: selected });
+
+      yield* compute.create(input, pinned);
+      yield* compute.create(input);
+
+      expect(client.create.mock.calls).toEqual([
+        [pinned, expect.any(Object)],
+        [selected, expect.any(Object)],
+      ]);
+    }),
+  );
+
   it.effect(
     "sends disjoint IPv4 deny ranges while retaining public hosts and IPv6 protections",
     () =>

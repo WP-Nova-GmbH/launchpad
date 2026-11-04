@@ -23,6 +23,7 @@ import { make, WorkflowActionError, type WorkflowActionIO } from "./WorkflowActi
 
 export const id = "workflow:job:action:push:0";
 const decodeRun = Schema.decodeUnknownSync(WorkflowRun);
+type ExecuteGit = GitVcsDriver["Service"]["execute"];
 export function initial() {
   const checkpoint = {
     checkpointId: "checkpoint",
@@ -121,6 +122,7 @@ export const harness = (
     | "commit-reply"
     | "push-reply"
     | "hook"
+    | "hook-replace"
     | "ownership"
     | "ownership-no-boot"
     | "ownership-other-host"
@@ -141,6 +143,7 @@ export const harness = (
     onHead: (sha: string) => Effect.Effect<void>;
     beforeArm?: Effect.Effect<void, EnvironmentAuthorizationError>;
   },
+  gitOverride?: (input: Parameters<ExecuteGit>[0]) => ReturnType<ExecuteGit> | undefined,
 ) =>
   Effect.gen(function* () {
     const state = yield* Ref.make(initial());
@@ -171,6 +174,7 @@ export const harness = (
     let host = "host";
     let remote: string | null = null;
     let tree = binding?.tree ?? "prepared";
+    let unreplacedCommitTree: string | null = null;
     let dirty = true;
     let deliveries = 0;
     let commits = 0;
@@ -265,8 +269,8 @@ export const harness = (
             }),
         ),
       );
-    const output = (stdout: string) => ({
-      exitCode: ChildProcessSpawner.ExitCode(0),
+    const output = (stdout: string, exitCode = 0) => ({
+      exitCode: ChildProcessSpawner.ExitCode(exitCode),
       stdout,
       stderr: "",
       stdoutTruncated: false,
@@ -318,9 +322,8 @@ export const harness = (
             requireProject: () => Effect.void,
           }),
       Layer.mock(CheckpointStore)({
-        captureCheckpoint: () => Effect.void,
+        captureCheckpoint: () => Effect.sync(() => ({ commitId: "checkpoint", treeId: tree })),
         deleteCheckpointRefs: () => Effect.void,
-        diffCheckpoints: () => Effect.succeed(""),
       }),
       Layer.mock(GitManager)({
         prepareWorkflowPullRequest: () =>
@@ -345,21 +348,29 @@ export const harness = (
           }),
         execute: (input) =>
           Effect.gen(function* () {
+            const override = gitOverride?.(input);
+            if (override) return yield* override;
             const args = input.args;
             if (args[0] === "ls-remote")
               return output(remote ? `${remote}\trefs/heads/${branchName}\n` : "");
             if (args[0] === "write-tree") return output(tree);
-            if (args[0] === "show")
-              return output(args[2] === "--format=%P" ? parent : "Implement\n\nSaved result");
-            if (args[0] === "rev-parse")
+            if (args[0] === "--no-replace-objects" && args[1] === "symbolic-ref")
+              return args.at(-1) === "HEAD" ? output(`refs/heads/${branchName}`) : output("", 1);
+            if (args[0] === "--no-replace-objects" && args[1] === "rev-parse") {
+              const revision = args.at(-1);
+              if (revision === "HEAD^{commit}") return output(head);
               return output(
-                args[1] === "HEAD"
-                  ? head
-                  : args[1] === `${binding?.base ?? "base"}^{tree}`
-                    ? "base-tree"
+                revision === `${binding?.base ?? "base"}^{tree}`
+                  ? "base-tree"
+                  : revision === `${head}^{tree}`
+                    ? (unreplacedCommitTree ?? tree)
                     : tree,
               );
-            if (args[0] === "merge-base") return output("");
+            }
+            if (args[0] === "--no-replace-objects" && args[1] === "show")
+              return output(args.includes("--format=%P") ? parent : "Implement\n\nSaved result");
+            if (args[0] === "rev-parse") return output(args[1] === "HEAD" ? head : tree);
+            if (args[0] === "--no-replace-objects" && args[1] === "merge-base") return output("");
             if (args[0] === "push") {
               assert.equal(args.at(-2), "https://github.com/acme/repo.git");
               assert.equal(args.at(-1), `${head}:refs/heads/${branchName}`);
@@ -388,6 +399,7 @@ export const harness = (
                 dirty = false;
                 if (binding) yield* binding.onHead(head);
                 if (lose === "hook") tree = "unreviewed";
+                if (lose === "hook-replace") unreplacedCommitTree = "unreviewed";
                 if (lose === "cancel")
                   yield* Ref.update(state, (run) => ({
                     ...run,
@@ -474,6 +486,9 @@ export const harness = (
       state,
       beginPr,
       beginRework,
+      changeWorkspaceTree: (treeId: string) => {
+        tree = treeId;
+      },
       prCounts: () => ({ creates, knownRead }),
       editBody: () => {
         marker = "Edited after creation";

@@ -11,6 +11,10 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
+import { RelayDb } from "../db.ts";
+import { readWorkflowVmBinding, workflowVmHasSecrets } from "./WorkflowVmBinding.ts";
+import { WorkflowVmPreparation } from "./WorkflowVmPreparation.ts";
 import * as Semaphore from "effect/Semaphore";
 import { AutomaticOffers, WorkflowQueued } from "../workflowEvents/AutomaticOffer.ts";
 import { queueReasonText } from "../workflowSources/IssueContext.ts";
@@ -93,26 +97,55 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
   const refresh = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     let job = row!.record;
-    if (job.vmAdmission) {
-      // Only an unprepared VM run can settle locally. Never dispatch a VM admission to a Machine.
-      if (job.workflow !== null || job.runtime !== null) return job;
+    const preparation = job.vmAdmission
+      ? yield* Effect.serviceOption(WorkflowVmPreparation)
+      : Option.none();
+    const vmRuntime = job.runtime?.kind === "vm" ? job.runtime : null;
+    if (job.vmAdmission && vmRuntime === null) {
       if (row!.pendingControl?.response.operation === "cancel")
         return (yield* store.settleQueuedVmCancellation(row!, leaseUntil)).record;
       if (job.status !== "queued") return job;
       const code = yield* queuedWorkflowVmReason(row!, job.vmAdmission.codexConnectionId);
-      const detail = queueReasonText[code];
       if (
-        job.queueReason?.code === code &&
-        job.queueReason.retryAt === null &&
-        job.detail === detail
+        code === "vm_waiting_capacity" &&
+        job.queueReason?.code === "target_invalid" &&
+        (job.queueReason.retryAt ?? 0) > Date.parse(now)
       )
         return job;
-      return (yield* update(row!, {
-        ...job,
-        queueReason: { code, retryAt: null },
-        detail,
-        updatedAt: now,
-      })).record;
+      const detail = queueReasonText[code];
+      if (
+        job.queueReason?.code !== code ||
+        job.queueReason.retryAt !== null ||
+        job.detail !== detail
+      )
+        row = yield* update(row!, {
+          ...job,
+          queueReason: { code, retryAt: null },
+          detail,
+          updatedAt: now,
+        });
+      return Option.isSome(preparation)
+        ? yield* preparation.value.advance(row!, leaseUntil)
+        : row!.record;
+    }
+    let vm: Effect.Success<ReturnType<typeof readWorkflowVmBinding>> | null = null;
+    const db = vmRuntime ? yield* Effect.serviceOption(RelayDb) : Option.none();
+    if (vmRuntime) {
+      if (Option.isSome(db)) {
+        vm = yield* readWorkflowVmBinding(db.value.$client, {
+          jobId,
+          organizationId: row!.organizationId,
+          repositoryId: row!.repositoryId,
+          threadId: vmRuntime.threadId,
+        }).pipe(Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)));
+      }
+      if (
+        !vm ||
+        (row!.pendingControl?.response.operation === "cancel" && job.startAttempted === false)
+      ) {
+        if (Option.isSome(preparation)) return yield* preparation.value.advance(row!, leaseUntil);
+        return job;
+      }
     }
     const connector = yield* EnvironmentConnector;
     const origin = yield* decodeOrigin(
@@ -233,21 +266,70 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       }
     }
     const runtime = job.runtime;
-    if (runtime?.kind !== "machine" || workflow.definition.target.kind !== "machine")
+    if (
+      !runtime ||
+      (vm
+        ? workflow.definition.target.kind !== "vm"
+        : runtime.kind !== "machine" || workflow.definition.target.kind !== "machine")
+    )
       return yield* new WorkflowInvalidError({
         message: "This workflow has no supported execution binding.",
       });
+    const destination = vm?.binding ?? (runtime.kind === "machine" ? runtime : null);
+    if (!destination) return job;
     const binding = {
       organizationId: row!.organizationId,
       repositoryId: job.repositoryId,
-      projectId: runtime.projectId,
+      projectId: destination.projectId,
     };
-    const canonicalKey = row!.repositoryCanonicalKey;
+    const canonicalKey = vm?.snapshot.canonicalKey ?? row!.repositoryCanonicalKey;
     if (canonicalKey === null)
       return yield* new WorkflowInvalidError({
         message: "The offered repository binding is missing.",
       });
+    const dispatch = (workflowControl: WorkflowControl) =>
+      connector
+        .dispatchJob({
+          ...dispatchIdentity(),
+          environmentId: destination.environmentId,
+          jobId: RelayJobId.make(jobId),
+          repositoryCanonicalKey: canonicalKey,
+          baseBranch: vm?.snapshot.branch ?? "HEAD",
+          instruction: job.instruction,
+          workflowControl,
+          ...(vm ? { workflowVmBinding: vm.binding } : {}),
+        })
+        .pipe(
+          Effect.tap((reply) =>
+            vm &&
+            reply.workflowResult?.progress &&
+            reply.workflowResult.progress.threadId !== vm.binding.threadId
+              ? Effect.fail(
+                  new WorkflowInvalidError({
+                    message: "Workflow progress belongs to a different VM thread.",
+                  }),
+                )
+              : Effect.void,
+          ),
+        );
+    const withdrawControl = (previous: WorkflowJobRecord, pendingOperation: string) =>
+      update(
+        previous,
+        {
+          ...previous.record,
+          ...(vm && pendingOperation === "cancel" && previous.record.status === "cancelling"
+            ? { status: previous.record.progress?.status ?? "preparing" }
+            : {}),
+          detail:
+            "The saved response author no longer has permission. A permitted repository member must respond.",
+          pendingManualControl: null,
+          updatedAt: now,
+        },
+        null,
+        false,
+      );
     let control: WorkflowControl = { ...binding, operation: "status" };
+    let memberCanDeliver = false;
     if (row!.pendingControl) {
       // A saved response is only deliverable while its author still has the checkpoint's role.
       const pending = row!.pendingControl;
@@ -256,40 +338,26 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         response.operation === "approve" ||
         response.operation === "input" ||
         response.operation === "request_changes";
-      if (
-        !(yield* canDeliverControl(
-          row!,
-          pending.userId,
-          checkpointResponse && job.progress?.checkpoint?.role === "member",
-        ))
-      ) {
-        row = yield* update(
-          row!,
-          {
-            ...job,
-            detail:
-              "The saved response author no longer has permission. A permitted repository member must respond.",
-            pendingManualControl: null,
-            updatedAt: now,
-          },
-          null,
-          false,
-        );
+      const ownVmCancellation =
+        vm &&
+        origin.kind === "manual" &&
+        row!.submitterUserId === pending.userId &&
+        (response.operation === "cancel" || response.operation === "retry_cancellation");
+      const memberCheckpoint = checkpointResponse && job.progress?.checkpoint?.role === "member";
+      memberCanDeliver =
+        (memberCheckpoint && (!vm || response.operation === "approve")) ||
+        (Boolean(ownVmCancellation || (vm && memberCheckpoint)) &&
+          Option.isSome(db) &&
+          !(yield* workflowVmHasSecrets(db.value.$client, jobId)));
+      if (!(yield* canDeliverControl(row!, pending.userId, memberCanDeliver))) {
+        row = yield* withdrawControl(row!, response.operation);
         return row.record;
       }
       control = { ...binding, ...response };
     } else if (job.progress === null)
       control = { ...binding, operation: "start", workflow, runtime };
     if (control.operation === "start" && (job.requiredProtocol ?? 2) < WORKFLOW_PROTOCOL) {
-      const reconciled = yield* connector.dispatchJob({
-        ...dispatchIdentity(),
-        environmentId: runtime.environmentId,
-        jobId: RelayJobId.make(jobId),
-        repositoryCanonicalKey: canonicalKey,
-        baseBranch: "HEAD",
-        instruction: job.instruction,
-        workflowControl: { ...binding, operation: "status" },
-      });
+      const reconciled = yield* dispatch({ ...binding, operation: "status" });
       const known = reconciled.workflowResult;
       if (known?.outcome === "cancelled" && known.protocol >= (job.requiredProtocol ?? 2))
         return (yield* update(
@@ -341,15 +409,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       control.operation === "request_changes" ||
       control.operation === "retry_action"
     ) {
-      const capability = yield* connector.dispatchJob({
-        ...dispatchIdentity(),
-        environmentId: runtime.environmentId,
-        jobId: RelayJobId.make(jobId),
-        repositoryCanonicalKey: canonicalKey,
-        baseBranch: "HEAD",
-        instruction: job.instruction,
-        workflowControl: { ...binding, operation: "status" },
-      });
+      const capability = yield* dispatch({ ...binding, operation: "status" });
       if (
         !capability.workflowResult ||
         capability.workflowResult.protocol < (job.requiredProtocol ?? 4)
@@ -357,18 +417,17 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         return yield* new WorkflowInvalidError({
           message: "Update this environment before responding to this workflow.",
         });
+      if (vm && row!.pendingControl) {
+        const current = yield* store.getJob(jobId);
+        if (!current || current.revision !== row!.revision || current.leaseUntil !== leaseUntil)
+          return current?.record ?? job;
+        if (!(yield* canDeliverControl(row!, row!.pendingControl.userId, memberCanDeliver)))
+          return (yield* withdrawControl(row!, control.operation)).record;
+      }
     }
-    const mayRetireOffer = job.startAttempted === false;
+    const mayRetireOffer = !vm && job.startAttempted === false;
     if (origin.kind === "automation" && control.operation === "start") {
-      const capability = yield* connector.dispatchJob({
-        ...dispatchIdentity(),
-        environmentId: runtime.environmentId,
-        jobId: RelayJobId.make(jobId),
-        repositoryCanonicalKey: canonicalKey,
-        baseBranch: "HEAD",
-        instruction: job.instruction,
-        workflowControl: { ...binding, operation: "status" },
-      });
+      const capability = yield* dispatch({ ...binding, operation: "status" });
       if (
         !capability.workflowResult ||
         capability.workflowResult.protocol < (job.requiredProtocol ?? 8)
@@ -421,15 +480,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
       job = row.record;
     }
-    const response = yield* connector.dispatchJob({
-      ...dispatchIdentity(),
-      environmentId: runtime.environmentId,
-      jobId: RelayJobId.make(jobId),
-      repositoryCanonicalKey: canonicalKey,
-      baseBranch: "HEAD",
-      instruction: job.instruction,
-      workflowControl: control,
-    });
+    const response = yield* dispatch(control);
     const outcome = response.workflowResult;
     if (!outcome)
       return yield* new WorkflowInvalidError({
@@ -452,6 +503,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       const next: RepositoryWorkflowJob = {
         ...job,
         progress: outcome.progress,
+        ...(vm ? { queueReason: null } : {}),
         pendingManualControl: keepPending ? job.pendingManualControl : null,
         status: outcome.progress.status,
         detail: outcome.detail ?? outcome.progress.detail,
@@ -461,6 +513,16 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       return row.record;
     }
     if (outcome.protocol >= 2 && outcome.outcome === "cancelled") {
+      if (vm && Option.isSome(preparation)) {
+        row = yield* update(row!, {
+          ...job,
+          startAttempted: false,
+          vmCancellationConfirmed: true,
+          detail: "Workflow never started. Cleaning up the VM.",
+          updatedAt: now,
+        });
+        return yield* preparation.value.advance(row, leaseUntil);
+      }
       row = yield* update(
         row!,
         { ...job, status: "cancelled", detail: "Cancelled before acceptance.", updatedAt: now },

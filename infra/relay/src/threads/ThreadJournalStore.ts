@@ -305,6 +305,7 @@ export function makeThreadJournalStore(sql: PgClient) {
   });
   const append = Effect.fn("relay.thread_journal.append")(function* (
     input: Owner & { readonly event: OrchestrationEvent },
+    workflowBootstrap = false,
   ) {
     if (
       input.event.aggregateKind !== "thread" ||
@@ -333,7 +334,7 @@ export function makeThreadJournalStore(sql: PgClient) {
           return yield* conflict("Environment no longer owns this thread generation");
         yield* requireLiveDisk(input);
         yield* requireUnfrozenPause(input);
-        if (placement.operationId !== null) {
+        if (placement.operationId !== null && !workflowBootstrap) {
           const [move] = yield* sql<{
             phase: string;
           }>`SELECT phase FROM relay_thread_moves WHERE operation_id = ${placement.operationId}`;
@@ -363,6 +364,7 @@ export function makeThreadJournalStore(sql: PgClient) {
   });
   const confirmThrough = Effect.fn("relay.thread_journal.confirm_through")(function* (
     input: Owner & { readonly sourceSequence: number },
+    workflowBootstrap = false,
   ) {
     if (!Number.isSafeInteger(input.sourceSequence) || input.sourceSequence < 0)
       return yield* conflict("Invalid history scan watermark");
@@ -376,7 +378,7 @@ export function makeThreadJournalStore(sql: PgClient) {
         if (prior && prior.sourceSequence >= input.sourceSequence) return prior.sourceSequence;
         yield* requireLiveDisk(input);
         yield* requireUnfrozenPause(input);
-        if (placement.operationId !== null) {
+        if (placement.operationId !== null && !workflowBootstrap) {
           const [move] = yield* sql<{ phase: string }>`SELECT phase FROM relay_thread_moves
           WHERE operation_id = ${placement.operationId}`;
           const [finalSave] = yield* sql<{
