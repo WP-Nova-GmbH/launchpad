@@ -130,7 +130,8 @@ vi.mock("@tanstack/react-router", () => ({
   useParams: () => null,
   useRouter: () => testState.router,
 }));
-vi.mock("react", () => ({
+vi.mock("react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("react")>()),
   useCallback: <T>(callback: T) => callback,
   useMemo: <T>(factory: () => T) => factory(),
 }));
@@ -201,6 +202,18 @@ describe.each([
     },
   ],
 ])("useNewThreadHandler with a %s draft", (_, draft) => {
+  it("does not open a draft for a workflow result before its server config loads", async () => {
+    testState.reset(draft);
+    const opened = await useNewThreadHandler()({
+      environmentId: "workflow-vm-not-hydrated",
+      projectId: "vm:workflow:job-1",
+    } as never);
+
+    expect(opened).toBeNull();
+    expect(testState.draftStore.setDraftThreadContext).not.toHaveBeenCalled();
+    expect(testState.router.navigate).not.toHaveBeenCalled();
+  });
+
   it("does not create or reopen a draft in an assigned thread VM", async () => {
     testState.reset(draft);
     testState.targetEnvironment.threadVm = { threadId: "thread-assigned" };

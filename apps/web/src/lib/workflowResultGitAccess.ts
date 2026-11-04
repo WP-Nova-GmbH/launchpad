@@ -5,10 +5,21 @@ import { createContext } from "react";
 /** A workflow result can display history and checkpoints without opening the live workspace. */
 export const LiveWorkspaceContext = createContext(true);
 
+type WorkflowVmCapabilities = Pick<
+  ExecutionEnvironmentDescriptor["capabilities"],
+  "workflowVmResultReader"
+>;
+
+export function canUseLiveProjectWorkspace(input: {
+  readonly projectId: string;
+  readonly capabilities: WorkflowVmCapabilities | undefined;
+}): boolean {
+  // A workflow VM project can be cached before the environment descriptor arrives.
+  return !input.capabilities?.workflowVmResultReader && !input.projectId.startsWith("vm:workflow:");
+}
+
 export function workflowResultGitAccess(input: {
-  readonly capabilities:
-    | Pick<ExecutionEnvironmentDescriptor["capabilities"], "workflowVmResultReader">
-    | undefined;
+  readonly capabilities: WorkflowVmCapabilities | undefined;
   readonly origin?: WorkflowResultOrigin | undefined;
   readonly threadId: string | null;
 }) {

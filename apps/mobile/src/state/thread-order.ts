@@ -6,7 +6,10 @@ import {
   reconcilePendingThreadOrder,
   type PendingThreadOrder,
 } from "../features/threads/threadOrder";
-import { getThreadListV2OrderedSection } from "../features/threads/threadListV2";
+import {
+  getThreadListV2ArrangementThreads,
+  getThreadListV2OrderedSection,
+} from "../features/threads/threadListV2";
 import { appAtomRegistry } from "./atom-registry";
 import { environmentServerConfigsAtom } from "./server";
 import { navigationThreadShellsAtom } from "./threads";
@@ -53,7 +56,10 @@ export function beginPendingThreadOrder(pending: PendingThreadOrder) {
     if (current === null) return;
     const configs = appAtomRegistry.get(environmentServerConfigsAtom);
     const ordered = getThreadListV2OrderedSection({
-      threads: appAtomRegistry.get(navigationThreadShellsAtom),
+      threads: getThreadListV2ArrangementThreads(
+        appAtomRegistry.get(navigationThreadShellsAtom),
+        configs,
+      ),
       section: current.section,
       now: new Date().toISOString(),
       queuedThreadKeys: appAtomRegistry.get(queuedThreadKeysAtom),

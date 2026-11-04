@@ -23,6 +23,7 @@ import { useResolveClassNames } from "uniwind";
 
 import { AppText as Text } from "./components/AppText";
 import { getCompactBrandHeaderOptions } from "./components/CompactBrandTitle";
+import { EmptyState } from "./components/EmptyState";
 import {
   RenderErrorBoundary,
   RenderFailureView,
@@ -114,6 +115,11 @@ import { nativeHeaderScrollEdgeEffects } from "./native/StackHeader";
 import { FORM_SHEET_PRESENTATION_OPTIONS } from "./native/sheet-surface";
 import { useThreadOutboxDrain } from "./state/use-thread-outbox-drain";
 import { useComposerAttachmentUploadWorker } from "./state/composer-attachment-uploads";
+import { useEnvironmentServerConfig } from "./state/entities";
+import {
+  resolveWorkflowResultAccess,
+  threadWorkspaceRouteTarget,
+} from "./state/workflow-result-access";
 
 const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 
@@ -838,6 +844,7 @@ function GuardedScreenLayout(props: {
   readonly children: ReactNode;
   readonly route: { readonly name: string; readonly params?: object | undefined };
 }) {
+  const workspaceTarget = threadWorkspaceRouteTarget(props.route);
   return (
     <RenderErrorBoundary
       resetKeys={[props.route.params]}
@@ -845,8 +852,47 @@ function GuardedScreenLayout(props: {
         <ScreenRenderFallback {...fallback} routeName={props.route.name} />
       )}
     >
-      {props.children}
+      {workspaceTarget === null ? (
+        props.children
+      ) : (
+        <ThreadWorkspaceRouteGate {...workspaceTarget}>{props.children}</ThreadWorkspaceRouteGate>
+      )}
     </RenderErrorBoundary>
+  );
+}
+
+function ThreadWorkspaceRouteGate({
+  children,
+  environmentId,
+  threadId,
+}: NonNullable<ReturnType<typeof threadWorkspaceRouteTarget>> & { readonly children: ReactNode }) {
+  const navigation = useNavigation();
+  const config = useEnvironmentServerConfig(environmentId);
+  const { readOnly, workspaceEnabled } = resolveWorkflowResultAccess(
+    config?.environment.capabilities ?? null,
+    undefined,
+    threadId,
+  );
+  if (threadId !== null && workspaceEnabled) return children;
+
+  const canReturnToThread = environmentId !== null && threadId !== null;
+  return (
+    <View className="flex-1 justify-center bg-sheet px-6">
+      <EmptyState
+        title="Workspace unavailable"
+        detail={
+          readOnly
+            ? "Open the workflow result to see its conversation and saved diff."
+            : "Open the thread to check its connection."
+        }
+        actionLabel={canReturnToThread ? "Open thread" : "Return home"}
+        onAction={() => {
+          if (canReturnToThread)
+            navigation.dispatch(StackActions.replace("Thread", { environmentId, threadId }));
+          else navigation.dispatch(StackActions.replace("Home"));
+        }}
+      />
+    </View>
   );
 }
 

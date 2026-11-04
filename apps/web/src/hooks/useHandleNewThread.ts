@@ -5,7 +5,12 @@ import {
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import { DEFAULT_SERVER_SETTINGS, type ScopedProjectRef, type ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type ScopedProjectRef,
+  type ServerConfig,
+  type ThreadId,
+} from "@t3tools/contracts";
 import { useParams, useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 import {
@@ -31,6 +36,7 @@ import {
   resolveNewThreadModelSelectionOverride,
 } from "../lib/chatThreadActions";
 import { readT3ProjectFile } from "../lib/t3ProjectFileDefaults";
+import { canUseLiveProjectWorkspace } from "../lib/workflowResultGitAccess";
 import { environmentServerConfigsAtom } from "../state/server";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
@@ -41,6 +47,13 @@ interface NewThreadWorkspaceOptions {
   worktreePath?: string | null;
   envMode?: DraftThreadEnvMode;
   startFromOrigin?: boolean;
+}
+
+function canCreateThreadForProject(projectId: string, config: ServerConfig | undefined): boolean {
+  return (
+    canCreateThreadInEnvironment(config) &&
+    canUseLiveProjectWorkspace({ projectId, capabilities: config?.environment.capabilities })
+  );
 }
 
 // The workspace options the caller passed explicitly, shaped for the draft
@@ -78,12 +91,12 @@ export function useNewThreadHandler() {
       // prepared checkout, a task to write — addresses that one rather than looking the project
       // up again and finding whichever draft it happens to hold.
     ): Promise<{ draftId: DraftId; threadId: ThreadId } | null> => {
-      if (!canCreateThreadInEnvironment(environmentServerConfigs.get(projectRef.environmentId))) {
+      const config = environmentServerConfigs.get(projectRef.environmentId);
+      if (!canCreateThreadForProject(projectRef.projectId, config)) {
         return Promise.resolve(null);
       }
       const projects = readProjects();
-      const targetServerSettings =
-        environmentServerConfigs.get(projectRef.environmentId)?.settings ?? DEFAULT_SERVER_SETTINGS;
+      const targetServerSettings = config?.settings ?? DEFAULT_SERVER_SETTINGS;
       const {
         getComposerDraft,
         getDraftSessionByLogicalProjectKey,
@@ -460,7 +473,7 @@ export function useHandleNewThread() {
   const projects = useMemo(
     () =>
       allProjects.filter((project) =>
-        canCreateThreadInEnvironment(configs.get(project.environmentId)),
+        canCreateThreadForProject(project.id, configs.get(project.environmentId)),
       ),
     [allProjects, configs],
   );
@@ -477,7 +490,8 @@ export function useHandleNewThread() {
   }, [projectOrder, projects]);
   const handleNewThread = useNewThreadHandler();
   const canCreateThreadInProject = useCallback(
-    (ref: ScopedProjectRef) => canCreateThreadInEnvironment(configs.get(ref.environmentId)),
+    (ref: ScopedProjectRef) =>
+      canCreateThreadForProject(ref.projectId, configs.get(ref.environmentId)),
     [configs],
   );
 

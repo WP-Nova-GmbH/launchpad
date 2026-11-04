@@ -4,7 +4,7 @@ import { ChevronDownIcon, LayersIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { SidebarProjectSnapshot } from "../../sidebarProjectGrouping";
-import { useEnvironments, type EnvironmentPresentation } from "../../state/environments";
+import type { EnvironmentPresentation } from "../../state/environments";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { InlineButton } from "../ui/button";
@@ -53,12 +53,11 @@ interface SettingsScopeMenuProps {
 export function SettingsScopeSentence() {
   const scope = useOptionalSettingsScope();
   const pathname = useLocation({ select: (location) => location.pathname });
-  const { environments } = useEnvironments();
   if (scope === null || SETTINGS_UNSCOPED_PATHS.has(pathname)) return null;
   const props: SettingsScopeMenuProps = {
     value: scope.search,
     groups: scope.groups,
-    environments,
+    environments: scope.availableEnvironments,
     onChange: scope.selectScope,
   };
   return (

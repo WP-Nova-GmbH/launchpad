@@ -11,6 +11,7 @@ import {
 import { RowPressable } from "../../components/RowPressable";
 import { CustomSnoozeSheet } from "./CustomSnoozeSheet";
 import { appAtomRegistry } from "../../state/atom-registry";
+import { serverEnvironment } from "../../state/server";
 import { threadArrangementOpenAtom } from "../../state/thread-order";
 import type { ThreadMoveDestination } from "./threadOrder";
 import type {
@@ -41,6 +42,7 @@ import { ThreadSwipeable } from "../home/thread-swipe-actions";
 import { buildThreadTitleRegenerationMenuItems } from "./thread-title-regeneration-menu";
 import {
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
+  canMutateThreadListRow,
   resolveThreadListV2SnoozeMenuSelection,
   resolveThreadListV2SnoozeGateExpiryMs,
   resolveThreadListV2Status,
@@ -91,6 +93,11 @@ const LEGACY_MENU_ACTIONS: MenuAction[] = [
   { id: "archive", title: "Archive", image: "archivebox" },
   { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
 ];
+const COPY_THREAD_ID_ACTION: MenuAction = {
+  id: "copy-thread-id",
+  title: "Copy thread ID",
+  image: "doc.on.doc",
+};
 
 /** Rounded-row radius shared with the v1 sidebar rows. */
 const SIDEBAR_V2_ROW_RADIUS = 12;
@@ -546,6 +553,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   } = props;
   const snoozedRow = props.snoozed === true;
   const pinnedRow = props.pinned === true;
+  const config = useEnvironmentServerConfig(thread.environmentId);
+  const canMutate = canMutateThreadListRow(thread.id, config?.environment.capabilities);
+  const canMutateNow = useCallback(
+    () =>
+      canMutateThreadListRow(
+        thread.id,
+        appAtomRegistry.get(serverEnvironment.configValueAtom(thread.environmentId))?.environment
+          .capabilities,
+      ),
+    [thread.environmentId, thread.id],
+  );
 
   const pr = useThreadPr(thread);
 
@@ -582,8 +600,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     setCustomSnoozeOpen(false);
   }
   const handleSnooze = useCallback(
-    (snoozedUntil: string) => onSnoozeThread(thread, snoozedUntil),
-    [onSnoozeThread, thread],
+    (snoozedUntil: string) => {
+      if (canMutateNow()) onSnoozeThread(thread, snoozedUntil);
+    },
+    [canMutateNow, onSnoozeThread, thread],
   );
   const handleUnsnooze = useCallback(() => onUnsnoozeThread(thread), [onUnsnoozeThread, thread]);
   const handleUnsettle = useCallback(() => onUnsettleThread(thread), [onUnsettleThread, thread]);
@@ -768,11 +788,14 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   );
   const environmentLabel = thread.portableLocation?.label ?? props.environmentLabel;
   const environmentMachine = thread.portableLocation?.machine ?? props.environmentMachine;
-  const canCreateThread = canCreateThreadInEnvironment(
-    useEnvironmentServerConfig(thread.environmentId),
-  );
+  const canCreateThread = canCreateThreadInEnvironment(config);
   const handleMenuAction = useCallback(
     ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
+      if (nativeEvent.event === COPY_THREAD_ID_ACTION.id) {
+        copyTextWithHaptic(thread.id, { target: "thread-id" });
+        return;
+      }
+      if (!canMutateNow()) return;
       if (nativeEvent.event === "new-thread-on-branch") onNewThreadOnBranch(thread);
       if (nativeEvent.event === "settle") handleSettle();
       if (nativeEvent.event === "unsettle") handleUnsettle();
@@ -787,9 +810,6 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       if (nativeEvent.event === "archive") handleArchive();
       if (nativeEvent.event === "rename") handleRename();
       if (nativeEvent.event === "regenerate-title") handleRegenerateTitle();
-      if (nativeEvent.event === "copy-thread-id") {
-        copyTextWithHaptic(thread.id, { target: "thread-id" });
-      }
       if (nativeEvent.event === "delete") handleDelete();
       if (nativeEvent.event === "snooze:custom") {
         setCustomSnoozeOpen(true);
@@ -807,6 +827,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       }
     },
     [
+      canMutateNow,
       onNewThreadOnBranch,
       thread,
       handleArchive,
@@ -884,8 +905,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         : null,
     [handleMenuAction, snoozePresetActions, swipeActions.secondary, thread.title],
   );
-  const swipeAccessibilityHint =
-    secondaryAction === null
+  const swipeAccessibilityHint = !canMutate
+    ? "Opens the thread."
+    : secondaryAction === null
       ? `Opens the thread. Swipe left to ${primaryAction.label.toLowerCase()}.`
       : `Opens the thread. Swipe left for ${primaryAction.label.toLowerCase()} and snooze actions.`;
 
@@ -1067,7 +1089,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     </>
   );
 
-  const rowContent = (close: () => void) =>
+  const rowContent = (close?: () => void) =>
     variant === "card" ? (
       <RowPressable
         key={`${thread.environmentId}:${thread.id}`}
@@ -1081,7 +1103,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         accessibilityRole="button"
         accessibilityState={{ selected }}
         onPress={() => {
-          close();
+          close?.();
           onSelectThread(thread);
         }}
         style={rowAppearance.cardStyle}
@@ -1114,7 +1136,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         accessibilityState={{ selected }}
         className={rowAppearance.className}
         onPress={() => {
-          close();
+          close?.();
           onSelectThread(thread);
         }}
         style={rowAppearance.style}
@@ -1178,6 +1200,20 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       </RowPressable>
     );
 
+  if (!canMutate) {
+    return (
+      <View collapsable={false}>
+        <ControlPillMenu
+          actions={[COPY_THREAD_ID_ACTION]}
+          onPressAction={handleMenuAction}
+          shouldOpenOnLongPress
+        >
+          {rowContent()}
+        </ControlPillMenu>
+      </View>
+    );
+  }
+
   return (
     <View collapsable={false}>
       {customSnoozeOpen && (
@@ -1214,7 +1250,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                     },
                   ]
                 : []),
-              { id: "copy-thread-id", title: "Copy thread ID", image: "doc.on.doc" },
+              COPY_THREAD_ID_ACTION,
               ...(snoozedRow
                 ? snoozedMenuActions
                 : !props.settlementSupported

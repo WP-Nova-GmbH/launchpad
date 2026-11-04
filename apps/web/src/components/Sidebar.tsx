@@ -104,7 +104,10 @@ import { isModelPickerOpen } from "../modelPickerVisibility";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { isMacPlatform } from "~/lib/utils";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
-import { workflowResultGitAccess } from "../lib/workflowResultGitAccess";
+import {
+  canUseLiveProjectWorkspace,
+  workflowResultGitAccess,
+} from "../lib/workflowResultGitAccess";
 import { releaseComposerDraftUploads } from "../lib/composerDraftUploads";
 import { readLocalApi } from "../localApi";
 import {
@@ -2352,6 +2355,16 @@ export default function Sidebar() {
   const projectGroupsRef = useRef(projectGroups);
   projectGroupsRef.current = projectGroups;
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
+  const canOpenProjectSettings = useCallback(
+    (group: SidebarProjectSnapshot) =>
+      group.memberProjects.some((project) =>
+        canUseLiveProjectWorkspace({
+          projectId: project.id,
+          capabilities: serverConfigs.get(project.environmentId)?.environment.capabilities,
+        }),
+      ),
+    [serverConfigs],
+  );
   const canMutateThread = useCallback(
     (environmentId: EnvironmentId, threadId: ThreadId) =>
       workflowResultGitAccess({
@@ -2516,6 +2529,7 @@ export default function Sidebar() {
 
   const openProjectSettings = useCallback(
     (projectGroup: SidebarProjectSnapshot) => {
+      if (!canOpenProjectSettings(projectGroup)) return;
       if (isMobile) {
         setOpenMobile(false);
       }
@@ -2524,7 +2538,7 @@ export default function Sidebar() {
         params: { projectKey: projectGroup.projectKey },
       });
     },
-    [isMobile, router, setOpenMobile],
+    [canOpenProjectSettings, isMobile, router, setOpenMobile],
   );
   // Anchor for the scope popup: the header search field, not its icon trigger.
   const headerSearchRef = useRef<HTMLDivElement | null>(null);
@@ -2537,13 +2551,14 @@ export default function Sidebar() {
       event: ReactMouseEvent<HTMLElement> | ReactKeyboardEvent<HTMLInputElement>,
       projectGroup: SidebarProjectSnapshot,
     ) => {
+      if (!canOpenProjectSettings(projectGroup)) return;
       event.preventDefault();
       event.stopPropagation();
       suppressNextScopeChangeRef.current = true;
       dispatchProjectScopeMenu({ type: "project-settings-opened" });
       openProjectSettings(projectGroup);
     },
-    [openProjectSettings],
+    [canOpenProjectSettings, openProjectSettings],
   );
 
   // Keep a dropped row at its destination while its server applies the
@@ -4591,7 +4606,7 @@ export default function Sidebar() {
                                 machineByEnvironmentId={environmentMachineById}
                               />
                             ) : null}
-                            {project ? (
+                            {project && canOpenProjectSettings(project) ? (
                               <Button
                                 size="icon-xs"
                                 variant="ghost-muted"

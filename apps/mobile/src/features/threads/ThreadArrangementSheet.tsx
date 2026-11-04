@@ -26,7 +26,7 @@ import {
   threadDragAction,
   type ThreadMoveDestination,
 } from "./threadOrder";
-import { getThreadListV2OrderedSection } from "./threadListV2";
+import { getThreadListV2ArrangementThreads, getThreadListV2OrderedSection } from "./threadListV2";
 
 const ROW_HEIGHT = 56;
 const HEADER_HEIGHT = 48;
@@ -148,8 +148,12 @@ function DragHandle(props: {
 
 export function ThreadArrangementSheet(props: { onClose: () => void }) {
   const insets = useSafeAreaInsets();
-  const threads = useAtomValue(navigationThreadShellsAtom);
+  const allThreads = useAtomValue(navigationThreadShellsAtom);
   const configs = useAtomValue(environmentServerConfigsAtom);
+  const threads = useMemo(
+    () => getThreadListV2ArrangementThreads(allThreads, configs),
+    [allThreads, configs],
+  );
   const queuedThreadKeys = useAtomValue(queuedThreadKeysAtom);
   const pendingOrder = useAtomValue(pendingThreadOrderAtom);
   const dropBusy = useAtomValue(threadDropBusyAtom);

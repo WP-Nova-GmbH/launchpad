@@ -1,6 +1,6 @@
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import { describe, expect, it } from "vite-plus/test";
-import { workflowResultGitAccess } from "./workflowResultGitAccess";
+import { canUseLiveProjectWorkspace, workflowResultGitAccess } from "./workflowResultGitAccess";
 
 const threadId = "workflow:result";
 const origin = {
@@ -45,5 +45,21 @@ describe("workflow result Git access", () => {
       workflowResultGitAccess({ threadId: "personal", capabilities: undefined, origin })
         .canReadCheckoutGit,
     ).toBe(true);
+  });
+});
+
+describe("workflow VM project access", () => {
+  it("preserves writable group members while result descriptors load", () => {
+    const members = [
+      { projectId: "vm:workflow:result", capabilities: undefined },
+      { projectId: "writable-checkout", capabilities: undefined },
+      { projectId: "another-result", capabilities: { workflowVmResultReader: true } },
+      { projectId: "vm:personal", capabilities: { workflowVmResultReader: false } },
+    ];
+
+    expect(members.filter(canUseLiveProjectWorkspace).map(({ projectId }) => projectId)).toEqual([
+      "writable-checkout",
+      "vm:personal",
+    ]);
   });
 });
