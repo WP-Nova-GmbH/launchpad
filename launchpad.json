@@ -1,10 +1,8 @@
 {
-  "$schema": "https://t3.codes/schema/t3.json",
-  "iconPath": "assets/dev/blueprint-web-apple-touch-180.png",
   "scripts": [
     {
-      "name": "Setup Worktree",
-      "command": "node scripts/setup-worktree.ts",
+      "name": "Verify disposable P04 configuration",
+      "command": "node p04-setup.mjs",
       "icon": "configure",
       "runOnWorktreeCreate": true
     }

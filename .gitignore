@@ -44,3 +44,6 @@ node_modules/
 
 # pnpm content-addressable store; never belongs in the repo.
 .pnpm-store/
+
+# Disposable P04 setup marker
+.p04-setup-ok
