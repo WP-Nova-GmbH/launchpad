@@ -7,12 +7,14 @@ import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import type * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
+import { mintThreadVmCodexToken, type ThreadVmCodexTokenError } from "./ThreadVmCodexToken.ts";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 
 export class ThreadVmCodexAuthSourceError extends Schema.TaggedError<ThreadVmCodexAuthSourceError>()(
@@ -99,6 +101,7 @@ export interface ManagedThreadVmCodexAuthContext {
   readonly label: string;
   readonly status: Effect.Effect<RelayCodexVmConnection, ThreadVmCodexAuthSourceError>;
   readonly preflight: Effect.Effect<void, ThreadVmCodexAuthSourceError>;
+  readonly mintToken?: Effect.Effect<Redacted.Redacted<string>, ThreadVmCodexTokenError>;
 }
 interface ThreadVmCodexAuthContextShape {
   readonly current: Effect.Effect<
@@ -185,6 +188,9 @@ export const makeThreadVmCodexAuthContext = Effect.gen(function* () {
       connectionId: selected.connectionId,
       label: selected.connection.label ?? "Organization Codex",
       status,
+      mintToken: mintThreadVmCodexToken(selected.connectionId).pipe(
+        Effect.provideContext(dependencies),
+      ),
       preflight: status.pipe(
         Effect.flatMap((connection) =>
           connection.status === "connected"

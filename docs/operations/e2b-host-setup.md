@@ -219,12 +219,24 @@ The check reads the model policy and model list from the selected build without 
 If the build cannot report its model policy, rebuild the runner and run the check again.
 Proof generated before the runner reported its own policy must be regenerated. On success,
 restart the dev relay to load the proof alongside the template selection. If you use an
-alternate selection file, set `E2B_TEMPLATE_FILE` for the check too. For a deployed relay,
-set `E2B_WORKFLOW_MODEL_PROOF` to the contents of the output directory's `workflow-models.json`
-when deploying the matching template. Workflows can still use the managed default while an
-explicit model catalog is unavailable when authoring. Manual VM runs require credential isolation
-proof for the selected build as well as `RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true` on the
-development relay. The model smoke check above supplies the authoring catalog.
+alternate selection file, set `E2B_TEMPLATE_FILE` for the check too. Workflows can still use the
+managed default while an explicit model catalog is unavailable when authoring.
+
+Manual workflow VM runs require credential isolation proof for the selected build and
+`RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true`. Add `--workflow-isolation` to the smoke command to
+verify the installed workflow launcher and its access boundaries in the disposable VM. The smoke
+publishes the isolation proof for that exact build after verification and native VM deletion
+succeed. A model-only check preserves an existing proof for the build. If the existing local proof
+is invalid, remove it before repeating the model check or run the isolation check again.
+
+For a deployed test relay with workflow execution enabled, set `E2B_WORKFLOW_MODEL_PROOF` to the
+contents of `workflow-models.json` from the successful isolation check for its selected build.
+When upgrading from an older isolation version, stop submitting new workflow VM runs and finish or
+cancel older runs before switching the relay. Stop the old relay workers before starting the upgraded
+workers against the same database and E2B host. Resolve any older running, paused, or saved guests
+that could still resume workflow execution before enabling workflow VM runs again. A pending run
+whose VM was never created releases its slot if its saved build differs from the proved selection.
+Start a new run to use the selected build.
 
 For relay authentication, database migrations, Cloudflare and app startup, continue
 with [VM development](vm-development.md). The E2B management API and proxy must stay

@@ -387,7 +387,9 @@ export const make = Effect.gen(function* () {
           if (
             !pin ||
             pin.treeId !== action.tree ||
-            (yield* readTree(pin.commitId).pipe(Effect.orElseSucceed(() => null))) !== pin.treeId
+            (yield* checkpoints
+              .resolvePinnedTree({ cwd, checkpointRef: CheckpointRef.make(pin.commitId) })
+              .pipe(Effect.orElseSucceed(() => null))) !== pin.treeId
           )
             return yield* new WorkflowActionError({
               message:
@@ -418,7 +420,11 @@ export const make = Effect.gen(function* () {
             owned(
               id,
               io,
-              checkpoints.deleteCheckpointRefs({ cwd, checkpointRefs: [verificationRef] }),
+              checkpoints.deleteCheckpointRefs({
+                cwd,
+                checkpointRefs: [verificationRef],
+                pinned: run.runtime.kind === "vm",
+              }),
             ),
           ),
         );

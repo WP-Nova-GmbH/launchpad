@@ -42,6 +42,7 @@ struct LaunchResult {
     error: Option<String>,
 }
 const LAUNCH_LIMIT: usize = 4096;
+const WORKFLOW_SETUP_EXIT_TOKEN: &str = "LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN";
 fn launch_result_bytes(result: &LaunchResult) -> Vec<u8> {
     let encoded = serde_json::to_vec(result).expect("Launch result consists of strings");
     if encoded.len() <= LAUNCH_LIMIT {
@@ -56,6 +57,28 @@ fn launch_result_bytes(result: &LaunchResult) -> Vec<u8> {
 
 /// One-shot ownership operations are independent of telemetry and never accept root absence.
 pub fn run(args: &[String]) -> io::Result<()> {
+    run_mode(args, false)
+}
+
+#[cfg(target_os = "linux")]
+pub fn run_workflow(args: &[String]) -> io::Result<()> {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    if unsafe { geteuid() } != 0
+        || !matches!(
+            args.first().map(String::as_str),
+            Some("host" | "capture" | "arm")
+        )
+    {
+        return Err(io::Error::other(
+            "Workflow setup requires the trusted broker",
+        ));
+    }
+    run_mode(args, true)
+}
+
+fn run_mode(args: &[String], workflow: bool) -> io::Result<()> {
     let operation = args.first().map(String::as_str);
     if operation == Some("host") {
         return output(None, false, false);
@@ -71,7 +94,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
                 .ok_or_else(|| io::Error::other("Setup owner exited before capture"))?;
             let started = Instant::now();
             loop {
-                if is_owner(pid, &birth)? && ready(pid, &birth)? {
+                if is_owner(pid, &birth)? && ready(pid, &birth, workflow)? {
                     return output(Some(birth), true, false);
                 }
                 if identity(pid)?.as_deref() != Some(birth.as_str())
@@ -100,7 +123,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             if !is_owner(pid, expected)? {
                 return Err(io::Error::other("Setup ownership was lost before delivery"));
             }
-            let result = arm(pid, expected)?;
+            let result = arm(pid, expected, workflow)?;
             output_launch(Some(expected.to_owned()), true, false, Some(result))
         }
         Some("stop") => {
@@ -141,7 +164,12 @@ fn output_launch(
 /// Keep the ownership anchor alive when the shell or PTY parent exits. Deliberately
 /// detached services have their own lifecycle; ordinary descendants remain in this session/job.
 pub fn launch(args: &[String]) -> io::Result<()> {
-    launch_mode(args, false)
+    launch_mode(args, false, false)
+}
+
+#[cfg(target_os = "linux")]
+pub fn launch_workflow(args: &[String]) -> io::Result<()> {
+    launch_mode(args, false, true)
 }
 
 pub fn launch_command(args: &[String]) -> io::Result<()> {
@@ -150,10 +178,47 @@ pub fn launch_command(args: &[String]) -> io::Result<()> {
             "Owned headless commands are unavailable on this platform",
         ));
     }
-    launch_mode(args, true)
+    launch_mode(args, true, false)
 }
 
-fn launch_mode(args: &[String], command_mode: bool) -> io::Result<()> {
+#[cfg(target_os = "linux")]
+fn workflow_setup_request(args: &[String]) -> io::Result<(LaunchRequest, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if args != ["--script-fd-v1"] || unsafe { fcntl(3, 1, 0) } != 0 {
+        return Err(io::Error::other("Missing protected workflow setup script"));
+    }
+    // The broker passes only this already unlinked, nonwritable input FD.
+    let script = unsafe { std::fs::File::from_raw_fd(3) };
+    let info = script.metadata()?;
+    if !info.is_file()
+        || info.uid() != 1000
+        || info.gid() != 1000
+        || info.nlink() != 0
+        || info.mode() & 0o7777 != 0o444
+    {
+        return Err(io::Error::other("Workflow setup script descriptor changed"));
+    }
+    let token = std::env::var(WORKFLOW_SETUP_EXIT_TOKEN)
+        .map_err(|_| io::Error::other("Missing workflow setup token"))?;
+    if token.len() != 32 || !token.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(io::Error::other("Invalid workflow setup token"));
+    }
+    Ok((
+        LaunchRequest {
+            protocol: 1,
+            token,
+            candidates: vec![ShellCandidate {
+                shell: "/bin/bash".into(),
+                args: vec!["/proc/self/fd/3".into()],
+            }],
+        },
+        script,
+    ))
+}
+
+fn launch_mode(args: &[String], command_mode: bool, workflow: bool) -> io::Result<()> {
     #[cfg(unix)]
     let mut control = if command_mode {
         use std::os::fd::FromRawFd;
@@ -170,7 +235,15 @@ fn launch_mode(args: &[String], command_mode: bool) -> io::Result<()> {
     } else {
         None
     };
-    let request = if args.first().map(String::as_str) == Some("--launch-v1") {
+    let (request, workflow_script): (LaunchRequest, Option<std::fs::File>) = if workflow {
+        #[cfg(target_os = "linux")]
+        {
+            let (request, script) = workflow_setup_request(args)?;
+            (request, Some(script))
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err(io::Error::other("Workflow setup is unavailable"));
+    } else if args.first().map(String::as_str) == Some("--launch-v1") {
         let payload = args
             .get(1)
             .filter(|payload| payload.len() <= 16384)
@@ -188,19 +261,22 @@ fn launch_mode(args: &[String], command_mode: bool) -> io::Result<()> {
         {
             return Err(io::Error::other("Invalid setup launch request"));
         }
-        request
+        (request, None)
     } else {
-        LaunchRequest {
-            protocol: 1,
-            token: String::new(),
-            candidates: vec![ShellCandidate {
-                shell: args
-                    .first()
-                    .ok_or_else(|| io::Error::other("Missing setup shell"))?
-                    .clone(),
-                args: args[1..].to_vec(),
-            }],
-        }
+        (
+            LaunchRequest {
+                protocol: 1,
+                token: String::new(),
+                candidates: vec![ShellCandidate {
+                    shell: args
+                        .first()
+                        .ok_or_else(|| io::Error::other("Missing setup shell"))?
+                        .clone(),
+                    args: args[1..].to_vec(),
+                }],
+            },
+            None,
+        )
     };
     #[cfg(unix)]
     {
@@ -221,11 +297,14 @@ fn launch_mode(args: &[String], command_mode: bool) -> io::Result<()> {
     let _job = windows::Job::create_owner()?;
     // Until the journal saves this PID/birth and arms it, no shell or startup script runs.
     // An unrecorded owner times out without children rather than surviving a launch crash forever.
-    let child = await_arm(|| {
+    let child = await_arm(workflow, || {
         let mut errors = Vec::new();
         for candidate in &request.candidates {
             let mut command = std::process::Command::new(&candidate.shell);
             command.args(&candidate.args);
+            if workflow {
+                command.env_remove(WORKFLOW_SETUP_EXIT_TOKEN);
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
@@ -278,6 +357,7 @@ fn launch_mode(args: &[String], command_mode: bool) -> io::Result<()> {
             },
         )
     })?;
+    drop(workflow_script);
     if let Some(mut child) = child {
         let code = child
             .wait()
@@ -334,8 +414,104 @@ fn command_result_survives_disconnected_result_and_diagnostic_readers() {
 fn owner_socket(pid: u32, birth: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp").join(format!("t3-setup-v4-{pid}-{birth}"))
 }
+
 #[cfg(unix)]
-fn request_arm(pid: u32, birth: &str, request: u8) -> io::Result<bool> {
+fn verify_setup_peer(
+    stream: &std::os::unix::net::UnixStream,
+    owner: Option<(u32, &str)>,
+    workflow: bool,
+) -> io::Result<()> {
+    if !workflow {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::{c_int, c_void};
+        use std::os::fd::AsRawFd;
+        #[repr(C)]
+        struct Credentials {
+            pid: c_int,
+            uid: u32,
+            gid: u32,
+        }
+        unsafe extern "C" {
+            fn getsockopt(
+                fd: c_int,
+                level: c_int,
+                name: c_int,
+                value: *mut c_void,
+                len: *mut u32,
+            ) -> c_int;
+        }
+        let mut peer = Credentials {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let expected_len = std::mem::size_of::<Credentials>() as u32;
+        let mut len = expected_len;
+        // Linux SOL_SOCKET/SO_PEERCRED. Kernel credentials cannot be supplied by
+        // a same-UID process substituting a listener in /tmp.
+        if unsafe {
+            getsockopt(
+                stream.as_raw_fd(),
+                1,
+                17,
+                (&mut peer as *mut Credentials).cast(),
+                &mut len,
+            )
+        } != 0
+            || len != expected_len
+            || peer.pid <= 0
+        {
+            return Err(io::Error::other(
+                "Workflow setup peer credentials are unavailable",
+            ));
+        }
+        let verified = match owner {
+            Some((pid, birth)) => {
+                peer.pid as u32 == pid
+                    && peer.uid == 10001
+                    && peer.gid == 10001
+                    && identity(pid)?.as_deref() == Some(birth)
+            }
+            None => peer.uid == 0 && peer.gid == 0,
+        };
+        if verified {
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (stream, owner);
+    Err(io::Error::other("Workflow setup peer is not authorized"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn workflow_setup_peer_checks_kernel_credentials_and_expected_owner() {
+    use std::os::unix::net::UnixStream;
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+        fn getegid() -> u32;
+    }
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let uid = unsafe { geteuid() };
+    let gid = unsafe { getegid() };
+    let pid = std::process::id();
+    let birth = identity(pid).unwrap().unwrap();
+    assert!(verify_setup_peer(&socket, Some((pid + 1, &birth)), true).is_err());
+    assert_eq!(
+        verify_setup_peer(&socket, None, true).is_ok(),
+        uid == 0 && gid == 0
+    );
+    assert_eq!(
+        verify_setup_peer(&socket, Some((pid, &birth)), true).is_ok(),
+        uid == 10001 && gid == 10001,
+    );
+}
+
+#[cfg(unix)]
+fn request_arm(pid: u32, birth: &str, request: u8, workflow: bool) -> io::Result<bool> {
     use std::io::{Read, Write};
     let mut stream = match std::os::unix::net::UnixStream::connect(owner_socket(pid, birth)) {
         Ok(stream) => stream,
@@ -349,6 +525,7 @@ fn request_arm(pid: u32, birth: &str, request: u8) -> io::Result<bool> {
         }
         Err(error) => return Err(error),
     };
+    verify_setup_peer(&stream, Some((pid, birth)), workflow)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     stream.write_all(&[request])?;
@@ -357,13 +534,14 @@ fn request_arm(pid: u32, birth: &str, request: u8) -> io::Result<bool> {
     Ok(ack[0] == 4)
 }
 #[cfg(unix)]
-fn ready(pid: u32, birth: &str) -> io::Result<bool> {
-    request_arm(pid, birth, b'C')
+fn ready(pid: u32, birth: &str, workflow: bool) -> io::Result<bool> {
+    request_arm(pid, birth, b'C', workflow)
 }
 #[cfg(unix)]
-fn arm(pid: u32, birth: &str) -> io::Result<LaunchResult> {
+fn arm(pid: u32, birth: &str, workflow: bool) -> io::Result<LaunchResult> {
     use std::io::{Read, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(owner_socket(pid, birth))?;
+    verify_setup_peer(&stream, Some((pid, birth)), workflow)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     stream.write_all(b"A")?;
@@ -378,6 +556,7 @@ fn arm(pid: u32, birth: &str) -> io::Result<LaunchResult> {
 }
 #[cfg(unix)]
 fn await_arm(
+    workflow: bool,
     spawn: impl FnOnce() -> (Option<std::process::Child>, LaunchResult),
 ) -> io::Result<Option<std::process::Child>> {
     use std::io::{Read, Write};
@@ -400,6 +579,9 @@ fn await_arm(
     while started.elapsed() < Duration::from_secs(30) {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                if verify_setup_peer(&stream, None, workflow).is_err() {
+                    continue;
+                }
                 stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                 let mut request = [0u8];
                 if stream.read_exact(&mut request).is_ok() && matches!(request[0], b'A' | b'C') {
@@ -425,15 +607,16 @@ fn await_arm(
     ))
 }
 #[cfg(target_os = "windows")]
-fn ready(pid: u32, birth: &str) -> io::Result<bool> {
+fn ready(pid: u32, birth: &str, _workflow: bool) -> io::Result<bool> {
     Ok(windows::LaunchEvent::open(pid, birth).is_ok())
 }
 #[cfg(target_os = "windows")]
-fn arm(pid: u32, birth: &str) -> io::Result<LaunchResult> {
+fn arm(pid: u32, birth: &str, _workflow: bool) -> io::Result<LaunchResult> {
     windows::LaunchEvent::open(pid, birth)?.arm(pid, birth)
 }
 #[cfg(target_os = "windows")]
 fn await_arm(
+    _workflow: bool,
     spawn: impl FnOnce() -> (Option<std::process::Child>, LaunchResult),
 ) -> io::Result<Option<std::process::Child>> {
     windows::LaunchEvent::wait(spawn)
@@ -476,9 +659,11 @@ fn is_owner(pid: u32, expected: &str) -> io::Result<bool> {
     Ok(system
         .process(sysinfo::Pid::from_u32(pid))
         .is_some_and(|p| {
-            p.cmd()
-                .get(1)
-                .is_some_and(|arg| arg == "--setup-owner-v4" || arg == "--command-owner-v1")
+            p.cmd().get(1).is_some_and(|arg| {
+                arg == "--setup-owner-v4"
+                    || arg == "--workflow-setup-owner-v4"
+                    || arg == "--command-owner-v1"
+            })
         })
         && identity(pid)?.as_deref() == Some(expected))
 }

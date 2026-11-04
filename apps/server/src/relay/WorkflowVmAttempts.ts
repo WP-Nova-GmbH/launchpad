@@ -1,4 +1,5 @@
 import type { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import type { ThreadPromptHandoff, ThreadPromptQueue } from "@t3tools/contracts";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,11 +15,28 @@ export interface WorkflowVmAttemptEnvironment {
   readonly environment: Readonly<Record<string, string>>;
   readonly hasSecrets: boolean;
   readonly secretNames: ReadonlyArray<string>;
+  readonly authorizeInference?: Effect.Effect<boolean>;
 }
 
 export function workflowReviewSecretMatcher(values: ReadonlyArray<string>) {
   const lines = [...new Set(values.flatMap((value) => value.split(/\r\n|\r|\n/u)).filter(Boolean))];
   return (text: string) => lines.some((line) => text.includes(line));
+}
+
+export function canContinueWorkflowVmInference(
+  queue: ThreadPromptQueue | undefined,
+  handoff: ThreadPromptHandoff,
+) {
+  if (!queue) return false;
+  // An uncertain delivery pauses new work while the original native turn can settle.
+  const recovering =
+    queue.pauseReason?.code === "delivery-unknown" &&
+    queue.pauseReason.resumeOnConfirmedAttemptId === handoff.attemptId;
+  if (!recovering && (!queue.enabled || queue.revision !== handoff.controlRevision)) return false;
+  const admitted = queue.admissions.find(({ attemptId }) => attemptId === handoff.attemptId);
+  return admitted
+    ? admitted.turnId === queue.awaitingTurnId && admitted.turnId !== queue.finalizedTurnId
+    : queue.handoff?.attemptId === handoff.attemptId;
 }
 
 export const CurrentWorkflowVmAttemptEnvironment =

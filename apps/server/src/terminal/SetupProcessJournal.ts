@@ -70,7 +70,12 @@ export interface SetupProcessJournalShape {
     input: Attempt & { readonly terminalId: string },
   ) => Effect.Effect<void, SetupProcessError>;
   readonly capture: (
-    input: Attempt & { readonly pid: number },
+    input: Attempt & {
+      readonly pid: number;
+      readonly guardArm?: (
+        arm: Effect.Effect<string, SetupProcessError>,
+      ) => Effect.Effect<string, SetupProcessError>;
+    },
   ) => Effect.Effect<string, SetupProcessError>;
   readonly complete: (input: Attempt) => Effect.Effect<void, SetupProcessError>;
   readonly cleanup: (input: Cleanup) => Effect.Effect<SetupCleanupReceipt, SetupProcessError>;
@@ -262,7 +267,8 @@ export const layer = Layer.effect(
               ownershipVersion: 4,
               boot: inspected.boot,
             });
-            return yield* processes.arm(input.pid, inspected.identity);
+            const arm = processes.arm(input.pid, inspected.identity);
+            return yield* input.guardArm ? input.guardArm(arm) : arm;
           }),
         ),
       complete: (input) =>

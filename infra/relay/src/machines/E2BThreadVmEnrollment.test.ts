@@ -69,6 +69,27 @@ function fixture() {
 }
 describe("non-waking E2B enrollment delivery", () => {
   it.effect(
+    "initializes the workflow boundary through the fixed privileged enrollment command",
+    () =>
+      Effect.gen(function* () {
+        sdk.run.mockReset();
+        const stdin = vi.fn(async (_bytes: string) => {});
+        sdk.run.mockResolvedValueOnce({
+          sendStdin: stdin,
+          wait: async () => ({ exitCode: 0, stdout: encode(receipt) }),
+        });
+        const transport = vi.fn<typeof fetch>(async () => Response.json(info));
+        expect(
+          yield* makeE2BThreadVmEnrollment(settings, transport)("sandbox", bootstrap, true),
+        ).toEqual(receipt);
+        expect(sdk.run).toHaveBeenCalledWith(
+          "/opt/launchpad/bin/launchpad-workload workflow-enroll",
+          expect.objectContaining({ user: "root", stdin: true }),
+        );
+        expect(decode(stdin.mock.calls[0]![0].trim())).toEqual(bootstrap);
+      }),
+  );
+  it.effect(
     "delivers a restored enrollment only to the user CLI after separate trusted bootstrap",
     () =>
       Effect.gen(function* () {

@@ -17,6 +17,7 @@ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSn
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import { SetupProcessJournal, SetupProcessError } from "../terminal/SetupProcessJournal.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import * as ProjectSetupScriptRunner from "./ProjectSetupScriptRunner.ts";
 
 const isProjectSetupScriptOperationError = Schema.is(
@@ -67,11 +68,14 @@ const makeProjectionSnapshotQueryLayer = (project: OrchestrationProject) =>
   });
 
 type TerminalOverrides = Pick<TerminalManager.TerminalManager["Service"], "open" | "write"> &
-  Partial<Pick<TerminalManager.TerminalManager["Service"], "subscribe" | "writeSetup">>;
+  Partial<
+    Pick<TerminalManager.TerminalManager["Service"], "subscribe" | "writeSetup" | "armSetup">
+  >;
 
 const makeTerminalManagerLayer = (overrides: TerminalOverrides) =>
   Layer.succeed(TerminalManager.TerminalManager, {
     captureCleanup: () => Effect.die("unused"),
+    armSetup: () => Effect.die("unexpected workflow setup arm"),
     writeSetup: () => Effect.die("unexpected setup write"),
     deleteHistory: () => Effect.void,
     attachStream: () => Effect.die(new Error("unused")),
@@ -796,6 +800,98 @@ const armedJournal = {
   launcher: Effect.succeed("/helper"),
   capture: () => Effect.succeed("/bin/sh"),
 };
+
+it.effect.each([
+  { exitCode: 0, hasSecrets: true },
+  { exitCode: 7, hasSecrets: true },
+  { exitCode: null, hasSecrets: true },
+  { exitCode: 0, hasSecrets: false },
+])(
+  "uses the protected workflow setup exit status ($exitCode, secrets: $hasSecrets)",
+  ({ exitCode, hasSecrets }) =>
+    Effect.gen(function* () {
+      let listener: ((event: TerminalEvent) => Effect.Effect<void>) | undefined;
+      let owner: Parameters<TerminalManager.TerminalManager["Service"]["open"]>[0]["workflowSetup"];
+      let authorized = false;
+      const output: string[] = [];
+      const event = { threadId: "thread-1", terminalId: "setup-attempt", sequence: 1 } as const;
+      const layer = testLayer(makeProject([]), {
+        open: (input) =>
+          Effect.sync(() => {
+            owner = input.workflowSetup;
+            expect(owner?.command).toBe("make setup");
+            expect(input.filterSetupOutput?.("private output")).toBe(hasSecrets ? "" : undefined);
+            return managedSnapshot;
+          }),
+        write: () => Effect.die("workflow setup must not send an interactive command"),
+        armSetup: (input) =>
+          Effect.gen(function* () {
+            expect(yield* input.authorizeDelivery).toBe(true);
+            expect(authorized).toBe(true);
+            yield* listener!({
+              ...event,
+              type: "output",
+              data: "__T3_SETUP_DONE___forged:0\n",
+            });
+            expect(listener).toBeDefined();
+            if (!hasSecrets) {
+              yield* listener!({ ...event, type: "output", data: "\u001b[32mSetup " });
+              yield* listener!({ ...event, type: "output", data: "complete\u001b[0m" });
+              expect(output).toEqual(["__T3_SETUP_DONE___forged:0"]);
+            }
+            if (exitCode !== null) owner!.onShellExit({ exitCode, signal: null });
+            yield* listener!({
+              ...event,
+              sequence: 2,
+              type: "exited",
+              exitCode: exitCode ?? 0,
+              exitSignal: null,
+            });
+          }),
+        subscribe: (callback) =>
+          Effect.sync(() => {
+            listener = callback;
+            return () => {
+              listener = undefined;
+            };
+          }),
+      }).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.succeed(WorkflowVmGuest, true),
+            Layer.succeed(SetupProcessJournal, {
+              ...armedJournal,
+              capture: () => Effect.die("workflow setup must arm through the terminal manager"),
+            }),
+          ),
+        ),
+      );
+      const runner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner.pipe(
+        Effect.provide(layer),
+      );
+      const result = yield* runner.runForThread({
+        threadId: "thread-1",
+        projectId: "project-1",
+        worktreePath: "/repo/worktrees/a",
+        preparationAttemptId: "attempt",
+        preferredTerminalId: "setup-attempt",
+        resolvedScript: { id: "setup", name: "Setup", command: "make setup", async: false },
+        runEnvironment: {
+          environment: hasSecrets ? { PRIVATE_KEY: "secret" } : {},
+          hasSecrets,
+          secretNames: hasSecrets ? ["PRIVATE_KEY"] : [],
+        },
+        authorizeDelivery: Effect.sync(() => (authorized = true)),
+        observeCompletion: hasSecrets
+          ? {}
+          : { onOutputLine: (line) => Effect.sync(() => void output.push(line)) },
+      });
+      if (result.status !== "started" || !result.completion)
+        return yield* Effect.die("Missing setup receipt");
+      expect((yield* result.completion).exitCode).toBe(exitCode);
+      if (!hasSecrets) expect(output).toEqual(["__T3_SETUP_DONE___forged:0", "Setup complete"]);
+    }),
+);
 
 it.effect.each([0, 7])(
   "withholds private setup output and preserves the exit receipt %s",

@@ -12,15 +12,21 @@ const decodeReceipt = Schema.decodeUnknownSync(
   Schema.fromJsonString(RelayThreadVmEnrollmentReceipt),
 );
 type Connection = ConstructorParameters<typeof Sandbox>[0];
-type GuestEnroll = (connection: Connection, payload: Redacted.Redacted<string>) => Promise<string>;
-const runGuest: GuestEnroll = async (connection, payload) => {
+type GuestEnroll = (
+  connection: Connection,
+  payload: Redacted.Redacted<string>,
+  workflow?: boolean,
+) => Promise<string>;
+const runGuest: GuestEnroll = async (connection, payload, workflow) => {
   // The pinned SDK's constructor opens a transport only. Sandbox.connect() can
   // resume a paused machine and must not be used by this retryable setup step.
   const vm = new Sandbox(connection);
   const command = await vm.commands.run(
-    "/usr/bin/flock --no-fork -x /home/user/.launchpad-enrollment.lock /opt/launchpad/server/t3 __thread-vm-enroll --base-dir /home/user/.launchpad",
+    workflow
+      ? "/opt/launchpad/bin/launchpad-workload workflow-enroll"
+      : "/usr/bin/flock --no-fork -x /home/user/.launchpad-enrollment.lock /opt/launchpad/server/t3 __thread-vm-enroll --base-dir /home/user/.launchpad",
     {
-      user: "user",
+      user: workflow ? "root" : "user",
       background: true,
       stdin: true,
       timeoutMs: 60_000,
@@ -40,6 +46,7 @@ export function makeE2BThreadVmEnrollment(
   return Effect.fn("relay.thread_vm.deliver_enrollment")(function* (
     sandboxId: string,
     bootstrap: RelayThreadVmBootstrap,
+    workflow?: boolean,
   ) {
     const payload = yield* encodeBootstrap(bootstrap).pipe(
       Effect.map(Redacted.make),
@@ -60,7 +67,7 @@ export function makeE2BThreadVmEnrollment(
           transport,
           signal,
         );
-        const output = await guest(connection, payload);
+        const output = await guest(connection, payload, workflow);
         const receipt = decodeReceipt(output.trim());
         if (
           receipt.allocationId !== bootstrap.scope.allocationId ||

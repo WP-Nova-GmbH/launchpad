@@ -162,9 +162,11 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
             ? "Repository checkout failed. Start a new run to try again."
             : cancelled
               ? "Cancelled after the workflow VM stopped."
-              : job.startAttempted === false
-                ? "The workflow VM stopped before execution began. Start a new run to try again."
-                : "The workflow VM was lost and its result could not be confirmed. Start a new run to try again.";
+              : preparation.blocker === "workflow_template_stale"
+                ? "The saved workflow VM build is no longer selected. Start a new run."
+                : job.startAttempted === false
+                  ? "The workflow VM stopped before execution began. Start a new run to try again."
+                  : "The workflow VM was lost and its result could not be confirmed. Start a new run to try again.";
           return (yield* store.updateJob(
             row,
             {

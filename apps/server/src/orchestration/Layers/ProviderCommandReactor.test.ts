@@ -278,7 +278,7 @@ describe("ProviderCommandReactor", () => {
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderServiceError>;
     readonly captureCheckpoint?: CheckpointStore["Service"]["captureCheckpoint"];
-    readonly hasCheckpointRef?: CheckpointStore["Service"]["hasCheckpointRef"];
+    readonly resolvePinnedTree?: CheckpointStore["Service"]["resolvePinnedTree"];
     readonly tryHandlePromptCommandEffect?: ProviderAuthService["Service"]["tryHandlePromptCommand"];
   }) {
     const now = "2026-01-01T00:00:00.000Z";
@@ -571,7 +571,8 @@ describe("ProviderCommandReactor", () => {
       Layer.provide(
         Layer.mock(CheckpointStore, {
           isGitRepository: () => Effect.succeed(false),
-          hasCheckpointRef: input?.hasCheckpointRef ?? (() => Effect.succeed(true)),
+          hasCheckpointRef: () => Effect.succeed(true),
+          resolvePinnedTree: input?.resolvePinnedTree ?? (() => Effect.succeed("baseline-tree")),
           ...(input?.captureCheckpoint ? { captureCheckpoint: input.captureCheckpoint } : {}),
         }),
       ),
@@ -8061,7 +8062,8 @@ describe("ProviderCommandReactor", () => {
         createHarness({
           deferReactorStart: true,
           captureCheckpoint: capture,
-          hasCheckpointRef: () => Effect.succeed(mode !== "recovered-missing-object"),
+          resolvePinnedTree: () =>
+            Effect.succeed(mode === "recovered-missing-object" ? null : baseline.treeId),
           startSessionEffect: (session) =>
             Effect.sync(() => {
               if (!overlap)
@@ -8397,6 +8399,10 @@ describe("ProviderCommandReactor", () => {
                 isGitRepository: () => Effect.succeed(true),
                 captureCheckpoint: () =>
                   Effect.succeed({ commitId: "result-commit", treeId: "result-tree" }),
+                resolvePinnedTree: ({ checkpointRef }) =>
+                  Effect.succeed(
+                    checkpointRef === "baseline-commit" ? "baseline-tree" : "result-tree",
+                  ),
                 diffCheckpoints: () => Effect.succeed(""),
                 deleteCheckpointRefs: () => Effect.void,
               }),

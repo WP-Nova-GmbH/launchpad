@@ -106,11 +106,16 @@ export const codexSessionAppServerArgs = (
   appServerArgs: ReadonlyArray<string> | undefined,
   launchArgs: string | undefined,
   managedConnectionId?: string,
+  workflowProxy?: { readonly baseUrl: string; readonly permitEnv: string },
 ) => {
   const launchAppServerArgs = codexAppServerArgs(launchArgs);
   return [
     ...launchAppServerArgs,
     ...(appServerArgs ?? []),
-    ...managedCodexArgs(managedConnectionId),
+    ...(workflowProxy
+      ? managedCodexProviderArgs(workflowProxy.baseUrl, "/usr/bin/printenv", [
+          workflowProxy.permitEnv,
+        ])
+      : managedCodexArgs(managedConnectionId)),
   ];
 };

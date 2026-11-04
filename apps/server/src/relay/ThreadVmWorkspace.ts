@@ -14,6 +14,8 @@ import * as Schema from "effect/Schema";
 import { readExistingServerSecret, ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { ProcessRunner } from "../processRunner.ts";
+import { VmCoordinatorProcess } from "../vmWorkloadCommand.ts";
+import { WorkflowReviewGitDirectory } from "../vcs/WorkflowReviewGitDirectory.ts";
 import {
   decodeInstalledThreadVm,
   readInstalledThreadVm,
@@ -126,6 +128,7 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
     const secrets = yield* ServerSecretStore;
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const reviewGitDirectory = yield* WorkflowReviewGitDirectory;
     if (
       !path.isAbsolute(workspaceRoot) ||
       path.normalize(workspaceRoot) !== workspaceRoot ||
@@ -154,7 +157,9 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
     // The workflow-only credential permits fresh checkout; reset still consumes a bundle.
     if (
       purpose === "initial"
-        ? !workflowGitToken || !/^github\.com\/[a-z0-9-]+\/[a-z0-9_.-]+$/iu.test(input.canonicalKey)
+        ? !workflowGitToken ||
+          !reviewGitDirectory ||
+          !/^github\.com\/[a-z0-9-]+\/[a-z0-9_.-]+$/iu.test(input.canonicalKey)
         : !repository || workflowGitToken
     )
       return yield* failure("repository_unavailable");
@@ -213,46 +218,43 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
       .pipe(Effect.mapError(() => failure("setup_unconfirmed")));
     const attempt = Effect.gen(function* () {
       yield* fs.makeDirectory(path.dirname(workspaceRoot), { recursive: true });
-      yield* run(
-        "git",
-        [
+      const gitEnvironment = {
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_LFS_SKIP_SMUDGE: "1",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_COUNT: "0",
+      };
+      const objectFormat =
+        repository?.objectFormat ?? (input.revision.length === 40 ? "sha1" : "sha256");
+      let initialBundle = repository?.bundlePath;
+      if (workflowGitToken && reviewGitDirectory) {
+        const trusted = (
+          command: string,
+          args: ReadonlyArray<string>,
+          env: NodeJS.ProcessEnv = gitEnvironment,
+        ) =>
+          run(command, args, "repository_unavailable", env).pipe(
+            Effect.provideService(VmCoordinatorProcess, true),
+          );
+        if (yield* fs.exists(reviewGitDirectory)) return yield* failure("setup_unconfirmed");
+        yield* trusted("/usr/bin/git", [
           "init",
-          `--object-format=${repository?.objectFormat ?? (input.revision.length === 40 ? "sha1" : "sha256")}`,
+          "--bare",
+          "--template=",
+          `--object-format=${objectFormat}`,
           "--",
-          workspaceRoot,
-        ],
-        "repository_unavailable",
-        { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_COUNT: "0" },
-      );
-      const git = (args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
-        run("git", ["-C", workspaceRoot, ...args], "repository_unavailable", {
-          GIT_TERMINAL_PROMPT: "0",
-          GIT_LFS_SKIP_SMUDGE: "1",
-          GIT_CONFIG_NOSYSTEM: "1",
-          GIT_CONFIG_GLOBAL: "/dev/null",
-          GIT_CONFIG_COUNT: "0",
-          ...env,
-        });
-      if (repository) {
-        yield* git(["bundle", "verify", repository.bundlePath]);
-        const head = (yield* git([
-          "bundle",
-          "list-heads",
-          repository.bundlePath,
-          BASELINE_REF,
-        ])).trim();
-        if (head !== `${input.revision} ${BASELINE_REF}`)
-          return yield* failure("repository_unavailable");
-        yield* git([
-          "fetch",
-          "--no-tags",
-          "--no-write-fetch-head",
-          repository.bundlePath,
-          `${BASELINE_REF}:refs/heads/${input.branch}`,
+          reviewGitDirectory,
         ]);
-      } else if (workflowGitToken) {
-        yield* git(["remote", "add", "origin", `https://${input.canonicalKey}.git`]);
-        yield* git(["fetch", "--no-tags", "--no-write-fetch-head", "origin", input.revision], {
+        const reviewGit = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv = gitEnvironment) =>
+          trusted(
+            "/usr/bin/git",
+            ["--git-dir", reviewGitDirectory, "-c", "core.fsync=objects,reference", ...args],
+            env,
+          );
+        const remote = `https://${input.canonicalKey}.git`;
+        yield* reviewGit(["fetch", "--no-tags", "--no-write-fetch-head", remote, input.revision], {
+          ...gitEnvironment,
           GIT_CONFIG_COUNT: "2",
           GIT_CONFIG_KEY_0: "http.https://github.com/.extraHeader",
           GIT_CONFIG_VALUE_0: `Authorization: Basic ${Encoding.encodeBase64(`x-access-token:${Redacted.value(workflowGitToken)}`)}`,
@@ -261,6 +263,38 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
           GIT_TRACE_CURL: "0",
           GIT_CURL_VERBOSE: "0",
         });
+        yield* reviewGit(["update-ref", BASELINE_REF, input.revision]);
+        yield* reviewGit(["fsck", "--full", "--strict", "--no-reflogs"]);
+        const staging = yield* fs.makeTempDirectoryScoped({ prefix: "launchpad-workflow-" });
+        initialBundle = path.join(staging, "repository.bundle");
+        yield* reviewGit(["bundle", "create", initialBundle, BASELINE_REF]);
+        yield* fs.chmod(initialBundle, 0o444);
+        yield* fs.chmod(staging, 0o711);
+        yield* trusted("/opt/launchpad/bin/launchpad-workload-exec", ["prepare-workspace"]);
+      }
+      yield* run(
+        "git",
+        ["init", `--object-format=${objectFormat}`, "--", workspaceRoot],
+        "repository_unavailable",
+        { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_COUNT: "0" },
+      );
+      const git = (args: ReadonlyArray<string>) =>
+        run("git", ["-C", workspaceRoot, ...args], "repository_unavailable", gitEnvironment);
+      if (initialBundle) {
+        yield* git(["bundle", "verify", initialBundle]);
+        const head = (yield* git(["bundle", "list-heads", initialBundle, BASELINE_REF])).trim();
+        if (head !== `${input.revision} ${BASELINE_REF}`)
+          return yield* failure("repository_unavailable");
+        yield* git([
+          "fetch",
+          "--no-tags",
+          "--no-write-fetch-head",
+          initialBundle,
+          `${BASELINE_REF}:refs/heads/${input.branch}`,
+        ]);
+      }
+      if (workflowGitToken) {
+        yield* git(["remote", "add", "origin", `https://${input.canonicalKey}.git`]);
         // Retain the initial commit independently of later changes to the run branch.
         yield* git(["update-ref", BASELINE_REF, input.revision]);
       }
@@ -298,6 +332,7 @@ export const prepareThreadVmWorkspace = Effect.fn("ThreadVmWorkspace.prepare")(
       yield* save(ready);
       return ready;
     }).pipe(
+      Effect.scoped,
       Effect.mapError((error) => (isWorkspaceError(error) ? error : failure("setup_failed"))),
     );
     return yield* attempt.pipe(

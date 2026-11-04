@@ -42,6 +42,7 @@ export function makeThreadVmProvisionWorker(
   verifyTemplate: Effect.Effect<void, ThreadVmComputeError> = Effect.void,
   workflow?: {
     readonly enabled: boolean;
+    readonly buildId: string;
     readonly verifyTemplate: (
       templateId: string,
       buildId: string,
@@ -50,13 +51,16 @@ export function makeThreadVmProvisionWorker(
 ) {
   const store = makeThreadVmProvisionStore(sql);
   const allocations = makeThreadVmAllocationStore(sql);
+  const verifiedWorkflowBuild = workflow?.enabled
+    ? { templateRef: templateId, buildId: workflow.buildId }
+    : undefined;
   const runOne = Effect.fn("relay.thread_vm_provision.run_one")(function* () {
     const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
     yield* makeThreadVmCapacityStore(sql).admitNext(
       hostId,
       workflow ? { workflowEnabled: workflow.enabled } : "personal",
     );
-    const row = yield* store.claim(claimId, hostId, workflow !== undefined);
+    const row = yield* store.claim(claimId, hostId, workflow !== undefined, verifiedWorkflowBuild);
     if (!row) return false;
     const claim = { allocationId: row.allocationId, claimId };
     if (row.phase === "pending" && row.allocationState === "deleting") {
@@ -162,6 +166,15 @@ export function makeThreadVmProvisionWorker(
         const snapshot = row.workflowSnapshot;
         if (snapshot && !workflow?.enabled) {
           yield* store.returnWorkflowReservation({ ...claim, errorCode: "workflow_disabled" });
+          return;
+        }
+        if (
+          snapshot &&
+          verifiedWorkflowBuild &&
+          (row.templateId !== verifiedWorkflowBuild.templateRef ||
+            snapshot.templateBuildId !== verifiedWorkflowBuild.buildId)
+        ) {
+          yield* store.rejectUnstarted({ ...claim, errorCode: "workflow_template_stale" });
           return;
         }
         if (snapshot && workflow) {

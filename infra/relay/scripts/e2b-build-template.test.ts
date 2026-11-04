@@ -17,8 +17,13 @@ import {
   buildTemplate,
   prepareTemplateContext,
   validateBuildTarget,
+  writeJsonAtomically,
 } from "./e2b-build-template.mjs";
 import { loadDevThreadVmRuntimeSettings } from "./dev-thread-vm-template.ts";
+import {
+  WORKFLOW_VM_ISOLATION_VERSION,
+  workflowVmModelProofPath,
+} from "../src/threads/ThreadVmWorkflowModelProof.ts";
 
 const { buildMock } = vi.hoisted(() => ({ buildMock: vi.fn<typeof Template.build>() }));
 vi.mock("e2b", async (original) => {
@@ -72,6 +77,38 @@ async function buildFixture() {
 }
 
 describe("runner build publication", () => {
+  it.each(["model-first", "isolation-first", "concurrent"] as const)(
+    "retains the isolation receipt for the same build after %s publication",
+    async (order) => {
+      const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-proof-"));
+      const model = { buildId: "fixture-build", templateRef: "fixture:build-runner" };
+      const isolation = { ...model, isolationVersion: WORKFLOW_VM_ISOLATION_VERSION };
+      const path = workflowVmModelProofPath(
+        NodePath.join(directory, "template.json"),
+        model.buildId,
+      );
+      const publishModel = () => writeJsonAtomically(path, model, { ifAbsent: true });
+      const publishIsolation = () => writeJsonAtomically(path, isolation);
+      const read = async () => decodeJsonObject(await NodeFSP.readFile(path, "utf8"));
+      try {
+        if (order === "model-first") {
+          expect(await publishModel()).toBe(true);
+          expect(await read()).toEqual(model);
+          await publishIsolation();
+        } else if (order === "isolation-first") {
+          await publishIsolation();
+          expect(await publishModel()).toBe(false);
+        } else {
+          await Promise.all([publishModel(), publishIsolation()]);
+        }
+        expect(await read()).toEqual(isolation);
+        expect(await NodeFSP.readdir(directory)).toEqual([NodePath.basename(path)]);
+      } finally {
+        await NodeFSP.rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("rejects a relative selected-template path before requesting a build", async () => {
     const fixture = await buildFixture();
     try {
@@ -213,6 +250,8 @@ describe("runner build publication", () => {
             "dockerfileSha256",
             "activitySha256",
             "workloadSha256",
+            "workflowExecSha256",
+            "workflowCheckpointReaderSha256",
             "workloadServiceSha256",
             "installerSha256",
           ])
@@ -221,6 +260,15 @@ describe("runner build publication", () => {
             NodeCrypto.createHash("sha256")
               .update(
                 await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
+              )
+              .digest("hex"),
+          );
+          expect(receipt.workflowExecSha256).toBe(
+            NodeCrypto.createHash("sha256")
+              .update(
+                await NodeFSP.readFile(
+                  new URL("../../e2b/template/workflow-exec.c", import.meta.url),
+                ),
               )
               .digest("hex"),
           );
@@ -413,11 +461,13 @@ describe("E2B runner build inputs", () => {
           const [, , source, destination] = installation.split(" ");
           expect([
             "/opt/launchpad-package/workload.py",
+            "/opt/launchpad-package/workflow-checkpoint-reader.py",
             "/opt/launchpad-package/activity.py",
             "/opt/launchpad-package/install.sh",
           ]).toContain(source);
           expect([
             "/opt/launchpad/bin/launchpad-workload",
+            "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py",
             "/opt/launchpad/bin/launchpad-activity",
             "/opt/launchpad/install.sh",
           ]).toContain(destination);
@@ -437,7 +487,7 @@ describe("E2B runner build inputs", () => {
           expect(copied.status, copied.stderr).toBe(0);
           protectedFiles.push(target);
         }
-        expect(protectedFiles).toHaveLength(6);
+        expect(protectedFiles).toHaveLength(7);
         const local = image + "/usr/local";
         await NodeFSP.mkdir(local, { recursive: true });
         const finalized = NodeChildProcess.spawnSync("chmod", ["-R", "777", local]);
@@ -492,6 +542,8 @@ describe("E2B runner build inputs", () => {
         "launchpad-workloads.service",
         "server.sha256",
         "server.tar.gz",
+        "workflow-checkpoint-reader.py",
+        "workflow-exec.c",
         "workload.py",
       ]);
       expect(await NodeFSP.readFile(NodePath.join(context, "server.tar.gz"))).toEqual(payload);

@@ -27,6 +27,7 @@ import {
 } from "@t3tools/contracts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
 const encodeExitError = Schema.encodeEffect(Schema.fromJsonString(VcsProcessExitError));
@@ -655,6 +656,51 @@ describe("VcsProcess.run on a managed executor", () => {
 });
 
 describe("VcsProcess private thread VM", () => {
+  it.effect("runs local Git inside a workflow guest without exposing repository credentials", () =>
+    Effect.gen(function* () {
+      const inputs: ProcessRunner.ProcessRunInput[] = [];
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: (input) =>
+            Effect.sync(() => {
+              inputs.push(input);
+              return {
+                code: ChildProcessSpawner.ExitCode(0),
+                stdout: " M tracked.txt",
+                stderr: "",
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              };
+            }),
+        }),
+        Effect.provideService(
+          OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+          {
+            github: Effect.die("The workload cannot mint organization credentials."),
+            threadVm: { github: Effect.die("The workload cannot mint VM credentials.") },
+          },
+        ),
+      );
+      const input = {
+        ...baseInput,
+        env: { GH_TOKEN: "token", GIT_CONFIG_PARAMETERS: "test", GIT_INDEX_FILE: "/tmp/index" },
+      };
+      const git = yield* service.run(input);
+      expect(git.stdout).toBe(" M tracked.txt");
+      expect(inputs[0]?.args).toEqual(baseInput.args);
+      expect(inputs[0]?.env?.GH_TOKEN).toBeUndefined();
+      expect(inputs[0]?.env?.GIT_CONFIG_PARAMETERS).toBeUndefined();
+      expect(inputs[0]?.env?.GIT_INDEX_FILE).toBe("/tmp/index");
+      expect(
+        yield* service.run({ ...input, command: "gh", args: ["pr", "list"] }).pipe(Effect.flip),
+      ).toMatchObject({ failureKind: "authentication" });
+      expect(inputs).toHaveLength(1);
+    }).pipe(Effect.provideService(WorkflowVmGuest, true)),
+  );
+
   it.effect(
     "keeps local Git offline, strips broader credentials, and fails closed on denied GitHub access",
     () =>

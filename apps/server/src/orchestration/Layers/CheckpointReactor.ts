@@ -369,7 +369,7 @@ const make = Effect.gen(function* () {
             fallbackFromToHead: false,
             ignoreWhitespace: false,
             format: "numstat",
-            ...(pinnedPair ? { requireComplete: true } : {}),
+            ...(pinnedPair ? { pinned: true, requireComplete: true } : {}),
           })
         : Effect.succeed("")
     ).pipe(

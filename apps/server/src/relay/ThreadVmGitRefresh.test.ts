@@ -6,6 +6,13 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import { makeThreadVmGitRefresh } from "./ThreadVmGitRefresh.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
+
+it.effect("skips personal Git config repair on a workflow guest", () =>
+  makeThreadVmGitRefresh(Effect.die("Workflow Git config must stay workload-owned")).pipe(
+    Effect.provideService(WorkflowVmGuest, true),
+  ),
+);
 
 it.effect("refreshes completed Git setup every five minutes", () =>
   Effect.gen(function* () {

@@ -24,6 +24,7 @@ import { withPreparingWorkflowVm } from "./ThreadVmWorkflowAccess.ts";
 type Deliver = (
   sandboxId: string,
   input: RelayThreadVmBootstrap,
+  workflow?: boolean,
 ) => Effect.Effect<RelayThreadVmEnrollmentReceipt, ThreadVmComputeError>;
 /** Retries only the immutable enrollment, never VM creation or execution activation. */
 export function makeThreadVmEnrollmentWorker(
@@ -63,7 +64,7 @@ export function makeThreadVmEnrollmentWorker(
             };
           }),
         );
-        const receipt = yield* deliver(row.computeRef, bootstrap);
+        const receipt = yield* deliver(row.computeRef, bootstrap, true);
         yield* withPreparingWorkflowVm(sql, row, (scope) =>
           Effect.gen(function* () {
             yield* provisions.finishEnrollment({ ...claim, receipt });

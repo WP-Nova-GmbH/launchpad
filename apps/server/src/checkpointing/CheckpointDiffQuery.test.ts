@@ -60,6 +60,7 @@ describe("CheckpointDiffQuery.layer", () => {
         isGitRepository: () => Effect.succeed(true),
         captureCheckpoint: () => Effect.succeed(captured),
         hasCheckpointRef: () => Effect.succeed(true),
+        resolvePinnedTree: () => Effect.succeed(null),
         restoreCheckpoint: () => Effect.succeed(true),
         diffCheckpoints: ({ fromCheckpointRef, toCheckpointRef, cwd, ignoreWhitespace }) =>
           Effect.sync(() => {
@@ -184,6 +185,7 @@ describe("CheckpointDiffQuery.layer", () => {
           isGitRepository: () => Effect.succeed(true),
           captureCheckpoint: () => Effect.succeed(captured),
           hasCheckpointRef: () => Effect.succeed(true),
+          resolvePinnedTree: () => Effect.succeed(null),
           restoreCheckpoint: () => Effect.succeed(true),
           diffCheckpoints: ({
             fromCheckpointRef,
@@ -342,6 +344,7 @@ describe("CheckpointDiffQuery.layer", () => {
         isGitRepository: () => Effect.succeed(true),
         captureCheckpoint: () => Effect.succeed(captured),
         hasCheckpointRef: () => Effect.succeed(true),
+        resolvePinnedTree: () => Effect.succeed(null),
         restoreCheckpoint: () => Effect.succeed(true),
         diffCheckpoints: ({ ignoreWhitespace }) =>
           Effect.sync(() => {
@@ -424,6 +427,7 @@ describe("CheckpointDiffQuery.layer", () => {
             hasCheckpointRefCallCount += 1;
             return true;
           }),
+        resolvePinnedTree: () => Effect.succeed(null),
         restoreCheckpoint: () => Effect.succeed(true),
         diffCheckpoints: () => Effect.succeed("diff patch"),
         deleteCheckpointRefs: () => Effect.void,
@@ -487,6 +491,7 @@ describe("CheckpointDiffQuery.layer", () => {
         isGitRepository: () => Effect.succeed(true),
         captureCheckpoint: () => Effect.succeed(captured),
         hasCheckpointRef: () => Effect.succeed(true),
+        resolvePinnedTree: () => Effect.succeed(null),
         restoreCheckpoint: () => Effect.succeed(true),
         diffCheckpoints: () => Effect.succeed(""),
         deleteCheckpointRefs: () => Effect.void,

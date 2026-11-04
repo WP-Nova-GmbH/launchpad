@@ -16,7 +16,7 @@ const standardResources = {
   minUsableDiskMb: 20480,
 };
 
-export async function writeJsonAtomically(path, value) {
+export async function writeJsonAtomically(path, value, { ifAbsent = false } = {}) {
   await NodeFSP.mkdir(NodePath.dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${NodeCrypto.randomUUID()}.tmp`;
   try {
@@ -24,7 +24,18 @@ export async function writeJsonAtomically(path, value) {
       flag: "wx",
       mode: 0o600,
     });
-    await NodeFSP.rename(temporary, path);
+    if (ifAbsent) {
+      // Publish the complete sibling file without replacing an existing receipt.
+      try {
+        await NodeFSP.link(temporary, path);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        return false;
+      }
+    } else {
+      await NodeFSP.rename(temporary, path);
+    }
+    return true;
   } finally {
     await NodeFSP.rm(temporary, { force: true });
   }
@@ -48,7 +59,14 @@ export async function prepareTemplateContext(archive, expectedSha256) {
       `${expectedSha256}  server.tar.gz\n`,
       { mode: 0o600 },
     );
-    for (const file of ["workload.py", "activity.py", "launchpad-workloads.service", "install.sh"])
+    for (const file of [
+      "workload.py",
+      "workflow-exec.c",
+      "workflow-checkpoint-reader.py",
+      "activity.py",
+      "launchpad-workloads.service",
+      "install.sh",
+    ])
       await NodeFSP.copyFile(NodePath.join(templateDirectory, file), NodePath.join(context, file));
     return context;
   } catch (error) {
@@ -110,6 +128,12 @@ export async function buildTemplate(args, apiKey) {
         .digest("hex"),
       workloadSha256: NodeCrypto.createHash("sha256")
         .update(await NodeFSP.readFile(NodePath.join(context, "workload.py")))
+        .digest("hex"),
+      workflowExecSha256: NodeCrypto.createHash("sha256")
+        .update(await NodeFSP.readFile(NodePath.join(context, "workflow-exec.c")))
+        .digest("hex"),
+      workflowCheckpointReaderSha256: NodeCrypto.createHash("sha256")
+        .update(await NodeFSP.readFile(NodePath.join(context, "workflow-checkpoint-reader.py")))
         .digest("hex"),
       workloadServiceSha256: NodeCrypto.createHash("sha256")
         .update(await NodeFSP.readFile(NodePath.join(context, "launchpad-workloads.service")))

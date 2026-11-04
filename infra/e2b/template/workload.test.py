@@ -145,6 +145,12 @@ class OwnedCoordinatorStopTest(unittest.TestCase):
 
 class CoordinatorLaunchTest(unittest.TestCase):
     def test_root_launcher_records_ownership_then_execs_fixed_server_as_user(self):
+        self.launch('restore', False)
+
+    def test_workflow_launcher_only_exports_guest_mode_to_coordinator(self):
+        self.launch('initial', True)
+
+    def launch(self, mode, workflow):
         with tempfile.TemporaryDirectory(prefix='launchpad-coordinator-') as temporary, contextlib.ExitStack() as stack:
             root=Path(temporary);groups=root/'groups';state=root/'state'
             groups.mkdir();state.mkdir();server=root/'t3';server.write_bytes(b'immutable-server')
@@ -155,6 +161,7 @@ class CoordinatorLaunchTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(workload,'BOOT',types.SimpleNamespace(read_text=lambda:'captured-boot')))
             stack.enter_context(mock.patch.object(workload,'coordinator_locked',lambda:contextlib.nullcontext()))
             stack.enter_context(mock.patch.object(workload,'immutable'))
+            stack.enter_context(mock.patch.object(workload,'workflow_guest',return_value=workflow))
             stack.enter_context(mock.patch.object(workload,'process_identity',return_value={'startTicks':'123'}))
             stack.enter_context(mock.patch.dict(os.environ,{'LAUNCHPAD_COORDINATOR_SCOPE':json.dumps(scope),'HOME':'/root'}))
             stack.enter_context(mock.patch('pwd.getpwnam',return_value=types.SimpleNamespace(pw_uid=1000,pw_gid=1000,pw_dir='/home/user',pw_name='user')))
@@ -164,16 +171,20 @@ class CoordinatorLaunchTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(os,'chdir'))
             execute=stack.enter_context(mock.patch.object(os,'execv',side_effect=RuntimeError('exec captured')))
             with self.assertRaisesRegex(RuntimeError,'exec captured'):
-                workload.run_coordinator('a'*64,'restore')
+                workload.run_coordinator('a'*64,mode)
             groups_call.assert_called_once_with([]);uid_call.assert_called_once_with(1000);gid_call.assert_called_once_with(1000)
             self.assertEqual(os.environ['HOME'],'/home/user')
             self.assertEqual(os.environ['USER'],'user')
             self.assertNotIn('LAUNCHPAD_COORDINATOR_SCOPE',os.environ)
+            self.assertEqual(os.environ.get('LAUNCHPAD_WORKFLOW_GUEST'), '1' if workflow else None)
             record=json.loads(next(state.glob('*.json')).read_text())
             self.assertEqual(record['scope'],scope);self.assertEqual(record['startTicks'],'123')
             self.assertEqual(record['pid'],os.getpid())
             self.assertEqual(execute.call_args.args[0],'/usr/bin/flock')
-            self.assertEqual(execute.call_args.args[1][-5:],[str(server),'__thread-vm-serve','--receipt-sha256','a'*64,'--restore'])
+            expected = [str(server), '__thread-vm-serve', '--receipt-sha256', 'a' * 64]
+            if mode != 'initial':
+                expected.append('--' + mode)
+            self.assertEqual(execute.call_args.args[1][-len(expected):], expected)
 
     def test_late_old_coordinator_start_is_denied_after_a_new_restore_binding(self):
         with tempfile.TemporaryDirectory(prefix='launchpad-coordinator-') as temporary:
@@ -184,6 +195,323 @@ class CoordinatorLaunchTest(unittest.TestCase):
             with mock.patch.object(workload,'COORDINATOR_STATE',root),mock.patch.object(workload,'immutable'):
                 with self.assertRaises(RuntimeError):workload.coordinator_admission(source)
                 workload.coordinator_admission(target)
+
+
+class WorkflowWorkloadTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='launchpad-workflow-')))
+        self.groups, self.state = root / 'groups', root / 'state'
+        self.groups.mkdir()
+        self.state.mkdir()
+        self.work_id = 'a' * 32
+        self.group = self.groups / self.work_id
+        self.record = self.state / (self.work_id + '.json')
+        self.gate = {'bootId': 'current-boot', 'sealedBy': None, 'lastSweep': float('inf')}
+        self.stack.enter_context(mock.patch.object(workload, 'ROOT', self.groups))
+        self.stack.enter_context(mock.patch.object(workload, 'STATE', self.state))
+        self.stack.enter_context(mock.patch.object(workload, 'locked', lambda: contextlib.nullcontext(self.gate)))
+        self.marked = self.stack.enter_context(mock.patch.object(workload, 'workflow_guest', return_value=True))
+        self.uid = self.stack.enter_context(mock.patch.object(os, 'getuid', return_value=1000))
+        self.identity = self.stack.enter_context(mock.patch.object(workload, 'process_identity', return_value={'startTicks': '42'}))
+        self.launch = ['run-workflow', self.work_id, 'terminal', '--', '/bin/sh', '-c', 'arbitrary argv']
+
+    def test_registers_original_pid_in_workflow_cgroup_before_dropping(self):
+        with mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute:
+            with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                workload.main(self.launch)
+        execute.assert_called_once_with(workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec', '--', *self.launch[4:]])
+        self.assertEqual((self.group / 'cgroup.procs').read_text(), str(os.getpid()))
+        self.assertEqual(json.loads(self.record.read_text()), {
+            'id': self.work_id, 'kind': 'terminal', 'leaderPid': os.getpid(),
+            'bootId': 'current-boot', 'startTicks': '42', 'workflow': True,
+        })
+
+    def test_unmarked_or_wrong_user_cannot_enter_workflow_launcher(self):
+        self.marked.return_value = False
+        with self.assertRaises(RuntimeError):
+            workload.main(self.launch)
+        self.marked.return_value = True
+        self.uid.return_value = 10001
+        with self.assertRaises(RuntimeError):
+            workload.main(self.launch)
+        self.assertFalse(self.group.exists())
+
+    def test_signal_matches_current_group_and_leader_or_kills_only_owned_descendants(self):
+        self.group.mkdir()
+        (self.group / 'cgroup.events').write_text('populated 1\n')
+        (self.group / 'cgroup.procs').write_text('42\n')
+        self.record.write_text(json.dumps({
+            'id': self.work_id, 'bootId': 'current-boot', 'workflow': True,
+            'leaderPid': 42, 'startTicks': '42',
+        }))
+        with mock.patch.object(os, 'pidfd_open', return_value=91, create=True), \
+                mock.patch.object(os, 'close'), \
+                mock.patch.object(signal, 'pidfd_send_signal', create=True) as send:
+            self.assertTrue(workload.signal_workflow(self.gate, self.work_id, 42, 'TERM'))
+            send.assert_called_once_with(91, signal.SIGTERM)
+            self.identity.return_value = {'startTicks': 'reused'}
+            self.assertFalse(workload.signal_workflow(self.gate, self.work_id, 42, 'TERM'))
+            send.assert_called_once()
+        with self.assertRaises(RuntimeError):
+            workload.signal_workflow(self.gate, self.work_id, 43, 'KILL')
+        self.assertFalse((self.group / 'cgroup.kill').exists())
+        self.assertTrue(workload.signal_workflow(self.gate, self.work_id, 42, 'KILL'))
+        self.assertEqual((self.group / 'cgroup.kill').read_text(), '1')
+
+    def test_configures_guest_dump_policy_and_rejects_weaker_runtime_policy(self):
+        scope = self.state / 'suid_dumpable'
+        scope.write_text('1\n')
+        with mock.patch.object(workload, 'DUMP_POLICY', scope):
+            with self.assertRaisesRegex(RuntimeError, 'memory protection'):
+                workload.require_workflow_dump_policy()
+            workload.require_workflow_dump_policy(configure=True)
+            self.assertEqual(scope.read_text(), '0\n')
+            workload.require_workflow_dump_policy()
+            scope.unlink()
+            with self.assertRaises(FileNotFoundError):
+                workload.require_workflow_dump_policy(configure=True)
+
+    def test_workflow_provider_bypasses_readable_shell_shim(self):
+        with (
+            mock.patch.object(workload, 'require_workflow_dump_policy') as policy,
+            mock.patch.object(workload, 'workflow_native', return_value=(None, Path('/pinned/codex'), None)),
+            mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                workload.main(['run-workflow', self.work_id, 'provider', '--', 'codex', 'app-server'])
+        policy.assert_called_once_with()
+        execute.assert_called_once_with(
+            workload.WORKFLOW_EXEC,
+            [workload.WORKFLOW_EXEC, 'exec-provider', '--', '/pinned/codex', 'app-server'],
+        )
+
+    def test_workflow_checkpoint_reader_uses_fixed_execute_only_python(self):
+        with (
+            mock.patch.object(workload, 'require_workflow_dump_policy') as policy,
+            mock.patch.object(workload, 'immutable', return_value=types.SimpleNamespace(
+                st_gid=workload.COORDINATOR_UID, st_mode=workload.WORKFLOW_NATIVE_MODE,
+            )) as immutable,
+            mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                workload.main([
+                    'run-workflow', self.work_id, 'process', '--',
+                    '/usr/bin/python3', '-IS', str(workload.CHECKPOINT_READER), 'capture',
+                ])
+        policy.assert_called_once_with()
+        self.assertEqual(immutable.call_args_list, [
+            mock.call(workload.CHECKPOINT_PYTHON), mock.call(workload.CHECKPOINT_READER),
+        ])
+        execute.assert_called_once_with(
+            workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec-checkpoint-reader', 'capture'],
+        )
+
+    def test_coordinator_launched_workflow_git_uses_fixed_execute_only_binary(self):
+        info = types.SimpleNamespace(st_gid=workload.COORDINATOR_UID, st_mode=workload.WORKFLOW_NATIVE_MODE)
+        for digit, git in [('b', 'git'), ('c', '/usr/bin/git')]:
+            with (
+                self.subTest(git=git),
+                mock.patch.object(workload, 'require_workflow_dump_policy') as policy,
+                mock.patch.object(workload, 'immutable', return_value=info) as immutable,
+                mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                    workload.main([
+                        'run-workflow', digit * 32, 'process', '--', git, 'ls-files', '--others', '-z',
+                    ])
+                policy.assert_called_once_with()
+                immutable.assert_called_once_with(workload.WORKFLOW_GIT)
+                execute.assert_called_once_with(workload.WORKFLOW_EXEC, [
+                    workload.WORKFLOW_EXEC, 'exec-git', '--', 'ls-files', '--others', '-z',
+                ])
+
+    def test_workflow_setup_waits_for_native_ready_before_locking_and_binds_exact_group(self):
+        self.uid.return_value = 0
+        inside_gate = False
+
+        @contextlib.contextmanager
+        def gate_lock():
+            nonlocal inside_gate
+            inside_gate = True
+            try:
+                yield self.gate
+            finally:
+                inside_gate = False
+
+        def native(operation, pid, *identity):
+            self.assertEqual(inside_gate, operation == 'arm')
+            self.assertEqual(pid, 42)
+            self.assertEqual(identity, () if operation == 'capture' else ('current-boot:42',))
+            return {'protocol': 4, 'identity': 'current-boot:42', 'owned': True, 'fullStop': False}
+
+        def validate(*args):
+            self.assertTrue(inside_gate)
+            self.assertEqual(args, (self.gate, self.work_id, 42, '42'))
+
+        with (
+            mock.patch.object(workload, 'locked', gate_lock),
+            mock.patch.object(workload, 'native_setup_control', side_effect=native),
+            mock.patch.object(workload, 'setup_cgroup_id', return_value=self.work_id),
+            mock.patch.object(workload, 'require_live_setup_owner', side_effect=validate) as verify,
+        ):
+            captured = workload.workflow_setup_control(['capture', '42'])
+            expected = f'workflow-vm:{self.work_id}:current-boot:42'
+            self.assertEqual(captured['identity'], expected)
+            self.assertEqual(workload.workflow_setup_control(['arm', '42', expected])['identity'], expected)
+            self.assertEqual(verify.call_count, 2)
+
+    def test_workflow_setup_cannot_arm_after_capture_when_launches_are_sealed(self):
+        self.uid.return_value = 0
+        self.gate['sealedBy'] = 'b' * 32
+        expected = f'workflow-vm:{self.work_id}:current-boot:42'
+        with mock.patch.object(workload, 'native_setup_control') as native:
+            with self.assertRaisesRegex(RuntimeError, 'Workload launches are sealed'):
+                workload.workflow_setup_control(['arm', '42', expected])
+            native.assert_not_called()
+
+    def test_uncertain_workflow_setup_arm_stops_the_group_before_unlocking(self):
+        self.uid.return_value = 0
+        self.group.mkdir()
+        expected = f'workflow-vm:{self.work_id}:current-boot:42'
+        with (
+            mock.patch.object(workload, 'require_live_setup_owner', return_value=self.group),
+            mock.patch.object(workload, 'native_setup_control', side_effect=RuntimeError('Lost arm reply')),
+            mock.patch.object(workload, 'wait_cgroup_event') as drained,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'Lost arm reply'):
+                workload.workflow_setup_control(['arm', '42', expected])
+            self.assertEqual((self.group / 'cgroup.kill').read_text(), '1')
+            drained.assert_called_once_with(self.group, 'populated', '0')
+
+    def test_workflow_setup_launch_registers_owner_in_its_terminal_cgroup(self):
+        info = types.SimpleNamespace(st_gid=workload.COORDINATOR_UID, st_mode=workload.WORKFLOW_NATIVE_MODE)
+        script = '/tmp/launchpad-workflow-setup-' + 'b' * 32 + '.sh'
+        with (
+            mock.patch.object(workload, 'require_workflow_dump_policy') as policy,
+            mock.patch.object(workload, 'immutable', return_value=info) as immutable,
+            mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                workload.main([
+                    'run-workflow', self.work_id, 'terminal', '--', str(workload.RESOURCE_MONITOR),
+                    '--setup-owner-v4', '--script-file-v1', script,
+                ])
+        self.assertTrue(json.loads(self.record.read_text())['setupOwner'])
+        self.assertEqual((self.group / 'cgroup.procs').read_text(), str(os.getpid()))
+        policy.assert_called_once_with()
+        immutable.assert_called_once_with(workload.WORKFLOW_SETUP_OWNER)
+        execute.assert_called_once_with(
+            workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'exec-setup-owner', script],
+        )
+
+    def test_workflow_setup_stop_waits_for_owned_cgroup_and_retries_after_reap(self):
+        self.uid.return_value = 0
+        self.group.mkdir()
+        events = self.group / 'cgroup.events'
+        events.write_text('populated 1\n')
+        other = self.groups / ('b' * 32)
+        other.mkdir()
+        self.record.write_text(json.dumps({
+            'id': self.work_id, 'kind': 'terminal', 'leaderPid': 42, 'startTicks': '42',
+            'bootId': 'current-boot', 'workflow': True, 'setupOwner': True,
+        }))
+        expected = f'workflow-vm:{self.work_id}:current-boot:42'
+
+        def drained(group, key, value, *, seconds):
+            self.assertEqual((group, key, value, seconds), (self.group, 'populated', '0', 5))
+            self.assertEqual((group / 'cgroup.kill').read_text(), '1')
+            events.write_text('populated 0\n')
+
+        with mock.patch.object(workload, 'wait_cgroup_event', side_effect=drained) as wait:
+            with self.assertRaisesRegex(RuntimeError, 'ownership changed'):
+                workload.workflow_setup_control(['stop', '43', expected])
+            self.assertFalse((self.group / 'cgroup.kill').exists())
+            receipt = workload.workflow_setup_control(['stop', '42', expected])
+            self.assertTrue(receipt['fullStop'])
+            self.assertFalse((other / 'cgroup.kill').exists())
+            events.unlink()
+            (self.group / 'cgroup.kill').unlink()
+            self.group.rmdir()
+            self.record.unlink()
+            self.assertEqual(workload.workflow_setup_control(['stop', '42', expected]), receipt)
+            wait.assert_called_once()
+            self.gate['bootId'] = 'later-boot'
+            with self.assertRaisesRegex(RuntimeError, 'boot changed'):
+                workload.workflow_setup_control(['stop', '42', expected])
+
+    def test_verifies_peer_only_against_current_pinned_provider_and_rechecks_identity(self):
+        self.group.mkdir()
+        membership = self.group / 'cgroup.procs'
+        membership.write_text('42\n')
+        provider = {
+            'id': self.work_id, 'bootId': 'current-boot', 'kind': 'provider',
+            'workflow': True, 'leaderPid': 42, 'startTicks': '42',
+        }
+        self.record.write_text(json.dumps(provider))
+        scope = self.state / 'suid_dumpable'
+        scope.write_text('0\n')
+        self.identity.return_value = {'startTicks': '42', 'processGroup': 42}
+        process_owner = types.SimpleNamespace(st_uid=workload.WORKFLOW_UID, st_gid=workload.WORKFLOW_UID)
+        environment_owner = types.SimpleNamespace(st_uid=0, st_mode=0o400)
+        def proc_stat(path):
+            if path.name == 'environ':
+                return environment_owner
+            return process_owner
+        with (
+            mock.patch.object(workload, 'DUMP_POLICY', scope),
+            mock.patch.object(workload, 'workflow_native', return_value=(None, None, object())),
+            mock.patch.object(os.path, 'samestat', return_value=True),
+            mock.patch.object(Path, 'stat', proc_stat),
+            mock.patch.object(os, 'pidfd_open', return_value=91, create=True),
+            mock.patch.object(os, 'close') as close,
+            mock.patch.object(workload, 'native_peer_control', return_value=0) as native,
+        ):
+            def verify(pid=42, start_ticks='42'):
+                return workload.verify_workflow_provider_peer(
+                    self.gate, self.work_id, pid, start_ticks, 3000, 4000,
+                )
+
+            self.assertFalse(verify(pid=43))
+            self.assertFalse(verify(start_ticks='99'))
+            native.assert_not_called()
+            self.assertTrue(verify())
+            native.assert_called_once_with('inspect-workflow-provider-socket', 91, 42, 3000, 4000)
+            close.assert_called_once_with(91)
+            environment_owner.st_uid = workload.WORKFLOW_UID
+            self.assertFalse(verify())
+            native.assert_called_once()
+            environment_owner.st_uid = 0
+            native.return_value = 1
+            self.assertFalse(verify())
+            native.return_value = 74
+            with self.assertRaisesRegex(RuntimeError, 'socket attribution'):
+                verify()
+
+            def replaced(*_args):
+                membership.write_text('43\n')
+                return 0
+
+            native.side_effect = replaced
+            self.assertFalse(verify())
+
+    def test_probes_cross_uid_socket_attribution_during_workflow_enrollment(self):
+        child = mock.MagicMock()
+        child.__enter__.return_value.pid = 42
+        with (
+            mock.patch.object(workload, 'require_workflow_dump_policy') as scope,
+            mock.patch.object(workload.subprocess, 'Popen', return_value=child) as spawn,
+            mock.patch.object(os, 'pidfd_open', return_value=91, create=True),
+            mock.patch.object(os, 'close') as close,
+            mock.patch.object(workload, 'native_peer_control', return_value=74) as native,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'socket attribution'):
+                workload.require_workflow_peer_support()
+        scope.assert_called_once_with(configure=True)
+        self.assertEqual(spawn.call_args.kwargs['user'], workload.WORKFLOW_UID)
+        native.assert_called_once_with('probe-workflow-provider-pidfd', 91)
+        close.assert_called_once_with(91)
 
 
 if __name__ == '__main__':

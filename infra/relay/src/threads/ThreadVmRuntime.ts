@@ -41,6 +41,7 @@ import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmRestoreWorker } from "./ThreadVmRestoreWorker.ts";
 import { makeThreadVmBackupRecoveryWorker } from "./ThreadVmBackupRecoveryWorker.ts";
 import { makeThreadVmProvisionWorker } from "./ThreadVmProvisionWorker.ts";
+import { staleWaitingWorkflowVm } from "./ThreadVmProvisionStore.ts";
 import { makeThreadVmEnrollmentWorker } from "./ThreadVmEnrollmentWorker.ts";
 import { makeE2BThreadVmActivity } from "../machines/E2BThreadVmActivity.ts";
 import { makeThreadVmActivityWorker } from "./ThreadVmActivityWorker.ts";
@@ -376,6 +377,10 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
       makeE2BThreadVmServer(settings.compute),
       settings.hostId,
     ).runOne();
+  const workflowEnabled = settings.workflowExecutionEnabled === true;
+  const verifiedWorkflowBuild = workflowEnabled
+    ? { templateRef: settings.compute.templateId, buildId: settings.templateBuildId }
+    : undefined;
   const pending = yield* sql`SELECT p.allocation_id FROM relay_thread_vm_provisions p
     JOIN relay_thread_vm_allocations a USING (allocation_id)
     JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
@@ -389,6 +394,7 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
       AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
       AND (p.phase = 'creating' OR (p.phase = 'created' AND a.state = 'running' AND (e.installed_at IS NULL OR (d.operation_id IS NOT NULL AND m.phase IN ('frozen','ready','committed','completed') AND t.generation IN (p.generation-1,p.generation)) OR s.phase IN ('pending','running') OR (s.phase = 'ready' AND t.environment_id = s.environment_id AND t.generation = p.generation
         AND (t.operation_id IS NULL OR (p.workflow_snapshot IS NOT NULL AND t.operation_id=p.operation_id)))))
+        OR (${staleWaitingWorkflowVm(sql, verifiedWorkflowBuild)})
         OR (p.phase = 'pending' AND (a.state = 'deleting' OR c.state = 'reserved'
           OR (c.state = 'waiting' AND (SELECT count(*) FROM relay_thread_vm_capacity used
             WHERE used.host_id = c.host_id AND used.state IN ('reserved', 'started')) < ${settings.maxRunningVms}))))
@@ -425,7 +431,7 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     settings.compute.templateId,
     settings.hostId,
     verifyTemplate(settings.compute.templateId, settings.templateBuildId),
-    { enabled: settings.workflowExecutionEnabled === true, verifyTemplate },
+    { enabled: workflowEnabled, buildId: settings.templateBuildId, verifyTemplate },
   );
   const enrollment = makeThreadVmEnrollmentWorker(
     sql,

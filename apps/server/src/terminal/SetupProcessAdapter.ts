@@ -2,8 +2,10 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { ProcessRunner } from "../processRunner.ts";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { ProcessRunner, make as makeProcessRunner } from "../processRunner.ts";
 import { ResourceMonitorBinary } from "../resourceTelemetry/ResourceMonitorBinary.ts";
+import { VmControlSpawner, WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 
 export class SetupProcessError extends Schema.TaggedError<SetupProcessError>()(
   "SetupProcessError",
@@ -51,11 +53,23 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const binary = yield* ResourceMonitorBinary;
     const runner = yield* ProcessRunner;
+    const workflowGuest = yield* WorkflowVmGuest;
+    const control = yield* VmControlSpawner;
+    const trustedRunner =
+      control && workflowGuest
+        ? yield* makeProcessRunner().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, control),
+          )
+        : undefined;
     const invoke = Effect.fn("SetupProcessAdapter.invoke")(
       function* (args: ReadonlyArray<string>) {
-        const output = yield* runner.run({
-          command: yield* binary.resolve,
-          args: ["--setup-process", ...args],
+        if (workflowGuest && !trustedRunner)
+          return yield* new SetupProcessError({
+            message: "Workflow setup controls are unavailable.",
+          });
+        const output = yield* (trustedRunner ?? runner).run({
+          command: workflowGuest ? "/opt/launchpad/bin/launchpad-workload" : yield* binary.resolve,
+          args: [workflowGuest ? "workflow-setup-control" : "--setup-process", ...args],
           timeout: "10 seconds",
           maxOutputBytes: 4096,
         });
@@ -80,13 +94,14 @@ export const layer = Layer.effect(
           Effect.mapError((error) => new SetupProcessError({ message: error.message })),
         );
       }),
-      // Probe the resolved binary before opening a PTY: stale helpers cannot deliver setup.
+      // The guest broker recognizes only the packaged workflow launcher.
       launcher: Effect.gen(function* () {
         const state = yield* invoke(["host"]);
         if (state.setupLaunchProtocol !== 1)
           return yield* new SetupProcessError({
             message: "Setup shell launch support is unavailable. Update the environment.",
           });
+        if (workflowGuest) return "/opt/launchpad/server/resource-monitor/t3-resource-monitor";
         return yield* binary.resolve.pipe(
           Effect.mapError((error) => new SetupProcessError({ message: error.message })),
         );

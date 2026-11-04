@@ -8,7 +8,10 @@ import {
   defaultDevThreadVmTemplatePath,
   loadDevThreadVmRuntimeSettings,
 } from "./dev-thread-vm-template.ts";
-import { workflowVmModelProofPath } from "../src/threads/ThreadVmWorkflowModelProof.ts";
+import {
+  WORKFLOW_VM_ISOLATION_VERSION,
+  workflowVmModelProofPath,
+} from "../src/threads/ThreadVmWorkflowModelProof.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -212,6 +215,42 @@ describe("local VM runner selection", () => {
       const settings = yield* load(env, fs);
       expect(settings?.compute.templateId).toBe(selection.templateRef);
       expect(settings?.workflowModelCatalog).toBeUndefined();
+    }),
+  );
+
+  it.effect("preserves exact-build isolation from either the sidecar or explicit config", () =>
+    Effect.gen(function* () {
+      const catalog = {
+        defaultModel: "gpt-6-astra",
+        models: [{ slug: "gpt-6-astra", name: "GPT-6 Astra", isCustom: false, capabilities: null }],
+      };
+      const model = {
+        schemaVersion: 2,
+        templateRef: selected.templateRef,
+        buildId: selected.buildId,
+        catalog,
+      };
+      const isolation = { ...model, isolationVersion: WORKFLOW_VM_ISOLATION_VERSION };
+      const config = { ...configured, RELAY_WORKFLOW_VM_EXECUTION_ENABLED: "true" };
+      for (const [sidecar, configuredProof, enabled] of [
+        [model, isolation, true],
+        [isolation, model, true],
+        [model, { ...isolation, buildId: "other-build" }, false],
+        [model, { ...isolation, templateRef: "other:build-selected" }, false],
+        [model, { ...isolation, isolationVersion: WORKFLOW_VM_ISOLATION_VERSION + 1 }, false],
+      ] as const) {
+        const settings = yield* load(
+          { ...config, E2B_WORKFLOW_MODEL_PROOF: encodeJson(configuredProof) },
+          FileSystem.makeNoop({
+            readFileString: (path) =>
+              Effect.succeed(
+                encodeJson(path === defaultDevThreadVmTemplatePath ? selected : sidecar),
+              ),
+          }),
+        );
+        expect(settings?.workflowModelCatalog).toEqual(catalog);
+        expect(settings?.workflowExecutionEnabled === true).toBe(enabled);
+      }
     }),
   );
 

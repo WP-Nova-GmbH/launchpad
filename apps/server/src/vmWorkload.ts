@@ -47,6 +47,9 @@ const harnessIdentityJson = Schema.fromJsonString(VmHarnessIdentity);
 const decodeHarnessIdentity = Schema.decodeEffect(harnessIdentityJson);
 const encodeHarnessIdentity = Schema.encodeEffect(harnessIdentityJson);
 const decodeHarnessStop = Schema.decodeEffect(Schema.fromJsonString(VmHarnessStop));
+const decodeHarnessPeer = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ matched: Schema.Boolean })),
+);
 export type VmHarnessStop = typeof VmHarnessStop.Type;
 export type VmHarnessStopAdmission = (
   signal: Effect.Effect<VmHarnessStop, VmWorkloadError>,
@@ -76,6 +79,20 @@ export const readVmHarnessIdentity = Effect.fn("VmWorkload.read_harness")(
     );
     if (identity.groupId !== groupId || identity.pid !== pid) return yield* new VmWorkloadError();
     return identity;
+  },
+  Effect.mapError(() => new VmWorkloadError()),
+);
+export const verifyWorkflowVmHarnessPeer = Effect.fn("VmWorkload.verify_workflow_harness_peer")(
+  function* (identity: VmHarnessIdentity, listenerPort: number, clientPort: number) {
+    const receipt = yield* harnessCommand([
+      "verify-workflow-provider-peer",
+      identity.groupId,
+      String(identity.pid),
+      identity.startTicks,
+      String(listenerPort),
+      String(clientPort),
+    ]);
+    return (yield* decodeHarnessPeer(receipt)).matched;
   },
   Effect.mapError(() => new VmWorkloadError()),
 );

@@ -2,6 +2,8 @@
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
@@ -20,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { describe, expect } from "vite-plus/test";
 
 import { checkpointRefForThreadTurn } from "./Utils.ts";
@@ -31,6 +34,11 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import {
+  WORKFLOW_REVIEW_SOURCE_REF,
+  WorkflowReviewGitDirectory,
+} from "../vcs/WorkflowReviewGitDirectory.ts";
+import { VmWorkloadTracking, WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import * as ServerConfig from "../config.ts";
 
 const ServerConfigLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
@@ -627,6 +635,314 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
   });
 
   describe("diffCheckpoints", () => {
+    it.effect("keeps workflow review objects and refs outside the mutable checkout", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const root = yield* fs.realPath(yield* makeTmpDir());
+        const cwd = NodePath.join(root, "worktree");
+        const directory = NodePath.join(root, "private-review.git");
+        yield* fs.makeDirectory(cwd);
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(NodePath.join(cwd, ".gitignore"), "*.local\n");
+        yield* writeTextFile(NodePath.join(cwd, "tracked.local"), "tracked despite ignore\n");
+        yield* git(cwd, ["add", ".gitignore"]);
+        yield* git(cwd, ["add", "-f", "tracked.local"]);
+        yield* git(cwd, ["commit", "-m", "add ignore rule and tracked file"]);
+        yield* git(root, ["init", "--bare", directory]);
+        yield* git(directory, [
+          "fetch",
+          "--no-tags",
+          `file://${cwd}`,
+          `HEAD:${WORKFLOW_REVIEW_SOURCE_REF}`,
+        ]);
+
+        yield* Effect.gen(function* () {
+          const store = yield* CheckpointStore.CheckpointStore;
+          const threadId = ThreadId.make("workflow:private-storage");
+          const baselineRef = checkpointRefForThreadTurn(threadId, 0);
+          const targetRef = checkpointRefForThreadTurn(threadId, 1);
+          const capture = (checkpointRef: CheckpointRef) =>
+            store.captureCheckpoint({ cwd, checkpointRef, strictWorkflowCapture: true });
+          const baseline = yield* capture(baselineRef);
+          yield* git(cwd, ["rm", "--cached", "tracked.local"]);
+          yield* git(cwd, ["commit", "-m", "change the workload HEAD"]);
+          yield* writeTextFile(NodePath.join(cwd, "README.md"), "the reviewed content\n");
+          yield* fs.remove(NodePath.join(cwd, "tracked.local"));
+          yield* Effect.sync(() =>
+            NodeChildProcess.execFileSync("mkfifo", [NodePath.join(cwd, "ignored.local")]),
+          );
+          const secret = NodePath.join(root, "control-state");
+          yield* writeTextFile(secret, "control canary content\n");
+          yield* fs.symlink(secret, NodePath.join(cwd, "link-to-control"));
+          const result = yield* capture(targetRef);
+
+          expect(yield* store.hasCheckpointRef({ cwd, checkpointRef: baselineRef })).toBe(false);
+          expect(yield* store.hasCheckpointRef({ cwd, checkpointRef: targetRef })).toBe(false);
+          expect(
+            yield* store.hasCheckpointRef({
+              cwd,
+              checkpointRef: CheckpointRef.make(result.commitId),
+            }),
+          ).toBe(false);
+
+          yield* writeTextFile(NodePath.join(cwd, "README.md"), "checkout-owned decoy\n");
+          const decoy = yield* store.captureCheckpoint({ cwd, checkpointRef: targetRef });
+          yield* git(cwd, ["config", "diff.external", "untrusted-diff-command"]);
+          const diff = {
+            cwd,
+            fromCheckpointRef: CheckpointRef.make(baseline.commitId),
+            toCheckpointRef: CheckpointRef.make(result.commitId),
+            ignoreWhitespace: false,
+            requireComplete: true,
+            pinned: true,
+          } as const;
+          expect(yield* store.resolvePinnedTree({ cwd, checkpointRef: diff.toCheckpointRef })).toBe(
+            result.treeId,
+          );
+          expect(
+            yield* store.resolvePinnedTree({
+              cwd,
+              checkpointRef: CheckpointRef.make(decoy.commitId),
+            }),
+          ).toBeNull();
+          yield* fs.remove(NodePath.join(cwd, ".git"), { recursive: true });
+          const patch = yield* store.diffCheckpoints(diff);
+          expect(patch).toContain("+the reviewed content");
+          expect(patch).toContain("-tracked despite ignore");
+          expect(patch).toContain("link-to-control");
+          expect(patch).not.toContain("control canary content");
+          expect(patch).not.toContain("checkout-owned decoy");
+          expect(patch).not.toContain("ignored.local");
+          yield* store.deleteCheckpointRefs({ cwd, checkpointRefs: [targetRef], pinned: true });
+          expect(yield* store.resolvePinnedTree({ cwd, checkpointRef: targetRef })).toBeNull();
+          expect(yield* store.resolvePinnedTree({ cwd, checkpointRef: baselineRef })).toBe(
+            baseline.treeId,
+          );
+        }).pipe(Effect.provideService(WorkflowReviewGitDirectory, directory));
+      }),
+    );
+
+    it.effect("captures a workflow baseline and review through the workload reader", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const root = yield* fs.realPath(yield* makeTmpDir());
+        const cwd = NodePath.join(root, "worktree");
+        const directory = NodePath.join(root, "private-review.git");
+        yield* fs.makeDirectory(cwd);
+        yield* initRepoWithCommit(cwd);
+        yield* fs.makeDirectory(NodePath.join(cwd, "other"));
+        yield* fs.makeDirectory(NodePath.join(cwd, "examples"));
+        const externalIgnore = NodePath.join(root, "external-ignore");
+        yield* writeTextFile(externalIgnore, "visible.txt\n");
+        yield* fs.symlink(externalIgnore, NodePath.join(cwd, "examples/.gitignore"));
+        yield* writeTextFile(NodePath.join(cwd, "other/baseline.txt"), "tracked baseline\n");
+        yield* writeTextFile(NodePath.join(cwd, ".gitignore"), ".gitignore\n*.generated\ncache/\n");
+        yield* git(cwd, ["add", "-f", ".gitignore", "examples/.gitignore", "other/baseline.txt"]);
+        yield* git(cwd, ["commit", "-m", "Track a self-ignored rule and a baseline directory"]);
+        yield* git(root, ["init", "--bare", directory]);
+        yield* git(directory, [
+          "fetch",
+          "--no-tags",
+          `file://${cwd}`,
+          `HEAD:${WORKFLOW_REVIEW_SOURCE_REF}`,
+        ]);
+
+        const privateDir = NodePath.join(cwd, "private");
+        const privateFile = NodePath.join(privateDir, "prepared.txt");
+        yield* fs.makeDirectory(privateDir, { mode: 0o700 });
+        yield* fs.writeFileString(privateFile, "setup baseline\n", { mode: 0o600 });
+        const exclude = NodePath.join(cwd, ".git/info/exclude");
+        yield* fs.writeFileString(exclude, "scratch.cache\n", { mode: 0o600 });
+        yield* fs.chmod(exclude, 0o600);
+        yield* fs.chmod(NodePath.dirname(exclude), 0o700);
+        yield* fs.writeFileString(NodePath.join(cwd, "scratch.cache"), "ignored setup file\n");
+
+        const native = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const script = NodeURL.fileURLToPath(
+          new URL("../../../../infra/e2b/template/workflow-checkpoint-reader.py", import.meta.url),
+        );
+        const reads: string[] = [];
+        let beforeCapture: Effect.Effect<void, VcsError | PlatformError.PlatformError> =
+          Effect.void;
+        const spawner = ChildProcessSpawner.make((command) => {
+          if (!ChildProcess.isStandardCommand(command) || command.command !== "/usr/bin/python3")
+            return native.spawn(command);
+          const mode = command.args[2]!;
+          reads.push(mode);
+          expect(command.options.cwd).toBe(cwd);
+          expect(command.args[1]).toBe(
+            "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py",
+          );
+          const start = native.spawn(
+            ChildProcess.make(command.command, ["-IS", script, mode], command.options),
+          );
+          return mode === "capture"
+            ? beforeCapture.pipe(Effect.orDie, Effect.andThen(start))
+            : start;
+        });
+        const store = yield* CheckpointStore.make.pipe(
+          Effect.provide(Layer.fresh(VcsDriverRegistry.layer)),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+        yield* Effect.gen(function* () {
+          const threadId = ThreadId.make("workflow:workload-reader");
+          const from = checkpointRefForThreadTurn(threadId, 0);
+          const to = checkpointRefForThreadTurn(threadId, 1);
+          const verify = CheckpointRef.make("refs/t3/workflow-verification/workload-reader");
+          const baseline = yield* store.captureCheckpoint({
+            cwd,
+            checkpointRef: from,
+            strictWorkflowCapture: true,
+          });
+          expect(new TextDecoder().decode(baseline.workflowIgnoreRules)).toBe("scratch.cache\n");
+          expect(
+            yield* git(directory, ["ls-tree", baseline.commitId, "examples/.gitignore"]),
+          ).toMatch(/^120000 blob /u);
+          yield* fs.writeFileString(privateFile, "reviewed update\n");
+          yield* writeTextFile(
+            NodePath.join(cwd, "examples/visible.txt"),
+            "ignore link not read\n",
+          );
+          yield* writeTextFile(NodePath.join(cwd, "agent.generated"), "committed despite ignore\n");
+          yield* writeTextFile(NodePath.join(cwd, "untracked.generated"), "ignored result\n");
+          yield* git(cwd, ["add", "-f", "agent.generated"]);
+          yield* git(cwd, ["commit", "-m", "Commit agent output"]);
+          yield* fs.remove(NodePath.join(cwd, "other/baseline.txt"));
+          const cache = NodePath.join(cwd, "cache");
+          yield* fs.makeDirectory(cache);
+          yield* writeTextFile(NodePath.join(cache, "entry"), "ignored cache\n");
+          yield* fs.chmod(cache, 0o000);
+          yield* Effect.addFinalizer(() => fs.chmod(cache, 0o700).pipe(Effect.ignore));
+          const capture = (checkpointRef: CheckpointRef) =>
+            store.captureCheckpoint({
+              cwd,
+              checkpointRef,
+              strictWorkflowCapture: true,
+              ...(baseline.workflowIgnoreRules
+                ? { workflowIgnoreRules: baseline.workflowIgnoreRules }
+                : {}),
+            });
+          const result = yield* capture(to);
+          const patch = yield* store.diffCheckpoints({
+            cwd,
+            fromCheckpointRef: CheckpointRef.make(baseline.commitId),
+            toCheckpointRef: CheckpointRef.make(result.commitId),
+            ignoreWhitespace: false,
+            requireComplete: true,
+            pinned: true,
+          });
+          expect(patch).toContain("private/prepared.txt");
+          expect(patch).toContain("-setup baseline\n+reviewed update");
+          expect(patch).toContain("+committed despite ignore");
+          expect(patch).toContain("+ignore link not read");
+          expect(patch).toContain("-tracked baseline");
+          expect(patch).not.toContain("untracked.generated");
+          expect(patch).not.toContain("scratch.cache");
+          expect(patch).not.toContain("cache/entry");
+          expect(
+            yield* store.resolvePinnedTree({
+              cwd,
+              checkpointRef: CheckpointRef.make(result.commitId),
+            }),
+          ).toBe(result.treeId);
+          expect(reads).toEqual(["exclude", "capture", "exclude", "exclude", "capture", "exclude"]);
+          expect((yield* capture(verify)).treeId).toBe(result.treeId);
+          yield* writeTextFile(NodePath.join(cwd, "agent.generated"), "edited after review\n");
+          expect((yield* capture(verify)).treeId).not.toBe(result.treeId);
+          yield* store.deleteCheckpointRefs({ cwd, checkpointRefs: [verify], pinned: true });
+
+          // A real sparse checkout stores its effective setting in worktree configuration.
+          yield* git(cwd, ["restore", "agent.generated", "other/baseline.txt"]);
+          yield* git(cwd, ["sparse-checkout", "set", "--sparse-index", "private"]);
+          expect(yield* fs.exists(NodePath.join(cwd, "other/baseline.txt"))).toBe(false);
+          const sparseError = { detail: "The workflow Git checkpoint requires a full checkout." };
+          expect(yield* Effect.flip(capture(verify))).toMatchObject(sparseError);
+          yield* git(cwd, ["sparse-checkout", "disable"]);
+          yield* git(cwd, ["update-index", "--assume-unchanged", "README.md"]);
+          yield* git(cwd, ["update-index", "--skip-worktree", "README.md"]);
+          expect(yield* Effect.flip(capture(verify))).toMatchObject(sparseError);
+          yield* git(cwd, ["update-index", "--no-skip-worktree", "README.md"]);
+          yield* git(cwd, ["update-index", "--no-assume-unchanged", "README.md"]);
+
+          // A clean scan can still return exit zero after omitting an unreadable directory.
+          const locked = NodePath.join(cwd, "locked");
+          yield* fs.makeDirectory(locked);
+          yield* writeTextFile(NodePath.join(locked, "result"), "cannot be scanned\n");
+          yield* fs.chmod(locked, 0o000);
+          if (process.getuid !== undefined && process.getuid() !== 0) {
+            expect(
+              yield* Effect.flip(capture(verify)).pipe(
+                Effect.ensuring(fs.chmod(locked, 0o700).pipe(Effect.orDie)),
+              ),
+            ).toMatchObject({ detail: "The workflow Git checkpoint paths are unavailable." });
+          } else {
+            yield* fs.chmod(locked, 0o700);
+          }
+          yield* fs.remove(locked, { recursive: true });
+
+          const vcs = yield* VcsProcess.VcsProcess;
+          beforeCapture = git(cwd, ["config", "--worktree", "core.sparseCheckout", "true"]).pipe(
+            Effect.asVoid,
+            Effect.provideService(VcsProcess.VcsProcess, vcs),
+          );
+          expect(yield* Effect.flip(capture(verify))).toMatchObject(sparseError);
+          yield* git(cwd, ["config", "--worktree", "core.sparseCheckout", "false"]);
+          beforeCapture = fs.writeFileString(
+            NodePath.join(cwd, ".gitignore"),
+            ".gitignore\ncache/\n",
+          );
+          expect(yield* Effect.flip(capture(verify))).toMatchObject({
+            detail: "The workflow Git checkpoint paths changed during capture.",
+          });
+          yield* git(cwd, ["restore", ".gitignore"]);
+          beforeCapture = git(cwd, [
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Change HEAD during capture",
+          ]).pipe(Effect.asVoid, Effect.provideService(VcsProcess.VcsProcess, vcs));
+          expect(yield* Effect.flip(capture(verify))).toMatchObject({
+            detail: "The workflow Git HEAD changed during capture.",
+          });
+          beforeCapture = Effect.void;
+          expect(yield* store.resolvePinnedTree({ cwd, checkpointRef: verify })).toBeNull();
+          yield* fs.writeFileString(exclude, "private/\n");
+          expect(yield* Effect.flip(capture(to))).toMatchObject({
+            detail: "The workflow Git ignore rules changed after preparation.",
+          });
+          expect(
+            yield* store.resolvePinnedTree({
+              cwd,
+              checkpointRef: CheckpointRef.make(result.commitId),
+            }),
+          ).toBe(result.treeId);
+        }).pipe(
+          Effect.provideService(WorkflowReviewGitDirectory, directory),
+          Effect.provideService(WorkflowVmGuest, true),
+          Effect.provideService(VmWorkloadTracking, true),
+        );
+      }),
+    );
+
+    it.effect(
+      "does not fall back to workload Git when a VM is missing private review storage",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const store = yield* CheckpointStore.CheckpointStore;
+          const checkpointRef = checkpointRefForThreadTurn(ThreadId.make("workflow:no-store"), 0);
+          const capture = store.captureCheckpoint({
+            cwd,
+            checkpointRef,
+            strictWorkflowCapture: true,
+          });
+          expect(
+            yield* Effect.flip(capture.pipe(Effect.provideService(VmWorkloadTracking, true))),
+          ).toMatchObject({ detail: "The private workflow checkpoint repository is unavailable." });
+          expect(yield* store.hasCheckpointRef({ cwd, checkpointRef })).toBe(false);
+        }),
+    );
     it.effect("rejects forced-text NULs in strict patches while allowing numstat delimiters", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

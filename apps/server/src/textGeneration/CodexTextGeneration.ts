@@ -5,6 +5,8 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as Sse from "effect/unstable/encoding/Sse";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -29,6 +31,7 @@ import type {
   ManagedThreadVmCodexAuthContext,
   ThreadVmCodexAuthSourceError,
 } from "../relay/ThreadVmCodexAuthSource.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildApprovalVerdictPrompt,
@@ -49,6 +52,30 @@ import { getCodexServiceTierOptionValue } from "../codexModelOptions.ts";
 
 const CODEX_TIMEOUT_MS = 180_000;
 const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeApprovalResponseTerminal = Schema.decodeUnknownResult(
+  Schema.fromJsonString(
+    Schema.Union([
+      Schema.Struct({
+        type: Schema.Literal("response.completed"),
+        response: Schema.Struct({
+          status: Schema.Literal("completed"),
+          output: Schema.Array(Schema.Unknown),
+        }),
+      }),
+      Schema.Struct({ type: Schema.Literals(["response.failed", "response.incomplete", "error"]) }),
+    ]),
+  ),
+);
+const isAssistantMessage = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("message"),
+    role: Schema.Literal("assistant"),
+    content: Schema.Array(Schema.Unknown),
+  }),
+);
+const isOutputText = Schema.is(
+  Schema.Struct({ type: Schema.Literal("output_text"), text: Schema.String }),
+);
 /**
  * Build a Codex text-generation closure bound to a specific `CodexSettings`
  * payload. See `makeCodexAdapter` for the overall per-instance rationale.
@@ -65,6 +92,29 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const serverConfig = yield* Effect.service(ServerConfig.ServerConfig);
   const resolvedEnvironment = environment ?? process.env;
+  const workflowGuest = yield* WorkflowVmGuest;
+
+  const resolveModel = Effect.fnUntraced(function* (
+    operation: string,
+    modelSelection: ModelSelection,
+  ) {
+    const models = yield* getModels;
+    const requestedModel = modelSelection.model;
+    const model =
+      models.find((candidate) => candidate.slug === requestedModel)?.slug ??
+      models.find(
+        (candidate) => !candidate.isCustom && codexModelFamily(candidate.slug) === requestedModel,
+      )?.slug ??
+      requestedModel;
+    if (managedAuth) {
+      const issue = managedCodexModelIssue(model);
+      if (issue) return yield* new TextGenerationError({ operation, detail: issue });
+    }
+    yield* (authPreflight ?? managedAuth?.preflight ?? Effect.void).pipe(
+      Effect.mapError((error) => new TextGenerationError({ operation, detail: error.message })),
+    );
+    return model;
+  });
 
   type MaterializedImageAttachments = {
     readonly imagePaths: ReadonlyArray<string>;
@@ -194,21 +244,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     const outputPath = yield* writeTempFile(operation, "codex-output", "");
 
     const runCodexCommand = Effect.fn("runCodexJson.runCodexCommand")(function* () {
-      const models = yield* getModels;
-      const requestedModel = modelSelection.model;
-      const model =
-        models.find((candidate) => candidate.slug === requestedModel)?.slug ??
-        models.find(
-          (candidate) => !candidate.isCustom && codexModelFamily(candidate.slug) === requestedModel,
-        )?.slug ??
-        requestedModel;
-      if (managedAuth) {
-        const issue = managedCodexModelIssue(model);
-        if (issue) return yield* new TextGenerationError({ operation, detail: issue });
-      }
-      yield* (authPreflight ?? managedAuth?.preflight ?? Effect.void).pipe(
-        Effect.mapError((error) => new TextGenerationError({ operation, detail: error.message })),
-      );
+      const model = yield* resolveModel(operation, modelSelection);
       const launchArgs = resolveCodexLaunchArgs(codexConfig.launchArgs, resolvedEnvironment);
       const reasoningEffort =
         getModelSelectionStringOptionValue(modelSelection, "reasoningEffort") ??
@@ -440,6 +476,88 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       } satisfies TextGeneration.ThreadTitleGenerationResult;
     });
 
+  const runWorkflowApprovalVerdict = Effect.fnUntraced(function* (
+    prompt: string,
+    outputSchema: ReturnType<typeof buildApprovalVerdictPrompt>["outputSchema"],
+    modelSelection: ModelSelection,
+  ) {
+    const operation = "generateApprovalVerdict";
+    const unavailable = () =>
+      new TextGenerationError({
+        operation,
+        detail: "The workflow supervisor could not reach Codex.",
+      });
+    const invalid = () =>
+      new TextGenerationError({
+        operation,
+        detail: "Codex did not return a complete workflow approval verdict.",
+      });
+    const mintToken = managedAuth?.mintToken;
+    if (!mintToken) return yield* unavailable();
+    const model = yield* resolveModel(operation, modelSelection);
+    const effort =
+      getModelSelectionStringOptionValue(modelSelection, "reasoningEffort") ??
+      DEFAULT_TEXT_GENERATION_REASONING_EFFORT;
+    return yield* Effect.gen(function* () {
+      const http = HttpClient.withScope(yield* HttpClient.HttpClient);
+      const token = yield* mintToken.pipe(Effect.mapError(unavailable));
+      // Keep the organization credential in the coordinator, and make a tool-free
+      // structured request independent of the workflow checkout and its config.
+      const response = yield* HttpClientRequest.post("https://api.openai.com/v1/responses").pipe(
+        HttpClientRequest.bearerToken(token),
+        HttpClientRequest.accept("text/event-stream"),
+        HttpClientRequest.bodyJson({
+          model,
+          input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }],
+          stream: true,
+          store: false,
+          reasoning: { effort },
+          tools: [],
+          tool_choice: "none",
+          text: {
+            format: {
+              type: "json_schema",
+              name: "workflow_approval_verdict",
+              strict: true,
+              schema: toJsonSchemaObject(outputSchema),
+            },
+          },
+        }),
+        Effect.flatMap(http.execute),
+        Effect.mapError(unavailable),
+      );
+      if (response.status < 200 || response.status >= 300) return yield* unavailable();
+      if (!response.headers["content-type"]?.startsWith("text/event-stream"))
+        return yield* invalid();
+      const terminal = yield* response.stream.pipe(
+        Stream.decodeText(),
+        Stream.pipeThroughChannel(Sse.decode({ maxEventSize: 1024 * 1024 })),
+        Stream.filterMap((event) => decodeApprovalResponseTerminal(event.data)),
+        Stream.runHead,
+        Effect.mapError(invalid),
+      );
+      if (Option.isNone(terminal) || terminal.value.type !== "response.completed")
+        return yield* invalid();
+      const messages = terminal.value.response.output.filter(isAssistantMessage);
+      const content = messages[0]?.content;
+      const text = content?.[0];
+      if (messages.length !== 1 || content?.length !== 1 || !isOutputText(text))
+        return yield* invalid();
+      return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(outputSchema))(text.text, {
+        onExcessProperty: "error",
+      }).pipe(Effect.mapError(invalid));
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(FetchHttpClient.layer),
+      Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+      Effect.timeoutOrElse({
+        duration: CODEX_TIMEOUT_MS,
+        orElse: () => Effect.fail(unavailable()),
+      }),
+      Effect.withTracerEnabled(false),
+    );
+  });
+
   const generateApprovalVerdict: TextGeneration.TextGeneration["Service"]["generateApprovalVerdict"] =
     Effect.fn("CodexTextGeneration.generateApprovalVerdict")(function* (input) {
       const { prompt, outputSchema } = buildApprovalVerdictPrompt({
@@ -452,14 +570,16 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         policy: input.policy,
       });
 
-      const generated = yield* runCodexJson({
-        operation: "generateApprovalVerdict",
-        cwd: input.cwd,
-        prompt,
-        outputSchemaJson: outputSchema,
-        imagePaths: [],
-        modelSelection: input.modelSelection,
-      });
+      const generated = yield* workflowGuest
+        ? runWorkflowApprovalVerdict(prompt, outputSchema, input.modelSelection)
+        : runCodexJson({
+            operation: "generateApprovalVerdict",
+            cwd: input.cwd,
+            prompt,
+            outputSchemaJson: outputSchema,
+            imagePaths: [],
+            modelSelection: input.modelSelection,
+          });
 
       return {
         verdict: generated.verdict,

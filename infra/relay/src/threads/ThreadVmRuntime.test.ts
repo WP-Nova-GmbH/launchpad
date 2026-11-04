@@ -66,6 +66,16 @@ it.effect("uses only valid model proof for the explicitly configured template bu
         }),
       }))?.workflowExecutionEnabled,
     ).toBe(true);
+    const previousIsolation = yield* load({
+      ...configured,
+      RELAY_WORKFLOW_VM_EXECUTION_ENABLED: "true",
+      E2B_WORKFLOW_MODEL_PROOF: encodeJson({
+        ...proof,
+        isolationVersion: WORKFLOW_VM_ISOLATION_VERSION - 1,
+      }),
+    });
+    expect(previousIsolation?.workflowModelCatalog).toEqual(catalog);
+    expect(previousIsolation?.workflowExecutionEnabled).toBeUndefined();
     for (const value of [
       "",
       "{broken",

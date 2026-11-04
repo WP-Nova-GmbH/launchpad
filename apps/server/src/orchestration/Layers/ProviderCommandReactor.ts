@@ -55,9 +55,11 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { WorkflowRunStore, type WorkflowRun } from "../../jobs/WorkflowRunStore.ts";
 import { ThreadExecutionRelayError } from "../../relay/ThreadExecutionRelay.ts";
 import {
+  canContinueWorkflowVmInference,
   CurrentWorkflowVmAttemptEnvironment,
   WorkflowVmAttempts,
 } from "../../relay/WorkflowVmAttempts.ts";
+import { WorkflowVmGuest } from "../../vmWorkloadCommand.ts";
 import {
   activeWorkflowStep,
   canRecoverPausedWorkflowTurn,
@@ -813,7 +815,8 @@ const make = Effect.gen(function* () {
     );
     if (!pin || !(yield* workflows.getWorkflowIgnoreRules(binding))) return false;
     return yield* checkpoints
-      .hasCheckpointRef({ cwd, checkpointRef: CheckpointRef.make(pin.commitId) })
+      .resolvePinnedTree({ cwd, checkpointRef: CheckpointRef.make(pin.commitId) })
+      .pipe(Effect.map((tree) => tree === pin.treeId))
       .pipe(Effect.orElseSucceed(() => false));
   });
   const unavailableWorkflowBaseline =
@@ -1053,6 +1056,7 @@ const make = Effect.gen(function* () {
     const existingSessionThreadId =
       thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
     if (existingSessionThreadId) {
+      const rotateWorkflowPermit = yield* WorkflowVmGuest;
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
       const cwdChanged = effectiveCwd !== activeSession?.cwd;
       const sessionModelSwitch = (yield* providerService.getCapabilities(desiredInstanceId))
@@ -1072,6 +1076,7 @@ const make = Effect.gen(function* () {
 
       if (
         !runtimeModeChanged &&
+        !rotateWorkflowPermit &&
         !rotatePersonalSession &&
         !cwdChanged &&
         !instanceChanged &&
@@ -2231,13 +2236,15 @@ const make = Effect.gen(function* () {
             operation: "sendTurn",
             issue: "This workflow VM no longer owns this Agent step.",
           });
-        return yield* workflowVmAttempts
-          .resolve(run.runtime, {
+        const binding = run.runtime;
+        const stepGeneration = run.sequence?.generation ?? 0;
+        const environment = yield* workflowVmAttempts
+          .resolve(binding, {
             purpose: "agent",
             attemptId,
             commandId: attemptId,
             stepId: step.id,
-            stepGeneration: run.sequence?.generation ?? 0,
+            stepGeneration,
           })
           .pipe(
             Effect.mapError(
@@ -2249,6 +2256,24 @@ const make = Effect.gen(function* () {
                 }),
             ),
           );
+        return {
+          ...environment,
+          authorizeInference: Effect.gen(function* () {
+            const current = yield* workflows.get(binding.jobId);
+            if (
+              !current ||
+              current.cancellationAttempt ||
+              activeWorkflowStep(current)?.id !== step.id ||
+              (current.sequence?.generation ?? 0) !== stepGeneration ||
+              !(yield* workflows.isVmFenceActive(binding))
+            )
+              return false;
+            return canContinueWorkflowVmInference(
+              (yield* readPromptThread(threadId))?.promptQueue,
+              handoff,
+            );
+          }).pipe(Effect.orElseSucceed(() => false)),
+        };
       });
       const environment = yield* workflowEnvironment;
       secretBearing = environment?.hasSecrets === true;

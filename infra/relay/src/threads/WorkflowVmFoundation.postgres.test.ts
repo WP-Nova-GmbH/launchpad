@@ -169,6 +169,9 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       "stopped-after-cancellation-acknowledged",
       "stopped-after-cancellation-revoked",
       "cancelled",
+      "stale-build-reserved",
+      "stale-template-waiting",
+      "stale-build-cancelled",
       "checkout-failed",
       "checkout-failed-after-disconnect",
       "checkout-failed-after-replacement",
@@ -320,6 +323,56 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect(
             yield* sql`SELECT thread_id FROM relay_workflow_run_configurations WHERE job_id=${jobId}`,
           ).toEqual([{ thread_id: threadId }]);
+          if (outcome.startsWith("stale-")) {
+            const waiting = outcome === "stale-template-waiting";
+            const cancelled = outcome === "stale-build-cancelled";
+            const next = yield* seed({ hostId, personal: true });
+            yield* first.capacity.configure(hostId, 1);
+            if (waiting) {
+              yield* sql`UPDATE relay_thread_vm_capacity SET state='waiting' WHERE operation_id=${jobId}`;
+              expect((yield* first.capacity.admitNext(hostId, "personal"))?.operationId).toBe(
+                next.operationId,
+              );
+              yield* sql`UPDATE relay_codex_vm_connections SET status='disconnected'
+                WHERE organization_id=${organizationId}`;
+            }
+            if (cancelled) {
+              const before = (yield* store.getJob(jobId))!;
+              yield* store.updateJob(
+                before,
+                { ...before.record, status: "cancelling" },
+                { userId: ownerUserId, response: { operation: "cancel" } },
+              );
+            }
+            const worker = makeThreadVmProvisionWorker(
+              sql,
+              {
+                create: () => Effect.die("Stale workflows must not create a VM"),
+                findOperation: () => Effect.die("The VM has never started"),
+                recoverIngress: () => Effect.die("No VM was created"),
+              },
+              waiting ? "new-template:tag" : "template:tag",
+              hostId,
+              Effect.void,
+              {
+                enabled: true,
+                buildId: waiting ? "pinned-build" : "new-build",
+                verifyTemplate: () => Effect.die("Stale workflows must not verify a tag"),
+              },
+            );
+            expect(yield* worker.runOne()).toBe(true);
+            expect(yield* first.capacity.get(jobId)).toMatchObject({ state: "released" });
+            expect(yield* advance).toMatchObject({
+              status: cancelled ? "cancelled" : "failed",
+              detail: expect.stringContaining(cancelled ? "Cancelled" : "saved workflow VM build"),
+              queueReason: null,
+            });
+            expect(yield* worker.runOne()).toBe(false);
+            expect(yield* first.capacity.get(next.operationId)).toMatchObject({
+              state: "reserved",
+            });
+            return;
+          }
           yield* sql`UPDATE relay_thread_vm_provisions SET error_code='setup_access_denied'
             WHERE allocation_id=${jobId}`;
           expect(yield* advance).toMatchObject({
@@ -797,38 +850,47 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
 
           let creates = 0;
           let lookups = 0;
-          const worker = makeThreadVmProvisionWorker(
-            sql,
-            {
-              create: (_input, template) =>
-                Effect.gen(function* () {
-                  expect(template).toBe("template");
-                  creates++;
-                  return yield* new ThreadVmComputeError({
-                    operation: "create",
-                    message: "Lost create reply",
-                  });
-                }),
-              findOperation: (operationId) =>
-                Effect.sync(() => {
-                  expect(operationId).toBe(f.operationId);
-                  lookups++;
-                  return [];
-                }),
-              recoverIngress: () => Effect.die("No compute identity was returned"),
-            },
-            "new-template",
-            hostId,
-            Effect.void,
-            {
-              enabled: true,
-              verifyTemplate: (template, build) =>
-                Effect.sync(() => {
-                  expect(template).toBe("template");
-                  expect(build).toBe(snapshot.templateBuildId);
-                }),
-            },
-          );
+          let tagAvailable = true;
+          const makeWorker = (templateId: string, buildId: string) =>
+            makeThreadVmProvisionWorker(
+              sql,
+              {
+                create: (_input, template) =>
+                  Effect.gen(function* () {
+                    expect(template).toBe("template");
+                    creates++;
+                    return yield* new ThreadVmComputeError({
+                      operation: "create",
+                      message: "Lost create reply",
+                    });
+                  }),
+                findOperation: (operationId) =>
+                  Effect.sync(() => {
+                    expect(operationId).toBe(f.operationId);
+                    lookups++;
+                    return [];
+                  }),
+                recoverIngress: () => Effect.die("No compute identity was returned"),
+              },
+              templateId,
+              hostId,
+              Effect.void,
+              {
+                enabled: true,
+                buildId,
+                verifyTemplate: (template, build) =>
+                  Effect.gen(function* () {
+                    expect(template).toBe("template");
+                    expect(build).toBe(snapshot.templateBuildId);
+                    if (!tagAvailable)
+                      return yield* new ThreadVmComputeError({
+                        operation: "verify runner",
+                        message: "Tag lookup failed temporarily",
+                      });
+                  }),
+              },
+            );
+          const worker = makeWorker("template", snapshot.templateBuildId);
           expect(yield* worker.runOne()).toBe(true);
           expect(creates).toBe(0);
           expect((yield* f.capacity.get(f.operationId))?.state).toBe("waiting");
@@ -844,12 +906,21 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           yield* personal.capacity.cancelUnstarted(personal.operationId);
           yield* sql`UPDATE relay_codex_vm_connections SET status='connected',payload_sealed='sealed',expires_at='2099-01-01'
           WHERE organization_id=${f.organizationId}`;
+          tagAvailable = false;
+          yield* sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
+          expect(yield* worker.runOne()).toBe(true);
+          expect(creates).toBe(0);
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("waiting");
+          expect(
+            yield* makeThreadVmProvisionStore(sql).get(f.allocationId, "organization_workflow"),
+          ).toMatchObject({ errorCode: "workflow_template_unverified" });
+          tagAvailable = true;
           yield* sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
           expect(yield* worker.runOne()).toBe(true);
           expect(creates).toBe(1);
           expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
           yield* sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
-          expect(yield* worker.runOne()).toBe(true);
+          expect(yield* makeWorker("new-template", "new-build").runOne()).toBe(true);
           expect(creates).toBe(1);
           expect(lookups).toBe(1);
           expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");

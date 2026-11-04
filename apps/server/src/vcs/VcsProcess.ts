@@ -24,6 +24,11 @@ import {
 } from "@t3tools/contracts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
+import {
+  VmCoordinatorProcess,
+  WorkflowVmGuest,
+  workflowVmGitEnvironment,
+} from "../vmWorkloadCommand.ts";
 import { hasRunnerSourceControlCredential, runnerSourceControlEnv } from "./runnerCredentials.ts";
 
 export interface VcsProcessInput {
@@ -153,35 +158,35 @@ const makeWithAccess = Effect.fnUntraced(function* (access?: CheckoutAccess["Ser
       argumentCount: input.args.length,
     };
 
-    // Every VCS subprocess the server runs is server-initiated — agents reach
-    // git through their own shell, never through here — so this is where the
-    // runner's push credential is granted (ADR-0009). It resolves to null when
-    // no runner credential is configured, leaving the inherited environment
-    // exactly as it was.
+    // Workflow commands can run repository hooks or other repository-controlled
+    // code. Only explicit coordinator operations may receive VM Git credentials.
+    const isolated = (yield* WorkflowVmGuest) && !(yield* VmCoordinatorProcess);
     const privateVm = organizationCredentials.threadVm;
     const needsGithubToken = input.command === "gh" && !input.args.includes("--version");
+    const vmAuthUnavailable = () =>
+      new VcsProcessExitError({
+        ...baseError,
+        exitCode: 1,
+        detail: "Repository access is unavailable for this thread VM.",
+        failureKind: "authentication",
+      });
+    if (isolated && needsGithubToken) return yield* vmAuthUnavailable();
     const vmToken =
       privateVm && needsGithubToken
-        ? yield* privateVm.github.pipe(
-            Effect.mapError(
-              () =>
-                new VcsProcessExitError({
-                  ...baseError,
-                  exitCode: 1,
-                  detail: "Repository access is unavailable for this thread VM.",
-                  failureKind: "authentication",
-                }),
-            ),
-          )
+        ? yield* privateVm.github.pipe(Effect.mapError(vmAuthUnavailable))
         : null;
-    const resolvedEnv = privateVm
-      ? privateThreadVmSourceControlEnv(
-          input.env ?? globalThis.process.env,
-          vmToken ? Redacted.value(vmToken) : null,
-        )
-      : yield* resolveRunnerEnv(input.env);
+    const resolvedEnv = isolated
+      ? workflowVmGitEnvironment(input.env)
+      : privateVm
+        ? privateThreadVmSourceControlEnv(
+            input.env ?? globalThis.process.env,
+            vmToken ? Redacted.value(vmToken) : null,
+          )
+        : yield* resolveRunnerEnv(input.env);
     const args =
-      privateVm && input.command === "git" ? privateThreadVmGitArgs(input.args) : input.args;
+      !isolated && privateVm && input.command === "git"
+        ? privateThreadVmGitArgs(input.args)
+        : input.args;
 
     const beginOwner = yield* ProcessRunner.CurrentWorkflowCommand;
     const owner = beginOwner

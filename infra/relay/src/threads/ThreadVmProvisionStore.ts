@@ -31,6 +31,19 @@ export interface ThreadVmProvision {
 }
 const conflict = (message: string) => new ThreadVmProvisionConflict({ message });
 
+/** Shared by the runtime poll and claim so stale pending work can retire without a slot. */
+export const staleWaitingWorkflowVm = (
+  sql: PgClient,
+  verifiedBuild: { readonly templateRef: string; readonly buildId: string } | undefined,
+) =>
+  verifiedBuild
+    ? sql`p.phase='pending' AND c.state='waiting' AND a.state='creating' AND a.compute_ref IS NULL
+      AND a.resource_kind='organization_workflow' AND a.runtime_protocol='native-v1'
+      AND p.workflow_snapshot IS NOT NULL
+      AND (a.template_id IS DISTINCT FROM ${verifiedBuild.templateRef}
+        OR p.workflow_snapshot->>'templateBuildId' IS DISTINCT FROM ${verifiedBuild.buildId})`
+    : sql`FALSE`;
+
 /** Internal API: reserve quota and authorize intent before enqueuing. Claims never transfer thread ownership. */
 export function makeThreadVmProvisionStore(sql: PgClient) {
   const allocations = makeThreadVmAllocationStore(sql);
@@ -84,6 +97,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     claimId: string,
     hostId: string,
     includeWorkflow = false,
+    verifiedWorkflowBuild?: Parameters<typeof staleWaitingWorkflowVm>[1],
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -98,7 +112,8 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
         AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         AND p.ingress_recovery_claim_id IS NULL
-        AND (c.state IN ('reserved', 'started') OR a.state = 'deleting')
+        AND (c.state IN ('reserved', 'started') OR a.state = 'deleting'
+          OR (${staleWaitingWorkflowVm(sql, verifiedWorkflowBuild)}))
         ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
         if (!candidate) return null;
         yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1
@@ -329,14 +344,20 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     },
   );
   const rejectUnstarted = Effect.fn("relay.thread_vm_provision.reject_unstarted")(
-    function* (input: { allocationId: string; claimId: string }) {
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      errorCode?: "workflow_template_stale";
+    }) {
       yield* sql.withTransaction(
         Effect.gen(function* () {
           const row = yield* locked(input);
           if (row.phase !== "pending") return yield* conflict("Creation may already have started");
           yield* allocations.requestDeletion(row.allocationId, row.resourceKind);
           yield* cancelUnstarted(input);
-          yield* sql`UPDATE relay_thread_vm_provisions SET error_code = 'access_denied' WHERE allocation_id = ${row.allocationId}`;
+          if (row.allocationState !== "deleting" || input.errorCode === undefined)
+            yield* sql`UPDATE relay_thread_vm_provisions SET error_code = ${input.errorCode ?? "access_denied"}
+              WHERE allocation_id = ${row.allocationId}`;
         }),
       );
     },

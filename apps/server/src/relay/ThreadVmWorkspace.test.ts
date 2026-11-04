@@ -7,6 +7,8 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import { WorkflowReviewGitDirectory } from "../vcs/WorkflowReviewGitDirectory.ts";
+import { VmCoordinatorProcess } from "../vmWorkloadCommand.ts";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
@@ -63,6 +65,7 @@ const fixture = Effect.fnUntraced(function* (
   const source = `${dir}/source`,
     workspace = `${dir}/workspace`,
     bundlePath = `${dir}/repository.bundle`;
+  const reviewGitDir = `${dir}/review.git`;
   const runner = yield* make();
   yield* fs.makeDirectory(source);
   const git = (args: ReadonlyArray<string>) =>
@@ -115,13 +118,17 @@ const fixture = Effect.fnUntraced(function* (
   const values = new Map<string, Uint8Array>([
     [THREAD_VM_IDENTITY_SECRET, new TextEncoder().encode(encode({ ...vm, scope: input.scope }))],
   ]);
-  const calls: Array<ProcessRunInput> = [];
+  const calls: Array<ProcessRunInput & { trusted: boolean }> = [];
   let loginCode = 0,
     truncateTree = false,
     fetchWait = Effect.void;
   const fetchEntered = yield* Deferred.make<void>();
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(
+      Effect.provideService(
+        WorkflowReviewGitDirectory,
+        options.workflow ? reviewGitDir : undefined,
+      ),
       Effect.provideService(ServerSecretStore, {
         get: (name) => Effect.sync(() => Option.fromNullishOr(values.get(name))),
         set: (name, value) =>
@@ -146,16 +153,22 @@ const fixture = Effect.fnUntraced(function* (
       Effect.provideService(ProcessRunner, {
         run: (request) =>
           Effect.gen(function* () {
-            calls.push(request);
+            calls.push({ ...request, trusted: yield* VmCoordinatorProcess });
+            if (request.command === "/opt/launchpad/bin/launchpad-workload-exec") {
+              yield* fs.makeDirectory(workspace);
+              return output();
+            }
             if (request.command === "codex")
               return output("", request.args[0] === "login" ? loginCode : 0);
             if (request.args.includes("fetch")) {
               yield* Deferred.succeed(fetchEntered, undefined);
               yield* fetchWait;
-              if (options.workflow)
+              if (request.env?.GIT_CONFIG_VALUE_0?.startsWith("Authorization:"))
                 return yield* runner.run({
                   ...request,
-                  args: request.args.map((argument) => (argument === "origin" ? source : argument)),
+                  args: request.args.map((argument) =>
+                    argument === "https://github.com/acme/project.git" ? source : argument,
+                  ),
                 });
             }
             if (truncateTree && request.args.includes("ls-tree"))
@@ -236,12 +249,14 @@ it.effect("fetches only the frozen workflow commit and confines the Git credenti
         call.env?.GIT_CONFIG_VALUE_0?.startsWith("Authorization:"),
       );
       assert.lengthOf(authorized, 1);
+      assert.isTrue(authorized[0]?.trusted);
+      assert.notInclude(authorized[0]?.args ?? [], f.workspace);
       assert.include(authorized[0]?.args ?? [], f.input.revision);
       assert.isFalse(f.calls.some((call) => call.args.some((arg) => arg.includes(token))));
       yield* run;
       assert.lengthOf(
         f.calls.filter((call) => call.args.includes("fetch")),
-        1,
+        2,
       );
     }),
   ),

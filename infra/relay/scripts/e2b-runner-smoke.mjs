@@ -7,13 +7,19 @@ import * as NodeUtil from "node:util";
 import * as NodeAssert from "node:assert/strict";
 import * as Schema from "effect/Schema";
 import {
+  WORKFLOW_VM_ISOLATION_VERSION,
   WORKFLOW_VM_MODEL_PROOF_VERSION,
   WorkflowVmModelProof,
+  verifiedWorkflowVmModelProof,
   workflowVmModelProofPath,
 } from "../src/threads/ThreadVmWorkflowModelProof.ts";
 import { writeJsonAtomically } from "./e2b-build-template.mjs";
 const { values } = NodeUtil.parseArgs({
-  options: { receipt: { type: "string" }, output: { type: "string" } },
+  options: {
+    receipt: { type: "string" },
+    output: { type: "string" },
+    "workflow-isolation": { type: "boolean", default: false },
+  },
 });
 NodeAssert.ok(values.receipt && values.output, "Provide --receipt and a new --output directory.");
 NodeAssert.ok(
@@ -33,19 +39,19 @@ NodeAssert.equal(new URL(receipt.apiUrl).href, new URL(options.apiUrl).href);
 NodeAssert.equal(receipt.templateRef, `${receipt.templateId}:${receipt.buildTag}`);
 NodeAssert.ok(/^build-[a-f0-9-]+$/.test(receipt.buildTag));
 NodeAssert.match(receipt.buildId, /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/u);
-const tags = await Template.getTags(receipt.templateId, options);
-NodeAssert.ok(
-  tags.some((tag) => tag.tag === receipt.buildTag && tag.buildId === receipt.buildId),
-  "The recorded build tag changed or disappeared.",
-);
-await NodeFSP.mkdir(values.output, { mode: 0o700 });
 const resources = receipt.resources ?? receipt.versions?.resources;
 NodeAssert.match(receipt.workloadSha256, /^[a-f0-9]{64}$/);
 NodeAssert.match(receipt.workloadServiceSha256, /^[a-f0-9]{64}$/);
 NodeAssert.match(receipt.installerSha256, /^[a-f0-9]{64}$/);
+if (values["workflow-isolation"]) {
+  NodeAssert.match(receipt.workflowExecSha256, /^[a-f0-9]{64}$/);
+  NodeAssert.match(receipt.workflowCheckpointReaderSha256, /^[a-f0-9]{64}$/);
+}
 NodeAssert.ok(
   resources && resources.cpuCount > 0 && resources.memoryMB > 0 && resources.minFreeDiskMb > 0,
 );
+await requireBuildTag();
+await NodeFSP.mkdir(values.output, { mode: 0o700 });
 const proof = `launchpad-runner-${NodeCrypto.randomUUID()}`;
 const save = (name, data) =>
   NodeFSP.writeFile(NodePath.join(values.output, name), JSON.stringify(data, null, 2) + "\n", {
@@ -54,6 +60,7 @@ const save = (name, data) =>
 await save("identity.json", { proof, templateRef: receipt.templateRef, buildId: receipt.buildId });
 let sandboxId;
 let modelProof;
+let stage = "allocation";
 try {
   const vm = await Sandbox.create(receipt.templateRef, {
     ...options,
@@ -65,6 +72,7 @@ try {
   });
   sandboxId = vm.sandboxId;
   await save("allocation.json", { proof, sandboxId: vm.sandboxId });
+  stage = "runner";
   const script = await NodeFSP.readFile(
     new URL("../../e2b/runner-guest-proof.py", import.meta.url),
     "utf8",
@@ -79,6 +87,7 @@ try {
       LAUNCHPAD_INSTALLER_SHA256: receipt.installerSha256,
     },
   });
+  stage = "model-catalog";
   const modelScript = await NodeFSP.readFile(
     new URL("../../e2b/workflow-model-proof.py", import.meta.url),
     "utf8",
@@ -100,10 +109,61 @@ try {
       }),
     ),
   )(modelResult.stdout);
+  if (values["workflow-isolation"]) {
+    stage = "workflow-isolation";
+    const isolationScript = await NodeFSP.readFile(
+      new URL("../../e2b/workflow-isolation-proof.py", import.meta.url),
+      "utf8",
+    );
+    const isolation = await vm.commands.run(
+      [
+        "set -eu",
+        "proof=$(mktemp /tmp/launchpad-workflow-isolation.XXXXXX.py)",
+        `trap 'rm -f "$proof"' EXIT`,
+        `cat > "$proof" <<'WORKFLOW_ISOLATION_PROOF'`,
+        isolationScript,
+        "WORKFLOW_ISOLATION_PROOF",
+        `/usr/bin/python3 "$proof"`,
+      ].join("\n"),
+      {
+        user: "root",
+        timeoutMs: 120_000,
+        envs: { LAUNCHPAD_CHECKPOINT_READER_SHA256: receipt.workflowCheckpointReaderSha256 },
+      },
+    );
+    const checks = {
+      workflowEnrollment: true,
+      workflowLauncher: true,
+      coordinatorCredentialsProtected: true,
+      coordinatorSignallingDenied: true,
+      reviewGitProtected: true,
+      privilegedControlDenied: true,
+      envdRootCommandDenied: true,
+      envdRootFileReadDenied: true,
+      workspaceWritable: true,
+      detachedWorkloadStopped: true,
+      unrelatedWorkloadPreserved: true,
+      setupOwnerVerified: true,
+      nativeCodexPeerVerified: true,
+      otherCodexPeersDenied: true,
+      privateCheckpointReaderVerified: true,
+    };
+    NodeAssert.deepEqual(JSON.parse(isolation.stdout), checks);
+    await requireBuildTag();
+    await save("workflow-isolation.json", {
+      proof,
+      sandboxId: vm.sandboxId,
+      buildId: receipt.buildId,
+      templateRef: receipt.templateRef,
+      ...checks,
+    });
+    console.log("Workflow credential isolation passed inside the packaged launcher.");
+  }
   modelProof = Schema.decodeUnknownSync(WorkflowVmModelProof)({
     schemaVersion: WORKFLOW_VM_MODEL_PROOF_VERSION,
     templateRef: receipt.templateRef,
     buildId: receipt.buildId,
+    ...(values["workflow-isolation"] ? { isolationVersion: WORKFLOW_VM_ISOLATION_VERSION } : {}),
     catalog: {
       defaultModel: guestCatalog.defaultModel,
       models: guestCatalog.models.map(({ slug, name }) => ({
@@ -136,8 +196,8 @@ try {
       console.error("Rebuild the selected VM runner to publish its Codex model catalog.");
     }
   }
-  await save("failure.json", { proof, errorType: error?.name ?? "Error" });
-  console.error(`Runner proof failed (${error?.name ?? "Error"}).`);
+  await save("failure.json", { proof, stage, errorType: error?.name ?? "Error" });
+  console.error(`Runner proof failed during ${stage} (${error?.name ?? "Error"}).`);
   process.exitCode = 1;
 } finally {
   try {
@@ -159,7 +219,25 @@ if (modelProof && !process.exitCode) {
     NodePath.join(import.meta.dirname, "../.t3/e2b-template.json");
   NodeAssert.ok(NodePath.isAbsolute(selection), "E2B_TEMPLATE_FILE must be an absolute path.");
   await writeJsonAtomically(NodePath.join(values.output, "workflow-models.json"), modelProof);
-  await writeJsonAtomically(workflowVmModelProofPath(selection, modelProof.buildId), modelProof);
+  const installedPath = workflowVmModelProofPath(selection, modelProof.buildId);
+  const published = await writeJsonAtomically(installedPath, modelProof, {
+    ifAbsent: modelProof.isolationVersion !== WORKFLOW_VM_ISOLATION_VERSION,
+  });
+  if (!published) {
+    const retained = await NodeFSP.readFile(installedPath, "utf8").catch(() => "");
+    NodeAssert.ok(
+      verifiedWorkflowVmModelProof(retained, modelProof.templateRef, modelProof.buildId),
+      `The existing workflow proof is invalid (${installedPath}). Remove it before repeating the model check or run with --workflow-isolation.`,
+    );
+  }
+}
+
+async function requireBuildTag() {
+  const tags = await Template.getTags(receipt.templateId, options);
+  NodeAssert.ok(
+    tags.some((tag) => tag.tag === receipt.buildTag && tag.buildId === receipt.buildId),
+    "The recorded build tag changed or disappeared.",
+  );
 }
 
 async function cleanup() {

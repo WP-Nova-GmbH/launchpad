@@ -713,9 +713,12 @@ export const make = Effect.gen(function* () {
       );
       if (
         !pin ||
-        (yield* readWorkflowTree(git, cwd, pin.commitId).pipe(Effect.orElseSucceed(() => null))) !==
-          pin.treeId ||
-        (yield* readWorkflowTree(git, cwd, pin.baselineCommitId).pipe(Effect.isSuccess)) === false
+        (yield* checkpoints
+          .resolvePinnedTree({ cwd, checkpointRef: CheckpointRef.make(pin.commitId) })
+          .pipe(Effect.orElseSucceed(() => null))) !== pin.treeId ||
+        (yield* checkpoints
+          .resolvePinnedTree({ cwd, checkpointRef: CheckpointRef.make(pin.baselineCommitId) })
+          .pipe(Effect.orElseSucceed(() => null))) === null
       )
         return "The saved workflow checkpoint is unavailable. Cancel the run and start again.";
       const ignoreRules = yield* persistence.getWorkflowIgnoreRules(run.runtime);
@@ -740,6 +743,7 @@ export const make = Effect.gen(function* () {
             .deleteCheckpointRefs({
               cwd,
               checkpointRefs: [verificationRef],
+              pinned: run.runtime.kind === "vm",
             })
             .pipe(Effect.ignoreCause({ log: true })),
         ),

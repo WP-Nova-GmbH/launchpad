@@ -3638,6 +3638,79 @@ it.layer(
     );
   });
 
+  it.effect.each(["before arm", "during arm"] as const)(
+    "serializes execution drain %s of captured workflow setup",
+    (when) => {
+      const fixture = setupJournalFixture();
+      return Effect.gen(function* () {
+        const { fence, execution, move } = yield* portableTerminalFixture;
+        const entered = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const hold = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(proceed)),
+        );
+        let launched = false;
+        const journal = {
+          ...fixture.journal,
+          capture: (input: Parameters<SetupProcessJournalShape["capture"]>[0]) =>
+            fixture.journal.capture(input).pipe(
+              Effect.andThen(when === "before arm" ? hold : Effect.void),
+              Effect.andThen(
+                input.guardArm!(
+                  (when === "during arm" ? hold : Effect.void).pipe(
+                    Effect.andThen(
+                      Effect.sync(() => {
+                        launched = true;
+                        return "/bin/bash";
+                      }),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        };
+        yield* Effect.gen(function* () {
+          const { manager } = yield* createManager(5, { execution });
+          const attempt = {
+            threadId: "thread-1",
+            attemptId: "attempt",
+            terminalId: DEFAULT_TERMINAL_ID,
+          };
+          yield* journal.begin(attempt);
+          const opened = yield* manager.open({
+            ...openInput(),
+            setupProcessOwner: yield* journal.launcher,
+            setupAttemptId: attempt.attemptId,
+          });
+          const arming = yield* manager
+            .armSetup({
+              ...attempt,
+              expectedPid: opened.pid!,
+              authorizeDelivery: Effect.succeed(true),
+            })
+            .pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(entered);
+          const draining = yield* fence
+            .beginDrain(move)
+            .pipe(Effect.forkChild({ startImmediately: true }));
+          if (when === "before arm") yield* Fiber.join(draining);
+          const drainWasPending = draining.pollUnsafe() === undefined;
+          yield* Deferred.succeed(proceed, undefined);
+          expect((yield* Fiber.join(arming))._tag).toBe(
+            when === "during arm" ? "Success" : "Failure",
+          );
+          yield* Fiber.join(draining);
+          expect(drainWasPending).toBe(when === "during arm");
+          expect(launched).toBe(when === "during arm");
+          expect(yield* journal.cleanup({ ...attempt, commandId: "cleanup" })).toMatchObject({
+            source: "native",
+            pid: opened.pid,
+          });
+        }).pipe(Effect.provideService(SetupProcessJournal, journal));
+      }).pipe(Effect.provide(SqlitePersistenceMemory));
+    },
+  );
+
   it.effect("portable terminals block input and new shells when a move drains execution", () =>
     Effect.gen(function* () {
       const { sql, fence, execution, move } = yield* portableTerminalFixture;

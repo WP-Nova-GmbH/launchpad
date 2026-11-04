@@ -323,6 +323,19 @@ export const harness = (
           }),
       Layer.mock(CheckpointStore)({
         captureCheckpoint: () => Effect.sync(() => ({ commitId: "checkpoint", treeId: tree })),
+        resolvePinnedTree: ({ cwd, checkpointRef }) => {
+          const override = gitOverride?.({
+            operation: "WorkflowCheckpoint.tree",
+            cwd,
+            args: ["rev-parse", "--verify", `${checkpointRef}^{tree}`],
+          });
+          return override
+            ? override.pipe(
+                Effect.map((result) => result.stdout.trim() || null),
+                Effect.orElseSucceed(() => null),
+              )
+            : Effect.sync(() => tree);
+        },
         deleteCheckpointRefs: () => Effect.void,
       }),
       Layer.mock(GitManager)({

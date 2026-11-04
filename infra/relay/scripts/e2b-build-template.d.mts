@@ -1,6 +1,10 @@
 import type { BuildInfo } from "e2b";
 
-export function writeJsonAtomically(path: string, value: unknown): Promise<void>;
+export function writeJsonAtomically(
+  path: string,
+  value: unknown,
+  options?: { ifAbsent?: boolean },
+): Promise<boolean>;
 export function prepareTemplateContext(archive: string, expectedSha256: string): Promise<string>;
 export function validateBuildTarget(apiUrl: string, name: string): string;
 export function buildTemplate(

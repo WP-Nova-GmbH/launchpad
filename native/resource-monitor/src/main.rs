@@ -798,6 +798,14 @@ fn main() -> io::Result<()> {
     if args.first().map(String::as_str) == Some("--setup-process") {
         return owned_process::run(&args[1..]);
     }
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--workflow-setup-owner-v4") {
+        return owned_process::launch_workflow(&args[1..]);
+    }
+    #[cfg(target_os = "linux")]
+    if args.first().map(String::as_str) == Some("--workflow-setup-process") {
+        return owned_process::run_workflow(&args[1..]);
+    }
     let mut writer = BufWriter::new(io::stdout().lock());
     write_event(
         &mut writer,

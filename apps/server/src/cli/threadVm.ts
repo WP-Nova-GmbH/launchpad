@@ -19,7 +19,8 @@ import {
   requireThreadVmWarmRestoreBootstrap,
 } from "../relay/ThreadVmRestoreIdentity.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
-import { withVmWorkloads } from "../vmWorkloadCommand.ts";
+import { isWorkflowVmGuest, withVmWorkloads } from "../vmWorkloadCommand.ts";
+import { WorkflowReviewGitDirectory } from "../vcs/WorkflowReviewGitDirectory.ts";
 import { mintThreadVmCodexToken, ThreadVmCodexTokenError } from "../relay/ThreadVmCodexToken.ts";
 import * as NodeStream from "@effect/platform-node/NodeStream";
 import * as Stream from "effect/Stream";
@@ -358,7 +359,10 @@ export const threadVmSetupCommand = Command.make("__thread-vm-setup", {
         return yield* new ThreadVmInitialStateError({ code: "identity_changed" });
       yield* inspectVmWorkloads({ type: "inspect" });
       const request = input.value;
-      const reply = yield* prepareThreadVmInitialState(
+      const workflow = yield* isWorkflowVmGuest;
+      if (workflow !== ("input" in request && request.input.workflow !== undefined))
+        return yield* new ThreadVmInitialStateError({ code: "identity_changed" });
+      const prepare = prepareThreadVmInitialState(
         "input" in request ? request.input : request,
         undefined,
         "input" in request ? request.gitToken : undefined,
@@ -374,8 +378,12 @@ export const threadVmSetupCommand = Command.make("__thread-vm-setup", {
             ProcessRunner.layer,
           ).pipe(Layer.provideMerge(Sqlite.layerConfig), Layer.provide(ServerConfig.layer(config))),
         ),
-        withVmWorkloads,
+        Effect.provideService(
+          WorkflowReviewGitDirectory,
+          workflow ? path.join(config.stateDir, "workflow-review.git") : undefined,
+        ),
       );
+      const reply = yield* withVmWorkloads(prepare, workflow);
       yield* Console.log(yield* encodeSetupReceipt(reply));
     }),
   ),
@@ -391,6 +399,9 @@ export const threadVmServeCommand = Command.make("__thread-vm-serve", {
   Command.withHandler(
     Effect.fn("ThreadVmServer.command")(function* ({ receiptSha256, move, restore }) {
       if (move && restore) return yield* new ThreadVmRestoreInstallError();
+      const workflow = yield* isWorkflowVmGuest;
+      if (workflow && (move || restore)) return yield* new ThreadVmRestoreInstallError();
+      const path = yield* Path.Path;
       // Dedicated guests do not inherit desktop bootstrap descriptors, dev origins or public listeners.
       const config = yield* resolveServerConfig(
         {
@@ -426,9 +437,15 @@ export const threadVmServeCommand = Command.make("__thread-vm-serve", {
         Effect.scoped,
       );
       yield* inspectVmWorkloads({ type: "inspect" });
-      return yield* runServer.pipe(
-        Effect.provideService(ServerConfig.ServerConfig, config),
-        withVmWorkloads,
+      return yield* withVmWorkloads(
+        runServer.pipe(
+          Effect.provideService(ServerConfig.ServerConfig, config),
+          Effect.provideService(
+            WorkflowReviewGitDirectory,
+            workflow ? path.join(config.stateDir, "workflow-review.git") : undefined,
+          ),
+        ),
+        workflow,
       );
     }),
   ),
@@ -490,7 +507,7 @@ export const threadVmCodexTokenCommand = Command.make("__thread-vm-codex-token",
   Command.withHandler(
     Effect.fnUntraced(function* ({ connectionId }) {
       const token = yield* Effect.gen(function* () {
-        if ((yield* HostProcessPlatform) !== "linux")
+        if ((yield* HostProcessPlatform) !== "linux" || (yield* isWorkflowVmGuest))
           return yield* new ThreadVmCodexTokenError({ reason: "not_managed" });
         const config = yield* resolveCliAuthConfig(
           { baseDir: Option.some("/home/user/.launchpad") },

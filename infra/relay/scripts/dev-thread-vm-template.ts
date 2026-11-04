@@ -8,7 +8,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import { TrimmedNonEmptyString } from "@t3tools/contracts";
 import { loadThreadVmRuntimeSettings } from "../src/threads/ThreadVmRuntime.ts";
-import { workflowVmModelProofPath } from "../src/threads/ThreadVmWorkflowModelProof.ts";
+import {
+  WORKFLOW_VM_ISOLATION_VERSION,
+  verifiedWorkflowVmModelProof,
+  workflowVmModelProofPath,
+} from "../src/threads/ThreadVmWorkflowModelProof.ts";
 
 export const defaultDevThreadVmTemplatePath = NodeURL.fileURLToPath(
   new URL("../.t3/e2b-template.json", import.meta.url),
@@ -87,9 +91,18 @@ export const loadDevThreadVmRuntimeSettings = Effect.gen(function* () {
       templateError(path, "The selected VM template belongs to a different E2B_API_URL"),
     );
 
-  const modelProof = yield* fs
+  let modelProof = yield* fs
     .readFileString(workflowVmModelProofPath(path, selected.buildId))
     .pipe(Effect.catch(() => Effect.void));
+  const verifiesIsolation = (proof: string) =>
+    verifiedWorkflowVmModelProof(proof, selected.templateRef, selected.buildId)
+      ?.isolationVersion === WORKFLOW_VM_ISOLATION_VERSION;
+  if (modelProof !== undefined && !verifiesIsolation(modelProof)) {
+    const configuredProof = yield* Config.String("E2B_WORKFLOW_MODEL_PROOF").pipe(
+      Effect.orElseSucceed(() => ""),
+    );
+    if (verifiesIsolation(configuredProof)) modelProof = configuredProof;
+  }
   const provider = yield* ConfigProvider.ConfigProvider;
   return yield* loadThreadVmRuntimeSettings.pipe(
     Effect.provideService(

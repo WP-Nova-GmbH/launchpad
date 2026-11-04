@@ -34,10 +34,12 @@ import * as NodeChildSpawner from "@effect/platform-node/NodeChildProcessSpawner
 import {
   readVmHarnessIdentity,
   stopIdleVmHarness,
+  verifyWorkflowVmHarnessPeer,
   VmWorkloadError,
   type VmHarnessIdentity,
   type VmHarnessStopAdmission,
 } from "../../vmWorkload.ts";
+import type { WorkflowCodexProxy } from "../../relay/WorkflowCodexProxy.ts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -201,6 +203,9 @@ export interface CodexSessionRuntimeOptions {
   readonly providerInstanceId?: ProviderInstanceId;
   readonly binaryPath: string;
   readonly managedConnectionId?: string;
+  readonly workflowProxy?: Pick<WorkflowCodexProxy, "baseUrl" | "bindPeer"> & {
+    readonly permitEnv: string;
+  };
   readonly homePath?: string;
   readonly launchArgs?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -1475,6 +1480,11 @@ export const makeCodexSessionRuntime = (
     const parentScope = yield* Scope.Scope;
     const trackWorkloads = yield* VmWorkloadTracking;
     const controlSpawner = yield* VmControlSpawner;
+    if (options.workflowProxy && (!trackWorkloads || !controlSpawner))
+      return yield* new CodexErrors.CodexAppServerSpawnError({
+        command: `${options.binaryPath} app-server`,
+        cause: "Workflow Codex process verification is unavailable.",
+      });
     const runtimeScope = trackWorkloads
       ? yield* Scope.fork(parentScope, "sequential")
       : parentScope;
@@ -1511,6 +1521,7 @@ export const makeCodexSessionRuntime = (
       options.appServerArgs,
       options.launchArgs,
       options.managedConnectionId,
+      options.workflowProxy,
     );
     const spawnCommand = yield* resolveSpawnCommand(options.binaryPath, appServerArgs, {
       env,
@@ -2739,6 +2750,28 @@ export const makeCodexSessionRuntime = (
           });
       }
 
+      if (trackedLaunch && controlSpawner) {
+        const identity = yield* readVmHarnessIdentity(trackedLaunch.workloadId, child.pid).pipe(
+          Effect.provideService(VmControlSpawner, controlSpawner),
+          Effect.option,
+        );
+        if (identity._tag === "Some") harnessIdentity = identity.value;
+        if (options.workflowProxy) {
+          if (identity._tag === "None")
+            return yield* new CodexErrors.CodexAppServerSpawnError({
+              command: `${options.binaryPath} app-server`,
+              cause: "The workflow Codex process could not be verified.",
+            });
+          options.workflowProxy.bindPeer((listenerPort, clientPort, signal) =>
+            Effect.runPromise(
+              verifyWorkflowVmHarnessPeer(identity.value, listenerPort, clientPort).pipe(
+                Effect.provideService(VmControlSpawner, controlSpawner),
+              ),
+              { signal },
+            ),
+          );
+        }
+      }
       const providerThreadId = opened.thread.id;
       const session = {
         ...(yield* Ref.get(sessionRef)),
@@ -2750,13 +2783,6 @@ export const makeCodexSessionRuntime = (
       } satisfies ProviderSession;
       yield* Ref.set(sessionRef, session);
       yield* emitSessionEvent("session/ready", "Codex App Server session ready.");
-      if (trackedLaunch && controlSpawner) {
-        const identity = yield* readVmHarnessIdentity(trackedLaunch.workloadId, child.pid).pipe(
-          Effect.provideService(VmControlSpawner, controlSpawner),
-          Effect.option,
-        );
-        if (identity._tag === "Some") harnessIdentity = identity.value;
-      }
       return session;
     });
 

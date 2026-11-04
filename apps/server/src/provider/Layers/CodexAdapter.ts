@@ -1,5 +1,11 @@
-import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import { VmControlSpawner, VmWorkloadTracking, WorkflowVmGuest } from "../../vmWorkloadCommand.ts";
 import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
+import {
+  openWorkflowCodexProxy,
+  WORKFLOW_CODEX_PERMIT_ENV,
+  type WorkflowCodexProxy,
+} from "../../relay/WorkflowCodexProxy.ts";
+import * as Redacted from "effect/Redacted";
 /**
  * CodexAdapterLive - Scoped live implementation for the Codex provider adapter.
  *
@@ -153,6 +159,8 @@ interface CodexAdapterSessionContext {
   stopped: boolean;
   readonly stopLock: Semaphore.Semaphore;
   readonly runtimeEpisode: string;
+  readonly workflowProxy?: WorkflowCodexProxy;
+  readonly workflowAttempt?: boolean;
 }
 
 type CodexCumulativeTokenUsage = {
@@ -2292,6 +2300,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   options?: CodexAdapterLiveOptions,
 ) {
   const trackWorkloads = yield* VmWorkloadTracking;
+  const workflowGuest = yield* WorkflowVmGuest;
   const controlSpawner = yield* VmControlSpawner;
   const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("codex");
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -2320,7 +2329,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     Effect.scoped(
       Effect.gen(function* () {
         const workflowEnvironment = yield* CurrentWorkflowVmAttemptEnvironment;
-        if (workflowEnvironment && !options?.managedAuth)
+        if ((workflowEnvironment || workflowGuest) && !options?.managedAuth)
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
             operation: "startSession",
@@ -2438,24 +2447,29 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           input.modelSelection?.instanceId === boundInstanceId
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
-        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-        const runtimeEnvironment = workflowEnvironment
-          ? { ...options?.environment, ...workflowEnvironment.environment }
-          : options?.environment;
-        const shellEnvironmentNames = workflowEnvironment
-          ? yield* encodeShellEnvironmentNames([
-              "PATH",
-              "HOME",
-              "USER",
-              "LOGNAME",
-              "SHELL",
-              "TMPDIR",
-              "LANG",
-              "LC_*",
-              "TERM",
-              ...Object.keys(workflowEnvironment.environment),
-            ]).pipe(Effect.orDie)
-          : null;
+        const mcpSession = workflowGuest
+          ? undefined
+          : McpProviderSession.readMcpProviderSession(input.threadId);
+        const runtimeEnvironment = workflowGuest
+          ? workflowEnvironment?.environment
+          : workflowEnvironment
+            ? { ...options?.environment, ...workflowEnvironment.environment }
+            : options?.environment;
+        const shellEnvironmentNames =
+          workflowEnvironment || workflowGuest
+            ? yield* encodeShellEnvironmentNames([
+                "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
+                "SHELL",
+                "TMPDIR",
+                "LANG",
+                "LC_*",
+                "TERM",
+                ...Object.keys(workflowEnvironment?.environment ?? {}),
+              ]).pipe(Effect.orDie)
+            : null;
         const appServerArgs = [
           ...(shellEnvironmentNames
             ? [
@@ -2477,6 +2491,47 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             : []),
         ];
 
+        const sessionScope = yield* Scope.make("sequential");
+        let sessionScopeTransferred = false;
+        yield* Effect.addFinalizer(() =>
+          sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
+        );
+        const mint = options?.managedAuth?.mintToken;
+        if (
+          workflowGuest &&
+          (!mint || (workflowEnvironment && !workflowEnvironment.authorizeInference))
+        )
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Workflow Codex authorization is unavailable.",
+          });
+        const authorize = workflowEnvironment?.authorizeInference ?? Effect.succeed(true);
+        const workflowProxy =
+          workflowGuest && mint
+            ? yield* openWorkflowCodexProxy((signal) =>
+                Effect.runPromise(
+                  Effect.gen(function* () {
+                    if (!(yield* authorize)) return undefined;
+                    const token = yield* mint;
+                    return (yield* authorize) ? Redacted.value(token) : undefined;
+                  }),
+                  { signal },
+                ),
+              ).pipe(
+                Effect.provideService(Scope.Scope, sessionScope),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterProcessError({
+                      provider: PROVIDER,
+                      threadId: input.threadId,
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              )
+            : undefined;
+
         const runtimeInput: CodexSessionRuntimeOptions = {
           ...(sessionOptions?.requireResume !== undefined
             ? { requireResume: sessionOptions.requireResume }
@@ -2490,7 +2545,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             : {}),
           ...(options?.models ? { models: options.models } : {}),
           launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
-          ...(runtimeEnvironment ? { environment: runtimeEnvironment } : {}),
+          ...(workflowProxy
+            ? {
+                workflowProxy: {
+                  baseUrl: workflowProxy.baseUrl,
+                  permitEnv: WORKFLOW_CODEX_PERMIT_ENV,
+                  bindPeer: workflowProxy.bindPeer,
+                },
+                environment: {
+                  ...runtimeEnvironment,
+                  [WORKFLOW_CODEX_PERMIT_ENV]: workflowProxy.permit,
+                },
+              }
+            : runtimeEnvironment
+              ? { environment: runtimeEnvironment }
+              : {}),
           ...(appServerArgs.length ? { appServerArgs } : {}),
           ...((portableHome ?? codexConfig.homePath)
             ? { homePath: portableHome ?? codexConfig.homePath }
@@ -2524,11 +2593,6 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // after the stop and often sparse, so keep the session's merged view of
         // it and read it when a turn fails on the limit.
         let rateLimits: CodexRateLimitSnapshot | undefined;
-        const sessionScope = yield* Scope.make("sequential");
-        let sessionScopeTransferred = false;
-        yield* Effect.addFinalizer(() =>
-          sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
-        );
         const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
         nativeAttempted = true;
         const runtime = yield* createRuntime(runtimeInput).pipe(
@@ -2554,6 +2618,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // runtime event the session emitted afterwards was dropped.
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
+            if (event.method === "turn/completed" || event.method === "session/closed")
+              workflowProxy?.revoke();
             yield* writeNativeEvent(event);
             // This deliberate close is part of settling the completed turn. A late
             // session.exited event could otherwise invalidate the next resumed turn.
@@ -2699,6 +2765,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           stopped: true,
           stopLock: yield* Semaphore.make(1),
           runtimeEpisode,
+          ...(workflowProxy ? { workflowProxy } : {}),
+          ...(workflowEnvironment ? { workflowAttempt: true } : {}),
         };
         // Startup can fail after spawning. Retain the exact runtime until cleanup is proven.
         sessions.set(input.threadId, context);
@@ -2803,6 +2871,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               operation: "sendTurn",
               issue: "The native session changed before turn dispatch.",
             });
+          session.workflowProxy?.activate();
         }),
         ...(input.delivery?.mode === "next-turn" ? { requireIdle: true } : {}),
         ...(input.delivery?.mode === "steer" && input.delivery.expectedTurnId !== undefined
@@ -2836,6 +2905,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         ),
         Effect.tap((result) => hooks?.onAdmitted(result, "provider-ack") ?? Effect.void),
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit) && !session.workflowAttempt
+            ? Effect.sync(() => session.workflowProxy?.revoke())
+            : Effect.void,
+        ),
       );
   });
 
@@ -2858,6 +2932,15 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const interruptTurn: CodexAdapterShape["interruptTurn"] = (threadId, turnId) =>
     requireSession(threadId).pipe(
+      Effect.tap((session) =>
+        Effect.gen(function* () {
+          if (
+            session.workflowProxy &&
+            (!turnId || (yield* session.runtime.getSession).activeTurnId === turnId)
+          )
+            session.workflowProxy.revoke();
+        }),
+      ),
       Effect.flatMap((session) => session.runtime.interruptTurn(turnId)),
       Effect.mapError((cause) =>
         cause._tag === "ProviderAdapterSessionNotFoundError"
@@ -3004,6 +3087,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         )
           return;
         session.stopped = true;
+        session.workflowProxy?.revoke();
         if (trackWorkloads && !session.runtime.closeNativeWriter)
           return yield* new ProviderAdapterProcessError({
             provider: PROVIDER,

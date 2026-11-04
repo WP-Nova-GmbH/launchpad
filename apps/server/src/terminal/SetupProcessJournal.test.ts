@@ -19,6 +19,7 @@ const harness = Effect.gen(function* () {
   const fail = yield* Ref.make(false);
   const inspectFail = yield* Ref.make(false);
   const stops = yield* Ref.make(0);
+  const arms = yield* Ref.make(0);
   const signals = yield* Ref.make<ReadonlyArray<string>>([]);
   const newJournal = () =>
     Effect.service(Journal.SetupProcessJournal).pipe(
@@ -27,7 +28,7 @@ const harness = Effect.gen(function* () {
           Layer.provide(
             Layer.mock(SetupProcessAdapter, {
               launcher: Effect.succeed("/native/helper"),
-              arm: () => Effect.succeed("/bin/sh"),
+              arm: () => Ref.update(arms, (count) => count + 1).pipe(Effect.as("/bin/sh")),
               host: Ref.get(boot),
               inspect: () =>
                 Effect.gen(function* () {
@@ -56,8 +57,28 @@ const harness = Effect.gen(function* () {
         ),
       ),
     );
-  return { identity, boot, fail, inspectFail, stops, signals, newJournal };
+  return { identity, boot, fail, inspectFail, stops, arms, signals, newJournal };
 });
+
+it.effect("retains a captured setup for cleanup when authorization expires before arm", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    const journal = yield* h.newJournal();
+    yield* journal.begin(owned);
+    yield* Effect.flip(
+      journal.capture({
+        ...attempt,
+        pid: 42,
+        guardArm: () => Effect.fail(new SetupProcessError({ message: "Setup permission expired" })),
+      }),
+    );
+    assert.strictEqual(yield* Ref.get(h.arms), 0);
+    const fresh = yield* h.newJournal();
+    const receipt = yield* fresh.cleanup(cleanup);
+    assert.strictEqual(receipt.identity, "original-birth");
+    assert.strictEqual(yield* Ref.get(h.stops), 1);
+  }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
 
 it.effect.each(["surviving", "absent", "reused"] as const)(
   "a fresh manager confirms the original process after restart: %s",

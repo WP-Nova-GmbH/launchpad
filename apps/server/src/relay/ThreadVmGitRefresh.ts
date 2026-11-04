@@ -6,6 +6,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { configureThreadVmRepository } from "./ThreadVmRepositoryBinding.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 
 /** Startup repair and metadata refresh run independently of the command inbox. */
 export const refreshInstalledThreadVmRepository = Effect.gen(function* () {
@@ -37,6 +38,9 @@ export function makeThreadVmGitRefresh<E, R>(
   let nextAttempt = 0,
     retryDelay = 30_000;
   return Effect.gen(function* () {
+    // Workflow checkout was authenticated once by the private bootstrap. Do not
+    // replace the workload's Git config with a coordinator-owned config.lock.
+    if (yield* WorkflowVmGuest) return;
     const now = (yield* DateTime.now).epochMilliseconds;
     if (now < nextAttempt) return;
     const result = yield* synchronize.pipe(

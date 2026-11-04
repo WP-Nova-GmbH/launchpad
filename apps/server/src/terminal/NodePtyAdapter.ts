@@ -1,4 +1,11 @@
-import { VmWorkloadTracking, vmWorkloadCommand } from "../vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  WorkflowVmGuest,
+  signalRunningWorkflowVmWorkload,
+  vmWorkloadCommand,
+  workflowVmProcessEnvironment,
+} from "../vmWorkloadCommand.ts";
 import * as NodeCrypto from "node:crypto";
 import * as NodeModule from "node:module";
 
@@ -99,14 +106,21 @@ const encodeSetupLaunch = Schema.encodeSync(
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
   private readonly platform: NodeJS.Platform;
+  private readonly signalWorkflow: ((signal: string) => Promise<void>) | undefined;
   private readonly outputListeners = new Set<(data: string) => void>();
   private readonly shellExitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
   private shellExit: PtyAdapter.PtyExitEvent | undefined;
   private pendingFrame = "";
 
-  constructor(process: import("node-pty").IPty, platform: NodeJS.Platform, token?: string) {
+  constructor(
+    process: import("node-pty").IPty,
+    platform: NodeJS.Platform,
+    token?: string,
+    signalWorkflow?: (signal: string) => Promise<void>,
+  ) {
     this.process = process;
     this.platform = platform;
+    this.signalWorkflow = signalWorkflow;
     if (token) {
       const prefix = `\x1b]T3_SETUP_EXIT;${token};`;
       process.onData((data) => {
@@ -160,7 +174,8 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
     this.process.resize(cols, rows);
   }
 
-  kill(signal?: string): void {
+  kill(signal?: string): void | Promise<void> {
+    if (this.signalWorkflow) return this.signalWorkflow(signal ?? "SIGHUP");
     // node-pty terminates the Windows process tree without a POSIX signal.
     this.process.kill(this.platform === "win32" ? undefined : signal);
   }
@@ -196,6 +211,9 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
 export const make = Effect.fn("NodePtyAdapter.make")(function* () {
   const loadNodePtyModule = yield* NodePtyModuleLoaderRef;
   const trackWorkloads = yield* VmWorkloadTracking;
+  const workflowGuest = yield* WorkflowVmGuest;
+  const controlSpawner = yield* VmControlSpawner;
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const platform = yield* HostProcessPlatform;
@@ -223,49 +241,107 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
 
   return PtyAdapter.PtyAdapter.of({
     spawn: Effect.fn("NodePtyAdapter.spawn")(function* (input) {
+      if (workflowGuest && (!trackWorkloads || !controlSpawner)) {
+        return yield* new PtyAdapter.PtySpawnError({
+          adapter: "node-pty",
+          shell: input.shell,
+          cause: new Error("Workflow terminal isolation is unavailable."),
+        });
+      }
       yield* ensureNodePtySpawnHelperExecutableCached;
       // node-pty only writes `name` into the child's TERM on the Unix path;
       // the ConPTY path leaves the environment untouched, so Windows children
       // inherit a missing or 16-color TERM unless it is set here.
-      const env =
-        platform === "win32" && input.env["TERM"] === undefined
+      const env = workflowGuest
+        ? workflowVmProcessEnvironment(input.env)
+        : platform === "win32" && input.env["TERM"] === undefined
           ? { ...input.env, TERM: "xterm-256color" }
           : input.env;
       const token = input.ownerExecutable ? NodeCrypto.randomUUID().replaceAll("-", "") : undefined;
+      const protectedOwner = workflowGuest && token !== undefined;
+      const candidate = input.ownerShellCandidates?.[0];
+      const script = candidate?.args?.[1];
+      const spawnError = (cause: unknown) =>
+        new PtyAdapter.PtySpawnError({ adapter: "node-pty", shell: input.shell, cause });
+      if (
+        protectedOwner &&
+        (input.ownerShellCandidates?.length !== 1 ||
+          candidate?.shell !== "/bin/bash" ||
+          candidate.args?.length !== 2 ||
+          candidate.args[0] !== "-c" ||
+          script === undefined ||
+          script.includes("\0"))
+      ) {
+        return yield* spawnError(new Error("Invalid workflow setup shell."));
+      }
+      const scriptFile = protectedOwner
+        ? `/tmp/launchpad-workflow-setup-${NodeCrypto.randomUUID().replaceAll("-", "")}.sh`
+        : undefined;
+      const removeScript = scriptFile
+        ? fs.remove(scriptFile, { force: true }).pipe(Effect.ignore)
+        : Effect.void;
       const ownedCommand = input.ownerExecutable ?? input.shell;
-      const ownedArgs = input.ownerExecutable
-        ? [
-            "--setup-owner-v4",
-            "--launch-v1",
-            encodeSetupLaunch({
-              protocol: 1,
-              token: token!,
-              candidates: input.ownerShellCandidates ?? [
-                { shell: input.shell, args: input.args ?? [] },
-              ],
+      const ownedArgs = scriptFile
+        ? ["--setup-owner-v4", "--script-file-v1", scriptFile]
+        : input.ownerExecutable
+          ? [
+              "--setup-owner-v4",
+              "--launch-v1",
+              encodeSetupLaunch({
+                protocol: 1,
+                token: token!,
+                candidates: input.ownerShellCandidates ?? [
+                  { shell: input.shell, args: input.args ?? [] },
+                ],
+              }),
+            ]
+          : (input.args ?? []);
+      const workload = trackWorkloads
+        ? vmWorkloadCommand(ownedCommand, ownedArgs, "terminal", workflowGuest)
+        : null;
+      const launch = workload ?? { command: ownedCommand, args: ownedArgs };
+      const ptyProcess = yield* Effect.gen(function* () {
+        if (scriptFile) {
+          yield* Effect.gen(function* () {
+            const file = yield* fs.open(scriptFile, { flag: "wx", mode: 0o600 });
+            yield* file
+              .writeAll(Buffer.from(script!.replaceAll("\r\n", "\n")))
+              .pipe(Effect.onError(() => removeScript));
+          }).pipe(Effect.scoped, Effect.mapError(spawnError));
+        }
+        const process = yield* Effect.try({
+          try: () =>
+            nodePty.spawn(launch.command, launch.args, {
+              cwd: input.cwd,
+              cols: input.cols,
+              rows: input.rows,
+              env: protectedOwner ? { ...env, LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN: token } : env,
+              name: "xterm-256color",
             }),
-          ]
-        : (input.args ?? []);
-      const launch = trackWorkloads
-        ? vmWorkloadCommand(ownedCommand, ownedArgs, "terminal")
-        : { command: ownedCommand, args: ownedArgs };
-      const ptyProcess = yield* Effect.try({
-        try: () =>
-          nodePty.spawn(launch.command, launch.args, {
-            cwd: input.cwd,
-            cols: input.cols,
-            rows: input.rows,
-            env,
-            name: "xterm-256color",
-          }),
-        catch: (cause) =>
-          new PtyAdapter.PtySpawnError({
-            adapter: "node-pty",
-            shell: input.shell,
-            cause,
-          }),
-      });
-      return new NodePtyProcess(ptyProcess, platform, token);
+          catch: spawnError,
+        }).pipe(Effect.onError(() => removeScript));
+        if (scriptFile) process.onExit(() => void runPromise(removeScript));
+        return process;
+      }).pipe(Effect.uninterruptible);
+      if (!workflowGuest || !workload || !controlSpawner)
+        return new NodePtyProcess(ptyProcess, platform, token);
+      let running = true;
+      ptyProcess.onExit(() => void (running = false));
+      return new NodePtyProcess(ptyProcess, platform, token, (signal) =>
+        runPromise(
+          removeScript.pipe(
+            Effect.andThen(
+              signalRunningWorkflowVmWorkload(
+                controlSpawner,
+                workload.workloadId,
+                ptyProcess.pid,
+                signal,
+                Effect.sync(() => running),
+              ),
+            ),
+          ),
+        ),
+      );
     }),
   });
 });

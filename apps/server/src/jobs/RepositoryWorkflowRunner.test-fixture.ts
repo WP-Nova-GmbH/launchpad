@@ -595,6 +595,10 @@ export const harness = Effect.gen(function* () {
           if (changedHead !== null) yield* Ref.set(head, changedHead);
           return { commitId: "capture-commit", treeId: yield* Ref.get(workspaceTree) };
         }),
+      resolvePinnedTree: ({ checkpointRef }) =>
+        Ref.get(checkpointTrees).pipe(
+          Effect.map((trees) => trees.get(`${checkpointRef}^{tree}`) ?? "prepared-tree"),
+        ),
       deleteCheckpointRefs: () => Effect.void,
     }),
     Layer.mock(TextGeneration)({

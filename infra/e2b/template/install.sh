@@ -76,12 +76,22 @@ codex --version
 pnpm --version
 
 id user >/dev/null 2>&1 || useradd --create-home --uid 1000 --shell /bin/bash user
+test "$(id -u user)" = 1000 && test "$(id -g user)" = 1000
+groupadd --gid 10001 launchpad-workflow
+useradd --create-home --uid 10001 --gid 10001 --shell /usr/sbin/nologin launchpad-workflow
+chmod 0700 /home/launchpad-workflow
+install -d -m0700 -o launchpad-workflow -g launchpad-workflow /home/launchpad-workflow/.codex
 mkdir -p /workspace /home/user/.launchpad /home/user/.codex
 chown user:user /workspace /home/user/.launchpad /home/user/.codex
 ln -s /opt/launchpad/server/t3 /opt/launchpad/bin/launchpad-server
 install -m0644 /opt/launchpad-package/install.sh /opt/launchpad/install.sh
 install -m0755 /opt/launchpad-package/activity.py /opt/launchpad/bin/launchpad-activity
 install -m0755 /opt/launchpad-package/workload.py /opt/launchpad/bin/launchpad-workload
+install -m0644 /opt/launchpad-package/workflow-checkpoint-reader.py /opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py
+install -m0751 -o root -g user "$(readlink -f /usr/bin/python3)" /opt/launchpad/bin/launchpad-workflow-reader-python
+test "$(/usr/bin/git --exec-path)" = /usr/lib/git-core
+install -m0751 -o root -g user "$(readlink -f /usr/bin/git)" /opt/launchpad/bin/launchpad-workflow-git
+install -m0751 -o root -g user /opt/launchpad/server/resource-monitor/t3-resource-monitor /opt/launchpad/bin/launchpad-workflow-setup-owner
 install -m0644 /opt/launchpad-package/launchpad-workloads.service /etc/systemd/system/launchpad-workloads.service
 mkdir -p /etc/systemd/system/multi-user.target.wants
 ln -s /etc/systemd/system/launchpad-workloads.service /etc/systemd/system/multi-user.target.wants/launchpad-workloads.service
@@ -98,6 +108,9 @@ done
 apt-get update
 apt-get install -y --no-install-recommends build-essential
 rm -rf /var/lib/apt/lists/*
+cc -std=c17 -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+  -Wl,-z,relro,-z,now -o /opt/launchpad-package/workflow-exec /opt/launchpad-package/workflow-exec.c
+install -m4750 -o root -g user /opt/launchpad-package/workflow-exec /opt/launchpad/bin/launchpad-workload-exec
 
 # Verify the final tools as the runtime user without retaining another snapshot.
 runuser -u user -- env PATH="$PATH" HOME=/home/user bash -euc '
