@@ -1,9 +1,13 @@
 import { assert, it } from "@effect/vitest";
 import { CodexSettings } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { ThreadVmCodexAuthSourceError } from "../../relay/ThreadVmCodexAuthSource.ts";
+import { withVmWorkloads } from "../../vmWorkloadCommand.ts";
 const decodeManagedSettings = Schema.decodeUnknownSync(CodexSettings);
 const noManagedSpawn = ChildProcessSpawner.make(() => Effect.die("Unexpected provider spawn"));
 const managedConnection = {
@@ -21,6 +25,59 @@ import {
   applyPreferredCodexDefaultModel,
   mapCodexModelCapabilities,
 } from "./CodexProvider.ts";
+
+for (const mode of ["ordinary", "personal", "workflow"] as const) {
+  it.effect(`starts the actual ${mode} Codex status probe in its accessible directory`, () =>
+    Effect.gen(function* () {
+      const commands: ChildProcess.StandardCommand[] = [];
+      const raw = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command))
+            return yield* Effect.die("Unexpected pipeline");
+          commands.push(command);
+          return yield* PlatformError.badArgument({
+            module: "CodexProbeTest",
+            method: "spawn",
+            description: "Test stops before executing a provider",
+          });
+        }),
+      );
+      const probe = checkCodexProviderStatus(
+        decodeManagedSettings({ binaryPath: "/opt/launchpad/node/bin/codex" }),
+        undefined,
+        { HOME: "/home/user", LD_PRELOAD: "untrusted-loader" },
+      );
+      const provider = yield* (
+        mode === "ordinary" ? probe : withVmWorkloads(probe, mode === "workflow")
+      ).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw),
+        Effect.provideService(HostProcessPlatform, "linux"),
+      );
+      assert.equal(provider.status, "error");
+      assert.equal(commands.length, 1);
+      const command = commands[0]!;
+      assert.ok(command.args.includes("app-server"));
+      assert.equal(
+        command.command,
+        mode === "ordinary"
+          ? "/opt/launchpad/node/bin/codex"
+          : "/opt/launchpad/bin/launchpad-workload",
+      );
+      if (mode === "workflow") {
+        assert.equal(command.args[0], "run-workflow");
+        assert.equal(command.args[3], "/home/launchpad-workflow");
+        assert.equal(command.options.cwd, "/");
+        assert.equal(command.options.extendEnv, false);
+        assert.equal(command.options.env?.HOME, "/home/launchpad-workflow");
+        assert.equal(command.options.env?.USER, "launchpad-workflow");
+        assert.equal(command.options.env?.LD_PRELOAD, undefined);
+      } else {
+        assert.equal(command.options.cwd, process.cwd());
+        if (mode === "personal") assert.equal(command.args[0], "run");
+      }
+    }),
+  );
+}
 
 it("maps current Codex model capability fields", () => {
   const capabilities = mapCodexModelCapabilities({

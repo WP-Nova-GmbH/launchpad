@@ -9,7 +9,12 @@ import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { makeVmWorkloadSpawner } from "./vmWorkloadCommand.ts";
+import {
+  makeVmWorkloadSpawner,
+  VmControlSpawner,
+  VmCoordinatorProcess,
+  withVmWorkloads,
+} from "./vmWorkloadCommand.ts";
 
 const handle = (
   pid: number,
@@ -108,5 +113,79 @@ it.effect("keeps detached workloads when the isolated command leader already exi
       .spawn(ChildProcess.make("/bin/true"))
       .pipe(Effect.scoped);
     assert.equal(spawns, 1);
+  }),
+);
+
+it.effect("keeps private review Git and explicit controls separate from checkout workloads", () =>
+  Effect.gen(function* () {
+    const commands: ChildProcess.StandardCommand[] = [];
+    const raw = ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipeline.");
+        commands.push(command);
+        return handle(42, Effect.succeed(ChildProcessSpawner.ExitCode(0)), Effect.succeed(false));
+      }),
+    );
+    const review = "/home/user/.launchpad/userdata/workflow-review.git";
+    yield* withVmWorkloads(
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        yield* spawner
+          .spawn(
+            ChildProcess.make("git", ["--git-dir", review, "rev-parse", "HEAD"], {
+              cwd: review,
+              env: { HOME: "/home/user", GIT_CONFIG_GLOBAL: "/dev/null" },
+            }),
+          )
+          .pipe(Effect.provideService(VmCoordinatorProcess, true));
+        yield* spawner.spawn(
+          ChildProcess.make("git", ["status", "--porcelain"], {
+            cwd: "/workspace/project",
+            env: { HOME: "/home/user", GH_TOKEN: "coordinator-only" },
+          }),
+        );
+        const control = yield* VmControlSpawner;
+        assert.ok(control);
+        yield* control.spawn(
+          ChildProcess.make("/opt/launchpad/bin/launchpad-workload", [
+            "provider-identity",
+            "a".repeat(32),
+            "42",
+          ]),
+        );
+      }),
+      true,
+    ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw));
+
+    assert.equal(commands.length, 3);
+    const [trusted, checkout, control] = commands;
+    assert.equal(trusted!.command, "/opt/launchpad/bin/launchpad-workload");
+    assert.equal(trusted!.args[0], "run");
+    assert.deepEqual(trusted!.args.slice(2), [
+      "process",
+      "--",
+      "git",
+      "--git-dir",
+      review,
+      "rev-parse",
+      "HEAD",
+    ]);
+    assert.equal(trusted!.options.cwd, review);
+    assert.equal(trusted!.options.env?.HOME, "/home/user");
+    assert.equal(checkout!.args[0], "run-workflow");
+    assert.deepEqual(checkout!.args.slice(2), [
+      "process",
+      "/workspace/project",
+      "--",
+      "git",
+      "-c",
+      "credential.helper=",
+      "status",
+      "--porcelain",
+    ]);
+    assert.equal(checkout!.options.cwd, "/");
+    assert.equal(checkout!.options.env?.HOME, "/home/launchpad-workflow");
+    assert.equal(checkout!.options.env?.GH_TOKEN, undefined);
+    assert.deepEqual(control!.args, ["provider-identity", "a".repeat(32), "42"]);
   }),
 );

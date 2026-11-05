@@ -47,6 +47,7 @@ import {
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
+import { WorkflowVmGuest, workflowVmBaseEnvironment } from "../../vmWorkloadCommand.ts";
 import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
 import {
   codexRateLimitsFailureMessage,
@@ -676,7 +677,8 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     binaryPath: codexSettings.binaryPath,
     homePath: codexSettings.homePath,
     launchArgs: resolveCodexLaunchArgs(codexSettings.launchArgs, resolvedEnvironment),
-    cwd: process.cwd(),
+    // The workflow UID cannot traverse the coordinator's private home.
+    cwd: (yield* WorkflowVmGuest) ? workflowVmBaseEnvironment.HOME : process.cwd(),
     customModels: codexSettings.customModels,
     environment: resolvedEnvironment,
     ...(managedAuth ? { managedConnectionId: managedAuth.connectionId } : {}),

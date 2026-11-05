@@ -11,11 +11,13 @@ vi.mock("node:child_process", { spy: true });
 import * as Ref from "effect/Ref";
 import * as Exit from "effect/Exit";
 import * as PlatformError from "effect/PlatformError";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
+import { withVmWorkloads } from "../../vmWorkloadCommand.ts";
 
 import {
   buildCodexAdditionalContext,
@@ -28,6 +30,7 @@ import {
   hasConfiguredMcpServer,
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
+  makeCodexSessionRuntime,
   openCodexThread,
   stopCodexProcess,
   readCodexThread,
@@ -36,6 +39,56 @@ import {
   toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
+
+it.effect("launches the actual Codex runtime through the isolated workflow launcher", () =>
+  Effect.gen(function* () {
+    let launches = 0;
+    const raw = ChildProcessSpawner.make((command) =>
+      Effect.gen(function* () {
+        launches++;
+        NodeAssert.equal(command._tag, "StandardCommand");
+        if (command._tag !== "StandardCommand") return yield* Effect.die("Unexpected pipeline");
+        NodeAssert.equal(command.command, "/opt/launchpad/bin/launchpad-workload");
+        NodeAssert.equal(command.args[0], "run-workflow");
+        NodeAssert.match(command.args[1]!, /^[a-f0-9]{32}$/u);
+        NodeAssert.deepEqual(command.args.slice(2, 6), [
+          "provider",
+          "/workspace/project",
+          "--",
+          "/opt/launchpad/node/bin/codex",
+        ]);
+        NodeAssert.ok(command.args.includes("app-server"));
+        NodeAssert.equal(command.options.cwd, "/");
+        NodeAssert.equal(command.options.extendEnv, false);
+        NodeAssert.equal(command.options.env?.HOME, "/home/launchpad-workflow");
+        NodeAssert.equal(command.options.env?.CODEX_HOME, "/home/launchpad-workflow/.codex");
+        NodeAssert.equal(command.options.env?.LD_PRELOAD, undefined);
+        return yield* PlatformError.badArgument({
+          module: "CodexTest",
+          method: "spawn",
+          description: "Test stops before executing a provider",
+        });
+      }),
+    );
+    const error = yield* withVmWorkloads(
+      makeCodexSessionRuntime({
+        threadId: ThreadId.make("isolated-launch-test"),
+        binaryPath: "/opt/launchpad/node/bin/codex",
+        cwd: "/workspace/project",
+        runtimeMode: "auto",
+        environment: { HOME: "/home/user", LD_PRELOAD: "untrusted-loader" },
+      }),
+      true,
+    ).pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw),
+      Effect.provideService(HostProcessPlatform, "linux"),
+      Effect.provide(NodeCrypto.layer),
+      Effect.flip,
+    );
+    NodeAssert.equal(error._tag, "CodexAppServerSpawnError");
+    NodeAssert.equal(launches, 1);
+  }).pipe(Effect.scoped),
+);
 
 describe("Codex thread history", () => {
   for (const numTurns of [1, 2, 3, 5]) {

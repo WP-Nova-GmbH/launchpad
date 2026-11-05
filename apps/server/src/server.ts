@@ -18,7 +18,7 @@ import * as SetupProcessAdapter from "./terminal/SetupProcessAdapter.ts";
 import * as NodeHttp from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
 import {
   EnvironmentHttpApi,
   ProviderDriverKind,
@@ -35,7 +35,7 @@ import * as Random from "effect/Random";
 import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import { FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
+import { Etag, FetchHttpClient, HttpRouter, HttpServer } from "effect/unstable/http";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -271,22 +271,25 @@ const RelayClientLive = Layer.unwrap(
 const HttpServerLive = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
-    return NodeHttpServer.layer(() => guardHttpResponseWriteErrors(NodeHttp.createServer()), {
-      host: config.host ?? "127.0.0.1",
-      port: config.port,
-      gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
-      // Negotiate permessage-deflate with clients that offer it; clients
-      // that don't still get uncompressed frames on their connection.
-      // Context takeover stays enabled (ws default) so the compression
-      // window is shared across frames — that also makes small frames cheap
-      // to compress, so no size threshold is set (ws only honors
-      // `threshold` when context takeover is disabled).
-      websocket: { perMessageDeflate: true },
-    });
+    // The convenience `layer` also installs Node services, replacing the VM launcher.
+    return Layer.mergeAll(
+      NodeHttpServer.layerServer(() => guardHttpResponseWriteErrors(NodeHttp.createServer()), {
+        host: config.host ?? "127.0.0.1",
+        port: config.port,
+        gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
+        // Negotiate permessage-deflate with clients that offer it; clients
+        // that don't still get uncompressed frames on their connection.
+        // Context takeover stays enabled (ws default) so the compression
+        // window is shared across frames — that also makes small frames cheap
+        // to compress, so no size threshold is set (ws only honors
+        // `threshold` when context takeover is disabled).
+        websocket: { perMessageDeflate: true },
+      }),
+      NodeHttpPlatform.layer,
+      Etag.layerWeak,
+    );
   }),
 );
-
-const PlatformServicesLive = NodeServices.layer;
 
 const ThreadExecutionLayerLive = ThreadExecution.layer.pipe(Layer.provide(ServerSecretStore.layer));
 
@@ -728,7 +731,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(httpCompressionLayer),
 );
 
-const makeServerLayer = Layer.unwrap(
+export const makeServerLayer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
     const activation = yield* Deferred.make<void>();
@@ -1188,10 +1191,10 @@ const makeServerLayer = Layer.unwrap(
           Layer.provide(ServerSecretStore.layer),
         ),
       ),
-      Layer.provideMerge(PlatformServicesLive),
     );
   }),
 );
 
-// The CLI supplies configuration.
+// The CLI supplies configuration and platform services. VM callers wrap the
+// process launcher before these layers capture it, so do not replace it here.
 export const runServer = Layer.launch(makeServerLayer);
