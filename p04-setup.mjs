@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 
-const secret = process.env.P04_RERUN_AZQMNDBI_SECRET;
-const revision = process.env.P04_RERUN_AZQMNDBI_REVISION;
+const secret = process.env.P04_FIX_19AU2VO1_SECRET;
+const revision = process.env.P04_FIX_19AU2VO1_REVISION;
 if (!secret || !["A", "B"].includes(revision) || !secret.startsWith(`P04_${revision}_`)) {
   throw new Error("P04 fixture setup could not verify its configuration");
 }
