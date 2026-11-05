@@ -3379,7 +3379,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       // Durable startup writes precede spawning; an empty, never-admitted thread can prove no native work.
       return (
         !!thread &&
-        thread.session === null &&
+        // Stop also projects an empty stopped session before a provider has started.
+        (thread.session === null ||
+          (thread.session.status === "stopped" &&
+            thread.session.providerName === null &&
+            thread.session.providerInstanceId === undefined &&
+            thread.session.activeTurnId === null)) &&
         thread.latestTurn === null &&
         !thread.messages.some((message) => message.role === "user") &&
         !thread.promptQueue?.handoff &&

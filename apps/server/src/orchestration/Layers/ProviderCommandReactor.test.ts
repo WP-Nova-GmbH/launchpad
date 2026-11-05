@@ -7696,36 +7696,120 @@ describe("ProviderCommandReactor", () => {
           }),
         );
         const initial = continuityQueueRun(`never-native-${mode}`);
+        const stopCommandId = CommandId.make(`never-native-stop:${mode}`);
+        const preparationAttemptId = CommandId.make(`never-native-setup:${mode}`);
         const run: WorkflowRun = {
           ...initial,
           promptDispatched: mode !== "input-first",
-          sequence:
-            mode === "input-first"
+          sequence: {
+            cursor: 0,
+            generation: 0,
+            started: true,
+            stepStartedAt: initial.createdAt,
+            completed: [],
+            responses: [],
+            feedback: null,
+          },
+          cancellationAttempt: {
+            commandId: stopCommandId,
+            createdAt: initial.createdAt,
+            ...(mode === "before-native-start"
               ? {
-                  cursor: 0,
-                  generation: 0,
-                  started: true,
-                  stepStartedAt: initial.createdAt,
-                  completed: [],
-                  responses: [],
-                  feedback: null,
+                  setupCleanup: {
+                    attemptId: preparationAttemptId,
+                    state: "done" as const,
+                    detail: null,
+                  },
                 }
-              : undefined,
+              : {}),
+          },
           progress: { ...initial.progress, status: "cancelling" },
         };
-        yield* Effect.promise(() =>
-          harness.runEffect(WorkflowRunStore.pipe(Effect.flatMap((store) => store.save(run)))),
-        );
+        if (mode === "before-native-start") {
+          yield* enqueueContinuity(harness, workflowPromptId(run), run.modelSelection);
+          yield* harness.engine.dispatch({
+            type: "thread.preparation.update",
+            threadId: run.progress.threadId,
+            commandId: CommandId.make(`never-native-setup-failed:${mode}`),
+            expectedRevision: null,
+            preparation: {
+              originalCommandId: preparationAttemptId,
+              attemptId: preparationAttemptId,
+              revision: 0,
+              state: "failed",
+              settled: true,
+              recipe: null,
+              script: { id: "setup", name: "Setup", command: "false", async: false },
+              failure: { reason: "failed", detail: "Setup failed before native startup" },
+            },
+            createdAt: run.createdAt,
+          });
+        }
+        const store = yield* Effect.promise(() => harness.runEffect(WorkflowRunStore));
+        yield* store.save(run);
+        expect(yield* store.isExecuting()).toBe(true);
         expect(
           yield* harness.providerService.isWorkflowSessionStopConfirmed({
             jobId: run.jobId,
             threadId: run.progress.threadId,
           }),
         ).toBe(true);
-        yield* harness.providerService.stopSession({ threadId: run.progress.threadId });
+        yield* Effect.promise(harness.startReactor);
+        const projectedStop = yield* harness.engine.subscribeDomainEvents.pipe(
+          Effect.flatMap((events) =>
+            events.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "thread.session-set" &&
+                  event.payload.threadId === run.progress.threadId &&
+                  event.payload.session.status === "stopped",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+            ),
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* harness.engine.dispatch({
+          type: "thread.session.stop",
+          commandId: stopCommandId,
+          threadId: run.progress.threadId,
+          createdAt: run.createdAt,
+        });
+        yield* Fiber.join(projectedStop);
+        yield* Effect.promise(harness.drain);
         expect(original.starts).toEqual([]);
         const thread = (yield* Effect.promise(harness.readModel)).threads[0]!;
-        expect(reconcileWorkflowRun(run, thread, false, true).progress.status).toBe("cancelled");
+        expect(thread.session).toMatchObject({
+          status: "stopped",
+          providerName: null,
+          activeTurnId: null,
+        });
+        expect(thread.session?.providerInstanceId).toBeUndefined();
+        const shutdownConfirmed = yield* harness.providerService.isWorkflowSessionStopConfirmed({
+          jobId: run.jobId,
+          threadId: run.progress.threadId,
+        });
+        expect(shutdownConfirmed).toBe(true);
+        if (mode === "before-native-start") {
+          expect(thread.promptQueue).toMatchObject({
+            enabled: false,
+            pauseReason: { code: "stopped" },
+            entries: [{ messageId: workflowPromptId(run), state: "pending" }],
+            preparation: { state: "failed", settled: true },
+          });
+          const waiting = reconcileWorkflowRun(run, thread, false, shutdownConfirmed);
+          expect(waiting.progress.status).toBe("cancelling");
+          expect(waiting.executionReserved).toBe(true);
+        }
+        const cancelled = reconcileWorkflowRun(run, thread, true, shutdownConfirmed);
+        expect(cancelled.progress.status).toBe("cancelled");
+        expect(cancelled.executionReserved).toBe(false);
+        expect(cancelled.cancellationAttempt).toBeNull();
+        expect(reconcileWorkflowRun(cancelled, thread, true, shutdownConfirmed)).toEqual(cancelled);
+        yield* store.save(cancelled);
+        expect(yield* store.isExecuting()).toBe(false);
+        expect(original.nativePrompts).toEqual([]);
       }),
   );
   effectIt.effect.each(["success", "failure-retry"] as const)(

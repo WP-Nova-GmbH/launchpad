@@ -41,6 +41,7 @@ import {
   ApprovalRequestId,
   ClaudeSettings,
   CodexSettings,
+  CommandId,
   EnvironmentId,
   EventId,
   MessageId,
@@ -61,6 +62,7 @@ import {
   serializeAssistantCitation,
 } from "@t3tools/shared/assistantCitations";
 import { createModelSelection } from "@t3tools/shared/model";
+import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
 import { it, assert, describe, vi } from "@effect/vitest";
 import { afterAll } from "vite-plus/test";
 
@@ -8900,6 +8902,18 @@ const emptyProofThread = (id: ThreadId) =>
     checkpoints: [],
     session: null,
   });
+const stoppedProofThread = (id: ThreadId) =>
+  decodeProofThread({
+    ...emptyProofThread(id),
+    session: {
+      threadId: id,
+      status: "stopped",
+      providerName: null,
+      activeTurnId: null,
+      lastError: null,
+      updatedAt: "2026-10-12T00:00:00.000Z",
+    },
+  });
 function makeProofProjection(
   read: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"]["getThreadDetailById"],
 ): ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"] {
@@ -8932,11 +8946,172 @@ function makeProofProjection(
   };
 }
 
-it.effect.each(["started", "pending", "binding", "final-read", "empty"] as const)(
-  "empty projection cannot grant stale shutdown proof: %s",
-  (mode) =>
+it.effect("recovers never-started cancellation from a saved neutral stopped projection", () =>
+  Effect.gen(function* () {
+    const id = asThreadId("neutral-stop-restart");
+    const initial = continuityWorkflow(id);
+    const attemptId = CommandId.make(`${id}:setup`);
+    const run: WorkflowRun = {
+      ...initial,
+      cancellationAttempt: {
+        commandId: `${id}:cancel`,
+        createdAt: initial.createdAt,
+        setupCleanup: { attemptId, state: "done", detail: null },
+      },
+      progress: { ...initial.progress, status: "cancelling" },
+    };
+    const runs = new Map([[run.jobId, run]]);
+    const projected = decodeProofThread({
+      ...stoppedProofThread(id),
+      promptQueue: {
+        ...emptyThreadPromptQueue(),
+        enabled: false,
+        pauseReason: { code: "stopped", detail: "Stopped by a teammate." },
+        preparation: {
+          originalCommandId: attemptId,
+          attemptId,
+          revision: 3,
+          state: "failed",
+          settled: true,
+          recipe: null,
+          script: { id: "setup", name: "Setup", command: "false", async: false },
+          failure: { reason: "cancelled", detail: "Setup stopped." },
+        },
+        entries: [
+          {
+            kind: "prompt",
+            messageId: `${id}:prompt`,
+            text: "Work that was never admitted",
+            attachments: [],
+            modelSelection: initial.modelSelection,
+            runtimeMode: "approval-required",
+            interactionMode: "default",
+            revision: 1,
+            acceptedSequence: 1,
+            createdAt: initial.createdAt,
+            state: "pending",
+          },
+        ],
+      },
+    });
+    for (let restart = 0; restart < 2; restart++) {
+      const fixture = makeProviderServiceLayer({
+        workflowRuns: runs,
+        projection: makeProofProjection(() => Effect.succeed(Option.some(projected))),
+      });
+      yield* Effect.gen(function* () {
+        const context = yield* Layer.build(fixture.serviceLayer);
+        const service = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+        const input = { jobId: run.jobId, threadId: id };
+        for (let repeat = 0; repeat < 2; repeat++) {
+          const confirmed = yield* service.isWorkflowSessionStopConfirmed(input);
+          assert.isTrue(confirmed);
+          assert.equal(
+            reconcileWorkflowRun(run, projected, false, confirmed).progress.status,
+            "cancelling",
+          );
+          const cancelled = reconcileWorkflowRun(run, projected, true, confirmed);
+          assert.equal(cancelled.progress.status, "cancelled");
+          assert.isFalse(cancelled.executionReserved);
+          assert.isNull(cancelled.cancellationAttempt);
+        }
+        assert.equal(fixture.codex.startSession.mock.calls.length, 0);
+      }).pipe(Effect.scoped);
+    }
+  }),
+);
+
+it.effect.each([
+  "provider-name",
+  "provider-instance",
+  "active-turn",
+  "running",
+  "history",
+  "handoff",
+  "awaiting-turn",
+  "admission",
+] as const)("neutral stopped projection cannot hide native evidence: %s", (mode) =>
+  Effect.gen(function* () {
+    const id = asThreadId(`neutral-stop-${mode}`);
+    const run = continuityWorkflow(id);
+    const base = stoppedProofThread(id);
+    const queue = emptyThreadPromptQueue();
+    const handoff = {
+      attemptId: CommandId.make(`${id}:delivery`),
+      messageId: MessageId.make(`${id}:prompt`),
+      revision: 1,
+      controlRevision: 0,
+      mode: "next-turn" as const,
+    };
+    const projected = decodeProofThread({
+      ...base,
+      session: {
+        ...base.session!,
+        ...(mode === "provider-name" ? { providerName: "codex" } : {}),
+        ...(mode === "provider-instance" ? { providerInstanceId: codexInstanceId } : {}),
+        ...(mode === "active-turn" ? { activeTurnId: `${id}:turn` } : {}),
+        ...(mode === "running" ? { status: "running" } : {}),
+      },
+      ...(mode === "history"
+        ? {
+            messages: [
+              {
+                id: `${id}:message`,
+                role: "user",
+                text: "Prior work",
+                turnId: null,
+                streaming: false,
+                createdAt: run.createdAt,
+                updatedAt: run.createdAt,
+              },
+            ],
+          }
+        : {}),
+      promptQueue: {
+        ...queue,
+        ...(mode === "handoff" ? { handoff } : {}),
+        ...(mode === "awaiting-turn" ? { awaitingTurnId: `${id}:turn` } : {}),
+        ...(mode === "admission"
+          ? { admissions: [{ ...handoff, turnId: `${id}:turn`, evidence: "provider-ack" }] }
+          : {}),
+      },
+    });
+    const fixture = makeProviderServiceLayer({
+      workflowRuns: new Map([[run.jobId, run]]),
+      projection: makeProofProjection(() => Effect.succeed(Option.some(projected))),
+    });
+    const context = yield* Layer.build(fixture.serviceLayer);
+    const service = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+    const confirmed = yield* service.isWorkflowSessionStopConfirmed({
+      jobId: run.jobId,
+      threadId: id,
+    });
+    assert.isFalse(confirmed);
+    assert.isTrue(
+      reconcileWorkflowRun(
+        { ...run, progress: { ...run.progress, status: "cancelling" } },
+        projected,
+        true,
+        confirmed,
+      ).executionReserved,
+    );
+    assert.equal(fixture.codex.startSession.mock.calls.length, 0);
+  }),
+);
+
+it.effect.each(
+  (["absent", "stopped"] as const).flatMap((projection) =>
+    (["started", "pending", "binding", "final-read", "empty"] as const).map((mode) => ({
+      projection,
+      mode,
+    })),
+  ),
+)(
+  "empty $projection projection cannot grant stale shutdown proof during provider ownership changes: $mode",
+  ({ projection, mode }) =>
     Effect.gen(function* () {
-      const id = asThreadId(`empty-proof-${mode}`);
+      const id = asThreadId(`empty-proof-${projection}-${mode}`);
+      const projected = projection === "stopped" ? stoppedProofThread(id) : emptyProofThread(id);
       const run = continuityWorkflow(id);
       const runs = new Map([[run.jobId, run]]);
       const entered = yield* Deferred.make<void>();
@@ -8946,7 +9121,7 @@ it.effect.each(["started", "pending", "binding", "final-read", "empty"] as const
         projection: makeProofProjection(() =>
           Deferred.succeed(entered, undefined).pipe(
             Effect.andThen(Deferred.await(release)),
-            Effect.as(Option.some(emptyProofThread(id))),
+            Effect.as(Option.some(projected)),
           ),
         ),
       });
@@ -9043,7 +9218,7 @@ it.effect.each(["started", "pending", "binding", "final-read", "empty"] as const
           assert.equal(
             reconcileWorkflowRun(
               { ...run, progress: { ...run.progress, status: "cancelling" } },
-              emptyProofThread(id),
+              projected,
               false,
               confirmed,
             ).executionReserved,
