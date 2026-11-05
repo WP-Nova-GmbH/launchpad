@@ -1,10 +1,11 @@
 {
   "scripts": [
     {
-      "name": "Verify disposable P04 configuration",
-      "command": "node p04-setup.mjs",
+      "name": "Deliberate setup failure before Agent for cancellation verification",
+      "command": "node -e \"process.exit(23)\"",
       "icon": "configure",
-      "runOnWorktreeCreate": true
+      "runOnWorktreeCreate": true,
+      "async": false
     }
   ]
 }
