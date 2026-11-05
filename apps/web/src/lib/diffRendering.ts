@@ -2,6 +2,7 @@ import { parsePatchFiles } from "@pierre/diffs/utils/parsePatchFiles";
 import { parseDiffFromFile } from "@pierre/diffs";
 import type { FileDiffMetadata } from "@pierre/diffs/types";
 import { unquoteGitPatchPath } from "@t3tools/shared/gitPatchPath";
+import { strictGitPatchFallbackReason } from "@t3tools/shared/gitPatchReview";
 
 const DIFF_THEME_NAMES = {
   light: "pierre-light",
@@ -32,15 +33,15 @@ export function fnv1a32(
   return hash >>> 0;
 }
 
-export function buildPatchCacheKey(patch: string, scope = "diff-panel"): string {
-  const normalizedPatch = patch.trim();
-  const primary = fnv1a32(normalizedPatch, FNV_OFFSET_BASIS_32, FNV_PRIME_32).toString(36);
-  const secondary = fnv1a32(
-    normalizedPatch,
-    SECONDARY_HASH_SEED,
-    SECONDARY_HASH_MULTIPLIER,
-  ).toString(36);
-  return `${scope}:${normalizedPatch.length}:${primary}:${secondary}`;
+export function buildPatchCacheKey(
+  patch: string,
+  scope = "diff-panel",
+  preservePatchWhitespace = false,
+): string {
+  const text = preservePatchWhitespace ? patch : patch.trim();
+  const primary = fnv1a32(text, FNV_OFFSET_BASIS_32, FNV_PRIME_32).toString(36);
+  const secondary = fnv1a32(text, SECONDARY_HASH_SEED, SECONDARY_HASH_MULTIPLIER).toString(36);
+  return `${scope}:${text.length}:${primary}:${secondary}`;
 }
 
 export type RenderablePatch =
@@ -76,6 +77,7 @@ export function getDiffLineStat(files: ReadonlyArray<FileDiffMetadata>): DiffLin
 
 interface RenderablePatchOptions {
   ignoreWhitespace?: boolean;
+  preservePatchWhitespace?: boolean;
   /**
    * Pierre's partial-patch parser keeps hunk render starts in source-file
    * coordinates. Its virtualizer iterates partial patches as compact rows, so
@@ -169,13 +171,18 @@ export function getRenderablePatch(
   options: RenderablePatchOptions = {},
 ): RenderablePatch | null {
   if (!patch) return null;
-  const normalizedPatch = patch.trim();
-  if (normalizedPatch.length === 0) return null;
+  const text = options.preservePatchWhitespace ? patch : patch.trim();
+  if (text.length === 0) return null;
+  const fallbackReason = options.preservePatchWhitespace
+    ? strictGitPatchFallbackReason(text)
+    : null;
+  if (fallbackReason) return { kind: "raw", text, reason: fallbackReason };
 
   try {
     const parsedPatches = parsePatchFiles(
-      normalizedPatch,
-      buildPatchCacheKey(normalizedPatch, cacheScope),
+      text,
+      buildPatchCacheKey(text, cacheScope, options.preservePatchWhitespace),
+      options.preservePatchWhitespace,
     );
     const sourceFiles = parsedPatches.flatMap((parsedPatch) => parsedPatch.files);
     const files = sourceFiles.map((file) => {
@@ -188,13 +195,13 @@ export function getRenderablePatch(
 
     return {
       kind: "raw",
-      text: normalizedPatch,
+      text,
       reason: "Unsupported diff format. Showing raw patch.",
     };
   } catch {
     return {
       kind: "raw",
-      text: normalizedPatch,
+      text,
       reason: "Failed to parse patch. Showing raw patch.",
     };
   }

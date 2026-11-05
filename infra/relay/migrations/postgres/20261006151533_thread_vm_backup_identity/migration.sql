@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_backups" ADD CONSTRAINT "relay_thread_vm_backups_snapshot_id_key" UNIQUE("snapshot_id");

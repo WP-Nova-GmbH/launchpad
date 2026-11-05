@@ -1,9 +1,67 @@
+export {
+  ThreadVmRestoreBoot,
+  ThreadVmWarmRestoreBootstrap,
+  ThreadVmWarmRestoreBootstrapReceipt,
+} from "./threadVm.ts";
+import { OrchestrationCommandReceipt, ThreadWorkspaceManifest } from "./threadTransfer.ts";
+import { ThreadTransferFormats, ThreadTransferEncodingPolicy } from "./threadTransferFormat.ts";
+export {
+  ThreadTransferFormat,
+  ThreadTransferFormats,
+  ThreadTransferEncodingPolicy,
+} from "./threadTransferFormat.ts";
+import { ThreadMoveProgressReport, ThreadMoveProgressSnapshot } from "./threadMoveProgress.ts";
+export {
+  ThreadMoveProgressReport,
+  ThreadMoveProgressSnapshot,
+  ThreadMoveWaitingForAuth,
+  ThreadMoveParticipantState,
+  ThreadMoveFailureDiagnostic,
+} from "./threadMoveProgress.ts";
+import { ThreadMoveParticipantState } from "./threadMoveProgress.ts";
+import {
+  RelayPortableThreadPlacement,
+  RelayAssignedWorkflowThreadPlacement,
+  RelayThreadActiveMove,
+  RelayThreadCurrentQueue,
+  ThreadVmCapabilities,
+  RelayThreadHistoryPage,
+  RelayPortableThreadPage,
+  RelayThreadCommandReceipt,
+  RelayThreadPendingCommandPage,
+  ThreadNativeCheckpointPublicationReceipt,
+  ThreadAttachmentCheckpointPublicationReceipt,
+  RelayThreadInboxEntry,
+  RelayThreadPersistedReceipt,
+  ThreadVmPolicyRecord,
+  WorkflowVmPolicyRecord,
+  WorkflowVmCapabilities,
+} from "./threadVm.ts";
+import {
+  RepositoryWorkflow,
+  WorkflowCatalog,
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  WorkflowJobPageQuery,
+  WorkflowJobPage,
+  SaveRepositoryWorkflow,
+  RunRepositoryWorkflow,
+  RespondToWorkflowJob,
+  WorkflowControl,
+  WorkflowControlResult,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+  WorkflowSubmissionPendingError,
+  WorkflowVmDispatchBinding,
+} from "./workflows.ts";
 import {
   RepositoryPolicyProof,
   RepositoryPolicyAcknowledgement,
   RepositoryAccessRemovalStatus,
 } from "./repositoryAccess.ts";
+import { ModelSelection, OrchestrationEvent, PortableThreadCommand } from "./orchestration.ts";
 import { AuthSessionUser } from "./auth.ts";
+import { ProviderAuthState } from "./providerSetup.ts";
 import {
   RelayIssueTrackerService,
   RelayIssueTrackerAuthorizationProfile,
@@ -32,8 +90,38 @@ import {
   RelayIssueTrackerError,
 } from "./issueTrackers.ts";
 export * from "./issueTrackers.ts";
+export * from "./workflowSources.ts";
+export * from "./codexVmConnection.ts";
+import {
+  CodexVmConnectionError,
+  RelayCodexVmConnection,
+  RelayCodexVmStartSignIn,
+  RelayCodexVmStartSignInResponse,
+  RelayCodexVmCompleteSignIn,
+  RelayCodexVmSignInAttempt,
+  RelayCodexVmToken,
+  RelayThreadVmCodexAuthSelection,
+  RelayThreadVmCodexAuthSource,
+  RelayThreadVmCodexPreference,
+  RelayThreadVmCodexPreferenceRequest,
+} from "./codexVmConnection.ts";
+import {
+  WorkflowSourceError,
+  WorkflowSourceOwner,
+  WorkflowRepositorySources,
+  WorkflowSourceHealthList,
+  BeginWorkflowSource,
+  WorkflowSourceAuthorization,
+  DisconnectWorkflowSource,
+  AllowWorkflowSource,
+  WorkflowSourceMetadataQuery,
+  WorkflowSourceMetadataPage,
+  WorkflowSourceSelectionQuery,
+  WorkflowSourceSelection,
+} from "./workflowSources.ts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
+import { WorkflowOrigin } from "./workflowOrigin.ts";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiEndpoint from "effect/unstable/httpapi/HttpApiEndpoint";
 import * as HttpApiGroup from "effect/unstable/httpapi/HttpApiGroup";
@@ -44,7 +132,12 @@ import * as OpenApi from "effect/unstable/httpapi/OpenApi";
 
 import {
   DpopFailureReason,
+  IsoDateTime,
+  CommandId,
   EnvironmentId,
+  MessageId,
+  NonNegativeInt,
+  PositiveInt,
   ProjectId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -676,6 +769,8 @@ export const RelayTenancyForbiddenReason = Schema.Literals([
 export type RelayTenancyForbiddenReason = typeof RelayTenancyForbiddenReason.Type;
 
 export const RelayTenancyNotFoundReason = Schema.Literals([
+  "thread_not_found",
+  "thread_move_not_found",
   "member_not_found",
   "repository_not_found",
   "alias_not_found",
@@ -698,6 +793,14 @@ export const RelayTenancyConflictReason = Schema.Literals([
   "invitation_not_pending",
   "invitation_email_mismatch",
   "machine_limit_reached",
+  "vm_policy_changed",
+  "workflow_configuration_changed",
+  "thread_command_conflict",
+  "thread_artifact_conflict",
+  "thread_checkpoint_conflict",
+  "thread_placement_changed",
+  "thread_vm_move_required",
+  "thread_deletion_conflict",
   "machine_deprovisioned",
   "github_app_configured",
   "github_app_credentials_rejected",
@@ -750,6 +853,8 @@ export class RelayTenancyConflictError extends Schema.TaggedError<RelayTenancyCo
 export const RelayTenancyInvalidReason = Schema.Literals([
   "skill_manifest_malformed",
   "skill_name_mismatch",
+  "workflow_configuration_invalid",
+  "workflow_configuration_limit",
 ]);
 export type RelayTenancyInvalidReason = typeof RelayTenancyInvalidReason.Type;
 
@@ -830,6 +935,7 @@ export class RelayMachineEnrollUnavailableError extends Schema.TaggedError<Relay
 }
 
 export const RelayMachineComputeUnavailableReason = Schema.Literals([
+  "retired",
   "not_configured",
   "request_failed",
 ]);
@@ -962,11 +1068,21 @@ export class RelayClientPrincipal extends Context.Service<
   }
 >()("@t3tools/contracts/relay/RelayClientPrincipal") {}
 
+export const RelayThreadVmCredentialScope = Schema.Struct({
+  allocationId: TrimmedNonEmptyString,
+  threadId: ThreadId,
+  repositoryId: TrimmedNonEmptyString,
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+});
+export type RelayThreadVmCredentialScope = typeof RelayThreadVmCredentialScope.Type;
+
 export class RelayEnvironmentPrincipal extends Context.Service<
   RelayEnvironmentPrincipal,
   {
     readonly environmentId: string;
+    readonly credentialId?: string;
     readonly environmentPublicKey: string;
+    readonly threadVm?: RelayThreadVmCredentialScope;
   }
 >()("@t3tools/contracts/relay/RelayEnvironmentPrincipal") {}
 
@@ -1405,6 +1521,51 @@ export const RelayRepository = Schema.Struct({
 });
 export type RelayRepository = typeof RelayRepository.Type;
 
+export const RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH = 128;
+export const RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES = 4 * 1024;
+export const RELAY_WORKFLOW_ENV_MAX_ENTRIES = 64;
+export const RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES = 32 * 1024;
+
+const RelayWorkflowEnvironmentName = Schema.String.check(
+  Schema.isMaxLength(RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH),
+  Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/u),
+);
+const RelayWorkflowConfigurationRevision = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: 2_147_483_647 }),
+);
+const RelayWorkflowEnvironmentEntry = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("variable"),
+    name: RelayWorkflowEnvironmentName,
+    value: Schema.String,
+  }),
+  Schema.Struct({ kind: Schema.Literal("secret"), name: RelayWorkflowEnvironmentName }),
+]);
+
+export const RelayRepositoryWorkflowConfiguration = Schema.Struct({
+  organizationId: RelayOrganizationId,
+  repositoryId: RelayRepositoryId,
+  revision: RelayWorkflowConfigurationRevision,
+  entries: Schema.Array(RelayWorkflowEnvironmentEntry).check(
+    Schema.isMaxLength(RELAY_WORKFLOW_ENV_MAX_ENTRIES),
+  ),
+});
+export type RelayRepositoryWorkflowConfiguration = typeof RelayRepositoryWorkflowConfiguration.Type;
+
+export const RelayUpdateRepositoryWorkflowConfiguration = Schema.Struct({
+  expectedRevision: RelayWorkflowConfigurationRevision,
+  mutation: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literals(["setVariable", "setSecret"]),
+      name: RelayWorkflowEnvironmentName,
+      value: Schema.String,
+    }),
+    Schema.Struct({ kind: Schema.Literal("delete"), name: RelayWorkflowEnvironmentName }),
+  ]),
+});
+export type RelayUpdateRepositoryWorkflowConfiguration =
+  typeof RelayUpdateRepositoryWorkflowConfiguration.Type;
+
 /** A repository plus the caller's own role on it; `null` for an admin with no grant. */
 export const RelayRepositorySummary = Schema.Struct({
   repository: RelayRepository,
@@ -1749,23 +1910,20 @@ export type RelayListGithubRepositoriesResponse = typeof RelayListGithubReposito
 // ---------------------------------------------------------------------------
 // Machines
 //
-// A machine is compute the relay provisions for exactly one organization
-// (ADR-0002): an agent executor or a review host — roles, not machine kinds
-// (ADR-0010). A machine proves it is the one the relay just created with a
-// per-instance seeded credential, exchanged once for a durable environment
-// credential. Enrollment is a second, parallel trust path beside the
-// human-driven link flow, never a replacement for it.
+// Organization machines retain manual enrollment for agent executors and
+// review hosts. A single-use seed proves the instance before it receives a
+// durable environment credential. Thread VMs use their separate allocation,
+// private-thread binding and quota protocol; they are not organization machines.
 // ---------------------------------------------------------------------------
 
-/** What a provisioned machine is for. One provisioning path, one enrollment story, two roles. */
+/** The role of a manually enrolled organization machine. */
 export const RelayMachineRole = Schema.Literals(["agent_executor", "review_host"]);
 export type RelayMachineRole = typeof RelayMachineRole.Type;
 
 /**
- * Which compute driver created the machine: a Docker container in dev, a
- * Hetzner Cloud server in production. `self_hosted` means no driver at all —
- * the organization runs its own compute and the admin delivers the enrollment
- * seed by hand (ADR-0002's self-hosted case).
+ * Legacy Docker/Hetzner kinds remain readable for persisted records. New
+ * organization machines accept only `self_hosted`: the operator starts their
+ * own server using the enrollment seed. E2B thread VMs are separate allocations.
  */
 export const RelayMachineComputeKind = Schema.Literals(["docker", "hetzner", "self_hosted"]);
 export type RelayMachineComputeKind = typeof RelayMachineComputeKind.Type;
@@ -1846,6 +2004,428 @@ export const RelayMachineEnrollProofPayload = Schema.Struct({
   origin: RelayManagedEndpointOrigin,
 });
 export type RelayMachineEnrollProofPayload = typeof RelayMachineEnrollProofPayload.Type;
+
+export const RelayThreadVmInitialThread = Schema.Struct({
+  title: TrimmedNonEmptyString,
+  modelSelection: ModelSelection.check(
+    Schema.makeFilter((selection) => selection.instanceId === "codex", {
+      message: "The VM runner supports the Codex instance only",
+    }),
+  ),
+  createdAt: IsoDateTime,
+});
+export type RelayThreadVmInitialThread = typeof RelayThreadVmInitialThread.Type;
+export const RelayThreadVmWorkspaceInput = Schema.Struct({
+  operationId: TrimmedNonEmptyString,
+  scope: RelayThreadVmCredentialScope,
+  canonicalKey: RelayRepositoryCanonicalKey,
+  branch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  revision: Schema.String.check(Schema.isPattern(/^([0-9a-f]{40}|[0-9a-f]{64})$/)),
+});
+export const RelayThreadVmSetupInput = Schema.Struct({
+  workspace: RelayThreadVmWorkspaceInput,
+  ...RelayThreadVmInitialThread.fields,
+  workflow: Schema.optionalKey(
+    Schema.Struct({
+      jobId: TrimmedNonEmptyString,
+      organizationId: RelayOrganizationId,
+      installationId: TrimmedNonEmptyString,
+      baseBranch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+    }),
+  ),
+});
+export type RelayThreadVmSetupInput = typeof RelayThreadVmSetupInput.Type;
+/** Private stdin handoff. Only input is stored by the guest. */
+export const RelayThreadVmWorkflowSetupEnvelope = Schema.Struct({
+  input: RelayThreadVmSetupInput,
+  gitToken: Schema.RedactedFromValue(TrimmedNonEmptyString),
+});
+export type RelayThreadVmWorkflowSetupEnvelope = typeof RelayThreadVmWorkflowSetupEnvelope.Type;
+export const RelayThreadVmCheckoutFailureCode = Schema.Literals([
+  "repository_unavailable",
+  "unsupported_git_dependencies",
+  "setup_failed",
+]);
+export type RelayThreadVmCheckoutFailureCode = typeof RelayThreadVmCheckoutFailureCode.Type;
+/** Read-only private stdin handoff for a previously attempted workflow checkout. */
+export const RelayThreadVmCheckoutFailureProbe = Schema.Struct({
+  environmentId: EnvironmentId,
+  workspace: RelayThreadVmWorkspaceInput,
+});
+export type RelayThreadVmCheckoutFailureProbe = typeof RelayThreadVmCheckoutFailureProbe.Type;
+export const RelayThreadVmCheckoutFailureReply = Schema.Struct({
+  failureCode: Schema.NullOr(RelayThreadVmCheckoutFailureCode),
+});
+export const RelayThreadVmSetupReceipt = Schema.Struct({
+  version: Schema.Literal(1),
+  operationId: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  scope: RelayThreadVmCredentialScope,
+  workspaceRoot: TrimmedNonEmptyString,
+  revision: RelayThreadVmWorkspaceInput.fields.revision,
+  sequence: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+  execution: Schema.Literal("frozen"),
+});
+export type RelayThreadVmSetupReceipt = typeof RelayThreadVmSetupReceipt.Type;
+
+export const RelayThreadVmSetupErrorCode = Schema.Literals([
+  "identity_changed",
+  "setup_unconfirmed",
+  "workspace_not_empty",
+  "repository_unavailable",
+  "unsupported_git_dependencies",
+  "provider_credentials_missing",
+  "provider_version_mismatch",
+  "setup_failed",
+  "baseline_import_failed",
+  "baseline_unconfirmed",
+  "unsupported_provider",
+]);
+export type RelayThreadVmSetupErrorCode = typeof RelayThreadVmSetupErrorCode.Type;
+export const RelayThreadVmSetupReply = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("prepared"), receipt: RelayThreadVmSetupReceipt }),
+  Schema.Struct({ status: Schema.Literal("blocked"), code: RelayThreadVmSetupErrorCode }),
+]);
+export type RelayThreadVmSetupReply = typeof RelayThreadVmSetupReply.Type;
+
+export const RelayThreadVmCreateRequest = Schema.Struct({
+  initialState: RelayThreadVmInitialThread,
+  allocationId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  threadId: ThreadId,
+  organizationId: RelayOrganizationId,
+  repositoryId: RelayRepositoryId,
+  canonicalKey: RelayRepositoryCanonicalKey,
+  branch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  revision: Schema.String.check(Schema.isPattern(/^([0-9a-f]{40}|[0-9a-f]{64})$/)),
+});
+export type RelayThreadVmCreateRequest = typeof RelayThreadVmCreateRequest.Type;
+export const RelayThreadVmSetup = Schema.Struct({
+  ...RelayThreadVmCreateRequest.fields,
+  // Older incomplete provisioning intents remain quarantined until reset.
+  initialState: Schema.NullOr(RelayThreadVmInitialThread),
+  ownerUserId: TrimmedNonEmptyString,
+  phase: Schema.Literals(["pending", "running", "ready", "failed"]),
+  environmentId: Schema.NullOr(EnvironmentId),
+  errorCode: Schema.NullOr(Schema.String),
+  receiptSha256: Schema.NullOr(Schema.String),
+});
+export type RelayThreadVmSetup = typeof RelayThreadVmSetup.Type;
+export const RelayThreadVmReplacementCandidate = Schema.Struct({
+  lastWorkAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  lastVerifiedBackupAt: Schema.optionalKey(Schema.NullOr(IsoDateTime)),
+  title: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  allocationId: Schema.String,
+  threadId: ThreadId,
+  state: Schema.Literals(["running", "paused"]),
+});
+export type RelayThreadVmReplacementCandidate = typeof RelayThreadVmReplacementCandidate.Type;
+export const RelayThreadVmReplacement = Schema.Struct({
+  requestId: Schema.String,
+  threadId: ThreadId,
+  phase: Schema.Literals(["awaiting_choice", "waiting", "admitted", "cancelled"]),
+  victimAllocationId: Schema.NullOr(Schema.String),
+  errorCode: Schema.NullOr(Schema.String),
+});
+export type RelayThreadVmReplacement = typeof RelayThreadVmReplacement.Type;
+export const RelayThreadVmQuotaResponse = Schema.Struct({
+  status: Schema.Literal("quota_reached"),
+  replacement: Schema.optional(RelayThreadVmReplacement),
+  maxVms: Schema.Number,
+  reservedVms: Schema.Number,
+  suggestedReplacement: Schema.NullOr(RelayThreadVmReplacementCandidate),
+});
+export const RelayThreadVmCreateResponse = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("accepted"), setup: RelayThreadVmSetup }),
+  RelayThreadVmQuotaResponse,
+]);
+export const RelayThreadVmResumeResponse = Schema.Struct({
+  operationId: Schema.String,
+  phase: Schema.Literals(["waiting", "resuming", "completed"]),
+});
+export type RelayThreadVmResumeResponse = typeof RelayThreadVmResumeResponse.Type;
+export type RelayThreadVmCreateResponse = typeof RelayThreadVmCreateResponse.Type;
+export const RelayThreadVmCancelSetupResponse = Schema.Struct({
+  allocationId: Schema.String,
+  status: Schema.Literals(["pending_cleanup", "deleted"]),
+});
+export type RelayThreadVmCancelSetupResponse = typeof RelayThreadVmCancelSetupResponse.Type;
+export const RelayThreadVmRestorePhase = Schema.Literals([
+  "pending",
+  "preparing",
+  "prepared",
+  "boot_preparing",
+  "boot_prepared",
+  "committed",
+  "creating",
+  "bootstrapping",
+  "booted",
+  "importing",
+  "completed",
+  "aborting",
+  "aborted",
+]);
+export type RelayThreadVmRestorePhase = typeof RelayThreadVmRestorePhase.Type;
+export const RelayThreadVmRestoreRequest = Schema.Struct({
+  operationId: Schema.String.check(Schema.isUUID()),
+  allocationId: Schema.String.check(Schema.isUUID()),
+  savedDiskOperationId: Schema.String.check(Schema.isUUID()),
+  expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
+});
+export type RelayThreadVmRestoreRequest = typeof RelayThreadVmRestoreRequest.Type;
+export const RelayThreadVmBackupRecoveryCandidate = Schema.Struct({
+  threadId: ThreadId,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  sourceAllocationId: Schema.String,
+  backupOperationId: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+  capturedAt: Schema.NullOr(Schema.String),
+  nativeCheckpointOperationId: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+  available: Schema.Boolean,
+  blockedReason: Schema.NullOr(Schema.String),
+});
+export type RelayThreadVmBackupRecoveryCandidate = typeof RelayThreadVmBackupRecoveryCandidate.Type;
+export const RelayThreadVmBackupRecoveryRequest = Schema.Struct({
+  operationId: Schema.String.check(Schema.isUUID()),
+  allocationId: Schema.String.check(Schema.isUUID()),
+  expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
+  backup: Schema.Struct({
+    sourceAllocationId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+    backupOperationId: Schema.String.check(Schema.isUUID()),
+    capturedAt: Schema.String,
+    nativeCheckpointOperationId: Schema.String.check(Schema.isUUID()),
+  }),
+});
+export type RelayThreadVmBackupRecoveryRequest = typeof RelayThreadVmBackupRecoveryRequest.Type;
+export const RelayThreadVmBackupRecoveryCancellation = Schema.Struct({
+  threadId: ThreadId,
+  operationId: Schema.String.check(Schema.isUUID()),
+  phase: Schema.Literal("cancelled"),
+});
+export type RelayThreadVmBackupRecoveryCancellation =
+  typeof RelayThreadVmBackupRecoveryCancellation.Type;
+const RelayThreadVmRecoveryStage = Schema.Literals([
+  "saving_history",
+  "retaining_source",
+  "stopping_source",
+  "restoring_workspace",
+]);
+export const RelayThreadVmRestore = Schema.Struct({
+  operationId: Schema.String,
+  allocationId: Schema.String,
+  threadId: ThreadId,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  phase: RelayThreadVmRestorePhase,
+  canCancel: Schema.optionalKey(Schema.Boolean),
+  recoveryStage: Schema.optionalKey(RelayThreadVmRecoveryStage),
+  errorCode: Schema.NullOr(Schema.String),
+});
+export type RelayThreadVmRestore = typeof RelayThreadVmRestore.Type;
+export const RelayThreadVmRestoreResponse = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("accepted"), restore: RelayThreadVmRestore }),
+  RelayThreadVmQuotaResponse,
+]);
+export type RelayThreadVmRestoreResponse = typeof RelayThreadVmRestoreResponse.Type;
+
+export const RelayThreadVmResetRequest = Schema.Struct({
+  operationId: Schema.String.check(Schema.isUUID()),
+  allocationId: Schema.String.check(Schema.isUUID()),
+  expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
+  canonicalKey: RelayRepositoryCanonicalKey,
+  branch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+  revision: Schema.String.check(Schema.isPattern(/^([0-9a-f]{40}|[0-9a-f]{64})$/)),
+});
+export type RelayThreadVmResetRequest = typeof RelayThreadVmResetRequest.Type;
+export const RelayThreadVmReset = Schema.Struct({
+  operationId: Schema.String,
+  allocationId: Schema.String,
+  threadId: ThreadId,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  phase: Schema.Literals([
+    "pending",
+    "creating",
+    "committed",
+    "importing",
+    "completed",
+    "cancelling",
+    "cancelled",
+  ]),
+  errorCode: Schema.NullOr(Schema.String),
+});
+export type RelayThreadVmReset = typeof RelayThreadVmReset.Type;
+export const RelayThreadVmResetResponse = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("accepted"), reset: RelayThreadVmReset }),
+  RelayThreadVmQuotaResponse,
+]);
+export type RelayThreadVmResetResponse = typeof RelayThreadVmResetResponse.Type;
+
+export const RelayThreadDeletionRequest = Schema.Struct({
+  operationId: Schema.String.check(Schema.isUUID()),
+  expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
+  confirmWorkspaceLoss: Schema.Literal(true),
+});
+export type RelayThreadDeletionRequest = typeof RelayThreadDeletionRequest.Type;
+export const RelayThreadDeletion = Schema.Struct({
+  threadId: ThreadId,
+  operationId: Schema.String,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  phase: Schema.Literals(["stopping", "cleaning", "completed"]),
+  errorCode: Schema.NullOr(Schema.String),
+});
+export type RelayThreadDeletion = typeof RelayThreadDeletion.Type;
+export const RelayThreadVmProviderAuthBinding = Schema.Struct({
+  operationId: Schema.NonEmptyString,
+  allocationId: Schema.NonEmptyString,
+  environmentId: EnvironmentId,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+  instanceId: Schema.Literal("codex"),
+});
+export type RelayThreadVmProviderAuthBinding = typeof RelayThreadVmProviderAuthBinding.Type;
+export const RelayThreadVmProviderAuth = Schema.Struct({
+  ...RelayThreadVmProviderAuthBinding.fields,
+  requirement: Schema.Literals(["sign_in_required", "authenticated", "provider_unavailable"]),
+  auth: ProviderAuthState,
+  authSource: Schema.optionalKey(RelayThreadVmCodexAuthSource),
+});
+export type RelayThreadVmProviderAuth = typeof RelayThreadVmProviderAuth.Type;
+export const RelayThreadVmProviderAuthRequest = Schema.Struct({
+  operationId: Schema.NonEmptyString,
+  allocationId: Schema.NonEmptyString,
+  generation: Schema.Int.check(Schema.isGreaterThan(0)),
+});
+export type RelayThreadVmProviderAuthRequest = typeof RelayThreadVmProviderAuthRequest.Type;
+/** Fixed guest control protocol. No client-selected instance, command or credential. */
+export const ThreadVmProviderAuthControl = Schema.Struct({
+  binding: RelayThreadVmProviderAuthBinding,
+  action: Schema.Literals(["status", "start", "cancel"]),
+  flowId: Schema.optionalKey(Schema.NonEmptyString),
+});
+export type ThreadVmProviderAuthControl = typeof ThreadVmProviderAuthControl.Type;
+export const RelayThreadVmStatus = Schema.Struct({
+  threadId: ThreadId,
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+  pendingProviderAuth: Schema.optionalKey(Schema.NullOr(RelayThreadVmProviderAuthBinding)),
+  allocation: Schema.NullOr(
+    Schema.Struct({
+      allocationId: Schema.String,
+      ownerUserId: Schema.String,
+      state: Schema.Literals(["creating", "running", "paused", "deleting"]),
+    }),
+  ),
+  setupPhase: Schema.NullOr(Schema.Literals(["pending", "running", "ready", "failed"])),
+  capacityState: Schema.NullOr(Schema.Literals(["waiting", "reserved", "started", "released"])),
+  activity: Schema.Literals(["busy", "idle", "unknown"]),
+  pausePhase: Schema.NullOr(Schema.Literals(["pending", "sealed", "completed", "cancelled"])),
+  resumePhase: Schema.NullOr(Schema.Literals(["waiting", "resuming", "completed"])),
+  sourceActivationPending: Schema.Boolean,
+  backupPhase: Schema.NullOr(
+    Schema.Literals([
+      "pending",
+      "creating",
+      "captured",
+      "verifying",
+      "cleanup",
+      "verified",
+      "failed",
+      "retiring",
+      "retired",
+    ]),
+  ),
+  lastVerifiedBackupAt: Schema.NullOr(Schema.String),
+  finalSave: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        operationId: Schema.String,
+        phase: Schema.Literals(["draining", "frozen", "saving", "deleting", "aborting"]),
+        reason: Schema.Literals(["idle", "replacement"]),
+        errorCode: Schema.NullOr(Schema.String),
+      }),
+    ),
+  ),
+  restore: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        operationId: Schema.String,
+        phase: RelayThreadVmRestorePhase,
+        canCancel: Schema.optionalKey(Schema.Boolean),
+        recoveryStage: Schema.optionalKey(RelayThreadVmRecoveryStage),
+        errorCode: Schema.NullOr(Schema.String),
+      }),
+    ),
+  ),
+  reset: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        operationId: Schema.String,
+        phase: RelayThreadVmReset.fields.phase,
+        errorCode: Schema.NullOr(Schema.String),
+      }),
+    ),
+  ),
+  replacement: Schema.optionalKey(Schema.NullOr(RelayThreadVmReplacement)),
+  repository: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        canonicalKey: RelayRepositoryCanonicalKey,
+        branch: Schema.String,
+        revision: Schema.String,
+      }),
+    ),
+  ),
+  savedDisk: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        operationId: Schema.optionalKey(Schema.String),
+        phase: Schema.Literals(["available", "restoring", "expiring", "expired"]),
+        savedAt: Schema.String,
+        expiresAt: Schema.String,
+      }),
+    ),
+  ),
+});
+export type RelayThreadVmStatus = typeof RelayThreadVmStatus.Type;
+
+export const RelayThreadVmBootstrap = Schema.Struct({
+  version: Schema.Literal(1),
+  restore: Schema.optional(Schema.Literal(true)),
+  operationId: TrimmedNonEmptyString,
+  scope: RelayThreadVmCredentialScope,
+  relayUrl: TrimmedNonEmptyString,
+  relayIssuer: TrimmedNonEmptyString,
+  seed: Schema.RedactedFromValue(TrimmedNonEmptyString),
+});
+export type RelayThreadVmBootstrap = typeof RelayThreadVmBootstrap.Type;
+export const RelayThreadVmEnrollmentReceipt = Schema.Struct({
+  enrolled: Schema.Literal(true),
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+  environmentId: EnvironmentId,
+  allocationId: TrimmedNonEmptyString,
+  operationId: TrimmedNonEmptyString,
+  threadId: ThreadId,
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+});
+export type RelayThreadVmEnrollmentReceipt = typeof RelayThreadVmEnrollmentReceipt.Type;
+
+export const RelayThreadVmEnrollProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+  allocationId: TrimmedNonEmptyString,
+  operationId: TrimmedNonEmptyString,
+  seed: TrimmedNonEmptyString,
+  environmentId: EnvironmentId,
+  environmentPublicKey: TrimmedNonEmptyString,
+});
+export const RelayThreadVmEnrollRequest = Schema.Struct({
+  proof: TrimmedNonEmptyString.check(Schema.isMaxLength(16_384)),
+});
+export const RelayThreadVmEnrollResponse = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+  scope: RelayThreadVmCredentialScope,
+  relayIssuer: TrimmedNonEmptyString,
+  cloudMintPublicKey: TrimmedNonEmptyString,
+  environmentCredential: TrimmedNonEmptyString,
+});
+export type RelayThreadVmEnrollResponse = typeof RelayThreadVmEnrollResponse.Type;
 
 export const RelayMachineEnrollRequest = Schema.Struct({
   proof: TrimmedNonEmptyString.annotate({
@@ -1931,12 +2511,16 @@ export type RelayJob = typeof RelayJob.Type;
  * relay issuer, and the response is signed back.
  */
 export const RelayCloudDispatchJobProofPayload = Schema.Struct({
+  workflowOrigin: Schema.optional(WorkflowOrigin),
+  requestedBy: Schema.optional(TrimmedNonEmptyString),
+  workflowVmBinding: Schema.optional(WorkflowVmDispatchBinding),
   ...RelaySignedJwtRegisteredClaims,
   environmentId: EnvironmentId,
   jobId: RelayJobId,
   repositoryCanonicalKey: TrimmedNonEmptyString,
   baseBranch: TrimmedNonEmptyString,
   instruction: TrimmedNonEmptyString,
+  workflowControl: Schema.optional(WorkflowControl),
 });
 export type RelayCloudDispatchJobProofPayload = typeof RelayCloudDispatchJobProofPayload.Type;
 
@@ -1950,6 +2534,8 @@ export const RelayEnvironmentDispatchJobResponseProofPayload = Schema.Struct({
   environmentId: EnvironmentId,
   jobId: RelayJobId,
   accepted: Schema.Boolean,
+  workflowResult: Schema.optional(WorkflowControlResult),
+  requestId: Schema.optional(TrimmedNonEmptyString),
 });
 export type RelayEnvironmentDispatchJobResponseProofPayload =
   typeof RelayEnvironmentDispatchJobResponseProofPayload.Type;
@@ -1961,8 +2547,12 @@ export type RelayEnvironmentDispatchJobResponseProofPayload =
 export const RelayEnvironmentDispatchJobResponse = Schema.Struct({
   accepted: Schema.Boolean,
   proof: TrimmedNonEmptyString,
+  workflowResult: Schema.optional(WorkflowControlResult),
 });
 export type RelayEnvironmentDispatchJobResponse = typeof RelayEnvironmentDispatchJobResponse.Type;
+
+/** Private VM workflow control carries both progress and its signed proof. */
+export const WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES = 1024 * 1024;
 
 export const RelayDeliveryKind = Schema.Literals([
   "live_activity_start",
@@ -1998,6 +2588,10 @@ export type RelayPublishResponse = typeof RelayPublishResponse.Type;
 export const RelayHealthResponse = Schema.Struct({
   ok: Schema.Boolean,
   service: Schema.Literal("relay"),
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+  threadVmConfigured: Schema.optionalKey(Schema.Boolean),
+  threadVmCapabilities: Schema.optionalKey(ThreadVmCapabilities),
+  workflowVmCapabilities: Schema.optionalKey(WorkflowVmCapabilities),
 });
 export type RelayHealthResponse = typeof RelayHealthResponse.Type;
 
@@ -2234,6 +2828,1362 @@ const RelayTenancyErrors = [
   RelayInternalError,
 ] as const;
 
+const RelayThreadOwnerParams = Schema.Struct({ environmentId: EnvironmentId, threadId: ThreadId });
+const RelayCodexVmConnectionsGroup = HttpApiGroup.make("codexVmConnections")
+  .add(
+    HttpApiEndpoint.get("status", "/v1/organization/codex-vm-connection", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("start", "/v1/organization/codex-vm-connection/sign-in", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayCodexVmStartSignIn,
+      success: RelayCodexVmStartSignInResponse,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("complete", "/v1/organization/codex-vm-connection/complete", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayCodexVmCompleteSignIn,
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.get("attempt", "/v1/organization/codex-vm-connection/attempts/:attemptId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: Schema.NullOr(RelayCodexVmSignInAttempt),
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("cancel", "/v1/organization/codex-vm-connection/cancel", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("disconnect", "/v1/organization/codex-vm-connection/disconnect", {
+      headers: RelayBearerRequestHeaders,
+      success: RelayCodexVmConnection,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+  )
+  .middleware(RelayClientAuth);
+const RelayThreadGeneration = {
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+};
+// A fresh VM authenticates with its expiring seed and a proof signed by its own key.
+const RelayThreadVmEnrollmentGroup = HttpApiGroup.make("threadVmEnrollment").add(
+  HttpApiEndpoint.post("enroll", "/v1/thread-vms/enroll", {
+    payload: RelayThreadVmEnrollRequest,
+    success: RelayThreadVmEnrollResponse,
+    error: RelayAuthAndInternalErrors,
+  }),
+);
+
+/** Runner control and envd ports cannot be opened as applications. */
+export const RelayThreadVmPreviewPort = Schema.Int.check(
+  Schema.isBetween({ minimum: 1024, maximum: 65535 }),
+  Schema.makeFilter((port) => port !== 3773 && port !== 49983),
+);
+export const RelayThreadVmPreviewProofPayload = Schema.Struct({
+  ...RelaySignedJwtRegisteredClaims,
+  environmentId: EnvironmentId,
+  operationId: TrimmedNonEmptyString,
+  scope: RelayThreadVmCredentialScope,
+  port: RelayThreadVmPreviewPort,
+});
+export type RelayThreadVmPreviewProofPayload = typeof RelayThreadVmPreviewProofPayload.Type;
+export const RelayThreadVmPreviewResponse = Schema.Struct({ url: TrimmedNonEmptyString });
+export type RelayThreadVmPreviewResponse = typeof RelayThreadVmPreviewResponse.Type;
+
+const RelayThreadVmsGroup = HttpApiGroup.make("threadVms")
+  .add(
+    HttpApiEndpoint.get("getCodexPreference", "/v1/threads/:threadId/provider-auth/preference", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: RelayThreadVmCodexPreference,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.put("setCodexPreference", "/v1/threads/:threadId/provider-auth/preference", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadVmCodexPreferenceRequest,
+      success: RelayThreadVmCodexPreference,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.get("getProviderAuthSource", "/v1/threads/:threadId/provider-auth/source", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: Schema.NullOr(RelayThreadVmCodexAuthSource),
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.put("selectProviderAuthSource", "/v1/threads/:threadId/provider-auth/source", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: Schema.Struct({
+        ...RelayThreadVmProviderAuthRequest.fields,
+        source: RelayThreadVmCodexAuthSelection,
+      }),
+      success: RelayThreadVmCodexAuthSource,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.get("getProviderAuth", "/v1/threads/:threadId/provider-auth", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: Schema.NullOr(RelayThreadVmProviderAuth),
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("startProviderAuth", "/v1/threads/:threadId/provider-auth/start", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadVmProviderAuthRequest,
+      success: RelayThreadVmProviderAuth,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("cancelProviderAuth", "/v1/threads/:threadId/provider-auth/cancel", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: Schema.Struct({
+        ...RelayThreadVmProviderAuthRequest.fields,
+        flowId: Schema.NonEmptyString,
+      }),
+      success: RelayThreadVmProviderAuth,
+      error: [...RelayTenancyErrors, CodexVmConnectionError],
+    }),
+    HttpApiEndpoint.post("openPreview", "/v1/threads/:threadId/vm-previews", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: Schema.Struct({ port: RelayThreadVmPreviewPort }),
+      success: RelayThreadVmPreviewResponse,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("create", "/v1/thread-vms", {
+      headers: RelayBearerRequestHeaders,
+      payload: RelayThreadVmCreateRequest,
+      success: RelayThreadVmCreateResponse,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("permanentlyDelete", "/v1/threads/:threadId/deletion", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadDeletionRequest,
+      success: RelayThreadDeletion,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getDeletion", "/v1/threads/:threadId/deletion", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: RelayThreadDeletion,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("reset", "/v1/threads/:threadId/vm-resets", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadVmResetRequest,
+      success: RelayThreadVmResetResponse,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getReset", "/v1/threads/:threadId/vm-resets/:operationId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId, operationId: Schema.String }),
+      success: RelayThreadVmReset,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("cancelReset", "/v1/threads/:threadId/vm-resets/:operationId/cancel", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId, operationId: Schema.String }),
+      success: RelayThreadVmReset,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("restore", "/v1/threads/:threadId/vm-restores", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadVmRestoreRequest,
+      success: RelayThreadVmRestoreResponse,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getBackupRecovery", "/v1/threads/:threadId/vm-backup-recovery", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: Schema.NullOr(RelayThreadVmBackupRecoveryCandidate),
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("restoreBackup", "/v1/threads/:threadId/vm-backup-recovery", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      payload: RelayThreadVmBackupRecoveryRequest,
+      success: RelayThreadVmRestoreResponse,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post(
+      "cancelBackupRecovery",
+      "/v1/threads/:threadId/vm-backup-recovery/cancel",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ threadId: ThreadId }),
+        payload: RelayThreadVmBackupRecoveryRequest,
+        success: RelayThreadVmBackupRecoveryCancellation,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.get("getRestore", "/v1/threads/:threadId/vm-restores/:operationId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId, operationId: Schema.String }),
+      success: RelayThreadVmRestore,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("cancelRestore", "/v1/threads/:threadId/vm-restores/:operationId/cancel", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId, operationId: Schema.String }),
+      success: RelayThreadVmRestore,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getSetup", "/v1/threads/:threadId/vm-setup", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: Schema.NullOr(RelayThreadVmSetup),
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getStatus", "/v1/threads/:threadId/vm-status", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: RelayThreadVmStatus,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("resume", "/v1/threads/:threadId/vm-resume", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: RelayThreadVmResumeResponse,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getReplacement", "/v1/thread-vm-replacements/:requestId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ requestId: Schema.String }),
+      success: RelayThreadVmReplacement,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get(
+      "getReplacementCandidates",
+      "/v1/thread-vm-replacements/:requestId/candidates",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ requestId: Schema.String }),
+        success: Schema.Array(RelayThreadVmReplacementCandidate),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post("selectReplacement", "/v1/thread-vm-replacements/:requestId/select", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ requestId: Schema.String }),
+      payload: Schema.Struct({ victimAllocationId: Schema.String }),
+      success: RelayThreadVmReplacement,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("cancelReplacement", "/v1/thread-vm-replacements/:requestId/cancel", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ requestId: Schema.String }),
+      success: RelayThreadVmReplacement,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("cancelSetup", "/v1/threads/:threadId/vm-setup/cancel", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ threadId: ThreadId }),
+      success: RelayThreadVmCancelSetupResponse,
+      error: RelayTenancyErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+export const RelayThreadVmClientAccess = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  projectId: ProjectId,
+  repositoryId: RelayRepositoryId,
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+  userId: TrimmedNonEmptyString,
+});
+
+export const RelayThreadVmManagedEndpoint = Schema.Struct({
+  endpoint: RelayManagedEndpoint,
+  runtime: RelayManagedEndpointRuntimeConfig,
+});
+
+const RelayThreadArtifactId = Schema.String.check(Schema.isUUID());
+export const RelayThreadLocalEnrollmentRequest = Schema.Struct({
+  operationId: RelayThreadArtifactId,
+  actorUserId: TrimmedNonEmptyString,
+  projectId: ProjectId,
+  canonicalKey: RelayRepositoryCanonicalKey,
+});
+export type RelayThreadLocalEnrollmentRequest = typeof RelayThreadLocalEnrollmentRequest.Type;
+export const RelayThreadLocalEnrollmentReceiptRequest = Schema.Struct({
+  operationId: RelayThreadArtifactId,
+  receipts: Schema.Array(OrchestrationCommandReceipt).check(Schema.isMaxLength(100)),
+});
+export type RelayThreadLocalEnrollmentReceiptRequest =
+  typeof RelayThreadLocalEnrollmentReceiptRequest.Type;
+export const RelayThreadLocalEnrollmentResponse = Schema.Struct({
+  threadId: ThreadId,
+  operationId: RelayThreadArtifactId,
+  phase: Schema.Literals(["preparing", "active", "aborted"]),
+  sourceSequence: Schema.NullOr(NonNegativeInt),
+  receiptCount: Schema.NullOr(NonNegativeInt),
+  placement: RelayPortableThreadPlacement,
+});
+export const RelayThreadLocalEnrollmentAbortResponse = Schema.Struct({
+  ...RelayThreadLocalEnrollmentRequest.fields,
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  outcome: Schema.Literals(["aborted", "continue"]),
+});
+export const RelayThreadVmPause = Schema.Struct({
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  ...RelayThreadGeneration,
+  operationId: RelayThreadArtifactId,
+  phase: Schema.Literals(["pending", "sealed", "completed", "cancelled"]),
+  bootId: Schema.NullOr(
+    Schema.String.check(Schema.isPattern(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u)),
+  ),
+  sourceSequence: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
+  canActivate: Schema.Boolean,
+  sourceReopened: Schema.Boolean,
+});
+export type RelayThreadVmPause = typeof RelayThreadVmPause.Type;
+export const RelayThreadVmBackupSource = Schema.Struct({
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  ...RelayThreadGeneration,
+  operationId: RelayThreadArtifactId,
+  phase: Schema.Literals(["pending", "creating", "verified", "failed", "retiring", "retired"]),
+  nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
+  canActivate: Schema.Boolean,
+  sourceReopened: Schema.Boolean,
+});
+export type RelayThreadVmBackupSource = typeof RelayThreadVmBackupSource.Type;
+export const RelayThreadVmFinalSave = Schema.Struct({
+  threadId: ThreadId,
+  environmentId: EnvironmentId,
+  ...RelayThreadGeneration,
+  operationId: RelayThreadArtifactId,
+  phase: Schema.Literals([
+    "draining",
+    "frozen",
+    "saving",
+    "deleting",
+    "completed",
+    "aborting",
+    "aborted",
+  ]),
+  nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
+  sourceActivationPending: Schema.Boolean,
+});
+export type RelayThreadVmFinalSave = typeof RelayThreadVmFinalSave.Type;
+
+export const RelayThreadVmGitMetadata = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("unknown") }),
+  Schema.Struct({ status: Schema.Literal("unconfigured") }),
+  Schema.Struct({
+    status: Schema.Literal("pending"),
+    appId: TrimmedNonEmptyString,
+    appSlug: Schema.optionalKey(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({
+    status: Schema.Literal("ready"),
+    appId: TrimmedNonEmptyString,
+    appSlug: TrimmedNonEmptyString,
+    botUserId: Schema.Int.check(Schema.isGreaterThan(0)),
+    name: TrimmedNonEmptyString,
+    email: TrimmedNonEmptyString,
+  }),
+]);
+export type RelayThreadVmGitMetadata = typeof RelayThreadVmGitMetadata.Type;
+
+export const RelayThreadVmRepositoryBinding = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadId: ThreadId,
+  ...RelayThreadGeneration,
+  repositoryId: RelayRepositoryId,
+  canonicalKey: RelayRepositoryCanonicalKey,
+  operationId: RelayThreadArtifactId,
+  git: Schema.optionalKey(RelayThreadVmGitMetadata),
+});
+export type RelayThreadVmRepositoryBinding = typeof RelayThreadVmRepositoryBinding.Type;
+
+/** Immutable Git data uploaded by the source environment, independent of VM disk retention. */
+export const RelayThreadVmRepositoryUpload = Schema.Struct({
+  operationId: RelayThreadArtifactId,
+  threadId: ThreadId,
+  sourceEnvironmentId: EnvironmentId,
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+  branch: ThreadWorkspaceManifest.fields.branch,
+  revision: ThreadWorkspaceManifest.fields.head,
+  objectFormat: ThreadWorkspaceManifest.fields.objectFormat,
+  bundle: Schema.Struct({
+    sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+    sizeBytes: NonNegativeInt,
+    chunks: Schema.Array(
+      Schema.Struct({
+        artifactId: RelayThreadArtifactId,
+        sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+        sizeBytes: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+      }),
+    ),
+  }),
+});
+export type RelayThreadVmRepositoryUpload = typeof RelayThreadVmRepositoryUpload.Type;
+
+export const RelayThreadVmIndependentHistory = Schema.Struct({
+  manifestArtifactId: RelayThreadArtifactId,
+  manifestSha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  sequenceSpace: Schema.Literal("relay-cursor-v1"),
+  nativeBoundary: Schema.Struct({
+    checkpointOperationId: RelayThreadArtifactId,
+    sourceEnvironmentId: EnvironmentId,
+    generation: Schema.Int.check(Schema.isGreaterThan(0)),
+    sourceSequence: NonNegativeInt,
+    relayCursor: NonNegativeInt,
+  }),
+  throughRelayCursor: NonNegativeInt,
+  throughCommandPosition: NonNegativeInt,
+});
+export type RelayThreadVmIndependentHistory = typeof RelayThreadVmIndependentHistory.Type;
+
+export const RelayThreadVmRestoreRecovery = Schema.Struct({
+  // Reset uses independently retained conversation data after its disk expires.
+  reset: Schema.optionalKey(
+    Schema.Struct({
+      canonicalKey: RelayThreadVmWorkspaceInput.fields.canonicalKey,
+      branch: RelayThreadVmWorkspaceInput.fields.branch,
+      revision: RelayThreadVmWorkspaceInput.fields.revision,
+      repositoryUpload: Schema.optionalKey(RelayThreadVmRepositoryUpload),
+    }),
+  ),
+  operationId: RelayThreadArtifactId,
+  savedDiskOperationId: Schema.optionalKey(RelayThreadArtifactId),
+  independentHistory: Schema.optionalKey(RelayThreadVmIndependentHistory),
+  environmentId: EnvironmentId,
+  scope: RelayThreadVmCredentialScope,
+  native: ThreadNativeCheckpointPublicationReceipt,
+  attachments: ThreadAttachmentCheckpointPublicationReceipt,
+}).check(
+  Schema.makeFilter(
+    (value) =>
+      (value.savedDiskOperationId !== undefined) !== (value.independentHistory !== undefined) &&
+      (!value.reset || value.independentHistory === undefined),
+    { message: "Recovery must select one saved disk or independent conversation source." },
+  ),
+);
+export type RelayThreadVmRestoreRecovery = typeof RelayThreadVmRestoreRecovery.Type;
+
+/** Guest import receipt; execution stays frozen until native readiness and relay activation. */
+export const RelayThreadVmRestoreImportReceipt = Schema.Struct({
+  version: Schema.Literal(1),
+  operationId: RelayThreadArtifactId,
+  environmentId: EnvironmentId,
+  scope: RelayThreadVmCredentialScope,
+  projectId: ProjectId,
+  workspaceRoot: TrimmedNonEmptyString,
+  checkoutPath: TrimmedNonEmptyString,
+  branch: Schema.NullOr(TrimmedNonEmptyString),
+  revision: RelayThreadVmWorkspaceInput.fields.revision,
+  manifestSha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  sourceEnvironmentId: EnvironmentId,
+  sourceSequence: NonNegativeInt,
+  nativeManifestArtifactId: RelayThreadArtifactId,
+  attachmentManifestArtifactId: RelayThreadArtifactId,
+  repositoryBundleSha256: Schema.optionalKey(
+    Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  ),
+  sequence: Schema.Int.check(Schema.isGreaterThan(0)),
+  execution: Schema.Literal("frozen"),
+});
+export type RelayThreadVmRestoreImportReceipt = typeof RelayThreadVmRestoreImportReceipt.Type;
+
+const RelayThreadVmCodexAuthGroup = HttpApiGroup.make("threadVmCodexAuth")
+  .add(
+    HttpApiEndpoint.post(
+      "codexAuthSource",
+      "/v1/environments/:environmentId/threads/:threadId/provider-auth/source",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadVmCodexAuthSource,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "codexAuthToken",
+      "/v1/environments/:environmentId/threads/:threadId/credentials/codex",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, connectionId: TrimmedNonEmptyString }),
+        success: RelayCodexVmToken,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
+const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
+  .add(
+    HttpApiEndpoint.post(
+      "getRestoreRecovery",
+      "/v1/environments/:environmentId/threads/:threadId/restore",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: Schema.NullOr(RelayThreadVmRestoreRecovery),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.get(
+      "restoreArtifact",
+      "/v1/environments/:environmentId/threads/:threadId/restores/:operationId/artifacts/:artifactId",
+      {
+        params: Schema.Struct({
+          ...RelayThreadOwnerParams.fields,
+          operationId: RelayThreadArtifactId,
+          artifactId: RelayThreadArtifactId,
+        }),
+        query: Schema.Struct({
+          generation: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0)),
+        }),
+        success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmRestoreActivation",
+      "/v1/environments/:environmentId/threads/:threadId/restore/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: RelayThreadVmRestoreImportReceipt,
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "getBackupSource",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: Schema.NullOr(RelayThreadVmBackupSource),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "freezeBackupSource",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source/freeze",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: RelayThreadArtifactId,
+          bootId: Schema.String.check(Schema.isUUID()),
+          sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
+        }),
+        success: RelayThreadVmBackupSource,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "cancelBackupSource",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source/cancel",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmBackupSource,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmBackupSourceActivation",
+      "/v1/environments/:environmentId/threads/:threadId/backup-source/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmBackupSource,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post("getPause", "/v1/environments/:environmentId/threads/:threadId/pause", {
+      params: RelayThreadOwnerParams,
+      payload: Schema.Struct(RelayThreadGeneration),
+      success: Schema.NullOr(RelayThreadVmPause),
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post(
+      "cancelPause",
+      "/v1/environments/:environmentId/threads/:threadId/pause/cancel",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmPause,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "freezePause",
+      "/v1/environments/:environmentId/threads/:threadId/pause/freeze",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: RelayThreadArtifactId,
+          bootId: Schema.String.check(Schema.isUUID()),
+          sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
+        }),
+        success: RelayThreadVmPause,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmPauseActivation",
+      "/v1/environments/:environmentId/threads/:threadId/pause/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmPause,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "getFinalSave",
+      "/v1/environments/:environmentId/threads/:threadId/final-save",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: Schema.NullOr(RelayThreadVmFinalSave),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "cancelFinalSave",
+      "/v1/environments/:environmentId/threads/:threadId/final-save/cancel",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmFinalSave,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmFinalSaveActivation",
+      "/v1/environments/:environmentId/threads/:threadId/final-save/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        success: RelayThreadVmFinalSave,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "freezeFinalSave",
+      "/v1/environments/:environmentId/threads/:threadId/final-save/freeze",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: RelayThreadArtifactId,
+          bootId: Schema.String.check(Schema.isUUID()),
+          sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
+        }),
+        success: RelayThreadVmFinalSave,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "prepareLocalEnrollment",
+      "/v1/environments/:environmentId/threads/:threadId/enrollment",
+      {
+        params: RelayThreadOwnerParams,
+        payload: RelayThreadLocalEnrollmentRequest,
+        success: RelayThreadLocalEnrollmentResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "receiveLocalEnrollmentReceipts",
+      "/v1/environments/:environmentId/threads/:threadId/enrollment/receipts",
+      {
+        params: RelayThreadOwnerParams,
+        payload: RelayThreadLocalEnrollmentReceiptRequest,
+        success: Schema.Struct({ ok: Schema.Literal(true) }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmLocalEnrollment",
+      "/v1/environments/:environmentId/threads/:threadId/enrollment/confirm",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          operationId: RelayThreadArtifactId,
+          sourceSequence: NonNegativeInt,
+          receiptCount: NonNegativeInt,
+        }),
+        success: RelayThreadLocalEnrollmentResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "abortLocalEnrollment",
+      "/v1/environments/:environmentId/threads/:threadId/enrollment/abort",
+      {
+        params: RelayThreadOwnerParams,
+        payload: RelayThreadLocalEnrollmentRequest,
+        success: RelayThreadLocalEnrollmentAbortResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "recoverEndpoint",
+      "/v1/environments/:environmentId/threads/:threadId/endpoint/recover",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadVmManagedEndpoint,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "releaseEndpoint",
+      "/v1/environments/:environmentId/threads/:threadId/endpoint/release",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, tunnelId: TrimmedNonEmptyString }),
+        success: Schema.Struct({ released: Schema.Boolean }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "checkClientAccess",
+      "/v1/environments/:environmentId/threads/:threadId/access/check",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, userId: TrimmedNonEmptyString }),
+        success: RelayThreadVmClientAccess,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmInitialActivation",
+      "/v1/environments/:environmentId/threads/:threadId/setup/activate",
+      {
+        params: RelayThreadOwnerParams,
+        payload: RelayThreadVmSetupReceipt,
+        success: Schema.Struct({ ready: Schema.Boolean }),
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "resolveWorkflowVmAttempt",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/attempt",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          jobId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+          purpose: Schema.Literals(["setup", "agent"]),
+          attemptId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+          stepId: TrimmedNonEmptyString.check(Schema.isMaxLength(120)),
+          stepGeneration: NonNegativeInt,
+          commandId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+        }),
+        success: Schema.Struct({
+          environment: Schema.Record(Schema.String, Schema.String),
+          hasSecrets: Schema.Boolean,
+          secretNames: Schema.Array(Schema.String),
+        }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "readWorkflowVmReviewSecrets",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/review-secrets",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          jobId: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+        }),
+        success: Schema.RedactedFromValue(Schema.Array(Schema.NonEmptyString)),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "repositoryBinding",
+      "/v1/environments/:environmentId/threads/:threadId/repository/binding",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadVmRepositoryBinding,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "mintRepositoryToken",
+      "/v1/environments/:environmentId/threads/:threadId/credentials/github",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          canonicalKey: RelayRepositoryCanonicalKey,
+        }),
+        success: Schema.Struct({
+          token: TrimmedNonEmptyString,
+          expiresAt: Schema.String,
+          canonicalKey: RelayRepositoryCanonicalKey,
+        }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "nextCommand",
+      "/v1/environments/:environmentId/threads/:threadId/commands/next",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: Schema.NullOr(RelayThreadInboxEntry),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "acknowledgeCommand",
+      "/v1/environments/:environmentId/threads/:threadId/commands/ack",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          commandId: TrimmedNonEmptyString,
+          receipt: RelayThreadPersistedReceipt,
+          commandReceipt: Schema.optionalKey(OrchestrationCommandReceipt),
+        }),
+        success: RelayOkResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "appendHistory",
+      "/v1/environments/:environmentId/threads/:threadId/history",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, event: OrchestrationEvent }),
+        success: Schema.Struct({
+          cursor: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+        }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmHistoryThrough",
+      "/v1/environments/:environmentId/threads/:threadId/history/through",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, sourceSequence: NonNegativeInt }),
+        success: Schema.Struct({ sourceSequence: NonNegativeInt }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "admitWork",
+      "/v1/environments/:environmentId/threads/:threadId/work/admit",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, workId: TrimmedNonEmptyString }),
+        success: Schema.Struct({ completed: Schema.Boolean, newlyAdmitted: Schema.Boolean }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "completeWork",
+      "/v1/environments/:environmentId/threads/:threadId/work/complete",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, workId: TrimmedNonEmptyString }),
+        success: RelayOkResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
+
+const RelayThreadArtifactHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u));
+export const RelayThreadArtifactReceipt = Schema.Struct({
+  artifactId: RelayThreadArtifactId,
+  threadId: ThreadId,
+  operationId: RelayThreadArtifactId,
+  kind: Schema.Literals(["workspace", "native", "attachment", "history", "manifest"]),
+  sha256: RelayThreadArtifactHash,
+  sizeBytes: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 64 * 1024 * 1024 })),
+  state: Schema.Literal("complete"),
+});
+export type RelayThreadArtifactReceipt = typeof RelayThreadArtifactReceipt.Type;
+
+/** Upload bytes with an environment credential; clients never receive private storage URLs. */
+const RelayThreadArtifactsGroup = HttpApiGroup.make("threadArtifacts")
+  .add(
+    HttpApiEndpoint.put(
+      "upload",
+      "/v1/environments/:environmentId/threads/:threadId/artifacts/:artifactId",
+      {
+        params: Schema.Struct({
+          ...RelayThreadOwnerParams.fields,
+          artifactId: RelayThreadArtifactId,
+        }),
+        query: Schema.Struct({
+          generation: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0)),
+          operationId: RelayThreadArtifactId,
+          kind: RelayThreadArtifactReceipt.fields.kind,
+          sha256: RelayThreadArtifactHash,
+          sizeBytes: Schema.NumberFromString.check(
+            Schema.isInt(),
+            Schema.isBetween({ minimum: 0, maximum: 64 * 1024 * 1024 }),
+          ),
+        }),
+        success: RelayThreadArtifactReceipt,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "publishNative",
+      "/v1/environments/:environmentId/threads/:threadId/checkpoints/native",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          manifestArtifactId: RelayThreadArtifactId,
+        }),
+        success: ThreadNativeCheckpointPublicationReceipt,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "publishAttachments",
+      "/v1/environments/:environmentId/threads/:threadId/checkpoints/attachments",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          manifestArtifactId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: RelayThreadArtifactId,
+        }),
+        success: ThreadAttachmentCheckpointPublicationReceipt,
+        error: RelayTenancyErrors,
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
+
+/** A durable handoff; elapsed time or a missing reply never grants execution. */
+const RelayThreadMoveFailureDetail = TrimmedNonEmptyString.check(Schema.isMaxLength(2000));
+export const RelayThreadMove = Schema.Struct({
+  manifestArtifactId: Schema.NullOr(RelayThreadArtifactId),
+  transferEncodingPolicy: Schema.optionalKey(Schema.NullOr(ThreadTransferEncodingPolicy)),
+  recoveryVerified: Schema.optional(Schema.Boolean),
+  threadId: ThreadId,
+  operationId: RelayThreadArtifactId,
+  actorUserId: TrimmedNonEmptyString,
+  sourceEnvironmentId: EnvironmentId,
+  expectedGeneration: Schema.Int.check(Schema.isGreaterThan(0)),
+  sourceReopenRequired: Schema.optionalKey(Schema.Boolean),
+  sourceReopened: Schema.optionalKey(Schema.Boolean),
+  destinationEnvironmentId: EnvironmentId,
+  destinationProjectId: ProjectId,
+  repositoryCanonicalKeys: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString)),
+  phase: Schema.Literals([
+    "preparing",
+    "frozen",
+    "ready",
+    "committed",
+    "completed",
+    "aborting",
+    "aborted",
+  ]),
+  sourceCursor: Schema.NullOr(NonNegativeInt),
+  manifestSha256: Schema.NullOr(RelayThreadArtifactHash),
+  failureDetail: Schema.optional(Schema.NullOr(RelayThreadMoveFailureDetail)),
+  progress: Schema.optional(Schema.Array(ThreadMoveProgressSnapshot)),
+  participantStates: Schema.optionalKey(
+    Schema.Array(ThreadMoveParticipantState).check(Schema.isMaxLength(2)),
+  ),
+});
+export type RelayThreadMove = typeof RelayThreadMove.Type;
+const RelayThreadMoveParams = Schema.Struct({
+  ...RelayThreadOwnerParams.fields,
+  operationId: RelayThreadArtifactId,
+});
+const RelayThreadMovesGroup = HttpApiGroup.make("threadMoves")
+  .add(
+    HttpApiEndpoint.post(
+      "progress",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/progress",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, ...ThreadMoveProgressReport.fields }),
+        success: Schema.Struct({ accepted: Schema.Literal(true) }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post("pending", "/v1/environments/:environmentId/thread-moves", {
+      params: Schema.Struct({ environmentId: EnvironmentId }),
+      payload: Schema.Struct({
+        after: Schema.NullOr(RelayThreadArtifactId),
+        limit: Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 50 })),
+        threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+      }),
+      success: Schema.Struct({
+        entries: Schema.Array(RelayThreadMove),
+        next: Schema.NullOr(RelayThreadArtifactId),
+      }),
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get(
+      "artifact",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/artifacts/:artifactId",
+      {
+        params: Schema.Struct({
+          ...RelayThreadMoveParams.fields,
+          artifactId: RelayThreadArtifactId,
+        }),
+        query: Schema.Struct({
+          generation: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0)),
+        }),
+        success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "begin",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/begin",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          actorUserId: TrimmedNonEmptyString,
+          destinationEnvironmentId: EnvironmentId,
+          destinationProjectId: ProjectId,
+          sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+          supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+          sourceMessageId: Schema.optionalKey(MessageId),
+        }),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "beginVm",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/begin-vm",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          actorUserId: TrimmedNonEmptyString,
+          cancelBeforeStart: Schema.Boolean,
+          sourceThreadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
+          supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+          sourceMessageId: Schema.optionalKey(MessageId),
+        }),
+        success: Schema.Union([
+          Schema.Struct({ status: Schema.Literal("accepted"), move: RelayThreadMove }),
+          RelayThreadVmQuotaResponse,
+        ]),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "selectEncoding",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/encoding",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "get",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          supportsSourceReopenAck: Schema.optionalKey(Schema.Literal(true)),
+        }),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "failed",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/failed",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          detail: RelayThreadMoveFailureDetail,
+          attempt: Schema.optionalKey(PositiveInt),
+          requiresRetry: Schema.optionalKey(Schema.Literal(true)),
+        }),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "freeze",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/freeze",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          sourceCursor: NonNegativeInt,
+          manifestSha256: RelayThreadArtifactHash,
+          attempt: Schema.optionalKey(PositiveInt),
+        }),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "publish",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/publish",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          manifestArtifactId: RelayThreadArtifactId,
+        }),
+        success: Schema.Struct({
+          manifestArtifactId: RelayThreadArtifactId,
+          artifactCount: NonNegativeInt,
+        }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "ready",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/ready",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          sourceCursor: NonNegativeInt,
+          manifestSha256: RelayThreadArtifactHash,
+          attempt: Schema.optionalKey(PositiveInt),
+          destinationVerifiedCommit: Schema.optionalKey(Schema.Literal(true)),
+        }),
+        success: RelayThreadMove,
+        error: [...RelayTenancyErrors, CodexVmConnectionError],
+      },
+    ),
+    HttpApiEndpoint.post(
+      "commit",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/commit",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "activate",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/activate",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "abort",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/abort",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "removed",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/removed",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "sourceReopened",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/reopened",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct(RelayThreadGeneration),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "reopenBlocked",
+      "/v1/environments/:environmentId/threads/:threadId/moves/:operationId/reopen-blocked",
+      {
+        params: RelayThreadMoveParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          reason: Schema.Literals(["capture_stop_unconfirmed", "source_reopen_failed"]),
+        }),
+        success: RelayThreadMove,
+        error: RelayTenancyErrors,
+      },
+    ),
+  )
+  .middleware(RelayEnvironmentAuth);
+
+const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
+  .add(
+    HttpApiEndpoint.post("retryMove", "/v1/threads/:threadId/moves/:operationId/retry", {
+      params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ sourceGeneration: PositiveInt, failedAttempt: PositiveInt }),
+      success: RelayThreadActiveMove,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("cancelMove", "/v1/threads/:threadId/moves/:operationId/cancel", {
+      params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ sourceGeneration: PositiveInt }),
+      success: RelayThreadActiveMove,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getMoveCancellation", "/v1/threads/:threadId/moves/:operationId/cancel", {
+      params: Schema.Struct({ threadId: ThreadId, operationId: RelayThreadArtifactId }),
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({
+        sourceGeneration: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0)),
+      }),
+      success: RelayThreadActiveMove,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.post("stage", "/v1/threads/:threadId/commands", {
+      params: Schema.Struct({ threadId: ThreadId }),
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ command: PortableThreadCommand }),
+      success: RelayThreadCommandReceipt,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("pending", "/v1/threads/:threadId/commands", {
+      params: Schema.Struct({ threadId: ThreadId }),
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({
+        after: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+        limit: Schema.NumberFromString.check(
+          Schema.isInt(),
+          Schema.isBetween({ minimum: 1, maximum: 200 }),
+        ),
+      }),
+      success: RelayThreadPendingCommandPage,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("receipt", "/v1/threads/:threadId/commands/:commandId", {
+      params: Schema.Struct({ threadId: ThreadId, commandId: TrimmedNonEmptyString }),
+      headers: RelayBearerRequestHeaders,
+      success: Schema.NullOr(RelayThreadCommandReceipt),
+      error: RelayTenancyErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+const RelayThreadHistoryGroup = HttpApiGroup.make("threadHistory")
+  .add(
+    HttpApiEndpoint.get("listThreads", "/v1/threads/portable", {
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({
+        after: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(191))),
+        limit: Schema.NumberFromString.check(
+          Schema.isInt(),
+          Schema.isBetween({ minimum: 1, maximum: 100 }),
+        ),
+      }),
+      success: RelayPortableThreadPage,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getPlacement", "/v1/threads/:threadId/placement", {
+      params: Schema.Struct({ threadId: ThreadId }),
+      headers: RelayBearerRequestHeaders,
+      success: RelayPortableThreadPlacement,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getAttachment", "/v1/threads/:threadId/attachments/:attachmentId", {
+      params: Schema.Struct({
+        threadId: ThreadId,
+        attachmentId: TrimmedNonEmptyString.check(
+          Schema.isMaxLength(128),
+          Schema.isPattern(/^[a-z0-9_-]+$/iu),
+        ),
+      }),
+      headers: RelayBearerRequestHeaders,
+      success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getCurrentQueue", "/v1/threads/:threadId/queue", {
+      params: Schema.Struct({ threadId: ThreadId }),
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({ commandId: Schema.optional(CommandId) }),
+      success: RelayThreadCurrentQueue,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getHistory", "/v1/threads/:threadId/history", {
+      params: Schema.Struct({ threadId: ThreadId }),
+      headers: RelayBearerRequestHeaders,
+      query: Schema.Struct({
+        after: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+        limit: Schema.NumberFromString.check(
+          Schema.isInt(),
+          Schema.isBetween({ minimum: 1, maximum: 200 }),
+        ),
+      }),
+      success: RelayThreadHistoryPage,
+      error: RelayTenancyErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+const RelayThreadVmPolicyGroup = HttpApiGroup.make("threadVmPolicy")
+  .add(
+    HttpApiEndpoint.get("getThreadVmPolicy", "/v1/organization/thread-vm-policy", {
+      headers: RelayBearerRequestHeaders,
+      success: ThreadVmPolicyRecord,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.put("updateThreadVmPolicy", "/v1/organization/thread-vm-policy", {
+      headers: RelayBearerRequestHeaders,
+      payload: ThreadVmPolicyRecord,
+      success: ThreadVmPolicyRecord,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.get("getWorkflowVmPolicy", "/v1/organization/workflow-vm-policy", {
+      headers: RelayBearerRequestHeaders,
+      success: WorkflowVmPolicyRecord,
+      error: RelayTenancyErrors,
+    }),
+    HttpApiEndpoint.put("updateWorkflowVmPolicy", "/v1/organization/workflow-vm-policy", {
+      headers: RelayBearerRequestHeaders,
+      payload: WorkflowVmPolicyRecord,
+      success: WorkflowVmPolicyRecord,
+      error: RelayTenancyErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
+
 const RelayOrganizationMemberParams = Schema.Struct({
   userId: TrimmedNonEmptyString,
 });
@@ -2241,6 +4191,163 @@ const RelayOrganizationMemberParams = Schema.Struct({
 const RelayRepositoryParams = Schema.Struct({
   repositoryId: RelayRepositoryId,
 });
+
+const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
+  .add(
+    HttpApiEndpoint.get("health", "/v1/repositories/:repositoryId/workflow-sources/health", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowSourceHealthList,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.get("owner", "/v1/workflow-sources", {
+      headers: RelayBearerRequestHeaders,
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("begin", "/v1/workflow-sources/linear/begin", {
+      headers: RelayBearerRequestHeaders,
+      payload: BeginWorkflowSource,
+      success: WorkflowSourceAuthorization,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("cancel", "/v1/workflow-sources/linear/cancel", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("disconnect", "/v1/workflow-sources/disconnect", {
+      headers: RelayBearerRequestHeaders,
+      payload: DisconnectWorkflowSource,
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("refreshOwner", "/v1/workflow-sources/refresh", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ connectionId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.get("repository", "/v1/repositories/:repositoryId/workflow-sources", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("allow", "/v1/repositories/:repositoryId/workflow-sources/allow", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: AllowWorkflowSource,
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("withdraw", "/v1/repositories/:repositoryId/workflow-sources/withdraw", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+      success: WorkflowRepositorySources,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("withdrawOwner", "/v1/workflow-sources/withdraw", {
+      headers: RelayBearerRequestHeaders,
+      payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+      success: WorkflowSourceOwner,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post(
+      "refreshRepository",
+      "/v1/repositories/:repositoryId/workflow-sources/refresh",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
+        success: WorkflowRepositorySources,
+        error: [...RelayTenancyErrors, WorkflowSourceError],
+      },
+    ),
+    HttpApiEndpoint.post("selection", "/v1/repositories/:repositoryId/workflow-sources/selection", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: WorkflowSourceSelectionQuery,
+      success: WorkflowSourceSelection,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+    HttpApiEndpoint.post("metadata", "/v1/repositories/:repositoryId/workflow-sources/metadata", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: WorkflowSourceMetadataQuery,
+      success: WorkflowSourceMetadataPage,
+      error: [...RelayTenancyErrors, WorkflowSourceError],
+    }),
+  )
+  .middleware(RelayClientAuth);
+
+const WorkflowErrors = [
+  ...RelayTenancyErrors,
+  WorkflowConflictError,
+  WorkflowInvalidError,
+] as const;
+const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
+  .add(
+    HttpApiEndpoint.get("list", "/v1/repositories/:repositoryId/workflows", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: WorkflowCatalog,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("save", "/v1/repositories/:repositoryId/workflows", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: SaveRepositoryWorkflow,
+      success: RepositoryWorkflow,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("listJobs", "/v1/repositories/:repositoryId/workflow-jobs", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      success: Schema.Struct({ jobs: Schema.Array(RepositoryWorkflowJobSummary) }),
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get("pageJobs", "/v1/repositories/:repositoryId/workflow-jobs/page", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      query: WorkflowJobPageQuery,
+      success: WorkflowJobPage,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.post("run", "/v1/repositories/:repositoryId/workflow-jobs", {
+      headers: RelayBearerRequestHeaders,
+      params: RelayRepositoryParams,
+      payload: RunRepositoryWorkflow,
+      success: RepositoryWorkflowJob,
+      error: [...WorkflowErrors, WorkflowSubmissionPendingError],
+    }),
+    HttpApiEndpoint.get("getJob", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+    HttpApiEndpoint.get(
+      "getJobResult",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/result",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+        success: RelayAssignedWorkflowThreadPlacement,
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.post("respond", "/v1/repositories/:repositoryId/workflow-jobs/:jobId", {
+      headers: RelayBearerRequestHeaders,
+      params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+      payload: RespondToWorkflowJob,
+      success: RepositoryWorkflowJob,
+      error: WorkflowErrors,
+    }),
+  )
+  .middleware(RelayClientAuth);
 
 /**
  * Organizations, membership, and invitations. Everything here is relay-owned:
@@ -2512,6 +4619,27 @@ const RelayRepositoriesGroup = HttpApiGroup.make("repositories")
       success: RelayOkResponse,
       error: RelayTenancyErrors,
     }).annotate(OpenApi.Summary, "Remove a repository and its keys"),
+    HttpApiEndpoint.get(
+      "getRepositoryWorkflowConfiguration",
+      "/v1/repositories/:repositoryId/workflow-environment",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        success: RelayRepositoryWorkflowConfiguration,
+        error: RelayTenancyErrors,
+      },
+    ).annotate(OpenApi.Summary, "Read repository workflow variables and secret names"),
+    HttpApiEndpoint.patch(
+      "updateRepositoryWorkflowConfiguration",
+      "/v1/repositories/:repositoryId/workflow-environment",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: RelayRepositoryParams,
+        payload: RelayUpdateRepositoryWorkflowConfiguration,
+        success: RelayRepositoryWorkflowConfiguration,
+        error: RelayTenancyErrors,
+      },
+    ).annotate(OpenApi.Summary, "Update one repository workflow variable or secret"),
     HttpApiEndpoint.post("addRepositoryAlias", "/v1/repositories/:repositoryId/aliases", {
       headers: RelayBearerRequestHeaders,
       params: RelayRepositoryParams,
@@ -2582,9 +4710,9 @@ const RelayMachineParams = Schema.Struct({
 });
 
 /**
- * Machines the organization owns: agent executors and review hosts. Admin
- * surface — provisioning buys compute and deprovisioning destroys it, so both
- * require the organization role that owns quota and billing.
+ * Admin management of manually enrolled organization machines. This revokes
+ * enrollment and connections; the operator owns the machine and its filesystem.
+ * Historical managed-compute records cannot use the removed provisioning drivers.
  */
 const RelayMachinesGroup = HttpApiGroup.make("machines")
   .add(
@@ -2629,12 +4757,12 @@ const RelayMachinesGroup = HttpApiGroup.make("machines")
       .annotate(OpenApi.Summary, "Deprovision a machine")
       .annotate(
         OpenApi.Description,
-        "Revokes the machine's credentials, releases its managed endpoint, and destroys its compute. Until the event mirror exists, thread history held on the machine is destroyed with it.",
+        "Revokes a self-hosted machine's credentials and releases its managed endpoint. The operator retains its compute and files. Legacy managed-compute records require operator cleanup.",
       ),
   )
   .annotate(
     OpenApi.Description,
-    "Organization machines — agent executors and review hosts — provisioned by the relay or self-hosted.",
+    "Manually enrolled organization machines. Private E2B thread VMs use the thread VM API.",
   )
   .middleware(RelayClientAuth);
 
@@ -3060,6 +5188,16 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayMobileGroup,
     RelayClientGroup,
     RelayOrganizationGroup,
+    RelayCodexVmConnectionsGroup,
+    RelayThreadVmPolicyGroup,
+    RelayThreadHistoryGroup,
+    RelayThreadCommandsGroup,
+    RelayThreadArtifactsGroup,
+    RelayThreadMovesGroup,
+    RelayThreadEnvironmentGroup,
+    RelayThreadVmCodexAuthGroup,
+    RelayThreadVmEnrollmentGroup,
+    RelayThreadVmsGroup,
     RelayRepositoriesGroup,
     RelayOrganizationProjectsGroup,
     RelayMachinesGroup,
@@ -3067,6 +5205,8 @@ export const RelayApi = HttpApi.make("RelayApi")
     RelayTokenGroup,
     RelayDpopClientGroup,
     RelayJobsGroup,
+    RelayWorkflowsGroup,
+    RelayWorkflowSourcesGroup,
     RelayServerGroup,
     RelayProjectCatalogServerGroup,
     RelaySourceControlServerGroup,
@@ -3084,3 +5224,46 @@ export const RelayApi = HttpApi.make("RelayApi")
     "Control-plane API for linking Launchpad environments, connecting authorized clients, and publishing agent activity.",
   );
 export type RelayApi = typeof RelayApi;
+
+export {
+  RelayThreadPendingCommandPage,
+  RelayPortableThreadPlacement,
+  RelayThreadActiveMove,
+  ThreadMoveCancellationBlocker,
+  RelayPrivateThreadPlacement,
+  RelayWorkflowThreadPlacement,
+  RelayPreparingWorkflowThreadPlacement,
+  RelayAssignedWorkflowThreadPlacement,
+  RelayThreadPlacement,
+  type RelayAssignedThreadPlacement,
+  isPrivateThreadPlacement,
+  isAssignedThreadPlacement,
+  RelayThreadHistoryPage,
+  RelayPortableThreadSummary,
+  RelayPortableThreadPage,
+  RelayThreadCurrentQueue,
+  ThreadVmCapabilities,
+  RelayPortableThreadVmSummary,
+  RelayThreadVmAllowance,
+  RelayThreadCommandReceipt,
+  RelayThreadInboxEntry,
+  RelayThreadPersistedReceipt,
+  ThreadVmPolicy,
+  ThreadVmPolicyRecord,
+  WorkflowVmPolicyRecord,
+  WorkflowVmCapabilities,
+  DEFAULT_WORKFLOW_VM_LIMIT,
+  DEFAULT_THREAD_VM_POLICY,
+  ThreadTransferChunkManifest,
+  ThreadTransferPackedManifest,
+  ThreadTransferArtifactManifest,
+  ThreadNativeCheckpointArchiveManifest,
+  ThreadNativeCheckpointPublicationReceipt,
+  ThreadAttachmentManifest,
+  ThreadAttachmentCheckpointArchiveManifest,
+  ThreadAttachmentCheckpointPublicationReceipt,
+  THREAD_ATTACHMENT_CHECKPOINT_MAX_FILES,
+  THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES,
+} from "./threadVm.ts";
+
+export * from "./codexConversation.ts";

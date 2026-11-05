@@ -465,15 +465,39 @@ export async function archiveSelectedThreadEntries<
 export function buildMultiSelectThreadContextMenuItems(input: {
   count: number;
   hasRunningThread: boolean;
+  readOnly?: boolean;
 }): readonly ContextMenuItem<"mark-unread" | "archive" | "delete">[] {
+  const markUnread = { id: "mark-unread" as const, label: `Mark unread (${input.count})` };
+  if (input.readOnly) return [markUnread];
   return [
-    { id: "mark-unread", label: `Mark unread (${input.count})` },
+    markUnread,
     {
       id: "archive",
       label: `Archive (${input.count})`,
       disabled: input.hasRunningThread,
     },
     { id: "delete", label: `Delete (${input.count})`, destructive: true },
+  ];
+}
+
+export function buildLegacyThreadContextMenuItems(input: {
+  readonly readOnly: boolean;
+  readonly newThreadBranch: string | null;
+}): readonly ContextMenuItem<string>[] {
+  const utilities = [
+    { id: "mark-unread", label: "Mark unread" },
+    { id: "copy-path", label: "Copy Path" },
+    { id: "copy-thread-id", label: "Copy Thread ID" },
+  ];
+  if (input.readOnly) return utilities;
+  return [
+    ...(input.newThreadBranch
+      ? [{ id: "new-thread-on-branch", label: `New thread on ${input.newThreadBranch}` }]
+      : []),
+    { id: "rename", label: "Rename thread" },
+    ...utilities,
+    { id: "project-settings", label: "Project settings" },
+    { id: "delete", label: "Delete", destructive: true, icon: "trash" },
   ];
 }
 

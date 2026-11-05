@@ -8,6 +8,8 @@ import {
 } from "@t3tools/contracts";
 import {
   forgetSharedPromptSubmission,
+  reconcileSharedPromptSubmission,
+  sharedPromptSubmissionAccount,
   hasSharedPromptSubmission,
   retainSharedPromptSubmission,
   useSharedPromptSubmissions,
@@ -86,6 +88,72 @@ describe("shared prompt transport journal", () => {
     forgetSharedPromptSubmission(first.command.commandId);
     expect(useSharedPromptSubmissions.getState().entries).toHaveLength(0);
   });
+  it("hands a lost-send journal to the relay while execution is still pending", () => {
+    const original = retainSharedPromptSubmission(environmentId, input, true);
+    const outcome = reconcileSharedPromptSubmission(
+      original.command.commandId,
+      {
+        relay: { commandId: original.command.commandId, position: 3, receipt: null },
+      },
+      sharedPromptSubmissionAccount(),
+    );
+    expect(outcome).toEqual({ status: "accepted" });
+    expect(useSharedPromptSubmissions.getState().entries).toEqual([]);
+    expect(saved.size).toBe(0);
+  });
+
+  it("keeps an unknown send and a relay rejection available for review", () => {
+    const original = retainSharedPromptSubmission(environmentId, input, true);
+    reconcileSharedPromptSubmission(original.command.commandId, { status: "unknown" }, null);
+    expect(useSharedPromptSubmissions.getState().entries).toHaveLength(1);
+    reconcileSharedPromptSubmission(
+      original.command.commandId,
+      {
+        relay: {
+          commandId: original.command.commandId,
+          position: 3,
+          receipt: { status: "rejected", detail: "Repository access was removed" },
+        },
+      },
+      null,
+    );
+    expect(useSharedPromptSubmissions.getState().entries[0]?.rejection).toBe(
+      "Repository access was removed",
+    );
+    expect(useSharedPromptSubmissions.getState().entries[0]?.command).toEqual(original.command);
+    expect(saved.size).toBe(1);
+  });
+
+  it("ignores an old account's delayed receipt even if both journals use the same command ID", () => {
+    setSharedPromptSubmissionAccount("alice");
+    const original = retainSharedPromptSubmission(environmentId, input, true);
+    const account = sharedPromptSubmissionAccount();
+    setSharedPromptSubmissionAccount("bob");
+    retainSharedPromptSubmission(environmentId, input, true);
+    reconcileSharedPromptSubmission(
+      original.command.commandId,
+      {
+        relay: { commandId: original.command.commandId, position: 3, receipt: null },
+      },
+      account,
+    );
+    expect(useSharedPromptSubmissions.getState().entries).toHaveLength(1);
+    setSharedPromptSubmissionAccount("alice");
+    expect(useSharedPromptSubmissions.getState().entries).toHaveLength(1);
+  });
+
+  it("does not discard a prompt for another command's relay acknowledgement", () => {
+    const original = retainSharedPromptSubmission(environmentId, input, true);
+    reconcileSharedPromptSubmission(
+      original.command.commandId,
+      {
+        relay: { commandId: "another-command", position: 3, receipt: null },
+      },
+      null,
+    );
+    expect(useSharedPromptSubmissions.getState().entries).toHaveLength(1);
+  });
+
   it("isolates saved submissions between signed-in accounts", () => {
     setSharedPromptSubmissionAccount("alice");
     const alice = retainSharedPromptSubmission(environmentId, input);

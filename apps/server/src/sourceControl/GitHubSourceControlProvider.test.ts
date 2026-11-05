@@ -507,3 +507,84 @@ for (const stage of ["read", "decode"] as const) {
     }),
   );
 }
+
+it.effect(
+  "carries the pinned host/repository through PR create, list, and bounded recovery details",
+  () =>
+    Effect.gen(function* () {
+      const calls: VcsProcess.VcsProcessInput[] = [];
+      let truncated = false;
+      const provider = yield* GitHubSourceControlProvider.make.pipe(
+        Effect.provide(GitHubCli.layer.pipe(Layer.provide(GitHubCliAvailability.layer))),
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: (input) =>
+            Effect.sync(() => {
+              if (input.args[0] === "--version") return processResult("gh version test");
+              if (input.args[1] === "rate_limit")
+                return processResult(
+                  '{"data":{"rateLimit":{"cost":1,"limit":5000,"remaining":5000,"resetAt":"2099-01-01T00:00:00Z"}}}',
+                );
+              calls.push(input);
+              const summary =
+                '{"number":42,"title":"Workflow","url":"https://enterprise.test/acme/repo/pull/42","baseRefName":"main","headRefName":"job","state":"OPEN","isCrossRepository":false}';
+              if (input.args[1] === "create")
+                return processResult("https://enterprise.test/acme/repo/pull/42\n");
+              if (input.args[1] === "list") return processResult(`[${summary}]`);
+              if (input.args.at(-1) === ".body")
+                return {
+                  ...processResult("<!-- launchpad-workflow-job:job -->"),
+                  stdoutTruncated: truncated,
+                };
+              return processResult(summary);
+            }),
+        }),
+      );
+      const context = {
+        provider: {
+          kind: "github" as const,
+          name: "GitHub Enterprise",
+          baseUrl: "https://enterprise.test",
+        },
+        repository: "enterprise.test/acme/repo",
+        remoteName: "upstream",
+        remoteUrl: "https://enterprise.test/acme/repo.git",
+      };
+      const receipt = yield* provider.createChangeRequest({
+        cwd: "/conflicting-origin",
+        context,
+        baseRefName: "main",
+        headSelector: "job",
+        title: "Workflow",
+        bodyFile: "/tmp/body",
+      });
+      assert.equal(receipt?.url, "https://enterprise.test/acme/repo/pull/42");
+      yield* provider.listChangeRequests({
+        cwd: "/conflicting-origin",
+        context,
+        headSelector: "job",
+        state: "all",
+        limit: 20,
+      });
+      const detail = yield* provider.getChangeRequestDetails!({
+        cwd: "/conflicting-origin",
+        context,
+        reference: "42",
+      });
+      assert.isTrue(detail.complete);
+      assert.include(detail.body, "launchpad-workflow-job");
+      truncated = true;
+      assert.isFalse(
+        (yield* provider.getChangeRequestDetails!({
+          cwd: "/conflicting-origin",
+          context,
+          reference: "42",
+        })).complete,
+      );
+      assert.isAtLeast(calls.length, 5);
+      for (const call of calls) {
+        assert.equal(call.args[0], "pr");
+        assert.equal(call.args[call.args.indexOf("--repo") + 1], "enterprise.test/acme/repo");
+      }
+      assert.isTrue(calls.some((call) => call.maxOutputBytes === 131072));
+    }),
+);

@@ -11,6 +11,7 @@ import type {
   ProjectScript as ContractProjectScript,
   ProviderInteractionMode,
   RuntimeMode,
+  ThreadPromptQueueEntry,
 } from "@t3tools/contracts";
 import type {
   EnvironmentProject,
@@ -75,6 +76,8 @@ export function isVideoAttachment(attachment: ChatFileAttachment): boolean {
 
 export interface ChatMessage extends Omit<OrchestrationMessage, "attachments"> {
   readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  readonly pendingStatus?: "Waiting to start…" | "Sending…";
+  readonly pendingPrompt?: ThreadPromptQueueEntry;
 }
 
 export type ProposedPlan = OrchestrationProposedPlan;

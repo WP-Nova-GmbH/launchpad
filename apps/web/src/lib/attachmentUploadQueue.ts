@@ -1,3 +1,4 @@
+import { recoverMovedDraftFile } from "./movedThreadDraft";
 import {
   PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES,
   type ChatAttachment,
@@ -190,12 +191,12 @@ async function runUpload(job: UploadJob): Promise<void> {
       return;
     }
     if (verification.status === "verified") {
+      stampDraftFileUpload(job, job.persistedAttachmentId);
       setUploadState(job.image.id, {
         status: "ready",
         environmentId: job.environmentId,
         attachmentId: job.persistedAttachmentId,
       });
-      stampDraftFileUpload(job, job.persistedAttachmentId);
       return;
     }
     if (verification.status === "missing" && !job.image.file && job.image.type === "file") {
@@ -248,7 +249,12 @@ async function runUpload(job: UploadJob): Promise<void> {
     });
     return;
   }
-  const file = job.image.file;
+  const file =
+    job.image.file ??
+    (job.image.type === "file" && job.image.recoveryUpload
+      ? await recoverMovedDraftFile(job.image).catch(() => null)
+      : null);
+  if (job.cancelled) return;
   if (!file) {
     setUploadState(job.image.id, {
       status: "failed",
@@ -310,12 +316,12 @@ async function runUpload(job: UploadJob): Promise<void> {
     return;
   }
   if (result.status === "uploaded") {
+    stampDraftFileUpload(job, result.attachmentId);
     setUploadState(job.image.id, {
       status: "ready",
       environmentId: job.environmentId,
       attachmentId: result.attachmentId,
     });
-    stampDraftFileUpload(job, result.attachmentId);
     if (job.previous) {
       deletePendingUpload(job.previous.environmentId, job.previous.attachmentId);
     }

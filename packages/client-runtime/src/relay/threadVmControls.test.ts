@@ -1,0 +1,5193 @@
+import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
+import {
+  EnvironmentId,
+  ThreadId,
+  ProjectId,
+  ProviderInstanceId,
+  CommandId,
+  MessageId,
+  type OrchestrationShellSnapshot,
+  type OrchestrationThread,
+  type ThreadPromptQueue,
+  type ProviderAuthState,
+} from "@t3tools/contracts";
+import type {
+  RelayThreadVmProviderAuth,
+  RelayThreadVmProviderAuthBinding,
+  RelayThreadVmCodexAuthSource,
+  RelayPortableThreadPlacement,
+  ThreadMoveWaitingForAuth,
+} from "@t3tools/contracts/relay";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import {
+  createThreadVmControlAtoms,
+  withPortableThreadDeletion,
+  threadVmProviderAuthPresentation,
+  threadVmAuthSourcePresentation,
+  threadVmAuthSourceChoice,
+} from "./threadVmControls.ts";
+import {
+  portableThreadClientRouteAtom,
+  createPortableThreadLibraryAtoms,
+  verifyPortableThreadClientRoute,
+} from "./portableThreadLibrary.ts";
+import { createThreadVmActionJournal } from "./threadVmActionSubmission.ts";
+import type { ThreadMoveSubmissionStorage } from "./threadMoveSubmission.ts";
+import { layer as tenancyLayer } from "./managedRelayTenancy.ts";
+import { remoteHttpClientLayer } from "../rpc/http.ts";
+import { managedRelaySessionAtom } from "./managedRelayState.ts";
+import { rememberPortableThreadPlacement } from "./portableThreadPresentation.ts";
+
+const environmentId = EnvironmentId.make("retired-environment"),
+  threadId = ThreadId.make("vm-thread"),
+  relayUrl = "https://relay.example.test",
+  at = "2026-10-07T00:00:00Z";
+const snapshot: OrchestrationShellSnapshot = {
+  snapshotSequence: 1,
+  updatedAt: at,
+  projects: [],
+  threads: [
+    {
+      id: threadId,
+      projectId: ProjectId.make("project"),
+      title: "VM",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      pullRequests: [],
+      latestTurn: null,
+      createdAt: at,
+      updatedAt: at,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      session: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+      relayRouting: { relayUrl, generation: 1, phase: "retired" },
+    },
+  ],
+};
+const status = {
+  threadId,
+  generation: 1,
+  allocation: null,
+  setupPhase: null,
+  capacityState: null,
+  activity: "unknown",
+  sourceActivationPending: false,
+  pausePhase: null,
+  resumePhase: null,
+  backupPhase: null,
+  lastVerifiedBackupAt: null,
+  savedDisk: {
+    operationId: "saved",
+    phase: "available",
+    savedAt: at,
+    expiresAt: "2026-11-07T00:00:00Z",
+  },
+};
+const authBinding: RelayThreadVmProviderAuthBinding = {
+  operationId: "move-auth",
+  allocationId: "fresh-vm",
+  environmentId: EnvironmentId.make("next-vm"),
+  generation: 2,
+  instanceId: "codex",
+};
+const idleAuth: ProviderAuthState = {
+  instanceId: ProviderInstanceId.make("codex"),
+  phase: "idle",
+  flowId: null,
+  authorizationUrl: null,
+  expiresAt: null,
+  message: null,
+  interaction: null,
+};
+const waitingAuth: RelayThreadVmProviderAuth = {
+  ...authBinding,
+  requirement: "sign_in_required",
+  auth: {
+    ...idleAuth,
+    phase: "waiting",
+    flowId: "flow-1",
+    authorizationUrl: "https://chatgpt.com/activate",
+    interaction: {
+      type: "deviceCode",
+      id: "interaction-1",
+      url: "https://chatgpt.com/activate",
+      userCode: "TEST-1234",
+    },
+  },
+};
+const pendingVmStatus = {
+  ...status,
+  allocation: null,
+  savedDisk: null,
+  pendingProviderAuth: authBinding,
+};
+const managedSource: RelayThreadVmCodexAuthSource = {
+  mode: "organization",
+  connectionId: "org-codex",
+  connection: {
+    connectionId: "org-codex",
+    label: "VM account",
+    status: "connected",
+    epoch: 1,
+    tokenRevision: 1,
+    errorCode: null,
+    refreshing: false,
+  },
+};
+
+describe("pending VM Codex sign-in presentation", () => {
+  it("hides stale personal device actions when an organization account is selected", () => {
+    expect(
+      threadVmProviderAuthPresentation({ ...waitingAuth, authSource: managedSource }),
+    ).toMatchObject({
+      title: "Organization Codex · VM account",
+      url: null,
+      userCode: null,
+      canStart: false,
+      canCancel: false,
+    });
+    expect(threadVmAuthSourcePresentation(managedSource).detail).toContain("ChatGPT plan");
+    if (managedSource.mode !== "organization") throw new Error("Expected organization source");
+    const replacement = threadVmAuthSourceChoice(managedSource, {
+      ...managedSource.connection,
+      connectionId: "replacement",
+    });
+    expect(replacement.selectedValue).not.toBe(replacement.organizationValue);
+    expect(threadVmAuthSourceChoice(managedSource, managedSource.connection).selectedValue).toBe(
+      threadVmAuthSourceChoice(managedSource, managedSource.connection).organizationValue,
+    );
+  });
+  it("requires a current connected selection before claiming managed preparation can continue", () => {
+    if (managedSource.mode !== "organization") throw new Error("Expected organization source");
+    const value = {
+      ...waitingAuth,
+      requirement: "authenticated" as const,
+      authSource: managedSource,
+    };
+    const replaced = { ...managedSource.connection, connectionId: "replacement" };
+    const message = threadVmProviderAuthPresentation({
+      ...value,
+      organizationConnection: replaced,
+    }).message;
+    expect(message).toContain("Choose the replacement account or personal sign-in");
+    expect(message).not.toContain("continues automatically");
+    for (const current of [
+      replaced,
+      { ...managedSource.connection, status: "disconnected" as const },
+      null,
+    ])
+      expect(threadVmAuthSourcePresentation(managedSource, current).usingPlan).toBe(false);
+  });
+  it("shows a device code only for the active official sign-in flow", () => {
+    expect(threadVmProviderAuthPresentation(waitingAuth)).toMatchObject({
+      url: "https://chatgpt.com/activate",
+      userCode: "TEST-1234",
+      canCancel: true,
+      canStart: false,
+    });
+    const unsafe = {
+      ...waitingAuth,
+      auth: {
+        ...waitingAuth.auth,
+        interaction: {
+          ...waitingAuth.auth.interaction!,
+          type: "deviceCode" as const,
+          id: "unsafe",
+          userCode: "TEST-1234",
+          url: "https://chatgpt.com.evil.test/activate",
+        },
+      },
+    };
+    expect(threadVmProviderAuthPresentation(unsafe)).toMatchObject({ url: null, userCode: null });
+  });
+  it("clears old codes after completion or cancellation and offers a new sign-in after cancellation", () => {
+    expect(
+      threadVmProviderAuthPresentation({ ...waitingAuth, requirement: "authenticated" }),
+    ).toMatchObject({
+      title: "Codex signed in",
+      url: null,
+      userCode: null,
+      canStart: false,
+      canCancel: false,
+    });
+    expect(
+      threadVmProviderAuthPresentation({
+        ...waitingAuth,
+        auth: { ...waitingAuth.auth, phase: "cancelled" },
+      }),
+    ).toMatchObject({
+      url: null,
+      userCode: null,
+      canStart: true,
+      canCancel: false,
+      startLabel: "Retry Codex sign-in",
+    });
+  });
+  it("shows an unsupported runner reason without offering an ineffective sign-in", () => {
+    expect(
+      threadVmProviderAuthPresentation({
+        ...waitingAuth,
+        requirement: "provider_unavailable",
+        auth: {
+          ...idleAuth,
+          phase: "failed",
+          message: "Update the runner to the supported Codex version.",
+        },
+      }),
+    ).toMatchObject({
+      title: "Codex needs attention",
+      message: "Update the runner to the supported Codex version.",
+      canStart: false,
+    });
+  });
+});
+const harness = Effect.fnUntraced(function* (
+  fetchFn: typeof fetch,
+  source = snapshot,
+  archived: Atom.Atom<AsyncResult.AsyncResult<OrchestrationShellSnapshot, never>> | null = null,
+  detail: Atom.Atom<Pick<OrchestrationThread, "promptQueue"> | null> | null = null,
+) {
+  const registry = AtomRegistry.make();
+  yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+  registry.set(managedRelaySessionAtom, {
+    accountId: "owner",
+    readClerkToken: () => Effect.succeed("owner-token"),
+  });
+  const controls = createThreadVmControlAtoms(
+    Atom.runtime(tenancyLayer({ relayUrl }).pipe(Layer.provide(remoteHttpClientLayer(fetchFn)))),
+    () => Atom.make(source),
+    undefined,
+    archived ? () => archived : undefined,
+    detail ? () => detail : undefined,
+  );
+  const query = controls.queryAtom(environmentId, threadId);
+  return { registry, controls, query };
+});
+
+describe("VM host availability", () => {
+  it.effect("awaits a saved-view status refresh using reads only", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        const calls: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init),
+            path = new URL(request.url).pathname;
+          expect(request.method).toBe("GET");
+          calls.push(path);
+          if (path === "/health") return Response.json({ ok: true, service: "relay" });
+          expect(path).toBe(`/v1/threads/${threadId}/vm-status`);
+          requested.resolve();
+          await release.promise;
+          return Response.json(status);
+        });
+        let finished = false;
+        const pending = yield* Effect.promise(() =>
+          h.controls.refreshStatus.run(h.registry, { environmentId, threadId }).then((result) => {
+            finished = true;
+            return result;
+          }),
+        ).pipe(Effect.forkChild);
+        yield* Effect.promise(() => requested.promise);
+        expect(finished).toBe(false);
+        release.resolve();
+        expect((yield* Fiber.join(pending))._tag).toBe("Success");
+        expect(calls).toEqual([`/v1/threads/${threadId}/vm-status`, "/health"]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "uses the relay capability without signing in and treats older relays as unconfigured",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const configured of [true, false, undefined]) {
+            let requests = 0;
+            const h = yield* harness(async (url, init) => {
+              const request = new Request(url, init);
+              expect(request.url).toBe(`${relayUrl}/health`);
+              expect(request.method).toBe("GET");
+              expect(request.headers.get("authorization")).toBeNull();
+              requests++;
+              return Response.json({ ok: true, service: "relay", threadVmConfigured: configured });
+            });
+            h.registry.set(managedRelaySessionAtom, null);
+            const query = h.controls.hostConfigurationQueryAtom,
+              view = h.controls.hostConfigurationAtom;
+            yield* AtomRegistry.mount(h.registry, view);
+            expect(
+              yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }),
+            ).toBe(configured === true);
+            const expected = configured === true ? null : "VM host not configured";
+            expect(h.registry.get(view).unavailableReason).toBe(expected);
+            expect(h.registry.get(view).unavailableReason).toBe(expected);
+            expect(requests).toBe(1);
+          }
+        }),
+      ),
+  );
+
+  it.effect("disables new VM moves during refresh and reflects changed relay configuration", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const response = Promise.withResolvers<Response>();
+        let requests = 0;
+        const h = yield* harness(async () => {
+          requests++;
+          return requests === 1
+            ? Response.json({ ok: true, service: "relay", threadVmConfigured: true })
+            : response.promise;
+        });
+        const query = h.controls.hostConfigurationQueryAtom,
+          view = h.controls.hostConfigurationAtom;
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view).unavailableReason).toBeNull();
+        h.registry.refresh(query);
+        expect(h.registry.get(view).unavailableReason).toBe("Checking VM host…");
+        response.resolve(Response.json({ ok: true, service: "relay", threadVmConfigured: false }));
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view).unavailableReason).toBe("VM host not configured");
+        expect(requests).toBe(2);
+      }),
+    ),
+  );
+
+  it.effect("distinguishes a failed capability check from an unconfigured host", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const reply of [
+          () => Response.json({ error: "unavailable" }, { status: 503 }),
+          () => Response.json({ ok: true, service: "relay", threadVmConfigured: "true" }),
+        ]) {
+          const h = yield* harness(async () => reply());
+          const query = h.controls.hostConfigurationQueryAtom,
+            view = h.controls.hostConfigurationAtom;
+          yield* AtomRegistry.mount(h.registry, view);
+          const result = yield* Effect.result(
+            AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }),
+          );
+          expect(result._tag).toBe("Failure");
+          expect(h.registry.get(view).unavailableReason).toBe(
+            "Could not check VM host. Reopen Run on to retry.",
+          );
+        }
+      }),
+    ),
+  );
+});
+
+const guestSnapshot: OrchestrationShellSnapshot = {
+  ...snapshot,
+  threads: snapshot.threads.map((thread) => ({
+    ...thread,
+    relayRouting: {
+      relayUrl: "https://guest-relay.example.test",
+      generation: 1,
+      phase: "active",
+    },
+  })),
+};
+const currentPlacement = {
+  threadId,
+  organizationId: "org",
+  repositoryId: "repo",
+  ownerUserId: "owner",
+  environmentId,
+  projectId: "project",
+  generation: 1,
+  operationId: null,
+};
+
+describe("cold VM relay transport bootstrap", () => {
+  it.effect(
+    "opens a deep link with one exact placement read and no library dialog or VM wake",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          const calls: string[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            expect(new URL(request.url).origin).toBe(relayUrl);
+            expect(request.method).toBe("GET");
+            expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+            calls.push(path);
+            return Response.json(path.endsWith("/placement") ? currentPlacement : status);
+          }, guestSnapshot);
+          yield* AtomRegistry.mount(h.registry, h.query);
+          expect(
+            (yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }))
+              ?.status,
+          ).toEqual(status);
+          expect(h.registry.get(h.controls.routeAtom(environmentId, threadId))).toEqual({
+            relayUrl,
+            generation: 1,
+            phase: "active",
+          });
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(45_000));
+          expect(calls.filter((path) => path.endsWith("/placement"))).toHaveLength(1);
+          expect(calls.filter((path) => path.endsWith("/vm-status")).length).toBeGreaterThan(1);
+        }),
+      ),
+  );
+
+  it.effect(
+    "denies an owner, generation or thread mismatch without retrying on status refresh",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const placement of [
+            { ...currentPlacement, environmentId: "another-owner" },
+            { ...currentPlacement, generation: 2 },
+            { ...currentPlacement, threadId: "another-thread" },
+          ]) {
+            let reads = 0;
+            const h = yield* harness(async (url) => {
+              expect(new URL(String(url)).pathname.endsWith("/placement")).toBe(true);
+              reads++;
+              return Response.json(placement);
+            }, guestSnapshot);
+            for (let retry = 0; retry < 2; retry++) {
+              h.registry.refresh(h.query);
+              expect(
+                (yield* Effect.result(
+                  AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }),
+                ))._tag,
+              ).toBe("Failure");
+            }
+            expect(reads).toBe(1);
+            expect(
+              h.registry.get(portableThreadClientRouteAtom(environmentId, threadId)),
+            ).toBeNull();
+          }
+        }),
+      ),
+  );
+  it.effect(
+    "retries a transient placement failure only after the selected thread's explicit Retry",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let placements = 0;
+          const h = yield* harness(async (url) => {
+            if (String(url).endsWith("/placement")) {
+              placements++;
+              return placements === 1
+                ? Response.json({ error: "Temporarily unavailable" }, { status: 503 })
+                : Response.json(currentPlacement);
+            }
+            return Response.json(status);
+          }, guestSnapshot);
+          yield* AtomRegistry.mount(h.registry, h.query);
+          expect(
+            (yield* Effect.result(
+              AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }),
+            ))._tag,
+          ).toBe("Failure");
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(45_000));
+          expect(placements).toBe(1);
+          h.controls.refresh(h.registry, environmentId, threadId);
+          expect(
+            (yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }))
+              ?.status,
+          ).toEqual(status);
+          expect(placements).toBe(2);
+        }),
+      ),
+  );
+
+  it.effect(
+    "verifies a new configured relay after a successful proof from the previous relay",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () => Effect.succeed("owner-token"),
+          });
+          const configured = Atom.make(relayUrl),
+            calls: string[] = [];
+          const fetchFn: typeof fetch = async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            expect(request.method).toBe("GET");
+            calls.push(new URL(request.url).origin + path);
+            if (path.endsWith("/portable"))
+              return Response.json({
+                entries: [
+                  {
+                    title: "VM",
+                    modelSelection: snapshot.threads[0]!.modelSelection,
+                    createdAt: at,
+                    updatedAt: at,
+                    placement: currentPlacement,
+                  },
+                ],
+                next: null,
+              });
+            return Response.json(path.endsWith("/placement") ? currentPlacement : status);
+          };
+          const runtime = Atom.runtime((get) =>
+              tenancyLayer({ relayUrl: get(configured) }).pipe(
+                Layer.provide(remoteHttpClientLayer(fetchFn)),
+              ),
+            ),
+            library = createPortableThreadLibraryAtoms(runtime),
+            controls = createThreadVmControlAtoms(runtime, () => Atom.make(guestSnapshot)),
+            query = controls.queryAtom(environmentId, threadId);
+          expect((yield* Effect.promise(() => library.loadIndex.run(registry, {})))._tag).toBe(
+            "Success",
+          );
+          yield* AtomRegistry.mount(registry, query);
+          yield* AtomRegistry.getResult(registry, query, { suspendOnWaiting: true });
+          registry.set(configured, "https://other-relay.example.test");
+          expect(
+            (yield* AtomRegistry.getResult(registry, query, { suspendOnWaiting: true }))?.status,
+          ).toEqual(status);
+          expect(registry.get(controls.routeAtom(environmentId, threadId))?.relayUrl).toBe(
+            "https://other-relay.example.test",
+          );
+          expect(calls.filter((call) => call.endsWith("/placement"))).toEqual([
+            "https://other-relay.example.test/v1/threads/vm-thread/placement",
+          ]);
+        }),
+      ),
+  );
+
+  it.effect("keeps a newer placement proof when an older generation's read completes later", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = AtomRegistry.make();
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+        const session = { accountId: "owner", readClerkToken: () => Effect.succeed("owner-token") };
+        registry.set(managedRelaySessionAtom, session);
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const relay = tenancyLayer({ relayUrl }).pipe(
+          Layer.provide(
+            remoteHttpClientLayer(async () => {
+              if (++reads === 1) {
+                requested.resolve();
+                await release.promise;
+                return Response.json(currentPlacement);
+              }
+              return Response.json({ ...currentPlacement, generation: 2 });
+            }),
+          ),
+        );
+        const older = yield* verifyPortableThreadClientRoute(registry, {
+          environmentId,
+          threadId,
+          generation: 1,
+          session,
+        }).pipe(Effect.provide(relay), Effect.forkChild);
+        yield* Effect.promise(() => requested.promise);
+        yield* verifyPortableThreadClientRoute(registry, {
+          environmentId,
+          threadId,
+          generation: 2,
+          session,
+        }).pipe(Effect.provide(relay));
+        release.resolve();
+        yield* Fiber.join(older);
+        expect(
+          registry.get(portableThreadClientRouteAtom(environmentId, threadId))?.generation,
+        ).toBe(2);
+      }),
+    ),
+  );
+
+  it.effect("discards an in-flight proof after the session or configured relay changes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const change of ["session", "relay"] as const) {
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          const session = {
+            accountId: "owner",
+            readClerkToken: () => Effect.succeed("owner-token"),
+          };
+          registry.set(managedRelaySessionAtom, session);
+          const configured = Atom.make(relayUrl),
+            requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>(),
+            calls: string[] = [];
+          const fetchFn: typeof fetch = async (url, init) => {
+            const request = new Request(url, init);
+            expect(request.method).toBe("GET");
+            expect(new URL(request.url).pathname.endsWith("/placement")).toBe(true);
+            calls.push(new URL(request.url).origin);
+            if (calls.length > 1)
+              return Response.json({ error: "No matching placement" }, { status: 403 });
+            requested.resolve();
+            await release.promise;
+            return Response.json(currentPlacement);
+          };
+          const controls = createThreadVmControlAtoms(
+              Atom.runtime((get) =>
+                tenancyLayer({ relayUrl: get(configured) }).pipe(
+                  Layer.provide(remoteHttpClientLayer(fetchFn)),
+                ),
+              ),
+              () => Atom.make(guestSnapshot),
+            ),
+            query = controls.queryAtom(environmentId, threadId);
+          const pending = yield* AtomRegistry.getResult(registry, query, {
+            suspendOnWaiting: true,
+          }).pipe(Effect.result, Effect.forkChild);
+          yield* Effect.promise(() => requested.promise);
+          if (change === "session") registry.set(managedRelaySessionAtom, { ...session });
+          else registry.set(configured, "https://other-relay.example.test");
+          release.resolve();
+          expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+          expect(registry.get(portableThreadClientRouteAtom(environmentId, threadId))).toBeNull();
+          expect(calls).toEqual([
+            relayUrl,
+            change === "relay" ? "https://other-relay.example.test" : relayUrl,
+          ]);
+        }
+      }),
+    ),
+  );
+});
+
+describe("completed thread location handoff", () => {
+  const placement = {
+    threadId,
+    organizationId: "org",
+    repositoryId: "repo",
+    ownerUserId: "owner",
+    environmentId,
+    projectId: "project",
+    generation: 1,
+    operationId: "moving",
+  };
+  const activeSnapshot: OrchestrationShellSnapshot = {
+    ...snapshot,
+    threads: [
+      { ...snapshot.threads[0]!, relayRouting: { relayUrl, generation: 1, phase: "active" } },
+    ],
+  };
+  const checkInput = { environmentId, threadId, accountId: "owner", relayUrl };
+
+  it.effect("shows a pending move failure and keeps polling until it clears and completes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        const detail = "Codex could not resume the transferred conversation: incompatible history.";
+        let reads = 0;
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json(
+            reads < 3
+              ? { ...placement, moveFailureDetail: reads === 1 ? detail : null }
+              : {
+                  ...placement,
+                  environmentId: "mac",
+                  generation: 2,
+                  operationId: null,
+                  moveFailureDetail: "An old failure must not follow a completed move.",
+                },
+          );
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: true,
+          error: null,
+          moveFailureDetail: detail,
+          placement: { operationId: placement.operationId },
+        });
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+        ).toMatchObject({ operationId: placement.operationId });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(2);
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: true,
+          error: null,
+          moveFailureDetail: null,
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(3);
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: false,
+          moveFailureDetail: null,
+          destination: { environmentId: "mac", generation: 2 },
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+        expect(reads).toBe(3);
+      }),
+    ),
+  );
+
+  for (const status of [503, 404]) {
+    it.effect(`handles a ${status} placement read while polling a known cancellation`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          const detail = Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>({
+            promptQueue: {
+              enabled: true,
+              revision: 1,
+              pauseReason: null,
+              handoff: null,
+              awaitingTurnId: null,
+              admissions: [],
+              finalizedTurnId: null,
+              entries: [
+                {
+                  kind: "move",
+                  state: "moving",
+                  operationId: CommandId.make("moving"),
+                  messageId: MessageId.make("move-entry"),
+                  destination: { kind: "vm" },
+                  revision: 1,
+                  acceptedSequence: 1,
+                  createdAt: at,
+                },
+              ],
+            },
+          });
+          const h = yield* harness(
+            async () => {
+              reads++;
+              if (reads === 2)
+                return status === 404
+                  ? Response.json(
+                      {
+                        _tag: "RelayTenancyNotFoundError",
+                        code: "tenancy_not_found",
+                        reason: "thread_not_found",
+                        traceId: "trace",
+                      },
+                      { status },
+                    )
+                  : Response.json({ error: "Temporarily unavailable" }, { status });
+              return Response.json({
+                ...placement,
+                operationId: reads === 1 ? "moving" : null,
+                activeMove: {
+                  operationId: "moving",
+                  sourceEnvironmentId: environmentId,
+                  sourceGeneration: 1,
+                  sourceKind: "environment",
+                  destinationEnvironmentId: "vm",
+                  destinationProjectId: "vm-project",
+                  destinationKind: "vm",
+                  phase: reads === 1 ? "reopening" : "aborted",
+                  cancellationMode: "direct",
+                },
+              });
+            },
+            activeSnapshot,
+            null,
+            detail,
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId),
+            query = h.controls.locationQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view)).toMatchObject({ movePending: true, destination: null });
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+          expect(reads).toBe(2);
+          expect(h.registry.get(view)?.error).toBeTruthy();
+          expect(h.registry.get(view)?.movePending).toBe(status === 503);
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(8_000));
+          expect(reads).toBe(status === 404 ? 2 : 3);
+          if (status === 503) {
+            expect(h.registry.get(view)).toBeNull();
+            expect(
+              h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+            ).toMatchObject({ operationId: null, activeMove: { phase: "aborted" } });
+          }
+        }),
+      ),
+    );
+  }
+
+  it.effect("hides a failure belonging to another claimed move", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const queue: ThreadPromptQueue = {
+          enabled: true,
+          revision: 1,
+          pauseReason: null,
+          handoff: null,
+          awaitingTurnId: null,
+          admissions: [],
+          finalizedTurnId: null,
+          entries: [
+            {
+              kind: "move",
+              state: "moving",
+              operationId: CommandId.make("new-move"),
+              messageId: MessageId.make("new-move-entry"),
+              destination: { kind: "vm" },
+              revision: 1,
+              acceptedSequence: 1,
+              createdAt: at,
+            },
+          ],
+        };
+        const h = yield* harness(
+          async () => Response.json({ ...placement, moveFailureDetail: "Old move failed." }),
+          activeSnapshot,
+          null,
+          Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>({ promptQueue: queue }),
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.locationQueryAtom(environmentId, threadId),
+          {
+            suspendOnWaiting: true,
+          },
+        );
+        expect(h.registry.get(view)).toMatchObject({ movePending: true, moveFailureDetail: null });
+      }),
+    ),
+  );
+
+  it.effect("hides a cached move failure as soon as the signed-in account changes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async () => {
+          if (++reads > 1) await release.promise;
+          return Response.json({ ...placement, moveFailureDetail: "Private move failure." });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.moveFailureDetail).toBe("Private move failure.");
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "other",
+          readClerkToken: () => Effect.succeed("other-token"),
+        });
+        expect(h.registry.get(view)?.moveFailureDetail ?? null).toBeNull();
+        release.resolve();
+      }),
+    ),
+  );
+
+  it.effect(
+    "confirms cancellation after the claimed queue move disappears, then stops tracking",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          const queue: ThreadPromptQueue = {
+            enabled: true,
+            revision: 1,
+            pauseReason: null,
+            handoff: null,
+            awaitingTurnId: null,
+            admissions: [],
+            finalizedTurnId: null,
+            entries: [
+              {
+                kind: "move",
+                state: "cancelling",
+                operationId: CommandId.make(placement.operationId),
+                messageId: MessageId.make("cancelled-move"),
+                destination: { kind: "vm" },
+                revision: 1,
+                acceptedSequence: 1,
+                createdAt: at,
+              },
+            ],
+          };
+          for (const outcome of ["stable", "pending", "denied"] as const) {
+            let cancelled = false,
+              reads = 0;
+            const detail = Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>({
+              promptQueue: queue,
+            });
+            const h = yield* harness(
+              async () => {
+                reads++;
+                if (cancelled && reads === 3 && outcome === "denied")
+                  return Response.json({ error: "Access removed" }, { status: 403 });
+                const pending = !cancelled || (reads === 3 && outcome === "pending");
+                return Response.json({
+                  ...placement,
+                  operationId: pending ? placement.operationId : null,
+                });
+              },
+              activeSnapshot,
+              null,
+              detail,
+            );
+            const view = h.controls.locationViewAtom(environmentId, threadId),
+              query = h.controls.locationQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+            expect(h.registry.get(view)?.movePending).toBe(true);
+            cancelled = true;
+            h.registry.set(detail, { promptQueue: { ...queue, revision: 2, entries: [] } });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+              Effect.result,
+            );
+            expect(reads).toBe(3);
+            if (outcome === "pending") {
+              expect(h.registry.get(view)?.movePending).toBe(true);
+              yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+              expect(reads).toBe(4);
+            } else if (outcome === "denied") {
+              expect(h.registry.get(view)?.error).toBeTruthy();
+              expect(h.registry.get(view)?.movePending).toBe(false);
+              yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+              expect(reads).toBe(3);
+              yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+              expect(reads).toBe(4);
+            }
+            expect(h.registry.get(view)).toBeNull();
+            expect(
+              h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId))
+                ?.operationId,
+            ).toBeNull();
+            const finalReads = reads;
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+            expect(reads).toBe(finalReads);
+          }
+        }),
+      ),
+  );
+
+  it.effect("keeps tracking a move when an explicit check supersedes the automatic lookup", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const destination = {
+          ...placement,
+          environmentId: "mac",
+          generation: 2,
+          operationId: null,
+        };
+        const h = yield* harness(async () => {
+          const request = ++reads;
+          if (request === 1) {
+            requested.resolve();
+            await release.promise;
+          }
+          return Response.json(
+            request === 1
+              ? placement
+              : request === 2
+                ? { ...destination, operationId: "activating" }
+                : destination,
+          );
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => requested.promise);
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Success");
+        release.resolve();
+        expect(
+          (yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+            Effect.result,
+          ))._tag,
+        ).toBe("Failure");
+        expect(h.registry.get(view)).toMatchObject({ movePending: true, error: null });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(3);
+        expect(h.registry.get(view)?.destination).toEqual({
+          environmentId: "mac",
+          threadId,
+          generation: 2,
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(4_000));
+        expect(reads).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect("publishes explicit recovery after the cached active source misses cutover", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const destination = {
+          ...placement,
+          environmentId: "mac",
+          generation: 2,
+          operationId: null,
+        };
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json(destination);
+        }, activeSnapshot);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        expect(h.registry.get(view)).toBeNull();
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Success");
+        expect(h.registry.get(view)).toMatchObject({
+          recoveryRequested: true,
+          destination: { environmentId: "mac", threadId, generation: 2 },
+          placement: destination,
+        });
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(EnvironmentId.make("mac"), threadId)),
+        ).toEqual(destination);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+        expect(reads).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "rechecks pending recovery and accepts ready and new operations at the same generation",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let reads = 0;
+          const h = yield* harness(
+            async () =>
+              Response.json({
+                ...placement,
+                environmentId: "mac",
+                generation: 2,
+                operationId: ++reads === 2 ? null : `move-${reads}`,
+              }),
+            activeSnapshot,
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          for (const pending of [true, false, true]) {
+            expect(
+              (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))
+                ._tag,
+            ).toBe("Success");
+            expect(h.registry.get(view)).toMatchObject({
+              recoveryRequested: true,
+              movePending: pending,
+            });
+            expect(h.registry.get(view)?.destination?.generation ?? null).toBe(pending ? null : 2);
+          }
+          expect(reads).toBe(3);
+        }),
+      ),
+  );
+
+  it.effect("does not let an older pending response replace a newer ready response", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async () => {
+          if (++reads === 1) {
+            requested.resolve();
+            await release.promise;
+            return Response.json({ ...placement, environmentId: "mac", generation: 2 });
+          }
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 2,
+            operationId: null,
+          });
+        }, activeSnapshot);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const older = h.controls.checkLocation.run(h.registry, checkInput);
+        yield* Effect.promise(() => requested.promise);
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Success");
+        release.resolve();
+        expect((yield* Effect.promise(() => older))._tag).toBe("Failure");
+        expect(h.registry.get(view)).toMatchObject({
+          movePending: false,
+          destination: { generation: 2 },
+        });
+      }),
+    ),
+  );
+
+  it.effect("ignores a later lower generation without replacing the confirmed destination", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let reads = 0;
+        const h = yield* harness(
+          async () =>
+            Response.json({
+              ...placement,
+              environmentId: "mac",
+              generation: ++reads === 1 ? 3 : 2,
+              operationId: null,
+            }),
+          activeSnapshot,
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+        expect(
+          (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))._tag,
+        ).toBe("Failure");
+        expect(h.registry.get(view)?.destination?.generation).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect(
+    "clears successful recovery after access is removed and permits an explicit retry",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          const h = yield* harness(
+            async () =>
+              ++reads === 2
+                ? Response.json({ error: "Access removed" }, { status: 403 })
+                : Response.json({
+                    ...placement,
+                    environmentId: "mac",
+                    generation: reads + 1,
+                    operationId: null,
+                  }),
+            activeSnapshot,
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+          expect(h.registry.get(view)?.destination?.generation).toBe(2);
+          expect(
+            (yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput)))
+              ._tag,
+          ).toBe("Failure");
+          expect(h.registry.get(view)?.error).toBeTruthy();
+          expect(h.registry.get(view)?.destination).toBeNull();
+          expect(
+            h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+          ).toBeNull();
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+          expect(reads).toBe(2);
+          yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+          expect(h.registry.get(view)?.destination?.generation).toBe(4);
+        }),
+      ),
+  );
+
+  it.effect("hides successful recovery once the current active location is confirmed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(
+          async () => Response.json({ ...placement, operationId: null }),
+          activeSnapshot,
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+        expect(h.registry.get(view)).toBeNull();
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId))?.environmentId,
+        ).toBe(environmentId);
+      }),
+    ),
+  );
+
+  it.effect("discards explicit recovery when the signed-in session changes while loading", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const h = yield* harness(async () => {
+          requested.resolve();
+          await release.promise;
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 2,
+            operationId: null,
+          });
+        }, activeSnapshot);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const pending = h.controls.checkLocation.run(h.registry, checkInput);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "other",
+          readClerkToken: () => Effect.succeed("other-token"),
+        });
+        release.resolve();
+        expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+        expect(h.registry.get(view)).toBeNull();
+        expect(
+          h.registry.get(h.controls.confirmedLocationAtom(environmentId, threadId)),
+        ).toBeNull();
+      }),
+    ),
+  );
+
+  it.effect("keeps an explicit result when an older automatic lookup completes later", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(async () => {
+          if (++reads === 1) {
+            requested.resolve();
+            await release.promise;
+            return Response.json(placement);
+          }
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 3,
+            operationId: null,
+          });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const automatic = yield* AtomRegistry.getResult(h.registry, query, {
+          suspendOnWaiting: true,
+        }).pipe(Effect.result, Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        yield* Effect.promise(() => h.controls.checkLocation.run(h.registry, checkInput));
+        release.resolve();
+        yield* Fiber.join(automatic);
+        expect(h.registry.get(view)).toMatchObject({ error: null, destination: { generation: 3 } });
+      }),
+    ),
+  );
+
+  it.effect(
+    "invalidates a successful location and late checks when the configured relay changes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () => Effect.succeed("owner-token"),
+          });
+          const configured = Atom.make(relayUrl),
+            source = Atom.make(activeSnapshot),
+            requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          let reads = 0;
+          const controls = createThreadVmControlAtoms(
+            Atom.runtime((get) =>
+              tenancyLayer({ relayUrl: get(configured) }).pipe(
+                Layer.provide(
+                  remoteHttpClientLayer(async () => {
+                    if (++reads === 2) {
+                      requested.resolve();
+                      await release.promise;
+                    }
+                    return Response.json({
+                      ...placement,
+                      environmentId: "mac",
+                      generation: 2,
+                      operationId: null,
+                    });
+                  }),
+                ),
+              ),
+            ),
+            () => source,
+          );
+          const view = controls.locationViewAtom(environmentId, threadId),
+            confirmed = controls.confirmedLocationAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(registry, view);
+          yield* Effect.promise(() => controls.checkLocation.run(registry, checkInput));
+          expect(registry.get(confirmed)?.generation).toBe(2);
+          const pending = controls.checkLocation.run(registry, checkInput);
+          yield* Effect.promise(() => requested.promise);
+          registry.set(configured, "https://another-relay.example.test");
+          release.resolve();
+          expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+          expect(registry.get(confirmed)).toBeNull();
+          expect(registry.get(view)).toBeNull();
+        }),
+      ),
+  );
+
+  it.effect(
+    "rejects a late recovery after the source route generation changes without leaving it loading",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () => Effect.succeed("owner-token"),
+          });
+          const source = Atom.make(activeSnapshot),
+            requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const controls = createThreadVmControlAtoms(
+            Atom.runtime(
+              tenancyLayer({ relayUrl }).pipe(
+                Layer.provide(
+                  remoteHttpClientLayer(async () => {
+                    requested.resolve();
+                    await release.promise;
+                    return Response.json({
+                      ...placement,
+                      environmentId: "mac",
+                      generation: 2,
+                      operationId: null,
+                    });
+                  }),
+                ),
+              ),
+            ),
+            () => source,
+          );
+          const view = controls.locationViewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(registry, view);
+          const pending = controls.checkLocation.run(registry, checkInput);
+          yield* Effect.promise(() => requested.promise);
+          registry.set(source, {
+            ...activeSnapshot,
+            threads: [
+              {
+                ...activeSnapshot.threads[0]!,
+                relayRouting: { relayUrl, generation: 3, phase: "active" },
+              },
+            ],
+          });
+          release.resolve();
+          expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+          expect(registry.get(view)?.destination).toBeNull();
+          expect(registry.get(view)?.isPending).toBe(false);
+          expect(registry.get(view)?.error).toBeTruthy();
+        }),
+      ),
+  );
+
+  it.effect("explicit recovery reads fresh placement and rejects another account", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let reads = 0;
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json({ ...placement, generation: reads, operationId: null });
+        });
+        const input = { environmentId, threadId, accountId: "owner", relayUrl };
+        for (const generation of [1, 2]) {
+          const result = yield* Effect.promise(() =>
+            h.controls.checkLocation.run(h.registry, input),
+          );
+          expect(result._tag).toBe("Success");
+          if (result._tag === "Success") expect(result.value.generation).toBe(generation);
+        }
+        const denied = yield* Effect.promise(() =>
+          h.controls.checkLocation.run(h.registry, { ...input, accountId: "other" }),
+        );
+        expect(denied._tag).toBe("Failure");
+        const changedRelay = yield* Effect.promise(() =>
+          h.controls.checkLocation.run(h.registry, {
+            ...input,
+            relayUrl: "https://another-relay.example.test",
+          }),
+        );
+        expect(changedRelay._tag).toBe("Failure");
+        expect(reads).toBe(2);
+      }),
+    ),
+  );
+  it.effect("recovers a cold stale route with no source snapshot using one relay read", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const h = yield* harness(
+          async (url, init) => {
+            const request = new Request(url, init);
+            expect(request.url).toBe(relayUrl + "/v1/threads/vm-thread/placement");
+            expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+            reads++;
+            return Response.json({
+              ...placement,
+              environmentId: "mac",
+              generation: 3,
+              operationId: null,
+            });
+          },
+          { ...snapshot, threads: [] },
+        );
+        const view = h.controls.locationViewAtom(environmentId, threadId, true),
+          query = h.controls.locationQueryAtom(environmentId, threadId, true);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.destination).toEqual({
+          environmentId: "mac",
+          threadId,
+          generation: 3,
+        });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+        expect(reads).toBe(1);
+      }),
+    ),
+  );
+  it.effect(
+    "keeps checking a relay cancellation without a source queue until reopening finishes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          let reopened = false;
+          const h = yield* harness(
+            async (url, init) => {
+              expect(new URL(new Request(url, init).url).pathname).toBe(
+                "/v1/threads/vm-thread/placement",
+              );
+              reads++;
+              return Response.json({
+                ...placement,
+                environmentId: "vm",
+                generation: 3,
+                operationId: null,
+                activeMove: {
+                  operationId: "cancelled-move",
+                  sourceEnvironmentId: "vm",
+                  sourceGeneration: 3,
+                  sourceKind: "vm",
+                  destinationEnvironmentId: "mac",
+                  destinationProjectId: "project",
+                  destinationKind: "environment",
+                  phase: reopened ? "aborted" : "reopening",
+                  cancellationMode: "legacy",
+                },
+              });
+            },
+            { ...snapshot, threads: [] },
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId, true);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(
+            h.registry,
+            h.controls.locationQueryAtom(environmentId, threadId, true),
+            {
+              suspendOnWaiting: true,
+            },
+          );
+          expect(h.registry.get(view)).toMatchObject({ movePending: true, destination: null });
+          const pendingReads = reads;
+          reopened = true;
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(4_000));
+          expect(reads).toBeGreaterThan(pendingReads);
+          expect(h.registry.get(view)).toMatchObject({
+            movePending: false,
+            destination: { environmentId: "vm", threadId, generation: 3 },
+          });
+          const finishedReads = reads;
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+          expect(reads).toBe(finishedReads);
+        }),
+      ),
+  );
+  it.effect("a cold pending move or denied lookup waits for explicit retry without polling", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        for (const denied of [false, true]) {
+          let reads = 0;
+          const h = yield* harness(
+            async () => {
+              reads++;
+              return denied
+                ? Response.json({ error: "Access removed" }, { status: 403 })
+                : Response.json(placement);
+            },
+            { ...snapshot, threads: [] },
+          );
+          const view = h.controls.locationViewAtom(environmentId, threadId, true),
+            query = h.controls.locationQueryAtom(environmentId, threadId, true);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+            Effect.result,
+          );
+          expect(h.registry.get(view)?.destination).toBeNull();
+          if (denied) expect(h.registry.get(view)?.error).toBeTruthy();
+          else expect(h.registry.get(view)?.movePending).toBe(true);
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+          expect(reads).toBe(1);
+          h.registry.refresh(query);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+            Effect.result,
+          );
+          expect(reads).toBe(2);
+        }
+      }),
+    ),
+  );
+  it.effect("ignores a cold route reply when the account changes while it is loading", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* harness(
+          async () => {
+            reads++;
+            requested.resolve();
+            await release.promise;
+            return Response.json({
+              ...placement,
+              environmentId: "mac",
+              generation: 3,
+              operationId: null,
+            });
+          },
+          { ...snapshot, threads: [] },
+        );
+        h.registry.set(managedRelaySessionAtom, null);
+        const view = h.controls.locationViewAtom(environmentId, threadId, true),
+          query = h.controls.locationQueryAtom(environmentId, threadId, true);
+        yield* AtomRegistry.mount(h.registry, view);
+        expect(h.registry.get(view)).toBeNull();
+        expect(reads).toBe(0);
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "owner",
+          readClerkToken: () => Effect.succeed("owner-token"),
+        });
+        const pending = yield* AtomRegistry.getResult(h.registry, query, {
+          suspendOnWaiting: true,
+        }).pipe(Effect.result, Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, null);
+        release.resolve();
+        yield* Fiber.join(pending);
+        expect(h.registry.get(view)).toBeNull();
+      }),
+    ),
+  );
+  it.effect(
+    "keeps polling a claimed move when its first placement read predates relay admission",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          const active = {
+            ...snapshot,
+            threads: [
+              {
+                ...snapshot.threads[0]!,
+                relayRouting: { relayUrl, generation: 1, phase: "active" as const },
+              },
+            ],
+          };
+          for (const state of ["moving", "blocked", "cancelling"] as const) {
+            const detail = Atom.make<Pick<OrchestrationThread, "promptQueue"> | null>(null);
+            let reads = 0;
+            const h = yield* harness(
+              async (url) => {
+                expect(String(url)).toBe(relayUrl + "/v1/threads/vm-thread/placement");
+                reads++;
+                return Response.json(
+                  reads === 1
+                    ? { ...placement, operationId: null }
+                    : { ...placement, environmentId: "mac", generation: 2, operationId: null },
+                );
+              },
+              active,
+              null,
+              detail,
+            );
+            const view = h.controls.locationViewAtom(environmentId, threadId),
+              query = h.controls.locationQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            expect(h.registry.get(view)).toBeNull();
+            expect(reads).toBe(0);
+            const promptQueue: ThreadPromptQueue = {
+              enabled: true,
+              revision: 1,
+              pauseReason: null,
+              handoff: null,
+              awaitingTurnId: null,
+              admissions: [],
+              finalizedTurnId: null,
+              entries: [
+                {
+                  kind: "move",
+                  state,
+                  operationId: CommandId.make("move-operation"),
+                  messageId: MessageId.make("move-entry"),
+                  destination: { kind: "vm" },
+                  revision: 1,
+                  acceptedSequence: 1,
+                  createdAt: at,
+                },
+              ],
+            };
+            h.registry.set(detail, { promptQueue });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.destination).toBeNull();
+            expect(reads).toBe(1);
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+            expect(h.registry.get(view)?.destination).toEqual({
+              environmentId: "mac",
+              threadId,
+              generation: 2,
+            });
+            expect(reads).toBe(2);
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+            expect(reads).toBe(2);
+          }
+        }),
+      ),
+  );
+  it.effect(
+    "follows a completed VM-to-local cutover without querying the disconnected source and stops reading",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          let reads = 0;
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            expect(request.method).toBe("GET");
+            expect(request.url).toBe(relayUrl + "/v1/threads/vm-thread/placement");
+            reads++;
+            return Response.json(
+              reads === 1
+                ? placement
+                : { ...placement, environmentId: "mac", generation: 2, operationId: null },
+            );
+          });
+          const view = h.controls.locationViewAtom(environmentId, threadId),
+            query = h.controls.locationQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view)?.destination).toBeNull();
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+          expect(h.registry.get(view)?.destination).toEqual({
+            environmentId: "mac",
+            threadId,
+            generation: 2,
+          });
+          expect(reads).toBe(2);
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+          expect(reads).toBe(2);
+        }),
+      ),
+  );
+  it.effect("does not poll ordinary active chats", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const active = {
+          ...snapshot,
+          threads: [
+            {
+              ...snapshot.threads[0]!,
+              relayRouting: { relayUrl, generation: 1, phase: "active" as const },
+            },
+          ],
+        };
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json(placement);
+        }, active);
+        const view = h.controls.locationViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(20_000));
+        expect(h.registry.get(view)).toBeNull();
+        expect(reads).toBe(0);
+      }),
+    ),
+  );
+  it.effect("does not keep polling a paused thread with no move operation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json({ ...placement, operationId: null });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.destination).toBeNull();
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+        expect(reads).toBe(1);
+      }),
+    ),
+  );
+  it.effect("stops automatic lookups after an access failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const h = yield* harness(async () => {
+          reads++;
+          return Response.json({ error: "Access removed" }, { status: 403 });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+          Effect.result,
+        );
+        expect(h.registry.get(view)?.error).toBeTruthy();
+        expect(h.registry.get(view)?.destination).toBeNull();
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+        expect(reads).toBe(1);
+      }),
+    ),
+  );
+  it.effect("discards a late cutover reply after signing out", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const h = yield* harness(async () => {
+          requested.resolve();
+          await release.promise;
+          return Response.json({
+            ...placement,
+            environmentId: "mac",
+            generation: 2,
+            operationId: null,
+          });
+        });
+        const view = h.controls.locationViewAtom(environmentId, threadId),
+          query = h.controls.locationQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        const pending = yield* AtomRegistry.getResult(h.registry, query, {
+          suspendOnWaiting: true,
+        }).pipe(Effect.result, Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, null);
+        release.resolve();
+        yield* Fiber.join(pending);
+        expect(h.registry.get(view)).toBeNull();
+      }),
+    ),
+  );
+});
+
+describe("owner-bound pending VM authentication", () => {
+  const authPlacement = (
+    waitingForAuth: ThreadMoveWaitingForAuth | null = "personal_sign_in",
+    binding = authBinding,
+  ): RelayPortableThreadPlacement => ({
+    ...currentPlacement,
+    operationId: binding.operationId,
+    moveProgress: [
+      {
+        ...binding,
+        threadId,
+        participant: "destination",
+        attempt: 1,
+        revision: 1,
+        stage: "downloading",
+        completedBytes: 0,
+        totalBytes: null,
+        completedArtifacts: 0,
+        totalArtifacts: null,
+        waitingForAuth,
+        updatedAt: at,
+      },
+    ],
+  });
+  const rememberAuthPlacement = (
+    h: Effect.Success<ReturnType<typeof harness>>,
+    placement = authPlacement(),
+  ) =>
+    rememberPortableThreadPlacement(
+      h.registry,
+      h.registry.get(managedRelaySessionAtom)!,
+      relayUrl,
+      placement,
+    );
+  const authHarness = Effect.fnUntraced(function* (fetchFn: typeof fetch) {
+    const h = yield* harness(fetchFn);
+    rememberAuthPlacement(h);
+    return h;
+  });
+  it.effect(
+    "reads account metadata during verification, recovers errors, and clears identity on sign-out",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let metadataFailed = false;
+          const h = yield* authHarness(async (url) => {
+            const path = new URL(String(url)).pathname;
+            if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            if (path.endsWith("provider-auth/source"))
+              return metadataFailed
+                ? Response.json({ error: "upstream_unavailable" }, { status: 503 })
+                : Response.json(managedSource);
+            if (path.endsWith("codex-vm-connection"))
+              return Response.json(
+                managedSource.mode === "organization" ? managedSource.connection : null,
+              );
+            return Response.json({
+              ...waitingAuth,
+              requirement: "authenticated",
+              authSource: managedSource,
+            });
+          });
+          const dialog = h.controls.providerAuthDialogViewAtom(environmentId, threadId),
+            sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+            authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, dialog);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(dialog)).toMatchObject({
+            phase: "connected",
+            source: managedSource,
+          });
+          metadataFailed = true;
+          rememberAuthPlacement(h, authPlacement("verification"));
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(dialog)).toMatchObject({ phase: "attention", canManage: false });
+          metadataFailed = false;
+          h.registry.refresh(sourceQuery);
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(dialog)).toMatchObject({
+            phase: "connected",
+            source: managedSource,
+            canManage: false,
+          });
+          h.registry.set(managedRelaySessionAtom, null);
+          expect(h.registry.get(dialog)).toMatchObject({
+            phase: "changed",
+            source: null,
+            binding: null,
+          });
+        }),
+      ),
+  );
+  it.effect(
+    "does not read account metadata before the exact destination is ready for authentication",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let metadataReads = 0;
+          const h = yield* authHarness(async (url) => {
+            const path = new URL(String(url)).pathname;
+            if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            metadataReads++;
+            return Response.json(null);
+          });
+          rememberAuthPlacement(h, authPlacement(null));
+          const dialog = h.controls.providerAuthDialogViewAtom(environmentId, threadId),
+            sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.mount(h.registry, dialog);
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          expect(metadataReads).toBe(0);
+          expect(h.registry.get(dialog).phase).toBe("checking");
+        }),
+      ),
+  );
+  it.effect("confirms a fast completion only at the exact destination allocation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let finished = false;
+        const h = yield* authHarness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status"))
+            return Response.json(
+              finished
+                ? {
+                    ...pendingVmStatus,
+                    generation: authBinding.generation,
+                    pendingProviderAuth: null,
+                    allocation: {
+                      allocationId: authBinding.allocationId,
+                      ownerUserId: "owner",
+                      state: "running",
+                    },
+                    setupPhase: "ready",
+                  }
+                : pendingVmStatus,
+            );
+          if (path.endsWith("provider-auth/source")) return Response.json(managedSource);
+          if (path.endsWith("codex-vm-connection"))
+            return Response.json(
+              managedSource.mode === "organization" ? managedSource.connection : null,
+            );
+          return Response.json({ ...waitingAuth, authSource: managedSource });
+        });
+        const dialog = h.controls.providerAuthDialogViewAtom(environmentId, threadId),
+          sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.mount(h.registry, dialog);
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        const selected = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: {
+              type: "select_source",
+              source: { mode: "organization", connectionId: "org-codex" },
+            },
+          }),
+        );
+        expect(selected._tag).toBe("Success");
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(dialog).phase).toBe("checking");
+        finished = true;
+        rememberAuthPlacement(h, {
+          ...currentPlacement,
+          operationId: null,
+          environmentId: authBinding.environmentId,
+          generation: authBinding.generation,
+          moveProgress: [],
+        });
+        h.registry.refresh(h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(dialog)).toMatchObject({
+          phase: "connected",
+          source: managedSource,
+          binding: authBinding,
+          canManage: false,
+        });
+      }),
+    ),
+  );
+  describe("VM Codex account selection", () => {
+    const input = { environmentId, threadId, accountId: "owner", binding: authBinding };
+    const organization = { mode: "organization", connectionId: "org-codex" } as const;
+    const accountHarness = Effect.fnUntraced(function* (
+      fetchFn: typeof fetch,
+      waitingForAuth: ThreadMoveWaitingForAuth = "personal_sign_in",
+    ) {
+      const h = yield* authHarness(async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+        if (path.endsWith("codex-vm-connection"))
+          return Response.json(
+            managedSource.mode === "organization" ? managedSource.connection : null,
+          );
+        return fetchFn(url, init);
+      });
+      rememberAuthPlacement(h, authPlacement(waitingForAuth));
+      yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+      const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+        sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+      yield* AtomRegistry.mount(h.registry, sourceView);
+      yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+      return { ...h, sourceView, sourceQuery };
+    });
+
+    it.effect(
+      "shows a held selection immediately and confirms its ACK before guest verification",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const putStarted = Promise.withResolvers<void>(),
+              putReply = Promise.withResolvers<Response>(),
+              authStarted = Promise.withResolvers<void>(),
+              authReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                putReply.resolve(Response.json(managedSource));
+                authReply.resolve(Response.json(null));
+              }),
+            );
+            let selected = false;
+            const h = yield* authHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+              if (path.endsWith("codex-vm-connection"))
+                return Response.json(
+                  managedSource.mode === "organization" ? managedSource.connection : null,
+                );
+              if (path.endsWith("provider-auth/source")) {
+                if (request.method === "PUT") {
+                  putStarted.resolve();
+                  const reply = await putReply.promise;
+                  selected = true;
+                  return reply;
+                }
+                return Response.json(selected ? managedSource : { mode: "personal" });
+              }
+              if (!selected) return Response.json(waitingAuth);
+              authStarted.resolve();
+              return authReply.promise;
+            });
+            const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+              sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+              authView = h.controls.viewAtom(environmentId, threadId),
+              authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, sourceView);
+            yield* AtomRegistry.mount(h.registry, authView);
+            yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+            yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(authView)?.providerAuth?.auth.interaction?.type).toBe(
+              "deviceCode",
+            );
+            const command = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "select_source", source: organization },
+              }),
+            ).pipe(Effect.forkScoped);
+            yield* Effect.promise(() => putStarted.promise);
+            expect(h.registry.get(sourceView).selection).toMatchObject({
+              phase: "saving",
+              requested: organization,
+              error: null,
+            });
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            putReply.resolve(Response.json(managedSource));
+            expect((yield* Fiber.join(command))._tag).toBe("Success");
+            yield* Effect.promise(() => authStarted.promise);
+            expect(h.registry.get(sourceView).data).toMatchObject({
+              source: managedSource,
+              accountSelectionRequired: false,
+            });
+            expect(h.registry.get(sourceView).selection.phase).toBe("confirmed");
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            authReply.resolve(new Response(null, { status: 503 }));
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true }).pipe(
+              Effect.result,
+            );
+            expect(h.registry.get(sourceView).data?.source).toEqual(managedSource);
+            expect(h.registry.get(sourceView).selection.phase).toBe("confirmed");
+            expect(h.registry.get(authView)?.providerAuthError).toBeTruthy();
+          }),
+        ),
+    );
+
+    for (const phase of ["confirmed", "rejected"] as const)
+      for (const result of ["source failure", "all reads fail", "empty", "unavailable"] as const)
+        it.effect(`handles ${result} after the account choice is ${phase}`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const readStarted = Promise.withResolvers<void>(),
+                readReply = Promise.withResolvers<Response>();
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => readReply.resolve(Response.json(null))),
+              );
+              let selected = false,
+                refreshed = false,
+                held = false,
+                writes = 0;
+              const h = yield* authHarness(async (url, init) => {
+                const request = new Request(url, init),
+                  path = new URL(request.url).pathname;
+                if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+                if (path.endsWith("codex-vm-connection"))
+                  return refreshed && result === "all reads fail"
+                    ? new Response(null, { status: 503 })
+                    : Response.json(
+                        managedSource.mode === "organization" ? managedSource.connection : null,
+                      );
+                if (path.endsWith("provider-auth/source")) {
+                  if (request.method === "PUT") {
+                    selected = true;
+                    writes++;
+                    return phase === "rejected"
+                      ? Response.json(
+                          { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                          { status: 409 },
+                        )
+                      : Response.json(managedSource);
+                  }
+                  if (held) {
+                    readStarted.resolve();
+                    return (await readReply.promise).clone();
+                  }
+                  if (refreshed) {
+                    if (result === "empty") return Response.json(null);
+                    if (result === "unavailable")
+                      return Response.json(
+                        { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+                        { status: 409 },
+                      );
+                    return new Response(null, { status: 503 });
+                  }
+                  return Response.json(
+                    selected || phase === "rejected" ? managedSource : { mode: "personal" },
+                  );
+                }
+                return selected ? new Response(null, { status: 503 }) : Response.json(waitingAuth);
+              });
+              const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+                sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+                authView = h.controls.viewAtom(environmentId, threadId),
+                authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+              yield* AtomRegistry.mount(h.registry, sourceView);
+              yield* AtomRegistry.mount(h.registry, authView);
+              yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(
+                (yield* Effect.promise(() =>
+                  h.controls.providerAuthAction.run(h.registry, {
+                    ...input,
+                    action: {
+                      type: "select_source",
+                      source: phase === "confirmed" ? organization : { mode: "personal" },
+                    },
+                  }),
+                ))._tag,
+              ).toBe(phase === "confirmed" ? "Success" : "Failure");
+              yield* AtomRegistry.getResult(h.registry, authQuery, {
+                suspendOnWaiting: true,
+              }).pipe(Effect.result);
+              refreshed = true;
+              h.registry.refresh(sourceQuery);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              const view = h.registry.get(sourceView);
+              expect(h.registry.get(authView)?.providerAuth).toBeNull();
+              expect(writes).toBe(1);
+              if (result === "empty" || result === "unavailable") {
+                expect(view.selection.phase).toBe(phase === "confirmed" ? "idle" : "rejected");
+                expect(view.data?.source).toBeNull();
+                held = true;
+                rememberAuthPlacement(h, authPlacement("account_selection"));
+                yield* Effect.promise(() => readStarted.promise);
+                expect(h.registry.get(sourceView).data?.source ?? null).toBeNull();
+                readReply.resolve(Response.json(null));
+                yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+                expect(h.registry.get(sourceView).data?.source).toBeNull();
+                return;
+              }
+              expect(view.selection.phase).toBe(phase);
+              if (phase === "rejected") expect(view.selection.error).toBeTruthy();
+              expect(view.data?.source).toEqual(managedSource);
+              expect(view.data?.error).toBeTruthy();
+              const choice = threadVmAuthSourceChoice(view.data?.source, view.data?.connection);
+              expect(choice.selectedValue).toBe(choice.organizationValue);
+              if (result === "all reads fail") {
+                expect(view.data?.connection).toBeNull();
+                expect(threadVmAuthSourcePresentation(view.data!.source!, null).usingPlan).toBe(
+                  false,
+                );
+              }
+              refreshed = false;
+              h.registry.refresh(sourceQuery);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(h.registry.get(sourceView).data?.source).toEqual(managedSource);
+              expect(h.registry.get(sourceView).data?.error).toBeNull();
+              expect(h.registry.get(sourceView).selection.phase).toBe(phase);
+              if (phase === "rejected")
+                expect(h.registry.get(sourceView).selection.error).toBeTruthy();
+              expect(writes).toBe(1);
+            }),
+          ),
+        );
+
+    it.effect("coalesces concurrent account selections into one PUT", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const started = Promise.withResolvers<void>(),
+            reply = Promise.withResolvers<Response>();
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => reply.resolve(Response.json(managedSource))),
+          );
+          let writes = 0;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") {
+              writes++;
+              started.resolve();
+              return reply.promise;
+            }
+            return Response.json(
+              new URL(request.url).pathname.endsWith("/source")
+                ? writes
+                  ? managedSource
+                  : { mode: "personal" }
+                : { ...waitingAuth, auth: idleAuth, authSource: managedSource },
+            );
+          });
+          const action = {
+            ...input,
+            action: { type: "select_source" as const, source: organization },
+          };
+          const first = h.controls.providerAuthAction.run(h.registry, action),
+            second = h.controls.providerAuthAction.run(h.registry, action);
+          yield* Effect.promise(() => started.promise);
+          expect(writes).toBe(1);
+          reply.resolve(Response.json(managedSource));
+          yield* Effect.promise(() => Promise.all([first, second]));
+          expect(writes).toBe(1);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+        }),
+      ),
+    );
+
+    for (const when of ["before", "during"] as const)
+      it.effect(`rejects an old metadata read started ${when} the selection PUT`, () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const putStarted = Promise.withResolvers<void>(),
+              putReply = Promise.withResolvers<Response>(),
+              readStarted = Promise.withResolvers<void>(),
+              readReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                putReply.resolve(Response.json(managedSource));
+                readReply.resolve(Response.json({ mode: "personal" }));
+              }),
+            );
+            let selected = false,
+              holdRead = false,
+              heldRead = false;
+            const h = yield* accountHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (request.method === "PUT") {
+                putStarted.resolve();
+                const reply = await putReply.promise;
+                selected = true;
+                return reply;
+              }
+              if (path.endsWith("/source")) {
+                if (holdRead && !heldRead) {
+                  heldRead = true;
+                  readStarted.resolve();
+                  return readReply.promise;
+                }
+                return Response.json(selected ? managedSource : { mode: "personal" });
+              }
+              return Response.json({
+                ...waitingAuth,
+                auth: idleAuth,
+                authSource: selected ? managedSource : { mode: "personal" },
+              });
+            });
+            if (when === "before") {
+              holdRead = true;
+              h.registry.refresh(h.sourceQuery);
+              yield* Effect.promise(() => readStarted.promise);
+            }
+            const command = h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            });
+            yield* Effect.promise(() => putStarted.promise);
+            if (when === "during") {
+              holdRead = true;
+              h.registry.refresh(h.sourceQuery);
+              yield* Effect.promise(() => readStarted.promise);
+            }
+            putReply.resolve(Response.json(managedSource));
+            expect((yield* Effect.promise(() => command))._tag).toBe("Success");
+            expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+            readReply.resolve(Response.json({ mode: "personal" }));
+            yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+            expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+          }),
+        ),
+      );
+
+    it.effect(
+      "keeps an ambiguous selection locked until metadata confirms the requested account",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            for (const failure of ["lost-reply", "server-error", "invalid-ack"] as const) {
+              for (const readback of ["personal", "null"] as const) {
+                let writes = 0,
+                  confirmed = false;
+                const h = yield* accountHarness(async (url, init) => {
+                  const request = new Request(url, init);
+                  if (request.method === "PUT") {
+                    writes++;
+                    // @effect-diagnostics-next-line globalErrorInEffectFailure:off - Fetch rejects lost replies with TypeError.
+                    if (failure === "lost-reply") throw new TypeError("Synthetic lost reply");
+                    return failure === "server-error"
+                      ? new Response(null, { status: 503 })
+                      : Response.json({ malformed: "ACK" });
+                  }
+                  expect(new URL(request.url).pathname.endsWith("/source")).toBe(true);
+                  return Response.json(
+                    confirmed
+                      ? managedSource
+                      : writes && readback === "null"
+                        ? null
+                        : { mode: "personal" },
+                  );
+                });
+                const selected = yield* Effect.promise(() =>
+                  h.controls.providerAuthAction.run(h.registry, {
+                    ...input,
+                    action: { type: "select_source", source: organization },
+                  }),
+                );
+                expect(selected._tag).toBe("Failure");
+                expect(h.registry.get(h.sourceView).selection).toMatchObject({
+                  phase: "unknown",
+                  requested: organization,
+                });
+                expect(
+                  (yield* Effect.promise(() =>
+                    h.controls.providerAuthAction.run(h.registry, {
+                      ...input,
+                      action: { type: "select_source", source: { mode: "personal" } },
+                    }),
+                  ))._tag,
+                ).toBe("Failure");
+                expect(writes).toBe(1);
+                expect(
+                  (yield* Effect.promise(() =>
+                    h.controls.providerAuthAction.run(h.registry, {
+                      ...input,
+                      action: { type: "check_selection" },
+                    }),
+                  ))._tag,
+                ).toBe("Success");
+                expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+                confirmed = true;
+                expect(
+                  (yield* Effect.promise(() =>
+                    h.controls.providerAuthAction.run(h.registry, {
+                      ...input,
+                      action: { type: "check_selection" },
+                    }),
+                  ))._tag,
+                ).toBe("Success");
+                expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+                expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+                expect(writes).toBe(1);
+              }
+            }
+          }),
+        ),
+    );
+    it.effect("checks selection through metadata even while the worker requires an account", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            calls.push(request.method + " " + path);
+            expect(request.method).toBe("GET");
+            expect(path.endsWith("provider-auth/source")).toBe(true);
+            return Response.json(
+              { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+              { status: 409 },
+            );
+          }, "account_selection");
+          expect(h.registry.get(h.sourceView).data?.accountSelectionRequired).toBe(true);
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "check_selection" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          expect(calls.length).toBeGreaterThan(1);
+          expect(
+            calls.every((call) => call === `GET /v1/threads/${threadId}/provider-auth/source`),
+          ).toBe(true);
+        }),
+      ),
+    );
+
+    it.effect("only explicitly retries the same unknown selection", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const writes: unknown[] = [];
+          let selected = false;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") {
+              writes.push(await request.json());
+              selected = writes.length > 2;
+              return selected
+                ? Response.json(managedSource)
+                : writes.length === 1
+                  ? new Response(null, { status: 503 })
+                  : Response.json(
+                      { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                      { status: 409 },
+                    );
+            }
+            expect(new URL(request.url).pathname.endsWith("/source")).toBe(true);
+            return Response.json(selected ? managedSource : { mode: "personal" });
+          });
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "retry_selection" },
+              }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(writes).toEqual([]);
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            }),
+          );
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "retry_selection" },
+            }),
+          );
+          expect(writes).toHaveLength(2);
+          expect(writes[1]).toEqual(writes[0]);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "retry_selection" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          expect(writes).toHaveLength(3);
+          expect(writes[2]).toEqual(writes[0]);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+          expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "retry_selection" },
+            }),
+          );
+          expect(writes).toHaveLength(3);
+        }),
+      ),
+    );
+
+    it.effect("keeps the previous source after a definite typed selection rejection", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let writes = 0,
+            hasSource = true;
+          const h = yield* accountHarness(async (url, init) => {
+            if (new Request(url, init).method === "PUT") {
+              writes++;
+              return Response.json(
+                { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                { status: 409 },
+              );
+            }
+            return Response.json(hasSource ? { mode: "personal" } : null);
+          });
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "select_source", source: organization },
+              }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("rejected");
+          expect(h.registry.get(h.sourceView).selection.error).toBeTruthy();
+          expect(h.registry.get(h.sourceView).data?.source).toEqual({ mode: "personal" });
+          expect(writes).toBe(1);
+          hasSource = false;
+          h.registry.refresh(h.sourceQuery);
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(h.sourceView).data?.source).toBeNull();
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            }),
+          );
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("rejected");
+          expect(h.registry.get(h.sourceView).data?.source).toBeNull();
+          expect(writes).toBe(2);
+        }),
+      ),
+    );
+
+    it.effect("clears a rejected account-choice error when personal sign-in continues", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          for (const action of [
+            { type: "start" },
+            { type: "refresh" },
+            { type: "cancel", flowId: "flow-1" },
+          ] as const) {
+            let auth: RelayThreadVmProviderAuth = {
+              ...waitingAuth,
+              auth: action.type === "start" ? idleAuth : waitingAuth.auth,
+              authSource: { mode: "personal" },
+            };
+            const nativeStarted = Promise.withResolvers<void>(),
+              nativeReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => nativeReply.resolve(Response.json(auth))),
+            );
+            let holdNative = false;
+            const h = yield* accountHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (request.method === "PUT")
+                return Response.json(
+                  { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                  { status: 409 },
+                );
+              if (path.endsWith("/source")) return Response.json({ mode: "personal" });
+              if (request.method === "POST")
+                auth = path.endsWith("/cancel")
+                  ? { ...auth, auth: { ...waitingAuth.auth, phase: "cancelled" } }
+                  : { ...auth, auth: waitingAuth.auth };
+              if (holdNative) {
+                nativeStarted.resolve();
+                return (await nativeReply.promise).clone();
+              }
+              return Response.json(auth);
+            });
+            const authView = h.controls.viewAtom(environmentId, threadId),
+              authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, authView);
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "select_source", source: organization },
+              }),
+            );
+            expect(h.registry.get(h.sourceView).selection).toMatchObject({ phase: "rejected" });
+            expect(h.registry.get(h.sourceView).selection.error).toBeTruthy();
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            holdNative = true;
+            const command = h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action,
+            });
+            yield* Effect.promise(() => nativeStarted.promise);
+            expect(h.registry.get(h.sourceView).selection).toMatchObject({
+              phase: "idle",
+              error: null,
+            });
+            holdNative = false;
+            nativeReply.resolve(Response.json(auth));
+            expect((yield* Effect.promise(() => command))._tag).toBe("Success");
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(h.sourceView).selection).toMatchObject({
+              phase: "idle",
+              error: null,
+            });
+            expect(h.registry.get(authView)?.providerAuth?.auth.phase).toBe(
+              action.type === "cancel" ? "cancelled" : "waiting",
+            );
+          }
+        }),
+      ),
+    );
+
+    it.effect(
+      "treats a timed-out PUT and its late ACK as unknown without repeating the write",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            vi.useFakeTimers();
+            yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+            const started = Promise.withResolvers<void>(),
+              reply = Promise.withResolvers<Response>(),
+              returned = Promise.withResolvers<void>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => reply.resolve(Response.json(managedSource))),
+            );
+            let writes = 0;
+            const h = yield* accountHarness(async (url, init) => {
+              if (new Request(url, init).method === "PUT") {
+                writes++;
+                started.resolve();
+                const response = await reply.promise;
+                returned.resolve();
+                return response;
+              }
+              return Response.json({ mode: "personal" });
+            });
+            const pending = h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            });
+            yield* Effect.promise(() => started.promise);
+            yield* Effect.promise(() => vi.advanceTimersByTimeAsync(10_000));
+            expect((yield* Effect.promise(() => pending))._tag).toBe("Failure");
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+            reply.resolve(Response.json(managedSource));
+            yield* Effect.promise(() => returned.promise);
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("unknown");
+            expect(writes).toBe(1);
+          }),
+        ),
+    );
+
+    it.effect("confirms a lost write reply from metadata without repeating the PUT", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let writes = 0;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") {
+              writes++;
+              // @effect-diagnostics-next-line globalErrorInEffectFailure:off - Fetch rejects lost replies with TypeError.
+              throw new TypeError("Synthetic lost successful reply");
+            }
+            expect(new URL(request.url).pathname.endsWith("/source")).toBe(true);
+            return Response.json(writes ? managedSource : { mode: "personal" });
+          });
+          yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            }),
+          );
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+          expect(h.registry.get(h.sourceView).data?.source).toEqual(managedSource);
+          expect(writes).toBe(1);
+        }),
+      ),
+    );
+
+    it.effect(
+      "hides an older personal code until the new selection's fresh auth read completes",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const oldStarted = Promise.withResolvers<void>(),
+              oldReply = Promise.withResolvers<Response>(),
+              oldReturned = Promise.withResolvers<void>(),
+              freshStarted = Promise.withResolvers<void>(),
+              freshReply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                oldReply.resolve(Response.json(null));
+                freshReply.resolve(Response.json(null));
+              }),
+            );
+            let selected = false,
+              reads = 0;
+            const h = yield* accountHarness(async (url, init) => {
+              const request = new Request(url, init);
+              if (request.method === "PUT") {
+                selected = true;
+                return Response.json(managedSource);
+              }
+              if (new URL(request.url).pathname.endsWith("/source"))
+                return Response.json(selected ? managedSource : { mode: "personal" });
+              if (++reads === 1) return Response.json(waitingAuth);
+              if (reads === 2) {
+                oldStarted.resolve();
+                const reply = await oldReply.promise;
+                oldReturned.resolve();
+                return reply;
+              }
+              freshStarted.resolve();
+              return freshReply.promise;
+            });
+            const authView = h.controls.viewAtom(environmentId, threadId),
+              authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, authView);
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(authView)?.providerAuth?.auth.interaction?.type).toBe(
+              "deviceCode",
+            );
+            h.registry.refresh(authQuery);
+            yield* Effect.promise(() => oldStarted.promise);
+            expect(
+              (yield* Effect.promise(() =>
+                h.controls.providerAuthAction.run(h.registry, {
+                  ...input,
+                  action: { type: "select_source", source: organization },
+                }),
+              ))._tag,
+            ).toBe("Success");
+            yield* Effect.promise(() => freshStarted.promise);
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            oldReply.resolve(Response.json(waitingAuth));
+            yield* Effect.promise(() => oldReturned.promise);
+            expect(h.registry.get(authView)?.providerAuth).toBeNull();
+            freshReply.resolve(
+              Response.json({
+                ...waitingAuth,
+                auth: idleAuth,
+                authSource: managedSource,
+                requirement: "authenticated",
+              }),
+            );
+            yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+            expect(h.registry.get(authView)?.providerAuth?.authSource).toEqual(managedSource);
+            expect(h.registry.get(h.sourceView).selection.phase).toBe("confirmed");
+          }),
+        ),
+    );
+    for (const changed of ["session", "binding", "relay"] as const)
+      it.effect(`ignores a selection ACK after its ${changed} scope changes`, () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const registry = AtomRegistry.make();
+            yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+            const configured = Atom.make(relayUrl),
+              started = Promise.withResolvers<void>(),
+              reply = Promise.withResolvers<Response>();
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => reply.resolve(Response.json(managedSource))),
+            );
+            registry.set(managedRelaySessionAtom, {
+              accountId: "owner",
+              readClerkToken: () => Effect.succeed("owner-token"),
+            });
+            let binding = authBinding,
+              writes = 0;
+            const fetchFn: typeof fetch = async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              if (path.endsWith("vm-status"))
+                return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
+              if (path.endsWith("/placement")) return Response.json(currentPlacement);
+              if (path.endsWith("codex-vm-connection"))
+                return Response.json(
+                  managedSource.mode === "organization" ? managedSource.connection : null,
+                );
+              if (request.method === "PUT") {
+                writes++;
+                started.resolve();
+                return reply.promise;
+              }
+              return Response.json({ mode: "personal" });
+            };
+            const controls = createThreadVmControlAtoms(
+              Atom.runtime((get) =>
+                tenancyLayer({ relayUrl: get(configured) }).pipe(
+                  Layer.provide(remoteHttpClientLayer(fetchFn)),
+                ),
+              ),
+              () => Atom.make(snapshot),
+            );
+            const h = { registry, controls, query: controls.queryAtom(environmentId, threadId) };
+            rememberAuthPlacement(h);
+            yield* AtomRegistry.getResult(registry, h.query, { suspendOnWaiting: true });
+            const sourceView = controls.providerAuthSourceViewAtom(environmentId, threadId),
+              sourceQuery = controls.providerAuthSourceQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(registry, sourceView);
+            yield* AtomRegistry.getResult(registry, sourceQuery, { suspendOnWaiting: true });
+            const command = controls.providerAuthAction.run(registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            });
+            yield* Effect.promise(() => started.promise);
+            if (changed === "session")
+              registry.set(managedRelaySessionAtom, {
+                accountId: "other",
+                readClerkToken: () => Effect.succeed("other-token"),
+              });
+            else if (changed === "relay")
+              registry.set(configured, "https://other-relay.example.test");
+            else {
+              binding = { ...authBinding, allocationId: "replacement-vm" };
+              rememberAuthPlacement(h, authPlacement("personal_sign_in", binding));
+              registry.refresh(h.query);
+            }
+            yield* AtomRegistry.getResult(registry, h.query, { suspendOnWaiting: true });
+            reply.resolve(Response.json(managedSource));
+            yield* Effect.promise(() => command);
+            expect(registry.get(sourceView).selection.phase).toBe("idle");
+            expect(registry.get(sourceView).data?.source).not.toEqual(managedSource);
+            expect(writes).toBe(1);
+          }),
+        ),
+      );
+
+    it.effect("lets a replacement binding select an account before the old PUT replies", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const oldStarted = Promise.withResolvers<void>(),
+            oldReply = Promise.withResolvers<Response>(),
+            nextStarted = Promise.withResolvers<void>();
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => oldReply.resolve(Response.json(managedSource))),
+          );
+          const nextBinding = {
+            ...authBinding,
+            operationId: "replacement-move",
+            allocationId: "replacement-vm",
+            environmentId: EnvironmentId.make("replacement-environment"),
+          };
+          let binding = authBinding,
+            oldFinished = false;
+          const writes: unknown[] = [];
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            if (path.endsWith("vm-status"))
+              return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
+            if (path.endsWith("codex-vm-connection"))
+              return Response.json(
+                managedSource.mode === "organization" ? managedSource.connection : null,
+              );
+            if (request.method === "PUT") {
+              writes.push(await request.json());
+              if (writes.length === 1) {
+                oldStarted.resolve();
+                return oldReply.promise;
+              }
+              expect(writes).toHaveLength(2);
+              nextStarted.resolve();
+              return Response.json({ mode: "personal" });
+            }
+            return Response.json({ mode: "personal" });
+          });
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+            sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, sourceView);
+          yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+          const old = h.controls.providerAuthAction
+            .run(h.registry, {
+              ...input,
+              action: { type: "select_source", source: organization },
+            })
+            .then((result) => {
+              oldFinished = true;
+              return result;
+            });
+          yield* Effect.promise(() => oldStarted.promise);
+          binding = nextBinding;
+          rememberAuthPlacement(h, authPlacement("personal_sign_in", nextBinding));
+          h.registry.refresh(h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const next = h.controls.providerAuthAction.run(h.registry, {
+            ...input,
+            binding: nextBinding,
+            action: { type: "select_source", source: { mode: "personal" } },
+          });
+          yield* Effect.promise(() => nextStarted.promise);
+          expect(oldFinished).toBe(false);
+          expect((yield* Effect.promise(() => next))._tag).toBe("Success");
+          expect(h.registry.get(sourceView).selection.phase).toBe("confirmed");
+          expect(h.registry.get(sourceView).data?.source).toEqual({ mode: "personal" });
+          oldReply.resolve(Response.json(managedSource));
+          yield* Effect.promise(() => old);
+          expect(h.registry.get(sourceView).data?.source).toEqual({ mode: "personal" });
+          expect(writes).toEqual([
+            {
+              operationId: authBinding.operationId,
+              allocationId: authBinding.allocationId,
+              generation: authBinding.generation,
+              source: organization,
+            },
+            {
+              operationId: nextBinding.operationId,
+              allocationId: nextBinding.allocationId,
+              generation: nextBinding.generation,
+              source: { mode: "personal" },
+            },
+          ]);
+        }),
+      ),
+    );
+
+    it.effect("settles selection when the auth wait changes while its token lookup is held", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            token = Promise.withResolvers<string>();
+          yield* Effect.addFinalizer(() => Effect.sync(() => token.resolve("owner-token")));
+          let held = false,
+            writes = 0;
+          const h = yield* accountHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (request.method === "PUT") writes++;
+            return Response.json({ mode: "personal" });
+          });
+          h.registry.set(managedRelaySessionAtom, {
+            accountId: "owner",
+            readClerkToken: () =>
+              Effect.suspend(() =>
+                held
+                  ? Effect.promise(() => {
+                      requested.resolve();
+                      return token.promise;
+                    })
+                  : Effect.succeed("owner-token"),
+              ),
+          });
+          rememberAuthPlacement(h);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, h.sourceQuery, { suspendOnWaiting: true });
+          held = true;
+          const command = h.controls.providerAuthAction.run(h.registry, {
+            ...input,
+            action: { type: "select_source", source: organization },
+          });
+          yield* Effect.promise(() => requested.promise);
+          expect(h.registry.get(h.sourceView).selection.phase).toBe("saving");
+          const updated = authPlacement("account_selection");
+          rememberAuthPlacement(h, {
+            ...updated,
+            moveProgress: updated.moveProgress!.map((progress) => ({ ...progress, attempt: 2 })),
+          });
+          token.resolve("owner-token");
+          expect((yield* Effect.promise(() => command))._tag).toBe("Failure");
+          expect(["rejected", "unknown"]).toContain(h.registry.get(h.sourceView).selection.phase);
+          expect(writes).toBe(0);
+        }),
+      ),
+    );
+
+    for (const phase of ["confirmed", "rejected"] as const)
+      for (const change of ["reconnect", "replacement"] as const)
+        it.effect(`retains newer ${change} metadata after the account choice is ${phase}`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              if (managedSource.mode !== "organization") return;
+              const requested = Promise.withResolvers<void>(),
+                reply = Promise.withResolvers<Response>();
+              const connectionId =
+                change === "replacement" ? "replacement-codex" : managedSource.connectionId;
+              const disconnected = {
+                ...managedSource,
+                connectionId,
+                connection: {
+                  ...managedSource.connection,
+                  connectionId,
+                  status:
+                    change === "replacement"
+                      ? ("connected" as const)
+                      : ("reconnect_required" as const),
+                },
+              };
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => reply.resolve(Response.json(disconnected))),
+              );
+              let selected = false,
+                reconnect = false,
+                held = false;
+              const h = yield* authHarness(async (url, init) => {
+                const request = new Request(url, init),
+                  path = new URL(request.url).pathname;
+                if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+                if (path.endsWith("codex-vm-connection"))
+                  return Response.json(
+                    reconnect ? disconnected.connection : managedSource.connection,
+                  );
+                if (request.method === "PUT") {
+                  selected = true;
+                  return phase === "rejected"
+                    ? Response.json(
+                        { _tag: "CodexVmConnectionError", reason: "not_connected" },
+                        { status: 409 },
+                      )
+                    : Response.json(managedSource);
+                }
+                if (held) {
+                  requested.resolve();
+                  return (await reply.promise).clone();
+                }
+                return Response.json(
+                  selected || phase === "rejected"
+                    ? reconnect
+                      ? disconnected
+                      : managedSource
+                    : { mode: "personal" },
+                );
+              });
+              yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+              const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+                sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+              yield* AtomRegistry.mount(h.registry, sourceView);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              yield* Effect.promise(() =>
+                h.controls.providerAuthAction.run(h.registry, {
+                  ...input,
+                  action: {
+                    type: "select_source",
+                    source: phase === "confirmed" ? organization : { mode: "personal" },
+                  },
+                }),
+              );
+              reconnect = true;
+              h.registry.refresh(sourceQuery);
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(h.registry.get(sourceView).data?.source).toEqual(disconnected);
+              expect(h.registry.get(sourceView).selection.phase).toBe(phase);
+              if (phase === "rejected")
+                expect(h.registry.get(sourceView).selection.error).toBeTruthy();
+              held = true;
+              rememberAuthPlacement(h, authPlacement("organization_connection"));
+              yield* Effect.promise(() => requested.promise);
+              expect(h.registry.get(sourceView).data?.source).toEqual(disconnected);
+              reply.resolve(Response.json(disconnected));
+              yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+              expect(h.registry.get(sourceView).data?.source).toEqual(disconnected);
+            }),
+          ),
+        );
+  });
+  it.effect("does not inspect or change move auth before an exact destination wait", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const h = yield* harness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          calls.push(path);
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path === "/health") return Response.json({ ok: true, service: "relay" });
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          query = h.controls.providerAuthQueryAtom(environmentId, threadId),
+          source = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+        const progressWithoutAuth = { ...authPlacement().moveProgress![0]! };
+        delete progressWithoutAuth.waitingForAuth;
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        for (const placement of [
+          undefined,
+          currentPlacement,
+          { ...authPlacement(), moveProgress: [] },
+          ...[
+            { operationId: "other-operation" },
+            { environmentId: "other-vm" },
+            { generation: 3 },
+          ].map((change) => ({
+            ...authPlacement(),
+            moveProgress: authPlacement().moveProgress!.map((progress) => ({
+              ...progress,
+              ...change,
+            })),
+          })),
+          { ...authPlacement(), moveProgress: [progressWithoutAuth] },
+          {
+            ...authPlacement(),
+            moveProgress: [
+              {
+                ...progressWithoutAuth,
+                participant: "source",
+                environmentId,
+                generation: 1,
+                stage: "capturing",
+              },
+            ],
+          },
+          authPlacement(null),
+        ] satisfies ReadonlyArray<RelayPortableThreadPlacement | undefined>) {
+          if (placement) rememberAuthPlacement(h, placement);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, source, { suspendOnWaiting: true });
+          for (const action of [
+            { type: "start" },
+            { type: "refresh" },
+            { type: "cancel", flowId: "old-flow" },
+            { type: "select_source", source: { mode: "personal" } },
+          ] as const) {
+            const result = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action,
+              }),
+            );
+            expect(result._tag).toBe("Failure");
+          }
+          expect(h.registry.get(view)?.providerAuth).toBeNull();
+          expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        }
+        yield* Effect.promise(() =>
+          h.controls.refreshStatus.run(h.registry, { environmentId, threadId }),
+        );
+        expect(calls.filter((path) => path.includes("provider-auth"))).toEqual([]);
+        rememberAuthPlacement(h);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.requirement).toBe("sign_in_required");
+        expect(calls.filter((path) => path.endsWith("provider-auth"))).toHaveLength(1);
+        rememberAuthPlacement(h, { ...authPlacement(), generation: 2, moveProgress: undefined });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth).toBeNull();
+        expect(h.registry.get(view)?.workerAuth).toBeUndefined();
+        expect(calls.filter((path) => path.endsWith("provider-auth"))).toHaveLength(1);
+      }),
+    ),
+  );
+  it.effect("rejects an auth action if the worker wait clears while its token is loading", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let block = false;
+        const calls: string[] = [];
+        const h = yield* harness(async (url) => {
+          calls.push(new URL(String(url)).pathname);
+          return Response.json(pendingVmStatus);
+        });
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "owner",
+          readClerkToken: () =>
+            block
+              ? Effect.promise(async () => {
+                  requested.resolve();
+                  await release.promise;
+                  return "owner-token";
+                })
+              : Effect.succeed("owner-token"),
+        });
+        rememberAuthPlacement(h);
+        yield* AtomRegistry.mount(h.registry, h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        block = true;
+        const action = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: { type: "start" },
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        rememberAuthPlacement(h, authPlacement(null));
+        release.resolve();
+        expect((yield* Fiber.join(action))._tag).toBe("Failure");
+        expect(calls.filter((path) => path.includes("provider-auth"))).toEqual([]);
+      }),
+    ),
+  );
+  for (const lifecycle of ["reset", "restore"] as const)
+    for (const cachedPlacement of [false, true])
+      it.effect(
+        `allows same-generation ${lifecycle} auth ${cachedPlacement ? "with a cached prior placement" : "without move receipts"}`,
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const writes: string[] = [];
+              const h = yield* harness(async (url, init) => {
+                const request = new Request(url, init),
+                  path = new URL(request.url).pathname;
+                if (request.method !== "GET") writes.push(`${request.method} ${path}`);
+                if (path.endsWith("vm-status"))
+                  return Response.json({
+                    ...pendingVmStatus,
+                    generation: authBinding.generation,
+                    [lifecycle]: {
+                      operationId: authBinding.operationId,
+                      phase: "importing",
+                      errorCode: null,
+                    },
+                  });
+                if (path.endsWith("provider-auth/source"))
+                  return Response.json({ mode: "personal" });
+                if (path.endsWith("codex-vm-connection")) return Response.json(null);
+                return Response.json({ ...waitingAuth, auth: idleAuth });
+              });
+              if (cachedPlacement) rememberAuthPlacement(h, currentPlacement);
+              yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+              const auth = yield* AtomRegistry.getResult(
+                  h.registry,
+                  h.controls.providerAuthQueryAtom(environmentId, threadId),
+                  { suspendOnWaiting: true },
+                ),
+                source = yield* AtomRegistry.getResult(
+                  h.registry,
+                  h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+                  { suspendOnWaiting: true },
+                );
+              for (const action of [
+                { type: "start" },
+                { type: "refresh" },
+                { type: "select_source", source: { mode: "personal" } },
+              ] as const) {
+                const result = yield* Effect.promise(() =>
+                  h.controls.providerAuthAction.run(h.registry, {
+                    environmentId,
+                    threadId,
+                    accountId: "owner",
+                    binding: authBinding,
+                    action,
+                  }),
+                );
+                expect(result._tag).toBe("Success");
+              }
+              expect(auth).toMatchObject({ requirement: "sign_in_required" });
+              expect(source).toMatchObject({ source: { mode: "personal" } });
+              expect(writes).toEqual([
+                `POST /v1/threads/${threadId}/provider-auth/start`,
+                `PUT /v1/threads/${threadId}/provider-auth/source`,
+              ]);
+            }),
+          ),
+      );
+  it.effect("keeps superseded and conflicting placements fenced during same-generation auth", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const placement of [
+          { ...currentPlacement, operationId: "other-operation" },
+          { ...currentPlacement, generation: authBinding.generation },
+          { ...currentPlacement, generation: authBinding.generation + 1 },
+        ]) {
+          const calls: string[] = [];
+          const h = yield* harness(async (url) => {
+            calls.push(new URL(String(url)).pathname);
+            return Response.json({
+              ...pendingVmStatus,
+              generation: authBinding.generation,
+              reset: { operationId: authBinding.operationId, phase: "importing", errorCode: null },
+            });
+          });
+          rememberAuthPlacement(h, placement);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          expect(
+            yield* AtomRegistry.getResult(
+              h.registry,
+              h.controls.providerAuthQueryAtom(environmentId, threadId),
+              { suspendOnWaiting: true },
+            ),
+          ).toBeNull();
+          expect(
+            yield* AtomRegistry.getResult(
+              h.registry,
+              h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+              { suspendOnWaiting: true },
+            ),
+          ).toBeNull();
+          for (const action of [
+            { type: "start" },
+            { type: "refresh" },
+            { type: "select_source", source: { mode: "personal" } },
+          ] as const) {
+            const result = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action,
+              }),
+            );
+            expect(result._tag).toBe("Failure");
+          }
+          expect(calls.filter((path) => path.includes("provider-auth"))).toEqual([]);
+        }
+      }),
+    ),
+  );
+  it.effect(
+    "refreshes account controls on a worker transition and rejects a late source failure",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>(),
+            returned = Promise.withResolvers<void>();
+          let reads = 0;
+          const h = yield* authHarness(async (url) => {
+            const path = new URL(String(url)).pathname;
+            if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            if (path.endsWith("codex-vm-connection"))
+              return Response.json(managedSource.connection);
+            if (!path.endsWith("provider-auth/source"))
+              return Response.json({ ...waitingAuth, auth: idleAuth });
+            if (++reads === 2) {
+              requested.resolve();
+              await release.promise;
+              returned.resolve();
+              return new Response(null, { status: 503 });
+            }
+            return Response.json({ mode: "personal" });
+          });
+          const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+            query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view).data?.source).toEqual({ mode: "personal" });
+          const placement: RelayPortableThreadPlacement = {
+            ...currentPlacement,
+            operationId: authBinding.operationId,
+            moveProgress: [
+              {
+                ...authBinding,
+                threadId,
+                participant: "destination",
+                attempt: 2,
+                revision: 1,
+                stage: "downloading",
+                completedBytes: 0,
+                totalBytes: null,
+                completedArtifacts: 0,
+                totalArtifacts: null,
+                waitingForAuth: "organization_connection",
+                updatedAt: at,
+              },
+            ],
+          };
+          const session = h.registry.get(managedRelaySessionAtom)!;
+          rememberPortableThreadPlacement(h.registry, session, relayUrl, placement);
+          expect(h.registry.get(view).data).toBeNull();
+          yield* Effect.promise(() => requested.promise);
+          rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+            ...placement,
+            moveProgress: placement.moveProgress!.map((p) => ({
+              ...p,
+              attempt: 3,
+              waitingForAuth: null,
+            })),
+          });
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          release.resolve();
+          yield* Effect.promise(() => returned.promise);
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view).error).toBeNull();
+          expect(h.registry.get(view).data).toBeNull();
+          expect(reads).toBe(2);
+          rememberAuthPlacement(h, {
+            ...placement,
+            moveProgress: placement.moveProgress!.map((p) => ({ ...p, attempt: 4 })),
+          });
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+          expect(h.registry.get(view).data).toMatchObject({
+            source: { mode: "personal" },
+            error: null,
+          });
+          expect(reads).toBe(3);
+        }),
+      ),
+  );
+  it.effect("fences retained and late auth failures while preserving a new current failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>(),
+          returned = Promise.withResolvers<void>();
+        let reads = 0;
+        const h = yield* authHarness(async (url) => {
+          if (new URL(String(url)).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          const read = ++reads;
+          if (read === 2) {
+            requested.resolve();
+            await release.promise;
+            returned.resolve();
+          }
+          return read === 3
+            ? Response.json({ ...waitingAuth, requirement: "authenticated", auth: idleAuth })
+            : new Response(null, { status: 503 });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          query = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+          Effect.result,
+        );
+        expect(h.registry.get(view)?.providerAuthError).not.toBeNull();
+        const placement: RelayPortableThreadPlacement = {
+          ...currentPlacement,
+          operationId: authBinding.operationId,
+          moveProgress: [
+            {
+              ...authBinding,
+              threadId,
+              participant: "destination",
+              attempt: 2,
+              revision: 1,
+              stage: "downloading",
+              completedBytes: 0,
+              totalBytes: null,
+              completedArtifacts: 0,
+              totalArtifacts: null,
+              waitingForAuth: "personal_sign_in",
+              updatedAt: at,
+            },
+          ],
+        };
+        const session = h.registry.get(managedRelaySessionAtom)!;
+        rememberPortableThreadPlacement(h.registry, session, relayUrl, placement);
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        yield* Effect.promise(() => requested.promise);
+        rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+          ...placement,
+          moveProgress: placement.moveProgress!.map((p) => ({
+            ...p,
+            attempt: 3,
+            waitingForAuth: null,
+          })),
+        });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        release.resolve();
+        yield* Effect.promise(() => returned.promise);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth).toBeNull();
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        rememberAuthPlacement(h, {
+          ...placement,
+          moveProgress: placement.moveProgress!.map((p) => ({ ...p, attempt: 4 })),
+        });
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        h.registry.refresh(query);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }).pipe(
+          Effect.result,
+        );
+        expect(h.registry.get(view)?.providerAuthError).not.toBeNull();
+      }),
+    ),
+  );
+  for (const outcome of [
+    "completed",
+    "completed_lost_reply",
+    "cancelled",
+    "different_environment",
+    "different_generation",
+    "replacement",
+  ] as const)
+    it.effect(`resolves a sign-in reply racing with ${outcome} from exact placement proof`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          let pending = true,
+            writes = 0;
+          const completedPlacement = {
+            ...currentPlacement,
+            environmentId:
+              outcome === "cancelled"
+                ? environmentId
+                : outcome === "different_environment"
+                  ? "other-vm"
+                  : authBinding.environmentId,
+            generation: outcome === "cancelled" ? 1 : outcome === "different_generation" ? 3 : 2,
+            operationId: null,
+          };
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            if (path.endsWith("vm-status"))
+              return Response.json({
+                ...pendingVmStatus,
+                pendingProviderAuth: pending
+                  ? authBinding
+                  : outcome === "replacement"
+                    ? { ...authBinding, operationId: "next-move", allocationId: "next-vm" }
+                    : undefined,
+              });
+            if (path.endsWith("/placement")) return Response.json(completedPlacement);
+            if (request.method === "POST") {
+              writes++;
+              requested.resolve();
+              await release.promise;
+              if (outcome === "completed_lost_reply")
+                throw new Error("Sign-in reply lost after completion");
+            }
+            return Response.json({ ...waitingAuth, requirement: "authenticated", auth: idleAuth });
+          });
+          yield* AtomRegistry.mount(h.registry, h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const action = yield* Effect.promise(() =>
+            h.controls.providerAuthAction.run(h.registry, {
+              environmentId,
+              threadId,
+              accountId: "owner",
+              binding: authBinding,
+              action: { type: "start" },
+            }),
+          ).pipe(Effect.forkScoped);
+          yield* Effect.promise(() => requested.promise);
+          pending = false;
+          h.registry.refresh(h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          release.resolve();
+          expect((yield* Fiber.join(action))._tag).toBe(
+            outcome.startsWith("completed") ? "Success" : "Failure",
+          );
+          expect(writes).toBe(1);
+        }),
+      ),
+    );
+  for (const cached of ["authenticated", "provider_unavailable"] as const)
+    it.effect(
+      `fences cached ${cached} auth on an accepted worker transition with the dialog closed`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const requested = Promise.withResolvers<void>(),
+              release = Promise.withResolvers<void>();
+            let reads = 0;
+            const paths: string[] = [];
+            const h = yield* authHarness(async (url) => {
+              const path = new URL(String(url)).pathname;
+              paths.push(path);
+              if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+              reads++;
+              if (reads === 2) {
+                requested.resolve();
+                await release.promise;
+              }
+              return Response.json({
+                ...waitingAuth,
+                requirement: reads === 1 ? cached : "authenticated",
+                auth: { ...idleAuth, message: reads === 1 ? "Earlier provider failure" : null },
+              });
+            });
+            const view = h.controls.viewAtom(environmentId, threadId),
+              query = h.controls.providerAuthQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.providerAuth?.requirement).toBe(cached);
+            const progress = {
+              operationId: authBinding.operationId,
+              threadId,
+              environmentId: authBinding.environmentId,
+              generation: authBinding.generation,
+              participant: "destination" as const,
+              attempt: 2,
+              revision: 1,
+              stage: "downloading" as const,
+              completedBytes: 0,
+              totalBytes: null,
+              completedArtifacts: 0,
+              totalArtifacts: null,
+              waitingForAuth: "personal_sign_in" as const,
+              updatedAt: at,
+            };
+            const placement: RelayPortableThreadPlacement = {
+              ...currentPlacement,
+              operationId: authBinding.operationId,
+              moveProgress: [progress],
+            };
+            const session = h.registry.get(managedRelaySessionAtom)!;
+            rememberPortableThreadPlacement(h.registry, session, relayUrl, placement);
+            expect(h.registry.get(view)?.providerAuth).toBeNull();
+            expect(h.registry.get(view)?.providerAuthError).toBeNull();
+            yield* Effect.promise(() => requested.promise);
+            expect(h.registry.get(view)?.workerAuth).toBe(progress.waitingForAuth);
+            release.resolve();
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
+            rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+              ...placement,
+              moveProgress: [{ ...progress, revision: 2, completedBytes: 1024 }],
+            });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(reads).toBe(2);
+            rememberPortableThreadPlacement(h.registry, session, relayUrl, {
+              ...placement,
+              moveProgress: undefined,
+            });
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view)?.workerAuth).toBe(progress.waitingForAuth);
+            expect(reads).toBe(2);
+            expect(paths).not.toContain(`/v1/threads/${threadId}/provider-auth/source`);
+          }),
+        ),
+    );
+  it.effect("asks for an explicit account without errors before restoring a fresh VM sign-in", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let selected = false;
+        const writes: unknown[] = [];
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init),
+            path = new URL(request.url).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("codex-vm-connection"))
+            return Response.json(
+              managedSource.mode === "organization" ? managedSource.connection : null,
+            );
+          if (path.endsWith("provider-auth/source") && request.method === "PUT") {
+            writes.push(await request.json());
+            selected = true;
+            return Response.json(managedSource);
+          }
+          if (!selected)
+            return Response.json(
+              { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+              { status: 409 },
+            );
+          return Response.json(
+            path.endsWith("provider-auth/source")
+              ? managedSource
+              : {
+                  ...waitingAuth,
+                  auth: idleAuth,
+                  authSource: managedSource,
+                  requirement: "authenticated",
+                },
+          );
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+          sourceQuery = h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.mount(h.registry, sourceView);
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(sourceView).data).toMatchObject({
+          accountSelectionRequired: true,
+          source: null,
+          connection: { status: "connected", connectionId: "org-codex" },
+          error: null,
+        });
+        expect(
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true }),
+        ).toBeNull();
+        expect(h.registry.get(view)?.providerAuthError).toBeNull();
+        expect(writes).toEqual([]);
+        const result = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: {
+              type: "select_source",
+              source: { mode: "organization", connectionId: "org-codex" },
+            },
+          }),
+        );
+        expect(result._tag).toBe("Success");
+        yield* AtomRegistry.getResult(h.registry, sourceQuery, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(sourceView).data).toMatchObject({
+          accountSelectionRequired: false,
+          source: managedSource,
+          error: null,
+        });
+        expect(h.registry.get(view)?.providerAuth?.requirement).toBe("authenticated");
+        expect(writes).toEqual([
+          {
+            operationId: authBinding.operationId,
+            allocationId: authBinding.allocationId,
+            generation: authBinding.generation,
+            source: { mode: "organization", connectionId: "org-codex" },
+          },
+        ]);
+      }),
+    ),
+  );
+  it.effect("keeps organization lookup failures visible while an account choice is required", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* authHarness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("codex-vm-connection")) return new Response(null, { status: 503 });
+          return Response.json(
+            { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+            { status: 409 },
+          );
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(view).data).toMatchObject({
+          accountSelectionRequired: true,
+          source: null,
+        });
+        expect(h.registry.get(view).data?.error).toContain("read Codex VM connection");
+      }),
+    ),
+  );
+  it.effect("does not treat an unavailable account without a pending binding as a choice", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* authHarness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(status);
+          return Response.json(
+            { _tag: "CodexVmConnectionError", reason: "source_unavailable" },
+            { status: 409 },
+          );
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(view).data).toMatchObject({ accountSelectionRequired: false });
+        expect(h.registry.get(view).data?.error).toContain("account selection is unavailable");
+      }),
+    ),
+  );
+  it.effect("preserves genuine Codex failures instead of presenting an account choice", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* authHarness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("codex-vm-connection"))
+            return Response.json(
+              managedSource.mode === "organization" ? managedSource.connection : null,
+            );
+          return Response.json(
+            { _tag: "CodexVmConnectionError", reason: "invalid_grant" },
+            { status: 409 },
+          );
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.mount(h.registry, sourceView);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(sourceView).data).toMatchObject({ accountSelectionRequired: false });
+        expect(h.registry.get(sourceView).data?.error).toContain("expired or was revoked");
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        ).pipe(Effect.result);
+        expect(h.registry.get(view)?.providerAuthError).toContain("expired or was revoked");
+      }),
+    ),
+  );
+  for (const lostReply of [false, true])
+    it.effect(
+      `confirms a selected organization account ${lostReply ? "after a lost write reply without repeating the write" : "from its ACK before guest verification"}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            let selected: RelayThreadVmCodexAuthSource = { mode: "personal" };
+            const writes: unknown[] = [],
+              calls: string[] = [];
+            const h = yield* authHarness(async (url, init) => {
+              const request = new Request(url, init),
+                path = new URL(request.url).pathname;
+              calls.push(`${request.method} ${path}`);
+              if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+              if (path.endsWith("codex-vm-connection"))
+                return Response.json(
+                  managedSource.mode === "organization" ? managedSource.connection : null,
+                );
+              if (path.endsWith("provider-auth/source")) {
+                if (request.method === "PUT") {
+                  writes.push(await request.json());
+                  selected = managedSource;
+                  if (lostReply) throw new TypeError("Synthetic lost response");
+                }
+                return Response.json(selected);
+              }
+              return Response.json({
+                ...waitingAuth,
+                auth: idleAuth,
+                authSource: selected,
+                requirement:
+                  selected.mode === "organization" ? "authenticated" : "sign_in_required",
+              });
+            });
+            yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+            const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+              query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+            yield* AtomRegistry.mount(h.registry, view);
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view).data?.source?.mode).toBe("personal");
+            const result = yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action: {
+                  type: "select_source",
+                  source: { mode: "organization", connectionId: "org-codex" },
+                },
+              }),
+            );
+            expect(result._tag).toBe(lostReply ? "Failure" : "Success");
+            yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+            expect(h.registry.get(view).data?.source).toEqual(managedSource);
+            expect(writes).toEqual([
+              {
+                operationId: authBinding.operationId,
+                allocationId: authBinding.allocationId,
+                generation: 2,
+                source: { mode: "organization", connectionId: "org-codex" },
+              },
+            ]);
+            if (!lostReply) {
+              const write = calls.findIndex((call) => call.startsWith("PUT"));
+              expect(calls.slice(write + 1)).not.toContain(
+                `GET /v1/threads/${threadId}/provider-auth`,
+              );
+              expect(h.registry.get(view).selection.phase).toBe("confirmed");
+            }
+          }),
+        ),
+    );
+
+  it.effect("reads a paused VM account from relay metadata without inspecting the guest", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init),
+            path = new URL(request.url).pathname;
+          expect(request.method).toBe("GET");
+          calls.push(path);
+          if (path.endsWith("vm-status"))
+            return Response.json({
+              ...status,
+              allocation: { allocationId: "paused", ownerUserId: "owner", state: "paused" },
+              savedDisk: null,
+            });
+          expect(path.endsWith("provider-auth/source")).toBe(true);
+          return Response.json(managedSource);
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+          query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true });
+        expect(h.registry.get(view).data?.source).toEqual(managedSource);
+        expect(calls).toEqual([
+          `/v1/threads/${threadId}/vm-status`,
+          `/v1/threads/${threadId}/provider-auth/source`,
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("keeps personal device sign-in usable when an older relay lacks source endpoints", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* authHarness(async (url) => {
+          const path = new URL(String(url)).pathname;
+          if (path.endsWith("vm-status")) return Response.json(pendingVmStatus);
+          if (path.endsWith("provider-auth/source") || path.endsWith("codex-vm-connection"))
+            return new Response(null, { status: 404 });
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const sourceView = h.controls.providerAuthSourceViewAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, sourceView);
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthSourceQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(h.registry.get(sourceView).data).toMatchObject({ unsupported: true });
+        expect(h.registry.get(sourceView).data?.error).toContain(
+          "personal sign-in remains available",
+        );
+        expect(h.registry.get(view)?.error).toBeNull();
+        expect(threadVmProviderAuthPresentation(h.registry.get(view)!.providerAuth!).canStart).toBe(
+          true,
+        );
+      }),
+    ),
+  );
+  it.effect("discards account metadata arriving after sign-out", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const h = yield* authHarness(async (url) => {
+          if (new URL(String(url)).pathname.endsWith("vm-status")) return Response.json(status);
+          requested.resolve();
+          await release.promise;
+          return Response.json(managedSource);
+        });
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const view = h.controls.providerAuthSourceViewAtom(environmentId, threadId),
+          query = h.controls.providerAuthSourceQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, null);
+        release.resolve();
+        expect(
+          yield* AtomRegistry.getResult(h.registry, query, { suspendOnWaiting: true }),
+        ).toBeNull();
+        expect(h.registry.get(view).data).toBeNull();
+      }),
+    ),
+  );
+  it.effect("keeps a delayed sign-in read running through unchanged VM status refreshes", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const requests: Request[] = [];
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          requests.push(request);
+          requested.resolve();
+          await release.promise;
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* Effect.promise(() => requested.promise);
+        for (let refresh = 0; refresh < 3; refresh++) {
+          h.registry.refresh(h.query);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        }
+        expect(requests).toHaveLength(1);
+        expect(requests[0]!.signal.aborted).toBe(false);
+        release.resolve();
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.auth.phase).toBe("idle");
+      }),
+    ),
+  );
+  it.effect("lets a slow active sign-in poll finish before scheduling the next poll", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const requests: Request[] = [];
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          requests.push(request);
+          if (requests.length === 2) {
+            requested.resolve();
+            await release.promise;
+          }
+          return Response.json(waitingAuth);
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        yield* Effect.promise(() => requested.promise);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(6_000));
+        expect(requests).toHaveLength(2);
+        expect(requests[1]!.signal.aborted).toBe(false);
+        release.resolve();
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.auth.interaction).toMatchObject({
+          userCode: "TEST-1234",
+        });
+      }),
+    ),
+  );
+  it.effect("hides the previous VM's code while its replacement sign-in read is pending", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let binding = authBinding;
+        const next = { ...authBinding, allocationId: "replacement-vm", operationId: "next-move" };
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json({ ...pendingVmStatus, pendingProviderAuth: binding });
+          if (binding === next) {
+            requested.resolve();
+            await release.promise;
+          }
+          return Response.json({ ...waitingAuth, ...binding });
+        });
+        const view = h.controls.viewAtom(environmentId, threadId),
+          authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+        yield* AtomRegistry.mount(h.registry, view);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.allocationId).toBe(authBinding.allocationId);
+        binding = next;
+        rememberAuthPlacement(h, authPlacement("personal_sign_in", next));
+        h.registry.refresh(h.query);
+        yield* Effect.promise(() => requested.promise);
+        expect(h.registry.get(view)?.providerAuth).toBeNull();
+        release.resolve();
+        yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+        expect(h.registry.get(view)?.providerAuth?.allocationId).toBe(next.allocationId);
+      }),
+    ),
+  );
+  it.effect(
+    "uses relay-only start and cancel for the next-generation VM while the source remains current",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [],
+            bodies: unknown[] = [];
+          let providerAuth: RelayThreadVmProviderAuth = { ...waitingAuth, auth: idleAuth };
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init),
+              pathname = new URL(request.url).pathname;
+            expect(new URL(request.url).hostname).toBe("relay.example.test");
+            expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+            calls.push(request.method + " " + pathname);
+            if (pathname.endsWith("vm-status")) return Response.json(pendingVmStatus);
+            if (request.method === "POST") {
+              bodies.push(await request.json());
+              providerAuth = pathname.endsWith("/cancel")
+                ? { ...waitingAuth, auth: { ...waitingAuth.auth, phase: "cancelled" } }
+                : waitingAuth;
+            }
+            return Response.json(providerAuth);
+          });
+          const view = h.controls.viewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          const authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(view)?.providerAuth?.auth.phase).toBe("idle");
+          const input = { environmentId, threadId, accountId: "owner", binding: authBinding };
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "start" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(view)?.providerAuth).toMatchObject(waitingAuth);
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action: { type: "cancel", flowId: "flow-1" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(view)?.providerAuth?.auth.phase).toBe("cancelled");
+          expect(bodies).toEqual([
+            {
+              operationId: authBinding.operationId,
+              allocationId: authBinding.allocationId,
+              generation: 2,
+            },
+            {
+              operationId: authBinding.operationId,
+              allocationId: authBinding.allocationId,
+              generation: 2,
+              flowId: "flow-1",
+            },
+          ]);
+          expect(calls.filter((call) => call.startsWith("POST"))).toEqual([
+            "POST /v1/threads/vm-thread/provider-auth/start",
+            "POST /v1/threads/vm-thread/provider-auth/cancel",
+          ]);
+        }),
+      ),
+  );
+  it.effect(
+    "never contacts a guest auth endpoint for an ordinary running or saved-only thread",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: string[] = [];
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(new URL(request.url).pathname);
+            return Response.json(status);
+          });
+          yield* AtomRegistry.mount(h.registry, h.controls.viewAtom(environmentId, threadId));
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          expect(calls).toEqual(["/v1/threads/vm-thread/vm-status"]);
+        }),
+      ),
+  );
+  it.effect("rejects a stale VM binding and another account before starting sign-in", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init);
+          calls.push(request.method + " " + new URL(request.url).pathname);
+          return Response.json(pendingVmStatus);
+        });
+        yield* AtomRegistry.mount(h.registry, h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const input = {
+          environmentId,
+          threadId,
+          accountId: "owner",
+          binding: { ...authBinding, allocationId: "stale-vm" },
+          action: { type: "start" as const },
+        };
+        for (const action of [
+          { type: "start" },
+          { type: "select_source", source: { mode: "organization", connectionId: "org-codex" } },
+        ] as const) {
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, { ...input, action }),
+            ))._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                ...input,
+                action,
+                binding: authBinding,
+                accountId: "other",
+              }),
+            ))._tag,
+          ).toBe("Failure");
+        }
+        expect(calls).toEqual(["GET /v1/threads/vm-thread/vm-status"]);
+      }),
+    ),
+  );
+  it.effect("polls an active sign-in and stops when the relay no longer has pending auth", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+        let reads = 0;
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          reads++;
+          return Response.json(reads === 1 ? waitingAuth : null);
+        });
+        yield* AtomRegistry.mount(h.registry, h.controls.viewAtom(environmentId, threadId));
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        yield* AtomRegistry.getResult(
+          h.registry,
+          h.controls.providerAuthQueryAtom(environmentId, threadId),
+          { suspendOnWaiting: true },
+        );
+        expect(reads).toBe(1);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+        expect(reads).toBe(2);
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(4_000));
+        expect(reads).toBe(2);
+      }),
+    ),
+  );
+  it.effect(
+    "hides the cached device code immediately while another account's status is loading",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (new URL(request.url).pathname.endsWith("vm-status")) {
+              if (request.headers.get("authorization") === "Bearer other-token") {
+                requested.resolve();
+                await release.promise;
+                return Response.json(status);
+              }
+              return Response.json(pendingVmStatus);
+            }
+            return Response.json(waitingAuth);
+          });
+          const view = h.controls.viewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(
+            h.registry,
+            h.controls.providerAuthQueryAtom(environmentId, threadId),
+            { suspendOnWaiting: true },
+          );
+          expect(h.registry.get(view)?.providerAuth?.auth.interaction?.type).toBe("deviceCode");
+          h.registry.set(managedRelaySessionAtom, {
+            accountId: "other",
+            readClerkToken: () => Effect.succeed("other-token"),
+          });
+          yield* Effect.promise(() => requested.promise);
+          expect(h.registry.get(view)?.providerAuth).toBeNull();
+          release.resolve();
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        }),
+      ),
+  );
+  it.effect(
+    "discards a previous account's device code when its read arrives after an account switch",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (new URL(request.url).pathname.endsWith("vm-status"))
+              return Response.json(
+                request.headers.get("authorization") === "Bearer other-token"
+                  ? status
+                  : pendingVmStatus,
+              );
+            requested.resolve();
+            await release.promise;
+            return Response.json(waitingAuth);
+          });
+          const view = h.controls.viewAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* Effect.promise(() => requested.promise);
+          h.registry.set(managedRelaySessionAtom, {
+            accountId: "other",
+            readClerkToken: () => Effect.succeed("other-token"),
+          });
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          release.resolve();
+          expect(
+            yield* AtomRegistry.getResult(
+              h.registry,
+              h.controls.providerAuthQueryAtom(environmentId, threadId),
+              { suspendOnWaiting: true },
+            ),
+          ).toBeNull();
+          expect(h.registry.get(view)?.accountId).toBe("other");
+          expect(h.registry.get(view)?.providerAuth).toBeNull();
+        }),
+      ),
+  );
+  it.effect("does not accept a sign-in reply after the account signs out", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requested = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        const h = yield* authHarness(async (url, init) => {
+          const request = new Request(url, init);
+          if (new URL(request.url).pathname.endsWith("vm-status"))
+            return Response.json(pendingVmStatus);
+          if (request.method === "POST") {
+            requested.resolve();
+            await release.promise;
+            return Response.json(waitingAuth);
+          }
+          return Response.json({ ...waitingAuth, auth: idleAuth });
+        });
+        yield* AtomRegistry.mount(h.registry, h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        const pending = yield* Effect.promise(() =>
+          h.controls.providerAuthAction.run(h.registry, {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            binding: authBinding,
+            action: { type: "start" },
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Effect.promise(() => requested.promise);
+        h.registry.set(managedRelaySessionAtom, null);
+        release.resolve();
+        expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+        expect(h.registry.get(h.controls.viewAtom(environmentId, threadId))).toBeNull();
+      }),
+    ),
+  );
+  it.effect(
+    "reads back an active flow after a lost start reply instead of offering a duplicate start",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let providerAuth: RelayThreadVmProviderAuth = { ...waitingAuth, auth: idleAuth };
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (new URL(request.url).pathname.endsWith("vm-status"))
+              return Response.json(pendingVmStatus);
+            if (request.method === "POST") {
+              providerAuth = waitingAuth;
+              throw new Error("Lost response");
+            }
+            return Response.json(providerAuth);
+          });
+          const view = h.controls.viewAtom(environmentId, threadId),
+            authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action: { type: "start" },
+              }),
+            ))._tag,
+          ).toBe("Failure");
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          expect(h.registry.get(view)?.providerAuth?.auth.phase).toBe("waiting");
+          expect(
+            threadVmProviderAuthPresentation(h.registry.get(view)!.providerAuth!).canStart,
+          ).toBe(false);
+        }),
+      ),
+  );
+  it.effect(
+    "allows cancellation during a delayed status poll and discards its older device code",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          vi.useFakeTimers();
+          yield* Effect.addFinalizer(() => Effect.sync(() => vi.useRealTimers()));
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>(),
+            returned = Promise.withResolvers<void>();
+          let reads = 0,
+            cancelled = false;
+          const h = yield* authHarness(async (url, init) => {
+            const request = new Request(url, init);
+            if (new URL(request.url).pathname.endsWith("vm-status"))
+              return Response.json(pendingVmStatus);
+            if (request.method === "POST") {
+              cancelled = true;
+              return Response.json({
+                ...waitingAuth,
+                auth: { ...waitingAuth.auth, phase: "cancelled" },
+              });
+            }
+            reads++;
+            if (reads === 2) {
+              requested.resolve();
+              await release.promise;
+              returned.resolve();
+              return Response.json(waitingAuth);
+            }
+            return Response.json(
+              cancelled
+                ? { ...waitingAuth, auth: { ...waitingAuth.auth, phase: "cancelled" } }
+                : waitingAuth,
+            );
+          });
+          const view = h.controls.viewAtom(environmentId, threadId),
+            authQuery = h.controls.providerAuthQueryAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, view);
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000));
+          yield* Effect.promise(() => requested.promise);
+          expect(h.registry.get(view)?.providerAuthPending).toBe(true);
+          expect(
+            threadVmProviderAuthPresentation(h.registry.get(view)!.providerAuth!).canCancel,
+          ).toBe(true);
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.providerAuthAction.run(h.registry, {
+                environmentId,
+                threadId,
+                accountId: "owner",
+                binding: authBinding,
+                action: { type: "cancel", flowId: "flow-1" },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true });
+          release.resolve();
+          yield* Effect.promise(() => returned.promise);
+          expect(
+            (yield* AtomRegistry.getResult(h.registry, authQuery, { suspendOnWaiting: true }))?.auth
+              .phase,
+          ).toBe("cancelled");
+          expect(
+            threadVmProviderAuthPresentation(h.registry.get(view)!.providerAuth!).userCode,
+          ).toBeNull();
+        }),
+      ),
+  );
+});
+
+function deletionJournal() {
+  const values = new Map<string, string>();
+  const storage: ThreadMoveSubmissionStorage = {
+    read: async (key) => values.get(key) ?? null,
+    write: async (key, value) => {
+      values.set(key, value);
+    },
+    remove: async (key) => {
+      values.delete(key);
+    },
+    withLock: async (_key, action) => action(),
+  };
+  return createThreadVmActionJournal(storage);
+}
+
+describe("deletion from ordinary thread entry points", () => {
+  const operationId = "00000000-0000-4000-8000-000000000001";
+  const input = { environmentId, input: { threadId } };
+  const scope = { accountId: "owner", relayUrl };
+
+  it.effect(
+    "uses the enrolled route from a cached archived thread without contacting its environment",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* harness(
+            async (url, init) => {
+              const request = new Request(url, init);
+              expect(request.method).toBe("POST");
+              expect(new URL(request.url).pathname).toBe("/v1/threads/vm-thread/deletion");
+              return Response.json({
+                threadId,
+                operationId,
+                generation: 1,
+                phase: "completed",
+                errorCode: null,
+              });
+            },
+            { ...snapshot, threads: [] },
+            Atom.make(AsyncResult.success(snapshot)),
+          );
+          const command = withPortableThreadDeletion(
+            {
+              label: "delete",
+              run: async () => {
+                throw new Error("Archived portable thread reached local deletion");
+              },
+            },
+            h.controls.action,
+            deletionJournal(),
+            h.controls.routeAtom,
+            () => operationId,
+          );
+          expect((yield* Effect.promise(() => command.run(h.registry, input)))._tag).toBe(
+            "Success",
+          );
+        }),
+      ),
+  );
+
+  it.effect(
+    "routes deletion through the relay after an initially pending archive query completes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const loaded = yield* Deferred.make<OrchestrationShellSnapshot>();
+          const archive = Atom.runtime(Layer.empty).atom(Deferred.await(loaded));
+          const calls: string[] = [];
+          const h = yield* harness(
+            async (url, init) => {
+              const request = new Request(url, init);
+              calls.push(request.method + " " + new URL(request.url).pathname);
+              return Response.json({
+                threadId,
+                operationId,
+                generation: 1,
+                phase: "completed",
+                errorCode: null,
+              });
+            },
+            { ...snapshot, threads: [] },
+            archive,
+          );
+          const route = h.controls.routeAtom(environmentId, threadId);
+          yield* AtomRegistry.mount(h.registry, route);
+          expect(h.registry.get(route)).toBeNull();
+          yield* Deferred.succeed(loaded, snapshot);
+          yield* AtomRegistry.getResult(h.registry, archive, { suspendOnWaiting: true });
+          expect(h.registry.get(route)).toEqual(snapshot.threads[0]!.relayRouting);
+          const command = withPortableThreadDeletion(
+            {
+              label: "delete",
+              run: async () => {
+                throw new Error("Late archived route reached local deletion");
+              },
+            },
+            h.controls.action,
+            deletionJournal(),
+            h.controls.routeAtom,
+            () => operationId,
+          );
+          expect((yield* Effect.promise(() => command.run(h.registry, input)))._tag).toBe(
+            "Success",
+          );
+          expect(calls).toEqual(["POST /v1/threads/vm-thread/deletion"]);
+        }),
+      ),
+  );
+
+  it.effect(
+    "leaves an unenrolled local thread on its environment without contacting the relay",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* harness(
+            async () => {
+              throw new Error("Unexpected relay call");
+            },
+            {
+              ...snapshot,
+              threads: [],
+            },
+          );
+          let localCalls = 0;
+          const command = withPortableThreadDeletion(
+            {
+              label: "delete",
+              run: async () => {
+                localCalls++;
+                return AsyncResult.success({ sequence: 8 });
+              },
+            },
+            h.controls.action,
+            deletionJournal(),
+            h.controls.routeAtom,
+            () => operationId,
+          );
+          expect(yield* Effect.promise(() => command.run(h.registry, input))).toMatchObject({
+            _tag: "Success",
+            value: { sequence: 8 },
+          });
+          expect(localCalls).toBe(1);
+        }),
+      ),
+  );
+
+  it.effect(
+    "retains a lost deletion reply and reuses its original request until physical cleanup completes",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const journal = deletionJournal(),
+            bodies: unknown[] = [];
+          let calls = 0;
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            expect(new URL(request.url).pathname).toBe("/v1/threads/vm-thread/deletion");
+            expect(request.method).toBe("POST");
+            expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+            expect(await journal.list(scope)).toHaveLength(1);
+            bodies.push(await request.json());
+            calls++;
+            if (calls === 1) throw new Error("Lost response");
+            return Response.json({
+              threadId,
+              operationId,
+              generation: 1,
+              phase: calls === 2 ? "stopping" : "completed",
+              errorCode: null,
+            });
+          });
+          const makeCommand = (id: string) =>
+            withPortableThreadDeletion(
+              {
+                label: "delete",
+                run: async () => {
+                  throw new Error("Portable deletion reached environment");
+                },
+              },
+              h.controls.action,
+              journal,
+              h.controls.routeAtom,
+              () => id,
+            );
+          expect(
+            (yield* Effect.promise(() => makeCommand(operationId).run(h.registry, input)))._tag,
+          ).toBe("Failure");
+          expect(yield* Effect.promise(() => journal.list(scope))).toHaveLength(1);
+          expect(
+            (yield* Effect.promise(() =>
+              makeCommand("00000000-0000-4000-8000-000000000002").run(h.registry, input),
+            ))._tag,
+          ).toBe("Success");
+          expect(yield* Effect.promise(() => journal.list(scope))).toHaveLength(1);
+          expect(
+            (yield* Effect.promise(() =>
+              makeCommand("00000000-0000-4000-8000-000000000003").run(h.registry, input),
+            ))._tag,
+          ).toBe("Success");
+          expect(yield* Effect.promise(() => journal.list(scope))).toEqual([]);
+          expect(bodies).toEqual(
+            Array.from({ length: 3 }, () => ({
+              operationId,
+              expectedGeneration: 1,
+              confirmWorkspaceLoss: true,
+            })),
+          );
+        }),
+      ),
+  );
+
+  it.effect("does not send an enrolled deletion while signed out", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* harness(async () => {
+          throw new Error("Unexpected request");
+        });
+        h.registry.set(managedRelaySessionAtom, null);
+        const journal = deletionJournal();
+        const command = withPortableThreadDeletion(
+          {
+            label: "delete",
+            run: async () => {
+              throw new Error("Unexpected local deletion");
+            },
+          },
+          h.controls.action,
+          journal,
+          h.controls.routeAtom,
+          () => operationId,
+        );
+        expect((yield* Effect.promise(() => command.run(h.registry, input)))._tag).toBe("Failure");
+        expect(yield* Effect.promise(() => journal.list(scope))).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect(
+    "leaves a saved reset intact and refuses deletion until that operation is resolved",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* harness(async () => {
+            throw new Error("Unexpected deletion request");
+          });
+          const journal = deletionJournal();
+          const reset = {
+            environmentId,
+            threadId,
+            action: {
+              type: "reset" as const,
+              payload: {
+                operationId,
+                allocationId: "00000000-0000-4000-8000-000000000002",
+                expectedGeneration: 1,
+                canonicalKey: "github.com/team/repo",
+                branch: "main",
+                revision: "a".repeat(40),
+              },
+            },
+          };
+          yield* Effect.promise(() => journal.prepare(scope, reset));
+          const command = withPortableThreadDeletion(
+            {
+              label: "delete",
+              run: async () => {
+                throw new Error("Unexpected local deletion");
+              },
+            },
+            h.controls.action,
+            journal,
+            h.controls.routeAtom,
+            () => operationId,
+          );
+          expect((yield* Effect.promise(() => command.run(h.registry, input)))._tag).toBe(
+            "Failure",
+          );
+          expect(yield* Effect.promise(() => journal.list(scope))).toEqual([reset]);
+        }),
+      ),
+  );
+});
+
+describe("shared VM controls", () => {
+  it.effect(
+    "checks a recovery candidate only on request and rejects stale or late account results",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const candidate = {
+            threadId,
+            generation: 1,
+            sourceAllocationId: "source-allocation",
+            backupOperationId: "00000000-0000-4000-8000-000000000001",
+            capturedAt: "2026-10-15T12:00:00.000Z",
+            nativeCheckpointOperationId: "00000000-0000-4000-8000-000000000002",
+            available: true,
+            blockedReason: null,
+          };
+          const calls: Request[] = [];
+          const input = {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            expectedGeneration: 1,
+            sourceAllocationId: candidate.sourceAllocationId,
+          };
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(request);
+            return Response.json(candidate);
+          });
+          expect(calls).toHaveLength(0);
+          expect(
+            yield* Effect.promise(() => h.controls.checkBackupRecovery.run(h.registry, input)),
+          ).toMatchObject({ _tag: "Success", value: candidate });
+          expect(calls[0]?.method).toBe("GET");
+          expect(calls[0]?.url).toBe(relayUrl + "/v1/threads/vm-thread/vm-backup-recovery");
+          expect(calls[0]?.headers.get("authorization")).toBe("Bearer owner-token");
+          expect(
+            yield* Effect.promise(() =>
+              h.controls.checkBackupRecovery.run(h.registry, {
+                ...input,
+                expectedGeneration: 2,
+              }),
+            ),
+          ).toMatchObject({ _tag: "Failure" });
+          const arrived = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const late = yield* harness(async () => {
+            arrived.resolve();
+            await release.promise;
+            return Response.json(candidate);
+          });
+          const pending = yield* Effect.promise(() =>
+            late.controls.checkBackupRecovery.run(late.registry, input),
+          ).pipe(Effect.forkScoped);
+          yield* Effect.promise(() => arrived.promise);
+          late.registry.set(managedRelaySessionAtom, null);
+          release.resolve();
+          expect(yield* Fiber.join(pending)).toMatchObject({ _tag: "Failure" });
+        }),
+      ),
+  );
+  it.effect("reads a saved-only VM from the relay without attempting connection or resume", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+          calls.push(request.method + " " + new URL(request.url).pathname);
+          return Response.json(status);
+        });
+        yield* AtomRegistry.mount(h.registry, h.query);
+        expect(
+          (yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }))?.status,
+        ).toEqual(status);
+        expect(calls).toEqual(["GET /v1/threads/vm-thread/vm-status"]);
+        expect(
+          h.registry.get(h.controls.viewAtom(environmentId, threadId))?.data?.status?.savedDisk
+            ?.phase,
+        ).toBe("available");
+      }),
+    ),
+  );
+  it.effect(
+    "opens an explicit port through the authenticated relay and discards a late account reply",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const calls: Request[] = [];
+          const release = Promise.withResolvers<void>();
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(request);
+            expect(request.headers.get("authorization")).toBe("Bearer owner-token");
+            expect(await request.json()).toEqual({ port: 4080 });
+            return Response.json({
+              url: "https://preview.example.test/__launchpad_preview/#one-use",
+            });
+          });
+          const opened = yield* Effect.promise(() =>
+            h.controls.openPreview.run(h.registry, { environmentId, threadId, port: 4080 }),
+          );
+          expect(opened._tag).toBe("Success");
+          expect(calls[0]?.url).toBe(relayUrl + "/v1/threads/vm-thread/vm-previews");
+          const invalid = yield* Effect.promise(() =>
+            h.controls.openPreview.run(h.registry, { environmentId, threadId, port: 3773 }),
+          );
+          expect(invalid._tag).toBe("Failure");
+          expect(calls).toHaveLength(1);
+          const lateArrived = Promise.withResolvers<void>();
+          const late = yield* harness(async () => {
+            lateArrived.resolve();
+            await release.promise;
+            return Response.json({ url: "https://preview.example.test/__launchpad_preview/#late" });
+          });
+          const pending = yield* Effect.promise(() =>
+            late.controls.openPreview.run(late.registry, { environmentId, threadId, port: 4080 }),
+          ).pipe(Effect.forkScoped);
+          // Token loading and fetch start are awaited through a receipt, not a sleep.
+          yield* Effect.promise(() => lateArrived.promise);
+          late.registry.set(managedRelaySessionAtom, null);
+          release.resolve();
+          expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+        }),
+      ),
+  );
+  it.effect("does not query ordinary local threads", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { relayRouting: _, ...thread } = snapshot.threads[0]!;
+        const h = yield* harness(
+          async () => {
+            throw new Error("Ordinary local threads cannot use VM endpoints");
+          },
+          { ...snapshot, threads: [thread] },
+        );
+        yield* AtomRegistry.mount(h.registry, h.query);
+        expect(
+          yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }),
+        ).toBeNull();
+        expect(h.registry.get(h.controls.viewAtom(environmentId, threadId))).toBeNull();
+      }),
+    ),
+  );
+  it.effect("rejects an environment-selected relay before reading the account token", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let tokens = 0;
+        const h = yield* harness(
+          async () => {
+            throw new Error("No token may reach another relay");
+          },
+          {
+            ...snapshot,
+            threads: [
+              {
+                ...snapshot.threads[0]!,
+                relayRouting: {
+                  relayUrl: "https://foreign.example.test",
+                  generation: 1,
+                  phase: "active",
+                },
+              },
+            ],
+          },
+        );
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "owner",
+          readClerkToken: () =>
+            Effect.sync(() => {
+              tokens++;
+              return "secret";
+            }),
+        });
+        const result = yield* Effect.promise(() =>
+          h.controls.action.run(h.registry, {
+            environmentId,
+            threadId,
+            action: { type: "resume" },
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        expect(tokens).toBe(0);
+      }),
+    ),
+  );
+  it.effect("sign-out while the token is loading prevents a queued lifecycle mutation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>(),
+          ready = yield* Deferred.make<string>();
+        const h = yield* harness(async () => {
+          throw new Error("Signed-out actions cannot be sent");
+        });
+        h.registry.set(managedRelaySessionAtom, {
+          accountId: "owner",
+          readClerkToken: () =>
+            Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(ready))),
+        });
+        const action = yield* Effect.promise(() =>
+          h.controls.action.run(h.registry, {
+            environmentId,
+            threadId,
+            action: { type: "resume" },
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(started);
+        h.registry.set(managedRelaySessionAtom, null);
+        yield* Deferred.succeed(ready, "old-token");
+        expect((yield* Fiber.join(action))._tag).toBe("Failure");
+      }),
+    ),
+  );
+  it.effect(
+    "keeps a lost restore retry's original IDs and displays the retained quota choice",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const operationId = "00000000-0000-4000-8000-000000000001",
+            allocationId = "00000000-0000-4000-8000-000000000002";
+          const payload = {
+            operationId,
+            allocationId,
+            savedDiskOperationId: "00000000-0000-4000-8000-000000000003",
+            expectedGeneration: 1,
+          };
+          const replacement = {
+            requestId: operationId,
+            threadId,
+            phase: "awaiting_choice",
+            victimAllocationId: null,
+            errorCode: null,
+          };
+          const bodies: unknown[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init),
+              path = new URL(request.url).pathname;
+            if (request.method === "POST") {
+              bodies.push(await request.json());
+              if (bodies.length === 1) throw new Error("Lost admission response");
+              return Response.json({
+                status: "quota_reached",
+                maxVms: 1,
+                reservedVms: 1,
+                replacement,
+                suggestedReplacement: null,
+              });
+            }
+            if (path.endsWith("/candidates"))
+              return Response.json([
+                { allocationId: "victim", threadId: "other", state: "paused", title: "Other work" },
+              ]);
+            return Response.json({ ...status, replacement });
+          });
+          const input = { environmentId, threadId, action: { type: "restore" as const, payload } };
+          expect((yield* Effect.promise(() => h.controls.action.run(h.registry, input)))._tag).toBe(
+            "Failure",
+          );
+          expect((yield* Effect.promise(() => h.controls.action.run(h.registry, input)))._tag).toBe(
+            "Success",
+          );
+          yield* AtomRegistry.mount(h.registry, h.query);
+          const data = yield* AtomRegistry.getResult(h.registry, h.query, {
+            suspendOnWaiting: true,
+          });
+          expect(bodies).toEqual([payload, payload]);
+          expect(data?.status?.replacement).toEqual(replacement);
+          expect(data?.candidates).toHaveLength(1);
+        }),
+      ),
+  );
+  it.effect(
+    "after deletion, reads only its cleanup receipt instead of trying to reach the retired VM",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const receipt = {
+              threadId,
+              operationId: "00000000-0000-4000-8000-000000000004",
+              generation: 1,
+              phase: "cleaning",
+              errorCode: null,
+            },
+            calls: string[] = [];
+          const h = yield* harness(async (url, init) => {
+            const request = new Request(url, init);
+            calls.push(request.method + " " + new URL(request.url).pathname);
+            return Response.json(receipt);
+          });
+          expect(
+            (yield* Effect.promise(() =>
+              h.controls.action.run(h.registry, {
+                environmentId,
+                threadId,
+                action: {
+                  type: "delete",
+                  payload: {
+                    operationId: receipt.operationId,
+                    expectedGeneration: 1,
+                    confirmWorkspaceLoss: true,
+                  },
+                },
+              }),
+            ))._tag,
+          ).toBe("Success");
+          yield* AtomRegistry.mount(h.registry, h.query);
+          expect(
+            (yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true }))
+              ?.deletion,
+          ).toEqual(receipt);
+          expect(calls).toEqual([
+            "POST /v1/threads/vm-thread/deletion",
+            "GET /v1/threads/vm-thread/deletion",
+          ]);
+        }),
+      ),
+  );
+  it.effect(
+    "recovers an original deletion from the configured relay after discovery and its thread have disappeared",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const payload = {
+            operationId: "00000000-0000-4000-8000-000000000044",
+            expectedGeneration: 1,
+            confirmWorkspaceLoss: true as const,
+          };
+          const calls: Request[] = [];
+          const h = yield* harness(
+            async (url, init) => {
+              const request = new Request(url, init);
+              calls.push(request);
+              expect(await request.json()).toEqual(payload);
+              return Response.json({
+                threadId,
+                operationId: payload.operationId,
+                generation: 1,
+                phase: "completed",
+                errorCode: null,
+              });
+            },
+            { ...snapshot, threads: [] },
+          );
+          const input = {
+            environmentId,
+            threadId,
+            accountId: "owner",
+            relayUrl,
+            action: { type: "delete" as const, payload },
+          };
+          expect((yield* Effect.promise(() => h.controls.action.run(h.registry, input)))._tag).toBe(
+            "Success",
+          );
+          expect(calls).toHaveLength(1);
+          expect(calls[0]?.url).toBe(relayUrl + "/v1/threads/vm-thread/deletion");
+          let tokens = 0;
+          h.registry.set(managedRelaySessionAtom, {
+            accountId: "other",
+            readClerkToken: () =>
+              Effect.sync(() => {
+                tokens++;
+                return "other-token";
+              }),
+          });
+          expect((yield* Effect.promise(() => h.controls.action.run(h.registry, input)))._tag).toBe(
+            "Failure",
+          );
+          expect(tokens).toBe(0);
+          expect(calls).toHaveLength(1);
+        }),
+      ),
+  );
+  it.effect(
+    "does not acknowledge an old account's lifecycle request when its HTTP reply arrives late",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requested = Promise.withResolvers<void>(),
+            release = Promise.withResolvers<void>();
+          const h = yield* harness(async () => {
+            requested.resolve();
+            await release.promise;
+            return Response.json({ ...status, resumePhase: "waiting" });
+          });
+          const pending = yield* Effect.promise(() =>
+            h.controls.action.run(h.registry, {
+              environmentId,
+              threadId,
+              accountId: "owner",
+              relayUrl,
+              action: { type: "resume" },
+            }),
+          ).pipe(Effect.forkScoped);
+          yield* Effect.promise(() => requested.promise);
+          h.registry.set(managedRelaySessionAtom, null);
+          release.resolve();
+          expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+        }),
+      ),
+  );
+});
+
+describe("VM lifecycle reads current state before mutation", () => {
+  it.effect("rejects resume when the VM generation changed after the card loaded", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let generation = 1;
+        const methods: string[] = [];
+        const h = yield* harness(async (url, init) => {
+          const request = new Request(url, init);
+          methods.push(request.method);
+          expect(request.method).toBe("GET");
+          return Response.json({
+            ...status,
+            generation,
+            allocation: { allocationId: "vm", ownerUserId: "owner", state: "paused" },
+            savedDisk: null,
+            setupPhase: "ready",
+          });
+        });
+        yield* AtomRegistry.mount(h.registry, h.query);
+        yield* AtomRegistry.getResult(h.registry, h.query, { suspendOnWaiting: true });
+        generation = 2;
+        const result = yield* Effect.promise(() =>
+          h.controls.action.run(h.registry, {
+            environmentId,
+            threadId,
+            action: { type: "resume" },
+          }),
+        );
+        expect(result._tag).toBe("Failure");
+        expect(methods).toEqual(["GET", "GET"]);
+      }),
+    ),
+  );
+});

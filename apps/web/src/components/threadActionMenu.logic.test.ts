@@ -35,6 +35,24 @@ function allIds(state: ThreadActionMenuState): string[] {
 }
 
 describe("buildThreadActionMenuItems", () => {
+  it("keeps copy and local list actions available for a read-only VM result", () => {
+    expect(
+      allIds({
+        ...baseState,
+        branch: "t3-job/result",
+        readOnly: true,
+        projectFilter: { label: "Repository", isActive: false },
+      }),
+    ).toEqual([
+      "mark-unread",
+      "filter-by-project",
+      "copy",
+      "copy-path",
+      "copy-branch",
+      "copy-thread-id",
+    ]);
+  });
+
   it("hides lifecycle items when the environment lacks the capabilities", () => {
     expect(
       ids({

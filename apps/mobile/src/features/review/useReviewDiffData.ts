@@ -122,10 +122,11 @@ export function useReviewDiffData(input: {
   readonly environmentId: EnvironmentId | undefined;
   readonly cwd: string | null;
   readonly selectedSection: ReviewSectionItem | null;
+  readonly strictWorkflowReview: boolean;
   readonly revision: string | undefined;
   readonly draftMessage: string;
 }) {
-  const { draftMessage, selectedSection, threadKey } = input;
+  const { draftMessage, selectedSection, strictWorkflowReview, threadKey } = input;
   const selectedSectionId = selectedSection?.id ?? null;
   const source = selectedSection?.source;
   const lazySource = source?.truncated && source.files ? source : null;
@@ -138,9 +139,10 @@ export function useReviewDiffData(input: {
               threadKey,
               sectionId: selectedSection?.id ?? null,
               diff: selectedSection?.diff,
+              strictWorkflowReview,
             }),
           ),
-    [lazySource, selectedSection?.diff, selectedSection?.id, threadKey],
+    [lazySource, selectedSection?.diff, selectedSection?.id, strictWorkflowReview, threadKey],
   );
   const registry = useContext(RegistryContext);
   const { environmentId, cwd } = input;

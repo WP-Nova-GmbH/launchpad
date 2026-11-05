@@ -283,3 +283,36 @@ it.effect("blocks shared credential session startup and preserves guarded adapte
     assert.strictEqual(Exit.isFailure(yield* Fiber.await(startup)), true);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
+
+it.effect("resolves routing and the guarded adapter from the same instance snapshot", () => {
+  const original = fakeInstances[0]!;
+  const replacement = {
+    ...original,
+    adapter: fakeClaudeAdapter,
+    continuationIdentity: { ...original.continuationIdentity, continuationKey: "replacement-home" },
+  };
+  let lookups = 0;
+  const instances = Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+    getInstance: () => Effect.sync(() => (++lookups === 1 ? original : replacement)),
+    listInstances: Effect.succeed([original]),
+    listUnavailable: Effect.succeed([]),
+    streamChanges: Stream.empty,
+    subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), (pubsub) =>
+      PubSub.subscribe(pubsub),
+    ),
+  });
+  return Effect.gen(function* () {
+    const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
+    const resolved = yield* registry.resolveInstance(original.instanceId);
+    assert.equal(
+      resolved.continuationIdentity.continuationKey,
+      original.continuationIdentity.continuationKey,
+    );
+    assert.strictEqual(resolved.adapter, original.adapter);
+    assert.equal(lookups, 1);
+  }).pipe(
+    Effect.provide(
+      ProviderAdapterRegistryLayer.ProviderAdapterRegistryLive.pipe(Layer.provide(instances)),
+    ),
+  );
+});

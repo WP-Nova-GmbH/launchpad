@@ -274,3 +274,20 @@ export async function shareLocalAttachment(input: {
     cached.preview.dispose();
   }
 }
+
+/** Relay downloads already carry original bytes; reuse the native cache/share lifetime. */
+export async function shareAttachmentBytes(input: {
+  readonly bytes: Uint8Array;
+  readonly attachment: AttachmentFileMetadata;
+  readonly signal: AbortSignal;
+}): Promise<void> {
+  if ((await availableSharing(input.signal)) === null) return;
+  const cached = await createCachedAttachmentFile(input.attachment);
+  try {
+    if (input.signal.aborted) return;
+    cached.file.write(input.bytes);
+    if (!input.signal.aborted) await cached.preview.share(input.signal);
+  } finally {
+    cached.preview.dispose();
+  }
+}

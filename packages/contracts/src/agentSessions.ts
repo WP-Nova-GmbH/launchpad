@@ -103,6 +103,24 @@ export const AgentSessionImportResult = Schema.Struct({
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 
+export const AgentSessionImportProgress = Schema.Struct({
+  importedCount: NonNegativeInt,
+  skippedCount: NonNegativeInt,
+  reading: Schema.NullOr(
+    Schema.Struct({
+      bytesRead: NonNegativeInt,
+      totalBytes: NonNegativeInt,
+    }),
+  ),
+});
+export type AgentSessionImportProgress = typeof AgentSessionImportProgress.Type;
+
+export const AgentSessionImportProgressEvent = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("progress"), progress: AgentSessionImportProgress }),
+  Schema.Struct({ type: Schema.Literal("complete"), result: AgentSessionImportResult }),
+]);
+export type AgentSessionImportProgressEvent = typeof AgentSessionImportProgressEvent.Type;
+
 export class AgentSessionScanError extends Schema.TaggedError<AgentSessionScanError>()(
   "AgentSessionScanError",
   {

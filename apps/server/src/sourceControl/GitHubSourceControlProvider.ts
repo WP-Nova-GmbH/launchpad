@@ -126,6 +126,7 @@ export const make = Effect.gen(function* () {
         return github
           .listOpenPullRequests({
             cwd: input.cwd,
+            ...(input.context?.repository ? { repository: input.context.repository } : {}),
             headSelector: input.headSelector,
             ...(input.context === undefined
               ? {}
@@ -161,6 +162,7 @@ export const make = Effect.gen(function* () {
           args: [
             "pr",
             "list",
+            ...(input.context?.repository ? ["--repo", input.context.repository] : []),
             "--head",
             input.headSelector,
             "--state",
@@ -173,6 +175,14 @@ export const make = Effect.gen(function* () {
         })
         .pipe(
           Effect.flatMap((result) => {
+            if (input.context?.repository && (result.stdoutTruncated || result.stdoutInvalidUtf8))
+              return Effect.fail(
+                new GitHubCli.GitHubChangeRequestListDecodeError({
+                  command: "gh",
+                  cwd: input.cwd,
+                  cause: "Incomplete workflow PR search",
+                }),
+              );
             const raw = result.stdout.trim();
             if (raw.length === 0) {
               return Effect.succeed([]);
@@ -262,6 +272,69 @@ export const make = Effect.gen(function* () {
 
   return SourceControlProvider.SourceControlProvider.of({
     kind: "github",
+    workflowPublishingTargeted: true,
+    getChangeRequestDetails: (input) =>
+      Effect.gen(function* () {
+        if (!input.context?.repository)
+          return yield* new SourceControlProviderError({
+            provider: "github",
+            operation: "workflowDetails",
+            cwd: input.cwd,
+            detail: "An explicit repository is required.",
+          });
+        const request = yield* github
+          .getPullRequest({
+            cwd: input.cwd,
+            reference: input.reference,
+            repository: input.context.repository,
+          })
+          .pipe(
+            Effect.map(toChangeRequest),
+            Effect.mapError(
+              (cause) =>
+                new SourceControlProviderError({
+                  provider: "github",
+                  operation: "workflowDetails",
+                  cwd: input.cwd,
+                  detail: "Pull request identity could not be read.",
+                  cause,
+                }),
+            ),
+          );
+        const body = yield* github
+          .execute({
+            cwd: input.cwd,
+            args: [
+              "pr",
+              "view",
+              "--repo",
+              input.context.repository,
+              String(request.number),
+              "--json",
+              "body",
+              "--jq",
+              ".body",
+            ],
+            maxOutputBytes: 131072,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new SourceControlProviderError({
+                  provider: "github",
+                  operation: "workflowDetails",
+                  cwd: input.cwd,
+                  detail: "Pull request recovery data could not be read.",
+                  cause,
+                }),
+            ),
+          );
+        return {
+          request,
+          body: body.stdout,
+          complete: !body.stdoutTruncated && !body.stdoutInvalidUtf8,
+        };
+      }),
     resolveLink: (input) => {
       // Automatic enrichment must not send ambient CLI credentials to a host from message text.
       if (input.url.host !== "github.com") return undefined;
@@ -276,6 +349,7 @@ export const make = Effect.gen(function* () {
       github
         .getPullRequest({
           ...input,
+          ...(input.context?.repository ? { repository: input.context.repository } : {}),
           ...(input.context === undefined
             ? {}
             : { rateLimitHost: new URL(input.context.provider.baseUrl).host }),
@@ -301,6 +375,7 @@ export const make = Effect.gen(function* () {
       github
         .createPullRequest({
           cwd: input.cwd,
+          ...(input.context?.repository ? { repository: input.context.repository } : {}),
           baseBranch: input.baseRefName,
           headSelector: input.headSelector,
           title: input.title,
@@ -360,6 +435,7 @@ export const make = Effect.gen(function* () {
       github
         .getDefaultBranch({
           ...input,
+          ...(input.context?.repository ? { repository: input.context.repository } : {}),
           ...(input.context === undefined
             ? {}
             : { rateLimitHost: new URL(input.context.provider.baseUrl).host }),

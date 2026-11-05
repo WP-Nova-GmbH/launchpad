@@ -1071,6 +1071,22 @@ export function createServerEnvironmentAtoms<R, E>(
     updateStateAtom,
     settingsValueAtom,
     providersValueAtom,
+    codexVmSignInCapability: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:codex-vm:sign-in-capability",
+      tag: WS_METHODS.codexVmSignInCapability,
+    }),
+    startCodexVmSignIn: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:codex-vm:sign-in-start",
+      tag: WS_METHODS.codexVmSignInStart,
+    }),
+    waitForCodexVmSignIn: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:codex-vm:sign-in-wait",
+      tag: WS_METHODS.codexVmSignInWait,
+    }),
+    cancelCodexVmSignIn: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:codex-vm:sign-in-cancel",
+      tag: WS_METHODS.codexVmSignInCancel,
+    }),
     providerAuthState: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:provider:auth-state",
       tag: WS_METHODS.providerAuthSubscribe,

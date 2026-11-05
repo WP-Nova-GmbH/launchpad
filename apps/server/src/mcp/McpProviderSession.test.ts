@@ -7,6 +7,7 @@ import {
   bindIssueTrackerTurn,
   completeIssueTrackerTurn,
   clearAllMcpProviderSessions,
+  clearMcpProviderSession,
 } from "./McpProviderSession.ts";
 
 describe("device CLI environment", () => {
@@ -65,4 +66,21 @@ it("does not let a late completion revoke the next user's authorization", () => 
   expect(readMcpProviderSession(config.threadId)?.issueTrackerTurnComplete).toBeUndefined();
   expect(readMcpProviderSession(config.threadId)?.issueTrackerAuthorizationId).toBe("bob-grant");
   clearAllMcpProviderSessions();
+});
+
+it("does not let late cleanup delete a replacement credential", () => {
+  const config = {
+    threadId: ThreadId.make("late-credential-cleanup"),
+    environmentId: EnvironmentId.make("environment"),
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerSessionId: "new-native",
+    endpoint: "http://localhost/mcp",
+    authorizationHeader: "Bearer fixture",
+    capabilities: new Set<string>(),
+  };
+  setMcpProviderSession(config);
+  clearMcpProviderSession(config.threadId, "old-native");
+  expect(readMcpProviderSession(config.threadId)).toBe(config);
+  clearMcpProviderSession(config.threadId, "new-native");
+  expect(readMcpProviderSession(config.threadId)).toBeUndefined();
 });

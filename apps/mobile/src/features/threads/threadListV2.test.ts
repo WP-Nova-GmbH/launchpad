@@ -27,6 +27,8 @@ import { threadJumpTarget } from "../keyboard/threadKeyboardShortcuts";
 import {
   buildThreadListV2Items,
   buildThreadListV2ListItems,
+  canMutateThreadListRow,
+  getThreadListV2ArrangementThreads,
   getThreadListV2OrderedSection,
   isThreadListV2ListItem,
   resolveThreadListV2SnoozeMenuSelection,
@@ -39,6 +41,19 @@ import {
 } from "./threadListV2";
 
 const environmentId = EnvironmentId.make("environment-1");
+
+describe("canMutateThreadListRow", () => {
+  it("withholds writes from connected or cached workflow VM results", () => {
+    expect(canMutateThreadListRow("workflow:job", { workflowVmResultReader: true })).toBe(false);
+    expect(canMutateThreadListRow("workflow:job", undefined)).toBe(false);
+  });
+
+  it("preserves ordinary rows and workflow threads on an enrolled machine", () => {
+    expect(canMutateThreadListRow("thread", undefined)).toBe(true);
+    expect(canMutateThreadListRow("workflow:job", { workflowVmResultReader: false })).toBe(true);
+    expect(canMutateThreadListRow("workflow:job", {})).toBe(true);
+  });
+});
 
 function makeThread(
   input: Partial<EnvironmentThreadShell> & Pick<EnvironmentThreadShell, "id" | "title">,
@@ -1038,6 +1053,51 @@ describe("buildThreadListV2ListItems", () => {
 });
 
 describe("pending mobile thread moves", () => {
+  it("reorders keyless writable rows with a finished workflow result between them", () => {
+    const guest = EnvironmentId.make("workflow-vm");
+    const configs = new Map([
+      [guest, { environment: { capabilities: { workflowVmResultReader: true } } }],
+    ]);
+    const rows = ["a", "workflow:result", "b"].map((id, index) =>
+      makeThread({
+        id: ThreadId.make(id),
+        title: id,
+        environmentId: index === 1 ? guest : environmentId,
+        createdAt: `2026-06-01T0${3 - index}:00:00.000Z`,
+      }),
+    );
+    const arrangementThreads = getThreadListV2ArrangementThreads(rows, configs);
+    const ordered = getThreadListV2OrderedSection({
+      threads: arrangementThreads,
+      section: "active",
+      now: NOW,
+    });
+    const movedId = `${environmentId}:a`;
+    const assignments = createThreadMovePlanner({
+      ordered,
+      allThreads: arrangementThreads,
+      section: "active",
+      reorderableEnvironmentIds: new Set([environmentId]),
+    })(movedId, "down");
+    expect(assignments?.map(({ id }) => id)).toEqual([`${environmentId}:b`, movedId]);
+    const pendingOrder = createPendingThreadOrder({
+      section: "active",
+      ordered,
+      movedId,
+      direction: "down",
+      assignments: assignments!,
+    });
+    const list = buildThreadListV2Items({
+      threads: rows,
+      arrangementThreads,
+      pendingOrder,
+      environmentId: null,
+      searchQuery: "",
+      now: NOW,
+    });
+    expect(list.items.map(({ thread }) => thread.id)).toEqual(["b", "workflow:result", "a"]);
+  });
+
   function fixture(section: "active" | "pinned" = "active") {
     const rows = ["a", "b", "c"].map((id, index) =>
       makeThread({

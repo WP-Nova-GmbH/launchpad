@@ -27,6 +27,9 @@ export interface CodexAppServerClientOptions {
 }
 
 interface CodexAppServerClientRaw {
+  readonly reserveIdleShutdown?: CodexProtocol.CodexAppServerPatchedProtocol["reserveIdleShutdown"];
+  readonly releaseIdleShutdown?: CodexProtocol.CodexAppServerPatchedProtocol["releaseIdleShutdown"];
+  readonly awaitInputDrained?: CodexProtocol.CodexAppServerPatchedProtocol["awaitInputDrained"];
   readonly notifications: CodexProtocol.CodexAppServerPatchedProtocol["incomingNotifications"];
   readonly requests: CodexProtocol.CodexAppServerPatchedProtocol["incomingRequests"];
   readonly request: CodexProtocol.CodexAppServerPatchedProtocol["request"];
@@ -218,6 +221,9 @@ const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make")(func
 
   return CodexAppServerClient.of({
     raw: {
+      reserveIdleShutdown: transport.reserveIdleShutdown,
+      releaseIdleShutdown: transport.releaseIdleShutdown,
+      awaitInputDrained: transport.awaitInputDrained,
       notifications: transport.incomingNotifications,
       requests: transport.incomingRequests,
       request: transport.request,

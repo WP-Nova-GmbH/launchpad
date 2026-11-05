@@ -5,6 +5,12 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
+/** Local dev transports can name this relay without changing its durable token issuer. */
+export const RelayTokenResourceAliases = Context.Reference<ReadonlyArray<string>>(
+  "launchpad-relay/Config/RelayTokenResourceAliases",
+  { defaultValue: () => [] },
+);
+
 export const ApnsEnvironment = Schema.Literals(["sandbox", "production"]);
 export type ApnsEnvironment = typeof ApnsEnvironment.Type;
 
@@ -56,14 +62,21 @@ export class RelayConfiguration extends Context.Service<
     readonly cloudMintPublicKey: string;
     /** Absent until a deployment configures a GitHub App; the surface hides itself. */
     readonly github?: GithubAppCredentials | undefined;
+    /** Configure only after native owner/credential isolation has been proven. */
+    readonly linearWorkflow?:
+      | { readonly clientId: string; readonly clientSecret?: Redacted.Redacted<string> }
+      | undefined;
+    /** Intake may observe delivery while admission stays disabled until release verification. */
+    readonly linearWorkflowWebhook?:
+      | {
+          readonly applicationId: string;
+          readonly signingSecret: Redacted.Redacted<string>;
+          readonly generation: string;
+          readonly admissionEnabled: boolean;
+        }
+      | undefined;
     readonly managedEndpointBaseDomain: string | undefined;
     readonly managedEndpointNamespace: string | undefined;
-    /**
-     * Development-only escape hatch for relay-provisioned Docker machines.
-     * When enabled, the connector may call a machine's loopback-only manual
-     * endpoint. Personal links and non-loopback endpoints remain rejected.
-     */
-    readonly allowLocalMachineEndpoints?: boolean;
     /**
      * The source enrolled executors keep themselves current with. Absent on a
      * relay that does not want machines updating themselves; executors then
@@ -84,3 +97,22 @@ export const make = (configuration: RelayConfiguration["Service"]) =>
 
 export const layer = (configuration: RelayConfiguration["Service"]) =>
   Layer.succeed(RelayConfiguration, make(configuration));
+
+export function workflowWebhookConfiguration(
+  applicationId: string | undefined,
+  signingSecret: Redacted.Redacted<string> | undefined,
+  generation: string | undefined,
+  admissionEnabled = false,
+) {
+  return applicationId?.trim() &&
+    signingSecret &&
+    Redacted.value(signingSecret).trim() &&
+    generation?.trim()
+    ? {
+        applicationId: applicationId.trim(),
+        signingSecret,
+        generation: generation.trim(),
+        admissionEnabled,
+      }
+    : undefined;
+}

@@ -8,6 +8,7 @@ import * as DateTime from "effect/DateTime";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { AtomCommand } from "./runtime.ts";
+import type { CommandSubmission } from "../operations/commands.ts";
 
 interface PendingThreadUpdate {
   readonly threadId: ThreadId;
@@ -51,7 +52,7 @@ export function createOptimisticThreadLifecycle(
   function wrap<Input extends { readonly threadId: ThreadId }, E>(
     command: AtomCommand<
       { readonly environmentId: EnvironmentId; readonly input: Input },
-      { readonly sequence: number },
+      CommandSubmission,
       E
     >,
     apply: (
@@ -77,11 +78,12 @@ export function createOptimisticThreadLifecycle(
         let confirmed = false;
         try {
           const result = await command.run(registry, target);
-          if (result._tag === "Success") {
-            update.sequence = result.value.sequence;
+          if (result._tag === "Success" && "sequence" in result.value) {
+            const sequence = result.value.sequence;
+            update.sequence = sequence;
             registry.update(pending, (current) => [...current]);
             const reconcile = (snapshot: OrchestrationShellSnapshot | null) => {
-              if (snapshot === null || snapshot.snapshotSequence >= result.value.sequence) {
+              if (snapshot === null || snapshot.snapshotSequence >= sequence) {
                 remove();
                 unsubscribe();
               }

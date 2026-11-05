@@ -21,13 +21,14 @@ import { resolveRelayClerkTokenOptions } from "./publicConfig";
 export interface CloudLinkDesiredState {
   readonly managedTunnel: boolean;
   readonly publish: boolean;
+  readonly keepLinked?: boolean;
 }
 
 /**
  * Drives the primary environment's Launchpad Connect link. Launchpad Connect (managed
  * tunnel) and agent-activity publishing are independent capabilities backed by
- * a single relay link, so consumers express the full desired state and
- * `reconcileCloudState` applies it: unlink when neither is wanted, otherwise
+ * a single relay link. Thread moves can retain that link without either feature.
+ * `reconcileCloudState` applies the desired state: unlink when no feature needs it, otherwise
  * (re)link with the mode the managed-tunnel bit implies and set the publish
  * preference. Re-linking only happens when the managed-tunnel mode actually
  * changes, so flipping publish alone is cheap.
@@ -86,7 +87,7 @@ export function useCloudLinkController() {
       return false;
     }
     const tokenResult = await settlePromise(() => getToken(resolveRelayClerkTokenOptions()));
-    const wantsLink = desired.managedTunnel || desired.publish;
+    const wantsLink = desired.managedTunnel || desired.publish || desired.keepLinked === true;
 
     // A failure after this point may follow a partially applied mutation (e.g.
     // the link succeeded but the preference update did not), so every exit —

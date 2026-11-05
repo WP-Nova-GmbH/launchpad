@@ -229,6 +229,8 @@ export default defineConfig(() => {
       port,
       strictPort: true,
       allowedHosts,
+      // Let the backend apply its CORS policy to proxied preflight requests.
+      cors: { preflightContinue: true },
       // Transform the whole module graph at server start instead of on the
       // first request. Without this, a cold worktree discovers and transforms
       // modules one import-level at a time while the browser waits — which
@@ -249,7 +251,7 @@ export default defineConfig(() => {
                 prefix,
                 {
                   target: devProxyTarget,
-                  changeOrigin: true,
+                  changeOrigin: false,
                   ...(prefix === "/ws" || prefix === "/api" ? { ws: true } : {}),
                 },
               ]),

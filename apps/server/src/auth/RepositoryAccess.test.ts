@@ -1,4 +1,11 @@
-import { expect, it } from "@effect/vitest";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { THREAD_VM_IDENTITY_SECRET } from "../relay/ThreadVmEnrollment.ts";
+import * as Exit from "effect/Exit";
+import { FetchHttpClient } from "effect/unstable/http";
+import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
+import { EnvironmentId } from "@t3tools/contracts";
+import { assert, expect, it } from "@effect/vitest";
 import {
   CommandId,
   MessageId,
@@ -28,7 +35,7 @@ import {
   encodeCloudMachineIdentityJson,
 } from "../cloud/config.ts";
 import { SecretStorePersistError, ServerSecretStore } from "./ServerSecretStore.ts";
-import { make } from "./RepositoryAccess.ts";
+import { make, stampCommandAuthor } from "./RepositoryAccess.ts";
 
 const user = { user: { userId: "vali", displayName: "Vali", imageUrl: null } };
 const admin = { user: { userId: "admin", displayName: null, imageUrl: null } };
@@ -117,6 +124,10 @@ const fixture = Effect.gen(function* () {
       ),
   } as unknown as ProjectionSnapshotQuery["Service"];
   const construct = make.pipe(
+    Effect.provide(FetchHttpClient.layer),
+    Effect.provideService(ServerEnvironmentIdentity, {
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("fixture")),
+    }),
     Effect.provideService(ServerSecretStore, secrets),
     Effect.provideService(ProjectionSnapshotQuery, query),
     Effect.provideService(ProjectionProjectRepository, {
@@ -153,6 +164,15 @@ const testLayer = SqlitePersistenceMemory.pipe(
   Layer.provide(Layer.succeed(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({}))),
 );
 it.layer(testLayer)("repository authorization", (it) => {
+  it.effect("never treats an unreadable private VM identity as a personal server", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      f.stored.delete(CLOUD_MACHINE_IDENTITY);
+      f.stored.set(THREAD_VM_IDENTITY_SECRET, new TextEncoder().encode("corrupt-enrollment"));
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(f.construct)));
+    }),
+  );
+
   it.effect("archival retains repository authorization and revocation still denies access", () =>
     Effect.gen(function* () {
       const { construct, threads } = yield* fixture;
@@ -512,6 +532,43 @@ it.layer(testLayer)("repository authorization", (it) => {
         yield* pending.requireThread(user, threadA);
       }),
   );
+  it.effect(
+    "requires queue acceptance on a personal server after a local thread starts using its queue",
+    () =>
+      Effect.gen(function* () {
+        const { construct, stored } = yield* fixture;
+        stored.delete(CLOUD_MACHINE_IDENTITY);
+        const access = yield* construct;
+        expect((yield* access.status).enabled).toBe(false);
+        const fields = {
+          commandId: CommandId.make("local-send"),
+          threadId: threadA,
+          message: { messageId: MessageId.make("local-message"), text: "hello", attachments: [] },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          createdAt: "2026-10-19T10:00:00.000Z",
+        };
+        yield* access.requireCommand(
+          {},
+          { ...fields, type: "thread.turn.start", message: { ...fields.message, role: "user" } },
+        );
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`INSERT INTO projection_thread_prompt_queues(thread_id,state_json) VALUES (${threadA},'{}')`;
+        for (const command of [
+          {
+            ...fields,
+            type: "thread.turn.start" as const,
+            message: { ...fields.message, role: "user" as const },
+          },
+          { ...fields, type: "thread.message.user.append" as const },
+        ])
+          expect((yield* Effect.flip(access.requireCommand({}, command))).message).toContain(
+            "shared queue",
+          );
+        yield* access.requireCommand({}, { ...fields, type: "thread.prompt.enqueue" });
+      }),
+  );
+
   it.effect("requires queued external sends while allowing authorized enqueue", () =>
     Effect.gen(function* () {
       const { construct } = yield* fixture;
@@ -545,6 +602,40 @@ it.layer(testLayer)("repository authorization", (it) => {
       yield* access.requireCommand(user, { ...fields, type: "thread.prompt.enqueue" });
     }),
   );
+  it.effect("routes enrolled thread commands through the relay even on the original server", () =>
+    Effect.gen(function* () {
+      const { construct } = yield* fixture;
+      const access = yield* construct;
+      yield* access.apply(policy, true);
+      const command = {
+        type: "thread.prompt.enqueue" as const,
+        commandId: CommandId.make("portable-send"),
+        threadId: threadA,
+        message: { messageId: MessageId.make("portable-prompt"), text: "run", attachments: [] },
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        createdAt: "2026-10-06T00:00:00.000Z",
+      };
+      yield* access.requireCommand(user, command);
+      const sql = yield* SqlClient.SqlClient;
+      yield* makeThreadExecutionFence(sql).prepare({
+        threadId: threadA,
+        relayUrl: "https://relay.test",
+        environmentId: "source",
+        projectId: projectA,
+        generation: 1,
+        operationId: "enrollment",
+      });
+      expect((yield* Effect.flip(access.requireCommand(user, command))).message).toContain(
+        "relay inbox",
+      );
+      yield* access.requireCommand(admin, {
+        ...command,
+        threadId: threadB,
+        commandId: CommandId.make("ordinary-send"),
+      });
+    }),
+  );
   it.effect("refuses unregistered new projects", () =>
     Effect.gen(function* () {
       const { construct } = yield* fixture;
@@ -564,4 +655,81 @@ it.layer(testLayer)("repository authorization", (it) => {
       ).toBe(true);
     }),
   );
+});
+
+it.effect(
+  "workflow execution requires a current exact organization repository binding without a human account",
+  () =>
+    Effect.gen(function* () {
+      const { construct, projects } = yield* fixture;
+      const access = yield* construct;
+      const binding = {
+        organizationId: "org",
+        repositoryId: "repo-a",
+        projectId: projectA,
+        repositoryCanonicalKey: "github.com/a/a",
+      };
+      assert.equal((yield* Effect.exit(access.requireWorkflowProject(binding)))._tag, "Failure");
+      yield* access.apply(policy, true);
+      yield* access.requireWorkflowProject(binding);
+      assert.equal(
+        (yield* Effect.exit(access.requireWorkflowProject({ ...binding, repositoryId: "repo-b" })))
+          ._tag,
+        "Failure",
+      );
+      assert.equal(
+        (yield* Effect.exit(access.requireWorkflowProject({ ...binding, organizationId: "other" })))
+          ._tag,
+        "Failure",
+      );
+      projects[0] = {
+        ...projects[0]!,
+        repositoryIdentity: {
+          ...projects[0]!.repositoryIdentity!,
+          canonicalKey: "github.com/other/other",
+        },
+      };
+      assert.equal((yield* Effect.exit(access.requireWorkflowProject(binding)))._tag, "Failure");
+      projects[0] = {
+        ...projects[0]!,
+        repositoryIdentity: {
+          ...projects[0]!.repositoryIdentity!,
+          canonicalKey: binding.repositoryCanonicalKey,
+        },
+      };
+      yield* access.apply(
+        {
+          ...policy,
+          revision: 2,
+          members: [],
+          repositories: policy.repositories.map((repo) => ({ ...repo, userIds: [] })),
+        },
+        true,
+      );
+      yield* access.requireWorkflowProject(binding);
+      yield* access.apply({ ...policy, revision: 3, members: [], repositories: [] }, true);
+      assert.equal((yield* Effect.exit(access.requireWorkflowProject(binding)))._tag, "Failure");
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
+
+it("strips internal workflow attribution while stamping the actual wire requester", () => {
+  const command = {
+    type: "thread.prompt.enqueue" as const,
+    commandId: CommandId.make("client-prompt"),
+    threadId: threadA,
+    message: { messageId: MessageId.make("client-message"), text: "hello", attachments: [] },
+    runtimeMode: "approval-required" as const,
+    interactionMode: "default" as const,
+    createdAt: "2026-10-15T00:00:00.000Z",
+    author: { userId: "fake", displayName: null, imageUrl: null },
+    workflowOrigin: {
+      kind: "automation" as const,
+      jobId: "job",
+      workflowId: "flow",
+      workflowName: "Trusted",
+    },
+  };
+  expect(stampCommandAuthor(command, user)).not.toHaveProperty("workflowOrigin");
+  expect(stampCommandAuthor(command, user)).toMatchObject({ author: user.user });
+  expect(stampCommandAuthor(command, {})).not.toHaveProperty("author");
 });

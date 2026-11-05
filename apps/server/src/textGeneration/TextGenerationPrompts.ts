@@ -337,6 +337,8 @@ export interface ApprovalVerdictPromptInput {
   requestType: string;
   requestDetail?: string | undefined;
   stepInstruction: string;
+  jobContext?: string | undefined;
+  reviewConstraint?: string | undefined;
   policy?: TextGenerationPolicy | undefined;
 }
 
@@ -374,7 +376,13 @@ export function buildApprovalVerdictPrompt(input: ApprovalVerdictPromptInput) {
     limitSection(input.requestDetail?.trim() || "(no detail provided)", 4_000),
     "",
     "The task the agent was given:",
-    limitSection(input.stepInstruction, 4_000),
+    limitSection(input.stepInstruction, input.jobContext === undefined ? 4_000 : 32_000),
+    ...(input.jobContext === undefined
+      ? []
+      : ["", "Job context:", limitSection(input.jobContext, 32_000)]),
+    ...(input.reviewConstraint === undefined
+      ? []
+      : ["", "Required review constraint:", input.reviewConstraint]),
     // No policy instructions are spliced in. The other prompts take theirs
     // from a field meant for that prompt; there is no approval-policy field,
     // and borrowing the thread-title one would let text written to shape

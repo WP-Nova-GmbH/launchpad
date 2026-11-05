@@ -282,6 +282,11 @@ export const AuthDesktopIdentityRequest = Schema.Struct({
 });
 export type AuthDesktopIdentityRequest = typeof AuthDesktopIdentityRequest.Type;
 
+export const AuthBrowserIdentityResult = Schema.Struct({
+  user: Schema.NullOr(AuthSessionUser),
+});
+export type AuthBrowserIdentityResult = typeof AuthBrowserIdentityResult.Type;
+
 export const AuthDesktopIdentityResult = Schema.Struct({
   ...AuthAccessTokenResult.fields,
   user: Schema.NullOr(AuthSessionUser),
@@ -349,6 +354,7 @@ export class EnvironmentAuthorizationError extends Schema.TaggedError<Environmen
   {
     message: Schema.String,
     requiredScope: AuthEnvironmentScope,
+    reason: Schema.optional(Schema.Literal("portable-thread")),
   },
 ) {}
 
@@ -414,6 +420,7 @@ export const AuthSessionState = Schema.Struct({
   auth: ServerAuthDescriptor,
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),
+  user: Schema.optionalKey(AuthSessionUser),
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
 });
 export type AuthSessionState = typeof AuthSessionState.Type;

@@ -21,6 +21,7 @@ export type SettingsPath =
   | "/settings/integrations"
   | "/settings/source-control"
   | "/settings/storage"
+  | "/settings/vms"
   | "/settings/connections"
   | "/settings/organization"
   | "/settings/archived";
@@ -92,6 +93,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/source-control": "Source Control",
   "/settings/storage": "Storage",
   "/settings/connections": "Connections",
+  "/settings/vms": "VM threads",
   "/settings/organization": "Organization",
   "/settings/archived": "Archive",
 };
@@ -823,6 +825,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/organization",
   },
   {
+    id: "workflow-sources",
+    title: "Workflow sources",
+    to: "/settings/connections",
+    cloudOnly: true,
+    searchTerms: ["Linear workflow source repository consent connect reconnect disconnect"],
+  },
+  {
     id: "personal-issue-trackers",
     title: "Issue trackers",
     to: "/settings/connections",
@@ -830,9 +839,19 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["Linear Jira personal account issues connect disconnect read-only OAuth"],
   },
   {
-    id: "organization-provider-accounts",
-    title: "Provider accounts",
+    id: "organization-codex-vms",
+    title: "Codex for VMs",
     to: "/settings/organization",
+    cloudOnly: true,
+    searchTerms: [
+      "ChatGPT organization shared account sign in connect reconnect disconnect virtual machine VM",
+    ],
+  },
+  {
+    id: "organization-provider-accounts",
+    title: "Machine provider accounts",
+    to: "/settings/organization",
+    searchTerms: ["Provider accounts executor sign in sessions API keys"],
   },
   {
     id: "organization-skills",
@@ -843,6 +862,21 @@ export const SETTINGS_SEARCH_ITEMS = [
     id: "organization-repositories",
     title: "Repositories and access",
     to: "/settings/organization",
+    searchTerms: ["workflow workflows job jobs human review automation agent manual run cancel"],
+  },
+  {
+    id: "vm-threads",
+    title: "VM threads",
+    to: "/settings/vms",
+    searchTerms: ["sandbox private virtual machines slots saved conversations restore reset"],
+  },
+  {
+    id: "organization-thread-vms",
+    title: "Thread VMs",
+    to: "/settings/organization",
+    searchTerms: [
+      "sandbox vm quota idle pause delete backup retention weekdays time zone workflow concurrency organization limit",
+    ],
   },
   {
     id: "organization-machines",
@@ -874,6 +908,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/source-control": "environment-defaults",
   "/settings/storage": "project-defaults",
   "/settings/connections": "connections",
+  "/settings/vms": null,
   "/settings/organization": null,
   "/settings/archived": "project-defaults",
 };

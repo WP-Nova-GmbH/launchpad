@@ -49,7 +49,7 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
     if (cached) return cached;
     const adapter: ProviderAdapterShape<ProviderAdapterError> = {
       ...instance.adapter,
-      startSession: (input) => {
+      startSession: (input, options) => {
         const start = Effect.gen(function* () {
           const binding = auth.credentialBinding;
           const related = binding
@@ -72,7 +72,7 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
             ProviderSession,
             ProviderAdapterError | ProviderSetupError,
             Scope.Scope
-          > = instance.adapter.startSession(input);
+          > = instance.adapter.startSession(input, options);
           // Every shared owner holds the startup scope. A credential change
           // interrupts admitted startup before it can escape the session drain.
           for (const peer of related) {
@@ -112,15 +112,11 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
       ),
     );
 
-  const getInstanceInfo: ProviderAdapterRegistryShape["getInstanceInfo"] = (instanceId) =>
+  const resolveInstance: ProviderAdapterRegistryShape["resolveInstance"] = (instanceId) =>
     registry.getInstance(instanceId).pipe(
       Effect.flatMap((instance) =>
         instance === undefined
-          ? Effect.fail(
-              new ProviderUnsupportedError({
-                provider: instanceId,
-              }),
-            )
+          ? Effect.fail(new ProviderUnsupportedError({ provider: instanceId }))
           : Effect.succeed({
               instanceId: instance.instanceId,
               driverKind: instance.driverKind,
@@ -128,9 +124,12 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
               accentColor: instance.accentColor,
               enabled: instance.enabled,
               continuationIdentity: instance.continuationIdentity,
+              adapter: guard(instance),
             }),
       ),
     );
+  const getInstanceInfo: ProviderAdapterRegistryShape["getInstanceInfo"] = (instanceId) =>
+    resolveInstance(instanceId).pipe(Effect.map(({ adapter: _adapter, ...info }) => info));
 
   const listInstances: ProviderAdapterRegistryShape["listInstances"] = () =>
     registry.listInstances.pipe(
@@ -138,6 +137,7 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
     );
 
   return {
+    resolveInstance,
     getByInstance,
     getInstanceInfo,
     listInstances,

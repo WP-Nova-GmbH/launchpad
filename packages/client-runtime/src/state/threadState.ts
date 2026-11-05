@@ -19,6 +19,8 @@ export interface EnvironmentThreadPageState {
 
 export interface EnvironmentThreadState {
   readonly data: Option.Option<OrchestrationThread>;
+  /** Event cursor applied to this exact detail, independent of the shell stream. */
+  readonly snapshotSequence?: number;
   readonly status: EnvironmentThreadStatus;
   readonly error: Option.Option<string>;
   readonly page: Option.Option<EnvironmentThreadPageState>;

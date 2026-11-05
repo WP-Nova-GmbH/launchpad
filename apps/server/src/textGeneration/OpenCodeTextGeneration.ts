@@ -462,6 +462,8 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
         requestType: input.requestType,
         requestDetail: input.requestDetail,
         stepInstruction: input.stepInstruction,
+        jobContext: input.jobContext,
+        reviewConstraint: input.reviewConstraint,
         policy: input.policy,
       });
       const generated = yield* runOpenCodeJson({

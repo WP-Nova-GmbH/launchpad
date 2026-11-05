@@ -1,6 +1,7 @@
 import type { ThreadMoveDestination } from "../threads/threadOrder";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import { canSnooze, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import * as Cause from "effect/Cause";
 import * as Haptics from "expo-haptics";
 import { useCallback, useRef } from "react";
@@ -13,7 +14,11 @@ import { refreshArchivedThreadsForEnvironment } from "../archive/useArchivedThre
 import { pinOrderKeyBetween } from "@t3tools/client-runtime/state/thread-sort";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { environmentServerConfigsAtom } from "../../state/server";
-import { environmentThreadShells, threadEnvironment } from "../../state/threads";
+import {
+  environmentThreadShells,
+  navigationThreadShellsAtom,
+  threadEnvironment,
+} from "../../state/threads";
 import { queuedThreadKeysAtom } from "../../state/use-thread-outbox";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
@@ -26,7 +31,11 @@ import {
   createThreadMovePlanner,
   threadDropLifecycle,
 } from "../threads/threadOrder";
-import { getThreadListV2OrderedSection } from "../threads/threadListV2";
+import {
+  canMutateThreadListRow,
+  getThreadListV2ArrangementThreads,
+  getThreadListV2OrderedSection,
+} from "../threads/threadListV2";
 import { resolveThreadTitleRename } from "../threads/thread-title-rename";
 
 /** Version skew: never send settle/unsettle to a server that predates them
@@ -77,6 +86,14 @@ function environmentSupportsTitleRegeneration(
   );
 }
 
+function canMutateThread(thread: EnvironmentThreadShell): boolean {
+  return canMutateThreadListRow(
+    thread.id,
+    appAtomRegistry.get(environmentServerConfigsAtom).get(thread.environmentId)?.environment
+      .capabilities,
+  );
+}
+
 type ThreadListAction = "archive" | "unarchive" | "delete" | "settle" | "unsettle";
 
 const ACTION_VERBS: Record<ThreadListAction, string> = {
@@ -120,6 +137,7 @@ function useThreadActionExecutor(
 
   const executeAction = useCallback(
     async (action: ThreadListAction, thread: EnvironmentThreadShell) => {
+      if (!canMutateThread(thread)) return false;
       const key = scopedThreadKey(thread.environmentId, thread.id);
       if (inFlightThreadKeys.current.has(key)) {
         return false;
@@ -208,8 +226,9 @@ function useConfirmDeleteThread(
 ) {
   return useCallback(
     (thread: EnvironmentThreadShell) => {
+      if (!canMutateThread(thread)) return;
       const title = "Delete thread?";
-      const message = `“${thread.title}” will be permanently deleted, including its terminal history.`;
+      const message = `“${thread.title}” will be permanently deleted, including its terminal history.\n\n${THREAD_DELETE_WARNING}`;
       if (process.env.EXPO_OS === "ios") {
         Alert.alert(title, message, [
           { text: "Cancel", style: "cancel" },
@@ -524,6 +543,7 @@ export function useThreadListActions(): {
   const renameThread = useCallback(
     (thread: EnvironmentThreadShell) => {
       const commit = (title: string) => {
+        if (!canMutateThread(thread)) return;
         const resolution = resolveThreadTitleRename({ title, originalTitle: thread.title });
         if (resolution.action === "reject-empty") {
           Alert.alert("Could not rename thread", "Thread title cannot be empty.");
@@ -576,7 +596,11 @@ export function useThreadListActions(): {
   const moveThread = useCallback(
     async (thread: EnvironmentThreadShell, direction: ThreadMoveDestination) => {
       if (getPendingThreadOrder() !== null || appAtomRegistry.get(threadDropBusyAtom)) return false;
-      const shells = appAtomRegistry.get(environmentThreadShells.threadShellsAtom);
+      const configs = appAtomRegistry.get(environmentServerConfigsAtom);
+      const shells = getThreadListV2ArrangementThreads(
+        appAtomRegistry.get(navigationThreadShellsAtom),
+        configs,
+      );
       const current = shells.find(
         (row) => row.id === thread.id && row.environmentId === thread.environmentId,
       );
@@ -597,7 +621,6 @@ export function useThreadListActions(): {
           appAtomRegistry.set(threadDropBusyAtom, false);
         }
       }
-      const configs = appAtomRegistry.get(environmentServerConfigsAtom);
       const supportsReorder = (environmentId: EnvironmentThreadShell["environmentId"]) => {
         const capabilities = configs.get(environmentId)?.environment.capabilities;
         return section === "pinned"

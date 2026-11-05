@@ -1,3 +1,5 @@
+import * as Journal from "../../terminal/SetupProcessJournal.ts";
+import { SetupProcessAdapter, SetupProcessError } from "../../terminal/SetupProcessAdapter.ts";
 import * as WorktreeSetupTracker from "../../project/WorktreeSetupTracker.ts";
 import {
   CommandId,
@@ -433,3 +435,83 @@ describe("ThreadDeletionReactor drain", () => {
     }),
   );
 });
+
+for (const mode of ["denied", "lost-owner"] as const) {
+  effectIt.effect(
+    `setup fence recovery rejects PID absence and needs explicit retry: ${mode}`,
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make(`fenced-setup-${mode}`);
+        const record =
+          '{"threadId":"' +
+          threadId +
+          '","attemptId":"attempt","terminalId":"setup","createdAt":"now","pid":123,"identity":"birth","completed":true,"exited":false,"legacy":false,"ownershipVersion":4,"boot":{"host":"fixture","session":"boot"}}';
+        yield* sql`INSERT INTO setup_processes VALUES (${threadId}, 'attempt', ${record})`;
+        yield* sql`INSERT INTO thread_cleanup_fences VALUES (${threadId}, 10, '[123]')`;
+        let stopCalls = 0;
+        let deny = true;
+        let boot = "boot";
+        let probes = 0;
+        const layer = ThreadDeletionReactorLive.pipe(
+          Layer.provide(
+            Journal.layer.pipe(
+              Layer.provide(
+                Layer.mock(SetupProcessAdapter, {
+                  host: Effect.sync(() => ({ host: "fixture", session: boot })),
+                  stop: () =>
+                    Effect.suspend(() => {
+                      stopCalls++;
+                      return deny
+                        ? Effect.fail(
+                            new SetupProcessError({ message: "Ownership could not be stopped" }),
+                          )
+                        : Effect.void;
+                    }),
+                }),
+              ),
+            ),
+          ),
+          Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+          Layer.provide(WorktreeSetupTracker.layer),
+          Layer.provide(
+            Layer.mock(OrchestrationEngineService, {
+              latestSequence: Effect.succeed(10),
+              subscribeDomainEvents: Effect.succeed(Stream.never),
+            }),
+          ),
+          Layer.provide(Layer.mock(ProviderService, { stopSession: () => Effect.void })),
+          Layer.provide(
+            Layer.mock(TerminalManager.TerminalManager, {
+              deleteHistory: () => Effect.void,
+              closeOwned: () => Effect.succeed(false),
+            }),
+          ),
+          Layer.provide(
+            Layer.succeed(CleanupProcessProbe, {
+              absent: () =>
+                Effect.sync(() => {
+                  probes++;
+                  return true;
+                }),
+            }),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const reactor = yield* ThreadDeletionReactor;
+          yield* reactor.start();
+          expect(yield* reactor.drainThrough(10, threadId).pipe(Effect.isFailure)).toBe(true);
+          expect(yield* reactor.drainThrough(10, threadId).pipe(Effect.isFailure)).toBe(true);
+          expect(stopCalls).toBe(1);
+          expect(probes).toBe(0);
+          expect((yield* sql`SELECT * FROM thread_cleanup_fences`).length).toBe(1);
+          if (mode === "lost-owner") boot = "next-boot";
+          else deny = false;
+          yield* reactor.drainThrough(10, threadId, "fresh-authorized-request");
+          expect(stopCalls).toBe(mode === "denied" ? 2 : 1);
+          expect(probes).toBe(0);
+          expect(yield* sql`SELECT * FROM thread_cleanup_fences`).toEqual([]);
+        }).pipe(Effect.provide(layer));
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+}

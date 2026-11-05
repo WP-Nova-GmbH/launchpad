@@ -65,6 +65,7 @@ import {
 import { useThreadRowProviderInstanceResolver } from "./thread-provider-instance";
 import {
   buildThreadListV2Items,
+  getThreadListV2ArrangementThreads,
   getThreadListV2OrderedSection,
   buildThreadListV2ListItems,
   isThreadListV2ListItem,
@@ -385,13 +386,17 @@ function ThreadNavigationSidebarPane(
   // the memoized rows' props comparison on every parent render.
   const resolveProviderInstance = useThreadRowProviderInstanceResolver(serverConfigs);
   const pendingOrder = usePendingThreadOrder(nowMinute, snoozeWakeTick);
+  const arrangementThreads = useMemo(
+    () => getThreadListV2ArrangementThreads(threads, serverConfigs),
+    [threads, serverConfigs],
+  );
   // Up/down menu availability for every card, computed once per section per
   // rebuild (see computeThreadMoveAvailability): per-thread planner calls made
   // list construction quadratic, and this list rebuilds on every minute tick.
   const threadMoveAvailability = useMemo(() => {
     const sectionAvailability = (section: "pinned" | "active") =>
       computeThreadMoveAvailability({
-        allThreads: threads,
+        allThreads: arrangementThreads,
         section,
         pendingOrder,
         reorderableEnvironmentIds: new Set(
@@ -404,7 +409,7 @@ function ThreadNavigationSidebarPane(
           ),
         ),
         ordered: getThreadListV2OrderedSection({
-          threads,
+          threads: arrangementThreads,
           section,
           pendingOrder,
           now: new Date().toISOString(),
@@ -416,7 +421,7 @@ function ThreadNavigationSidebarPane(
     return new Map([...sectionAvailability("pinned"), ...sectionAvailability("active")]);
   }, [
     serverConfigs,
-    threads,
+    arrangementThreads,
     pendingOrder,
     queuedThreadKeys,
     settlementEnvironmentIds,
@@ -428,6 +433,7 @@ function ThreadNavigationSidebarPane(
     return buildThreadListV2Items({
       pendingOrder,
       threads: threads.filter((thread) => thread.archivedAt === null),
+      arrangementThreads,
       environmentId: options.selectedEnvironmentId,
       projectRefs: selectedProjectScope === null ? null : selectedProjectScope.projectRefs,
       searchQuery: props.searchQuery,
@@ -443,6 +449,7 @@ function ThreadNavigationSidebarPane(
     });
   }, [
     pendingOrder,
+    arrangementThreads,
     queuedThreadKeys,
     nowMinute,
     snoozeWakeTick,

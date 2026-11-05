@@ -17,12 +17,20 @@ import * as VcsProcess from "./VcsProcess.ts";
 export interface VcsCaptureCheckpointInput {
   readonly cwd: string;
   readonly checkpointRef: CheckpointRef;
+  readonly strictWorkflowCapture?: boolean;
+  /** The ignore rules frozen with the initial workflow checkpoint. */
+  readonly workflowIgnoreRules?: Uint8Array;
 }
 
 export interface VcsRestoreCheckpointInput {
   readonly cwd: string;
   readonly checkpointRef: CheckpointRef;
   readonly fallbackToHead?: boolean;
+}
+
+export interface VcsPinnedCheckpointInput {
+  readonly cwd: string;
+  readonly checkpointRef: CheckpointRef;
 }
 
 export interface VcsDiffCheckpointsInput {
@@ -32,18 +40,33 @@ export interface VcsDiffCheckpointsInput {
   readonly fallbackFromToHead?: boolean;
   readonly ignoreWhitespace: boolean;
   readonly format?: "patch" | "numstat";
+  readonly requireComplete?: boolean;
+  /** These commit IDs came from durable pins. Never substitute objects or return partial output. */
+  readonly pinned?: boolean;
 }
 
 export interface VcsDeleteCheckpointRefsInput {
   readonly cwd: string;
   readonly checkpointRefs: ReadonlyArray<CheckpointRef>;
+  readonly pinned?: boolean;
+}
+
+export interface CapturedCheckpoint {
+  readonly commitId: string;
+  readonly treeId: string;
+  readonly workflowIgnoreRules?: Uint8Array;
 }
 
 export interface VcsCheckpointOps {
-  readonly captureCheckpoint: (input: VcsCaptureCheckpointInput) => Effect.Effect<void, VcsError>;
+  readonly captureCheckpoint: (
+    input: VcsCaptureCheckpointInput,
+  ) => Effect.Effect<CapturedCheckpoint, VcsError>;
   readonly hasCheckpointRef: (
     input: Omit<VcsRestoreCheckpointInput, "fallbackToHead">,
   ) => Effect.Effect<boolean, VcsError>;
+  readonly resolvePinnedTree: (
+    input: VcsPinnedCheckpointInput,
+  ) => Effect.Effect<string | null, VcsError>;
   readonly restoreCheckpoint: (
     input: VcsRestoreCheckpointInput,
   ) => Effect.Effect<boolean, VcsError>;

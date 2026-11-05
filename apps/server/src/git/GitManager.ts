@@ -129,6 +129,20 @@ export class GitManager extends Context.Service<
     readonly preparePullRequestThread: (
       input: GitPreparePullRequestThreadInput,
     ) => Effect.Effect<GitPreparePullRequestThreadResult, GitManagerServiceError>;
+    readonly prepareWorkflowPullRequest?: (input: {
+      readonly cwd: string;
+      readonly threadId?: ThreadId;
+      readonly baseBranch: string;
+      readonly baseRef: string;
+      readonly headBranch: string;
+    }) => Effect.Effect<{ readonly title: string; readonly body: string }, GitManagerServiceError>;
+    readonly prepareWorkflowCommit?: (input: {
+      readonly cwd: string;
+      readonly threadId?: ThreadId;
+    }) => Effect.Effect<
+      { readonly subject: string; readonly body: string } | null,
+      GitManagerServiceError
+    >;
     readonly runStackedAction: (
       input: GitRunStackedActionInput,
       options?: GitRunStackedActionOptions,
@@ -2011,6 +2025,34 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  const generatePullRequestContent = Effect.fn("GitManager.preparePrContent")(function* (
+    settings: SourceControlTextGenerationSettings,
+    cwd: string,
+    baseBranch: string,
+    baseRangeRef: string,
+    headBranch: string,
+    providerKind: SourceControlProviderKind,
+  ) {
+    const rangeContext = yield* gitCore.readRangeContext(cwd, baseRangeRef);
+    const policy = yield* resolveStylePolicy(cwd, settings);
+    const changeRequestTemplate =
+      settings.style.followChangeRequestTemplates && providerKind === "github"
+        ? Option.getOrUndefined(yield* detectPrTemplate(cwd, baseRangeRef, gitCore.execute))
+        : undefined;
+
+    return yield* textGeneration.generatePrContent({
+      cwd,
+      baseBranch,
+      headBranch,
+      commitSummary: limitContext(rangeContext.commitSummary, 20_000),
+      diffSummary: limitContext(rangeContext.diffSummary, 20_000),
+      diffPatch: limitContext(rangeContext.diffPatch, 60_000),
+      ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
+      ...(policy ? { policy } : {}),
+      modelSelection: settings.modelSelection,
+    });
+  });
+
   const runPrStep = Effect.fn("runPrStep")(function* (
     settings: SourceControlTextGenerationSettings,
     cwd: string,
@@ -2060,24 +2102,14 @@ export const make = Effect.gen(function* () {
       label: `Generating ${terms.shortLabel} content...`,
     });
     const baseRangeRef = yield* resolveBaseRangeRef(cwd, baseBranch);
-    const rangeContext = yield* gitCore.readRangeContext(cwd, baseRangeRef);
-    const policy = yield* resolveStylePolicy(cwd, settings);
-    const changeRequestTemplate =
-      settings.style.followChangeRequestTemplates && provider.kind === "github"
-        ? Option.getOrUndefined(yield* detectPrTemplate(cwd, baseRangeRef, gitCore.execute))
-        : undefined;
-
-    const generated = yield* textGeneration.generatePrContent({
+    const generated = yield* generatePullRequestContent(
+      settings,
       cwd,
       baseBranch,
-      headBranch: headContext.headBranch,
-      commitSummary: limitContext(rangeContext.commitSummary, 20_000),
-      diffSummary: limitContext(rangeContext.diffSummary, 20_000),
-      diffPatch: limitContext(rangeContext.diffPatch, 60_000),
-      ...(changeRequestTemplate ? { changeRequestTemplate } : {}),
-      ...(policy ? { policy } : {}),
-      modelSelection: settings.modelSelection,
-    });
+      baseRangeRef,
+      headContext.headBranch,
+      provider.kind,
+    );
 
     const bodyFile = path.join(
       tempDir,
@@ -2648,6 +2680,45 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  const workflowTextSettings = (input: { cwd: string; threadId?: ThreadId | undefined }) =>
+    projectSettingsFor(input).pipe(
+      Effect.flatMap((settings) =>
+        settings.sourceControlWriterModelSelection === null
+          ? Effect.succeed({
+              modelSelection: settings.textGenerationModelSelection,
+              style: settings.sourceControlWritingStyle,
+            })
+          : providerRegistry.getProviders.pipe(
+              Effect.map((providers) => ({
+                modelSelection: ServerSettings.resolveSourceControlWriterModelSelection(
+                  settings,
+                  providers,
+                ),
+                style: settings.sourceControlWritingStyle,
+              })),
+            ),
+      ),
+      Effect.mapError(
+        (cause) =>
+          new GitManagerError({
+            operation: "runStackedAction",
+            cwd: input.cwd,
+            detail: "Failed to get server settings.",
+            cause,
+          }),
+      ),
+    );
+  const prepareWorkflowCommit = Effect.fn("GitManager.prepareWorkflowCommit")(function* (input: {
+    cwd: string;
+    threadId?: ThreadId;
+  }) {
+    return yield* resolveCommitAndBranchSuggestion({
+      ...input,
+      branch: null,
+      settings: yield* workflowTextSettings(input),
+    });
+  });
+
   const runStackedAction: GitManager["Service"]["runStackedAction"] = Effect.fn("runStackedAction")(
     function* (input, options) {
       const progress = yield* createProgressEmitter(input, options);
@@ -2713,33 +2784,7 @@ export const make = Effect.gen(function* () {
         let commitMessageForStep = input.commitMessage;
         let preResolvedCommitSuggestion: CommitAndBranchSuggestion | undefined = undefined;
 
-        const textGenerationSettings = yield* projectSettingsFor(input).pipe(
-          Effect.flatMap((settings) =>
-            settings.sourceControlWriterModelSelection === null
-              ? Effect.succeed({
-                  modelSelection: settings.textGenerationModelSelection,
-                  style: settings.sourceControlWritingStyle,
-                })
-              : providerRegistry.getProviders.pipe(
-                  Effect.map((providers) => ({
-                    modelSelection: ServerSettings.resolveSourceControlWriterModelSelection(
-                      settings,
-                      providers,
-                    ),
-                    style: settings.sourceControlWritingStyle,
-                  })),
-                ),
-          ),
-          Effect.mapError(
-            (cause) =>
-              new GitManagerError({
-                operation: "runStackedAction",
-                cwd: input.cwd,
-                detail: "Failed to get server settings.",
-                cause,
-              }),
-          ),
-        );
+        const textGenerationSettings = yield* workflowTextSettings(input);
 
         if (input.featureBranch) {
           yield* Ref.set(currentPhase, Option.some("branch"));
@@ -2856,6 +2901,20 @@ export const make = Effect.gen(function* () {
   );
 
   return GitManager.of({
+    prepareWorkflowPullRequest: (input) =>
+      workflowTextSettings(input).pipe(
+        Effect.flatMap((settings) =>
+          generatePullRequestContent(
+            settings,
+            input.cwd,
+            input.baseBranch,
+            input.baseRef,
+            input.headBranch,
+            "github",
+          ),
+        ),
+      ),
+    prepareWorkflowCommit,
     localStatus,
     remoteStatus,
     status,

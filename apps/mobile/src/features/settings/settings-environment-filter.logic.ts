@@ -1,4 +1,14 @@
-import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentId, ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
+
+export function canManageSettingsWorkspace(
+  capabilities:
+    | Pick<ExecutionEnvironmentDescriptor["capabilities"], "workflowVmResultReader">
+    | undefined,
+  projectId?: string,
+): boolean {
+  // A result project can be present in the shell cache before its environment config.
+  return capabilities?.workflowVmResultReader !== true && !projectId?.startsWith("vm:workflow:");
+}
 
 export function toggleSettingsEnvironment(
   selected: ReadonlySet<EnvironmentId> | null,

@@ -1,3 +1,4 @@
+import type { RelayThreadVmCredentialScope } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -6,7 +7,7 @@ import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { and, eq, exists, isNull, ne, notExists, or } from "drizzle-orm";
+import { and, eq, exists, isNull, ne, notExists, or, sql } from "drizzle-orm";
 import { QueryBuilder } from "drizzle-orm/pg-core";
 
 import * as RelayDb from "../db.ts";
@@ -14,6 +15,8 @@ import {
   relayEnvironmentCredentials,
   relayEnvironmentLinks,
   relayMachines,
+  relayThreadVmBindings,
+  relayThreadVmAllocations,
 } from "../persistence/schema.ts";
 
 export class EnvironmentCredentialCreatePersistenceError extends Schema.TaggedError<EnvironmentCredentialCreatePersistenceError>()(
@@ -63,6 +66,7 @@ export interface EnvironmentCredentialPrincipal {
   readonly credentialId: string;
   readonly environmentId: string;
   readonly environmentPublicKey: string;
+  readonly threadVm?: RelayThreadVmCredentialScope;
 }
 
 export class EnvironmentCredentials extends Context.Service<
@@ -195,47 +199,96 @@ const make = Effect.gen(function* () {
           credentialId: relayEnvironmentCredentials.credentialId,
           environmentId: relayEnvironmentCredentials.environmentId,
           environmentPublicKey: relayEnvironmentCredentials.environmentPublicKey,
+          threadVm: sql<RelayThreadVmCredentialScope | null>`(
+            SELECT json_build_object('allocationId', b.allocation_id, 'threadId', b.thread_id, 'repositoryId', b.repository_id, 'generation', b.generation)
+            FROM relay_thread_vm_bindings b WHERE b.environment_id = "relay_environment_credentials"."environment_id"
+          )`,
         })
         .from(relayEnvironmentCredentials)
         .where(
           and(
             eq(relayEnvironmentCredentials.credentialHash, credentialHash),
             isNull(relayEnvironmentCredentials.revokedAt),
-            // A credential is only as alive as what anchors it: an active link
-            // for a personal environment, or an active machine for an enrolled
-            // one. Revoking the anchor kills the credential without a second
-            // write.
+            // VM identities remain narrow even if another path creates a personal
+            // link or machine record for them. Retain revoked bindings to prevent
+            // fallback to those broader anchors.
             or(
-              exists(
-                new QueryBuilder()
-                  .select({ userId: relayEnvironmentLinks.userId })
-                  .from(relayEnvironmentLinks)
-                  .where(
-                    and(
+              and(
+                notExists(
+                  new QueryBuilder()
+                    .select({ environmentId: relayThreadVmBindings.environmentId })
+                    .from(relayThreadVmBindings)
+                    .where(
                       eq(
-                        relayEnvironmentLinks.environmentId,
+                        relayThreadVmBindings.environmentId,
                         relayEnvironmentCredentials.environmentId,
                       ),
-                      eq(
-                        relayEnvironmentLinks.environmentPublicKey,
-                        relayEnvironmentCredentials.environmentPublicKey,
-                      ),
-                      isNull(relayEnvironmentLinks.revokedAt),
                     ),
+                ),
+                or(
+                  exists(
+                    new QueryBuilder()
+                      .select({ userId: relayEnvironmentLinks.userId })
+                      .from(relayEnvironmentLinks)
+                      .where(
+                        and(
+                          eq(
+                            relayEnvironmentLinks.environmentId,
+                            relayEnvironmentCredentials.environmentId,
+                          ),
+                          eq(
+                            relayEnvironmentLinks.environmentPublicKey,
+                            relayEnvironmentCredentials.environmentPublicKey,
+                          ),
+                          isNull(relayEnvironmentLinks.revokedAt),
+                        ),
+                      ),
                   ),
+                  exists(
+                    new QueryBuilder()
+                      .select({ machineId: relayMachines.machineId })
+                      .from(relayMachines)
+                      .where(
+                        and(
+                          eq(
+                            relayMachines.environmentId,
+                            relayEnvironmentCredentials.environmentId,
+                          ),
+                          eq(
+                            relayMachines.environmentPublicKey,
+                            relayEnvironmentCredentials.environmentPublicKey,
+                          ),
+                          isNull(relayMachines.deprovisionedAt),
+                        ),
+                      ),
+                  ),
+                ),
               ),
               exists(
                 new QueryBuilder()
-                  .select({ machineId: relayMachines.machineId })
-                  .from(relayMachines)
+                  .select({ allocationId: relayThreadVmBindings.allocationId })
+                  .from(relayThreadVmBindings)
+                  .innerJoin(
+                    relayThreadVmAllocations,
+                    eq(relayThreadVmAllocations.allocationId, relayThreadVmBindings.allocationId),
+                  )
                   .where(
                     and(
-                      eq(relayMachines.environmentId, relayEnvironmentCredentials.environmentId),
                       eq(
-                        relayMachines.environmentPublicKey,
+                        relayThreadVmBindings.environmentId,
+                        relayEnvironmentCredentials.environmentId,
+                      ),
+                      eq(
+                        relayThreadVmBindings.environmentPublicKey,
                         relayEnvironmentCredentials.environmentPublicKey,
                       ),
-                      isNull(relayMachines.deprovisionedAt),
+                      eq(
+                        relayThreadVmBindings.credentialId,
+                        relayEnvironmentCredentials.credentialId,
+                      ),
+                      eq(relayThreadVmAllocations.threadId, relayThreadVmBindings.threadId),
+                      isNull(relayThreadVmBindings.revokedAt),
+                      isNull(relayThreadVmAllocations.deletedAt),
                     ),
                   ),
               ),
@@ -261,6 +314,7 @@ const make = Effect.gen(function* () {
             credentialId: row.credentialId,
             environmentId: row.environmentId,
             environmentPublicKey: row.environmentPublicKey,
+            ...(row.threadVm ? { threadVm: row.threadVm } : {}),
           })
         : Option.none();
     }),

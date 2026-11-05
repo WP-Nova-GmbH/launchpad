@@ -2,6 +2,8 @@ import { ThreadId } from "@t3tools/contracts";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Schema from "effect/Schema";
 
+import type { ThreadExecutionFenceError } from "../persistence/ThreadExecutionFence.ts";
+
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 
 export class OrchestrationCommandInvariantError extends Schema.TaggedError<OrchestrationCommandInvariantError>()(
@@ -9,6 +11,7 @@ export class OrchestrationCommandInvariantError extends Schema.TaggedError<Orche
   {
     commandType: Schema.String,
     detail: Schema.String,
+    reason: Schema.optional(Schema.Literal("queue-provider")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {
@@ -77,6 +80,7 @@ export class OrchestrationProjectorDecodeError extends Schema.TaggedError<Orches
 }
 
 export type OrchestrationDispatchError =
+  | ThreadExecutionFenceError
   | ProjectionRepositoryError
   | OrchestrationCommandRejection
   | OrchestrationCommandIdConflictError

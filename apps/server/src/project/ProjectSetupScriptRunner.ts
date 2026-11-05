@@ -18,6 +18,8 @@ import * as Schema from "effect/Schema";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
+import { SetupProcessJournal, SetupProcessError } from "../terminal/SetupProcessJournal.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 
 export interface ProjectSetupScriptRunnerResultNoScript {
   readonly status: "no-script";
@@ -33,9 +35,8 @@ export interface ProjectSetupScriptRunnerResultStarted {
   /** False when the script's `async` flag asks the agent to wait for it. */
   readonly async: boolean;
   /**
-   * Resolves when the script's shell prints the completion sentinel. The
-   * exit code is null when the terminal exited or was closed before the
-   * sentinel arrived. Only present when `observeCompletion` was requested.
+   * Resolves when the setup command reports its result. The exit code is
+   * null if the terminal closes before the result is known.
    */
   readonly completion?: Effect.Effect<ProjectSetupScriptCompletion>;
 }
@@ -59,8 +60,12 @@ export interface ProjectSetupScriptRunnerInput {
   readonly projectCwd?: string;
   readonly worktreePath: string;
   readonly preferredTerminalId?: string;
+  /** The preparation reactor persists this ownership intent before starting work. */
+  readonly preparationAttemptId?: string;
   /** A durable preparation executes the script selected before the attempt began. */
   readonly resolvedScript?: ThreadPreparation["script"];
+  readonly runEnvironment?: import("../relay/WorkflowVmAttempts.ts").WorkflowVmAttemptEnvironment;
+  readonly authorizeDelivery?: Effect.Effect<boolean>;
   /**
    * Wrap the command so the shell reports its exit code back through the
    * terminal stream, and forward cleaned output lines while it runs. The
@@ -78,7 +83,13 @@ export class ProjectSetupScriptOperationError extends Schema.TaggedError<Project
     projectId: Schema.optional(Schema.String),
     projectCwd: Schema.optional(Schema.String),
     worktreePath: Schema.String,
-    operation: Schema.Literals(["resolveProject", "readSettings", "openTerminal", "writeCommand"]),
+    operation: Schema.Literals([
+      "resolveProject",
+      "readSettings",
+      "openTerminal",
+      "recordProcess",
+      "writeCommand",
+    ]),
     waitForCompletion: Schema.optional(Schema.Boolean),
     cause: Schema.Defect(),
   },
@@ -136,6 +147,18 @@ function completionSentinelPattern(token: string): RegExp {
   return new RegExp(`${COMPLETION_SENTINEL_PREFIX}_${token}:(-?\\d+)`);
 }
 
+/** Keep only the synthetic exit receipt, even when a PTY splits it across chunks. */
+const filterPrivateSetupOutput = (token: string) => {
+  const pattern = completionSentinelPattern(token);
+  let pending = "";
+  return (chunk: string) => {
+    const lines = `${pending}${chunk}`.split(/\r\n|\r|\n/u);
+    pending = (lines.pop() ?? "").slice(-PARTIAL_LINE_MAX_LENGTH);
+    const receipt = lines.map((line) => pattern.exec(line)?.[1]).find((code) => code !== undefined);
+    return receipt === undefined ? "" : `\n${completionSentinel(token)}${receipt}\n`;
+  };
+};
+
 /** Removes ANSI escape sequences and cursor controls so lines can be shown as plain text. */
 function stripTerminalControl(text: string): string {
   return (
@@ -152,21 +175,29 @@ function stripTerminalControl(text: string): string {
 
 type CompletionShell = "posix" | "fish" | "powershell";
 
-/**
- * Predicts the shell TerminalManager will spawn for the setup terminal. The
- * manager takes `$SHELL` on POSIX and PowerShell on Windows, falling back to
- * other shells only when that one fails to spawn.
- */
+function selectedCompletionShell(shell: string): CompletionShell {
+  const name = shell
+    .split(/[\\/]/)
+    .at(-1)
+    ?.toLowerCase()
+    .replace(/\.exe$/, "");
+  if (name === "fish") return "fish";
+  if (name === "pwsh" || name === "powershell") return "powershell";
+  if (["sh", "bash", "zsh", "dash", "ksh", "ash"].includes(name ?? "")) return "posix";
+  throw new Error(`Setup completion is unsupported for shell '${shell}'.`);
+}
+
 function resolveCompletionShell(
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
 ): CompletionShell {
-  if (platform === "win32") return "powershell";
-  const shell = env.SHELL ?? "";
-  const name = shell.split("/").at(-1) ?? shell;
-  if (name === "fish") return "fish";
-  if (name === "pwsh" || name === "powershell") return "powershell";
-  return "posix";
+  return platform === "win32"
+    ? "powershell"
+    : env.SHELL?.endsWith("/fish")
+      ? "fish"
+      : /(?:pwsh|powershell)$/.test(env.SHELL ?? "")
+        ? "powershell"
+        : "posix";
 }
 
 /**
@@ -197,7 +228,9 @@ function wrapCommandForCompletion(
 export const make = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const terminalManager = yield* TerminalManager.TerminalManager;
+  const journal = yield* SetupProcessJournal;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const workflowGuest = yield* WorkflowVmGuest;
   const completionShell = resolveCompletionShell(
     yield* HostProcessPlatform,
     yield* HostProcessEnvironment,
@@ -212,8 +245,9 @@ export const make = Effect.gen(function* () {
     readonly threadId: string;
     readonly terminalId: string;
     /** Per-run sentinel, so only this run's wrapper can settle completion. */
-    readonly sentinel: string;
-    readonly sentinelPattern: RegExp;
+    readonly sentinel?: string;
+    readonly sentinelPattern?: RegExp;
+    readonly readOwnedExit?: () => number | null;
     /** The shell echoes typed input; lines ending with these are the wrapper, not output. */
     readonly echoedWrapperLines: ReadonlyArray<string>;
     readonly onOutputLine: ((line: string) => Effect.Effect<void>) | undefined;
@@ -223,6 +257,7 @@ export const make = Effect.gen(function* () {
       const done = yield* Deferred.make<ProjectSetupScriptCompletion>();
       let lineBuffer = "";
       let settled = false;
+      let shellExited = false;
       let unsubscribe = () => {};
 
       const settle = (exitCode: number | null) =>
@@ -240,7 +275,7 @@ export const make = Effect.gen(function* () {
 
       const handleLine = (rawLine: string) =>
         Effect.suspend(() => {
-          const sentinel = input.sentinelPattern.exec(rawLine);
+          const sentinel = input.sentinelPattern?.exec(rawLine);
           if (sentinel) {
             const parsed = Number(sentinel[1]);
             return settle(Number.isFinite(parsed) ? parsed : null);
@@ -248,7 +283,7 @@ export const make = Effect.gen(function* () {
           const cleaned = stripTerminalControl(rawLine).trimEnd();
           if (
             cleaned.length === 0 ||
-            cleaned.includes(input.sentinel) ||
+            (input.sentinel !== undefined && cleaned.includes(input.sentinel)) ||
             input.echoedWrapperLines.some((echoed) => cleaned.endsWith(echoed)) ||
             input.onOutputLine === undefined
           ) {
@@ -278,7 +313,18 @@ export const make = Effect.gen(function* () {
           }
           return Effect.forEach(lines, handleLine, { discard: true });
         }
-        if (event.type === "exited" || event.type === "closed") {
+        if (
+          event.type === "exited" ||
+          event.type === "closed" ||
+          event.type === "restarted" ||
+          event.type === "started"
+        ) {
+          shellExited = true;
+          if (event.type === "exited" && input.readOwnedExit) {
+            const lastLine = lineBuffer;
+            lineBuffer = "";
+            return handleLine(lastLine).pipe(Effect.ensuring(settle(input.readOwnedExit())));
+          }
           return settle(null);
         }
         return Effect.void;
@@ -288,7 +334,7 @@ export const make = Effect.gen(function* () {
       const completion = Deferred.await(done).pipe(
         Effect.ensuring(Effect.sync(() => unsubscribe())),
       );
-      return { completion, unsubscribe };
+      return { completion, unsubscribe, shellExited: () => shellExited };
     });
 
   const runForThread: ProjectSetupScriptRunner["Service"]["runForThread"] = Effect.fn(
@@ -358,25 +404,64 @@ export const make = Effect.gen(function* () {
     const env = projectScriptRuntimeEnv({
       project: { cwd: project.workspaceRoot },
       worktreePath: input.worktreePath,
+      ...(input.runEnvironment ? { extraEnv: input.runEnvironment.environment } : {}),
     });
     const observe = input.observeCompletion;
-    const completionToken = observe ? NodeCrypto.randomUUID().replaceAll("-", "") : null;
-    const commandLine =
-      observe && completionToken
-        ? wrapCommandForCompletion(
-            script.command,
-            completionShell,
-            completionSentinel(completionToken),
-          )
-        : script.command;
+    const completionToken =
+      observe && !workflowGuest ? NodeCrypto.randomUUID().replaceAll("-", "") : null;
+    if (input.runEnvironment?.hasSecrets && !observe)
+      return yield* new ProjectSetupScriptOperationError({
+        ...errorContext,
+        operation: "recordProcess",
+        cause: new Error("Secret-bearing setup requires a tracked completion receipt."),
+      });
 
-    yield* terminalManager
+    const setupProcessOwner = input.preparationAttemptId
+      ? yield* journal.launcher.pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProjectSetupScriptOperationError({
+                ...errorContext,
+                operation: "recordProcess",
+                cause,
+              }),
+          ),
+        )
+      : undefined;
+    if (workflowGuest && (!setupProcessOwner || !input.authorizeDelivery))
+      return yield* new ProjectSetupScriptOperationError({
+        ...errorContext,
+        operation: "recordProcess",
+        cause: new Error("Workflow setup requires durable ownership and authorization."),
+      });
+    let ownedExitCode: number | null = null;
+    const opened = yield* terminalManager
       .open({
         threadId: input.threadId,
         terminalId,
         cwd,
         worktreePath: input.worktreePath,
+        ...(setupProcessOwner
+          ? { setupProcessOwner, setupAttemptId: input.preparationAttemptId }
+          : {}),
+        ...(workflowGuest
+          ? {
+              workflowSetup: {
+                command: script.command,
+                onShellExit: ({ exitCode }) => {
+                  ownedExitCode = exitCode;
+                },
+              },
+            }
+          : {}),
         ...(script.async === false ? { waitForProcessExitOnClose: true } : {}),
+        ...(input.runEnvironment?.hasSecrets
+          ? {
+              filterSetupOutput: completionToken
+                ? filterPrivateSetupOutput(completionToken)
+                : () => "",
+            }
+          : {}),
         // Setup may run before a terminal client attaches to answer color probes.
         env: { ...env, NO_COLOR: "1", FORCE_COLOR: "0" },
       })
@@ -391,42 +476,53 @@ export const make = Effect.gen(function* () {
             }),
         ),
       );
-    // Subscribe before writing so the sentinel cannot race past the listener.
-    const observed =
-      observe && completionToken
-        ? yield* observeTerminalCompletion({
-            threadId: input.threadId,
-            terminalId,
-            sentinel: completionSentinel(completionToken),
-            sentinelPattern: completionSentinelPattern(completionToken),
-            echoedWrapperLines: commandLine.split("\r").filter((line) => line.length > 0),
-            onOutputLine: observe.onOutputLine,
-          })
-        : undefined;
-
-    yield* terminalManager
-      .write({
+    // Listen before arm: shell startup can exit before the native launch ACK arrives.
+    const echoedWrapperLines: string[] = [];
+    const observed = observe
+      ? yield* observeTerminalCompletion({
+          threadId: input.threadId,
+          terminalId,
+          ...(completionToken
+            ? {
+                sentinel: completionSentinel(completionToken),
+                sentinelPattern: completionSentinelPattern(completionToken),
+              }
+            : { readOwnedExit: () => ownedExitCode }),
+          echoedWrapperLines,
+          onOutputLine: observe.onOutputLine,
+        })
+      : undefined;
+    const selected = yield* Effect.gen(function* () {
+      if (!input.preparationAttemptId) return;
+      if (opened.pid === null)
+        return yield* new SetupProcessError({ message: "Setup terminal has no captured PID." });
+      if (workflowGuest) {
+        yield* terminalManager.armSetup({
+          threadId: input.threadId,
+          terminalId,
+          attemptId: input.preparationAttemptId,
+          expectedPid: opened.pid,
+          authorizeDelivery: input.authorizeDelivery!,
+        });
+        return;
+      }
+      return yield* journal.capture({
         threadId: input.threadId,
-        terminalId,
-        data: `${commandLine}\r`,
-      })
-      .pipe(
-        Effect.mapError(
-          (cause) =>
-            new ProjectSetupScriptOperationError({
-              ...errorContext,
-              operation: "writeCommand",
-              waitForCompletion: script.async === false,
-              cause,
-            }),
-        ),
-        // Nothing will ever settle the completion if the command never ran.
-        Effect.onExit((exit) =>
-          exit._tag === "Failure" ? Effect.sync(() => observed?.unsubscribe()) : Effect.void,
-        ),
-      );
-
-    return {
+        attemptId: input.preparationAttemptId,
+        pid: opened.pid,
+      });
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProjectSetupScriptOperationError({
+            ...errorContext,
+            operation: "recordProcess",
+            cause,
+          }),
+      ),
+      Effect.onError(() => Effect.sync(() => observed?.unsubscribe())),
+    );
+    const started = {
       status: "started",
       scriptId: script.id,
       scriptName: script.name,
@@ -436,6 +532,69 @@ export const make = Effect.gen(function* () {
       async: script.async !== false,
       ...(observed ? { completion: observed.completion } : {}),
     } as const;
+    // The trusted arm starts the one-shot script. Its owner reports completion.
+    if (workflowGuest) return started;
+    const actualShell = selected
+      ? yield* Effect.try({
+          try: () => selectedCompletionShell(selected),
+          catch: (cause) =>
+            new ProjectSetupScriptOperationError({
+              ...errorContext,
+              operation: "recordProcess",
+              cause,
+            }),
+        }).pipe(Effect.onError(() => Effect.sync(() => observed?.unsubscribe())))
+      : completionShell;
+    const commandLine =
+      observe && completionToken
+        ? wrapCommandForCompletion(script.command, actualShell, completionSentinel(completionToken))
+        : script.command;
+    echoedWrapperLines.push(...commandLine.split("\r").filter((line) => line.length > 0));
+    if (observed?.shellExited())
+      return yield* new ProjectSetupScriptOperationError({
+        ...errorContext,
+        operation: "recordProcess",
+        cause: new Error("Setup shell exited before command delivery."),
+      });
+
+    const commandInput = {
+      threadId: input.threadId,
+      terminalId,
+      data: `${commandLine}\r`,
+    };
+    if (input.authorizeDelivery && !(yield* input.authorizeDelivery)) {
+      observed?.unsubscribe();
+      return yield* new ProjectSetupScriptOperationError({
+        ...errorContext,
+        operation: "writeCommand",
+        cause: new Error("The workflow no longer owns this setup attempt."),
+      });
+    }
+    yield* (
+      input.preparationAttemptId
+        ? terminalManager.writeSetup({
+            ...commandInput,
+            attemptId: input.preparationAttemptId,
+            expectedPid: opened.pid!,
+          })
+        : terminalManager.write(commandInput)
+    ).pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProjectSetupScriptOperationError({
+            ...errorContext,
+            operation: "writeCommand",
+            waitForCompletion: script.async === false,
+            cause,
+          }),
+      ),
+      // Nothing will ever settle the completion if the command never ran.
+      Effect.onExit((exit) =>
+        exit._tag === "Failure" ? Effect.sync(() => observed?.unsubscribe()) : Effect.void,
+      ),
+    );
+
+    return started;
   });
 
   return ProjectSetupScriptRunner.of({ runForThread });

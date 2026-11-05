@@ -239,7 +239,7 @@ const makeEventStore = Effect.gen(function* () {
           COUNT(*) AS "eventCount",
           COALESCE(SUM(octet_length(payload_json)), 0) AS "payloadBytes",
           COALESCE(MAX(event_type IN (
-            'thread.created', 'project.created'
+            'thread.created', 'project.created', 'thread.placement-imported'
           )), 0) AS "hasCreateEvent"
         FROM (
           SELECT payload_json, event_type

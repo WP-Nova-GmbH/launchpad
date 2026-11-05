@@ -58,7 +58,9 @@ export function resolveEnvironmentOptionLabel(input: {
 export function shouldShowEnvironmentIndicator(input: {
   activeEnvironment: Pick<EnvironmentOption, "isPrimary"> | null;
   canPickEnvironment: boolean;
+  existingThread?: boolean;
 }): boolean {
+  if (input.existingThread) return true;
   if (input.canPickEnvironment) return true;
   return input.activeEnvironment !== null && !input.activeEnvironment.isPrimary;
 }
@@ -109,7 +111,9 @@ export function resolveCurrentWorkspaceLabel(activeWorktreePath: string | null):
 export function resolveLockedWorkspaceLabel(
   activeWorktreePath: string | null,
   effectiveEnvMode: EnvMode,
+  isVmWorkspace = false,
 ): string {
+  if (isVmWorkspace) return "VM workspace";
   if (activeWorktreePath) return "Worktree";
   return effectiveEnvMode === "worktree" ? resolveEnvModeLabel("worktree") : "Local checkout";
 }

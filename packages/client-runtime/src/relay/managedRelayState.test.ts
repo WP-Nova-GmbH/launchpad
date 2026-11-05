@@ -14,8 +14,11 @@ import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { afterEach, vi } from "vite-plus/test";
 
 import { DPOP_UNKNOWN_HINT } from "./errorPresentation.ts";
+import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as ManagedRelay from "./managedRelay.ts";
+import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
 import {
+  createManagedRelayOrganizationCatalogQueryManager,
   createManagedRelayQueryManager,
   createManagedRelaySession,
   deregisterManagedRelayEnvironment,
@@ -108,6 +111,62 @@ function setSession() {
     readClerkToken: () => Promise.resolve("clerk-token"),
   });
 }
+
+it.effect("keeps workflow repositories usable when only the machine catalog fails", () =>
+  Effect.gen(function* () {
+    setSession();
+    const membership = {
+      organization: { organizationId: "org-1", name: "Example", createdAt: "2026-06-01" },
+      userId: "account-1",
+      role: "admin",
+      joinedAt: "2026-06-01",
+    };
+    let failRepositories = false;
+    const runtime = Atom.runtime(
+      ManagedRelayTenancy.layer({ relayUrl: "https://relay.example.test" }).pipe(
+        Layer.provide(
+          remoteHttpClientLayer(async (input, init) => {
+            switch (new URL(new Request(input, init).url).pathname) {
+              case "/v1/organization":
+                return Response.json(membership);
+              case "/v1/repositories":
+                return failRepositories
+                  ? new Response(null, { status: 403 })
+                  : Response.json({ repositories: [] });
+              case "/v1/organization/projects":
+                return new Response(null, { status: 503 });
+              default:
+                throw new Error("Unexpected relay request");
+            }
+          }),
+        ),
+      ),
+    );
+    const workflows = createManagedRelayOrganizationCatalogQueryManager(runtime, {
+      allowMissingProjects: true,
+    });
+    const strict = createManagedRelayOrganizationCatalogQueryManager(runtime);
+    expect(yield* AtomRegistry.getResult(registry, workflows.catalogAtom("account-1"))).toEqual({
+      membership,
+      repositories: [],
+      projects: [],
+      projectsUnavailable: true,
+    });
+    expect(
+      (yield* Effect.result(AtomRegistry.getResult(registry, strict.catalogAtom("account-1"))))
+        ._tag,
+    ).toBe("Failure");
+    failRepositories = true;
+    workflows.refresh(registry, "account-1");
+    expect(
+      (yield* Effect.result(
+        AtomRegistry.getResult(registry, workflows.catalogAtom("account-1"), {
+          suspendOnWaiting: true,
+        }),
+      ))._tag,
+    ).toBe("Failure");
+  }),
+);
 
 function clerkToken(expiresAtSeconds: number): string {
   const encode = (value: unknown) =>

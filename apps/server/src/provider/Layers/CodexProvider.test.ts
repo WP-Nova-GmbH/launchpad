@@ -1,6 +1,83 @@
 import { assert, it } from "@effect/vitest";
+import { CodexSettings } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as Effect from "effect/Effect";
+import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import { ThreadVmCodexAuthSourceError } from "../../relay/ThreadVmCodexAuthSource.ts";
+import { withVmWorkloads } from "../../vmWorkloadCommand.ts";
+const decodeManagedSettings = Schema.decodeUnknownSync(CodexSettings);
+const noManagedSpawn = ChildProcessSpawner.make(() => Effect.die("Unexpected provider spawn"));
+const managedConnection = {
+  connectionId: "selected-connection",
+  label: "Organization account",
+  status: "connected" as const,
+  epoch: 1,
+  tokenRevision: 1,
+  errorCode: null,
+  refreshing: false,
+};
 
-import { applyPreferredCodexDefaultModel, mapCodexModelCapabilities } from "./CodexProvider.ts";
+import {
+  checkCodexProviderStatus,
+  applyPreferredCodexDefaultModel,
+  mapCodexModelCapabilities,
+} from "./CodexProvider.ts";
+
+for (const mode of ["ordinary", "personal", "workflow"] as const) {
+  it.effect(`starts the actual ${mode} Codex status probe in its accessible directory`, () =>
+    Effect.gen(function* () {
+      const commands: ChildProcess.StandardCommand[] = [];
+      const raw = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command))
+            return yield* Effect.die("Unexpected pipeline");
+          commands.push(command);
+          return yield* PlatformError.badArgument({
+            module: "CodexProbeTest",
+            method: "spawn",
+            description: "Test stops before executing a provider",
+          });
+        }),
+      );
+      const probe = checkCodexProviderStatus(
+        decodeManagedSettings({ binaryPath: "/opt/launchpad/node/bin/codex" }),
+        undefined,
+        { HOME: "/home/user", LD_PRELOAD: "untrusted-loader" },
+      );
+      const provider = yield* (
+        mode === "ordinary" ? probe : withVmWorkloads(probe, mode === "workflow")
+      ).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw),
+        Effect.provideService(HostProcessPlatform, "linux"),
+      );
+      assert.equal(provider.status, "error");
+      assert.equal(commands.length, 1);
+      const command = commands[0]!;
+      assert.ok(command.args.includes("app-server"));
+      assert.equal(
+        command.command,
+        mode === "ordinary"
+          ? "/opt/launchpad/node/bin/codex"
+          : "/opt/launchpad/bin/launchpad-workload",
+      );
+      if (mode === "workflow") {
+        assert.equal(command.args[0], "run-workflow");
+        assert.equal(command.args[3], "/home/launchpad-workflow");
+        assert.equal(command.options.cwd, "/");
+        assert.equal(command.options.extendEnv, false);
+        assert.equal(command.options.env?.HOME, "/home/launchpad-workflow");
+        assert.equal(command.options.env?.USER, "launchpad-workflow");
+        assert.equal(command.options.env?.LD_PRELOAD, undefined);
+      } else {
+        assert.equal(command.options.cwd, process.cwd());
+        if (mode === "personal") assert.equal(command.args[0], "run");
+      }
+    }),
+  );
+}
 
 it("maps current Codex model capability fields", () => {
   const capabilities = mapCodexModelCapabilities({
@@ -188,3 +265,85 @@ it("ignores custom models that shadow a preferred slug", () => {
 
   assert.deepStrictEqual(models.find((model) => model.isDefault)?.slug, "gpt-5.4");
 });
+
+it.effect(
+  "uses organization metadata with a filtered catalog instead of treating native account=null as signed out",
+  () =>
+    Effect.gen(function* () {
+      let received: { managedConnectionId?: string } | undefined;
+      const provider = yield* checkCodexProviderStatus(
+        decodeManagedSettings({}),
+        (input) => {
+          received = input;
+          return Effect.succeed({
+            account: { account: null, requiresOpenaiAuth: false },
+            version: "0.159.3",
+            skills: [],
+            models: ["gpt-6-astra", "gpt-5.5", "custom-unknown"].map((slug) => ({
+              slug,
+              name: slug,
+              isCustom: false,
+              capabilities: null,
+            })),
+          });
+        },
+        {},
+        {
+          connectionId: "selected-connection",
+          label: "Organization account",
+          status: Effect.succeed(managedConnection),
+          preflight: Effect.die("A read-only status probe must not admit a turn"),
+        },
+      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noManagedSpawn));
+      assert.equal(received?.managedConnectionId, "selected-connection");
+      assert.equal(provider.auth.status, "authenticated");
+      assert.equal(provider.auth.type, "organization-managed");
+      assert.deepEqual(
+        provider.models.map((model) => model.slug),
+        ["gpt-6-astra"],
+      );
+      assert.equal(provider.usageLimits?.unavailable?.reason, "unsupported");
+    }),
+);
+
+it.effect(
+  "distinguishes an unavailable relay from a confirmed organization reconnect requirement",
+  () =>
+    Effect.gen(function* () {
+      for (const unavailable of [false, true]) {
+        const provider = yield* checkCodexProviderStatus(
+          decodeManagedSettings({}),
+          () => Effect.die("An unavailable managed account must not start a probe"),
+          {},
+          {
+            connectionId: "selected-connection",
+            label: "Organization account",
+            status: unavailable
+              ? Effect.fail(new ThreadVmCodexAuthSourceError({ reason: "unavailable" }))
+              : Effect.succeed({ ...managedConnection, status: "reconnect_required" }),
+            preflight: Effect.void,
+          },
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noManagedSpawn));
+        assert.equal(provider.auth.status, unavailable ? "unknown" : "unauthenticated");
+        assert.ok(provider.message);
+        assert.ok(!provider.message!.includes("codex login"));
+      }
+    }),
+);
+
+it.effect(
+  "does not publish personal readiness after the VM selection changed to organization authentication",
+  () =>
+    Effect.gen(function* () {
+      const provider = yield* checkCodexProviderStatus(
+        decodeManagedSettings({}),
+        () => Effect.die("A stale personal provider must not probe native auth"),
+        {},
+        undefined,
+        Effect.fail(new ThreadVmCodexAuthSourceError({ reason: "selection_changed" })),
+      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noManagedSpawn));
+      assert.equal(provider.status, "error");
+      assert.equal(provider.auth.status, "unknown");
+      assert.match(provider.message!, /selection changed/);
+    }),
+);

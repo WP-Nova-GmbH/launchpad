@@ -128,6 +128,19 @@ describe("chatThreadActions", () => {
     expect(projectRef).toEqual(scopeProjectRef(ENVIRONMENT_ID, PROJECT_ID));
   });
 
+  it("uses an eligible default when the active thread is assigned to a VM", () => {
+    const fallback = scopeProjectRef(EnvironmentId.make("local"), PROJECT_ID);
+    expect(
+      resolveThreadActionProjectRef(
+        createContext({
+          activeThread: { environmentId: ENVIRONMENT_ID, projectId: PROJECT_ID },
+          defaultProjectRef: fallback,
+          canCreateThreadInProject: (ref) => ref.environmentId !== ENVIRONMENT_ID,
+        }),
+      ),
+    ).toEqual(fallback);
+  });
+
   it("falls back to the default project ref when there is no active thread context", () => {
     const projectRef = resolveThreadActionProjectRef(
       createContext({

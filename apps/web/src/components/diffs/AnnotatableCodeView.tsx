@@ -83,6 +83,7 @@ interface AnnotatableCodeViewProps {
   sectionId: string;
   sectionTitle: string;
   composerDraftTarget: ScopedThreadRef | DraftId;
+  readOnly?: boolean;
   options: StyledDiffCodeViewOptions<DiffCommentAnnotationGroup>;
   viewerRef?: Ref<AnnotatableCodeViewHandle>;
   className?: string;
@@ -107,6 +108,7 @@ export function AnnotatableCodeView({
   sectionId,
   sectionTitle,
   composerDraftTarget,
+  readOnly = false,
   options,
   viewerRef,
   className,
@@ -119,7 +121,9 @@ export function AnnotatableCodeView({
   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
   const reviewComments = useComposerDraftStore(
-    (store) => store.getComposerDraft(composerDraftTarget)?.reviewComments ?? EMPTY_REVIEW_COMMENTS,
+    (store) =>
+      (readOnly ? undefined : store.getComposerDraft(composerDraftTarget)?.reviewComments) ??
+      EMPTY_REVIEW_COMMENTS,
   );
   const [selectedLines, setSelectedLines] = useState<{
     id: string;
@@ -214,7 +218,7 @@ export function AnnotatableCodeView({
 
   const beginComment = useCallback(
     (range: SelectedLineRange | null, context: DiffSelectionContext) => {
-      if (!range) return;
+      if (readOnly || !range) return;
       const item = context.item;
       if (item.type !== "diff") return;
       const file = filesByKey.get(item.id);
@@ -242,7 +246,7 @@ export function AnnotatableCodeView({
         },
       });
     },
-    [filesByKey, sectionId, sectionTitle],
+    [filesByKey, readOnly, sectionId, sectionTitle],
   );
 
   const hasOpenComment = draft !== null;
@@ -264,8 +268,8 @@ export function AnnotatableCodeView({
       onSelectedLinesChange={setSelectedLines}
       options={{
         ...options,
-        enableGutterUtility: !hasOpenComment,
-        enableLineSelection: !hasOpenComment,
+        enableGutterUtility: !readOnly && !hasOpenComment,
+        enableLineSelection: !readOnly && !hasOpenComment,
         onGutterUtilityClick: beginComment,
       }}
       renderHeaderFilenameSuffix={(item) =>

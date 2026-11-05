@@ -4,18 +4,36 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { createModelSelection } from "@t3tools/shared/model";
 import { expect } from "vite-plus/test";
+import { FetchHttpClient } from "effect/unstable/http";
 
 import { CodexSettings, ProviderInstanceId, TextGenerationError } from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import { makeCodexTextGeneration } from "./CodexTextGeneration.ts";
+import {
+  ThreadVmCodexAuthSourceError,
+  type ManagedThreadVmCodexAuthContext,
+} from "../relay/ThreadVmCodexAuthSource.ts";
 import { writeFakeCli } from "../testUtils/fakeCli.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 const decodeCodexSettings = Schema.decodeSync(CodexSettings);
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const sse = (event: unknown) => `data: ${encodeJson(event)}\n\n`;
+const completedApproval = (content: ReadonlyArray<unknown>) =>
+  sse({
+    type: "response.completed",
+    response: {
+      status: "completed",
+      output: [{ type: "reasoning" }, { type: "message", role: "assistant", content }],
+    },
+  });
 
 const DEFAULT_TEST_MODEL_SELECTION = createModelSelection(
   ProviderInstanceId.make("codex"),
@@ -135,6 +153,8 @@ function withFakeCodexEnv<A, E, R>(
     launchArgs?: string;
     environment?: NodeJS.ProcessEnv;
     models?: ReadonlyArray<string>;
+    managedAuth?: ManagedThreadVmCodexAuthContext;
+    authPreflight?: Effect.Effect<void, ThreadVmCodexAuthSourceError>;
   },
   effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
 ) {
@@ -154,12 +174,273 @@ function withFakeCodexEnv<A, E, R>(
           capabilities: null,
         })),
       ),
+      input.managedAuth,
+      input.authPreflight,
     );
     return yield* effectFn(textGeneration);
   }).pipe(Effect.scoped);
 }
 
 it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
+  const approval = {
+    cwd: "/untrusted-workflow-repository",
+    toolKind: "command",
+    requestType: "command_execution_approval",
+    requestDetail: "Run repository tests",
+    stepInstruction: "Fix the failing test",
+    modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-astra"),
+  } as const;
+  const supervisor = (mintToken?: ManagedThreadVmCodexAuthContext["mintToken"]) =>
+    makeCodexTextGeneration(
+      decodeCodexSettings({ binaryPath: "/must-not-spawn-codex-for-supervisor" }),
+      { OPENAI_BASE_URL: "https://repo-config.invalid" },
+      Effect.succeed([]),
+      {
+        connectionId: "connection",
+        label: "Organization account",
+        status: Effect.die("No separate status probe required"),
+        preflight: Effect.void,
+        ...(mintToken ? { mintToken } : {}),
+      },
+    ).pipe(Effect.provideService(WorkflowVmGuest, true));
+
+  it.effect("uses coordinator transport for an isolated workflow approval", () =>
+    Effect.gen(function* () {
+      let minted = 0;
+      const requests: Array<{ url: string; init?: RequestInit | undefined }> = [];
+      const generation = yield* supervisor(
+        Effect.sync(() => {
+          minted++;
+          return Redacted.make("supervisor-fixture-token");
+        }),
+      );
+      const result = yield* generation.generateApprovalVerdict(approval).pipe(
+        Effect.provideService(FetchHttpClient.Fetch, async (url, init) => {
+          requests.push({ url: String(url), init });
+          return new Response(
+            [
+              sse({ type: "response.output_text.delta", delta: '{"verdict":"deny"}' }),
+              completedApproval([
+                {
+                  type: "output_text",
+                  text: encodeJson({ verdict: "approve", reasoning: "In scope." }),
+                },
+              ]),
+            ].join(""),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }),
+      );
+      expect(minted).toBe(1);
+      expect(requests).toHaveLength(1);
+      const request = requests[0]!;
+      expect(request.url).toBe("https://api.openai.com/v1/responses");
+      expect(request.init?.method).toBe("POST");
+      expect(request.init?.redirect).toBe("manual");
+      expect(new Headers(request.init?.headers).get("authorization")).toBe(
+        "Bearer supervisor-fixture-token",
+      );
+      const body = yield* Effect.promise(() => new Response(request.init?.body).text());
+      expect(decodeJson(body)).toMatchObject({
+        model: "gpt-6-astra",
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: expect.stringContaining("Run repository tests") },
+            ],
+          },
+        ],
+        tools: [],
+        tool_choice: "none",
+        store: false,
+        stream: true,
+        reasoning: { effort: "low" },
+        text: {
+          format: {
+            type: "json_schema",
+            name: "workflow_approval_verdict",
+            strict: true,
+            schema: {
+              type: "object",
+              required: ["verdict", "reasoning"],
+              additionalProperties: false,
+            },
+          },
+        },
+      });
+      expect(result).toEqual({ verdict: "approve", reasoning: "In scope." });
+    }),
+  );
+
+  it.effect("fails closed when isolated approval inference has no coordinator credential", () =>
+    Effect.gen(function* () {
+      const generation = yield* supervisor();
+      const error = yield* generation.generateApprovalVerdict(approval).pipe(
+        Effect.provideService(FetchHttpClient.Fetch, () => {
+          throw new Error("No network request expected");
+        }),
+        Effect.flip,
+      );
+      expect(error.detail).toBe("The workflow supervisor could not reach Codex.");
+    }),
+  );
+
+  it.effect.each(["redirect", "incomplete", "refusal"] as const)(
+    "rejects an isolated approval %s without exposing upstream details",
+    (outcome) =>
+      Effect.gen(function* () {
+        let forwarded = 0;
+        let signal: AbortSignal | null | undefined;
+        const generation = yield* supervisor(Effect.succeed(Redacted.make("fixture-token")));
+        const error = yield* generation.generateApprovalVerdict(approval).pipe(
+          Effect.provideService(FetchHttpClient.Fetch, async (_url, init) => {
+            forwarded++;
+            signal = init?.signal;
+            expect(init?.redirect).toBe("manual");
+            if (outcome === "redirect")
+              return new Response("private upstream details", {
+                status: 307,
+                headers: { location: "https://redirect.invalid" },
+              });
+            return new Response(
+              outcome === "refusal"
+                ? completedApproval([{ type: "refusal", refusal: "private upstream details" }])
+                : sse({ type: "response.output_text.delta", delta: "private upstream details" }),
+              { headers: { "content-type": "text/event-stream" } },
+            );
+          }),
+          Effect.flip,
+        );
+        expect(forwarded).toBe(1);
+        expect(signal?.aborted).toBe(true);
+        expect(error.detail).toBe(
+          outcome === "redirect"
+            ? "The workflow supervisor could not reach Codex."
+            : "Codex did not return a complete workflow approval verdict.",
+        );
+      }),
+  );
+
+  it.effect(
+    "pins structured text generation to the managed helper after conflicting environment flags",
+    () =>
+      withFakeCodexEnv(
+        {
+          output: '{"title":"Managed title"}',
+          requireArg: 'model_provider="launchpad_vm"',
+          environment: { ...process.env, T3CODE_CODEX_LAUNCH_ARGS: '-c model_provider="personal"' },
+          managedAuth: {
+            connectionId: "connection",
+            label: "Organization account",
+            status: Effect.die("No status probe required"),
+            preflight: Effect.void,
+          },
+        },
+        (generation) =>
+          generation.generateThreadTitle({
+            cwd: process.cwd(),
+            message: "Title",
+            modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna"),
+          }),
+      ),
+  );
+
+  it.effect("blocks new auxiliary inference after central disconnection", () =>
+    withFakeCodexEnv(
+      {
+        output: '{"title":"must-not-be-generated"}',
+        managedAuth: {
+          connectionId: "connection",
+          label: "Organization account",
+          status: Effect.die("No status probe required"),
+          preflight: Effect.fail(
+            new ThreadVmCodexAuthSourceError({ reason: "reconnect_required" }),
+          ),
+        },
+      },
+      (generation) =>
+        Effect.gen(function* () {
+          const error = yield* generation
+            .generateThreadTitle({
+              cwd: process.cwd(),
+              message: "Title",
+              modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-6-luna"),
+            })
+            .pipe(Effect.flip);
+          expect(error.detail).toContain("Reconnect the organization's Codex");
+        }),
+    ),
+  );
+
+  it.effect("requires an explicitly supported auxiliary model", () =>
+    withFakeCodexEnv(
+      {
+        output: '{"title":"must-not-be-generated"}',
+        managedAuth: {
+          connectionId: "connection",
+          label: "Organization account",
+          status: Effect.die("No status probe required"),
+          preflight: Effect.die("Unsupported model must fail before token lookup"),
+        },
+      },
+      (generation) =>
+        Effect.gen(function* () {
+          const error = yield* generation
+            .generateThreadTitle({
+              cwd: process.cwd(),
+              message: "Title",
+              modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.5"),
+            })
+            .pipe(Effect.flip);
+          expect(error.detail).toContain("Select a supported model");
+        }),
+    ),
+  );
+
+  it.effect(
+    "blocks a captured personal provider after the VM switches to organization sign-in",
+    () =>
+      withFakeCodexEnv(
+        {
+          output: '{"title":"must-not-be-generated"}',
+          authPreflight: Effect.fail(
+            new ThreadVmCodexAuthSourceError({ reason: "selection_changed" }),
+          ),
+        },
+        (generation) =>
+          Effect.gen(function* () {
+            const error = yield* generation
+              .generateThreadTitle({
+                cwd: process.cwd(),
+                message: "Title",
+                modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+              })
+              .pipe(Effect.flip);
+            expect(error.detail).toContain("selection changed");
+          }),
+      ),
+  );
+
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    withFakeCodexEnv(
+      {
+        output: JSON.stringify({ verdict: "approve", reasoning: "In scope" }),
+        stdinMustContain:
+          "Job context:\nFix JOB_CONTEXT\n\nRequired review constraint:\nREVIEW_REQUIRED",
+      },
+      (textGeneration) =>
+        textGeneration.generateApprovalVerdict({
+          cwd: process.cwd(),
+          toolKind: "command",
+          requestType: "command_execution_approval",
+          stepInstruction: "s".repeat(5_000),
+          jobContext: "Fix JOB_CONTEXT",
+          reviewConstraint: "REVIEW_REQUIRED",
+          modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+        }),
+    ),
+  );
   for (const selectedModel of ["gpt-5.6-luna", "openai.gpt-5.6-luna"]) {
     it.effect(`dispatches the qualified live model for ${selectedModel}`, () =>
       withFakeCodexEnv(

@@ -109,10 +109,17 @@ const runScan = (input: ScannerTestInput) =>
     return yield* scanner.scan;
   }).pipe(Effect.provide(makeScannerTestLayer(input)));
 
-const runRecentThreadOutcomes = (input: ScannerTestInput & { readonly workspaceRoot: string }) =>
+const runRecentThreadOutcomes = (
+  input: ScannerTestInput & {
+    readonly workspaceRoot: string;
+    readonly onReadProgress?: (
+      progress: AgentSessionScanner.AgentSessionReadProgress,
+    ) => Effect.Effect<void>;
+  },
+) =>
   Effect.gen(function* () {
     const scanner = yield* AgentSessionScanner.AgentSessionScanner;
-    return yield* scanner.recentThreads(input.workspaceRoot).pipe(
+    return yield* scanner.recentThreads(input.workspaceRoot, [], input.onReadProgress).pipe(
       Stream.runCollect,
       Effect.map((outcomes) => Array.from(outcomes)),
     );
@@ -1375,6 +1382,66 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
   });
 
   describe("recentThreads", () => {
+    it.effect(
+      "reports byte progress while reading large histories without changing the imported messages",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3-import-progress-claude-");
+          const codexHomePath = yield* makeTempDir("t3-import-progress-codex-");
+          const workspaceRoot = yield* makeTempDir("t3-import-progress-workspace-");
+          const contents = [
+            encodeTranscriptRecord({
+              type: "session_meta",
+              payload: { id: "progress-session", cwd: workspaceRoot },
+            }),
+            encodeTranscriptRecord({
+              type: "event_msg",
+              payload: { type: "user_message", message: "Keep this message" },
+            }),
+            encodeTranscriptRecord({
+              type: "response_item",
+              payload: { type: "function_call_output", output: "x".repeat(5 * 1024 * 1024) },
+            }),
+          ].join("\n");
+          yield* writeTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              "08",
+              "24",
+              "rollout-progress.jsonl",
+            ),
+            contents,
+            mtimeMs: nowMs,
+          });
+          const progress: Array<AgentSessionScanner.AgentSessionReadProgress> = [];
+          const outcomes = yield* runRecentThreadOutcomes({
+            claudeHomePath,
+            codexHomePath,
+            workspaceRoot,
+            onReadProgress: (event) =>
+              Effect.sync(() => {
+                progress.push(event);
+              }),
+          });
+          const totalBytes = new TextEncoder().encode(contents).byteLength;
+          expect(progress[0]).toEqual({ bytesRead: 0, totalBytes });
+          expect(
+            progress.some((event) => event.bytesRead > 0 && event.bytesRead < totalBytes),
+          ).toBe(true);
+          expect(progress.at(-1)).toEqual({ bytesRead: totalBytes, totalBytes });
+          expect(outcomes).toHaveLength(1);
+          expect(outcomes[0]).toMatchObject({
+            _tag: "Importable",
+            thread: { messages: [{ role: "user", text: "Keep this message" }] },
+          });
+        }),
+    );
+
     it.effect.each([false, true])(
       "counts terminal newlines correctly with record overflow=%s",
       (overflow) =>

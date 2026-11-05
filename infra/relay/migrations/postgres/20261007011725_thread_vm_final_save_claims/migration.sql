@@ -1,0 +1,6 @@
+ALTER TABLE "relay_thread_vm_final_saves" ADD COLUMN "claim_id" varchar(64);--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ADD COLUMN "claim_until" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ADD COLUMN "retry_at" timestamp with time zone DEFAULT now() NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ADD COLUMN "error_code" varchar(64);--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ADD CONSTRAINT "relay_thread_vm_final_saves_backup" CHECK ("phase" NOT IN ('saving','deleting','completed') OR "backup_operation_id" IS NOT NULL);--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" DROP CONSTRAINT "relay_thread_vm_final_saves_frozen", ADD CONSTRAINT "relay_thread_vm_final_saves_frozen" CHECK ("phase" NOT IN ('frozen','saving','deleting','completed') OR ("source_sequence" IS NOT NULL AND "source_sequence" >= 0 AND "native_checkpoint_operation_id" IS NOT NULL AND "frozen_at" IS NOT NULL));

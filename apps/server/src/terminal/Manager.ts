@@ -1,3 +1,11 @@
+import { CheckoutAccess } from "../workspace/CheckoutAccess.ts";
+import * as NodeCrypto from "node:crypto";
+import {
+  SetupProcessError,
+  SetupProcessJournal,
+  type SetupCleanupReceipt,
+} from "./SetupProcessJournal.ts";
+import { WorkflowVmGuest, workflowVmBaseEnvironment } from "../vmWorkloadCommand.ts";
 /**
  * TerminalManager - Terminal session orchestration service interface.
  *
@@ -6,6 +14,8 @@
  *
  * @module TerminalManager
  */
+import { ThreadExecution } from "../relay/ThreadExecution.ts";
+import type { ThreadWorkIdentity } from "../relay/ThreadExecutionRelay.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   DEFAULT_TERMINAL_ID,
@@ -14,6 +24,7 @@ import {
   TerminalCwdNotFoundError,
   TerminalCwdStatError,
   TerminalError,
+  TerminalExecutionError,
   TerminalHistoryError,
   TerminalNotRunningError,
   TerminalProcessExitError,
@@ -144,9 +155,27 @@ class TerminalProcessSignalError extends Schema.TaggedError<TerminalProcessSigna
   }
 }
 
-/**
- * TerminalManager - Service tag for terminal session orchestration.
- */
+interface WorkflowSetupLaunch {
+  readonly command: string;
+  readonly onShellExit: (event: PtyAdapter.PtyExitEvent) => void;
+}
+
+type InternalTerminalOpenInput = TerminalOpenInput & {
+  readonly waitForProcessExitOnClose?: boolean;
+  readonly setupProcessOwner?: string;
+  readonly setupAttemptId?: string;
+  readonly filterSetupOutput?: (chunk: string) => string;
+  readonly workflowSetup?: WorkflowSetupLaunch;
+};
+
+type TerminalSetupTarget = {
+  readonly threadId: string;
+  readonly terminalId: string;
+  readonly attemptId: string;
+  readonly expectedPid: number;
+};
+
+/** TerminalManager - Service tag for terminal session orchestration. */
 export class TerminalManager extends Context.Service<
   TerminalManager,
   {
@@ -157,7 +186,7 @@ export class TerminalManager extends Context.Service<
      * persisted history on first open.
      */
     readonly open: (
-      input: TerminalOpenInput & { readonly waitForProcessExitOnClose?: boolean },
+      input: InternalTerminalOpenInput,
     ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
 
     /**
@@ -175,6 +204,16 @@ export class TerminalManager extends Context.Service<
      * Write input bytes to a terminal session.
      */
     readonly write: (input: TerminalWriteInput) => Effect.Effect<void, TerminalError>;
+
+    /** Deliver setup only to its captured owner, serialized with terminal replacement. */
+    readonly writeSetup: (
+      input: TerminalSetupTarget & { readonly data: string },
+    ) => Effect.Effect<void, TerminalError>;
+
+    /** Capture and launch a workflow setup under the current execution admission. */
+    readonly armSetup: (
+      input: TerminalSetupTarget & { readonly authorizeDelivery: Effect.Effect<boolean> },
+    ) => Effect.Effect<void, TerminalError>;
 
     /**
      * Resize the PTY backing a terminal session.
@@ -204,13 +243,26 @@ export class TerminalManager extends Context.Service<
       input: TerminalCloseInput & { readonly waitForProcessExit?: boolean },
     ) => Effect.Effect<void, TerminalError>;
 
+    /** Close only a captured setup process, returning false when this runtime lost its handle. */
+    readonly closeOwned: (input: {
+      readonly threadId: string;
+      readonly terminalId: string;
+      readonly receipt?: SetupCleanupReceipt;
+      readonly expectedPid?: number;
+      /** Only set after authoritative OS evidence confirms this process instance exited. */
+      readonly exitConfirmed?: true;
+    }) => Effect.Effect<boolean, TerminalError>;
+
     readonly deleteHistory: (threadId: string) => Effect.Effect<void, TerminalHistoryError>;
 
     /** Capture exact current handles for deletion; retries never resolve replacement sessions by ID. */
-    readonly captureCleanup: (threadId: string) => Effect.Effect<{
-      readonly processIds: ReadonlyArray<number>;
-      readonly stop: Effect.Effect<void, TerminalError>;
-    }>;
+    readonly captureCleanup: (threadId: string) => Effect.Effect<
+      {
+        readonly processIds: ReadonlyArray<number>;
+        readonly stop: Effect.Effect<void, TerminalError>;
+      },
+      TerminalError
+    >;
 
     /**
      * Subscribe to terminal runtime events with a direct callback.
@@ -269,13 +321,20 @@ export interface ShellCandidate {
 }
 
 export interface TerminalStartInput extends TerminalOpenInput {
+  setupProcessOwner?: string;
+  setupAttemptId?: string;
+  workflowSetup?: WorkflowSetupLaunch;
   cols: number;
   rows: number;
 }
 
 interface TerminalSessionState {
+  pendingExecution?: ThreadWorkIdentity;
   /** Required setup must not report closure while its process can still write. */
   waitForProcessExitOnClose?: boolean;
+  setupProcessOwner?: string;
+  setupAttemptId?: string;
+  filterSetupOutput?: (chunk: string) => string;
   threadId: string;
   terminalId: string;
   cwd: string;
@@ -313,6 +372,7 @@ type PendingProcessEvent =
 
 type DrainProcessEventAction =
   | { type: "idle" }
+  | { type: "discard-output" }
   | {
       type: "output";
       threadId: string;
@@ -1329,6 +1389,11 @@ function normalizedRuntimeEnv(
 }
 
 interface TerminalManagerOptions {
+  checkoutAccess: Pick<CheckoutAccess["Service"], "assertAvailable">;
+  execution: Pick<
+    ThreadExecution["Service"],
+    "begin" | "assertAccepting" | "withActiveWork" | "confirmOrdinaryStopped"
+  >;
   logsDir: string;
   historyLineLimit?: number;
   historyByteLimit?: number;
@@ -1406,6 +1471,8 @@ export const resolveProviderInstanceTerminalEnvironment = Effect.fn(
 export const make = Effect.fn("TerminalManager.make")(function* () {
   const { terminalLogsDir } = yield* ServerConfig.ServerConfig;
   const ptyAdapter = yield* PtyAdapter.PtyAdapter;
+  const execution = yield* ThreadExecution;
+  const checkoutAccess = yield* CheckoutAccess;
   const portDiscovery = yield* PortScanner.PortDiscovery;
   const nativeTelemetry = yield* NativeTelemetryClient.NativeTelemetryClient;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -1421,6 +1488,8 @@ export const make = Effect.fn("TerminalManager.make")(function* () {
     }),
   );
   return yield* makeWithOptions({
+    execution,
+    checkoutAccess,
     logsDir: terminalLogsDir,
     ptyAdapter,
     processTable: nativeTelemetry.processTable.pipe(
@@ -1442,6 +1511,30 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
 
+  const executionError = (input: { threadId: string; terminalId: string }) => () =>
+    new TerminalExecutionError({
+      threadId: input.threadId,
+      terminalId: input.terminalId,
+      detail: "Terminal execution is awaiting permission from the thread’s current environment.",
+    });
+  const processWork = new WeakMap<PtyAdapter.PtyProcess, ThreadWorkIdentity>();
+  const withProcessPermission = <A, E, R>(
+    session: TerminalSessionState,
+    process: PtyAdapter.PtyProcess,
+    effect: Effect.Effect<A, E, R>,
+  ) =>
+    options.execution
+      .withActiveWork(
+        processWork.get(process) ?? {
+          threadId: session.threadId,
+          workId: "untracked",
+          kind: "terminal",
+        },
+        options.checkoutAccess
+          .assertAvailable({ path: session.cwd })
+          .pipe(Effect.mapError(executionError(session)), Effect.andThen(effect), Effect.result),
+      )
+      .pipe(Effect.mapError(executionError(session)), Effect.flatMap(Effect.fromResult));
   const logsDir = options.logsDir;
   const historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
   const historyByteLimit = options.historyByteLimit ?? DEFAULT_HISTORY_BYTE_LIMIT;
@@ -1450,9 +1543,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   // applied in createTerminalSpawnEnv) — an allowlist here silently strips
   // things like PSModulePath, DISPLAY, proxies, and toolchain variables.
   // `options.env` is the test seam.
-  const baseEnv = options.env ?? process.env;
+  const workflowGuest = yield* WorkflowVmGuest;
+  const baseEnv = workflowGuest ? workflowVmBaseEnvironment : (options.env ?? process.env);
   const shellResolver = options.shellResolver ?? (() => defaultShellResolver(platform, baseEnv));
   const processRunner = yield* ProcessRunner.ProcessRunner;
+  const journal = yield* SetupProcessJournal;
   const resolveLaunchInputEnvironment = Effect.fn("terminal.resolveLaunchInputEnvironment")(
     function* <Input extends TerminalOpenInput | TerminalAttachInput | TerminalRestartInput>(
       input: Input,
@@ -1606,27 +1701,76 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     terminalId: string;
     exited: Deferred.Deferred<void>;
     done: boolean;
+    reconcile: Effect.Effect<void, TerminalExecutionError>;
+    ptyDone: boolean;
+    shellExited: boolean;
+    setupAttemptId?: string;
     unsubscribe: () => void;
   };
   const ownedProcesses = new Map<PtyAdapter.PtyProcess, OwnedProcess>();
-  const trackProcess = (process: PtyAdapter.PtyProcess, session: TerminalSessionState) => {
+  const trackProcess = (
+    process: PtyAdapter.PtyProcess,
+    session: TerminalSessionState,
+    work: ThreadWorkIdentity,
+    ordinary: boolean,
+  ) => {
+    const lock = Semaphore.makeUnsafe(1);
+    let reconciled = false;
     const owned: OwnedProcess = {
       process,
       threadId: session.threadId,
       terminalId: session.terminalId,
       exited: Deferred.makeUnsafe<void>(),
       done: false,
+      reconcile: lock.withPermit(
+        Effect.gen(function* () {
+          if (!owned.done || reconciled) return;
+          // Local capture waits for Launchpad-owned open terminals. A positive
+          // PTY exit closes that work; detached programs are outside this guard.
+          // Portable execution still needs the VM's independent workload proof.
+          if (ordinary)
+            yield* options.execution
+              .confirmOrdinaryStopped(work)
+              .pipe(Effect.mapError(executionError(session)));
+          reconciled = true;
+          ownedProcesses.delete(process);
+        }),
+      ),
+      ptyDone: false,
+      shellExited: false,
+      ...(session.setupAttemptId ? { setupAttemptId: session.setupAttemptId } : {}),
       unsubscribe: () => {},
     };
     ownedProcesses.set(process, owned);
-    owned.unsubscribe = process.onExit(() => {
-      owned.done = true;
+    const offShellExit = process.onShellExit?.(() => {
+      owned.shellExited = true;
+    });
+    const offExit = process.onExit(() => {
+      owned.ptyDone = true;
+      // A PTY exit is not proof that a setup session/job stopped.
+      if (!owned.setupAttemptId) {
+        owned.done = true;
+      }
       Deferred.doneUnsafe(owned.exited, Effect.void);
-      ownedProcesses.delete(process);
       owned.unsubscribe();
       runFork(clearKillFiber(process));
+      runFork(
+        owned.reconcile.pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("terminal exit admission reconciliation failed", {
+              threadId: owned.threadId,
+              terminalId: owned.terminalId,
+              cause,
+            }),
+          ),
+        ),
+      );
     });
-    if (owned.done) owned.unsubscribe();
+    owned.unsubscribe = () => {
+      offExit();
+      offShellExit?.();
+    };
+    if (owned.ptyDone) owned.unsubscribe();
   };
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
@@ -1697,8 +1841,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     threadId: string,
     terminalId: string,
   ) {
-    const terminated = yield* Effect.try({
-      try: () => process.kill("SIGTERM"),
+    const terminated = yield* Effect.tryPromise({
+      try: async () => process.kill("SIGTERM"),
       catch: (cause) =>
         new TerminalProcessSignalError({
           cause,
@@ -1722,8 +1866,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
     yield* Effect.sleep(processKillGraceMs);
 
-    yield* Effect.try({
-      try: () => process.kill("SIGKILL"),
+    yield* Effect.tryPromise({
+      try: async () => process.kill("SIGKILL"),
       catch: (cause) =>
         new TerminalProcessSignalError({
           cause,
@@ -2094,9 +2238,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         }
 
         if (nextEvent.type === "output") {
+          const output = session.filterSetupOutput?.(nextEvent.data) ?? nextEvent.data;
+          if (!output) return { type: "discard-output" } as const;
           const sanitized = sanitizeTerminalHistoryChunk(
             session.pendingHistoryControlSequence,
-            nextEvent.data,
+            output,
           );
           session.pendingHistoryControlSequence = sanitized.pendingControlSequence;
           if (sanitized.visibleText.length > 0) {
@@ -2110,7 +2256,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             terminalId: session.terminalId,
             sequence: eventStamp.sequence,
             history: sanitized.visibleText.length > 0 ? session.history : null,
-            data: nextEvent.data,
+            data: output,
           } as const;
         }
 
@@ -2147,6 +2293,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       if (action.type === "idle") {
         return;
       }
+      if (action.type === "discard-output") continue;
 
       if (action.type === "output") {
         if (action.history !== null) {
@@ -2187,12 +2334,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
   });
 
-  const confirmProcessExit = Effect.fn("terminal.confirmProcessExit")(function* (
-    owned: OwnedProcess,
-  ) {
+  const confirmPtyExit = Effect.fn("terminal.confirmPtyExit")(function* (owned: OwnedProcess) {
     const { process, threadId, terminalId } = owned;
     yield* clearKillFiber(process);
-    if (owned.done) return;
+    if (owned.done) return yield* owned.reconcile;
+    if (owned.ptyDone) return;
     const failure = (detail: string, cause?: unknown) =>
       new TerminalProcessExitError({
         threadId,
@@ -2202,15 +2348,15 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         ...(cause === undefined ? {} : { cause }),
       });
     const signal = (value: "SIGTERM" | "SIGKILL") =>
-      Effect.try({
-        try: () => process.kill(value),
+      Effect.tryPromise({
+        try: async () => process.kill(value),
         catch: (cause) => failure(`Sending ${value} failed.`, cause),
       });
     yield* signal("SIGTERM");
     const stopped = yield* Deferred.await(owned.exited).pipe(
       Effect.timeoutOption(processKillGraceMs),
     );
-    if (Option.isSome(stopped)) return;
+    if (Option.isSome(stopped)) return yield* owned.reconcile;
     yield* signal("SIGKILL");
     yield* Deferred.await(owned.exited).pipe(
       Effect.timeoutOrElse({
@@ -2218,6 +2364,86 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         orElse: () => Effect.fail(failure("No process exit was reported after termination.")),
       }),
     );
+    yield* owned.reconcile;
+  });
+
+  const finalizeReceipt = Effect.fn("terminal.finalizeReceipt")(function* (
+    proof: SetupCleanupReceipt,
+  ) {
+    const matches = [...ownedProcesses.values()].filter(
+      (owned) =>
+        owned.threadId === proof.threadId &&
+        owned.terminalId === proof.terminalId &&
+        owned.setupAttemptId === proof.attemptId &&
+        (proof.pid === null || owned.process.pid === proof.pid),
+    );
+    for (const owned of matches) {
+      // The saved uncaptured intent cannot arm anymore; this exact wrapper has no shell.
+      if (proof.source === "not-delivered") yield* confirmPtyExit(owned);
+      owned.done = true;
+      Deferred.doneUnsafe(owned.exited, Effect.void);
+      yield* owned.reconcile;
+      owned.unsubscribe();
+      yield* clearKillFiber(owned.process);
+    }
+    return matches;
+  });
+  const cleanupSaved = Effect.fn("terminal.cleanupSaved")(function* (
+    threadId: string,
+    terminalId?: string,
+    excludeAttempt?: string,
+    commandId = NodeCrypto.randomUUID(),
+  ) {
+    const owners = yield* journal.owners(threadId, terminalId).pipe(
+      Effect.mapError(
+        (error) =>
+          new TerminalProcessExitError({
+            threadId,
+            terminalId: terminalId ?? DEFAULT_TERMINAL_ID,
+            terminalPid: 0,
+            detail: error.message,
+          }),
+      ),
+    );
+    for (const owner of owners) {
+      if (owner.attemptId === excludeAttempt) continue;
+      const proof = yield* journal.cleanup({ ...owner, commandId }).pipe(
+        Effect.mapError(
+          (error) =>
+            new TerminalProcessExitError({
+              threadId,
+              terminalId: owner.terminalId,
+              terminalPid: owner.pid ?? 0,
+              detail: error.message,
+            }),
+        ),
+      );
+      yield* finalizeReceipt(proof);
+    }
+  });
+  const confirmProcessExit = Effect.fn("terminal.confirmProcessExit")(function* (
+    owned: OwnedProcess,
+  ) {
+    if (owned.done) return yield* owned.reconcile;
+    if (!owned.setupAttemptId) return yield* confirmPtyExit(owned);
+    const proof = yield* journal
+      .cleanup({
+        threadId: owned.threadId,
+        attemptId: owned.setupAttemptId,
+        commandId: NodeCrypto.randomUUID(),
+      })
+      .pipe(
+        Effect.mapError(
+          (error) =>
+            new TerminalProcessExitError({
+              threadId: owned.threadId,
+              terminalId: owned.terminalId,
+              terminalPid: owned.process.pid,
+              detail: error.message,
+            }),
+        ),
+      );
+    yield* finalizeReceipt(proof);
   });
 
   const stopProcess = Effect.fn("terminal.stopProcess")(function* (
@@ -2226,7 +2452,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   ) {
     const process = session.process;
     if (!process) return;
-    const strict = waitForProcessExit || session.waitForProcessExitOnClose === true;
+    const strict =
+      !!session.setupAttemptId || waitForProcessExit || session.waitForProcessExitOnClose === true;
     const owned = ownedProcesses.get(process);
     if (strict && owned) yield* confirmProcessExit(owned);
 
@@ -2262,6 +2489,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     session: TerminalSessionState,
     index = 0,
     lastError: PtyAdapter.PtySpawnError | null = null,
+    ownerExecutable?: string,
   ): Effect.fn.Return<
     { process: PtyAdapter.PtyProcess; shellLabel: string },
     PtyAdapter.PtySpawnError
@@ -2288,6 +2516,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     const attempt = yield* Effect.result(
       options.ptyAdapter.spawn({
         shell: candidate.shell,
+        ...(ownerExecutable ? { ownerExecutable, ownerShellCandidates: shellCandidates } : {}),
         ...(candidate.args ? { args: candidate.args } : {}),
         cwd: session.cwd,
         cols: session.cols,
@@ -2304,11 +2533,18 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     const spawnError = attempt.failure;
-    if (!isRetryableShellSpawnError(spawnError)) {
+    if (ownerExecutable || !isRetryableShellSpawnError(spawnError)) {
       return yield* spawnError;
     }
 
-    return yield* trySpawn(shellCandidates, spawnEnv, session, index + 1, spawnError);
+    return yield* trySpawn(
+      shellCandidates,
+      spawnEnv,
+      session,
+      index + 1,
+      spawnError,
+      ownerExecutable,
+    );
   });
 
   const startSession = Effect.fn("terminal.startSession")(function* (
@@ -2316,6 +2552,46 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     input: TerminalStartInput,
     eventType: "started" | "restarted",
   ) {
+    const work: ThreadWorkIdentity = session.pendingExecution ?? {
+      threadId: session.threadId,
+      workId: NodeCrypto.randomUUID(),
+      kind: "terminal",
+    };
+    session.pendingExecution = work;
+    const permission = yield* options.execution
+      .begin(work)
+      .pipe(Effect.mapError(executionError(session)));
+    if (permission !== "start" && permission !== "ordinary")
+      return yield* executionError(session)();
+    // Ordinary terminals settle on their PTY exit. Portable terminals retain
+    // their independent VM workload reservation until reconciliation.
+    if (input.setupProcessOwner) {
+      const owners = yield* journal.owners(session.threadId, session.terminalId).pipe(
+        Effect.mapError(
+          (error) =>
+            new TerminalProcessExitError({
+              threadId: session.threadId,
+              terminalId: session.terminalId,
+              terminalPid: 0,
+              detail: error.message,
+            }),
+        ),
+      );
+      if (
+        !input.setupAttemptId ||
+        !owners.some(
+          (owner) =>
+            owner.attemptId === input.setupAttemptId && !owner.exited && owner.pid === null,
+        )
+      )
+        return yield* new TerminalProcessExitError({
+          threadId: session.threadId,
+          terminalId: session.terminalId,
+          terminalPid: 0,
+          detail: "Setup requires an uncaptured durable launch intent.",
+        });
+    }
+    yield* cleanupSaved(session.threadId, session.terminalId, input.setupAttemptId);
     yield* stopProcess(session);
     yield* Effect.annotateCurrentSpan({
       "terminal.thread_id": session.threadId,
@@ -2327,6 +2603,10 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     const startingAt = yield* nowIso;
     yield* modifyManagerState((state) => {
       session.status = "starting";
+      if (input.setupProcessOwner) session.setupProcessOwner = input.setupProcessOwner;
+      else delete session.setupProcessOwner;
+      if (input.setupAttemptId) session.setupAttemptId = input.setupAttemptId;
+      else delete session.setupAttemptId;
       session.cwd = input.cwd;
       session.worktreePath = input.worktreePath ?? null;
       session.cols = input.cols;
@@ -2349,11 +2629,23 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       increment(terminalSessionsTotal, { lifecycle: eventType }).pipe(
         Effect.andThen(
           Effect.gen(function* () {
-            const shellCandidates = resolveShellCandidates(shellResolver, platform, baseEnv);
+            // The owner waits for this one-shot shell while retaining the setup cgroup.
+            const shellCandidates = input.workflowSetup
+              ? [{ shell: "/bin/bash", args: ["-c", input.workflowSetup.command] }]
+              : resolveShellCandidates(shellResolver, platform, baseEnv);
             const terminalEnv = createTerminalSpawnEnv(baseEnv, session.runtimeEnv);
-            const spawnResult = yield* trySpawn(shellCandidates, terminalEnv, session);
+            const spawnResult = yield* trySpawn(
+              shellCandidates,
+              terminalEnv,
+              session,
+              0,
+              null,
+              input.setupProcessOwner,
+            );
             ptyProcess = spawnResult.process;
-            trackProcess(ptyProcess, session);
+            processWork.set(ptyProcess, work);
+            delete session.pendingExecution;
+            trackProcess(ptyProcess, session, work, permission === "ordinary");
             startedShell = spawnResult.shellLabel;
 
             const processPid = ptyProcess.pid;
@@ -2363,12 +2655,21 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
               }
               runFork(drainProcessEvents(session, processPid));
             });
-            const unsubscribeExit = ptyProcess.onExit((event) => {
+            const handleExit = (event: PtyAdapter.PtyExitEvent) => {
               if (!enqueueProcessEvent(session, processPid, { type: "exit", event })) {
                 return;
               }
               runFork(drainProcessEvents(session, processPid));
+            };
+            const offExit = ptyProcess.onExit(handleExit);
+            const offShellExit = ptyProcess.onShellExit?.((event) => {
+              input.workflowSetup?.onShellExit(event);
+              handleExit(event);
             });
+            const unsubscribeExit = () => {
+              offExit();
+              offShellExit?.();
+            };
 
             let eventStamp: ReturnType<typeof advanceEventSequence> = {
               updatedAt: session.updatedAt,
@@ -2456,6 +2757,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     waitForProcessExit = false,
   ) {
     const key = toSessionKey(threadId, terminalId);
+    yield* cleanupSaved(threadId, terminalId);
     if (waitForProcessExit) {
       for (const owned of ownedProcesses.values())
         if (owned.threadId === threadId && owned.terminalId === terminalId)
@@ -2650,6 +2952,8 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         cleanupProcessHandles(session);
         if (!session.process) return;
         yield* clearKillFiber(session.process);
+        // Durable setup ownership outlives this server; journal recovery stops the retained unit.
+        if (session.setupProcessOwner) return;
         yield* runKillEscalation(session.process, session.threadId, session.terminalId);
       });
 
@@ -2661,9 +2965,15 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   );
 
   const openWithWorkspaceLease = Effect.fn("terminal.openLocked")(function* (
-    input: TerminalOpenInput & { readonly waitForProcessExitOnClose?: boolean },
+    input: InternalTerminalOpenInput,
   ) {
     const terminalId = input.terminalId;
+    yield* options.execution
+      .assertAccepting(input.threadId)
+      .pipe(Effect.mapError(executionError(input)));
+    yield* options.checkoutAccess
+      .assertAvailable({ path: input.cwd })
+      .pipe(Effect.mapError(executionError(input)));
     yield* assertValidCwd(input.cwd);
 
     const sessionKey = toSessionKey(input.threadId, terminalId);
@@ -2675,6 +2985,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       const rows = input.rows ?? DEFAULT_OPEN_ROWS;
       const session: TerminalSessionState = {
         ...(input.waitForProcessExitOnClose ? { waitForProcessExitOnClose: true } : {}),
+        ...(input.filterSetupOutput ? { filterSetupOutput: input.filterSetupOutput } : {}),
         threadId: input.threadId,
         terminalId,
         cwd: input.cwd,
@@ -2718,6 +3029,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           cols,
           rows,
           ...(input.env ? { env: input.env } : {}),
+          ...(input.setupProcessOwner ? { setupProcessOwner: input.setupProcessOwner } : {}),
+          ...(input.setupAttemptId ? { setupAttemptId: input.setupAttemptId } : {}),
+          ...(input.workflowSetup ? { workflowSetup: input.workflowSetup } : {}),
         },
         "started",
       );
@@ -2725,6 +3039,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     const liveSession = existing.value;
+    if (input.filterSetupOutput) liveSession.filterSetupOutput = input.filterSetupOutput;
     if (input.waitForProcessExitOnClose) liveSession.waitForProcessExitOnClose = true;
     const nextRuntimeEnv = normalizedRuntimeEnv(input.env);
     const currentRuntimeEnv = liveSession.runtimeEnv;
@@ -2771,6 +3086,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           cols: targetCols,
           rows: targetRows,
           ...(input.env ? { env: input.env } : {}),
+          ...(input.setupProcessOwner ? { setupProcessOwner: input.setupProcessOwner } : {}),
+          ...(input.setupAttemptId ? { setupAttemptId: input.setupAttemptId } : {}),
+          ...(input.workflowSetup ? { workflowSetup: input.workflowSetup } : {}),
         },
         "started",
       );
@@ -2778,7 +3096,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     if (liveSession.cols !== targetCols || liveSession.rows !== targetRows) {
-      yield* resizePtyProcess(liveSession, liveSession.process, targetCols, targetRows);
+      yield* withProcessPermission(
+        liveSession,
+        liveSession.process,
+        resizePtyProcess(liveSession, liveSession.process, targetCols, targetRows),
+      );
       liveSession.cols = targetCols;
       liveSession.rows = targetRows;
       liveSession.updatedAt = yield* nowIso;
@@ -2787,9 +3109,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     return snapshot(liveSession);
   });
 
-  const openLocked = (
-    input: TerminalOpenInput & { readonly waitForProcessExitOnClose?: boolean },
-  ) =>
+  const openLocked = (input: InternalTerminalOpenInput) =>
     withWorkspaceLease(
       path.resolve(input.worktreePath ?? input.cwd),
       openWithWorkspaceLease(input),
@@ -2841,7 +3161,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             (session.cols !== targetCols || session.rows !== targetRows)
           ) {
             const process = session.process;
-            yield* resizePtyProcess(session, process, targetCols, targetRows);
+            yield* withProcessPermission(
+              session,
+              process,
+              resizePtyProcess(session, process, targetCols, targetRows),
+            );
             session.cols = targetCols;
             session.rows = targetRows;
             session.updatedAt = yield* nowIso;
@@ -3052,17 +3376,137 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         terminalId,
       });
     }
-    yield* Effect.try({
-      try: () => process.write(input.data),
-      catch: (cause) =>
-        new TerminalWriteError({
-          threadId: input.threadId,
-          terminalId,
-          terminalPid: process.pid,
-          cause,
-        }),
-    });
+    yield* withProcessPermission(
+      session,
+      process,
+      Effect.try({
+        try: () => process.write(input.data),
+        catch: (cause) =>
+          new TerminalWriteError({
+            threadId: input.threadId,
+            terminalId,
+            terminalPid: process.pid,
+            cause,
+          }),
+      }),
+    );
   });
+
+  const setupDeliveryError = (input: TerminalSetupTarget, detail: string) =>
+    new TerminalProcessExitError({
+      threadId: input.threadId,
+      terminalId: input.terminalId,
+      terminalPid: input.expectedPid,
+      detail,
+    });
+
+  // The caller holds the terminal lifecycle lock. Keep delivery inside the
+  // same local execution transaction as the ownership and checkout checks.
+  const withSetupDelivery = Effect.fnUntraced(function* <A, E>(
+    input: TerminalSetupTarget,
+    deliver: (process: PtyAdapter.PtyProcess) => Effect.Effect<A, E>,
+    authorize?: Effect.Effect<boolean>,
+  ) {
+    const rejected = (detail: string) => setupDeliveryError(input, detail);
+    const owners = yield* journal
+      .owners(input.threadId, input.terminalId)
+      .pipe(Effect.mapError((error) => rejected(error.message)));
+    const saved = owners.find((owner) => owner.attemptId === input.attemptId);
+    if (
+      !saved ||
+      saved.threadId !== input.threadId ||
+      saved.terminalId !== input.terminalId ||
+      saved.pid !== input.expectedPid ||
+      !saved.identity ||
+      saved.exited ||
+      saved.evidence
+    )
+      return yield* rejected("Setup ownership changed before command delivery.");
+
+    const session = yield* requireSession(input.threadId, input.terminalId);
+    const process = session.process;
+    if (!process) return yield* rejected("Setup terminal is not running.");
+    return yield* withProcessPermission(
+      session,
+      process,
+      Effect.gen(function* () {
+        if (authorize && !(yield* authorize))
+          return yield* rejected("The workflow no longer owns this setup attempt.");
+        // Check the exact handle after authorization. Ordinary writes run
+        // synchronously here. The workflow broker rechecks the OS owner.
+        const delivery = yield* modifyManagerState<Effect.Effect<A, E | TerminalProcessExitError>>(
+          (state) => {
+            const current = state.sessions.get(toSessionKey(input.threadId, input.terminalId));
+            const owned = ownedProcesses.get(process);
+            if (
+              cleanupEpochs.get(input.threadId)?.blocked ||
+              current !== session ||
+              current.status !== "running" ||
+              current.setupAttemptId !== input.attemptId ||
+              current.process !== process ||
+              process.pid !== input.expectedPid ||
+              !owned ||
+              owned.threadId !== input.threadId ||
+              owned.terminalId !== input.terminalId ||
+              owned.setupAttemptId !== input.attemptId ||
+              owned.done ||
+              owned.ptyDone ||
+              owned.shellExited
+            )
+              return [
+                Effect.fail(rejected("Setup terminal changed or exited before command delivery.")),
+                state,
+              ] as const;
+            return [deliver(process), state] as const;
+          },
+        );
+        return yield* delivery;
+      }),
+    );
+  });
+
+  const writeSetup: TerminalManager["Service"]["writeSetup"] = (input) =>
+    withThreadLock(
+      input.threadId,
+      withSetupDelivery(input, (process) => {
+        try {
+          process.write(input.data);
+          return Effect.void;
+        } catch (cause) {
+          return Effect.fail(
+            new TerminalWriteError({
+              threadId: input.threadId,
+              terminalId: input.terminalId,
+              terminalPid: process.pid,
+              cause,
+            }),
+          );
+        }
+      }),
+    );
+
+  const armSetup: TerminalManager["Service"]["armSetup"] = (input) =>
+    withThreadLock(
+      input.threadId,
+      journal
+        .capture({
+          threadId: input.threadId,
+          attemptId: input.attemptId,
+          pid: input.expectedPid,
+          // The attempt remains recoverable even if authorization is revoked
+          // or the broker's acknowledgement is lost.
+          guardArm: (arm) =>
+            withSetupDelivery(
+              input,
+              () => Effect.uninterruptible(arm),
+              input.authorizeDelivery,
+            ).pipe(Effect.mapError((error) => new SetupProcessError({ message: error.message }))),
+        })
+        .pipe(
+          Effect.mapError((error) => setupDeliveryError(input, error.message)),
+          Effect.asVoid,
+        ),
+    );
 
   const resizeLocked = Effect.fn("terminal.resize")(function* (input: TerminalResizeInput) {
     const session = yield* getSession(input.threadId, input.terminalId);
@@ -3074,7 +3518,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     if (!process || session.value.status !== "running") {
       return;
     }
-    yield* resizePtyProcess(session.value, process, input.cols, input.rows);
+    yield* withProcessPermission(
+      session.value,
+      process,
+      resizePtyProcess(session.value, process, input.cols, input.rows),
+    );
     session.value.cols = input.cols;
     session.value.rows = input.rows;
     session.value.updatedAt = yield* nowIso;
@@ -3110,8 +3558,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   const restartResolved = (input: TerminalRestartInput) =>
     Effect.gen(function* () {
+      yield* options.execution
+        .assertAccepting(input.threadId)
+        .pipe(Effect.mapError(executionError(input)));
       yield* increment(terminalRestartsTotal, { scope: "thread" });
       const terminalId = input.terminalId;
+      yield* options.checkoutAccess
+        .assertAvailable({ path: input.cwd })
+        .pipe(Effect.mapError(executionError(input)));
       yield* assertValidCwd(input.cwd);
 
       const sessionKey = toSessionKey(input.threadId, terminalId);
@@ -3212,6 +3666,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
           return;
         }
 
+        yield* cleanupSaved(input.threadId);
         const threadSessions = yield* sessionsForThread(input.threadId);
         yield* Effect.forEach(
           threadSessions,
@@ -3238,6 +3693,18 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
         const processes = [...ownedProcesses.values()].filter(
           (owned) => owned.threadId === threadId,
         );
+        const owners = yield* journal.owners(threadId).pipe(
+          Effect.mapError(
+            (error) =>
+              new TerminalProcessExitError({
+                threadId,
+                terminalId: DEFAULT_TERMINAL_ID,
+                terminalPid: 0,
+                detail: error.message,
+              }),
+          ),
+        );
+        const commandId = NodeCrypto.randomUUID();
         let completed = false;
         return {
           processIds: processes.map((owned) => owned.process.pid),
@@ -3245,6 +3712,20 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             threadId,
             Effect.gen(function* () {
               if (completed) return;
+              for (const owner of owners) {
+                const failure = (error: { message: string }) =>
+                  new TerminalProcessExitError({
+                    threadId,
+                    terminalId: owner.terminalId,
+                    terminalPid: owner.pid ?? 0,
+                    detail: error.message,
+                  });
+                const confirmed = yield* journal.confirmed(owner).pipe(Effect.mapError(failure));
+                const proof = yield* (
+                  confirmed ? journal.recover(owner) : journal.cleanup({ ...owner, commandId })
+                ).pipe(Effect.mapError(failure));
+                yield* finalizeReceipt(proof);
+              }
               for (const owned of processes) yield* confirmProcessExit(owned);
               for (const { session, process } of captured) {
                 if (session.process !== process && session.process !== null)
@@ -3273,12 +3754,67 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     open,
     attachStream,
     write,
+    writeSetup,
+    armSetup,
     resize,
     clear,
     restart,
     close,
     subscribe,
     subscribeMetadata,
+    closeOwned: (input) =>
+      withThreadLock(
+        input.threadId,
+        Effect.gen(function* () {
+          if (input.receipt) {
+            const proof = input.receipt;
+            const matches = yield* finalizeReceipt(proof);
+            const current = yield* getSession(proof.threadId, proof.terminalId);
+            if (
+              Option.isSome(current) &&
+              current.value.setupAttemptId === proof.attemptId &&
+              (!current.value.process ||
+                matches.some((owned) => owned.process === current.value.process))
+            )
+              yield* closeSession(proof.threadId, proof.terminalId, false);
+            return matches.length > 0;
+          }
+          const owned = [...ownedProcesses.values()].filter(
+            (process) =>
+              process.threadId === input.threadId &&
+              process.terminalId === input.terminalId &&
+              (input.expectedPid === undefined || process.process.pid === input.expectedPid),
+          );
+          if (owned.length === 0) return false;
+          if (owned.some((process) => process.setupAttemptId)) {
+            yield* Effect.forEach(owned, confirmProcessExit, { discard: true });
+          } else if (input.exitConfirmed) {
+            // Native cleanup checked birth identity. Never signal a stale PTY PID again.
+            for (const process of owned) {
+              process.done = true;
+              Deferred.doneUnsafe(process.exited, Effect.void);
+              ownedProcesses.delete(process.process);
+              process.unsubscribe();
+              yield* clearKillFiber(process.process);
+            }
+          } else yield* Effect.forEach(owned, confirmProcessExit, { discard: true });
+          const session = yield* getSession(input.threadId, input.terminalId);
+          if (
+            input.expectedPid !== undefined &&
+            Option.isSome(session) &&
+            session.value.process &&
+            !owned.some((process) => process.process === session.value.process)
+          )
+            return true;
+          yield* closeSession(
+            input.threadId,
+            input.terminalId,
+            false,
+            input.exitConfirmed !== true,
+          );
+          return true;
+        }),
+      ),
   });
 });
 

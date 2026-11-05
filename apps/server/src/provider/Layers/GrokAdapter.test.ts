@@ -216,6 +216,33 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("rejects missing local approval and user-input callbacks before native dispatch", () =>
+    Effect.gen(function* () {
+      const directory = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-missing-callback-")),
+      );
+      const logPath = NodePath.join(directory, "requests.jsonl");
+      const wrapper = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: logPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapper);
+      const threadId = ThreadId.make("grok-missing-callback");
+      yield* adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const requests = yield* Effect.promise(() => readJsonLines(logPath));
+      for (const response of [
+        adapter.respondToRequest(threadId, ApprovalRequestId.make("missing"), "accept"),
+        adapter.respondToUserInput(threadId, ApprovalRequestId.make("missing"), {}),
+      ])
+        assert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+      assert.deepEqual(yield* Effect.promise(() => readJsonLines(logPath)), requests);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("validates at ACP dispatch and can retry a rejected prompt", () =>
     Effect.gen(function* () {
       const directory = yield* Effect.promise(() =>
@@ -274,7 +301,7 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       const originalTurns = [...(yield* adapter.readThread(threadId)).turns];
       assert.isFalse(adapter.capabilities.supportsConversationRollback);
       const error = yield* adapter.rollbackThread(threadId, 1).pipe(Effect.flip);
-      assert.equal(error._tag, "ProviderAdapterRequestError");
+      assert.equal(error._tag, "ProviderAdapterValidationError");
       assert.deepStrictEqual((yield* adapter.readThread(threadId)).turns, originalTurns);
       yield* adapter.stopSession(threadId);
     }),
@@ -387,10 +414,10 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       const permissionError = yield* adapter
         .sendTurn({ threadId, input: "/always-approve on" })
         .pipe(Effect.flip);
-      if (permissionError._tag !== "ProviderAdapterRequestError") {
+      if (permissionError._tag !== "ProviderAdapterValidationError") {
         assert.fail(`Unexpected error: ${permissionError._tag}`);
       }
-      assert.include(permissionError.detail, "permission selector");
+      assert.include(permissionError.issue, "permission selector");
       yield* adapter.sendTurn({ threadId, input: "/goal status" });
       yield* adapter.stopSession(threadId);
       const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));

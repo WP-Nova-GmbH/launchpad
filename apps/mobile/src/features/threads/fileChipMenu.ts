@@ -61,14 +61,17 @@ export function fileChipShareSource(target: FileChipTarget, threadId: ThreadId) 
 }
 
 /** Saving is available for the media and documents the host asset endpoint can serve. */
-export function fileChipMenu(target: FileChipTarget): MarkdownFileContextMenu {
+export function fileChipMenu(
+  target: FileChipTarget,
+  workspaceFilesAvailable = true,
+): MarkdownFileContextMenu {
   return {
     title: target.fullPath ?? target.relativePath ?? "",
     actions: [
       ...(target.fullPath ? [{ id: "copy-full-path", title: "Copy full path" }] : []),
       ...(target.relativePath ? [{ id: "copy-relative-path", title: "Copy relative path" }] : []),
-      { id: "open-file", title: "Open in file viewer" },
-      ...(fileChipMetadata(target)
+      ...(workspaceFilesAvailable ? [{ id: "open-file", title: "Open in file viewer" }] : []),
+      ...(workspaceFilesAvailable && fileChipMetadata(target)
         ? [
             {
               id: "save",

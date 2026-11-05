@@ -1,0 +1,682 @@
+import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
+import type { RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
+import { makeThreadVmEnrollmentStore } from "./ThreadVmEnrollmentStore.ts";
+import type { PgClient } from "@effect/sql-pg/PgClient";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import {
+  makeThreadVmAllocationStore,
+  type ThreadVmResourceKind,
+} from "./ThreadVmAllocationStore.ts";
+import type { relayThreadVmProvisions } from "../persistence/schema.ts";
+
+export class ThreadVmProvisionConflict extends Schema.TaggedError<ThreadVmProvisionConflict>()(
+  "ThreadVmProvisionConflict",
+  { message: Schema.String },
+) {}
+export interface ThreadVmProvision {
+  readonly resourceKind: ThreadVmResourceKind;
+  readonly workflowSnapshot: (typeof relayThreadVmProvisions.$inferSelect)["workflowSnapshot"];
+  readonly allocationId: string;
+  readonly operationId: string;
+  readonly generation: number;
+  readonly threadId: string;
+  readonly templateId: string;
+  readonly computeRef: string | null;
+  readonly allocationState: "creating" | "running" | "paused" | "deleting" | "deleted";
+  readonly phase: "pending" | "creating" | "created" | "cancelled";
+  readonly claimId: string | null;
+  readonly ingressRecoveryClaimId: string | null;
+  readonly errorCode: string | null;
+}
+const conflict = (message: string) => new ThreadVmProvisionConflict({ message });
+
+/** Shared by the runtime poll and claim so stale pending work can retire without a slot. */
+export const staleWaitingWorkflowVm = (
+  sql: PgClient,
+  verifiedBuild: { readonly templateRef: string; readonly buildId: string } | undefined,
+) =>
+  verifiedBuild
+    ? sql`p.phase='pending' AND c.state='waiting' AND a.state='creating' AND a.compute_ref IS NULL
+      AND a.resource_kind='organization_workflow' AND a.runtime_protocol='native-v1'
+      AND p.workflow_snapshot IS NOT NULL
+      AND (a.template_id IS DISTINCT FROM ${verifiedBuild.templateRef}
+        OR p.workflow_snapshot->>'templateBuildId' IS DISTINCT FROM ${verifiedBuild.buildId})`
+    : sql`FALSE`;
+
+/** Internal API: reserve quota and authorize intent before enqueuing. Claims never transfer thread ownership. */
+export function makeThreadVmProvisionStore(sql: PgClient) {
+  const allocations = makeThreadVmAllocationStore(sql);
+  const capacity = makeThreadVmCapacityStore(sql);
+  const get = Effect.fn("relay.thread_vm_provision.get")(function* (
+    allocationId: string,
+    resourceKind?: ThreadVmResourceKind,
+  ) {
+    const [row] =
+      yield* sql<ThreadVmProvision>`SELECT p.allocation_id AS "allocationId", p.operation_id AS "operationId", p.generation,
+      a.thread_id AS "threadId", a.template_id AS "templateId", a.compute_ref AS "computeRef", a.state AS "allocationState",
+      a.resource_kind AS "resourceKind", p.workflow_snapshot AS "workflowSnapshot",
+      p.phase, p.claim_id AS "claimId", p.ingress_recovery_claim_id AS "ingressRecoveryClaimId", p.error_code AS "errorCode"
+      FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
+      WHERE a.runtime_protocol='native-v1' AND p.allocation_id = ${allocationId}
+        AND a.resource_kind=${resourceKind ?? "personal"}`;
+    return row ?? null;
+  });
+  const enqueue = Effect.fn("relay.thread_vm_provision.enqueue")(function* (input: {
+    allocationId: string;
+    operationId: string;
+    generation: number;
+    hostId: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [allocation] = yield* sql<{
+          state: string;
+        }>`SELECT state FROM relay_thread_vm_allocations WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' AND resource_kind='personal' FOR UPDATE`;
+        if (!allocation) return yield* conflict("Reserve the VM allocation before provisioning");
+        const prior = yield* get(input.allocationId);
+        if (prior) {
+          if (
+            prior.operationId !== input.operationId ||
+            prior.generation !== input.generation ||
+            (yield* capacity.get(prior.operationId))?.hostId !== input.hostId
+          )
+            return yield* conflict("Provisioning identity was reused with different intent");
+          return prior;
+        }
+        if (allocation.state !== "creating")
+          return yield* conflict("Allocation no longer accepts provisioning");
+        yield* capacity.request({ ...input, kind: "create" });
+        yield* sql`INSERT INTO relay_thread_vm_provisions (allocation_id, operation_id, generation)
+        VALUES (${input.allocationId}, ${input.operationId}, ${input.generation})`;
+        return (yield* get(input.allocationId))!;
+      }),
+    );
+  });
+  const claim = Effect.fn("relay.thread_vm_provision.claim")(function* (
+    claimId: string,
+    hostId: string,
+    includeWorkflow = false,
+    verifiedWorkflowBuild?: Parameters<typeof staleWaitingWorkflowVm>[1],
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [candidate] = yield* sql<{
+          allocationId: string;
+          resourceKind: ThreadVmResourceKind;
+        }>`SELECT p.allocation_id AS "allocationId",a.resource_kind AS "resourceKind" FROM relay_thread_vm_provisions p
+        JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
+        JOIN relay_thread_vm_allocations a ON a.allocation_id = p.allocation_id
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (${includeWorkflow}
+          AND a.resource_kind='organization_workflow' AND p.workflow_snapshot IS NOT NULL))
+        AND c.host_id = ${hostId} AND p.phase IN ('pending', 'creating') AND p.retry_at <= clock_timestamp()
+        AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
+        AND p.ingress_recovery_claim_id IS NULL
+        AND (c.state IN ('reserved', 'started') OR a.state = 'deleting'
+          OR (${staleWaitingWorkflowVm(sql, verifiedWorkflowBuild)}))
+        ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
+        if (!candidate) return null;
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1
+        WHERE allocation_id = ${candidate.allocationId}`;
+        return yield* get(candidate.allocationId, candidate.resourceKind);
+      }),
+    );
+  });
+  const locked = Effect.fnUntraced(function* (input: { allocationId: string; claimId: string }) {
+    // All writers take allocation then operation, including cancellation and late create receipts.
+    const [allocation] = yield* sql<{ resourceKind: ThreadVmResourceKind }>`
+      SELECT resource_kind AS "resourceKind" FROM relay_thread_vm_allocations
+      WHERE allocation_id = ${input.allocationId} AND runtime_protocol='native-v1' FOR UPDATE`;
+    if (!allocation)
+      return yield* conflict(
+        "This VM belongs to an earlier runtime and requires manual migration.",
+      );
+    const rows = yield* sql`SELECT allocation_id FROM relay_thread_vm_provisions
+      WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp() FOR UPDATE`;
+    if (!rows.length) return yield* conflict("Provisioning worker claim expired or changed");
+    const row = yield* get(input.allocationId, allocation.resourceKind);
+    if (!row || (row.resourceKind === "organization_workflow" && !row.workflowSnapshot))
+      return yield* conflict("Workflow provisioning has no frozen intent");
+    if (row.ingressRecoveryClaimId !== null)
+      return yield* conflict("VM ingress recovery is in flight or unconfirmed; retain capacity");
+    return row;
+  });
+  const beginCreate = Effect.fn("relay.thread_vm_provision.begin_create")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    templateId: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (row.phase !== "pending" || row.allocationState !== "creating")
+          return yield* conflict("VM creation is already attempted or cancelled");
+        // Choose the current image at first creation, then retain it for recovery and enrollment.
+        if (row.workflowSnapshot && row.templateId !== input.templateId)
+          return yield* conflict("Workflow provisioning template changed");
+        if (!row.workflowSnapshot)
+          yield* sql`UPDATE relay_thread_vm_allocations SET template_id = ${input.templateId}
+            WHERE allocation_id = ${input.allocationId}`;
+        yield* capacity.beginExecution(row.operationId);
+        yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating' WHERE allocation_id = ${input.allocationId}`;
+        return {
+          ...row,
+          templateId: input.templateId,
+          phase: "creating" as const,
+        };
+      }),
+    );
+  });
+  // A known ID is durable even when the create reply omitted its ingress token.
+  // Keep provisioning incomplete until token recovery is explicitly admitted.
+  const recordObserved = Effect.fn("relay.thread_vm_provision.record_observed")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    computeRef: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (
+          row.phase !== "creating" ||
+          row.allocationState === "deleted" ||
+          (row.computeRef !== null && row.computeRef !== input.computeRef)
+        )
+          return yield* conflict("Provisioning no longer accepts this compute identity");
+        yield* capacity.recordCreated(row.operationId, input.computeRef);
+        yield* sql`UPDATE relay_thread_vm_allocations SET compute_ref=${input.computeRef}
+        WHERE allocation_id=${input.allocationId}`;
+        return (yield* get(input.allocationId, row.resourceKind))!;
+      }),
+    );
+  });
+  const returnWorkflowReservation = Effect.fn(
+    "relay.thread_vm_provision.return_workflow_reservation",
+  )(function* (input: {
+    allocationId: string;
+    claimId: string;
+    errorCode: "workflow_disabled" | "workflow_codex_unavailable" | "workflow_template_unverified";
+  }) {
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (!row.workflowSnapshot || row.phase !== "pending" || row.computeRef !== null)
+          return yield* conflict("Workflow creation may already have started");
+        const released = yield* sql`UPDATE relay_thread_vm_capacity SET state='waiting'
+            WHERE allocation_id=${row.allocationId} AND operation_id=${row.operationId}
+              AND state='reserved' AND compute_ref IS NULL RETURNING operation_id`;
+        if (!released.length) return yield* conflict("Workflow reservation is no longer unused");
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id=NULL,claim_until=NULL,
+            error_code=${input.errorCode},retry_at=clock_timestamp()+interval '30 seconds'
+            WHERE allocation_id=${row.allocationId}`;
+      }),
+    );
+  });
+  const admitIngressRecovery = Effect.fn("relay.thread_vm_provision.admit_ingress")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      computeRef: string;
+      hostId: string;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* locked(input);
+          const reservation = yield* capacity.get(row.operationId);
+          if (
+            row.phase !== "creating" ||
+            !["creating", "running"].includes(row.allocationState) ||
+            row.computeRef !== input.computeRef ||
+            reservation?.state !== "started" ||
+            reservation.computeRef !== input.computeRef ||
+            reservation.allocationId !== row.allocationId ||
+            reservation.hostId !== input.hostId
+          )
+            return yield* conflict(
+              "Ingress recovery requires the current admitted compute identity",
+            );
+          return row;
+        }),
+      );
+    },
+  );
+  const beginIngressRecovery = Effect.fn("relay.thread_vm_provision.begin_ingress_recovery")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      computeRef: string;
+      hostId: string;
+    }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* admitIngressRecovery(input);
+          yield* sql`UPDATE relay_thread_vm_provisions SET ingress_recovery_claim_id=${input.claimId}
+          WHERE allocation_id=${input.allocationId}`;
+          return row;
+        }),
+      );
+    },
+  );
+  // A reply settles its own network attempt, not a worker lease or execution admission.
+  const settleIngressRecovery = Effect.fn("relay.thread_vm_provision.settle_ingress_recovery")(
+    function* (input: { allocationId: string; claimId: string; computeRef: string }) {
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const allocation = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+          WHERE allocation_id=${input.allocationId} AND compute_ref=${input.computeRef}
+            AND deleted_at IS NULL FOR UPDATE`;
+          if (!allocation.length)
+            return yield* conflict("Ingress recovery compute identity changed");
+          const rows =
+            yield* sql`UPDATE relay_thread_vm_provisions SET ingress_recovery_claim_id=NULL
+          WHERE allocation_id=${input.allocationId} AND phase='creating'
+            AND ingress_recovery_claim_id=${input.claimId} RETURNING allocation_id`;
+          if (!rows.length) return yield* conflict("Ingress recovery belongs to another attempt");
+        }),
+      );
+    },
+  );
+  const cancelKnown = Effect.fn("relay.thread_vm_provision.cancel_known")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    computeRef: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (row.phase !== "creating" || row.computeRef !== input.computeRef)
+          return yield* conflict("Cancellation requires the current known compute identity");
+        yield* allocations.requestDeletion(row.allocationId, row.resourceKind);
+      }),
+    );
+  });
+  const recordCreated = Effect.fn("relay.thread_vm_provision.record_created")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    computeRef: string;
+    sealedTrafficAccessToken?: string;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* locked(input);
+        if (row.phase !== "creating")
+          return yield* conflict("Provisioning does not accept a create receipt");
+        if (row.allocationState !== "deleting" && !input.sealedTrafficAccessToken)
+          return yield* conflict("Provisioning requires its private ingress credential");
+        yield* capacity.recordCreated(row.operationId, input.computeRef);
+        yield* allocations.recordCreated({ ...input, resourceKind: row.resourceKind });
+        yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'created', claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
+        return (yield* get(input.allocationId, row.resourceKind))!;
+      }),
+    );
+  });
+  const defer = Effect.fn("relay.thread_vm_provision.defer")(function* (input: {
+    allocationId: string;
+    claimId: string;
+    errorCode: "create_uncertain" | "compute_unavailable" | "identity_conflict";
+  }) {
+    const rows = yield* sql`UPDATE relay_thread_vm_provisions SET error_code = ${input.errorCode},
+      retry_at = clock_timestamp() + interval '30 seconds', claim_id = NULL, claim_until = NULL
+      WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp()
+      AND phase IN ('pending', 'creating') RETURNING allocation_id`;
+    if (!rows.length) return yield* conflict("Provisioning worker claim expired or changed");
+  });
+  const cancelUnstarted = Effect.fn("relay.thread_vm_provision.cancel_unstarted")(
+    function* (input: { allocationId: string; claimId: string }) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* locked(input);
+          if (
+            row.phase !== "pending" ||
+            row.computeRef !== null ||
+            row.allocationState !== "deleting"
+          )
+            return yield* conflict("External VM creation may already have started");
+          yield* capacity.cancelUnstarted(row.operationId);
+          yield* allocations.confirmDeleted({
+            allocationId: input.allocationId,
+            computeRef: null,
+            resourceKind: row.resourceKind,
+          });
+          yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'cancelled', claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
+        }),
+      );
+    },
+  );
+  const rejectUnstarted = Effect.fn("relay.thread_vm_provision.reject_unstarted")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      errorCode?: "workflow_template_stale";
+    }) {
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* locked(input);
+          if (row.phase !== "pending") return yield* conflict("Creation may already have started");
+          yield* allocations.requestDeletion(row.allocationId, row.resourceKind);
+          yield* cancelUnstarted(input);
+          if (row.allocationState !== "deleting" || input.errorCode === undefined)
+            yield* sql`UPDATE relay_thread_vm_provisions SET error_code = ${input.errorCode ?? "access_denied"}
+              WHERE allocation_id = ${row.allocationId}`;
+        }),
+      );
+    },
+  );
+  /** A confirmed create rejection settles the original intent even after its worker lease expires. */
+  const rejectCreate = Effect.fn("relay.thread_vm_provision.reject_create")(function* (
+    input: Pick<
+      ThreadVmProvision,
+      "allocationId" | "operationId" | "generation" | "threadId" | "resourceKind"
+    >,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        // Match cancellation's job -> placement -> allocation -> provision lock order.
+        let cancellationRequested = false;
+        if (input.resourceKind === "organization_workflow") {
+          const [job] = yield* sql<{ cancellationRequested: boolean }>`
+            SELECT COALESCE(pending_control#>>'{response,operation}' IN ('cancel','retry_cancellation'),false)
+              OR COALESCE((record->>'vmCancellationConfirmed')::boolean,false) AS "cancellationRequested"
+            FROM relay_workflow_jobs WHERE job_id=${input.allocationId}
+              AND record#>>'{runtime,kind}'='vm' AND record#>>'{runtime,threadId}'=${input.threadId}
+            FOR NO KEY UPDATE`;
+          if (!job) return yield* conflict("Workflow creation identity changed");
+          cancellationRequested = job.cancellationRequested;
+        }
+        const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
+          WHERE thread_id=${input.threadId} FOR NO KEY UPDATE`;
+        if (!placement) return yield* conflict("Creation thread no longer exists");
+        const coordinated = yield* sql`SELECT 1 FROM relay_thread_vm_move_destinations
+          WHERE allocation_id=${input.allocationId}
+          UNION ALL SELECT 1 FROM relay_thread_vm_resets WHERE allocation_id=${input.allocationId}`;
+        if (coordinated.length) return false;
+
+        const [allocation] = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+          WHERE allocation_id=${input.allocationId} AND thread_id=${input.threadId}
+            AND resource_kind=${input.resourceKind} AND runtime_protocol='native-v1' FOR UPDATE`;
+        if (!allocation) return yield* conflict("Creation allocation identity changed");
+        yield* sql`SELECT allocation_id FROM relay_thread_vm_provisions
+          WHERE allocation_id=${input.allocationId} FOR UPDATE`;
+        const row = yield* get(input.allocationId, input.resourceKind);
+        if (
+          !row ||
+          row.operationId !== input.operationId ||
+          row.generation !== input.generation ||
+          row.computeRef !== null ||
+          row.ingressRecoveryClaimId !== null ||
+          (row.resourceKind === "organization_workflow" && row.workflowSnapshot === null)
+        )
+          return yield* conflict("Creation rejection no longer matches the admitted operation");
+        const [reservation] = yield* sql<{ state: string; computeRef: string | null }>`
+          SELECT state,compute_ref AS "computeRef" FROM relay_thread_vm_capacity
+          WHERE operation_id=${input.operationId} AND allocation_id=${input.allocationId}
+            AND kind='create' FOR UPDATE`;
+        if (!reservation || reservation.computeRef !== null)
+          return yield* conflict("Creation capacity belongs to another execution");
+        if (
+          row.phase === "cancelled" &&
+          row.allocationState === "deleted" &&
+          reservation.state === "released" &&
+          (row.errorCode === "create_rejected" || row.errorCode === "create_rejected_after_cancel")
+        )
+          return true;
+        if (
+          row.phase !== "creating" ||
+          !["creating", "deleting"].includes(row.allocationState) ||
+          reservation.state !== "started"
+        )
+          return yield* conflict("Creation no longer accepts a rejection receipt");
+
+        yield* allocations.requestDeletion(input.allocationId, input.resourceKind);
+        const released = yield* sql`UPDATE relay_thread_vm_capacity SET state='released'
+          WHERE operation_id=${input.operationId} AND allocation_id=${input.allocationId}
+            AND kind='create' AND state='started' AND compute_ref IS NULL RETURNING operation_id`;
+        if (!released.length) return yield* conflict("Creation capacity changed before rejection");
+        yield* allocations.confirmDeleted({
+          allocationId: input.allocationId,
+          computeRef: null,
+          resourceKind: input.resourceKind,
+        });
+        const errorCode = cancellationRequested
+          ? "create_rejected_after_cancel"
+          : "create_rejected";
+        yield* sql`UPDATE relay_thread_vm_provisions SET phase='cancelled',claim_id=NULL,claim_until=NULL,
+          revision=revision+1,error_code=${errorCode} WHERE allocation_id=${input.allocationId}`;
+        // Fence refreshes that read preparation before this receipt acquired the job lock.
+        if (input.resourceKind === "organization_workflow")
+          yield* sql`UPDATE relay_workflow_jobs SET revision=revision+1
+            WHERE job_id=${input.allocationId}`;
+        return true;
+      }),
+    );
+  });
+  const claimEnrollment = Effect.fn("relay.thread_vm_provision.claim_enrollment")(function* (
+    claimId: string,
+    hostId: string,
+    includeWorkflow = false,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [candidate] = yield* sql<{
+          allocationId: string;
+          resourceKind: ThreadVmResourceKind;
+        }>`SELECT p.allocation_id AS "allocationId",a.resource_kind AS "resourceKind"
+        FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
+        JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
+        LEFT JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (${includeWorkflow}
+          AND a.resource_kind='organization_workflow' AND p.workflow_snapshot IS NOT NULL
+          AND EXISTS (SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+            WHERE t.thread_id=a.thread_id AND t.operation_id=p.operation_id AND j.status='preparing' AND j.pending_control IS NULL)))
+          AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
+          AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
+        ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
+        if (!candidate) return null;
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1
+        WHERE allocation_id = ${candidate.allocationId}`;
+        return yield* get(candidate.allocationId, candidate.resourceKind);
+      }),
+    );
+  });
+  const finishEnrollment = Effect.fn("relay.thread_vm_provision.finish_enrollment")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      receipt: RelayThreadVmEnrollmentReceipt;
+    }) {
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* locked(input);
+          if (
+            row.phase !== "created" ||
+            row.allocationId !== input.receipt.allocationId ||
+            row.operationId !== input.receipt.operationId
+          )
+            return yield* conflict("Enrollment reply belongs to a different operation");
+          yield* makeThreadVmEnrollmentStore(sql).confirmInstalled(input.receipt, row.resourceKind);
+          yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = NULL, claim_until = NULL, error_code = NULL WHERE allocation_id = ${input.allocationId}`;
+        }),
+      );
+    },
+  );
+  const deferEnrollment = Effect.fn("relay.thread_vm_provision.defer_enrollment")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      errorCode:
+        | "enrollment_unconfirmed"
+        | "enrollment_access_denied"
+        | "enrollment_build_mismatch";
+    }) {
+      const rows =
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = NULL, claim_until = NULL,
+      error_code = ${input.errorCode}, retry_at = clock_timestamp() + interval '30 seconds'
+      WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp()
+      AND phase = 'created' RETURNING allocation_id`;
+      if (!rows.length) return yield* conflict("Enrollment worker claim expired or changed");
+    },
+  );
+  const claimSetup = Effect.fn("relay.thread_vm_provision.claim_setup")(function* (
+    claimId: string,
+    hostId: string,
+    resourceKind: ThreadVmResourceKind = "personal",
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [candidate] = yield* sql<{
+          allocationId: string;
+        }>`SELECT p.allocation_id AS "allocationId"
+      FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
+      JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
+      JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
+      JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind=${resourceKind} AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+      AND e.installed_at IS NOT NULL AND s.phase IN ('pending','running')
+      AND ${
+        resourceKind === "personal"
+          ? sql`true`
+          : sql`p.workflow_snapshot IS NOT NULL
+        AND EXISTS (SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+          WHERE t.thread_id=a.thread_id AND t.operation_id=p.operation_id AND j.status='preparing' AND j.pending_control IS NULL)`
+      }
+      AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
+      ORDER BY ${resourceKind === "organization_workflow" ? sql`p.retry_at,p.position` : sql`p.position`}
+      FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
+        if (!candidate) return null;
+        const deadline = sql`statement_timestamp() + interval '2 minutes'`;
+        // An interrupted workflow attempt should rejoin the queue after untouched work.
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = ${deadline},
+          retry_at = ${resourceKind === "organization_workflow" ? deadline : sql`retry_at`},
+          revision = revision + 1 WHERE allocation_id = ${candidate.allocationId}`;
+        return yield* get(candidate.allocationId, resourceKind);
+      }),
+    );
+  });
+  const claimStartup = Effect.fn("relay.thread_vm_provision.claim_startup")(function* (
+    claimId: string,
+    hostId: string,
+    resourceKind: ThreadVmResourceKind = "personal",
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [candidate] = yield* sql<{
+          allocationId: string;
+        }>`SELECT p.allocation_id AS "allocationId"
+        FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING (allocation_id)
+        JOIN relay_thread_vm_capacity c ON c.operation_id = p.operation_id
+        JOIN relay_thread_vm_setups s ON s.allocation_id = p.allocation_id
+        JOIN relay_thread_placements t ON t.thread_id = a.thread_id
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind=${resourceKind} AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL
+        AND p.generation=1 AND s.phase = 'ready' AND s.receipt_sha256 IS NOT NULL
+        AND t.environment_id = s.environment_id AND t.generation = p.generation
+        AND ${
+          resourceKind === "personal"
+            ? sql`t.operation_id IS NULL`
+            : sql`t.operation_id=p.operation_id
+          AND p.workflow_snapshot IS NOT NULL AND EXISTS (SELECT 1 FROM relay_workflow_jobs j
+            WHERE j.job_id=t.workflow_job_id AND j.status='preparing' AND j.pending_control IS NULL)`
+        }
+        AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
+        ORDER BY p.retry_at,p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
+        if (!candidate) return null;
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = ${claimId}, claim_until = clock_timestamp() + interval '2 minutes', revision = revision + 1 WHERE allocation_id = ${candidate.allocationId}`;
+        return yield* get(candidate.allocationId, resourceKind);
+      }),
+    );
+  });
+  const claimMoveStartup = Effect.fn("relay.thread_vm_provision.claim_move_startup")(function* (
+    claimId: string,
+    hostId: string,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [candidate] = yield* sql<{
+          allocationId: string;
+        }>`SELECT p.allocation_id AS "allocationId"
+        FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING(allocation_id)
+          JOIN relay_thread_vm_capacity c ON c.operation_id=p.operation_id
+          JOIN relay_thread_vm_move_destinations d ON d.allocation_id=p.allocation_id
+          JOIN relay_thread_moves m ON m.operation_id=d.operation_id
+          JOIN relay_thread_placements t ON t.thread_id=a.thread_id
+          JOIN relay_thread_vm_enrollments e ON e.allocation_id=p.allocation_id
+          JOIN relay_thread_vm_bindings b ON b.allocation_id=p.allocation_id
+          JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
+          JOIN relay_thread_move_artifacts r ON r.operation_id=m.operation_id
+        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id=${hostId} AND p.phase='created' AND a.state='running' AND a.deleted_at IS NULL
+          AND e.installed_at IS NOT NULL AND b.revoked_at IS NULL AND k.revoked_at IS NULL
+          AND b.environment_id=m.destination_environment_id AND b.generation=p.generation
+          AND ((m.phase IN ('frozen','ready') AND t.operation_id=m.operation_id AND t.generation=m.expected_generation)
+            OR (m.phase='committed' AND t.operation_id=m.operation_id AND t.generation=p.generation AND t.environment_id=m.destination_environment_id)
+            OR (m.phase='completed' AND t.operation_id IS NULL AND t.generation=p.generation AND t.environment_id=m.destination_environment_id))
+          AND p.retry_at<=clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until<=clock_timestamp())
+        ORDER BY p.retry_at,p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;
+        if (!candidate) return null;
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id=${claimId},claim_until=clock_timestamp()+interval '2 minutes',revision=revision+1 WHERE allocation_id=${candidate.allocationId}`;
+        return yield* get(candidate.allocationId);
+      }),
+    );
+  });
+  const releaseStartupClaim = Effect.fn("relay.thread_vm_provision.release_startup_claim")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      errorCode: "startup_unconfirmed" | "startup_access_denied" | null;
+    }) {
+      const rows =
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = NULL, claim_until = NULL,
+      error_code = ${input.errorCode}, retry_at = clock_timestamp() + interval '60 seconds'
+      WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp()
+      AND phase = 'created' RETURNING allocation_id`;
+      if (!rows.length) return yield* conflict("VM startup claim expired or changed");
+    },
+  );
+  // Call within the access transaction, before accepting an external setup result.
+  const requireSetupClaim = Effect.fn("relay.thread_vm_provision.require_setup_claim")(
+    function* (input: { allocationId: string; claimId: string }) {
+      const row = yield* locked(input);
+      if (row.phase !== "created" || row.allocationState !== "running")
+        return yield* conflict("VM no longer accepts setup");
+      return row;
+    },
+  );
+  const releaseSetupClaim = Effect.fn("relay.thread_vm_provision.release_setup_claim")(
+    function* (input: {
+      allocationId: string;
+      claimId: string;
+      errorCode: "setup_unconfirmed" | "setup_access_denied" | null;
+    }) {
+      const rows =
+        yield* sql`UPDATE relay_thread_vm_provisions SET claim_id = NULL, claim_until = NULL,
+    error_code = ${input.errorCode}, retry_at = clock_timestamp() + interval '30 seconds'
+    WHERE allocation_id = ${input.allocationId} AND claim_id = ${input.claimId} AND claim_until > clock_timestamp()
+    AND phase = 'created' RETURNING allocation_id`;
+      if (!rows.length) return yield* conflict("VM setup claim expired or changed");
+    },
+  );
+  return {
+    get,
+    enqueue,
+    claim,
+    beginCreate,
+    returnWorkflowReservation,
+    recordObserved,
+    admitIngressRecovery,
+    beginIngressRecovery,
+    settleIngressRecovery,
+    cancelKnown,
+    recordCreated,
+    defer,
+    cancelUnstarted,
+    rejectUnstarted,
+    rejectCreate,
+    claimStartup,
+    claimMoveStartup,
+    releaseStartupClaim,
+    claimSetup,
+    requireSetupClaim,
+    releaseSetupClaim,
+    claimEnrollment,
+    finishEnrollment,
+    deferEnrollment,
+  };
+}

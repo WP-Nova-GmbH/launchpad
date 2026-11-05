@@ -1,3 +1,4 @@
+import { RepositorySourcesButton } from "../workflows/WorkflowSources";
 import {
   BuildingIcon,
   CopyIcon,
@@ -10,6 +11,7 @@ import {
   UsersIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useAuth } from "@clerk/react";
 import type {
   RelayGithubInstallationCandidate,
   RelayInvitation,
@@ -27,6 +29,7 @@ import type {
 } from "@t3tools/contracts/relay";
 
 import { GitHubIcon } from "../Icons";
+import { Link } from "@tanstack/react-router";
 import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
 import { useProjects } from "../../state/entities";
@@ -75,6 +78,9 @@ import {
   useRelativeTimeTick,
 } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
+import { ThreadVmPolicySettings } from "./ThreadVmPolicySettings";
+import { CodexVmConnectionSettings } from "./CodexVmConnectionSettings";
+import { WorkflowEnvironmentButton } from "./WorkflowEnvironmentSettings";
 
 const ORG_ROLE_LABELS: Readonly<Record<RelayOrgRole, string>> = {
   admin: "Admin",
@@ -547,6 +553,29 @@ function RepositoryRow({
             </Button>
           </div>
         ) : null}
+        <div className="flex flex-wrap gap-2 border-t pt-3">
+          {canConfigure ? <RepositorySourcesButton repositoryId={repositoryId} /> : null}
+          {canConfigure && state.snapshot ? (
+            <WorkflowEnvironmentButton
+              accountId={state.snapshot.membership.userId}
+              organizationId={entry.repository.organizationId}
+              repositoryId={repositoryId}
+              repositoryName={entry.repository.name}
+            />
+          ) : null}
+          <Button
+            variant="outline"
+            render={
+              <Link
+                to="/workflows/$repositoryId"
+                params={{ repositoryId: entry.repository.repositoryId }}
+                search={{ tab: "workflows" }}
+              />
+            }
+          >
+            Manage workflows
+          </Button>
+        </div>
       </div>
     </SettingsRow>
   );
@@ -778,9 +807,9 @@ function ProviderAccountsSection({ state }: { state: OrganizationAdminState }) {
       icon={<KeyRoundIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Sign in once, here, and every executor of this organization uses that account. Sharing a
-        sign-in copies the provider&apos;s session from this device; a key works for providers you
-        bill through an API key. Nobody signs in on a machine.
+        These sign-ins are copied to organization machines. VMs use the separate Codex for VMs
+        connection above. A provider session is shared from this device; API keys are available for
+        providers billed through an API.
       </SectionNote>
       {isAdmin ? null : (
         <SectionNote>Only admins can see and change what the organization shares.</SectionNote>
@@ -1292,8 +1321,7 @@ function MachineRow({
   nowMs: number;
   enrollment: IssuedMachineEnrollment | undefined;
 }) {
-  // Destroying a machine destroys thread history on it, so the trash icon
-  // arms a second, labeled click instead of acting immediately.
+  // Disconnecting removes organization access; confirm before revoking it.
   const [confirming, setConfirming] = useState(false);
   const { copyToClipboard } = useCopyToClipboard({ target: "setup command" });
   const isAdmin = state.snapshot?.membership.role === "admin";
@@ -1313,6 +1341,7 @@ function MachineRow({
     selfHosted && awaitingSetup && !enrollment
       ? "the setup command was only shown when the machine was created"
       : null,
+    !selfHosted ? "legacy managed compute needs cleanup on its original host" : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -1349,7 +1378,7 @@ function MachineRow({
               Copy setup command
             </Button>
           ) : null}
-          {isAdmin && machine.status !== "deprovisioned" ? (
+          {isAdmin && selfHosted && machine.status !== "deprovisioned" ? (
             confirming ? (
               <Button
                 size="sm"
@@ -1361,13 +1390,13 @@ function MachineRow({
                   void state.deprovisionMachine(machine.machineId);
                 }}
               >
-                Destroy machine
+                Disconnect machine
               </Button>
             ) : (
               <Button
                 size="icon-sm"
                 variant="ghost"
-                aria-label={`Destroy ${machine.label}`}
+                aria-label={`Disconnect ${machine.label}`}
                 disabled={state.busy}
                 onClick={() => setConfirming(true)}
               >
@@ -1383,9 +1412,8 @@ function MachineRow({
 
 function MachinesSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
-  // A machine flips to ready on its own within a couple of minutes of being
-  // provisioned. While one is in that window, the list keeps itself fresh —
-  // asking the admin to reload the page would make the product look stuck.
+  // Refresh while an invited computer completes enrollment or its invitation
+  // expires, so the admin sees the change without reloading.
   const nowMs = useRelativeTimeTick(30_000);
   const machines = visibleMachines(snapshot?.machines ?? []);
   const settingUp = hasMachineSettingUp(machines, nowMs);
@@ -1409,10 +1437,9 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       icon={<ServerIcon className="size-4 text-muted-foreground" />}
     >
       <SectionNote>
-        Machines are computers this organization works through — bought via Launchpad Connect or its
-        own, connected by hand. Agent executors run work, review hosts will run review apps. A ready
-        machine appears to every member beside their own environments. Destroying one also destroys
-        any thread history it holds.
+        Connect computers your organization already runs. A ready machine appears to members beside
+        their own environments. Disconnecting it revokes its Launchpad Connect access and keeps its
+        files.
       </SectionNote>
       {machines.length === 0 ? (
         <Empty className="min-h-48">
@@ -1422,8 +1449,8 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
           <EmptyHeader>
             <EmptyTitle>No machines yet</EmptyTitle>
             <EmptyDescription>
-              Provision one and it joins this organization on its own — nobody signs in on it, and
-              it can never be linked as somebody&apos;s personal environment.
+              Connect an existing computer and run its setup command to make it available to your
+              organization.
             </EmptyDescription>
           </EmptyHeader>
         </Empty>
@@ -1443,15 +1470,8 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
       {isAdmin ? (
         <>
           <MachineCreateRow
-            title="Provision a machine"
-            description="Creates a fresh machine that sets itself up and calls home on its own — usually within a couple of minutes. Review hosts sit idle until review apps ship."
-            actionLabel="Provision"
-            busy={state.busy}
-            onCreate={(input) => state.provisionMachine(input)}
-          />
-          <MachineCreateRow
             title="Connect your own machine"
-            description="Registers a computer this organization already runs. Copy the setup command it hands back and run it on that computer within 24 hours — the machine enrolls itself from there."
+            description="On that computer, install the dependencies for your Launchpad checkout. Copy the setup command and run it from the checkout root within 24 hours."
             actionLabel="Connect"
             busy={state.busy}
             onCreate={(input) => state.connectMachine(input)}
@@ -1463,8 +1483,7 @@ function MachinesSection({ state }: { state: OrganizationAdminState }) {
 }
 
 /**
- * One machine-creation row: name, role, and the verb that decides who gets
- * the enrollment seed — a compute driver (Provision) or the admin (Connect).
+ * Register an existing computer and deliver its one-use enrollment seed.
  */
 function MachineCreateRow({
   title,
@@ -1480,7 +1499,6 @@ function MachineCreateRow({
   onCreate: (input: { label: string; role: RelayMachineRole }) => Promise<boolean>;
 }) {
   const [label, setLabel] = useState("");
-  const [role, setRole] = useState<RelayMachineRole>("agent_executor");
   return (
     <SettingsRow
       title={title}
@@ -1496,29 +1514,11 @@ function MachineCreateRow({
             onChange={(event) => setLabel(event.currentTarget.value)}
             className="w-full sm:w-48"
           />
-          <Select
-            value={role}
-            onValueChange={(value) => {
-              if (typeof value === "string") setRole(value as RelayMachineRole);
-            }}
-          >
-            <SelectTrigger size="sm" className="w-40" aria-label={`${title} — role`}>
-              <SelectValue>{MACHINE_ROLE_LABELS[role]}</SelectValue>
-            </SelectTrigger>
-            <SelectPopup align="end" alignItemWithTrigger={false}>
-              <SelectItem hideIndicator value="agent_executor">
-                Agent executor
-              </SelectItem>
-              <SelectItem hideIndicator value="review_host">
-                Review host
-              </SelectItem>
-            </SelectPopup>
-          </Select>
           <Button
             size="sm"
             disabled={busy || label.trim().length === 0}
             onClick={() => {
-              void onCreate({ label: label.trim(), role }).then((ok) => {
+              void onCreate({ label: label.trim(), role: "agent_executor" }).then((ok) => {
                 if (ok) setLabel("");
               });
             }}
@@ -1577,6 +1577,7 @@ function OrganizationSignInButton() {
  * hook above that check would crash the app on a build without it.
  */
 function ConfiguredOrganizationSettings() {
+  const { userId } = useAuth();
   const state = useOrganizationAdmin();
   // The alert sits at the top of a long page while the action that failed may
   // be at the bottom. Bring the message to the person instead of hoping they
@@ -1621,9 +1622,22 @@ function ConfiguredOrganizationSettings() {
           <OrganizationSection state={state} />
           <MembersSection state={state} />
           <GithubSection state={state} />
+          {state.snapshot && state.snapshot.membership.userId === userId ? (
+            <CodexVmConnectionSettings
+              key={state.snapshot.membership.organization.organizationId}
+              organizationId={state.snapshot.membership.organization.organizationId}
+              isAdmin={state.snapshot.membership.role === "admin"}
+            />
+          ) : null}
           <ProviderAccountsSection state={state} />
           <SkillsSection state={state} />
           <RepositoriesSection state={state} />
+          {state.snapshot ? (
+            <ThreadVmPolicySettings
+              isAdmin={state.snapshot.membership.role === "admin"}
+              organizationId={state.snapshot.membership.organization.organizationId}
+            />
+          ) : null}
           <MachinesSection state={state} />
         </>
       )}

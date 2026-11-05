@@ -230,6 +230,25 @@ describe("reconcileMachineEnrollment", () => {
     }).pipe(provideEnrollmentHarness(harness));
   });
 
+  it.effect("still enrolls and persists identity when managed tunnels are disabled", () => {
+    const memory = makeMemorySecretStore();
+    const harness: EnrollmentHarness = {
+      store: memory.store,
+      requests: [],
+      applyConfigCalls: [],
+      env: { ...machineEnv, T3CODE_DISABLE_MANAGED_TUNNELS: "1" },
+    };
+    return Effect.gen(function* () {
+      expect(yield* reconcileMachineEnrollment("http://127.0.0.1:4483")).toMatchObject({
+        outcome: "enrolled",
+        identity: { machineId: "machine-1", organizationId: "organization-1" },
+      });
+      expect(harness.requests).toHaveLength(1);
+      expect(memory.read(RELAY_ENVIRONMENT_CREDENTIAL_SECRET)).toBe("t3env_machine_credential");
+      expect(memory.read(CLOUD_MACHINE_IDENTITY)).not.toBeNull();
+    }).pipe(provideEnrollmentHarness(harness));
+  });
+
   it.effect("ignores a seed without relay configuration", () => {
     const { store } = makeMemorySecretStore();
     const harness: EnrollmentHarness = {

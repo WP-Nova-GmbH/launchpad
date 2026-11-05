@@ -1,4 +1,20 @@
+import * as CheckoutAccess from "./workspace/CheckoutAccess.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "./persistence/CheckoutCapture.ts";
+import * as Context from "effect/Context";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { OrchestrationCommandInvariantError } from "./orchestration/Errors.ts";
+import {
+  SetupProcessJournal,
+  SetupProcessError,
+  type SetupProcessJournalShape,
+} from "./terminal/SetupProcessJournal.ts";
 import * as GitHubCliAvailability from "./sourceControl/GitHubCliAvailability.ts";
+import {
+  WorkflowRunStore,
+  layer as WorkflowRunStoreLayer,
+  type WorkflowRun,
+  type WorkflowRunStoreShape,
+} from "./jobs/WorkflowRunStore.ts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -6,6 +22,7 @@ import * as NodeCrypto from "node:crypto";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import {
+  ClientOrchestrationCommand,
   type DeviceServiceState,
   AuthAccessTokenType,
   AuthStandardClientScopes,
@@ -27,6 +44,7 @@ import {
   type OrchestrationThreadStreamItem,
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
+  type TerminalAttachStreamEvent,
   TerminalNotRunningError,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -45,6 +63,9 @@ import {
   ThreadId,
   TurnId,
   UsageLimitSourceId,
+  VcsProcessExitError,
+  VcsProcessOutputLimitError,
+  VcsProcessOutputReadError,
   WS_METHODS,
   WsRpcGroup,
   EditorId,
@@ -67,6 +88,7 @@ import * as Deferred from "effect/Deferred";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -124,6 +146,10 @@ import {
   resolveFileManagerRevealKindForConfig,
 } from "./ws.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
+import {
+  CheckpointWorkflowDiffRestrictedError,
+  CheckpointWorkflowPinUnavailableError,
+} from "./checkpointing/Errors.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
@@ -324,6 +350,10 @@ const makeLiveToolActivityEvent = (
     payload: { threadId: defaultThreadId, activity },
   };
 };
+const encodeClientCommandJson = Schema.encodeEffect(
+  Schema.fromJsonString(ClientOrchestrationCommand),
+);
+
 const testEnvironmentDescriptor = {
   environmentId: EnvironmentId.make("environment-test"),
   label: "Test environment",
@@ -528,9 +558,11 @@ const makeBrowserOtlpPayload = (spanName: string) =>
   });
 
 const buildAppUnderTest = (options?: {
+  onDatabase?: (sql: SqlClient.SqlClient) => Effect.Effect<void>;
   onPairingChangesSubscribed?: Effect.Effect<void>;
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
+    workflowRunStore?: Partial<WorkflowRunStoreShape>;
     repositoryAccess?: Partial<RepositoryAccessShape>;
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
     environmentTheme?: Partial<EnvironmentTheme.EnvironmentThemeService["Service"]>;
@@ -558,6 +590,7 @@ const buildAppUnderTest = (options?: {
     providerSessionDirectory?: Partial<
       ProviderSessionDirectory.ProviderSessionDirectory["Service"]
     >;
+    setupProcessJournal?: Partial<SetupProcessJournalShape>;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
     threadDeletionReactor?: Partial<ThreadDeletionReactor["Service"]>;
@@ -587,6 +620,7 @@ const buildAppUnderTest = (options?: {
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const repositoryAccess = yield* RepositoryAccess;
+    const workflowRunStore = yield* WorkflowRunStore;
     const tempBaseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-router-test-" });
     const baseDir = options?.config?.baseDir ?? tempBaseDir;
     const devUrl = options?.config?.devUrl;
@@ -781,7 +815,18 @@ const buildAppUnderTest = (options?: {
       // Viewed-file marks for a host that keeps none of its own are rows, so the routes want a
       // database. Its own, in memory: nothing here shares a table with the auth store.
       makeRoutesLayer.pipe(
-        Layer.provide(Layer.mergeAll(serviceLauncherClientLayer, SqlitePersistenceMemory)),
+        Layer.provide(
+          Layer.mergeAll(
+            serviceLauncherClientLayer,
+            options?.onDatabase
+              ? SqlitePersistenceMemory.pipe(
+                  Layer.tap((context) =>
+                    options.onDatabase!(Context.get(context, SqlClient.SqlClient)),
+                  ),
+                )
+              : SqlitePersistenceMemory,
+          ),
+        ),
       ),
       {
         disableListenLog: true,
@@ -1032,6 +1077,10 @@ const buildAppUnderTest = (options?: {
               drainThrough: () => Effect.void,
               ...options?.layers?.threadDeletionReactor,
             }),
+            Layer.succeed(SetupProcessJournal, {
+              ...SetupProcessJournal.defaultValue(),
+              ...options?.layers?.setupProcessJournal,
+            }),
             Layer.mock(ThreadPreparationReactor)({
               start: () => Effect.void,
               drain: Effect.void,
@@ -1256,6 +1305,12 @@ const buildAppUnderTest = (options?: {
         }),
       )
       .pipe(
+        Layer.provide(
+          Layer.succeed(WorkflowRunStore, {
+            ...workflowRunStore,
+            ...options?.layers?.workflowRunStore,
+          }),
+        ),
         Layer.provideMerge(makeAuthTestLayer()),
         Layer.provide(
           Layer.succeed(RepositoryAccess, {
@@ -1265,6 +1320,7 @@ const buildAppUnderTest = (options?: {
         ),
         Layer.provideMerge(ServerSecretStore.layer),
         Layer.provide(workspaceAndProjectServicesLayer),
+        Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
         Layer.provideMerge(
           options?.layers?.httpClient === undefined
             ? FetchHttpClient.layer
@@ -6544,23 +6600,33 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
-  it.effect("keeps agent session import project failures structured over websocket rpc", () =>
-    Effect.gen(function* () {
-      yield* buildAppUnderTest();
+  it.effect.each([false, true])(
+    "keeps agent session import project failures structured over websocket rpc (progress=%s)",
+    (progress) =>
+      Effect.gen(function* () {
+        yield* buildAppUnderTest();
 
-      const projectId = ProjectId.make("missing-import-project");
-      const wsUrl = yield* getWsServerUrl("/ws");
-      const error = yield* Effect.scoped(
-        withWsRpcClient(wsUrl, (client) =>
-          client[WS_METHODS.agentSessionsImport]({ projectId }).pipe(Effect.flip),
-        ),
-      );
+        const projectId = ProjectId.make("missing-import-project");
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const error = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            progress
+              ? client[WS_METHODS.agentSessionsImportWithProgress]({ projectId }).pipe(
+                  Stream.runDrain,
+                  Effect.flip,
+                )
+              : client[WS_METHODS.agentSessionsImport]({ projectId }).pipe(
+                  Effect.asVoid,
+                  Effect.flip,
+                ),
+          ),
+        );
 
-      assert.equal(error._tag, "AgentSessionImportProjectNotFoundError");
-      if (error._tag === "AgentSessionImportProjectNotFoundError") {
-        assert.equal(error.projectId, projectId);
-      }
-    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+        assert.equal(error._tag, "AgentSessionImportProjectNotFoundError");
+        if (error._tag === "AgentSessionImportProjectNotFoundError") {
+          assert.equal(error.projectId, projectId);
+        }
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("returns scanner skip counts over websocket rpc", () =>
@@ -6632,7 +6698,30 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               scan.candidates.map((candidate) => candidate.path),
               [workspaceRoot],
             );
-            return yield* client[WS_METHODS.agentSessionsImport]({ projectId });
+            const result = yield* client[WS_METHODS.agentSessionsImport]({ projectId });
+            const events = yield* client[WS_METHODS.agentSessionsImportWithProgress]({
+              projectId,
+            }).pipe(Stream.runCollect);
+            assert.isTrue(
+              events.some((event) => event.type === "progress" && event.progress.reading !== null),
+            );
+            assert.deepEqual(
+              Array.from(events).filter(
+                (event) => event.type === "complete" || event.progress.reading === null,
+              ),
+              [
+                {
+                  type: "progress",
+                  progress: { importedCount: 0, skippedCount: 0, reading: null },
+                },
+                {
+                  type: "progress",
+                  progress: { importedCount: 0, skippedCount: 1, reading: null },
+                },
+                { type: "complete", result: { importedCount: 0, skippedCount: 1 } },
+              ],
+            );
+            return result;
           }),
         ),
       );
@@ -7441,7 +7530,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 return ModelManifest.BUNDLED_MODEL_MANIFEST;
               }),
             },
-            providerInstanceRegistry: { listInstances: Effect.succeed(instances) },
+            providerInstanceRegistry: {
+              listInstances: Effect.succeed(instances),
+              getInstance: (id) =>
+                Effect.succeed(instances.find((instance) => instance.instanceId === id)),
+              listUnavailable: Effect.succeed([]),
+            },
             providerRegistry: { refresh: () => probe, refreshInstance: () => probe },
           },
         });
@@ -9114,6 +9208,277 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("restricts workflow VM review to checkpoint-backed results", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("workflow:review");
+      const targetTurnId = TurnId.make("workflow:review:turn");
+      const checkpoint = {
+        threadId,
+        fromTurnCount: 0,
+        toTurnCount: 1,
+        diff: "checkpoint-diff",
+        completeWorkflowReview: true as const,
+        targetTurnId,
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: { workflowVm: true, threadId },
+          checkpointDiffQuery: {
+            getTurnDiff: ({ strictWorkflowReview, toTurnCount, expectedTurnId }) => {
+              assert.equal(strictWorkflowReview, true);
+              assert.equal(expectedTurnId, targetTurnId);
+              if (toTurnCount === 1) return Effect.succeed(checkpoint);
+              if (toTurnCount === 5)
+                return Effect.fail(
+                  new CheckpointWorkflowPinUnavailableError({ threadId, turnCount: toTurnCount }),
+                );
+              const details = {
+                operation: "GitVcsDriver.checkpoints.diffCheckpoints",
+                command: "git diff",
+                cwd: "/tmp/repo",
+                stream: "stdout" as const,
+              };
+              if (toTurnCount === 6)
+                return Effect.fail(
+                  new VcsProcessExitError({
+                    ...details,
+                    exitCode: 128,
+                    detail: "Pinned commit is missing.",
+                  }),
+                );
+              if (toTurnCount === 2)
+                return Effect.fail(
+                  new VcsProcessOutputLimitError({
+                    ...details,
+                    maxBytes: 10_000_000,
+                    observedBytes: 10_000_001,
+                  }),
+                );
+              const reason =
+                toTurnCount === 3
+                  ? "invalid_utf8"
+                  : toTurnCount === 4
+                    ? "binary_summary"
+                    : "nul_byte";
+              return Effect.fail(
+                new VcsProcessOutputReadError({ ...details, reason, cause: new Error(reason) }),
+              );
+            },
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const actual = yield* client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+              threadId,
+              fromTurnCount: 0,
+              toTurnCount: 1,
+              strictWorkflowReview: true,
+              expectedTurnId: targetTurnId,
+            });
+            assert.deepEqual(actual, checkpoint);
+
+            for (const [toTurnCount, message] of [
+              [2, /too large to review/],
+              [3, /not valid UTF-8/],
+              [4, /binary summary for a changed file/],
+              [5, /saved workflow checkpoint is unavailable/],
+              [6, /saved workflow checkpoint could not be read/],
+              [7, /contains a NUL byte/],
+            ] as const) {
+              const failed = yield* Effect.flip(
+                client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+                  threadId,
+                  fromTurnCount: toTurnCount - 1,
+                  toTurnCount,
+                  strictWorkflowReview: true,
+                  expectedTurnId: targetTurnId,
+                }),
+              );
+              assert.equal(failed._tag, "OrchestrationGetTurnDiffError");
+              assert.match(failed.message, message);
+              assert.isFalse("completeWorkflowReview" in failed);
+            }
+
+            const preview = yield* Effect.flip(
+              client[WS_METHODS.reviewGetDiffPreview]({ cwd: "/tmp/repo" }),
+            );
+            assert.match(preview.message, /scoped to run results/);
+
+            const file = yield* Effect.flip(
+              client[WS_METHODS.reviewGetDiffFileContents]({
+                cwd: "/tmp/repo",
+                sourceKind: "working-tree",
+                changeType: "new",
+                baseRef: null,
+                headRef: null,
+                oldPath: ".env",
+                newPath: ".env",
+              }),
+            );
+            assert.match(file.message, /scoped to run results/);
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("opens a finished workflow VM result and fences live checkout actions", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("workflow:finished");
+      const turnId = TurnId.make("finished-turn");
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-workflow-result-" });
+      const createdAt = DateTime.formatIso(TEST_EPOCH);
+      const thread = {
+        ...makeDefaultOrchestrationReadModel().threads[0]!,
+        id: threadId,
+        workflowJob: null,
+        messages: [
+          {
+            id: MessageId.make("finished-message"),
+            role: "assistant" as const,
+            text: "Updated [README.md](README.md).",
+            turnId,
+            streaming: false,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        ],
+      };
+      const checkpoint = { threadId, fromTurnCount: 0, toTurnCount: 1, diff: "saved diff" };
+      let diffFailure: VcsProcessExitError | null = null;
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: { workflowVm: true, threadId },
+          serverEnvironment: {
+            getDescriptor: Effect.succeed({
+              ...testEnvironmentDescriptor,
+              threadVm: { threadId },
+              capabilities: {
+                ...testEnvironmentDescriptor.capabilities,
+                workflowVmResultReader: true,
+              },
+            }),
+          },
+          projectionSnapshotQuery: {
+            getThreadDetailSnapshot: () => Effect.succeedSome({ snapshotSequence: 1, thread }),
+          },
+          checkpointDiffQuery: {
+            getTurnDiff: () =>
+              Effect.fail(new CheckpointWorkflowDiffRestrictedError({ reason: "contains_secret" })),
+            getFullThreadDiff: () =>
+              diffFailure ? Effect.fail(diffFailure) : Effect.succeed(checkpoint),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const config = yield* client[WS_METHODS.serverGetConfig]({});
+            assert.isTrue(config.environment.capabilities.workflowVmResultReader);
+            const item = yield* client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId,
+              sharedPromptQueue: true,
+            }).pipe(Stream.runHead);
+            const snapshot = Option.getOrThrow(item);
+            assertTrue(snapshot.kind === "snapshot");
+            assert.isNull(snapshot.snapshot.thread.workflowJob);
+            assert.deepEqual(snapshot.snapshot.thread.messages, thread.messages);
+            assert.deepEqual(
+              yield* client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                threadId,
+                toTurnCount: 1,
+              }),
+              checkpoint,
+            );
+            const blocked = yield* Effect.flip(
+              client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+                threadId,
+                fromTurnCount: 0,
+                toTurnCount: 1,
+                strictWorkflowReview: true,
+                expectedTurnId: turnId,
+              }),
+            );
+            assert.match(blocked.message, /contains a workflow secret/);
+            diffFailure = new VcsProcessExitError({
+              operation: "diff",
+              command: "git diff",
+              cwd,
+              exitCode: 1,
+              detail: "credential-only-in-git-diagnostics",
+            });
+            const readFailure = yield* Effect.flip(
+              client[ORCHESTRATION_WS_METHODS.getFullThreadDiff]({
+                threadId,
+                toTurnCount: 1,
+              }),
+            );
+            assert.equal(readFailure.message, "Failed to load full thread diff");
+            assert.notProperty(readFailure, "cause");
+
+            const message = {
+              messageId: MessageId.make("follow-up"),
+              text: "Continue",
+              attachments: [],
+            };
+            const prompt = {
+              threadId,
+              createdAt,
+              runtimeMode: "full-access" as const,
+              interactionMode: "default" as const,
+            };
+            const terminal = { threadId, terminalId: "result-terminal", cwd };
+            const liveActions: ReadonlyArray<
+              Effect.Effect<unknown, { readonly _tag: string; readonly message: string }>
+            > = [
+              client[WS_METHODS.projectsListEntries]({ cwd }),
+              client[WS_METHODS.projectsReadFile]({ cwd, relativePath: "README.md" }),
+              client[WS_METHODS.projectsWriteFile]({
+                cwd,
+                relativePath: "README.md",
+                contents: "edit",
+              }),
+              client[WS_METHODS.shellOpenInEditor]({ cwd, editor: "file-manager" }),
+              client[WS_METHODS.terminalOpen](terminal),
+              client[WS_METHODS.terminalAttach](terminal).pipe(Stream.runHead),
+              client[WS_METHODS.terminalWrite]({
+                threadId,
+                terminalId: terminal.terminalId,
+                data: "git status\n",
+              }),
+              client[WS_METHODS.vcsRefreshStatus]({ cwd }),
+              client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                ...prompt,
+                type: "thread.turn.start",
+                commandId: CommandId.make("send-follow-up"),
+                modelSelection: defaultModelSelection,
+                message: { ...message, role: "user" },
+              }),
+              client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+                ...prompt,
+                type: "thread.prompt.enqueue",
+                commandId: CommandId.make("queue-follow-up"),
+                message,
+              }),
+            ];
+            for (const request of liveActions) {
+              const denied = yield* Effect.result(request);
+              assertTrue(denied._tag === "Failure");
+              assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+              assert.match(denied.failure.message, /scoped to run results/);
+            }
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc git.pull errors", () =>
     Effect.gen(function* () {
       const gitError = new GitCommandError({
@@ -10636,6 +11001,114 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect(
+    "subscribeThread reloads imported history using the real persisted baseline boundary",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* OrchestrationEventStore;
+        const thread = {
+          ...makeDefaultOrchestrationReadModel().threads[0]!,
+          title: "Imported conversation",
+        };
+        const base = makeLiveToolActivityEvent(0, "tool.completed");
+        const boundary = yield* store.append({
+          ...base,
+          type: "thread.placement-imported",
+          payload: {
+            threadId: defaultThreadId,
+            projectId: thread.projectId,
+            branch: thread.branch,
+            worktreePath: thread.worktreePath,
+            updatedAt: base.occurredAt,
+          },
+        });
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: {
+              latestSequence: Effect.succeed(boundary.sequence),
+              getThreadReplayStats: ({ threadId, ...range }) =>
+                store.getAggregateReplayStats({
+                  ...range,
+                  aggregateKind: "thread",
+                  aggregateId: threadId,
+                }),
+              readThreadEvents: () => Stream.die("Imported history must be replaced by a snapshot"),
+            },
+            projectionSnapshotQuery: {
+              getThreadDetailSnapshot: () =>
+                Effect.succeedSome({ snapshotSequence: boundary.sequence, thread }),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const items = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId: defaultThreadId,
+              afterSequence: boundary.sequence - 1,
+              requestCompletionMarker: true,
+            }).pipe(
+              Stream.takeUntil((item) => item.kind === "synchronized"),
+              Stream.runCollect,
+            ),
+          ),
+        );
+        const first = items[0];
+        assertTrue(first?.kind === "snapshot");
+        assert.equal(first.snapshot.thread.title, "Imported conversation");
+        assert.deepEqual(items[1], { kind: "synchronized" });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeHttpServer.layerTest,
+            OrchestrationEventStoreLive.pipe(Layer.provideMerge(SqlitePersistenceMemory)),
+          ),
+        ),
+      ),
+  );
+
+  it.effect("subscribeThread closes a live stream when a new baseline replaces its history", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const events = yield* PubSub.unbounded<OrchestrationEvent>();
+        const loaded = yield* Deferred.make<void>();
+        const thread = makeDefaultOrchestrationReadModel().threads[0]!;
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: { streamDomainEvents: Stream.fromPubSub(events) },
+            projectionSnapshotQuery: {
+              getThreadDetailSnapshot: () => Effect.succeedSome({ snapshotSequence: 1, thread }),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const listening = yield* withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({ threadId: defaultThreadId }).pipe(
+            Stream.tap((item) =>
+              item.kind === "snapshot" ? Deferred.succeed(loaded, undefined) : Effect.void,
+            ),
+            Stream.runDrain,
+          ),
+        ).pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(loaded);
+        const base = makeLiveToolActivityEvent(2, "tool.completed");
+        const boundary: OrchestrationEvent = {
+          ...base,
+          type: "thread.placement-imported",
+          payload: {
+            threadId: defaultThreadId,
+            projectId: thread.projectId,
+            branch: null,
+            worktreePath: null,
+            updatedAt: base.occurredAt,
+          },
+        };
+        yield* PubSub.publish(events, boundary);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(listening)));
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("subscribeThread resets cached history when its ID is created again", () =>
     Effect.gen(function* () {
       const thread = {
@@ -11927,12 +12400,110 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("rejects legacy bootstrap before Git when a capture already holds its source", () =>
+    Effect.gen(function* () {
+      let captures: ReturnType<typeof makeCheckoutCapture> | undefined;
+      let gitCalls = 0;
+      const dispatched: OrchestrationCommand[] = [];
+      yield* buildAppUnderTest({
+        onDatabase: (sql) =>
+          Effect.sync(() => {
+            captures = makeCheckoutCapture(sql);
+          }),
+        layers: {
+          vcsDriver: {
+            isInsideWorkTree: () =>
+              Effect.sync(() => {
+                gitCalls++;
+                return true;
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: dispatched.length };
+              }),
+            readEvents: () => Stream.empty,
+          },
+        },
+      });
+      if (!captures) throw new Error("Missing route database");
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const checkoutRoot = yield* CheckoutAccess.resolveCheckoutPath("/tmp/project", fs, path);
+      yield* captures.acquireDrain({
+        operationId: "capture-before-bootstrap",
+        threadId: "moving",
+        environmentId: "source",
+        generation: 1,
+        checkoutRoot,
+        gitCommonRoot: checkoutRoot,
+      });
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const result = yield* Effect.scoped(
+        withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+          client[ORCHESTRATION_WS_METHODS.dispatchCommand]({
+            type: "thread.turn.start",
+            commandId: CommandId.make("held-bootstrap"),
+            threadId: ThreadId.make("held-bootstrap"),
+            message: {
+              messageId: MessageId.make("held-bootstrap-message"),
+              role: "user",
+              text: "hello",
+              attachments: [],
+            },
+            modelSelection: defaultModelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            bootstrap: {
+              createThread: {
+                projectId: defaultProjectId,
+                title: "Held",
+                modelSelection: defaultModelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: "main",
+                worktreePath: null,
+                createdAt,
+              },
+              prepareWorktree: {
+                projectCwd: "/tmp/project",
+                baseBranch: "main",
+                branch: "held-bootstrap",
+              },
+              runSetupScript: true,
+            },
+            createdAt,
+          }),
+        ),
+      ).pipe(Effect.result);
+      assertTrue(result._tag === "Failure");
+      if (result._tag === "Failure") {
+        assert.equal(result.failure._tag, "OrchestrationDispatchCommandError");
+        assert.include(result.failure.message, "Waiting for this checkout");
+      }
+      assert.equal(gitCalls, 0);
+      assert.deepEqual(dispatched, []);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect(
     "bootstraps first-send worktree turns on the server before dispatching turn start",
     () =>
       Effect.gen(function* () {
         const dispatchedCommands: Array<OrchestrationCommand> = [];
         const bootstrapGitOperations: string[] = [];
+        let captures: ReturnType<typeof makeCheckoutCapture> | undefined;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sourceRoot = yield* CheckoutAccess.resolveCheckoutPath("/tmp/project", fs, path);
+        const targetRoot = yield* CheckoutAccess.resolveCheckoutPath(
+          "/tmp/bootstrap-worktree",
+          fs,
+          path,
+        );
+        let terminalAdmission: string | undefined;
         const refreshStatus = vi.fn((_: string) =>
           Effect.succeed({
             isRepo: true,
@@ -11960,9 +12531,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         );
         const fetchRemote = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["fetchRemote"]>[0]) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               bootstrapGitOperations.push("fetch");
-            }),
+              if (!captures) throw new Error("Missing route database");
+              const scope = { checkoutRoot: sourceRoot, gitCommonRoot: sourceRoot };
+              assert.lengthOf(yield* captures.blockers(scope), 1);
+              yield* captures.acquireDrain({
+                ...scope,
+                operationId: "capture-during-legacy-setup",
+                threadId: "moving",
+                environmentId: "source",
+                generation: 1,
+              });
+              const parentAdmissionId = yield* CheckoutAdmission;
+              assert.isDefined(parentAdmissionId);
+              yield* captures.assertAccepting(scope, { parentAdmissionId: parentAdmissionId! });
+            }).pipe(Effect.orDie),
         );
         const remoteBranchExists = vi.fn(
           (_: Parameters<GitVcsDriver.GitVcsDriver["Service"]["remoteBranchExists"]>[0]) =>
@@ -12000,18 +12584,38 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"]
             >[0],
           ) =>
-            Effect.succeed({
-              status: "started" as const,
-              scriptId: "setup",
-              scriptName: "Setup",
-              scriptCommand: "npm install",
-              terminalId: "setup-setup",
-              cwd: "/tmp/bootstrap-worktree",
-              async: true,
-            }),
+            Effect.gen(function* () {
+              if (!captures) throw new Error("Missing route database");
+              const parentAdmissionId = yield* CheckoutAdmission;
+              assert.isDefined(parentAdmissionId);
+              assert.equal(
+                (yield* captures.getAdmission(parentAdmissionId!))?.checkoutRoot,
+                targetRoot,
+              );
+              terminalAdmission = (yield* captures.admit({
+                threadId: "thread-bootstrap",
+                workId: "async-setup-terminal",
+                kind: "terminal",
+                checkoutRoot: targetRoot,
+                parentAdmissionId: parentAdmissionId!,
+              })).admissionId;
+              return {
+                status: "started" as const,
+                scriptId: "setup",
+                scriptName: "Setup",
+                scriptCommand: "npm install",
+                terminalId: "setup-setup",
+                cwd: "/tmp/bootstrap-worktree",
+                async: true,
+              };
+            }).pipe(Effect.orDie),
         );
 
         yield* buildAppUnderTest({
+          onDatabase: (sql) =>
+            Effect.sync(() => {
+              captures = makeCheckoutCapture(sql);
+            }),
           layers: {
             vcsDriver: {
               isInsideWorkTree: () => Effect.succeed(true),
@@ -12083,6 +12687,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         );
 
         assert.equal(response.sequence, 8);
+        if (!captures) throw new Error("Missing route database");
+        assert.lengthOf(
+          yield* captures.blockers({ checkoutRoot: sourceRoot, gitCommonRoot: sourceRoot }),
+          0,
+        );
+        assert.deepEqual(
+          (yield* captures.blockers({ checkoutRoot: targetRoot, gitCommonRoot: targetRoot })).map(
+            (row) => row.admissionId,
+          ),
+          [terminalAdmission],
+        );
         assert.deepEqual(
           dispatchedCommands.map((command) => command.type),
           [
@@ -12870,6 +13485,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
   ])("$caseName", ({ async, cancel, exitCode }) =>
     Effect.gen(function* () {
       const dispatchedCommands: Array<OrchestrationCommand> = [];
+      let captures: ReturnType<typeof makeCheckoutCapture> | undefined;
+      let checkoutAccess: Effect.Success<typeof CheckoutAccess.make> | undefined;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const pathService = yield* Path.Path;
+      let worktreeRemoved = false;
       const scriptExit = yield* Deferred.make<void>();
       const runForThread = vi.fn(
         (
@@ -12890,12 +13510,32 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       yield* buildAppUnderTest({
+        onDatabase: (sql) =>
+          Effect.gen(function* () {
+            captures = makeCheckoutCapture(sql);
+            checkoutAccess = yield* CheckoutAccess.make.pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, pathService),
+              Effect.orDie,
+            );
+          }),
         layers: {
           vcsDriver: {
             isInsideWorkTree: () => Effect.succeed(true),
           },
           gitVcsDriver: {
             execute: () => Effect.succeed(SUCCESSFUL_GIT_EXECUTION),
+            removeWorktree: () =>
+              Effect.gen(function* () {
+                if (!checkoutAccess) throw new Error("Missing checkout guard");
+                const operation = yield* checkoutAccess.begin({
+                  kind: "vcs",
+                  paths: ["/tmp/project", "/tmp/bootstrap-worktree"],
+                });
+                worktreeRemoved = true;
+                yield* checkoutAccess.complete(operation);
+              }).pipe(Effect.orDie),
             createWorktree: () =>
               Effect.succeed({
                 worktree: {
@@ -13002,10 +13642,25 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.isFalse(turnStarted());
 
       if (cancel) {
+        if (!captures) throw new Error("Missing route database");
+        const checkoutRoot = yield* CheckoutAccess.resolveCheckoutPath(
+          "/tmp/bootstrap-worktree",
+          fileSystem,
+          pathService,
+        );
+        yield* captures.acquireDrain({
+          operationId: "target-move-during-setup-cancel",
+          threadId: "target-sibling",
+          environmentId: "source",
+          generation: 1,
+          checkoutRoot,
+          gitCommonRoot: checkoutRoot,
+        });
         const cancelled = yield* Effect.scoped(
           withWsRpcClient(wsUrl, (client) => client[WS_METHODS.worktreeSetupCancel]({ threadId })),
         );
         assert.isTrue(cancelled.cancelled);
+        assert.isTrue(worktreeRemoved);
         assertTrue(dispatchedCommands.some((command) => command.type === "thread.delete"));
         const outcome = dispatchedCommands.findLast(
           (command) =>
@@ -13036,6 +13691,33 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       // finish and start the turn regardless.
       yield* Fiber.interrupt(dispatchFiber);
       assert.isFalse(turnStarted());
+      if (!captures) throw new Error("Missing route database");
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      for (const [requested, expected] of [
+        ["/tmp/project", 0],
+        ["/tmp/bootstrap-worktree", 1],
+      ] as const) {
+        const checkoutRoot = yield* CheckoutAccess.resolveCheckoutPath(requested, fs, path);
+        assert.lengthOf(
+          yield* captures.blockers({ checkoutRoot, gitCommonRoot: checkoutRoot }),
+          expected,
+        );
+      }
+      const sourceRoot = yield* CheckoutAccess.resolveCheckoutPath("/tmp/project", fs, path);
+      const captureOwner = {
+        operationId: "source-move-during-target-setup",
+        threadId: "moving-sibling",
+        environmentId: "source",
+        generation: 1,
+      };
+      yield* captures.acquireDrain({
+        ...captureOwner,
+        checkoutRoot: sourceRoot,
+        gitCommonRoot: sourceRoot,
+      });
+      yield* captures.enterCapturing(captureOwner);
+      yield* captures.release(captureOwner, { outcome: "sealed", manifestSha256: "a".repeat(64) });
 
       yield* Deferred.succeed(scriptExit, undefined);
       yield* snapshotWhere((snapshot) => stageStatus(snapshot, "agent") === "done");
@@ -13473,6 +14155,348 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("keeps an authorized terminal attachment alive for output after setup", () =>
+    Effect.gen(function* () {
+      const subscribed =
+        yield* Deferred.make<(event: TerminalAttachStreamEvent) => Effect.Effect<void>>();
+      const snapshotSeen = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const snapshot = {
+        threadId: defaultThreadId,
+        terminalId: "default",
+        cwd: "/workspace/project",
+        worktreePath: null,
+        status: "running" as const,
+        pid: 1234,
+        history: "shell prompt> ",
+        exitCode: null,
+        exitSignal: null,
+        label: "Terminal",
+        updatedAt: "2026-10-19T16:00:00.000Z",
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          repositoryAccess: {
+            status: Effect.succeed({ enabled: true, ready: true, revision: 1 }),
+            requireMember: () => Effect.void,
+            projectIds: () => Effect.succeed(new Set([defaultProjectId])),
+            requireThread: (_actor, id) => Effect.sync(() => assert.equal(id, defaultThreadId)),
+            requireProject: (_actor, id) => Effect.sync(() => assert.equal(id, defaultProjectId)),
+          },
+          projectionSnapshotQuery: {
+            getThreadSubscriptionAnchor: () =>
+              Effect.succeedSome({
+                projectId: defaultProjectId,
+                creationSequence: 1,
+                snapshotSequence: 1,
+              }),
+          },
+          orchestrationEngine: { subscribeDomainEvents: Effect.succeed(Stream.never) },
+          terminalManager: {
+            attachStream: (_input, listener) =>
+              Effect.gen(function* () {
+                yield* listener({ type: "snapshot", snapshot });
+                yield* Deferred.succeed(subscribed, listener);
+                return () => Deferred.doneUnsafe(closed, Effect.void);
+              }),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const pending = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.terminalAttach]({
+            threadId: defaultThreadId,
+            terminalId: "default",
+          }).pipe(
+            Stream.tap((event) =>
+              event.type === "snapshot" ? Deferred.succeed(snapshotSeen, undefined) : Effect.void,
+            ),
+            Stream.take(2),
+            Stream.runCollect,
+          ),
+        ),
+      ).pipe(Effect.forkScoped);
+      const deliver = yield* Deferred.await(subscribed);
+      yield* Deferred.await(snapshotSeen).pipe(Effect.raceFirst(Fiber.join(pending)));
+      const output = {
+        type: "output" as const,
+        threadId: defaultThreadId,
+        terminalId: "default",
+        data: "later output\r\n",
+      };
+      yield* deliver(output);
+      assert.deepEqual(Array.from(yield* Fiber.join(pending)), [
+        { type: "snapshot", snapshot },
+        output,
+      ]);
+      yield* Deferred.await(closed);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes workflow-compatible terminal null and omitted paths through RPC", () =>
+    Effect.gen(function* () {
+      const received: unknown[] = [];
+      const snapshot = {
+        threadId: "thread-1",
+        terminalId: "default",
+        cwd: "/tmp/project",
+        worktreePath: null,
+        status: "running" as const,
+        pid: 1234,
+        history: "",
+        exitCode: null,
+        exitSignal: null,
+        label: "Primary",
+        updatedAt: DateTime.formatIso(TEST_EPOCH),
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          terminalManager: {
+            open: (input) =>
+              Effect.sync(() => {
+                received.push(input);
+                return snapshot;
+              }),
+            restart: (input) =>
+              Effect.sync(() => {
+                received.push(input);
+                return snapshot;
+              }),
+            attachStream: (input, publish) =>
+              Effect.gen(function* () {
+                received.push(input);
+                yield* publish({ type: "snapshot", snapshot });
+                return () => Effect.void;
+              }),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      for (const worktreePath of [undefined, null, "/tmp/unowned-worktree"]) {
+        const input = {
+          threadId: "thread-1",
+          terminalId: "default",
+          cwd: "/tmp/project",
+          ...(worktreePath === undefined ? {} : { worktreePath }),
+        };
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            Effect.gen(function* () {
+              assert.equal((yield* client[WS_METHODS.terminalOpen](input)).terminalId, "default");
+              assert.equal(
+                (yield* client[WS_METHODS.terminalRestart]({ ...input, cols: 120, rows: 40 }))
+                  .terminalId,
+                "default",
+              );
+              const events = yield* client[WS_METHODS.terminalAttach](input).pipe(
+                Stream.take(1),
+                Stream.runCollect,
+              );
+              assert.equal(events[0]?.type, "snapshot");
+            }),
+          ),
+        );
+      }
+      assert.equal(received.length, 9);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "workflow RPC ownership protects the worktree removal target and permits terminal cleanup",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const base = yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-ownership-" });
+        const cwd = path.join(base, "repo");
+        const owned = path.join(base, "job");
+        const alias = path.join(base, "alias");
+        yield* fs.makeDirectory(cwd);
+        yield* fs.makeDirectory(owned);
+        yield* fs.symlink(owned, alias);
+        const now = DateTime.formatIso(TEST_EPOCH);
+        const run: WorkflowRun = {
+          jobId: "ownership-job",
+          runtime: {
+            kind: "machine",
+            environmentId: EnvironmentId.make("env"),
+            projectId: ProjectId.make("project"),
+          },
+          userId: "user",
+          repositoryCanonicalKey: "github.com/acme/repo",
+          instruction: "Fix issue",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+          baseBranch: "main",
+          baseSha: "sha",
+          createdAt: now,
+          promptDispatched: true,
+          executionReserved: false,
+          worktreePath: owned,
+          preparedHead: "sha",
+          approvedBy: null,
+          progress: {
+            revision: 1,
+            status: "awaiting_review",
+            threadId: ThreadId.make("workflow:ownership-job:agent"),
+            detail: null,
+            checkpoint: null,
+          },
+          workflow: {
+            workflowId: "workflow",
+            organizationId: "org",
+            repositoryId: "repo",
+            revision: 1,
+            archived: false,
+            createdAt: now,
+            updatedAt: now,
+            definition: {
+              name: "Implement",
+              target: {
+                kind: "machine",
+                environmentId: EnvironmentId.make("env"),
+                projectId: ProjectId.make("project"),
+              },
+              steps: [
+                {
+                  id: "agent",
+                  kind: "agent",
+                  title: "Agent",
+                  instruction: "Implement",
+                  modelSelection: null,
+                },
+                { id: "review", kind: "review", title: "Review", role: "maintainer" },
+              ],
+            },
+          },
+        };
+        const store = yield* WorkflowRunStore;
+        yield* store.save(run);
+        const removed: string[] = [];
+        yield* buildAppUnderTest({
+          layers: {
+            gitVcsDriver: {
+              removeWorktree: (input) =>
+                Effect.sync(() => {
+                  removed.push(input.path);
+                }),
+            },
+            vcsStatusBroadcaster: {
+              refreshStatus: () =>
+                Effect.succeed({
+                  isRepo: true,
+                  hasPrimaryRemote: true,
+                  isDefaultRef: true,
+                  refName: "main",
+                  hasWorkingTreeChanges: false,
+                  workingTree: { files: [], insertions: 0, deletions: 0 },
+                  hasUpstream: true,
+                  aheadCount: 0,
+                  behindCount: 0,
+                  pr: null,
+                }),
+            },
+            terminalManager: {
+              attachStream: (_input, publish) =>
+                Effect.gen(function* () {
+                  yield* publish({
+                    type: "snapshot",
+                    snapshot: {
+                      threadId: run.progress.threadId,
+                      terminalId: "default",
+                      cwd: owned,
+                      worktreePath: owned,
+                      status: "exited",
+                      pid: null,
+                      history: "saved output",
+                      exitCode: 0,
+                      exitSignal: null,
+                      label: "Primary",
+                      updatedAt: now,
+                    },
+                  });
+                  return () => Effect.void;
+                }),
+            },
+          },
+        });
+        const wsUrl = yield* getWsServerUrl("/ws");
+        for (const target of [owned, "../job", alias, path.join(owned, "..", "job")]) {
+          const denied = yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.vcsRemoveWorktree]({ cwd, path: target, force: true }).pipe(
+                Effect.result,
+              ),
+            ),
+          );
+          assert.equal(denied._tag, "Failure");
+          if (denied._tag === "Failure")
+            assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+        }
+        assert.deepEqual(removed, []);
+        for (const method of [WS_METHODS.terminalOpen, WS_METHODS.terminalRestart]) {
+          const denied = yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[method]({
+                threadId: "another-thread",
+                terminalId: "default",
+                cwd,
+                worktreePath: alias,
+                cols: 120,
+                rows: 40,
+              }).pipe(Effect.result),
+            ),
+          );
+          assert.equal(denied._tag, "Failure");
+          if (denied._tag === "Failure")
+            assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+        }
+        const writableAttach = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.terminalAttach]({
+              threadId: run.progress.threadId,
+              terminalId: "default",
+              cwd: owned,
+            }).pipe(Stream.take(1), Stream.runCollect, Effect.result),
+          ),
+        );
+        assert.equal(writableAttach._tag, "Failure");
+        if (writableAttach._tag === "Failure")
+          assert.equal(writableAttach.failure._tag, "EnvironmentAuthorizationError");
+        const events = yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.terminalAttach]({
+              threadId: run.progress.threadId,
+              terminalId: "default",
+            }).pipe(Stream.take(1), Stream.runCollect),
+          ),
+        );
+        assert.equal(events[0]?.type, "snapshot");
+        const unowned = path.join(base, "unowned");
+        yield* Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.vcsRemoveWorktree]({ cwd, path: unowned }),
+          ),
+        );
+        for (const status of ["done", "cancelled"] as const) {
+          yield* store.save({ ...run, progress: { ...run.progress, status } });
+          yield* Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.vcsRemoveWorktree]({ cwd, path: "../job", force: true }),
+            ),
+          );
+        }
+        assert.deepEqual(removed, [unowned, owned, owned]);
+      }).pipe(
+        Effect.provide(
+          WorkflowRunStoreLayer.pipe(
+            Layer.provide(SqlitePersistenceMemory),
+            Layer.provideMerge(NodeHttpServer.layerTest),
+          ),
+        ),
+      ),
+  );
+
   it.effect("routes websocket rpc terminal.write errors", () =>
     Effect.gen(function* () {
       const terminalError = new TerminalNotRunningError({
@@ -13870,3 +14894,96 @@ it.effect(
       assert.equal(response.status, 404);
     }).pipe(Effect.provide(Layer.merge(NodeHttpServer.layerTest, NodeServices.layer))),
 );
+
+for (const transport of ["http", "websocket"] as const) {
+  for (const failure of [false, true]) {
+    it.effect(`Archive setup cleanup precedes hiding over ${transport}; failure=${failure}`, () =>
+      Effect.gen(function* () {
+        const effects: string[] = [];
+        const owner = {
+          threadId: defaultThreadId,
+          attemptId: "ready-setup",
+          terminalId: "setup-ready",
+          createdAt: "now",
+          pid: 123,
+          identity: "birth",
+          completed: true,
+          exited: false,
+          legacy: false,
+          ownershipVersion: 4 as const,
+        };
+        yield* buildAppUnderTest({
+          layers: {
+            setupProcessJournal: {
+              owners: () => Effect.succeed([owner]),
+              confirmed: () => Effect.succeed(!failure),
+              cleanup: () =>
+                Effect.suspend(() => {
+                  effects.push("cleanup");
+                  return failure
+                    ? Effect.fail(new SetupProcessError({ message: "Setup stop denied" }))
+                    : Effect.succeed({ ...owner, source: "native" as const });
+                }),
+            },
+            terminalManager: {
+              closeOwned: () =>
+                Effect.sync(() => {
+                  effects.push("finalize");
+                  return true;
+                }),
+              close: () => Effect.void,
+            },
+            orchestrationEngine: {
+              dispatch: (command, options) =>
+                Effect.suspend(() => {
+                  if (options?.rejection)
+                    return Effect.fail(
+                      new OrchestrationCommandInvariantError({
+                        commandType: command.type,
+                        detail: options.rejection.detail,
+                      }),
+                    );
+                  effects.push(command.type);
+                  return Effect.succeed({ sequence: effects.length });
+                }),
+            },
+          },
+        });
+        const command = {
+          type: "thread.archive" as const,
+          threadId: defaultThreadId,
+          commandId: CommandId.make(`archive-proof-${transport}-${failure}`),
+        };
+        if (transport === "http") {
+          const response = yield* fetchEffect(
+            yield* getHttpServerUrl("/api/orchestration/dispatch"),
+            {
+              method: "POST",
+              headers: {
+                cookie: yield* getAuthenticatedSessionCookieHeader(),
+                "content-type": "application/json",
+              },
+              body: yield* encodeClientCommandJson(command),
+            },
+          );
+          assert.equal(response.status, failure ? 500 : 200);
+        } else {
+          const result = yield* Effect.scoped(
+            withWsRpcClient(yield* getWsServerUrl("/ws"), (client) =>
+              client[ORCHESTRATION_WS_METHODS.dispatchCommand](command),
+            ).pipe(Effect.result),
+          );
+          assert.equal(result._tag, failure ? "Failure" : "Success");
+        }
+        if (failure) assert.deepEqual(effects, ["thread.queue.pause", "cleanup"]);
+        else
+          assert.deepEqual(effects, [
+            "thread.queue.pause",
+            "cleanup",
+            "finalize",
+            "thread.archive",
+          ]);
+      }).pipe(Effect.provide(Layer.merge(NodeHttpServer.layerTest, NodeServices.layer))),
+    );
+  }
+}

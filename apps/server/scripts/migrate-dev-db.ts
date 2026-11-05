@@ -37,7 +37,11 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { Command, Flag } from "effect/unstable/cli";
 
-import { migrationManifest, runMigrations } from "../src/persistence/Migrations.ts";
+import {
+  migrationManifest,
+  runMigrations,
+  verifyMigrationHistory,
+} from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 export class MigrateDevDbNotInWorktreeError extends Schema.TaggedError<MigrateDevDbNotInWorktreeError>()(
@@ -336,6 +340,8 @@ const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigra
  * database recorded: same slot under a different name means the migration
  * was skipped, not applied. */
 const verifyMigrationSlots = Effect.fn("verifyMigrationSlots")(function* () {
+  const compatible = yield* verifyMigrationHistory.pipe(Effect.result);
+  if (compatible._tag === "Success") return;
   const sql = yield* SqlClient.SqlClient;
   const applied = yield* sql<{ migration_id: number; name: string }>`
     SELECT migration_id, name FROM effect_sql_migrations`;
@@ -346,6 +352,7 @@ const verifyMigrationSlots = Effect.fn("verifyMigrationSlots")(function* () {
       return yield* new MigrateDevDbSlotCollisionError({ slot, codeName, appliedName });
     }
   }
+  return yield* compatible.failure;
 });
 
 export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
@@ -431,6 +438,10 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
     yield* verifyMigrationSlots().pipe(
       Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
       Effect.catchTags({
+        MigrationError: (cause) =>
+          Effect.fail(
+            new MigrateDevDbPhaseError({ phase: "verify", databasePath: snapshotPath, cause }),
+          ),
         SqlError: (cause) =>
           Effect.fail(
             new MigrateDevDbPhaseError({ phase: "verify", databasePath: snapshotPath, cause }),

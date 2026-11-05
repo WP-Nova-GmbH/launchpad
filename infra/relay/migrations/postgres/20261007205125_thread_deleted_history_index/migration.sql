@@ -1,0 +1,1 @@
+CREATE INDEX "idx_relay_thread_history_deleted" ON "relay_thread_history" ("thread_id","source_sequence") WHERE "event_json"->>'type'='thread.deleted';

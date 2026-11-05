@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Bootstraps a freshly provisioned machine (ADR-0002) into a running Launchpad
-# executor. The Hetzner compute driver's cloud-init writes the enrollment env
-# file and pipes this script through bash; it installs Node, clones the
+# Bootstraps an operator-managed Ubuntu computer into a Launchpad executor.
+# The operator writes the enrollment env file before running this script.
+# It installs Node, clones the
 # source, and starts the server as a systemd service. The server then enrolls
 # itself with the relay using the seeded credential and never needs this
 # script again.

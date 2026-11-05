@@ -35,15 +35,15 @@ export interface ThreadDeletionReactorShape {
   /**
    * Waits through the supplied event sequence and confirms captured cleanup.
    * Passing a thread ID isolates failures and waiting to that thread.
-   * A successful thread.create sequence is the fence callers use before the
-   * new incarnation can own runtime resources. An unconfirmed exit retries
-   * captured handles in this runtime. After restart, only confirmed absence of
-   * captured process IDs clears the durable fence; unknown ownership stays blocked.
-   * A drain never terminates a process using an ID recovered from storage.
+   * Saved setup ownership requires full-unit proof; ordinary captured PID fences
+   * may use confirmed absence. A fresh authorized creation supplies a cleanup
+   * command ID to retry a failed stop. Startup/status drains reuse saved proof or
+   * pending work and cannot turn a failed cleanup into an implicit retry.
    */
   readonly drainThrough: (
     sequence: number,
     threadId?: ThreadId,
+    cleanupCommandId?: string,
   ) => Effect.Effect<void, ThreadCleanupError>;
 }
 

@@ -295,9 +295,11 @@ export function applyPendingThreadOrder<T extends OrderRow>(
 ): T[] {
   if (pending == null || pending.section !== section) return [...rows];
   const rank = new Map(pending.orderedIds.map((id, index) => [id, index]));
-  return [...rows].sort(
-    (left, right) => (rank.get(rowId(left)) ?? Infinity) - (rank.get(rowId(right)) ?? Infinity),
-  );
+  const movedRows = rows.filter((row) => rank.has(rowId(row)));
+  movedRows.sort((left, right) => rank.get(rowId(left))! - rank.get(rowId(right))!);
+  // Read-only result rows stay visible in their current slots while the move settles.
+  let next = 0;
+  return rows.map((row) => (rank.has(rowId(row)) ? movedRows[next++]! : row));
 }
 
 /** Match desktop re-entry: a pin wakes the thread on the server; Active clears

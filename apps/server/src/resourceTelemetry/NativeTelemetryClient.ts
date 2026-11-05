@@ -1,3 +1,4 @@
+import { VmControlSpawner } from "../vmWorkloadCommand.ts";
 import type {
   HostPowerSnapshot,
   ResourceMonitorCapabilities,
@@ -363,7 +364,7 @@ export function canCommandNativeTelemetrySidecar(
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.fn("resourceTelemetry.nativeTelemetryClient.make")(function* () {
   const binary = yield* ResourceMonitorBinary.ResourceMonitorBinary;
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const spawner = (yield* VmControlSpawner) ?? (yield* ChildProcessSpawner.ChildProcessSpawner);
   const crypto = yield* Crypto.Crypto;
   const config = yield* ServerConfig;
   const initializedAt = yield* DateTime.now;
