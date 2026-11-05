@@ -28,6 +28,7 @@ it.effect("keeps provisioning off without requiring any compute credentials", ()
   Effect.gen(function* () {
     expect(yield* load({})).toBeUndefined();
     expect(yield* load({ E2B_API_URL: "incomplete" })).toBeUndefined();
+    expect(yield* load({ E2B_HOST_ADDRESSES: "invalid,," })).toBeUndefined();
   }),
 );
 it.effect("uses only valid model proof for the explicitly configured template build", () =>
@@ -141,10 +142,57 @@ it.effect.each([
   ["E2B_API_URL", "http://127.0.0.1:3000?token=secret"],
   ["E2B_HOST_ID", " "],
   ["E2B_HOST_ID", "x".repeat(192)],
-  ["E2B_HOST_ADDRESSES", " , "],
 ] as const)("rejects unsafe or incomplete configuration %s=%s", ([key, value]) =>
   Effect.gen(function* () {
     expect((yield* Effect.result(load({ ...configured, [key]: value })))._tag).toBe("Failure");
+  }),
+);
+it.effect.each([
+  ["192.0.2.10", ["192.0.2.10"]],
+  ["2001:db8::10", ["2001:db8::10"]],
+  ["2001:0DB8:0000:0000:0000:0000:0000:0010", ["2001:0DB8:0000:0000:0000:0000:0000:0010"]],
+  ["::ffff:192.0.2.10", ["::ffff:192.0.2.10"]],
+  [" 192.0.2.10 , 2001:db8::10 ", ["192.0.2.10", "2001:db8::10"]],
+] as const)("accepts numeric host addresses %s", ([value, addresses]) =>
+  Effect.gen(function* () {
+    expect(
+      (yield* load({ ...configured, E2B_HOST_ADDRESSES: value }))?.compute.hostAddresses,
+    ).toEqual(addresses);
+  }),
+);
+it.effect.each([
+  "",
+  " ",
+  ",",
+  " , ",
+  "placeholder",
+  "relay.example.com",
+  "192.0.2.10/32",
+  "2001:db8::10/128",
+  "[2001:db8::10]",
+  "fe80::1%eth0",
+  "999.0.2.10",
+  "192.0.2",
+  "192.0.002.10",
+  "0xc000020a",
+  "3221225994",
+  "2001:db8:::10",
+  "1:2:3:4:5:6:7:8:9",
+  ",192.0.2.10",
+  "192.0.2.10,",
+  "192.0.2.10, ,2001:db8::10",
+  "192.0.2.10,,2001:db8::10",
+  "192.0.2.10,not-an-ip-secret",
+])("rejects invalid host addresses %s without exposing configuration values", (value) =>
+  Effect.gen(function* () {
+    const result = yield* Effect.result(load({ ...configured, E2B_HOST_ADDRESSES: value }));
+    expect(result._tag).toBe("Failure");
+    if (result._tag === "Failure") {
+      expect(result.failure.message).toBe(
+        "SourceError: E2B_HOST_ADDRESSES requires a comma-separated list of IPv4 or IPv6 addresses.",
+      );
+      expect(String(result.failure)).not.toContain(configured.E2B_API_KEY);
+    }
   }),
 );
 it.effect("accepts host identities up to the persistence limit", () =>

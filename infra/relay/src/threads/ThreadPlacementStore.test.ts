@@ -1206,6 +1206,313 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       }),
     );
 
+    it.effect("settles rejected fresh VM creation and admits the next host reservation", () =>
+      Effect.gen(function* () {
+        const hostId = NodeCrypto.randomUUID();
+        const rejected = yield* makeProvisionFixture({}, hostId);
+        const next = yield* makeProvisionFixture({}, hostId);
+        const capacity = makeThreadVmCapacityStore(rejected.sql);
+        yield* capacity.configure(hostId, 1);
+        let attempts = 0;
+        yield* rejected
+          .worker({
+            ...rejected.compute,
+            create: () => {
+              attempts++;
+              return Effect.fail(
+                new ThreadVmComputeError({
+                  operation: "create",
+                  message: "Host rejected creation before allocating compute",
+                  createRejected: true,
+                }),
+              );
+            },
+          })
+          .runOne();
+        expect(attempts).toBe(1);
+        expect(yield* rejected.provisions.get(rejected.allocationId)).toMatchObject({
+          phase: "cancelled",
+          allocationState: "deleted",
+          computeRef: null,
+          claimId: null,
+          ingressRecoveryClaimId: null,
+          errorCode: "create_rejected",
+        });
+        expect((yield* rejected.allocations.get(rejected.allocationId))?.deletedAt).not.toBeNull();
+        expect(yield* capacity.get(rejected.operationId)).toMatchObject({
+          state: "released",
+          computeRef: null,
+        });
+        expect(yield* next.worker().runOne()).toBe(true);
+        expect(next.creates()).toBe(1);
+        expect((yield* capacity.get(next.operationId))?.state).toBe("started");
+        expect(yield* rejected.worker().runOne()).toBe(false);
+      }),
+    );
+
+    it.effect("retains fresh VM capacity after an uncertain create response", () =>
+      Effect.gen(function* () {
+        for (const createRejected of [undefined, false]) {
+          const hostId = NodeCrypto.randomUUID();
+          const uncertain = yield* makeProvisionFixture({}, hostId);
+          const next = yield* makeProvisionFixture({}, hostId);
+          const capacity = makeThreadVmCapacityStore(uncertain.sql);
+          yield* capacity.configure(hostId, 1);
+          yield* uncertain
+            .worker({
+              ...uncertain.compute,
+              create: () =>
+                Effect.fail(
+                  new ThreadVmComputeError({
+                    operation: "create",
+                    message: "Response lost before a compute identity was observed",
+                    ...(createRejected === undefined ? {} : { createRejected }),
+                  }),
+                ),
+            })
+            .runOne();
+          expect(yield* uncertain.provisions.get(uncertain.allocationId)).toMatchObject({
+            phase: "creating",
+            allocationState: "creating",
+            computeRef: null,
+            errorCode: "compute_unavailable",
+          });
+          expect(yield* capacity.get(uncertain.operationId)).toMatchObject({
+            state: "started",
+            computeRef: null,
+          });
+          expect(yield* capacity.admitNext(hostId)).toBeNull();
+          expect(yield* next.worker().runOne()).toBe(false);
+          expect(next.creates()).toBe(0);
+          yield* uncertain.eligible;
+          yield* uncertain.worker().runOne();
+          expect((yield* uncertain.provisions.get(uncertain.allocationId))?.errorCode).toBe(
+            "create_uncertain",
+          );
+          expect((yield* capacity.get(uncertain.operationId))?.state).toBe("started");
+        }
+      }),
+    );
+
+    it.effect(
+      "settles rejected fresh VM creation after claim expiry or takeover and accepts duplicate receipts",
+      () =>
+        Effect.gen(function* () {
+          for (const takeover of [false, true]) {
+            const f = yield* provisionFixture;
+            const capacity = makeThreadVmCapacityStore(f.sql);
+            yield* capacity.admitNext(f.hostId);
+            yield* f.provisions.claim("original-create", f.hostId);
+            yield* f.provisions.beginCreate({
+              allocationId: f.allocationId,
+              claimId: "original-create",
+              templateId: "template:immutable-build",
+            });
+            yield* f.sql`UPDATE relay_thread_vm_provisions SET claim_until=clock_timestamp()-interval '1 second'
+              WHERE allocation_id=${f.allocationId}`;
+            if (takeover) {
+              expect(yield* f.provisions.claim("replacement-worker", f.hostId)).toMatchObject({
+                claimId: "replacement-worker",
+                phase: "creating",
+              });
+              yield* f.allocations.requestDeletion(f.allocationId);
+            }
+            const identity = {
+              allocationId: f.allocationId,
+              operationId: f.operationId,
+              generation: f.intent.generation,
+              threadId: f.threadId,
+              resourceKind: "personal" as const,
+            };
+            expect(yield* f.provisions.rejectCreate(identity)).toBe(true);
+            expect(yield* f.provisions.rejectCreate(identity)).toBe(true);
+            expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+              phase: "cancelled",
+              allocationState: "deleted",
+              computeRef: null,
+              claimId: null,
+              errorCode: "create_rejected",
+            });
+            expect((yield* capacity.get(f.operationId))?.state).toBe("released");
+            expect(
+              yield* Effect.flip(
+                f.provisions.defer({
+                  allocationId: f.allocationId,
+                  claimId: takeover ? "replacement-worker" : "original-create",
+                  errorCode: "compute_unavailable",
+                }),
+              ),
+            ).toMatchObject({ _tag: "ThreadVmProvisionConflict" });
+            expect(
+              yield* f.sql`SELECT claim_until FROM relay_thread_vm_provisions WHERE allocation_id=${f.allocationId}`,
+            ).toEqual([{ claim_until: null }]);
+          }
+        }),
+    );
+
+    it.effect("retains rejected fresh VM capacity when immutable receipt identity differs", () =>
+      Effect.gen(function* () {
+        const f = yield* provisionFixture;
+        const capacity = makeThreadVmCapacityStore(f.sql);
+        yield* capacity.admitNext(f.hostId);
+        yield* f.provisions.claim("creator", f.hostId);
+        yield* f.provisions.beginCreate({
+          allocationId: f.allocationId,
+          claimId: "creator",
+          templateId: "template:immutable-build",
+        });
+        const identity = {
+          allocationId: f.allocationId,
+          operationId: f.operationId,
+          generation: f.intent.generation,
+          threadId: f.threadId,
+          resourceKind: "personal" as const,
+        };
+        for (const mismatch of [
+          { allocationId: NodeCrypto.randomUUID() },
+          { operationId: NodeCrypto.randomUUID() },
+          { generation: identity.generation + 1 },
+          { threadId: NodeCrypto.randomUUID() },
+          { resourceKind: "organization_workflow" as const },
+        ]) {
+          expect(
+            yield* Effect.flip(f.provisions.rejectCreate({ ...identity, ...mismatch })),
+          ).toMatchObject({ _tag: "ThreadVmProvisionConflict" });
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "creating",
+            allocationState: "creating",
+            claimId: "creator",
+          });
+          expect((yield* capacity.get(f.operationId))?.state).toBe("started");
+        }
+      }),
+    );
+
+    it.effect(
+      "retains rejected fresh VM capacity for known compute, ingress recovery or incompatible reservations",
+      () =>
+        Effect.gen(function* () {
+          for (const guard of ["allocation", "capacity", "ingress", "kind", "state", "runtime"]) {
+            const f = yield* provisionFixture;
+            const capacity = makeThreadVmCapacityStore(f.sql);
+            yield* capacity.admitNext(f.hostId);
+            yield* f.provisions.claim("creator", f.hostId);
+            yield* f.provisions.beginCreate({
+              allocationId: f.allocationId,
+              claimId: "creator",
+              templateId: "template:immutable-build",
+            });
+            if (guard === "allocation")
+              yield* f.sql`UPDATE relay_thread_vm_allocations SET compute_ref=${`known-${f.allocationId}`}
+                WHERE allocation_id=${f.allocationId}`;
+            if (guard === "capacity")
+              yield* f.sql`UPDATE relay_thread_vm_capacity SET compute_ref=${`known-${f.allocationId}`}
+                WHERE operation_id=${f.operationId}`;
+            if (guard === "ingress")
+              yield* f.sql`UPDATE relay_thread_vm_provisions SET ingress_recovery_claim_id='unsettled-recovery'
+                WHERE allocation_id=${f.allocationId}`;
+            if (guard === "kind")
+              yield* f.sql`UPDATE relay_thread_vm_capacity SET kind='resume' WHERE operation_id=${f.operationId}`;
+            if (guard === "state")
+              yield* f.sql`UPDATE relay_thread_vm_capacity SET state='reserved' WHERE operation_id=${f.operationId}`;
+            if (guard === "runtime")
+              yield* f.sql`UPDATE relay_thread_vm_allocations SET runtime_protocol='legacy' WHERE allocation_id=${f.allocationId}`;
+            expect(
+              yield* Effect.flip(
+                f.provisions.rejectCreate({
+                  allocationId: f.allocationId,
+                  operationId: f.operationId,
+                  generation: f.intent.generation,
+                  threadId: f.threadId,
+                  resourceKind: "personal",
+                }),
+              ),
+            ).toMatchObject({ _tag: "ThreadVmProvisionConflict" });
+            expect((yield* capacity.get(f.operationId))?.state).toBe(
+              guard === "state" ? "reserved" : "started",
+            );
+            expect(
+              yield* f.sql`SELECT state,deleted_at FROM relay_thread_vm_allocations
+                WHERE allocation_id=${f.allocationId}`,
+            ).toEqual([{ state: "creating", deleted_at: null }]);
+          }
+        }),
+    );
+
+    it.effect(
+      "retains rejected VM creation reserved for personal move and reset coordinators",
+      () =>
+        Effect.gen(function* () {
+          for (const coordinator of ["move", "reset"]) {
+            const f = yield* provisionFixture;
+            const capacity = makeThreadVmCapacityStore(f.sql);
+            if (coordinator === "move") {
+              yield* f.sql`INSERT INTO relay_thread_moves
+              (operation_id,thread_id,actor_user_id,source_environment_id,expected_generation,
+                destination_environment_id,destination_project_id,phase)
+              VALUES(${f.operationId},${f.threadId},${f.ownerUserId},'local',1,'vm','vm-project','preparing')`;
+              yield* f.sql`INSERT INTO relay_thread_vm_move_destinations(operation_id,allocation_id)
+              VALUES(${f.operationId},${f.allocationId})`;
+            } else {
+              const sourceAllocationId = NodeCrypto.randomUUID();
+              const sourceOperationId = NodeCrypto.randomUUID();
+              const allocation = (yield* f.allocations.get(f.allocationId))!;
+              yield* f.sql`INSERT INTO relay_thread_vm_allocations
+              (allocation_id,thread_id,organization_id,owner_user_id,template_id,state,deleted_at)
+              VALUES(${sourceAllocationId},${f.threadId},${allocation.organizationId},${f.ownerUserId},
+                'template:immutable-build','deleted','now')`;
+              yield* f.sql`INSERT INTO relay_thread_vm_backups
+              (operation_id,allocation_id,generation,compute_ref,snapshot_name,phase)
+              VALUES(${sourceOperationId},${sourceAllocationId},1,${`source-${sourceAllocationId}`},
+                ${sourceOperationId},'retired')`;
+              yield* f.sql`INSERT INTO relay_thread_vm_saved_disks
+              (operation_id,thread_id,backup_operation_id,generation,host_id,phase)
+              VALUES(${sourceOperationId},${f.threadId},${sourceOperationId},1,${f.hostId},'expired')`;
+              yield* f.sql`INSERT INTO relay_thread_artifacts
+              (artifact_id,thread_id,operation_id,kind,storage_key,sha256,size_bytes,state)
+              VALUES(${sourceOperationId},${f.threadId},${sourceOperationId},'manifest',
+                ${`thread-artifacts/v1/${sourceOperationId}`},${"a".repeat(64)},0,'complete')`;
+              yield* f.sql`INSERT INTO relay_thread_native_checkpoints
+              (operation_id,thread_id,turn_id,source_environment_id,generation,source_sequence,
+                native_thread_id,native_manifest_sha256,archive_sha256,manifest_artifact_id,
+                manifest_sha256,artifact_count)
+              VALUES(${sourceOperationId},${f.threadId},'last-source-turn','local',1,0,
+                ${sourceOperationId},${"a".repeat(64)},${"a".repeat(64)},${sourceOperationId},
+                ${"a".repeat(64)},1)`;
+              yield* f.sql`INSERT INTO relay_thread_vm_resets
+              (operation_id,thread_id,allocation_id,actor_user_id,expected_generation,
+                saved_disk_operation_id,native_checkpoint_operation_id,source_environment_id,
+                source_sequence,host_id,template_id,canonical_key,branch,revision)
+              VALUES(${f.operationId},${f.threadId},${f.allocationId},${f.ownerUserId},1,
+                ${sourceOperationId},${sourceOperationId},'local',0,${f.hostId},
+                'template:immutable-build','github.com/test/reset','main',${"a".repeat(40)})`;
+            }
+            yield* capacity.admitNext(f.hostId);
+            yield* f.provisions.claim("coordinator-creator", f.hostId);
+            yield* f.provisions.beginCreate({
+              allocationId: f.allocationId,
+              claimId: "coordinator-creator",
+              templateId: "template:immutable-build",
+            });
+            expect(
+              yield* f.provisions.rejectCreate({
+                allocationId: f.allocationId,
+                operationId: f.operationId,
+                generation: f.intent.generation,
+                threadId: f.threadId,
+                resourceKind: "personal",
+              }),
+            ).toBe(false);
+            expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+              phase: "creating",
+              allocationState: "creating",
+              claimId: "coordinator-creator",
+            });
+            expect((yield* capacity.get(f.operationId))?.state).toBe("started");
+          }
+        }),
+    );
+
     it.effect(
       "keeps physical capacity after a lost create and rejects false deletion confirmation",
       () =>

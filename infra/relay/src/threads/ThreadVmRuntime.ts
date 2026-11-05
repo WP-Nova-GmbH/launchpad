@@ -118,6 +118,8 @@ function cookieDomain(origin: string) {
   }
 }
 
+const decodeHostAddresses = Schema.decodeUnknownEffect(Schema.Array(Schema.IpAddressFromString));
+
 /** Disabled relays need no compute configuration and perform no E2B requests. */
 export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
   const enabled = yield* Config.Boolean("RELAY_THREAD_VM_PROVISIONING_ENABLED").pipe(
@@ -178,10 +180,17 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
     return yield* new ThreadVmRuntimeConfigurationError({
       message: "Automatic VM deletion requires verified backups to be enabled.",
     });
-  const hostAddresses = (yield* Config.String("E2B_HOST_ADDRESSES"))
+  const hostAddresses = (yield* Config.String("E2B_HOST_ADDRESSES").pipe(Config.withDefault("")))
     .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
+    .map((value) => value.trim());
+  yield* decodeHostAddresses(hostAddresses).pipe(
+    Effect.mapError(
+      () =>
+        new ThreadVmRuntimeConfigurationError({
+          message: "E2B_HOST_ADDRESSES requires a comma-separated list of IPv4 or IPv6 addresses.",
+        }),
+    ),
+  );
   const validUrl = (value: string, publicOnly: boolean) => {
     try {
       const url = new URL(value);
@@ -207,7 +216,6 @@ export const loadThreadVmRuntimeSettings = Effect.gen(function* () {
     !/^[^:]+:build-[^:]+$/u.test(templateId) ||
     !Number.isSafeInteger(maxRunningVms) ||
     maxRunningVms < 1 ||
-    !hostAddresses.length ||
     !Redacted.value(apiKey).trim()
   ) {
     return yield* new ThreadVmRuntimeConfigurationError({

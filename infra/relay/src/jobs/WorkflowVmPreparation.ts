@@ -64,6 +64,8 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
         : [];
     // Setup failure and its deleting fence commit together. Later cancels cannot change that outcome.
     const checkoutFailed = job.startAttempted === false && preparation?.setupPhase === "failed";
+    const createRejected = preparation?.blocker === "create_rejected";
+    const createRejectedAfterCancel = preparation?.blocker === "create_rejected_after_cancel";
     const operation = row.pendingControl?.response.operation;
     const acknowledgedCancellation =
       job.vmCancellationConfirmed === true || job.progress?.status === "cancelling";
@@ -76,6 +78,8 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
       job.status === "cancelling" &&
       job.runtime?.kind === "vm" &&
       !checkoutFailed &&
+      !createRejected &&
+      !createRejectedAfterCancel &&
       ((job.startAttempted === false && operation === "cancel") || cancelPaused)
     ) {
       return yield* sql.withTransaction(
@@ -183,6 +187,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
         Effect.gen(function* () {
           const cancelled =
             !checkoutFailed &&
+            !createRejected &&
             job.status === "cancelling" &&
             (acknowledgedCancellation ||
               ((operation === "cancel" || operation === "retry_cancellation") &&
@@ -191,12 +196,16 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           const detail = checkoutFailed
             ? "Repository checkout failed. Start a new run to try again."
             : cancelled
-              ? "Cancelled after the workflow VM stopped."
-              : preparation.blocker === "workflow_template_stale"
-                ? "The saved workflow VM build is no longer selected. Start a new run."
-                : job.startAttempted === false
-                  ? "The workflow VM stopped before execution began. Start a new run to try again."
-                  : "The workflow VM was lost and its result could not be confirmed. Start a new run to try again.";
+              ? createRejectedAfterCancel
+                ? "Cancelled before the workflow VM was created."
+                : "Cancelled after the workflow VM stopped."
+              : createRejected || createRejectedAfterCancel
+                ? "VM creation was rejected. Check the compute host configuration and start a new run."
+                : preparation.blocker === "workflow_template_stale"
+                  ? "The saved workflow VM build is no longer selected. Start a new run."
+                  : job.startAttempted === false
+                    ? "The workflow VM stopped before execution began. Start a new run to try again."
+                    : "The workflow VM was lost and its result could not be confirmed. Start a new run to try again.";
           return (yield* store.updateJob(
             row,
             {

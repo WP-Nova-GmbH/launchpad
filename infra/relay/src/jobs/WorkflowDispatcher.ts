@@ -606,8 +606,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           latest.leaseUntil !== leaseUntil
         )
           return latest?.record ?? null;
-        if (latest.record.vmAdmission) return latest.record;
-        if (latest.record.origin?.kind === "automation" && latest.record.workflow === null) {
+        if (
+          !latest.record.vmAdmission &&
+          latest.record.origin?.kind === "automation" &&
+          latest.record.workflow === null
+        ) {
           const reason = isWorkflowQueued(error)
             ? error
             : { code: "source_unavailable" as const, retryAt: null };
@@ -629,7 +632,9 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         }
         const detail = isWorkflowInvalidError(error)
           ? error.message
-          : "Waiting for the selected environment to reconnect or acknowledge the job.";
+          : latest.record.vmAdmission
+            ? "Could not reach the workflow VM or confirm its response. Launchpad will retry automatically."
+            : "Waiting for the selected environment to reconnect or acknowledge the job.";
         return (yield* update(
           latest,
           { ...latest.record, detail, updatedAt: DateTime.formatIso(yield* DateTime.now) },

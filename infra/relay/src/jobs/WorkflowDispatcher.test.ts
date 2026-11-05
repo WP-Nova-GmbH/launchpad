@@ -21,6 +21,7 @@ import { Organizations } from "../tenancy/Organizations.ts";
 import { Repositories, RepositoryPersistenceError } from "../tenancy/Repositories.ts";
 import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "./Workflows.ts";
 import { refreshWorkflowJob, validateWorkflowTarget } from "./WorkflowDispatcher.ts";
+import { WorkflowVmPreparation } from "./WorkflowVmPreparation.ts";
 
 const NOW = "2026-10-08T12:00:00.000Z";
 const workflow: RepositoryWorkflow & {
@@ -462,6 +463,163 @@ const vmWorkflow: RepositoryWorkflow = {
   definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
 };
 const vmAdmission = { codexConnectionId: "original-connection", hasSecrets: false };
+const vmReviewJob: WorkflowJobRecord = {
+  ...initial,
+  status: "awaiting_review",
+  pendingControl: {
+    userId: "maintainer",
+    response: { operation: "approve", expectedRevision: 5, checkpointId: "saved" },
+  },
+  record: {
+    ...initial.record,
+    status: "awaiting_review",
+    vmAdmission,
+    runtime: { kind: "vm", threadId: ThreadId.make("vm-thread") },
+    workflow: vmWorkflow,
+    progress: {
+      ...accepted.progress!,
+      status: "awaiting_review",
+      revision: 5,
+      checkpoint: {
+        checkpointId: "saved",
+        turnId: "turn",
+        checkpointRef: "ref",
+        checkpointTurnCount: 1,
+      },
+    },
+  },
+};
+
+for (const automated of [false, true])
+  it.effect(
+    `shows VM preparation failures and clears them on recovery (${automated ? "automatic" : "manual"})`,
+    () =>
+      Effect.gen(function* () {
+        const h = yield* harness;
+        yield* Ref.set(h.definition, vmWorkflow);
+        yield* Ref.set(h.workflowVmLimit, 1);
+        yield* Ref.set(h.codex, {
+          connectionId: vmAdmission.codexConnectionId,
+          status: "connected" as const,
+        });
+        yield* Ref.update(h.row, (row) => ({
+          ...row,
+          record: {
+            ...row.record,
+            vmAdmission,
+            ...(automated
+              ? {
+                  origin: {
+                    kind: "automation" as const,
+                    organizationId: "org-1",
+                    repositoryId: "repo-1",
+                    workflowId: "flow-1",
+                    source: {
+                      provider: "linear" as const,
+                      applicationId: "app",
+                      workspaceId: "ws",
+                      connectionId: "connection",
+                      grantId: "grant",
+                    },
+                    occurrenceId: "event",
+                  },
+                }
+              : {}),
+          },
+        }));
+        const message =
+          "Could not reach the workflow VM or confirm its response. Launchpad will retry automatically.";
+        const failed = yield* h.refresh.pipe(
+          Effect.provideService(WorkflowVmPreparation, {
+            advance: () =>
+              Effect.fail(new WorkflowPersistenceError({ cause: "VM preparation unavailable" })),
+          }),
+        );
+        assert.equal(failed?.detail, message);
+        assert.equal(failed?.status, "queued");
+        assert.deepStrictEqual(failed?.queueReason, {
+          code: "vm_waiting_capacity",
+          retryAt: null,
+        });
+        assert.equal((yield* Ref.get(h.row)).record.detail, message);
+        assert.isNull((yield* Ref.get(h.row)).leaseUntil);
+
+        const recovered = yield* h.refresh;
+        assert.notEqual(recovered?.detail, message);
+        assert.equal(recovered?.queueReason?.code, "vm_waiting_capacity");
+      }),
+  );
+
+it.effect("redacts unexpected VM failures while preserving a pending approval and progress", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.set(h.row, vmReviewJob);
+    const failed = yield* h.refresh.pipe(
+      Effect.provideService(WorkflowVmPreparation, {
+        advance: () =>
+          Effect.fail(
+            new WorkflowPersistenceError({
+              cause: new Error("VM request failed: Authorization: Bearer vm-auth-secret"),
+            }),
+          ),
+      }),
+    );
+    assert.equal(
+      failed?.detail,
+      "Could not reach the workflow VM or confirm its response. Launchpad will retry automatically.",
+    );
+    assert.equal(failed?.status, vmReviewJob.record.status);
+    assert.deepStrictEqual(failed?.progress, vmReviewJob.record.progress);
+    assert.deepStrictEqual(failed?.runtime, vmReviewJob.record.runtime);
+    assert.deepStrictEqual(failed?.workflow, vmReviewJob.record.workflow);
+    const row = yield* Ref.get(h.row);
+    assert.equal(row.record.detail, failed?.detail);
+    assert.deepStrictEqual(row.pendingControl, vmReviewJob.pendingControl);
+    assert.isNull(row.leaseUntil);
+    assert.lengthOf(yield* Ref.get(h.controls), 0);
+  }),
+);
+
+for (const changed of ["revision", "lease", "terminal"] as const)
+  it.effect(`does not overwrite a VM job changed during a failed refresh (${changed})`, () =>
+    Effect.gen(function* () {
+      const h = yield* harness;
+      yield* Ref.set(h.row, vmReviewJob);
+      const result = yield* h.refresh.pipe(
+        Effect.provideService(WorkflowVmPreparation, {
+          advance: () =>
+            Effect.gen(function* () {
+              yield* Ref.update(h.row, (row): WorkflowJobRecord => ({
+                ...row,
+                revision: row.revision + (changed === "revision" ? 1 : 0),
+                leaseUntil: changed === "lease" ? "lease-2" : row.leaseUntil,
+                status: changed === "terminal" ? "cancelled" : "cancelling",
+                pendingControl:
+                  changed === "terminal"
+                    ? null
+                    : { userId: "canceller", response: { operation: "cancel" as const } },
+                record: {
+                  ...row.record,
+                  status: changed === "terminal" ? "cancelled" : "cancelling",
+                  detail: "Cancellation requested during refresh.",
+                },
+              }));
+              return yield* new WorkflowPersistenceError({ cause: "Stale VM failure" });
+            }),
+        }),
+      );
+      const row = yield* Ref.get(h.row);
+      assert.deepStrictEqual(result, row.record);
+      assert.equal(result?.detail, "Cancellation requested during refresh.");
+      assert.equal(result?.status, changed === "terminal" ? "cancelled" : "cancelling");
+      assert.equal(row.revision, changed === "revision" ? 1 : 0);
+      assert.equal(row.leaseUntil, changed === "lease" ? "lease-2" : null);
+      assert.equal(
+        row.pendingControl?.response.operation ?? null,
+        changed === "terminal" ? null : "cancel",
+      );
+    }),
+  );
 
 it.effect("keeps a queued VM admission bound to its original target kind and Codex identity", () =>
   Effect.gen(function* () {

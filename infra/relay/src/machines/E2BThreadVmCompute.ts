@@ -1,4 +1,5 @@
-import { Sandbox, SandboxNotFoundError, type SandboxOpts, type SandboxInfo } from "e2b";
+import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
+import { Sandbox, SandboxNotFoundError, type SandboxInfo } from "e2b";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -85,6 +86,7 @@ export class ThreadVmComputeError extends Schema.TaggedError<ThreadVmComputeErro
     operation: Schema.String,
     message: Schema.String,
     cause: Schema.optional(Schema.Defect()),
+    createRejected: Schema.optional(Schema.Boolean),
     connectUncertain: Schema.optional(Schema.Boolean),
   },
 ) {}
@@ -106,10 +108,6 @@ export interface ThreadVmSnapshotCreateInput extends ThreadVmCreateInput {
 }
 
 interface E2BComputeClient {
-  readonly create: (
-    template: string,
-    options: SandboxOpts,
-  ) => Promise<{ sandboxId: string; trafficAccessToken?: string }>;
   readonly getInfo: typeof Sandbox.getInfo;
   readonly kill: typeof Sandbox.kill;
   readonly pause: typeof Sandbox.pause;
@@ -125,6 +123,15 @@ interface E2BComputeClient {
     ...args: Parameters<typeof Sandbox.list>
   ) => Pick<ReturnType<typeof Sandbox.list>, "hasNext" | "nextItems">;
 }
+
+const encodeCreate = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeCreated = Schema.decodeUnknownSync(
+  Schema.Struct({
+    sandboxID: Schema.NonEmptyString,
+    envdVersion: Schema.NonEmptyString,
+    trafficAccessToken: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  }),
+);
 
 export const makeE2BThreadVmCompute = (
   settings: E2BThreadVmSettings,
@@ -200,36 +207,62 @@ export const makeE2BThreadVmCompute = (
       return yield* new ThreadVmComputeError({
         operation: "configuration",
         message: configurationError,
+        createRejected: true,
       });
-    return yield* request("create", async (signal) => {
-      const sandbox = await client.create(templateId, {
-        ...options,
-        // Cold boots can use the host's five-minute budget plus recovery time.
-        requestTimeoutMs: 420_000,
-        signal,
-        timeoutMs: settings.timeoutMs,
-        secure: true,
-        metadata: {
-          "launchpad.managed": "thread-vm-v1",
-          "launchpad.allocation_id": input.allocationId,
-          "launchpad.operation_id": input.operationId,
-          "launchpad.thread_id": input.threadId,
-          "launchpad.generation": String(input.generation),
-          ...restoreMetadata,
-        },
-        envs: { ...input.environment },
-        network: {
-          denyOut,
-          allowPublicTraffic: false,
-        },
-        lifecycle: { onTimeout: { action: "pause", mode: "full" }, autoResume: false },
-      });
-      return {
-        sandboxId: sandbox.sandboxId,
-        ...(sandbox.trafficAccessToken?.trim()
-          ? { trafficAccessToken: Redacted.make(sandbox.trafficAccessToken) }
-          : {}),
-      };
+    // Only this execution's original POST can prove rejection. SDK errors can
+    // also come from response decoding or follow-up requests after allocation.
+    let createRejected = false;
+    return yield* Effect.tryPromise({
+      try: async (signal) => {
+        const response = await transport(`${settings.apiUrl.replace(/\/$/u, "")}/v2/sandboxes`, {
+          method: "POST",
+          headers: { "X-API-Key": options.apiKey, "Content-Type": "application/json" },
+          redirect: "error",
+          // Cold boots can use the host's five-minute budget plus recovery time.
+          signal: AbortSignal.any([signal, AbortSignal.timeout(420_000)]),
+          body: encodeCreate({
+            templateID: templateId,
+            metadata: {
+              "launchpad.managed": "thread-vm-v1",
+              "launchpad.allocation_id": input.allocationId,
+              "launchpad.operation_id": input.operationId,
+              "launchpad.thread_id": input.threadId,
+              "launchpad.generation": String(input.generation),
+              ...restoreMetadata,
+            },
+            envVars: { ...input.environment },
+            timeout: Math.ceil(settings.timeoutMs / 1000),
+            network: { denyOut, allowPublicTraffic: false },
+            autoPause: true,
+            autoPauseMemory: true,
+            autoResume: { enabled: false },
+          }),
+        });
+        if (!response.ok) {
+          createRejected = response.status === 400;
+          await response.body?.cancel().catch(() => {});
+          throw new Error("Native create failed");
+        }
+        const sandbox = decodeCreated(await response.json());
+        const envdVersion = sandbox.envdVersion.replace(
+          /\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*$/u,
+          "",
+        );
+        if (parseSemver(envdVersion) === null || compareSemverVersions(envdVersion, "0.1.0") < 0)
+          throw new Error("Unsupported envd version");
+        return {
+          sandboxId: sandbox.sandboxID,
+          ...(sandbox.trafficAccessToken?.trim()
+            ? { trafficAccessToken: Redacted.make(sandbox.trafficAccessToken) }
+            : {}),
+        };
+      },
+      catch: () =>
+        new ThreadVmComputeError({
+          operation: "create",
+          message: "E2B create failed. Reconcile the operation before retrying.",
+          ...(createRejected ? { createRejected: true } : {}),
+        }),
     });
   });
   return {

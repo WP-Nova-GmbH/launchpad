@@ -18,7 +18,11 @@ import {
   EnvironmentConnector,
   EnvironmentMintRequestFailed,
 } from "../environments/EnvironmentConnector.ts";
-import { respondToWorkflowJob } from "../http/WorkflowsApi.ts";
+import {
+  authorizeWorkflowRepository,
+  refreshWorkflowJobForClient,
+  respondToWorkflowJob,
+} from "../http/WorkflowsApi.ts";
 import { readThreadVmReviewSecrets } from "../http/ThreadEnvironmentApi.ts";
 import { layer as machines } from "../machines/Machines.ts";
 import { layer as catalog } from "../projects/OrganizationProjectCatalog.ts";
@@ -26,6 +30,9 @@ import { layer as organizations } from "../tenancy/Organizations.ts";
 import { layer as repositories } from "../tenancy/Repositories.ts";
 import { RelaySecretBox, layer as secretBox } from "../auth/SecretBox.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
+import { makeThreadVmCapacityStore } from "../threads/ThreadVmCapacityStore.ts";
+import { makeThreadVmProvisionStore } from "../threads/ThreadVmProvisionStore.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { configLayer } from "../workflowSources/test-fixture.ts";
 import { updateRepositoryWorkflowConfiguration } from "./RepositoryWorkflowConfiguration.ts";
 import {
@@ -36,7 +43,8 @@ import {
 } from "./WorkflowRunConfiguration.ts";
 import { readWorkflowVmBinding, requireWorkflowVmViewer } from "./WorkflowVmBinding.ts";
 import { refreshWorkflowJob } from "./WorkflowDispatcher.ts";
-import { layer as workflows } from "./Workflows.ts";
+import { advanceWorkflowVmPreparation } from "./WorkflowVmPreparation.ts";
+import { layer as workflows, Workflows } from "./Workflows.ts";
 
 const databaseUrl = process.env.LAUNCHPAD_WORKFLOW_RUN_CONFIG_TEST_DATABASE_URL;
 const database = Layer.effectDiscard(
@@ -208,6 +216,169 @@ const encodePayload = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))
 
 describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
   it.layer(services)((it) => {
+    for (const cancellation of [
+      "none",
+      "before",
+      "after",
+      "revoked",
+      "racing_before",
+      "racing_revoked",
+    ] as const) {
+      it.effect(`settles a rejected initial VM create with ${cancellation} cancellation`, () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          const run = yield* f.queue();
+          yield* run.accept;
+          const { jobId } = run.identity;
+          const threadId = `workflow:${jobId}`;
+          const identity = {
+            allocationId: jobId,
+            operationId: jobId,
+            generation: 1,
+            threadId,
+            resourceKind: "organization_workflow" as const,
+          };
+          yield* f.sql`UPDATE relay_workflow_jobs SET record=record || ${f.sql.json({
+            runtime: { kind: "vm", threadId },
+            vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
+            startAttempted: false,
+          })} WHERE job_id=${jobId}`;
+          yield* makeThreadPlacementStore(f.sql).prepareWorkflow({
+            ...f.scope,
+            threadId,
+            workflowJobId: jobId,
+            operationId: jobId,
+          });
+          yield* f.sql`INSERT INTO relay_thread_vm_allocations
+            (allocation_id,thread_id,organization_id,resource_kind,template_id,state,runtime_protocol)
+            VALUES (${jobId},${threadId},${f.scope.organizationId},'organization_workflow','template','creating','native-v1')`;
+          const snapshot = {
+            canonicalKey: "github.com/test/repo",
+            installationId: "42",
+            branch: "main",
+            commitSha: "a".repeat(40),
+            templateBuildId: "build",
+          };
+          yield* f.sql`INSERT INTO relay_thread_vm_provisions
+            (allocation_id,operation_id,generation,phase,workflow_snapshot)
+            VALUES (${jobId},${jobId},1,'creating',${f.sql.json(snapshot)})`;
+          yield* f.sql`INSERT INTO relay_thread_vm_setups(allocation_id,canonical_key,branch,revision)
+            VALUES (${jobId},${snapshot.canonicalKey},${snapshot.branch},${snapshot.commitSha})`;
+          yield* makeThreadVmCapacityStore(f.sql).configure(jobId, 1);
+          yield* f.sql`INSERT INTO relay_thread_vm_capacity
+            (operation_id,allocation_id,host_id,kind,state)
+            VALUES (${jobId},${jobId},${jobId},'create','started')`;
+          const cancel = f.sql`UPDATE relay_workflow_jobs SET status='cancelling',
+            record=record || '{"status":"cancelling"}',
+            pending_control=${f.sql.json({ userId: f.userId, response: { operation: "cancel" } })}
+            WHERE job_id=${jobId}`;
+          const racing = cancellation === "racing_before" || cancellation === "racing_revoked";
+          const revoked = cancellation === "revoked" || cancellation === "racing_revoked";
+          const cancelled = cancellation === "before" || cancellation === "racing_before";
+          if (cancelled || revoked) yield* cancel;
+          const provisions = makeThreadVmProvisionStore(f.sql);
+          const marker = cancelled || revoked ? "create_rejected_after_cancel" : "create_rejected";
+          const reject = Effect.gen(function* () {
+            expect(yield* provisions.rejectCreate(identity)).toBe(true);
+            expect((yield* provisions.get(jobId, "organization_workflow"))?.errorCode).toBe(marker);
+          });
+          if (!racing) yield* reject;
+          if (cancellation === "after") {
+            yield* cancel;
+            expect(yield* provisions.rejectCreate(identity)).toBe(true);
+            expect((yield* provisions.get(jobId, "organization_workflow"))?.errorCode).toBe(marker);
+          }
+          if (revoked)
+            yield* f.sql`DELETE FROM relay_organization_members
+              WHERE organization_id=${f.scope.organizationId} AND user_id=${f.userId}`;
+          yield* Effect.gen(function* () {
+            const store = yield* Workflows;
+            const advance = Effect.gen(function* () {
+              const row = yield* store.claim(jobId);
+              expect(row).not.toBeNull();
+              if (!row?.leaseUntil) return yield* Effect.die("Expected a workflow lease");
+              return yield* advanceWorkflowVmPreparation(row, row.leaseUntil).pipe(
+                Effect.ensuring(store.release(jobId, row.leaseUntil).pipe(Effect.orDie)),
+              );
+            });
+            if (racing) {
+              const checkedCancellation = yield* Deferred.make<void>();
+              const receiptRecorded = yield* Deferred.make<void>();
+              const staleAdvance = yield* Effect.forkChild(
+                advance.pipe(
+                  Effect.provideService(Workflows, {
+                    ...store,
+                    canSettleVmCancellation: (row) =>
+                      store.canSettleVmCancellation(row).pipe(
+                        Effect.tap(() => Deferred.succeed(checkedCancellation, undefined)),
+                        Effect.tap(() => Deferred.await(receiptRecorded)),
+                      ),
+                  }),
+                ),
+              );
+              // Preparation has been read, but cancellation has not locked the job yet.
+              yield* Deferred.await(checkedCancellation);
+              yield* reject;
+              const afterReceipt = yield* store.getJob(jobId);
+              yield* reject;
+              expect((yield* store.getJob(jobId))?.revision).toBe(afterReceipt?.revision);
+              yield* Deferred.succeed(receiptRecorded, undefined);
+              expect(yield* Fiber.join(staleAdvance)).toMatchObject({ status: "cancelling" });
+              expect(yield* store.getJob(jobId)).toMatchObject({
+                pendingControl: { userId: f.userId, response: { operation: "cancel" } },
+                record: { status: "cancelling" },
+              });
+            }
+            const settled = yield* advance;
+            expect(settled).toMatchObject({
+              status: cancelled ? "cancelled" : "failed",
+              detail: cancelled
+                ? "Cancelled before the workflow VM was created."
+                : "VM creation was rejected. Check the compute host configuration and start a new run.",
+              queueReason: null,
+            });
+            expect(yield* store.getJob(jobId)).toMatchObject({
+              record: settled,
+              pendingControl: null,
+            });
+            if (!cancelled) {
+              if (revoked)
+                yield* f.sql`INSERT INTO relay_organization_members
+                  (organization_id,user_id,role,created_at,updated_at)
+                  VALUES (${f.scope.organizationId},${f.userId},'admin','2026','2026')`;
+              expect(
+                yield* respondToWorkflowJob(
+                  { repositoryId: f.scope.repositoryId, jobId },
+                  { operation: "cancel" },
+                ),
+              ).toMatchObject({ status: "failed", detail: settled.detail });
+              expect(yield* store.getJob(jobId)).toMatchObject({
+                record: settled,
+                pendingControl: null,
+              });
+            }
+          }).pipe(
+            Effect.provideService(ThreadVmRuntimeConfiguration, { settings: undefined }),
+            Effect.provideService(RelayClientPrincipal, { userId: f.userId, token: "admin" }),
+            Effect.provide(
+              Layer.mergeAll(
+                organizations,
+                repositories,
+                machines,
+                catalog,
+                workflows,
+                Layer.mock(EnvironmentConnector)({}),
+                EffectNodeCrypto.layer,
+              ).pipe(
+                Layer.provideMerge(RelayTransactions.layer),
+                Layer.provideMerge(Layer.effect(RelayDb, PgDrizzle.makeWithDefaults())),
+              ),
+            ),
+          );
+        }),
+      );
+    }
+
     it.effect("keeps the first snapshot across rotation, removal and replay", () =>
       Effect.gen(function* () {
         const f = yield* fixture();
@@ -517,6 +688,7 @@ describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
           record=record || ${f.sql.json({ status: "awaiting_review", progress })}
           WHERE job_id=${jobId}`;
         let offline = true;
+        let oldProtocol = false;
         let revokeDuringProbe = false;
         let approvals = 0;
         const revokeViewer = f.sql`DELETE FROM relay_repository_access
@@ -540,7 +712,7 @@ describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
               return {
                 accepted: true,
                 workflowResult: {
-                  protocol: WORKFLOW_PROTOCOL,
+                  protocol: oldProtocol ? 8 : WORKFLOW_PROTOCOL,
                   outcome: "accepted",
                   detail: null,
                   progress: approved
@@ -563,8 +735,28 @@ describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
           expect(
             yield* respondToWorkflowJob(scope, { operation: "approve", ...response }),
           ).toMatchObject({ responsePending: true, pendingResponseOperation: "approve" });
+          yield* authorizeWorkflowRepository(repositoryId);
+          expect(yield* refreshWorkflowJobForClient(jobId)).toMatchObject({
+            status: "awaiting_review",
+            detail:
+              "Could not reach the workflow VM or confirm its response. Launchpad will retry automatically.",
+            progress,
+            responsePending: true,
+            pendingResponseOperation: "approve",
+          });
           expect(approvals).toBe(0);
           offline = false;
+          oldProtocol = true;
+          yield* authorizeWorkflowRepository(repositoryId);
+          expect(yield* refreshWorkflowJobForClient(jobId)).toMatchObject({
+            status: "awaiting_review",
+            detail: "Update this environment before responding to this workflow.",
+            progress,
+            responsePending: true,
+            pendingResponseOperation: "approve",
+          });
+          expect(approvals).toBe(0);
+          oldProtocol = false;
           revokeDuringProbe = true;
           expect((yield* refreshWorkflowJob(jobId))?.detail).toContain("no longer has permission");
           expect(approvals).toBe(0);
@@ -574,6 +766,10 @@ describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
           expect(
             (yield* respondToWorkflowJob(scope, { operation: "approve", ...response })).status,
           ).toBe("done");
+          yield* authorizeWorkflowRepository(repositoryId);
+          const completed = yield* refreshWorkflowJobForClient(jobId);
+          expect(completed).toMatchObject({ status: "done", detail: null, responsePending: false });
+          expect(completed).not.toHaveProperty("pendingResponseOperation");
           expect((yield* refreshWorkflowJob(jobId))?.status).toBe("done");
           expect((yield* refreshWorkflowJob(jobId))?.status).toBe("done");
           expect(approvals).toBe(1);

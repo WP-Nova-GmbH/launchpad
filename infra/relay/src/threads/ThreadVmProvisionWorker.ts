@@ -221,8 +221,8 @@ export function makeThreadVmProvisionWorker(
           ),
         );
         if (!admitted) return;
-        yield* finish(
-          yield* compute.create(
+        const created = yield* compute
+          .create(
             {
               allocationId: row.allocationId,
               operationId: row.operationId,
@@ -231,8 +231,26 @@ export function makeThreadVmProvisionWorker(
               environment: {},
             },
             selectedTemplate,
-          ),
-        );
+          )
+          .pipe(
+            Effect.catchTag("ThreadVmComputeError", (error) => {
+              if (!error.createRejected) return Effect.fail(error);
+              return store
+                .rejectCreate({
+                  allocationId: row.allocationId,
+                  operationId: row.operationId,
+                  generation: row.generation,
+                  threadId: row.threadId,
+                  resourceKind: row.resourceKind,
+                })
+                .pipe(
+                  Effect.flatMap((settled) =>
+                    settled ? Effect.succeed(null) : Effect.fail(error),
+                  ),
+                );
+            }),
+          );
+        if (created) yield* finish(created);
         return;
       }
       if (row.computeRef) {

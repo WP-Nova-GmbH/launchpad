@@ -362,6 +362,94 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
       );
     },
   );
+  /** A confirmed create rejection settles the original intent even after its worker lease expires. */
+  const rejectCreate = Effect.fn("relay.thread_vm_provision.reject_create")(function* (
+    input: Pick<
+      ThreadVmProvision,
+      "allocationId" | "operationId" | "generation" | "threadId" | "resourceKind"
+    >,
+  ) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        // Match cancellation's job -> placement -> allocation -> provision lock order.
+        let cancellationRequested = false;
+        if (input.resourceKind === "organization_workflow") {
+          const [job] = yield* sql<{ cancellationRequested: boolean }>`
+            SELECT COALESCE(pending_control#>>'{response,operation}' IN ('cancel','retry_cancellation'),false)
+              OR COALESCE((record->>'vmCancellationConfirmed')::boolean,false) AS "cancellationRequested"
+            FROM relay_workflow_jobs WHERE job_id=${input.allocationId}
+              AND record#>>'{runtime,kind}'='vm' AND record#>>'{runtime,threadId}'=${input.threadId}
+            FOR NO KEY UPDATE`;
+          if (!job) return yield* conflict("Workflow creation identity changed");
+          cancellationRequested = job.cancellationRequested;
+        }
+        const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
+          WHERE thread_id=${input.threadId} FOR NO KEY UPDATE`;
+        if (!placement) return yield* conflict("Creation thread no longer exists");
+        const coordinated = yield* sql`SELECT 1 FROM relay_thread_vm_move_destinations
+          WHERE allocation_id=${input.allocationId}
+          UNION ALL SELECT 1 FROM relay_thread_vm_resets WHERE allocation_id=${input.allocationId}`;
+        if (coordinated.length) return false;
+
+        const [allocation] = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
+          WHERE allocation_id=${input.allocationId} AND thread_id=${input.threadId}
+            AND resource_kind=${input.resourceKind} AND runtime_protocol='native-v1' FOR UPDATE`;
+        if (!allocation) return yield* conflict("Creation allocation identity changed");
+        yield* sql`SELECT allocation_id FROM relay_thread_vm_provisions
+          WHERE allocation_id=${input.allocationId} FOR UPDATE`;
+        const row = yield* get(input.allocationId, input.resourceKind);
+        if (
+          !row ||
+          row.operationId !== input.operationId ||
+          row.generation !== input.generation ||
+          row.computeRef !== null ||
+          row.ingressRecoveryClaimId !== null ||
+          (row.resourceKind === "organization_workflow" && row.workflowSnapshot === null)
+        )
+          return yield* conflict("Creation rejection no longer matches the admitted operation");
+        const [reservation] = yield* sql<{ state: string; computeRef: string | null }>`
+          SELECT state,compute_ref AS "computeRef" FROM relay_thread_vm_capacity
+          WHERE operation_id=${input.operationId} AND allocation_id=${input.allocationId}
+            AND kind='create' FOR UPDATE`;
+        if (!reservation || reservation.computeRef !== null)
+          return yield* conflict("Creation capacity belongs to another execution");
+        if (
+          row.phase === "cancelled" &&
+          row.allocationState === "deleted" &&
+          reservation.state === "released" &&
+          (row.errorCode === "create_rejected" || row.errorCode === "create_rejected_after_cancel")
+        )
+          return true;
+        if (
+          row.phase !== "creating" ||
+          !["creating", "deleting"].includes(row.allocationState) ||
+          reservation.state !== "started"
+        )
+          return yield* conflict("Creation no longer accepts a rejection receipt");
+
+        yield* allocations.requestDeletion(input.allocationId, input.resourceKind);
+        const released = yield* sql`UPDATE relay_thread_vm_capacity SET state='released'
+          WHERE operation_id=${input.operationId} AND allocation_id=${input.allocationId}
+            AND kind='create' AND state='started' AND compute_ref IS NULL RETURNING operation_id`;
+        if (!released.length) return yield* conflict("Creation capacity changed before rejection");
+        yield* allocations.confirmDeleted({
+          allocationId: input.allocationId,
+          computeRef: null,
+          resourceKind: input.resourceKind,
+        });
+        const errorCode = cancellationRequested
+          ? "create_rejected_after_cancel"
+          : "create_rejected";
+        yield* sql`UPDATE relay_thread_vm_provisions SET phase='cancelled',claim_id=NULL,claim_until=NULL,
+          revision=revision+1,error_code=${errorCode} WHERE allocation_id=${input.allocationId}`;
+        // Fence refreshes that read preparation before this receipt acquired the job lock.
+        if (input.resourceKind === "organization_workflow")
+          yield* sql`UPDATE relay_workflow_jobs SET revision=revision+1
+            WHERE job_id=${input.allocationId}`;
+        return true;
+      }),
+    );
+  });
   const claimEnrollment = Effect.fn("relay.thread_vm_provision.claim_enrollment")(function* (
     claimId: string,
     hostId: string,
@@ -580,6 +668,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     defer,
     cancelUnstarted,
     rejectUnstarted,
+    rejectCreate,
     claimStartup,
     claimMoveStartup,
     releaseStartupClaim,
