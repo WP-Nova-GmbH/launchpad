@@ -13,6 +13,30 @@ const principal = {
 };
 const path = "/v1/environments/vm-env/threads/private-thread";
 describe("thread VM credential HTTP boundary", () => {
+  it.each(["attempt", "review-secrets"])(
+    "permits workflow %s only for the assigned thread",
+    (action) => {
+      const workflowThreadId = ThreadId.make(`workflow:${"a".repeat(64)}`);
+      const workflowPrincipal = {
+        ...principal,
+        threadVm: { ...principal.threadVm, threadId: workflowThreadId },
+      };
+      const url = `/v1/environments/vm-env/threads/${encodeURIComponent(workflowThreadId)}/workflow/${action}`;
+      expect(threadVmCredentialAllows(workflowPrincipal, "POST", url)).toBe(true);
+      for (const method of ["GET", "PUT", "DELETE"])
+        expect(threadVmCredentialAllows(workflowPrincipal, method, url)).toBe(false);
+      for (const forbidden of [
+        url.replace("vm-env", "another-env"),
+        url.replace(encodeURIComponent(workflowThreadId), "another-thread"),
+        url + "/extra",
+        url + "/",
+        url.replace(`/workflow/${action}`, `/workflow%2F${action}`),
+        url.replace(`/workflow/${action}`, "/workflow/another"),
+      ])
+        expect(threadVmCredentialAllows(workflowPrincipal, "POST", forbidden)).toBe(false);
+    },
+  );
+
   it("permits only the assigned thread's command/history/work protocol", () => {
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/github")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/codex")).toBe(true);

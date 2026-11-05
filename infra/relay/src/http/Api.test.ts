@@ -34,7 +34,7 @@ import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   RelayEnvironmentAuth,
   RelayEnvironmentPrincipal,
@@ -305,6 +305,84 @@ describe("relay DPoP failure mapping", () => {
 });
 
 describe("relay environment authentication", () => {
+  it.effect.each(["attempt", "review-secrets"] as const)(
+    "authorizes only the assigned VM thread's workflow/%s requests",
+    (endpoint) => {
+      const principal = {
+        credentialId: "vm-credential",
+        environmentId: "workflow-vm",
+        environmentPublicKey: "vm-public-key",
+        threadVm: {
+          allocationId: "workflow-allocation",
+          threadId: ThreadId.make("workflow:" + "a".repeat(64)),
+          repositoryId: "workflow-repository",
+          generation: 1,
+        },
+      };
+      const path = `/v1/environments/${principal.environmentId}/threads/${encodeURIComponent(principal.threadVm.threadId)}/workflow/${endpoint}`;
+      const credentials: EnvironmentCredentials.EnvironmentCredentials["Service"] = {
+        create: () => Effect.die("unused create"),
+        authenticate: () => Effect.succeed(Option.some(principal)),
+        revokeForEnvironmentPublicKey: () => Effect.die("unused revoke"),
+      };
+
+      return Effect.gen(function* () {
+        const auth = yield* RelayEnvironmentAuth;
+        for (const [method, url, expected] of [
+          ["POST", path, true],
+          ["POST", path.replace("workflow-vm", "other-vm"), false],
+          [
+            "POST",
+            path.replace(encodeURIComponent(principal.threadVm.threadId), "other-thread"),
+            false,
+          ],
+          ["GET", path, false],
+          ["PUT", path, false],
+          ["POST", path + "/extra", false],
+        ] as const) {
+          let reachedHandler = false;
+          const allowed = yield* auth
+            .environmentBearer(
+              Effect.gen(function* () {
+                expect(yield* RelayEnvironmentPrincipal).toEqual(principal);
+                reachedHandler = true;
+                return HttpServerResponse.empty();
+              }),
+              {
+                credential: Redacted.make("vm-credential"),
+                endpoint: {} as never,
+                group: {} as never,
+              },
+            )
+            .pipe(
+              Effect.as(true),
+              Effect.catchTag("RelayAuthInvalidError", (error) => {
+                expect(error.reason).toBe("not_authorized");
+                return Effect.succeed(false);
+              }),
+              Effect.provideService(
+                HttpServerRequest.HttpServerRequest,
+                HttpServerRequest.fromWeb(new Request("https://relay.test" + url, { method })),
+              ),
+            );
+          expect(allowed).toBe(expected);
+          expect(reachedHandler).toBe(expected);
+        }
+      }).pipe(
+        Effect.provideService(HttpServerRequest.ParsedSearchParams, {}),
+        Effect.provideService(HttpRouter.RouteContext, { params: {}, route: {} as never }),
+        Effect.provide(
+          relayEnvironmentAuthLayer.pipe(
+            Layer.provide(
+              Layer.succeed(EnvironmentCredentials.EnvironmentCredentials, credentials),
+            ),
+          ),
+        ),
+        Effect.scoped,
+      );
+    },
+  );
+
   it.effect("preserves credential lookup persistence failures as internal errors", () => {
     const failure = new EnvironmentCredentials.EnvironmentCredentialAuthenticatePersistenceError({
       stage: "lookup-credential",
