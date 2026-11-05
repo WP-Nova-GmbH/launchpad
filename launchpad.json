@@ -4,7 +4,8 @@
       "name": "Verify disposable P04 configuration",
       "command": "node p04-setup.mjs",
       "icon": "configure",
-      "runOnWorktreeCreate": true
+      "runOnWorktreeCreate": true,
+      "async": false
     }
   ]
 }
