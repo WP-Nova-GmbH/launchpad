@@ -1,7 +1,9 @@
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -52,30 +54,58 @@ import { getCodexServiceTierOptionValue } from "../codexModelOptions.ts";
 
 const CODEX_TIMEOUT_MS = 180_000;
 const encodeJsonString = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
-const decodeApprovalResponseTerminal = Schema.decodeUnknownResult(
+const decodeApprovalEventType = Schema.decodeUnknownResult(
+  Schema.fromJsonString(Schema.Struct({ type: Schema.String })),
+);
+const decodeApprovalJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeApprovalOutputItemEvent = Schema.decodeUnknownResult(
   Schema.fromJsonString(
-    Schema.Union([
-      Schema.Struct({
-        type: Schema.Literal("response.completed"),
-        response: Schema.Struct({
-          status: Schema.Literal("completed"),
-          output: Schema.Array(Schema.Unknown),
-        }),
+    Schema.Struct({
+      type: Schema.Literals(["response.output_item.added", "response.output_item.done"]),
+      output_index: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      item: Schema.Unknown,
+    }),
+  ),
+);
+const isApprovalOutputIdentity = Schema.is(
+  Schema.Struct({
+    id: Schema.String.check(Schema.isMinLength(1)),
+    type: Schema.Literals(["message", "reasoning"]),
+  }),
+);
+const isOutputItemWithId = Schema.is(Schema.Struct({ id: Schema.String }));
+const decodeCompletedApprovalResponse = Schema.decodeUnknownResult(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("response.completed"),
+      response: Schema.Struct({
+        status: Schema.Literal("completed"),
+        output: Schema.Array(Schema.Unknown),
       }),
-      Schema.Struct({ type: Schema.Literals(["response.failed", "response.incomplete", "error"]) }),
-    ]),
+    }),
   ),
 );
 const isAssistantMessage = Schema.is(
   Schema.Struct({
     type: Schema.Literal("message"),
     role: Schema.Literal("assistant"),
+    status: Schema.optionalKey(Schema.Unknown),
     content: Schema.Array(Schema.Unknown),
   }),
 );
 const isOutputText = Schema.is(
   Schema.Struct({ type: Schema.Literal("output_text"), text: Schema.String }),
 );
+const isCompletedAssistantMessage = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("message"),
+    role: Schema.Literal("assistant"),
+    status: Schema.Literal("completed"),
+    content: Schema.Array(Schema.Unknown),
+  }),
+);
+const isRefusal = Schema.is(Schema.Struct({ type: Schema.Literal("refusal") }));
+const isTextGenerationError = Schema.is(TextGenerationError);
 /**
  * Build a Codex text-generation closure bound to a specific `CodexSettings`
  * payload. See `makeCodexAdapter` for the overall per-instance rationale.
@@ -482,25 +512,22 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     modelSelection: ModelSelection,
   ) {
     const operation = "generateApprovalVerdict";
-    const unavailable = () =>
+    const failure = (kind: keyof typeof TextGeneration.WORKFLOW_APPROVAL_FAILURE_DETAILS) =>
       new TextGenerationError({
         operation,
-        detail: "The workflow supervisor could not reach Codex.",
-      });
-    const invalid = () =>
-      new TextGenerationError({
-        operation,
-        detail: "Codex did not return a complete workflow approval verdict.",
+        detail: TextGeneration.WORKFLOW_APPROVAL_FAILURE_DETAILS[kind],
       });
     const mintToken = managedAuth?.mintToken;
-    if (!mintToken) return yield* unavailable();
-    const model = yield* resolveModel(operation, modelSelection);
+    if (!mintToken) return yield* failure("credential");
+    const model = yield* resolveModel(operation, modelSelection).pipe(
+      Effect.mapError(() => failure("preflight")),
+    );
     const effort =
       getModelSelectionStringOptionValue(modelSelection, "reasoningEffort") ??
       DEFAULT_TEXT_GENERATION_REASONING_EFFORT;
     return yield* Effect.gen(function* () {
       const http = HttpClient.withScope(yield* HttpClient.HttpClient);
-      const token = yield* mintToken.pipe(Effect.mapError(unavailable));
+      const token = yield* mintToken.pipe(Effect.mapError(() => failure("credential")));
       // Keep the organization credential in the coordinator, and make a tool-free
       // structured request independent of the workflow checkout and its config.
       const response = yield* HttpClientRequest.post("https://api.openai.com/v1/responses").pipe(
@@ -524,35 +551,150 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           },
         }),
         Effect.flatMap(http.execute),
-        Effect.mapError(unavailable),
+        Effect.mapError(() => failure("transport")),
       );
-      if (response.status < 200 || response.status >= 300) return yield* unavailable();
-      if (!response.headers["content-type"]?.startsWith("text/event-stream"))
-        return yield* invalid();
+      if (response.status < 200 || response.status >= 300) {
+        yield* Effect.logWarning("workflow approval HTTP request failed", {
+          status: response.status,
+        });
+        return yield* failure("http");
+      }
+      const contentType = response.headers["content-type"];
+      // Managed Codex can omit Content-Type. The SSE terminal and verdict still
+      // have to validate; an explicitly different format is never accepted.
+      if (
+        contentType !== undefined &&
+        contentType.split(";", 1)[0]?.trim().toLowerCase() !== "text/event-stream"
+      )
+        return yield* failure("contentType");
+      const addedItems = new Map<number, { readonly id: string; readonly type: string }>();
+      const addedIds = new Set<string>();
+      const completedItems = new Map<number, unknown>();
+      const completedIds = new Set<string>();
       const terminal = yield* response.stream.pipe(
         Stream.decodeText(),
         Stream.pipeThroughChannel(Sse.decode({ maxEventSize: 1024 * 1024 })),
-        Stream.filterMap((event) => decodeApprovalResponseTerminal(event.data)),
+        Stream.filterMapEffect((event) =>
+          Effect.gen(function* () {
+            if (event.data === "[DONE]") return Result.fail(undefined);
+            const decodedType = decodeApprovalEventType(event.data);
+            if (Result.isFailure(decodedType)) return yield* failure("stream");
+            switch (decodedType.success.type) {
+              case "response.output_item.added":
+              case "response.output_item.done": {
+                const decoded = decodeApprovalOutputItemEvent(event.data);
+                if (Result.isFailure(decoded)) return yield* failure("outputItem");
+                const { output_index: index, item } = decoded.success;
+                if (!isApprovalOutputIdentity(item)) return yield* failure("outputItem");
+                if (decoded.success.type === "response.output_item.added") {
+                  if (
+                    addedItems.has(index) ||
+                    addedIds.has(item.id) ||
+                    completedItems.has(index) ||
+                    completedIds.has(item.id)
+                  )
+                    return yield* failure("conflictingOutput");
+                  addedItems.set(index, { id: item.id, type: item.type });
+                  addedIds.add(item.id);
+                } else {
+                  const added = addedItems.get(index);
+                  if (
+                    completedItems.has(index) ||
+                    completedIds.has(item.id) ||
+                    (addedIds.has(item.id) && added?.id !== item.id) ||
+                    (added && (added.id !== item.id || added.type !== item.type))
+                  )
+                    return yield* failure("conflictingOutput");
+                  if (item.type === "message" && !isCompletedAssistantMessage(item))
+                    return yield* failure("outputItem");
+                  completedItems.set(index, item);
+                  completedIds.add(item.id);
+                }
+                return Result.fail(undefined);
+              }
+              case "response.failed":
+                return yield* failure("failed");
+              case "response.incomplete":
+                return yield* failure("incomplete");
+              case "error":
+                return yield* failure("upstreamError");
+              case "response.completed": {
+                const decoded = decodeCompletedApprovalResponse(event.data);
+                if (Result.isFailure(decoded)) return yield* failure("malformedTerminal");
+                return Result.succeed(decoded.success);
+              }
+              default:
+                return Result.fail(undefined);
+            }
+          }),
+        ),
         Stream.runHead,
-        Effect.mapError(invalid),
+        Effect.mapError((error) => (isTextGenerationError(error) ? error : failure("stream"))),
       );
-      if (Option.isNone(terminal) || terminal.value.type !== "response.completed")
-        return yield* invalid();
-      const messages = terminal.value.response.output.filter(isAssistantMessage);
+      if (Option.isNone(terminal)) return yield* failure("missingTerminal");
+      const terminalOutput = terminal.value.response.output;
+      // Managed streaming completions can omit the final output snapshot. Only
+      // complete item receipts can fill it; text deltas never establish a verdict.
+      let output = terminalOutput;
+      if (terminalOutput.length > 0) {
+        const snapshotIds = new Set<string>();
+        for (const item of terminalOutput) {
+          if (!isOutputItemWithId(item)) continue;
+          if (snapshotIds.has(item.id)) return yield* failure("conflictingOutput");
+          snapshotIds.add(item.id);
+        }
+        for (const [index, item] of completedItems)
+          if (!Equal.equals(item, terminalOutput[index]))
+            return yield* failure("conflictingOutput");
+        for (const [index, identity] of addedItems) {
+          const item = terminalOutput[index];
+          if (
+            !isApprovalOutputIdentity(item) ||
+            identity.id !== item.id ||
+            identity.type !== item.type
+          )
+            return yield* failure("conflictingOutput");
+        }
+      } else {
+        const ordered = Array.from(completedItems.entries()).sort(
+          ([left], [right]) => left - right,
+        );
+        if (
+          ordered.some(([index], position) => index !== position) ||
+          Array.from(addedItems.keys()).some((index) => !completedItems.has(index))
+        )
+          return yield* failure("outputItem");
+        output = ordered.map(([, item]) => item);
+      }
+      const messages = output.filter(isAssistantMessage);
+      if (
+        messages.some((message) => message.status !== undefined && message.status !== "completed")
+      )
+        return yield* failure("outputItem");
       const content = messages[0]?.content;
       const text = content?.[0];
-      if (messages.length !== 1 || content?.length !== 1 || !isOutputText(text))
-        return yield* invalid();
-      return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(outputSchema))(text.text, {
+      if (content?.some(isRefusal)) return yield* failure("refusal");
+      if (messages.length !== 1 || content?.length !== 1 || !isOutputText(text)) {
+        yield* Effect.logWarning("workflow approval output shape was unsupported", {
+          outputCount: output.length,
+          assistantMessageCount: messages.length,
+          contentCount: content?.length ?? 0,
+        });
+        return yield* failure("output");
+      }
+      const verdict = yield* decodeApprovalJson(text.text).pipe(
+        Effect.mapError(() => failure("verdictJson")),
+      );
+      return yield* Schema.decodeUnknownEffect(outputSchema)(verdict, {
         onExcessProperty: "error",
-      }).pipe(Effect.mapError(invalid));
+      }).pipe(Effect.mapError(() => failure("verdictSchema")));
     }).pipe(
       Effect.scoped,
       Effect.provide(FetchHttpClient.layer),
       Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
       Effect.timeoutOrElse({
         duration: CODEX_TIMEOUT_MS,
-        orElse: () => Effect.fail(unavailable()),
+        orElse: () => Effect.fail(failure("timeout")),
       }),
       Effect.withTracerEnabled(false),
     );

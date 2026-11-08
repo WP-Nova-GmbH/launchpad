@@ -2,6 +2,7 @@ import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { canRecoverPrivateThreadLocation } from "@t3tools/client-runtime/relay/workflow-result";
 import { useAtomValue } from "@effect/atom-react";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
@@ -62,6 +63,7 @@ import { resolveThreadSyncPhase } from "../threadSync";
 export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const navigate = useNavigate();
   const handoff = useLocation({ select: (location) => location.state.threadMoveHandoff });
+  const workflowOrigin = useLocation({ select: (location) => location.state.workflowOrigin });
   const environments = useEnvironments();
   const reconnect = useAtomCommand(environmentCatalog.retryNow);
   const relaySession = useAtomValue(managedRelaySessionAtom);
@@ -102,9 +104,16 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   const serverThreadStatus = useThreadStatus(serverThreadRef);
   const environmentThreadRefs = useEnvironmentThreadRefs(serverThreadRef?.environmentId ?? null);
   const bootstrapComplete = shell.data?.snapshot._tag === "Some";
-  const connection = serverThreadRef
-    ? environments.presentationById.get(serverThreadRef.environmentId)?.connection
+  const environment = serverThreadRef
+    ? environments.presentationById.get(serverThreadRef.environmentId)
     : undefined;
+  const connection = environment?.connection;
+  const privateLocationRecovery = canRecoverPrivateThreadLocation({
+    capabilities: environment?.serverConfig?.environment.capabilities,
+    origin: workflowOrigin,
+    accountId: relaySession?.accountId,
+    threadId: serverThreadRef?.threadId,
+  });
   const relayUrl = handoff ? threadMoveRelayUrl() : null;
   const handoffCurrent = useAtomValue(
     portableThreadPlacementsAtom,
@@ -336,7 +345,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
               size="sm"
               variant="secondary"
               onClick={() => {
-                if (openingHandoff)
+                if (openingHandoff && privateLocationRecovery)
                   appAtomRegistry.refresh(
                     threadVmControls.locationQueryAtom(
                       target.threadRef.environmentId,
@@ -358,7 +367,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   return (
     <SidebarInset className="h-svh min-h-0 overflow-hidden overscroll-y-none md:h-dvh">
       <WorkflowResultReturn />
-      {target.kind === "server" ? (
+      {target.kind === "server" && privateLocationRecovery ? (
         <CurrentThreadLocation
           key={scopedThreadKey(target.threadRef)}
           environmentId={target.threadRef.environmentId}

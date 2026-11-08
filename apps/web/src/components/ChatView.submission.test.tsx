@@ -187,7 +187,7 @@ import { AppAtomRegistryProvider, appAtomRegistry } from "../rpc/atomRegistry";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import * as Effect from "effect/Effect";
 import { PrimaryConnectionTarget } from "@t3tools/client-runtime/connection";
-import { threadEnvironment } from "../state/threads";
+import { portableThreadCommands, threadEnvironment } from "../state/threads";
 import { makeSubmissionRuntime, preparationBarrier } from "./chat/submissionTestUtils";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore } from "../rightPanelStore";
@@ -316,7 +316,7 @@ beforeEach(() => {
           showInteractionModeToggle: true,
         },
       ],
-      environment: { capabilities: {}, platform: { machine: "local" } },
+      environment: { capabilities: {}, platform: { machine: "desktop" } },
       version: "0.1.7",
     } as unknown as ServerConfig,
   };
@@ -384,6 +384,29 @@ function switchAccount(accountId: string | null) {
   );
 }
 
+function renderedText() {
+  const text = (node: ReturnType<ReactTestRenderer["toJSON"]> | string): string => {
+    if (node === null) return "";
+    if (typeof node === "string") return node;
+    if (Array.isArray(node)) return node.map(text).join("");
+    return node.children?.map(text).join("") ?? "";
+  };
+  return text(renderer!.toJSON());
+}
+
+function observeQueuedCommands(error: string | null = "This thread is unavailable.") {
+  const state = Atom.make({
+    relayCommands: [],
+    environmentCommands: error === null ? [{ commandId: "queued-change" }] : [],
+    waitingForRelay: 0,
+    waitingForEnvironment: error === null ? 1 : 0,
+    hasMore: false,
+    rejections: [],
+    error,
+  });
+  return vi.spyOn(portableThreadCommands, "viewAtom").mockReturnValue(state);
+}
+
 afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
@@ -417,7 +440,11 @@ it.each(["workflow-link", "direct"] as const)(
       ],
     };
     const config = mocks.environment!.serverConfig!;
+    const queuedCommands = observeQueuedCommands();
     await render(resultThreadId);
+    expect(queuedCommands).toHaveBeenCalledWith(environmentId, resultThreadId);
+    expect(renderedText()).toContain("Queued changes could not be refreshed.");
+    queuedCommands.mockClear();
     const previous = composerProps();
     vi.spyOn(serverEnvironment, "configValueAtom").mockReturnValue(testServerConfig);
     mocks.checkpointDiff = {
@@ -461,6 +488,8 @@ it.each(["workflow-link", "direct"] as const)(
     });
     await act(async () => vi.dynamicImportSettled());
     const root = renderer!.root;
+    expect(queuedCommands).not.toHaveBeenCalled();
+    expect(renderedText()).not.toContain("Queued changes could not be refreshed.");
     expect(root.findAllByProps({ "data-submission-composer": true })).toHaveLength(0);
     const checkpoint = root.findByProps({ "data-submission-checkpoint-panel": true });
     expect(checkpoint.props.readOnly).toBe(true);
@@ -522,6 +551,123 @@ it.each(["workflow-link", "direct"] as const)(
     expect(mocks.fileMenu).not.toHaveBeenCalled();
     expect(transport.requests).toHaveLength(0);
     expect(transport.dispatched).toHaveLength(0);
+
+    mocks.thread = { ...mocks.thread!, id: threadId };
+    mocks.environment = { ...mocks.environment!, serverConfig: config };
+    mocks.locationState = {};
+    await act(async () => {
+      appAtomRegistry.set(testServerConfig, config);
+      renderer!.update(chatView(threadId));
+    });
+    expect(queuedCommands).toHaveBeenCalledWith(environmentId, threadId);
+    expect(renderedText()).toContain("Queued changes could not be refreshed.");
+  },
+);
+
+it.each(["direct", "workflow-link", "cold", "personal", "machine-workflow"] as const)(
+  "shows current provider health only for writable conversations: %s",
+  async (entry) => {
+    const resultReader = entry !== "personal" && entry !== "machine-workflow";
+    const id = ThreadId.make(entry === "personal" ? "personal" : `workflow:${entry}`);
+    const message =
+      "Could not verify this VM's Codex account with Launchpad Connect. Check the connection and retry.";
+    const config = mocks.environment!.serverConfig!;
+    mocks.thread = { ...mocks.thread!, id, workflowJob: null };
+    mocks.environment = {
+      ...mocks.environment!,
+      serverConfig:
+        entry === "cold"
+          ? null
+          : {
+              ...config,
+              providers: config.providers.map((provider) => ({
+                ...provider,
+                status: "warning",
+                auth: { status: "unknown" },
+                message,
+              })),
+              environment: {
+                ...config.environment,
+                capabilities:
+                  entry === "workflow-link"
+                    ? { ...config.environment.capabilities }
+                    : { ...config.environment.capabilities, workflowVmResultReader: resultReader },
+              },
+            },
+    };
+    if (entry === "workflow-link" || entry === "machine-workflow") {
+      mocks.locationState = {
+        workflowOrigin: {
+          accountId: "alice",
+          organizationId: "org",
+          repositoryId: RelayRepositoryId.make("repo"),
+          jobId: entry,
+          threadId: id,
+          workflowVmResultReader: true,
+        },
+      };
+    }
+
+    await render(id);
+
+    if (resultReader) {
+      expect(renderedText()).toContain("This workflow result is read-only.");
+      expect(renderedText()).not.toContain(message);
+    } else expect(renderedText()).toContain(message);
+  },
+);
+
+it("does not read personal queued commands when opening a direct VM result before config arrives", async () => {
+  const resultThreadId = ThreadId.make("workflow:cold-result");
+  const config = mocks.environment!.serverConfig!;
+  mocks.thread = { ...mocks.thread!, id: resultThreadId, workflowJob: null };
+  mocks.environment = { ...mocks.environment!, serverConfig: null };
+  const queuedCommands = observeQueuedCommands();
+
+  await render(resultThreadId);
+  expect(renderedText()).toContain("This workflow result is read-only.");
+  expect(queuedCommands).not.toHaveBeenCalled();
+  expect(renderedText()).not.toContain("Queued changes could not be refreshed.");
+
+  mocks.environment = {
+    ...mocks.environment!,
+    serverConfig: {
+      ...config,
+      environment: {
+        ...config.environment,
+        capabilities: { ...config.environment.capabilities, workflowVmResultReader: true },
+      },
+    },
+  };
+  await act(async () => renderer!.update(chatView(resultThreadId)));
+  expect(queuedCommands).not.toHaveBeenCalled();
+  expect(renderedText()).not.toContain("Queued changes could not be refreshed.");
+});
+
+it.each(["personal", "machine-workflow"] as const)(
+  "keeps queued changes visible in an offline writable %s thread",
+  async (kind) => {
+    const writableThreadId = ThreadId.make(kind === "personal" ? "personal" : "workflow:machine");
+    const config = mocks.environment!.serverConfig!;
+    mocks.thread = { ...mocks.thread!, id: writableThreadId };
+    mocks.environment = {
+      ...mocks.environment!,
+      connection: { phase: "offline", error: null, traceId: null },
+      serverConfig: {
+        ...config,
+        environment: {
+          ...config.environment,
+          capabilities: { ...config.environment.capabilities, workflowVmResultReader: false },
+        },
+      },
+    };
+    const queuedCommands = observeQueuedCommands(null);
+
+    await render(writableThreadId);
+
+    expect(queuedCommands).toHaveBeenCalledWith(environmentId, writableThreadId);
+    expect(renderedText()).toContain("waiting for this");
+    expect(renderedText()).not.toContain("This workflow result is read-only.");
   },
 );
 

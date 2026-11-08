@@ -158,6 +158,8 @@ export const WorkflowRun = Schema.Struct({
     Schema.NullOr(
       Schema.Struct({
         commandId: Schema.String,
+        /** Native VM cleanup keeps its original seal when orchestration retries use a new command. */
+        workloadCancellationId: Schema.optional(Schema.String),
         createdAt: Schema.String,
         setupCleanup: Schema.optional(SetupCleanup),
       }),

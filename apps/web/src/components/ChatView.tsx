@@ -3877,12 +3877,11 @@ export default function ChatView(props: ChatViewProps) {
       setDismissedProviderStatusBannerKey(null);
     }
   }, [dismissedProviderStatusBannerKey, providerStatusBannerKey]);
-  const visibleProviderStatus = shouldShowProviderStatusBanner(
-    activeProviderStatus,
-    dismissedProviderStatusBannerKey,
-  )
-    ? activeProviderStatus
-    : null;
+  const visibleProviderStatus =
+    canUseLiveWorkspace &&
+    shouldShowProviderStatusBanner(activeProviderStatus, dismissedProviderStatusBannerKey)
+      ? activeProviderStatus
+      : null;
   const hasTimelineTopBanner = Boolean(visibleThreadError) || visibleProviderStatus !== null;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
@@ -10238,11 +10237,13 @@ export default function ChatView(props: ChatViewProps) {
           />
         </WorkspacePageHeader>
 
-        <PortableThreadCommandStatus
-          environmentId={activeThread.environmentId}
-          threadId={activeThread.id}
-          representedMessageIds={relayRepresentedMessageIds}
-        />
+        {canUseLiveWorkspace ? (
+          <PortableThreadCommandStatus
+            environmentId={activeThread.environmentId}
+            threadId={activeThread.id}
+            representedMessageIds={relayRepresentedMessageIds}
+          />
+        ) : null}
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">
           {/* Chat column */}

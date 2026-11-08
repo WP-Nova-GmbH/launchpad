@@ -3426,6 +3426,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             !sessions.has(threadId) &&
             Array.from(confirmedStops.values()).includes(threadId),
       ),
+    isSessionWriterStopConfirmed: (threadId, episode) =>
+      Effect.sync(() => !pendingStarts.has(episode) && closedVmWriters.get(episode) === threadId),
     getSessionRuntimeEpisode: (threadId) =>
       Effect.sync(() => sessions.get(threadId)?.runtimeEpisode),
     releaseSessionStopConfirmation: (threadId, episode) =>

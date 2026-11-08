@@ -33,6 +33,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ServerConfig } from "../config.ts";
@@ -66,7 +67,7 @@ import {
   ThreadVmCodexAuthSourceError,
 } from "./ThreadVmCodexAuthSource.ts";
 import { THREAD_VM_IDENTITY_SECRET } from "./ThreadVmEnrollment.ts";
-import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
+import { VmWorkloadMaintenance, VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { ThreadExecution } from "./ThreadExecution.ts";
 import { makeThreadExecutionRelay } from "./ThreadExecutionRelay.ts";
 
@@ -2029,8 +2030,10 @@ for (const lost of [
                   };
                   let authReads = 0;
                   let authLost = true;
+                  const maintenance = yield* Semaphore.make(1);
                   const tracked = Layer.mergeAll(
                     Layer.succeed(VmWorkloadTracking, true),
+                    Layer.succeed(VmWorkloadMaintenance, maintenance),
                     Layer.succeed(ServerEnvironmentIdentity, {
                       getEnvironmentId: Effect.succeed(destinationId),
                     }),
@@ -2787,8 +2790,10 @@ for (const reportFault of ["none", "lookup", "journal", "controller"] as const)
                 generation: 2,
               },
             };
+            const maintenance = yield* Semaphore.make(1);
             const vmLayer = Layer.mergeAll(
               Layer.succeed(VmWorkloadTracking, true),
+              Layer.succeed(VmWorkloadMaintenance, maintenance),
               Layer.succeed(ServerEnvironmentIdentity, {
                 getEnvironmentId: Effect.succeed(destinationId),
               }),

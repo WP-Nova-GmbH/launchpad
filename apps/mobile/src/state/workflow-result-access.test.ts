@@ -67,10 +67,26 @@ describe("workflow result access", () => {
   });
 
   it("keeps a direct workflow VM link read-only without navigation state", () => {
-    expect(resolveWorkflowResultAccess(null, undefined, "thread").workspaceEnabled).toBe(false);
-    expect(
-      resolveWorkflowResultAccess({ workflowVmResultReader: true }, undefined, "thread"),
-    ).toEqual({
+    for (const capabilities of [null, { workflowVmResultReader: true }]) {
+      expect(resolveWorkflowResultAccess(capabilities, undefined, "workflow:job")).toEqual({
+        readOnly: true,
+        workspaceEnabled: false,
+      });
+    }
+  });
+
+  it.each(["thread", "workflow:job:agent", null])(
+    "preserves ordinary chat access while configuration loads: %s",
+    (threadId) => {
+      expect(resolveWorkflowResultAccess(null, undefined, threadId)).toEqual({
+        readOnly: false,
+        workspaceEnabled: false,
+      });
+    },
+  );
+
+  it("keeps a cold VM result read-only with an unrelated navigation origin", () => {
+    expect(resolveWorkflowResultAccess(null, vmResult, "workflow:job")).toEqual({
       readOnly: true,
       workspaceEnabled: false,
     });
@@ -86,6 +102,9 @@ describe("workflow result access", () => {
   });
 
   it("prefers the server capability and ignores hints from another conversation", () => {
+    expect(
+      resolveWorkflowResultAccess({ workflowVmResultReader: false }, undefined, "workflow:job"),
+    ).toEqual({ readOnly: false, workspaceEnabled: true });
     expect(
       resolveWorkflowResultAccess({ workflowVmResultReader: false }, vmResult, "thread")
         .workspaceEnabled,

@@ -24,10 +24,13 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
 import { workflowReviewSecretMatcher, WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
+import { withWorkflowVmCancelledCheckpointRead } from "../relay/WorkflowVmCancellation.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import {
   CheckpointDiffResultInvalidError,
   CheckpointRefUnavailableError,
@@ -115,6 +118,25 @@ export const make = Effect.gen(function* () {
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const workflowRuns = yield* WorkflowRunStore;
   const workflowAttempts = yield* WorkflowVmAttempts;
+  const workflowGuest = yield* WorkflowVmGuest;
+  const sql = yield* Effect.serviceOption(SqlClient.SqlClient);
+
+  const readDiff = Effect.fnUntraced(function* (
+    binding: WorkflowVmDispatchBinding | null,
+    threadId: ThreadId,
+    turnCount: number,
+    input: CheckpointStore.DiffCheckpointsInput,
+  ) {
+    const read = checkpointStore.diffCheckpoints(input);
+    if (!workflowGuest || !binding) return yield* read;
+    if (Option.isNone(sql))
+      return yield* new CheckpointWorkflowPinUnavailableError({ threadId, turnCount });
+    return yield* withWorkflowVmCancelledCheckpointRead(sql.value, binding, read).pipe(
+      Effect.catchTag(["ThreadExecutionFenceError", "VmWorkloadError", "SqlError"], () =>
+        Effect.fail(new CheckpointWorkflowPinUnavailableError({ threadId, turnCount })),
+      ),
+    );
+  });
 
   const readWorkflowPin = Effect.fnUntraced(function* (
     binding: WorkflowVmDispatchBinding,
@@ -287,17 +309,15 @@ export const make = Effect.gen(function* () {
         toCheckpointRef = to;
       }
 
-      const diff = yield* checkpointStore
-        .diffCheckpoints({
-          cwd: workspaceCwd,
-          fromCheckpointRef,
-          toCheckpointRef,
-          fallbackFromToHead: false,
-          ignoreWhitespace,
-          ...(strictWorkflowReview ? { requireComplete: true } : {}),
-          ...(binding ? { pinned: true } : {}),
-        })
-        .pipe(Effect.withSpan("checkpoint.turnDiff.diffCheckpoints"));
+      const diff = yield* readDiff(binding, input.threadId, input.toTurnCount, {
+        cwd: workspaceCwd,
+        fromCheckpointRef,
+        toCheckpointRef,
+        fallbackFromToHead: false,
+        ignoreWhitespace,
+        ...(strictWorkflowReview ? { requireComplete: true } : {}),
+        ...(binding ? { pinned: true } : {}),
+      }).pipe(Effect.withSpan("checkpoint.turnDiff.diffCheckpoints"));
       yield* verifySharedPatch(binding, diff);
 
       const turnDiff = {
@@ -393,16 +413,14 @@ export const make = Effect.gen(function* () {
       fromCheckpointRef = yield* readWorkflowPin(binding, context.value, 0);
       toCheckpointRef = yield* readWorkflowPin(binding, context.value, input.toTurnCount);
     }
-    const diff = yield* checkpointStore
-      .diffCheckpoints({
-        cwd: workspaceCwd,
-        fromCheckpointRef,
-        toCheckpointRef,
-        fallbackFromToHead: false,
-        ignoreWhitespace,
-        ...(binding ? { pinned: true } : {}),
-      })
-      .pipe(Effect.withSpan("checkpoint.fullThread.diffCheckpoints"));
+    const diff = yield* readDiff(binding, input.threadId, input.toTurnCount, {
+      cwd: workspaceCwd,
+      fromCheckpointRef,
+      toCheckpointRef,
+      fallbackFromToHead: false,
+      ignoreWhitespace,
+      ...(binding ? { pinned: true } : {}),
+    }).pipe(Effect.withSpan("checkpoint.fullThread.diffCheckpoints"));
     yield* verifySharedPatch(binding, diff);
 
     const turnDiff = buildTurnDiffResult(

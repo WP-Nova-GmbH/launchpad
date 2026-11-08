@@ -2240,6 +2240,14 @@ export const make = Effect.gen(function* () {
           pendingPreparationRetry: null,
           cancellationAttempt: {
             commandId: `workflow:${run.jobId}:cancel:${request.control.expectedRevision}`,
+            ...(run.runtime.kind === "vm"
+              ? {
+                  workloadCancellationId:
+                    run.cancellationAttempt?.workloadCancellationId ??
+                    run.cancellationAttempt?.commandId ??
+                    `workflow:${run.jobId}:cancel`,
+                }
+              : {}),
             createdAt: yield* timestamp,
           },
           progress: {

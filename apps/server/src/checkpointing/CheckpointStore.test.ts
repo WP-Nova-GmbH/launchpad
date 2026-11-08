@@ -19,9 +19,14 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { describe, expect } from "vite-plus/test";
 
@@ -29,7 +34,14 @@ import { checkpointRefForThreadTurn } from "./Utils.ts";
 import { parseTurnDiffFilesFromNumstat } from "./Diffs.ts";
 import * as CheckpointStore from "./CheckpointStore.ts";
 import * as CheckpointDiffQuery from "./CheckpointDiffQuery.ts";
-import { WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
+import { WorkflowRun, WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
+import { THREAD_VM_IDENTITY_SECRET } from "../relay/ThreadVmEnrollment.ts";
+import {
+  workflowVmCancellationOperation,
+  workflowVmCancellationSeal,
+} from "../relay/WorkflowVmCancellation.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -38,7 +50,8 @@ import {
   WORKFLOW_REVIEW_SOURCE_REF,
   WorkflowReviewGitDirectory,
 } from "../vcs/WorkflowReviewGitDirectory.ts";
-import { VmWorkloadTracking, WorkflowVmGuest } from "../vmWorkloadCommand.ts";
+import { VmWorkloadTracking, WorkflowVmGuest, withVmWorkloads } from "../vmWorkloadCommand.ts";
+import { inspectVmWorkloads } from "../vmWorkload.ts";
 import * as ServerConfig from "../config.ts";
 
 const ServerConfigLayer = ServerConfig.ServerConfig.layerTest(process.cwd(), {
@@ -56,6 +69,10 @@ const TestLayer = CheckpointStoreTestLayer.pipe(
   Layer.provideMerge(ServerConfigLayer),
   Layer.provideMerge(NodeServices.layer),
 );
+const encodeFixtureJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeFixtureRun = Schema.decodeEffect(WorkflowRun);
+const decodeFixtureRunJson = Schema.decodeEffect(Schema.fromJsonString(WorkflowRun));
+const decodeFixtureJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 function makeTmpDir(
   prefix = "checkpoint-store-test-",
@@ -118,6 +135,378 @@ function buildLargeText(lineCount = 5_000): string {
 }
 
 it.layer(TestLayer)("CheckpointStore.layer", (it) => {
+  it.effect(
+    "reads real pinned diffs after cancellation through a preconstructed and restarted VM stack",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const root = yield* fs.realPath(yield* makeTmpDir());
+        const cwd = NodePath.join(root, "worktree");
+        const directory = NodePath.join(root, "private-review.git");
+        yield* fs.makeDirectory(cwd);
+        yield* initRepoWithCommit(cwd);
+        yield* git(root, ["init", "--bare", directory]);
+        yield* git(directory, [
+          "fetch",
+          "--no-tags",
+          `file://${cwd}`,
+          `HEAD:${WORKFLOW_REVIEW_SOURCE_REF}`,
+        ]);
+        const threadId = ThreadId.make("workflow:cancelled-diff");
+        const projectId = ProjectId.make("vm:cancelled-diff");
+        const turnId = TurnId.make("cancelled-turn");
+        const binding = {
+          kind: "vm" as const,
+          jobId: "cancelled-diff",
+          organizationId: "org",
+          repositoryId: "repo",
+          threadId,
+          allocationId: "allocation",
+          environmentId: EnvironmentId.make("environment"),
+          generation: 1,
+          operationId: "enroll",
+          projectId,
+        };
+        const proof = {
+          ...binding,
+          cancellationId: "cancel",
+          runtimeEpisode: "episode",
+          continuationKey: "codex:instance:codex",
+          providerInstanceId: "codex",
+          bootId: "cb7c9212-2128-478f-9d11-6e4c8ed6f882",
+          epoch: 1,
+        };
+        const run = yield* decodeFixtureRun({
+          jobId: binding.jobId,
+          userId: "owner",
+          repositoryCanonicalKey: "github.com/acme/repo",
+          instruction: "Work",
+          modelSelection: { instanceId: "codex", model: "gpt-test" },
+          providerContinuation: { driver: "codex", continuationKey: proof.continuationKey },
+          baseBranch: "main",
+          baseSha: "base",
+          createdAt: "2026-11-06T00:00:00.000Z",
+          promptDispatched: true,
+          executionReserved: false,
+          worktreePath: cwd,
+          preparedHead: null,
+          approvedBy: null,
+          cancellationAttempt: null,
+          runtime: binding,
+          workflow: {
+            workflowId: "workflow",
+            organizationId: "org",
+            repositoryId: "repo",
+            revision: 1,
+            archived: false,
+            createdAt: "2026-11-06T00:00:00.000Z",
+            updatedAt: "2026-11-06T00:00:00.000Z",
+            definition: {
+              name: "Workflow",
+              target: { kind: "vm", baseBranch: null },
+              steps: [
+                {
+                  id: "agent",
+                  kind: "agent",
+                  title: "Work",
+                  instruction: "Work",
+                  modelSelection: null,
+                },
+              ],
+            },
+          },
+          progress: { revision: 3, status: "cancelled", threadId, detail: null, checkpoint: null },
+        });
+        const sql = yield* SqlClient.SqlClient;
+        const json = encodeFixtureJson;
+        const running = {
+          ...run,
+          executionReserved: true,
+          progress: { ...run.progress, status: "running" },
+        };
+        yield* sql`INSERT INTO repository_workflow_jobs(job_id,thread_id,status,execution_reserved,record_json) VALUES(${binding.jobId},${threadId},'running',1,${json(running)})`;
+        yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase) VALUES(${threadId},'https://relay.test',${binding.environmentId},${projectId},1,'enroll','active')`;
+        const installed = {
+          operationId: binding.operationId,
+          scope: {
+            allocationId: binding.allocationId,
+            threadId,
+            repositoryId: binding.repositoryId,
+            generation: 1,
+          },
+          relayUrl: "https://relay.test",
+          relayIssuer: "https://relay.test",
+          environmentId: binding.environmentId,
+          environmentCredential: "test-only",
+          cloudMintPublicKey: "test-only",
+        };
+        const secretLayer = Layer.mock(ServerSecretStore)({
+          get: (key) =>
+            Effect.succeed(
+              key === THREAD_VM_IDENTITY_SECRET
+                ? Option.some(new TextEncoder().encode(json(installed)))
+                : Option.none(),
+            ),
+        });
+        const native = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const reader = NodeURL.fileURLToPath(
+          new URL("../../../../infra/e2b/template/workflow-checkpoint-reader.py", import.meta.url),
+        );
+        const kernel = { sealed: false, transferLaunches: 0, rejectedLaunches: 0 };
+        const report = () => ({
+          bootId: proof.bootId,
+          epoch: kernel.sealed ? proof.epoch : 0,
+          sealedBy: kernel.sealed ? workflowVmCancellationSeal(proof) : null,
+          groups: [],
+          stopped: true,
+        });
+        const spawner = ChildProcessSpawner.make((command) => {
+          if (
+            !ChildProcess.isStandardCommand(command) ||
+            command.command !== "/opt/launchpad/bin/launchpad-workload"
+          )
+            return native.spawn(command);
+          const action = command.args[0];
+          if (action === "seal" || action === "stop") {
+            expect(command.args.slice(1)).toEqual([
+              proof.bootId,
+              workflowVmCancellationSeal(proof),
+            ]);
+            if (action === "stop") expect(kernel.sealed).toBe(true);
+            kernel.sealed = true;
+          }
+          if (action === "inspect" || action === "seal" || action === "stop")
+            return Effect.succeed(
+              ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(1),
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                isRunning: Effect.succeed(false),
+                kill: () => Effect.void,
+                unref: Effect.succeed(Effect.void),
+                stdin: Sink.drain,
+                stdout: Stream.encodeText(Stream.make(json(report()))),
+                stderr: Stream.empty,
+                all: Stream.empty,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.empty,
+              }),
+            );
+          if (kernel.sealed) {
+            if (action !== "run-transfer") {
+              kernel.rejectedLaunches++;
+              return Effect.fail(
+                PlatformError.badArgument({
+                  module: "VmWorkload",
+                  method: "spawn",
+                  description: "Workload launches are sealed",
+                }),
+              );
+            }
+            expect(command.args.slice(1, 4)).toEqual([
+              proof.bootId,
+              workflowVmCancellationSeal(proof),
+              String(proof.epoch),
+            ]);
+            kernel.transferLaunches++;
+          }
+          const separator = command.args.indexOf("--");
+          const executable = command.args[separator + 1]!;
+          const args = command.args.slice(separator + 2);
+          const launchCwd = action === "run-workflow" ? command.args[3] : command.options.cwd;
+          return native.spawn(
+            ChildProcess.make(
+              executable,
+              executable === "/usr/bin/python3" ? ["-IS", reader, args[2]!] : args,
+              {
+                ...command.options,
+                cwd: launchCwd,
+                env: {
+                  ...command.options.env,
+                  HOME: process.env.HOME,
+                  USER: process.env.USER,
+                  LOGNAME: process.env.LOGNAME,
+                  PATH: process.env.PATH,
+                },
+              },
+            ),
+          );
+        });
+        const from = checkpointRefForThreadTurn(threadId, 0),
+          to = checkpointRefForThreadTurn(threadId, 1);
+        const store = yield* withVmWorkloads(
+          CheckpointStore.make.pipe(
+            Effect.provide(
+              Layer.fresh(VcsDriverRegistry.layer.pipe(Layer.provide(VcsProcess.layerLocal))),
+            ),
+          ),
+          true,
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+        const captures = yield* withVmWorkloads(
+          Effect.gen(function* () {
+            const baseline = yield* store.captureCheckpoint({
+              cwd,
+              checkpointRef: from,
+              strictWorkflowCapture: true,
+            });
+            yield* writeTextFile(
+              NodePath.join(cwd, "README.md"),
+              "# test\nSaved before cancellation\n",
+            );
+            const checkpoint = yield* store.captureCheckpoint({
+              cwd,
+              checkpointRef: to,
+              strictWorkflowCapture: true,
+            });
+            return { baseline, checkpoint };
+          }),
+          true,
+        ).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(WorkflowReviewGitDirectory, directory),
+        );
+        const runs = yield* WorkflowRunStore,
+          attempts = yield* WorkflowVmAttempts;
+        const projection = Layer.mock(ProjectionSnapshotQuery)({
+          getThreadCheckpointContext: () =>
+            Effect.succeedSome({
+              threadId,
+              projectId,
+              workspaceRoot: cwd,
+              worktreePath: null,
+              checkpoints: [
+                {
+                  turnId,
+                  checkpointTurnCount: 1,
+                  checkpointRef: to,
+                  status: "ready",
+                  files: [],
+                  assistantMessageId: null,
+                  completedAt: run.createdAt,
+                },
+              ],
+            }),
+          getFullThreadDiffContext: () =>
+            Effect.succeedSome({
+              threadId,
+              projectId,
+              workspaceRoot: cwd,
+              worktreePath: null,
+              latestCheckpointTurnCount: 1,
+              toCheckpointRef: to,
+            }),
+        });
+        const queryEffect = CheckpointDiffQuery.make.pipe(
+          Effect.provide(projection),
+          Effect.provideService(CheckpointStore.CheckpointStore, store),
+          Effect.provideService(WorkflowRunStore, {
+            ...runs,
+            getVmBindingForThread: () => Effect.succeed(binding),
+            getCheckpointPinForRun: () =>
+              Effect.succeed({
+                ...captures.baseline,
+                baselineCommitId: captures.baseline.commitId,
+                checkpointRef: from,
+              }),
+            getCheckpointPinForTurn: () =>
+              Effect.succeed({
+                ...captures.checkpoint,
+                baselineCommitId: captures.baseline.commitId,
+                checkpointRef: to,
+              }),
+          }),
+          Effect.provideService(WorkflowVmAttempts, {
+            ...attempts,
+            readReviewSecrets: () => Effect.succeed(Redacted.make([])),
+          }),
+        );
+        const query = yield* withVmWorkloads(queryEffect, true).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+        yield* withVmWorkloads(
+          Effect.gen(function* () {
+            yield* inspectVmWorkloads({
+              type: "seal",
+              bootId: proof.bootId,
+              operationId: workflowVmCancellationOperation(proof),
+            });
+            yield* inspectVmWorkloads({
+              type: "stop",
+              bootId: proof.bootId,
+              operationId: workflowVmCancellationOperation(proof),
+            });
+          }),
+          true,
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+        yield* sql`UPDATE repository_workflow_jobs SET status='cancelled',execution_reserved=0,record_json=${json(run)} WHERE job_id=${binding.jobId}`;
+        const payload = {
+          workflowVmCancellation: proof,
+          stoppedRuntimeEventsDrained: true,
+          providerContinuation: {
+            workflowJobId: binding.jobId,
+            continuationKey: proof.continuationKey,
+            runtimeEpisode: proof.runtimeEpisode,
+            shutdownConfirmed: true,
+            shutdownEvidenceVersion: 2,
+          },
+        };
+        yield* sql`INSERT INTO provider_session_runtime(thread_id,provider_name,provider_instance_id,adapter_key,status,last_seen_at,runtime_payload_json) VALUES(${threadId},'codex','codex','codex','stopped',${run.createdAt},${json(payload)})`;
+        const strict = {
+          threadId,
+          fromTurnCount: 0,
+          toTurnCount: 1,
+          strictWorkflowReview: true,
+          expectedTurnId: turnId,
+        };
+        for (const restart of [false, true])
+          yield* withVmWorkloads(
+            Effect.gen(function* () {
+              const current = restart ? yield* queryEffect : query;
+              const turn = yield* current.getTurnDiff(strict);
+              expect(turn.completeWorkflowReview).toBe(true);
+              expect(turn.diff).toContain("+Saved before cancellation");
+              expect(
+                (yield* current.getTurnDiff({ threadId, fromTurnCount: 0, toTurnCount: 1 })).diff,
+              ).toBe(turn.diff);
+              expect((yield* current.getFullThreadDiff({ threadId, toTurnCount: 1 })).diff).toBe(
+                turn.diff,
+              );
+              expect(
+                yield* Effect.flip(
+                  store.captureCheckpoint({ cwd, checkpointRef: to, strictWorkflowCapture: true }),
+                ),
+              ).toBeDefined();
+              expect(
+                yield* Effect.flip(
+                  store.deleteCheckpointRefs({ cwd, checkpointRefs: [to], pinned: true }),
+                ),
+              ).toBeDefined();
+            }),
+            true,
+          ).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provideService(WorkflowReviewGitDirectory, directory),
+            Effect.provide(secretLayer),
+          );
+        expect(kernel.transferLaunches).toBeGreaterThan(0);
+        expect(kernel.rejectedLaunches).toBeGreaterThanOrEqual(4);
+        expect(report()).toEqual({
+          bootId: proof.bootId,
+          epoch: proof.epoch,
+          sealedBy: workflowVmCancellationSeal(proof),
+          groups: [],
+          stopped: true,
+        });
+        const [retained] = yield* sql<{
+          record: string;
+          payload: string;
+        }>`SELECT j.record_json AS record,p.runtime_payload_json AS payload FROM repository_workflow_jobs j JOIN provider_session_runtime p ON p.thread_id=j.thread_id WHERE j.job_id=${binding.jobId}`;
+        const retainedRun = yield* decodeFixtureRunJson(retained!.record);
+        const retainedPayload = yield* decodeFixtureJson(retained!.payload);
+        expect(retainedRun.cancellationAttempt).toBeNull();
+        expect(retainedPayload).toEqual(payload);
+      }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+
   it.effect("checks the real pinned patch before returning review and finished result diffs", () =>
     Effect.gen(function* () {
       const cwd = yield* makeTmpDir();
@@ -762,11 +1151,43 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
           new URL("../../../../infra/e2b/template/workflow-checkpoint-reader.py", import.meta.url),
         );
         const reads: string[] = [];
+        const gitLaunchDirectories: string[] = [];
         let beforeCapture: Effect.Effect<void, VcsError | PlatformError.PlatformError> =
           Effect.void;
         const spawner = ChildProcessSpawner.make((command) => {
-          if (!ChildProcess.isStandardCommand(command) || command.command !== "/usr/bin/python3")
-            return native.spawn(command);
+          if (!ChildProcess.isStandardCommand(command)) return native.spawn(command);
+          if (command.command === "/opt/launchpad/bin/launchpad-workload") {
+            const separator = command.args.indexOf("--");
+            const executable = command.args[separator + 1]!;
+            const workflow = command.args[0] === "run-workflow";
+            const launchCwd = workflow ? command.args[3]! : command.options.cwd;
+            if (workflow && executable === "git") {
+              gitLaunchDirectories.push(launchCwd!);
+              // The coordinator's home is inaccessible after the guest drops to the workload UID.
+              if (launchCwd === process.cwd())
+                return Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "PermissionDenied",
+                    module: "ChildProcessSpawner",
+                    method: "spawn",
+                    syscall: "chdir",
+                  }),
+                );
+            }
+            command = ChildProcess.make(executable, command.args.slice(separator + 2), {
+              ...command.options,
+              cwd: launchCwd,
+              // Execute the Linux launch protocol using the actual host account and Git binary.
+              env: {
+                ...command.options.env,
+                HOME: process.env.HOME,
+                USER: process.env.USER,
+                LOGNAME: process.env.LOGNAME,
+                PATH: process.env.PATH,
+              },
+            });
+          }
+          if (command.command !== "/usr/bin/python3") return native.spawn(command);
           const mode = command.args[2]!;
           reads.push(mode);
           expect(command.options.cwd).toBe(cwd);
@@ -780,20 +1201,31 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
             ? beforeCapture.pipe(Effect.orDie, Effect.andThen(start))
             : start;
         });
-        const store = yield* CheckpointStore.make.pipe(
-          Effect.provide(Layer.fresh(VcsDriverRegistry.layer)),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        );
+        const store = yield* withVmWorkloads(
+          CheckpointStore.make.pipe(
+            Effect.provide(
+              Layer.fresh(VcsDriverRegistry.layer.pipe(Layer.provide(VcsProcess.layerLocal))),
+            ),
+          ),
+          true,
+        ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
         yield* Effect.gen(function* () {
           const threadId = ThreadId.make("workflow:workload-reader");
           const from = checkpointRefForThreadTurn(threadId, 0);
           const to = checkpointRefForThreadTurn(threadId, 1);
           const verify = CheckpointRef.make("refs/t3/workflow-verification/workload-reader");
+          const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const indexBefore = yield* fs.readFile(NodePath.join(cwd, ".git/index"));
           const baseline = yield* store.captureCheckpoint({
             cwd,
             checkpointRef: from,
             strictWorkflowCapture: true,
           });
+          expect(gitLaunchDirectories.length).toBeGreaterThan(0);
+          expect(gitLaunchDirectories).toContain(cwd);
+          expect(gitLaunchDirectories).not.toContain(process.cwd());
+          expect(yield* git(cwd, ["rev-parse", "HEAD"])).toBe(headBefore);
+          expect(yield* fs.readFile(NodePath.join(cwd, ".git/index"))).toEqual(indexBefore);
           expect(new TextDecoder().decode(baseline.workflowIgnoreRules)).toBe("scratch.cache\n");
           expect(
             yield* git(directory, ["ls-tree", baseline.commitId, "examples/.gitignore"]),

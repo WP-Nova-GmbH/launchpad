@@ -7,6 +7,7 @@ import types
 import tempfile
 import os
 import json
+import select
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,89 @@ from unittest import mock
 spec = importlib.util.spec_from_file_location('launchpad_workload', Path(__file__).with_name('workload.py'))
 workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
+
+
+class KernelStopReceiptTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='launchpad-kernel-stop-')))
+        self.groups = [root / ('a' * 32), root / ('b' * 32)]
+        for group in self.groups:
+            group.mkdir()
+            (group / 'cgroup.events').write_text('populated 1\n')
+        self.gate = {'bootId': 'same-boot', 'epoch': 4, 'sealedBy': 'c' * 32}
+        self.clock = 0
+        self.notifications = []
+        self.notification = lambda group: (group / 'cgroup.events').write_text('populated 0\n')
+        self.stack.enter_context(mock.patch.object(workload, 'ROOT', root))
+        self.stack.enter_context(mock.patch.object(workload, 'BOOT', types.SimpleNamespace(read_text=lambda: 'same-boot\n')))
+        self.stack.enter_context(mock.patch.object(workload.time, 'monotonic', side_effect=lambda: self.clock))
+        self.stack.enter_context(mock.patch.object(workload.time, 'sleep', side_effect=AssertionError('shutdown must wait on kernel events')))
+        self.stack.enter_context(mock.patch.object(workload, 'inventory', side_effect=self.inventory))
+        self.stack.enter_context(mock.patch.object(select, 'poll', side_effect=self.poller))
+
+    def inventory(self, gate):
+        groups = [{'id': group.name, 'bootId': 'same-boot'} for group in self.groups
+                  if (group / 'cgroup.events').read_text() == 'populated 1\n']
+        return {**gate, 'groups': groups, 'stopped': not groups}
+
+    def poller(self):
+        current = types.SimpleNamespace(group=None)
+
+        def register(events, flags):
+            self.assertEqual(flags, select.POLLPRI | select.POLLERR)
+            current.group = Path(events.name).parent
+
+        def poll(milliseconds):
+            # Every owned group must receive kill before waiting for any one.
+            for group in self.groups:
+                self.assertEqual((group / 'cgroup.kill').read_text(), '1')
+            self.notifications.append((current.group, milliseconds))
+            self.clock += 2
+            self.notification(current.group)
+            return [(1, select.POLLPRI)]
+
+        return types.SimpleNamespace(register=register, poll=poll)
+
+    def test_waits_for_async_kernel_notifications_with_one_shared_deadline(self):
+        receipt = workload.stop_workloads(self.gate)
+        self.assertTrue(receipt['stopped'])
+        self.assertEqual(receipt['groups'], [])
+        self.assertEqual(self.notifications, [(self.groups[0], 5000), (self.groups[1], 3000)])
+        self.assertEqual((receipt['bootId'], receipt['epoch'], receipt['sealedBy']), ('same-boot', 4, 'c' * 32))
+
+    def test_timeout_never_returns_an_empty_receipt_for_a_surviving_child(self):
+        self.notification = lambda group: None
+        with self.assertRaisesRegex(RuntimeError, 'Kernel workload receipt is unavailable'):
+            workload.stop_workloads(self.gate)
+        self.assertFalse(self.inventory(self.gate)['stopped'])
+        self.assertGreaterEqual(self.clock, 5)
+        self.assertTrue(all((group / 'cgroup.kill').exists() for group in self.groups))
+
+    def test_later_survivor_does_not_receive_another_full_timeout(self):
+        self.notification = lambda group: ((group / 'cgroup.events').write_text('populated 0\n')
+                                           if group == self.groups[0] else None)
+        with self.assertRaisesRegex(RuntimeError, 'Kernel workload receipt is unavailable'):
+            workload.stop_workloads(self.gate)
+        self.assertFalse(self.inventory(self.gate)['stopped'])
+        self.assertEqual(self.notifications[1][1], 3000)
+
+    def test_changed_boot_or_seal_cannot_be_reported_as_stopped(self):
+        original = copy.deepcopy(self.gate)
+        for field, changed in [('bootId', 'different-boot'), ('sealedBy', 'd' * 32), ('epoch', 5)]:
+            self.gate.update(original)
+            self.clock = 0
+            for group in self.groups:
+                (group / 'cgroup.events').write_text('populated 1\n')
+
+            def notify(group):
+                (group / 'cgroup.events').write_text('populated 0\n')
+                self.gate[field] = changed
+
+            self.notification = notify
+            with self.assertRaisesRegex(RuntimeError, 'shutdown ownership changed'):
+                workload.stop_workloads(self.gate)
 
 
 class WarmRestoreGateTest(unittest.TestCase):

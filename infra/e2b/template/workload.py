@@ -187,6 +187,25 @@ def wait_cgroup_event(group, key, value, seconds=2):
             poll.poll(max(1, int(remaining * 1000)))
 
 
+def stop_workloads(gate, seconds=5):
+    # cgroup.kill initiates termination; it is not a receipt that descendants
+    # have exited. Keep admission sealed while waiting for kernel notifications.
+    expected = (gate['bootId'], gate['epoch'], gate['sealedBy'])
+    groups = [ROOT / record['id'] for record in inventory(gate)['groups']]
+    deadline = time.monotonic() + seconds
+    for group in groups:
+        (group / 'cgroup.kill').write_text('1')
+    for group in groups:
+        wait_cgroup_event(group, 'populated', '0', seconds=max(0, deadline - time.monotonic()))
+    if ((gate['bootId'], gate['epoch'], gate['sealedBy']) != expected
+            or BOOT.read_text().strip() != expected[0]):
+        raise RuntimeError('Workload shutdown ownership changed')
+    receipt = inventory(gate)
+    if not receipt['stopped']:
+        raise RuntimeError('Kernel workload shutdown is still pending')
+    return receipt
+
+
 def exclusive_provider(group, identity):
     # A subtree, including an empty unexpected one, is not a single owned harness.
     if any(p.is_dir() for p in group.iterdir()):
@@ -857,9 +876,8 @@ def main(args):
             if action == "stop":
                 # Only recognized groups from this boot are targets. The gate
                 # prevents a concurrent launch while the kernel kills children.
-                current = inventory(gate)
-                for record in current["groups"]:
-                    (ROOT / record["id"] / "cgroup.kill").write_text("1")
+                print(json.dumps(stop_workloads(gate)))
+                return
         elif action != "inspect" or len(args) != 1:
             raise ValueError("Invalid workload action")
         print(json.dumps(inventory(gate)))

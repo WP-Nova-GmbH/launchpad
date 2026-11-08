@@ -20,6 +20,7 @@ import { assertThreadVmQueueIdle } from "./ThreadVmQueueActivity.ts";
 import { ThreadExecution } from "./ThreadExecution.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
+import { adoptWorkflowVmCancellationSeal } from "./WorkflowVmCancellation.ts";
 
 const decodeSession = Schema.decodeUnknownEffect(OrchestrationSession);
 
@@ -67,6 +68,7 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     }
     if (owner.operationId !== input.operationId || !["draining", "frozen"].includes(owner.phase))
       return yield* fail(threadId, "Another operation holds this source.");
+    if (tracked && owner.phase === "draining") yield* adoptWorkflowVmCancellationSeal(sql, input);
     yield* assertThreadVmQueueIdle(sql, threadId);
     const unsettled = yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${threadId}
       AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending')

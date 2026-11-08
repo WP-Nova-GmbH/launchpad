@@ -173,6 +173,11 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     runtimeEpisode?: string,
   ) => Effect.Effect<boolean>;
+  /** The exact VM native writer reached EOF; detached workload shutdown is separate. */
+  readonly isSessionWriterStopConfirmed?: (
+    threadId: ThreadId,
+    runtimeEpisode: string,
+  ) => Effect.Effect<boolean>;
   readonly getSessionRuntimeEpisode?: (threadId: ThreadId) => Effect.Effect<string | undefined>;
   readonly releaseSessionStopConfirmation?: (
     threadId: ThreadId,

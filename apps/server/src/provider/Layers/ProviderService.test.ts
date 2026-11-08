@@ -10,9 +10,20 @@ import * as NodeCrypto from "node:crypto";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
-import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadMaintenance,
+  VmWorkloadTracking,
+} from "../../vmWorkloadCommand.ts";
+import type { InstalledThreadVm } from "../../relay/ThreadVmEnrollment.ts";
+import { THREAD_VM_IDENTITY_SECRET } from "../../relay/ThreadVmEnrollment.ts";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import * as Sink from "effect/Sink";
 import { ThreadExecution } from "../../relay/ThreadExecution.ts";
 import { makeThreadExecutionRelay } from "../../relay/ThreadExecutionRelay.ts";
+import { makeThreadVmSourceRecovery } from "../../relay/ThreadVmSourceRecovery.ts";
+import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
+import { TerminalManager } from "../../terminal/Manager.ts";
 import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
 import { CheckoutAdmission, makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
 import {
@@ -81,6 +92,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -553,6 +565,8 @@ const hasMetricSnapshot = (
 function makeProviderServiceLayer(
   input: {
     readonly vmWorkloads?: boolean;
+    readonly installedVm?: InstalledThreadVm;
+    readonly workloadControl?: ChildProcessSpawner.ChildProcessSpawner["Service"];
     readonly nativeHistory?: boolean;
     readonly configLayer?: typeof serverConfigTestLayer;
     readonly executionLayer?: Layer.Layer<ThreadExecution | SqlClient.SqlClient>;
@@ -600,6 +614,19 @@ function makeProviderServiceLayer(
       Layer.provide(input.executionLayer ?? SqlitePersistenceMemory),
       Layer.provide(historyLayer),
       Layer.provide(Layer.succeed(VmWorkloadTracking, input.vmWorkloads ?? false)),
+      Layer.provide(Layer.succeed(VmControlSpawner, input.workloadControl)),
+      Layer.provide(
+        input.installedVm
+          ? Layer.mock(ServerSecretStore.ServerSecretStore)({
+              get: (name) =>
+                Effect.succeed(
+                  name === THREAD_VM_IDENTITY_SECRET
+                    ? Option.some(new TextEncoder().encode(encodeJson(input.installedVm)))
+                    : Option.none(),
+                ),
+            })
+          : Layer.empty,
+      ),
       Layer.provide(input.executionLayer ?? threadExecutionTestLayer),
       Layer.provide(NodeServices.layer),
       Layer.provide(
@@ -615,6 +642,12 @@ function makeProviderServiceLayer(
             const base = yield* WorkflowRunStore;
             return {
               ...base,
+              isWorkflowVmThread: (id: string) =>
+                Effect.succeed(
+                  Array.from(input.workflowRuns?.values() ?? []).some(
+                    (run) => run.runtime.kind === "vm" && run.progress.threadId === id,
+                  ),
+                ),
               get: (id: string) => Effect.sync(() => input.workflowRuns?.get(id) ?? null),
               getByThread: (id: string) =>
                 Effect.sync(
@@ -7251,7 +7284,7 @@ const decodeVmCheckpointSettings = Schema.decodeSync(CodexSettings);
 for (const workflowOwned of [false, true])
   it.effect(
     workflowOwned
-      ? "tracked VM native writer closure cannot confirm workflow tree cleanup"
+      ? "tracked VM workflow writer checkpoint resumes the next Agent without full tree cleanup"
       : "tracked VM checkpoint closes only its writer and resumes the next turn",
     () =>
       Effect.scoped(
@@ -7261,6 +7294,66 @@ for (const workflowOwned of [false, true])
           const root = yield* fs.makeTempDirectoryScoped({ prefix: "vm-checkpoint-lifecycle-" });
           const home = path.join(root, "codex"),
             threadId = asThreadId(workflowOwned ? "vm-checkpoint-workflow" : "vm-checkpoint-next");
+          const bootId = "cb7c9212-2128-478f-9d11-6e4c8ed6f882";
+          const pipesClosed = yield* Deferred.make<void>();
+          let cancelling = false;
+          const kernel = {
+            epoch: 0,
+            sealedBy: null as string | null,
+            stopped: false,
+            stops: 0,
+            survivorOnce: false,
+          };
+          const workloadControl = ChildProcessSpawner.make(
+            Effect.fnUntraced(function* (command) {
+              assert.isTrue(ChildProcess.isStandardCommand(command));
+              if (!ChildProcess.isStandardCommand(command))
+                return yield* Effect.die("unexpected pipeline");
+              const [action, , operation] = command.args;
+              if (action === "seal") {
+                assert(
+                  kernel.sealedBy === null || kernel.sealedBy === operation,
+                  "another operation owns the workload seal",
+                );
+                if (kernel.sealedBy === null) kernel.epoch++;
+                kernel.sealedBy = operation!;
+              }
+              if (action === "reopen") {
+                assert.equal(kernel.sealedBy, operation);
+                kernel.sealedBy = null;
+                kernel.epoch++;
+              }
+              if (action === "stop") {
+                assert.equal(kernel.sealedBy, operation);
+                kernel.stopped = !kernel.survivorOnce;
+                kernel.survivorOnce = false;
+                kernel.stops++;
+                if (kernel.stopped) yield* Deferred.succeed(pipesClosed, undefined);
+              }
+              const report = {
+                bootId,
+                epoch: kernel.epoch,
+                sealedBy: kernel.sealedBy,
+                groups: kernel.stopped
+                  ? []
+                  : [{ id: "a".repeat(32), bootId, kind: "provider", leaderPid: 123 }],
+                stopped: kernel.stopped,
+              };
+              return ChildProcessSpawner.makeHandle({
+                pid: ChildProcessSpawner.ProcessId(1),
+                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+                isRunning: Effect.succeed(false),
+                kill: () => Effect.void,
+                unref: Effect.succeed(Effect.void),
+                stdin: Sink.drain,
+                stdout: Stream.encodeText(Stream.make(encodeJson(report))),
+                stderr: Stream.empty,
+                all: Stream.empty,
+                getInputFd: () => Sink.drain,
+                getOutputFd: () => Stream.empty,
+              });
+            }),
+          );
           const rollout = path.join(
             home,
             "sessions",
@@ -7344,6 +7437,8 @@ for (const workflowOwned of [false, true])
                   }),
                   closeNativeWriter: Effect.gen(function* () {
                     if (state.writerCloses) return;
+                    // A detached child holds the native pipe until the kernel stops its group.
+                    if (cancelling) yield* Deferred.await(pipesClosed);
                     state.writerCloses++;
                     yield* Queue.offer(events, {
                       id: asEventId(`vm-checkpoint-writer-closed-${runtimes.length}`),
@@ -7367,6 +7462,16 @@ for (const workflowOwned of [false, true])
             runs = new Map(workflowOwned ? [[run.jobId, run]] : []);
           const fixture = makeProviderServiceLayer({
             vmWorkloads: true,
+            workloadControl,
+            installedVm: {
+              operationId: "enroll",
+              scope: { allocationId: "allocation", threadId, repositoryId: "repo", generation: 1 },
+              environmentId: EnvironmentId.make("environment"),
+              relayUrl: "https://relay.invalid",
+              relayIssuer: "https://relay.invalid",
+              environmentCredential: "fixture-only-credential",
+              cloudMintPublicKey: "fixture-only-key",
+            },
             nativeHistory: true,
             configLayer,
             workflowRuns: runs,
@@ -7417,21 +7522,6 @@ for (const workflowOwned of [false, true])
             });
             const episode = yield* native.getSessionRuntimeEpisode!(threadId);
             assert(episode);
-            if (workflowOwned) {
-              const error = yield* Effect.flip(provider.stopSession({ threadId }));
-              assert.equal(error._tag, "ProviderValidationError");
-              assert.notEqual(
-                Option.getOrThrow(yield* directory.getBinding(threadId)).status,
-                "stopped",
-              );
-              assert.isFalse(
-                yield* provider.isWorkflowSessionStopConfirmed({ jobId: run.jobId, threadId }),
-              );
-              assert.isFalse(yield* native.isSessionStopConfirmed!(threadId, episode));
-              assert.equal(runtimes[0]!.writerCloses, 1);
-              assert.equal(runtimes[0]!.strongStops, 0);
-              return;
-            }
             yield* sql`INSERT INTO thread_execution_fences
               (thread_id,relay_url,environment_id,project_id,generation,operation_id,phase)
               VALUES(${threadId},'https://relay.invalid','environment','project',1,'enroll','active')`;
@@ -7446,6 +7536,10 @@ for (const workflowOwned of [false, true])
             assert.notEqual(metadata.shutdownEvidenceVersion, 2);
             assert.propertyVal(stopped.runtimePayload, "stoppedRuntimeEventsDrained", true);
             assert.isFalse(yield* native.isSessionStopConfirmed!(threadId, episode));
+            if (workflowOwned)
+              assert.isFalse(
+                yield* provider.isWorkflowSessionStopConfirmed({ jobId: run.jobId, threadId }),
+              );
             assert.equal(runtimes[0]!.writerCloses, 1);
             assert.equal(runtimes[0]!.strongStops, 0);
             const [archive] = yield* sql<{
@@ -7477,6 +7571,197 @@ for (const workflowOwned of [false, true])
                   event.type === "turn.started" && event.turnId === "vm-checkpoint-next-turn",
               ),
             );
+            if (workflowOwned) {
+              cancelling = true;
+              const vmRun = decodeContinuityWorkflowRun({
+                ...run,
+                runtime: {
+                  kind: "vm",
+                  jobId: run.jobId,
+                  threadId,
+                  organizationId: "org",
+                  repositoryId: "repo",
+                  allocationId: "allocation",
+                  environmentId: "environment",
+                  generation: 1,
+                  operationId: "enroll",
+                  projectId: "project",
+                },
+                cancellationAttempt: {
+                  commandId: "cancel-vm",
+                  createdAt: "2026-10-05T10:02:00.000Z",
+                },
+                progress: { ...run.progress, status: "cancelling" },
+              });
+              for (const changed of [
+                { generation: 2 },
+                { operationId: "replacement" },
+                { allocationId: "replacement" },
+                { environmentId: "replacement" },
+              ]) {
+                runs.set(
+                  run.jobId,
+                  decodeContinuityWorkflowRun({
+                    ...vmRun,
+                    runtime: { ...vmRun.runtime, ...changed },
+                  }),
+                );
+                assert.equal(
+                  (yield* Effect.flip(provider.stopSession({ threadId })))._tag,
+                  "ProviderValidationError",
+                );
+              }
+              assert.equal(kernel.stops, 0);
+              runs.set(run.jobId, vmRun);
+              kernel.survivorOnce = true;
+              assert.equal(
+                (yield* Effect.flip(provider.stopSession({ threadId })))._tag,
+                "ProviderValidationError",
+              );
+              assert.equal(runtimes[1]!.writerCloses, 0);
+              runs.set(run.jobId, {
+                ...vmRun,
+                cancellationAttempt: {
+                  ...vmRun.cancellationAttempt!,
+                  commandId: "retry-vm-cancellation",
+                  workloadCancellationId: vmRun.cancellationAttempt!.commandId,
+                },
+              });
+              const confirmation = vi.spyOn(directory, "confirmShutdown");
+              confirmation.mockReturnValueOnce(Effect.succeed(false));
+              assert.equal(
+                (yield* Effect.flip(provider.stopSession({ threadId })))._tag,
+                "ProviderValidationError",
+              );
+              assert.equal(runtimes[1]!.writerCloses, 1);
+              assert.isFalse(
+                yield* provider.isWorkflowSessionStopConfirmed({ jobId: run.jobId, threadId }),
+              );
+              kernel.epoch++;
+              assert.equal(
+                (yield* Effect.flip(provider.stopSession({ threadId })))._tag,
+                "ProviderValidationError",
+              );
+              assert.equal(kernel.stops, 2);
+              kernel.epoch--;
+              yield* provider.stopSession({ threadId });
+              assert.equal(runtimes[1]!.writerCloses, 1);
+              assert.equal(kernel.stops, 3);
+              assert.isTrue(
+                yield* provider.isWorkflowSessionStopConfirmed({ jobId: run.jobId, threadId }),
+              );
+              assert.property(
+                Option.getOrThrow(yield* directory.getBinding(threadId)).runtimePayload,
+                "workflowVmCancellation",
+              );
+              const fullStopped = Option.getOrThrow(yield* directory.getBinding(threadId));
+              const fullMetadata = (yield* decodeClaudeRestartOwnership(fullStopped.runtimePayload))
+                .providerContinuation;
+              for (const changed of [
+                { runtimeEpisode: "replacement" },
+                { continuationKey: "replacement" },
+              ]) {
+                yield* directory.upsert({
+                  ...fullStopped,
+                  runtimePayload: {
+                    providerContinuation: {
+                      workflowJobId: run.jobId,
+                      continuationKey: vmRun.providerContinuation!.continuationKey,
+                      runtimeEpisode: fullMetadata.runtimeEpisode,
+                      shutdownConfirmed: true,
+                      shutdownEvidenceVersion: 2,
+                      ...changed,
+                    },
+                  },
+                });
+                assert.equal(
+                  (yield* Effect.flip(provider.stopSession({ threadId })))._tag,
+                  "ProviderValidationError",
+                );
+                assert.equal(kernel.stops, 3);
+                yield* directory.upsert(fullStopped);
+              }
+              yield* provider.stopSession({ threadId });
+              assert.deepEqual(
+                Option.getOrThrow(yield* directory.getBinding(threadId)),
+                fullStopped,
+              );
+              assert.equal(kernel.stops, 3);
+              const finished = decodeContinuityWorkflowRun({
+                ...vmRun,
+                executionReserved: false,
+                cancellationAttempt: null,
+                progress: { ...vmRun.progress, status: "cancelled" },
+              });
+              runs.set(run.jobId, finished);
+              yield* provider.stopSession({ threadId });
+              assert.deepEqual(
+                Option.getOrThrow(yield* directory.getBinding(threadId)),
+                fullStopped,
+              );
+              yield* sql`INSERT INTO repository_workflow_jobs VALUES (${run.jobId},${threadId},'cancelled',0,${encodeJson(finished)})`;
+              yield* sql`INSERT OR IGNORE INTO thread_execution_work(thread_id,work_id,generation,kind) VALUES (${threadId},'provider:retained-stop-receipt',1,'provider')`;
+              yield* sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_status,checkpoint_files_json)
+                VALUES (${threadId},'vm-checkpoint-next-turn','completed','2026-10-05T10:01:00.000Z','2026-10-05T10:02:00.000Z','ready','[]')`;
+              const finalSaveOperation = NodeCrypto.randomUUID();
+              const maintenance = yield* Semaphore.make(1);
+              const recovered = yield* Effect.gen(function* () {
+                const recovery = yield* makeThreadVmSourceRecovery(
+                  { synchronize: () => Effect.succeed(undefined) },
+                  { synchronize: () => Effect.succeed(undefined) },
+                );
+                return yield* recovery
+                  .capture({
+                    threadId,
+                    environmentId: "environment",
+                    relayUrl: "https://relay.invalid",
+                    generation: 1,
+                    operationId: finalSaveOperation,
+                    previousOperationId: "enroll",
+                  })
+                  .pipe(Effect.result);
+              }).pipe(
+                Effect.provideService(VmWorkloadTracking, true),
+                Effect.provideService(VmControlSpawner, workloadControl),
+                Effect.provideService(VmWorkloadMaintenance, maintenance),
+                Effect.provideService(
+                  ThreadExecution,
+                  makeThreadExecutionRelay(sql, {
+                    admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
+                    complete: () => Effect.void,
+                  }),
+                ),
+                Effect.provide(
+                  Layer.mergeAll(
+                    Layer.succeedContext(context),
+                    Layer.mock(TerminalManager)({ close: () => Effect.void }),
+                    Layer.mock(OrchestrationEngineService)({}),
+                  ),
+                ),
+              );
+              assert.equal(recovered._tag, "Failure");
+              if (recovered._tag === "Failure")
+                assert.include(
+                  recovered.failure.message,
+                  "Native provider history cannot leave a workflow VM",
+                );
+              yield* provider.stopSession({ threadId });
+              const afterRecovery = Option.getOrThrow(yield* directory.getBinding(threadId));
+              const finalMetadata = (yield* decodeClaudeRestartOwnership(
+                afterRecovery.runtimePayload,
+              )).providerContinuation;
+              assert.isTrue(finalMetadata.shutdownConfirmed);
+              assert.equal(finalMetadata.shutdownEvidenceVersion, 2);
+              assert.equal(kernel.stops, 3);
+              assert.isTrue(
+                yield* provider.isWorkflowSessionStopConfirmed({ jobId: run.jobId, threadId }),
+              );
+              assert.deepEqual(
+                yield* sql`SELECT work_id FROM thread_execution_work WHERE thread_id=${threadId} AND (completed=0 OR relay_completed=0)`,
+                [],
+              );
+              return;
+            }
             yield* provider.stopSession({ threadId });
             yield* provider.stopSession({ threadId });
             assert.equal(runtimes[1]!.writerCloses, 1);

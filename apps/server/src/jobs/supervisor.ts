@@ -32,7 +32,10 @@ import * as Stream from "effect/Stream";
 import { RunRepositoryWorkflow, WorkflowAgentStep } from "@t3tools/contracts/workflows";
 
 import type { OrchestrationEngineShape } from "../orchestration/Services/OrchestrationEngine.ts";
-import type { TextGeneration } from "../textGeneration/TextGeneration.ts";
+import {
+  WORKFLOW_APPROVAL_FAILURE_DETAILS,
+  type TextGeneration,
+} from "../textGeneration/TextGeneration.ts";
 import {
   ApprovalRequestedActivityPayload,
   classifyApprovalRequest,
@@ -251,21 +254,28 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
           : { jobContext: input.jobContext, reviewConstraint: input.reviewConstraint }),
         modelSelection,
       })
-      .pipe(Effect.option);
+      .pipe(Effect.result);
 
-    if (generated._tag === "None") {
-      // A supervisor that cannot be reached has not approved anything.
-      yield* Effect.logWarning("supervisor model call failed", { threadId, requestId });
+    if (generated._tag === "Failure") {
+      const failure = Object.entries(WORKFLOW_APPROVAL_FAILURE_DETAILS).find(
+        ([, detail]) => detail === generated.failure.detail,
+      );
+      // Persist only our fixed explanations, never provider error bodies or causes.
+      yield* Effect.logWarning("supervisor model call failed", {
+        threadId,
+        requestId,
+        failureKind: failure?.[0] ?? "unavailable",
+      });
       return yield* settleVerdict({
         requestId,
         requestType,
         verdict: "escalate",
-        reasoning: "The supervisor model could not be reached.",
+        reasoning: failure?.[1] ?? "The supervisor model did not return a usable approval verdict.",
         consultedModel: true,
       });
     }
 
-    const { verdict, reasoning } = generated.value;
+    const { verdict, reasoning } = generated.success;
     yield* settleVerdict({ requestId, requestType, verdict, reasoning, consultedModel: true });
   });
 

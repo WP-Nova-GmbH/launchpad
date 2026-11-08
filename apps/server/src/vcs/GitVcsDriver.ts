@@ -525,24 +525,27 @@ const gitCommand = (
     readonly appendTruncationMarker?: boolean;
   },
 ) =>
-  process.run({
-    operation,
-    command: "git",
-    args: ["-C", cwd, ...args],
-    cwd,
-    spawnCwd: globalThis.process.cwd(),
-    ...(options?.stdin !== undefined ? { stdin: options.stdin } : {}),
-    ...(options?.env !== undefined ? { env: options.env } : {}),
-    ...(options?.allowNonZeroExit !== undefined
-      ? { allowNonZeroExit: options.allowNonZeroExit }
-      : {}),
-    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-    ...(options?.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
-    ...(options?.outputMode !== undefined ? { outputMode: options.outputMode } : {}),
-    ...(options?.appendTruncationMarker !== undefined
-      ? { appendTruncationMarker: options.appendTruncationMarker }
-      : {}),
-  });
+  Effect.flatMap(WorkflowVmGuest, (workflowGuest) =>
+    process.run({
+      operation,
+      command: "git",
+      args: ["-C", cwd, ...args],
+      cwd,
+      // The VM launcher enters cwd after dropping UID; coordinator home is private.
+      ...(workflowGuest ? {} : { spawnCwd: globalThis.process.cwd() }),
+      ...(options?.stdin !== undefined ? { stdin: options.stdin } : {}),
+      ...(options?.env !== undefined ? { env: options.env } : {}),
+      ...(options?.allowNonZeroExit !== undefined
+        ? { allowNonZeroExit: options.allowNonZeroExit }
+        : {}),
+      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      ...(options?.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
+      ...(options?.outputMode !== undefined ? { outputMode: options.outputMode } : {}),
+      ...(options?.appendTruncationMarker !== undefined
+        ? { appendTruncationMarker: options.appendTruncationMarker }
+        : {}),
+    }),
+  );
 
 export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* () {
   const fileSystem = yield* FileSystem.FileSystem;

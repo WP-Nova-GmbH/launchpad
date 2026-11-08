@@ -7,6 +7,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as NodeCrypto from "node:crypto";
 import * as Context from "effect/Context";
 import * as FileSystem from "effect/FileSystem";
+import * as Semaphore from "effect/Semaphore";
 import { collectUint8StreamText } from "./stream/collectUint8StreamText.ts";
 /** Enabled only by the private VM entry points. Never infer this from client input. */
 export const VmWorkloadTracking = Context.Reference<boolean>("t3/VmWorkloadTracking", {
@@ -27,6 +28,11 @@ export const VmSealedWorkloadAdmission = Context.Reference<
     }
   | undefined
 >("t3/VmSealedWorkloadAdmission", { defaultValue: () => undefined });
+/** One guest shares this permit across sealed reads, exports and seal adoption. */
+export const VmWorkloadMaintenance = Context.Reference<Semaphore.Semaphore | undefined>(
+  "t3/VmWorkloadMaintenance",
+  { defaultValue: () => undefined },
+);
 const helper = "/opt/launchpad/bin/launchpad-workload";
 export const workflowVmBaseEnvironment = {
   PATH: "/opt/launchpad/bin:/opt/launchpad/node/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -315,6 +321,7 @@ export function makeVmWorkloadSpawner(
 export const withVmWorkloads = <A, E, R>(effect: Effect.Effect<A, E, R>, workflow = false) =>
   Effect.gen(function* () {
     const raw = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const maintenance = yield* Semaphore.make(1);
     return yield* effect.pipe(
       Effect.provideService(
         ChildProcessSpawner.ChildProcessSpawner,
@@ -323,6 +330,7 @@ export const withVmWorkloads = <A, E, R>(effect: Effect.Effect<A, E, R>, workflo
       Effect.provideService(VmControlSpawner, raw),
       Effect.provideService(VmWorkloadTracking, true),
       Effect.provideService(WorkflowVmGuest, workflow),
+      Effect.provideService(VmWorkloadMaintenance, maintenance),
     );
   });
 

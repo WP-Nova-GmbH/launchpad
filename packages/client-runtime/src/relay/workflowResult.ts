@@ -41,6 +41,26 @@ export function workflowResultOrigin(
     : null;
 }
 
+/** Repository VM results use workflow:<job>; machine runs keep their :agent
+ * suffix and may need private location recovery even when their source is gone.
+ */
+export function canRecoverPrivateThreadLocation(input: {
+  readonly capabilities: { readonly workflowVmResultReader?: boolean } | null | undefined;
+  readonly origin?: WorkflowResultOrigin | null | undefined;
+  readonly accountId: string | null | undefined;
+  readonly threadId: string | null | undefined;
+}) {
+  if (input.capabilities?.workflowVmResultReader !== undefined)
+    return !input.capabilities.workflowVmResultReader;
+  const origin = workflowResultOrigin(
+    { workflowOrigin: input.origin },
+    input.accountId,
+    input.threadId ?? undefined,
+  );
+  if (origin?.workflowVmResultReader) return false;
+  return input.capabilities != null || !/^workflow:[^:]+$/.test(input.threadId ?? "");
+}
+
 export function workflowResultCheckpoint(
   checkpoint: WorkflowCheckpoint | null | undefined,
 ): WorkflowResultCheckpoint | undefined {

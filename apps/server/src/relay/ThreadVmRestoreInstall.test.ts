@@ -25,9 +25,11 @@ import {
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import * as Sink from "effect/Sink";
+import * as Semaphore from "effect/Semaphore";
 import {
   VmControlSpawner,
   VmWorkloadTracking,
+  VmWorkloadMaintenance,
   makeVmWorkloadSpawner,
 } from "../vmWorkloadCommand.ts";
 import * as FileSystem from "effect/FileSystem";
@@ -926,8 +928,10 @@ it.layer(
                   return HttpClientResponse.fromWeb(request, Response.json({ ready }, { status }));
                 }),
               );
+              const maintenance = yield* Semaphore.make(1);
               const activate = activateRestoredThreadVm(f.threadId).pipe(
                 Effect.provideService(VmWorkloadTracking, true),
+                Effect.provideService(VmWorkloadMaintenance, maintenance),
                 Effect.provideService(VmControlSpawner, control),
                 Effect.provideService(ProcessRunner, trackedRunner),
                 Effect.provideService(HttpClient.HttpClient, client),

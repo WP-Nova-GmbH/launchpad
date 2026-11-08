@@ -331,6 +331,7 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
 // NDJSON writers and is provided at the outer runtime layer so both
 // `ProviderService` and the per-instance drivers read the same logger pair.
 const ProviderLayerLive = ProviderServiceLive.pipe(
+  Layer.provide(ServerSecretStore.layer),
   Layer.provide(OrchestrationEventStoreLive),
   Layer.provide(ThreadExecutionLayerLive),
   Layer.provide(WorkflowRunStore.layer),

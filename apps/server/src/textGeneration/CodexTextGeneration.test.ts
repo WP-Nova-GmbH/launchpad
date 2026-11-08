@@ -3,6 +3,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
@@ -204,73 +205,84 @@ it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
       },
     ).pipe(Effect.provideService(WorkflowVmGuest, true));
 
-  it.effect("uses coordinator transport for an isolated workflow approval", () =>
-    Effect.gen(function* () {
-      let minted = 0;
-      const requests: Array<{ url: string; init?: RequestInit | undefined }> = [];
-      const generation = yield* supervisor(
-        Effect.sync(() => {
-          minted++;
-          return Redacted.make("supervisor-fixture-token");
-        }),
-      );
-      const result = yield* generation.generateApprovalVerdict(approval).pipe(
-        Effect.provideService(FetchHttpClient.Fetch, async (url, init) => {
-          requests.push({ url: String(url), init });
-          return new Response(
-            [
-              sse({ type: "response.output_text.delta", delta: '{"verdict":"deny"}' }),
-              completedApproval([
-                {
-                  type: "output_text",
-                  text: encodeJson({ verdict: "approve", reasoning: "In scope." }),
+  it.effect.each(["text/event-stream", "Text/Event-Stream ; charset=utf-8", undefined] as const)(
+    "uses coordinator transport and a fragmented completed approval with Content-Type %s",
+    (contentType) =>
+      Effect.gen(function* () {
+        let minted = 0;
+        const requests: Array<{ url: string; init?: RequestInit | undefined }> = [];
+        const generation = yield* supervisor(
+          Effect.sync(() => {
+            minted++;
+            return Redacted.make("supervisor-fixture-token");
+          }),
+        );
+        const result = yield* generation.generateApprovalVerdict(approval).pipe(
+          Effect.provideService(FetchHttpClient.Fetch, async (url, init) => {
+            requests.push({ url: String(url), init });
+            const body = new TextEncoder().encode(
+              [
+                sse({ type: "response.output_text.delta", delta: '{"verdict":"deny"}' }),
+                completedApproval([
+                  {
+                    type: "output_text",
+                    text: encodeJson({ verdict: "approve", reasoning: "In scope." }),
+                  },
+                ]),
+              ].join(""),
+            );
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  for (let offset = 0; offset < body.length; offset += 7)
+                    controller.enqueue(body.subarray(offset, offset + 7));
+                  controller.close();
                 },
-              ]),
-            ].join(""),
-            { headers: { "content-type": "text/event-stream" } },
-          );
-        }),
-      );
-      expect(minted).toBe(1);
-      expect(requests).toHaveLength(1);
-      const request = requests[0]!;
-      expect(request.url).toBe("https://api.openai.com/v1/responses");
-      expect(request.init?.method).toBe("POST");
-      expect(request.init?.redirect).toBe("manual");
-      expect(new Headers(request.init?.headers).get("authorization")).toBe(
-        "Bearer supervisor-fixture-token",
-      );
-      const body = yield* Effect.promise(() => new Response(request.init?.body).text());
-      expect(decodeJson(body)).toMatchObject({
-        model: "gpt-6-astra",
-        input: [
-          {
-            role: "user",
-            content: [
-              { type: "input_text", text: expect.stringContaining("Run repository tests") },
-            ],
-          },
-        ],
-        tools: [],
-        tool_choice: "none",
-        store: false,
-        stream: true,
-        reasoning: { effort: "low" },
-        text: {
-          format: {
-            type: "json_schema",
-            name: "workflow_approval_verdict",
-            strict: true,
-            schema: {
-              type: "object",
-              required: ["verdict", "reasoning"],
-              additionalProperties: false,
+              }),
+              { headers: contentType === undefined ? {} : { "content-type": contentType } },
+            );
+          }),
+        );
+        expect(minted).toBe(1);
+        expect(requests).toHaveLength(1);
+        const request = requests[0]!;
+        expect(request.url).toBe("https://api.openai.com/v1/responses");
+        expect(request.init?.method).toBe("POST");
+        expect(request.init?.redirect).toBe("manual");
+        expect(new Headers(request.init?.headers).get("authorization")).toBe(
+          "Bearer supervisor-fixture-token",
+        );
+        const body = yield* Effect.promise(() => new Response(request.init?.body).text());
+        expect(decodeJson(body)).toMatchObject({
+          model: "gpt-6-astra",
+          input: [
+            {
+              role: "user",
+              content: [
+                { type: "input_text", text: expect.stringContaining("Run repository tests") },
+              ],
+            },
+          ],
+          tools: [],
+          tool_choice: "none",
+          store: false,
+          stream: true,
+          reasoning: { effort: "low" },
+          text: {
+            format: {
+              type: "json_schema",
+              name: "workflow_approval_verdict",
+              strict: true,
+              schema: {
+                type: "object",
+                required: ["verdict", "reasoning"],
+                additionalProperties: false,
+              },
             },
           },
-        },
-      });
-      expect(result).toEqual({ verdict: "approve", reasoning: "In scope." });
-    }),
+        });
+        expect(result).toEqual({ verdict: "approve", reasoning: "In scope." });
+      }),
   );
 
   it.effect("fails closed when isolated approval inference has no coordinator credential", () =>
@@ -282,43 +294,357 @@ it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
         }),
         Effect.flip,
       );
-      expect(error.detail).toBe("The workflow supervisor could not reach Codex.");
+      expect(error.detail).toBe(TextGeneration.WORKFLOW_APPROVAL_FAILURE_DETAILS.credential);
     }),
   );
 
-  it.effect.each(["redirect", "incomplete", "refusal"] as const)(
+  const approvalReasoningItem = { id: "reasoning-1", type: "reasoning" };
+  const approvalMessageItem = {
+    id: "message-1",
+    type: "message",
+    role: "assistant",
+    phase: "final_answer",
+    status: "completed",
+    content: [
+      { type: "output_text", text: encodeJson({ verdict: "approve", reasoning: "In scope." }) },
+    ],
+  };
+  const outputItem = (type: "added" | "done", output_index: number, item: unknown) =>
+    sse({ type: `response.output_item.${type}`, output_index, item });
+  const completedOutput = (output: ReadonlyArray<unknown>) =>
+    sse({ type: "response.completed", response: { status: "completed", output } });
+
+  it.effect.each(["sparse", "snapshot"] as const)(
+    "uses completed item receipts with a %s completion and no Content-Type",
+    (completion) =>
+      Effect.gen(function* () {
+        const generation = yield* supervisor(Effect.succeed(Redacted.make("fixture-token")));
+        const result = yield* generation.generateApprovalVerdict(approval).pipe(
+          Effect.provideService(
+            FetchHttpClient.Fetch,
+            async () =>
+              new Response(
+                new TextEncoder().encode(
+                  [
+                    outputItem("added", 0, approvalReasoningItem),
+                    outputItem("done", 0, approvalReasoningItem),
+                    outputItem("added", 1, {
+                      ...approvalMessageItem,
+                      status: "in_progress",
+                      content: [],
+                    }),
+                    sse({ type: "response.output_text.delta", delta: '{"verdict":"deny"}' }),
+                    sse({
+                      type: "response.content_part.done",
+                      output_index: 1,
+                      content_index: 0,
+                      item_id: approvalMessageItem.id,
+                      part: approvalMessageItem.content[0],
+                    }),
+                    outputItem("done", 1, approvalMessageItem),
+                    completedOutput(
+                      completion === "sparse" ? [] : [approvalReasoningItem, approvalMessageItem],
+                    ),
+                  ].join(""),
+                ),
+              ),
+          ),
+        );
+        expect(result).toEqual({ verdict: "approve", reasoning: "In scope." });
+      }),
+  );
+
+  it.effect.each([
+    ["duplicate-index", "conflictingOutput"],
+    ["duplicate-id", "conflictingOutput"],
+    ["duplicate-added", "conflictingOutput"],
+    ["changed-added-id", "conflictingOutput"],
+    ["cross-index-added-done", "conflictingOutput"],
+    ["cross-index-done-added", "conflictingOutput"],
+    ["negative-index", "outputItem"],
+    ["missing-id", "outputItem"],
+    ["missing-index", "outputItem"],
+    ["unfinished-message", "outputItem"],
+    ["unsupported-item", "outputItem"],
+    ["refusal", "refusal"],
+    ["delta-only", "output"],
+    ["no-terminal", "missingTerminal"],
+    ["unfinished-added", "outputItem"],
+    ["conflicting-snapshot", "conflictingOutput"],
+    ["unfinished-snapshot", "outputItem"],
+    ["duplicate-snapshot-id", "conflictingOutput"],
+    ["multiple-messages", "output"],
+  ] as const)(
+    "rejects ambiguous or incomplete completed-item receipts: %s",
+    ([outcome, failureKind]) =>
+      Effect.gen(function* () {
+        const generation = yield* supervisor(Effect.succeed(Redacted.make("fixture-token")));
+        const reasoning = outputItem("done", 0, approvalReasoningItem);
+        const message = outputItem("done", 1, approvalMessageItem);
+        let events = [reasoning, message];
+        let terminal = completedOutput([]);
+        switch (outcome) {
+          case "duplicate-index":
+            events = [reasoning, reasoning, message];
+            break;
+          case "duplicate-id":
+            events = [
+              reasoning,
+              outputItem("done", 1, { ...approvalMessageItem, id: approvalReasoningItem.id }),
+            ];
+            break;
+          case "duplicate-added":
+            events = [
+              outputItem("added", 0, approvalReasoningItem),
+              outputItem("added", 0, approvalReasoningItem),
+            ];
+            break;
+          case "changed-added-id":
+            events = [
+              reasoning,
+              outputItem("added", 1, { ...approvalMessageItem, id: "other-message" }),
+              message,
+            ];
+            break;
+          case "cross-index-added-done":
+            events = [
+              outputItem("added", 0, approvalReasoningItem),
+              outputItem("done", 1, { ...approvalMessageItem, id: approvalReasoningItem.id }),
+            ];
+            terminal = completedOutput([
+              approvalReasoningItem,
+              { ...approvalMessageItem, id: approvalReasoningItem.id },
+            ]);
+            break;
+          case "cross-index-done-added":
+            events = [
+              outputItem("done", 1, { ...approvalMessageItem, id: approvalReasoningItem.id }),
+              outputItem("added", 0, approvalReasoningItem),
+            ];
+            terminal = completedOutput([
+              approvalReasoningItem,
+              { ...approvalMessageItem, id: approvalReasoningItem.id },
+            ]);
+            break;
+          case "negative-index":
+            events = [outputItem("done", -1, approvalMessageItem)];
+            break;
+          case "missing-id":
+            events = [outputItem("done", 0, { type: "reasoning" })];
+            break;
+          case "missing-index":
+            events = [message];
+            break;
+          case "unfinished-message":
+            events = [
+              reasoning,
+              outputItem("done", 1, { ...approvalMessageItem, status: "incomplete" }),
+            ];
+            break;
+          case "unsupported-item":
+            events = [outputItem("done", 0, { id: "tool-1", type: "function_call" })];
+            break;
+          case "refusal":
+            events = [
+              reasoning,
+              outputItem("done", 1, {
+                ...approvalMessageItem,
+                content: [{ type: "refusal", refusal: "private refusal sentinel" }],
+              }),
+            ];
+            break;
+          case "delta-only":
+            events = [
+              sse({
+                type: "response.output_text.delta",
+                delta: encodeJson({ verdict: "approve", reasoning: "In scope." }),
+              }),
+            ];
+            break;
+          case "no-terminal":
+            terminal = "";
+            break;
+          case "unfinished-added":
+            events = [
+              reasoning,
+              outputItem("added", 1, {
+                ...approvalMessageItem,
+                status: "in_progress",
+                content: [],
+              }),
+            ];
+            break;
+          case "conflicting-snapshot":
+            terminal = completedOutput([
+              approvalReasoningItem,
+              {
+                ...approvalMessageItem,
+                content: [
+                  {
+                    type: "output_text",
+                    text: encodeJson({ verdict: "deny", reasoning: "Out of scope." }),
+                  },
+                ],
+              },
+            ]);
+            break;
+          case "unfinished-snapshot":
+            events = [];
+            terminal = completedOutput([
+              approvalReasoningItem,
+              { ...approvalMessageItem, status: "incomplete" },
+            ]);
+            break;
+          case "duplicate-snapshot-id":
+            events = [];
+            terminal = completedOutput([
+              approvalReasoningItem,
+              { ...approvalMessageItem, id: approvalReasoningItem.id },
+            ]);
+            break;
+          case "multiple-messages":
+            events = [
+              reasoning,
+              message,
+              outputItem("done", 2, { ...approvalMessageItem, id: "message-2" }),
+            ];
+            break;
+        }
+        const error = yield* generation.generateApprovalVerdict(approval).pipe(
+          Effect.provideService(
+            FetchHttpClient.Fetch,
+            async () => new Response(new TextEncoder().encode([...events, terminal].join(""))),
+          ),
+          Effect.flip,
+        );
+        expect(error.detail).toBe(TextGeneration.WORKFLOW_APPROVAL_FAILURE_DETAILS[failureKind]);
+        expect(encodeJson(error)).not.toContain("private refusal sentinel");
+      }),
+  );
+
+  it.effect.each([
+    ["redirect", "http", true],
+    ["content-type", "contentType", true],
+    ["missing-terminal", "missingTerminal", true],
+    ["malformed-terminal", "malformedTerminal", true],
+    ["failed", "failed", true],
+    ["incomplete", "incomplete", true],
+    ["error", "upstreamError", true],
+    ["refusal", "refusal", true],
+    ["output-shape", "output", true],
+    ["verdict-json", "verdictJson", true],
+    ["verdict-schema", "verdictSchema", true],
+    ["malformed-event", "stream", true],
+    ["stream-failure", "stream", true],
+    ["transport", "transport", true],
+    ["missing-terminal", "missingTerminal", false],
+    ["malformed-terminal", "malformedTerminal", false],
+    ["incomplete", "incomplete", false],
+    ["refusal", "refusal", false],
+    ["malformed-event", "stream", false],
+  ] as const)(
     "rejects an isolated approval %s without exposing upstream details",
-    (outcome) =>
+    ([outcome, failureKind, declaredContentType]) =>
       Effect.gen(function* () {
         let forwarded = 0;
         let signal: AbortSignal | null | undefined;
+        const logs: unknown[] = [];
+        const logger = Logger.make(({ message }) => logs.push(message));
         const generation = yield* supervisor(Effect.succeed(Redacted.make("fixture-token")));
-        const error = yield* generation.generateApprovalVerdict(approval).pipe(
-          Effect.provideService(FetchHttpClient.Fetch, async (_url, init) => {
-            forwarded++;
-            signal = init?.signal;
-            expect(init?.redirect).toBe("manual");
-            if (outcome === "redirect")
-              return new Response("private upstream details", {
-                status: 307,
-                headers: { location: "https://redirect.invalid" },
-              });
-            return new Response(
-              outcome === "refusal"
-                ? completedApproval([{ type: "refusal", refusal: "private upstream details" }])
-                : sse({ type: "response.output_text.delta", delta: "private upstream details" }),
-              { headers: { "content-type": "text/event-stream" } },
-            );
-          }),
-          Effect.flip,
-        );
+        const error = yield* generation
+          .generateApprovalVerdict({
+            ...approval,
+            requestDetail: "private request sentinel",
+          })
+          .pipe(
+            Effect.provideService(FetchHttpClient.Fetch, async (_url, init) => {
+              forwarded++;
+              signal = init?.signal;
+              expect(init?.redirect).toBe("manual");
+              if (outcome === "redirect")
+                return new Response("private upstream details", {
+                  status: 307,
+                  headers: { location: "https://redirect.invalid" },
+                });
+              if (outcome === "content-type")
+                return new Response(
+                  completedApproval([
+                    {
+                      type: "output_text",
+                      text: encodeJson({ verdict: "approve", reasoning: "In scope." }),
+                    },
+                  ]),
+                  { headers: { "content-type": "application/json" } },
+                );
+              if (outcome === "transport") throw new Error("private upstream details");
+              if (outcome === "stream-failure")
+                return new Response(
+                  new ReadableStream({
+                    start(controller) {
+                      controller.error(new Error("private upstream details"));
+                    },
+                  }),
+                  { headers: { "content-type": "text/event-stream" } },
+                );
+              const body =
+                outcome === "missing-terminal"
+                  ? sse({ type: "response.output_text.delta", delta: "private upstream details" })
+                  : outcome === "malformed-terminal"
+                    ? sse({ type: "response.completed", response: { status: "completed" } })
+                    : outcome === "failed" || outcome === "incomplete" || outcome === "error"
+                      ? sse({
+                          type: outcome === "error" ? "error" : `response.${outcome}`,
+                          message: "private upstream details",
+                        })
+                      : outcome === "refusal"
+                        ? completedApproval([
+                            { type: "refusal", refusal: "private upstream details" },
+                          ])
+                        : outcome === "output-shape"
+                          ? completedApproval([])
+                          : outcome === "malformed-event"
+                            ? "data: private upstream details\n\n"
+                            : completedApproval([
+                                {
+                                  type: "output_text",
+                                  text:
+                                    outcome === "verdict-json"
+                                      ? "private upstream details"
+                                      : encodeJson({
+                                          verdict: "approve",
+                                          reasoning: "private upstream details",
+                                          unexpected: "private upstream details",
+                                        }),
+                                },
+                              ]);
+              const responseBody =
+                outcome === "missing-terminal"
+                  ? body
+                  : body +
+                    completedApproval([
+                      {
+                        type: "output_text",
+                        text: encodeJson({ verdict: "approve", reasoning: "In scope." }),
+                      },
+                    ]);
+              return new Response(
+                declaredContentType ? responseBody : new TextEncoder().encode(responseBody),
+                { headers: declaredContentType ? { "content-type": "text/event-stream" } : {} },
+              );
+            }),
+            Effect.flip,
+            Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+          );
         expect(forwarded).toBe(1);
         expect(signal?.aborted).toBe(true);
-        expect(error.detail).toBe(
-          outcome === "redirect"
-            ? "The workflow supervisor could not reach Codex."
-            : "Codex did not return a complete workflow approval verdict.",
-        );
+        expect(error.detail).toBe(TextGeneration.WORKFLOW_APPROVAL_FAILURE_DETAILS[failureKind]);
+        const saved = encodeJson({ error, logs });
+        for (const privateText of [
+          "private upstream details",
+          "private request sentinel",
+          "fixture-token",
+        ])
+          expect(saved).not.toContain(privateText);
       }),
   );
 

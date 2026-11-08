@@ -9,9 +9,14 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Sink from "effect/Sink";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { VmControlSpawner, VmWorkloadTracking } from "../vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadMaintenance,
+  VmWorkloadTracking,
+} from "../vmWorkloadCommand.ts";
 
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
@@ -57,6 +62,7 @@ for (const problem of [
         const f = yield* attachmentCheckpointFixture,
           operationId = NodeCrypto.randomUUID(),
           advancedOperationId = NodeCrypto.randomUUID();
+        const maintenance = yield* Semaphore.make(1);
         yield* f.sql`INSERT INTO provider_session_runtime(thread_id,provider_name,adapter_key,status,last_seen_at) VALUES(${f.owner.threadId},'codex','codex','stopped','2026-10-07T00:00:00Z')`;
         yield* f.sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_files_json) VALUES(${f.owner.threadId},${f.nativeInput.turnId},'completed','2026-10-07T00:00:00Z','2026-10-07T00:01:00Z','[]')`;
         let operation: RelayThreadVmPause = {
@@ -283,10 +289,17 @@ for (const problem of [
         ).pipe(
           Effect.provide(services),
           Effect.provideService(VmWorkloadTracking, true),
+          Effect.provideService(VmWorkloadMaintenance, maintenance),
           Effect.provideService(VmControlSpawner, control),
         );
         const synchronize = (threadId: string) =>
-          worker.synchronize(threadId).pipe(Effect.provideService(VmControlSpawner, control));
+          worker
+            .synchronize(threadId)
+            .pipe(
+              Effect.provideService(VmWorkloadTracking, true),
+              Effect.provideService(VmWorkloadMaintenance, maintenance),
+              Effect.provideService(VmControlSpawner, control),
+            );
         if (problem === "completed-reopened-before-final-save") {
           const before = (yield* f.fences.get(f.owner.threadId))!;
           yield* f.fences.beginDrain({

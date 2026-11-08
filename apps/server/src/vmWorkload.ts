@@ -4,10 +4,12 @@ import {
   VmControlSpawner,
   VmWorkloadTracking,
   VmSealedWorkloadAdmission,
+  VmWorkloadMaintenance,
   makeVmWorkloadSpawner,
 } from "./vmWorkloadCommand.ts";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
 const Identifier = Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u));
@@ -157,6 +159,16 @@ export const inspectVmWorkloads = Effect.fn("VmWorkload.inspect")(
   Effect.mapError(() => new VmWorkloadError()),
 );
 
+/** Serialize operations that inspect and use one guest's unchanged workload seal. */
+export const withVmWorkloadMaintenance = Effect.fnUntraced(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) {
+  if (!(yield* VmWorkloadTracking)) return yield* effect;
+  const maintenance = yield* VmWorkloadMaintenance;
+  if (!maintenance) return yield* new VmWorkloadError();
+  return yield* maintenance.withPermits(1)(effect);
+});
+
 /** A source export may run its own Git commands while ordinary launches stay
  * sealed. Those commands get tracked too: a detached export hook blocks the final
  * receipt instead of being mistaken for a stopped workspace.
@@ -164,37 +176,55 @@ export const inspectVmWorkloads = Effect.fn("VmWorkload.inspect")(
 export const withSealedVmWorkloads = <A, E, R>(
   operationId: string,
   effect: Effect.Effect<A, E, R>,
+  expected?: { readonly bootId: string; readonly epoch: number },
 ) =>
-  Effect.gen(function* () {
-    if (!(yield* VmWorkloadTracking)) return yield* effect;
-    const control = yield* VmControlSpawner;
-    if (!control) return yield* new VmWorkloadError();
-    const operation = NodeCrypto.createHash("sha256")
-      .update(operationId)
-      .digest("hex")
-      .slice(0, 32);
-    const before = yield* inspectVmWorkloads({ type: "inspect" });
-    if (!before.stopped || before.sealedBy !== operation) return yield* new VmWorkloadError();
-    const spawner = makeVmWorkloadSpawner(control);
-    const runner = yield* ProcessRunner.make().pipe(
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    );
-    const result = yield* effect.pipe(
-      Effect.provideService(VmSealedWorkloadAdmission, {
-        bootId: before.bootId,
-        operationId: operation,
-        epoch: before.epoch,
-      }),
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-      Effect.provideService(ProcessRunner.ProcessRunner, runner),
-    );
-    const after = yield* inspectVmWorkloads({ type: "inspect" });
-    if (
-      !after.stopped ||
-      after.bootId !== before.bootId ||
-      after.epoch !== before.epoch ||
-      after.sealedBy !== operation
-    )
-      return yield* new VmWorkloadError();
-    return result;
-  });
+  withVmWorkloadMaintenance(
+    Effect.gen(function* () {
+      if (!(yield* VmWorkloadTracking)) return yield* effect;
+      const control = yield* VmControlSpawner;
+      if (!control) return yield* new VmWorkloadError();
+      const operation = NodeCrypto.createHash("sha256")
+        .update(operationId)
+        .digest("hex")
+        .slice(0, 32);
+      const before = yield* inspectVmWorkloads({ type: "inspect" });
+      if (
+        !before.stopped ||
+        before.sealedBy !== operation ||
+        (expected && (before.bootId !== expected.bootId || before.epoch !== expected.epoch))
+      )
+        return yield* new VmWorkloadError();
+      const spawner = makeVmWorkloadSpawner(control);
+      const runner = yield* ProcessRunner.make().pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      );
+      const verifyStopped = Effect.gen(function* () {
+        const after = yield* inspectVmWorkloads({ type: "inspect" });
+        if (
+          !after.stopped ||
+          after.bootId !== before.bootId ||
+          after.epoch !== before.epoch ||
+          after.sealedBy !== operation
+        )
+          return yield* new VmWorkloadError();
+      }).pipe(
+        Effect.interruptible,
+        Effect.timeoutOrElse({
+          duration: "10 seconds",
+          orElse: () => Effect.fail(new VmWorkloadError()),
+        }),
+      );
+      return yield* effect.pipe(
+        Effect.provideService(VmSealedWorkloadAdmission, {
+          bootId: before.bootId,
+          operationId: operation,
+          epoch: before.epoch,
+        }),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.provideService(ProcessRunner.ProcessRunner, runner),
+        Effect.onExit((exit) =>
+          Exit.isSuccess(exit) ? verifyStopped : verifyStopped.pipe(Effect.ignoreCause),
+        ),
+      );
+    }),
+  );

@@ -36,11 +36,14 @@ export function resolveWorkflowResultAccess(
   origin: WorkflowResultOrigin | null | undefined,
   threadId: string | null,
 ) {
+  // Cold VM-result links may have neither configuration nor navigation state.
+  // Machine workflow threads have an additional :agent suffix.
   const readOnly =
     capabilities?.workflowVmResultReader ??
-    (origin != null &&
-      origin.threadId === threadId &&
-      (origin.workflowVmResultReader === true || origin.reviewVisitId !== undefined));
+    ((capabilities === null && /^workflow:[^:]+$/.test(threadId ?? "")) ||
+      (origin != null &&
+        origin.threadId === threadId &&
+        (origin.workflowVmResultReader === true || origin.reviewVisitId !== undefined)));
   // A deep link can load its thread before the environment descriptor arrives.
   return { readOnly, workspaceEnabled: capabilities !== null && !readOnly };
 }

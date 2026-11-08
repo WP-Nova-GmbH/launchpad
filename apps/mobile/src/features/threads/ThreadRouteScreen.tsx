@@ -1,4 +1,7 @@
 import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
+import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { canRecoverPrivateThreadLocation } from "@t3tools/client-runtime/relay/workflow-result";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
 import {
@@ -277,6 +280,13 @@ function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const threadIdRaw = firstRouteParam(params.threadId);
   const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
   const routeEnvironmentRuntime = useRemoteEnvironmentRuntime(environmentId);
+  const relaySession = useAtomValue(managedRelaySessionAtom);
+  const privateLocationRecovery = canRecoverPrivateThreadLocation({
+    capabilities: routeEnvironmentRuntime?.serverConfig?.environment.capabilities,
+    origin: params.workflowOrigin,
+    accountId: relaySession?.accountId,
+    threadId: threadIdRaw,
+  });
   const { readOnly, workspaceEnabled } = resolveWorkflowResultAccess(
     routeEnvironmentRuntime?.serverConfig?.environment.capabilities ?? null,
     params.workflowOrigin,
@@ -317,7 +327,7 @@ function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
 
   return (
     <>
-      {!readOnly && (
+      {!readOnly && privateLocationRecovery && (
         <CurrentThreadLocation
           key={routeThreadKey}
           environmentId={environmentId}

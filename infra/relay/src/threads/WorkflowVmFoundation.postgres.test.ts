@@ -3,6 +3,7 @@ import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodeEffectCrypto from "@effect/platform-node/NodeCrypto";
 import * as PgClient from "@effect/sql-pg/PgClient";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { RelayEnvironmentPrincipal } from "@t3tools/contracts/relay";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import { DateTime, Deferred, Effect, Fiber, FileSystem, Layer, Redacted } from "effect";
 import type { SandboxInfo } from "e2b";
@@ -10,6 +11,8 @@ import * as TestClock from "effect/testing/TestClock";
 import * as NodeCrypto from "node:crypto";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
+import { makeThreadVmActivityStore } from "./ThreadVmActivityStore.ts";
+import { makeThreadVmActivityWorker } from "./ThreadVmActivityWorker.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 import { makeThreadVmProvisionWorker } from "./ThreadVmProvisionWorker.ts";
@@ -27,6 +30,10 @@ import { advanceWorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
 import { Workflows, layer as workflows } from "../jobs/Workflows.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { ThreadVmRuntimeConfiguration } from "./ThreadVmRuntime.ts";
+import {
+  admitPortableThreadWork,
+  completePortableThreadWork,
+} from "../http/ThreadEnvironmentApi.ts";
 
 const databaseUrl = process.env.LAUNCHPAD_VM_TEST_DATABASE_URL;
 const database = Layer.effectDiscard(
@@ -59,8 +66,8 @@ const seed = Effect.fnUntraced(function* (input: {
   const sql = yield* PgClient.PgClient;
   const organizationId = input.organizationId ?? NodeCrypto.randomUUID();
   const repositoryId = NodeCrypto.randomUUID();
-  const threadId = NodeCrypto.randomUUID();
   const workflowJobId = NodeCrypto.randomUUID();
+  const threadId = input.personal ? NodeCrypto.randomUUID() : `workflow:${workflowJobId}`;
   const allocationId = NodeCrypto.randomUUID();
   const operationId = NodeCrypto.randomUUID();
   const ownerUserId = NodeCrypto.randomUUID();
@@ -147,6 +154,57 @@ const seed = Effect.fnUntraced(function* (input: {
     ownerUserId,
     hostId: input.hostId,
   };
+});
+
+const activeWorkflow = Effect.fnUntraced(function* () {
+  const f = yield* seed({ hostId: NodeCrypto.randomUUID() });
+  const environmentId = NodeCrypto.randomUUID();
+  const credentialId = NodeCrypto.randomUUID();
+  const connectionId = NodeCrypto.randomUUID();
+  const computeRef = NodeCrypto.randomUUID();
+  yield* f.capacity.admitNext(f.hostId, "all");
+  yield* f.capacity.beginExecution(f.operationId);
+  yield* f.capacity.recordCreated(f.operationId, computeRef);
+  yield* f.sql`INSERT INTO relay_repositories(repository_id,organization_id,name,created_at,updated_at)
+    VALUES(${f.repositoryId},${f.organizationId},'Workflow work','2026','2026')`;
+  yield* f.sql`UPDATE relay_thread_vm_allocations SET state='running',compute_ref=${computeRef}
+    WHERE allocation_id=${f.allocationId}`;
+  yield* f.sql`INSERT INTO relay_thread_vm_provisions(allocation_id,operation_id,generation,phase,workflow_snapshot)
+    VALUES(${f.allocationId},${f.operationId},1,'created',${f.sql.json({
+      canonicalKey: "github.com/acme/example",
+      installationId: "1",
+      branch: "main",
+      commitSha: "a".repeat(40),
+      templateBuildId: "build",
+    })})`;
+  yield* f.sql`INSERT INTO relay_environment_credentials(credential_id,environment_id,environment_public_key,credential_hash,created_at,updated_at)
+    VALUES(${credentialId},${environmentId},'workflow-key',${credentialId},'2026','2026')`;
+  yield* f.sql`INSERT INTO relay_thread_vm_bindings(environment_id,allocation_id,thread_id,repository_id,generation,environment_public_key,credential_id)
+    VALUES(${environmentId},${f.allocationId},${f.threadId},${f.repositoryId},1,'workflow-key',${credentialId})`;
+  yield* f.sql`INSERT INTO relay_thread_vm_enrollments(allocation_id,operation_id,seed_hash,environment_id,environment_public_key,credential_id,sealed_response,expires_at,installed_at)
+    VALUES(${f.allocationId},${f.operationId},${credentialId},${environmentId},'workflow-key',${credentialId},'response',clock_timestamp()+interval '1 hour',clock_timestamp())`;
+  yield* f.placements.assignWorkflow({ ...f, environmentId });
+  yield* f.sql`INSERT INTO relay_thread_vm_setups(allocation_id,canonical_key,branch,revision,phase,environment_id,receipt_sha256)
+    VALUES(${f.allocationId},'github.com/acme/example','main',${"a".repeat(40)},'ready',${environmentId},${"b".repeat(64)})`;
+  yield* f.sql`INSERT INTO relay_thread_vm_codex_auth(allocation_id,environment_id,generation,thread_id,organization_id,mode,connection_id,acknowledged_connection_id)
+    VALUES(${f.allocationId},${environmentId},1,${f.threadId},${f.organizationId},'organization',${connectionId},${connectionId})`;
+  yield* f.sql`UPDATE relay_workflow_jobs SET status='running',record=record ||
+    jsonb_build_object('status','running','startAttempted',true,'vmAdmission',jsonb_build_object('codexConnectionId',${connectionId}::text,'hasSecrets',false))
+    WHERE job_id=${f.workflowJobId}`;
+  yield* f.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${f.threadId}`;
+  const principal = {
+    environmentId,
+    environmentPublicKey: "workflow-key",
+    credentialId,
+    threadVm: {
+      allocationId: f.allocationId,
+      threadId: ThreadId.make(f.threadId),
+      repositoryId: f.repositoryId,
+      generation: 1,
+    },
+  };
+  const owner = { threadId: f.threadId, environmentId, generation: 1 };
+  return { ...f, principal, owner };
 });
 
 const services = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
@@ -1203,6 +1261,148 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           workflowJobId,
           environmentId: null,
         });
+      }),
+    );
+
+    it.effect("admits and completes workflow setup and successive Agent work idempotently", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow();
+        const asVm = Effect.provideService(RelayEnvironmentPrincipal, f.principal);
+        const activity = makeThreadVmActivityStore(f.sql);
+        for (const workId of [
+          "setup:checkout",
+          "terminal:setup",
+          "provider:agent-1",
+          "provider:agent-2",
+        ]) {
+          const work = { ...f.owner, workId };
+          const revision = Number((yield* activity.get(f.allocationId))?.revision ?? 0);
+          expect(yield* admitPortableThreadWork(work).pipe(asVm)).toEqual({
+            completed: false,
+            newlyAdmitted: true,
+          });
+          expect(yield* activity.get(f.allocationId)).toMatchObject({
+            revision: BigInt(revision + 1),
+            activity: "unknown",
+            idleSince: null,
+            lastWorkAt: expect.anything(),
+          });
+          expect(yield* admitPortableThreadWork(work).pipe(asVm)).toEqual({
+            completed: false,
+            newlyAdmitted: false,
+          });
+          expect(Number((yield* activity.get(f.allocationId))?.revision)).toBe(revision + 1);
+          expect(yield* completePortableThreadWork(work).pipe(asVm)).toEqual({ ok: true });
+          expect(Number((yield* activity.get(f.allocationId))?.revision)).toBe(revision + 2);
+          expect(yield* completePortableThreadWork(work).pipe(asVm)).toEqual({ ok: true });
+          expect(Number((yield* activity.get(f.allocationId))?.revision)).toBe(revision + 2);
+          expect(yield* admitPortableThreadWork(work).pipe(asVm)).toEqual({
+            completed: true,
+            newlyAdmitted: false,
+          });
+          expect(
+            yield* f.sql`SELECT completed FROM relay_thread_execution_admissions
+              WHERE thread_id=${f.threadId} AND work_id=${workId}`,
+          ).toEqual([{ completed: true }]);
+        }
+      }),
+    );
+
+    for (const invalid of [
+      "paused",
+      "deleted",
+      "legacy",
+      "wrong-environment",
+      "wrong-generation",
+      "wrong-credential",
+      "wrong-repository",
+      "revoked-binding",
+      "revoked-credential",
+      "unacknowledged-codex",
+      "not-started",
+      "done",
+      "cancelling",
+    ] as const) {
+      it.effect(`rejects ${invalid} workflow work without persisting an admission`, () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          let principal = f.principal;
+          let owner = f.owner;
+          if (invalid === "paused")
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET state='paused' WHERE allocation_id=${f.allocationId}`;
+          if (invalid === "deleted")
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
+          if (invalid === "legacy")
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET runtime_protocol='legacy' WHERE allocation_id=${f.allocationId}`;
+          if (invalid === "wrong-environment")
+            owner = { ...owner, environmentId: NodeCrypto.randomUUID() };
+          if (invalid === "wrong-generation") owner = { ...owner, generation: 2 };
+          if (invalid === "wrong-credential")
+            principal = { ...principal, credentialId: NodeCrypto.randomUUID() };
+          if (invalid === "wrong-repository")
+            principal = {
+              ...principal,
+              threadVm: { ...principal.threadVm, repositoryId: NodeCrypto.randomUUID() },
+            };
+          if (invalid === "revoked-binding")
+            yield* f.sql`UPDATE relay_thread_vm_bindings SET revoked_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
+          if (invalid === "revoked-credential")
+            yield* f.sql`UPDATE relay_environment_credentials SET revoked_at='2026' WHERE credential_id=${principal.credentialId}`;
+          if (invalid === "unacknowledged-codex")
+            yield* f.sql`UPDATE relay_thread_vm_codex_auth SET acknowledged_connection_id=NULL WHERE allocation_id=${f.allocationId}`;
+          if (invalid === "not-started")
+            yield* f.sql`UPDATE relay_workflow_jobs SET record=record || '{"startAttempted":false}'::jsonb WHERE job_id=${f.workflowJobId}`;
+          if (invalid === "done" || invalid === "cancelling")
+            yield* f.sql`UPDATE relay_workflow_jobs SET status=${invalid} WHERE job_id=${f.workflowJobId}`;
+          expect(
+            yield* Effect.isFailure(
+              admitPortableThreadWork({ ...owner, workId: "provider:rejected" }).pipe(
+                Effect.provideService(RelayEnvironmentPrincipal, principal),
+              ),
+            ),
+          ).toBe(true);
+          expect(
+            yield* f.sql`SELECT work_id FROM relay_thread_execution_admissions WHERE thread_id=${f.threadId}`,
+          ).toEqual([]);
+          expect(yield* makeThreadVmActivityStore(f.sql).get(f.allocationId)).toBeNull();
+        }),
+      );
+    }
+
+    it.effect("records workflow work without enabling personal idle inspection or deadlines", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow();
+        const activity = makeThreadVmActivityStore(f.sql);
+        yield* activity.recordWork(f.allocationId);
+        expect(yield* Effect.isFailure(activity.beginInspection(f.allocationId))).toBe(true);
+        expect(
+          yield* Effect.isFailure(
+            activity.finishInspection({
+              allocationId: f.allocationId,
+              revision: 1,
+              activity: "idle",
+            }),
+          ),
+        ).toBe(true);
+        expect(
+          yield* makeThreadVmActivityWorker(
+            f.sql,
+            () => Effect.die("Personal inspection must not touch a workflow VM"),
+            f.hostId,
+          ).runOne(),
+        ).toBe(false);
+        expect(
+          yield* f.sql`SELECT revision,activity,idle_since,pause_due_at,delete_due_at
+            FROM relay_thread_vm_activity WHERE allocation_id=${f.allocationId}`,
+        ).toEqual([
+          {
+            revision: 1n,
+            activity: "unknown",
+            idle_since: null,
+            pause_due_at: null,
+            delete_due_at: null,
+          },
+        ]);
       }),
     );
 

@@ -34,6 +34,7 @@ import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
+import { workflowVmCancellationSeal } from "../relay/WorkflowVmCancellation.ts";
 import * as Store from "./WorkflowRunStore.ts";
 import { type WorkflowRequest } from "./RepositoryWorkflowRunner.ts";
 import { decidePromptQueueCommand } from "../orchestration/promptQueueDecider.ts";
@@ -1394,6 +1395,54 @@ const prepareVmWorkflow = Effect.fnUntraced(function* (h: Effect.Success<typeof 
   return { fence, binding, workflowVm, start };
 });
 
+it.effect("keeps the original VM workload cancellation identity across new retry commands", () =>
+  test(
+    Effect.gen(function* () {
+      const h = yield* harness;
+      const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+      yield* fence.activate(binding);
+      const runner = yield* h.newRunner;
+      yield* runner.handle(start);
+      yield* Ref.set(h.providerProof, false);
+      const store = yield* Store.WorkflowRunStore;
+      let run = (yield* store.get(start.jobId))!;
+      const originalId = `workflow:${start.jobId}:cancel`;
+      yield* store.save({
+        ...run,
+        cancellationAttempt: { commandId: originalId, createdAt: NOW },
+        progress: { ...run.progress, status: "cancelling", retryableCancellation: true },
+      });
+      let previousCommand = originalId;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        run = (yield* store.get(start.jobId))!;
+        yield* runner.handle({ ...retryCancellation(run.progress.revision), workflowVm });
+        const retried = (yield* store.get(start.jobId))!;
+        assert(retried.cancellationAttempt);
+        assert.notEqual(retried.cancellationAttempt.commandId, previousCommand);
+        assert.equal(retried.cancellationAttempt.workloadCancellationId, originalId);
+        assert.equal(
+          workflowVmCancellationSeal({
+            jobId: start.jobId,
+            cancellationId:
+              retried.cancellationAttempt.workloadCancellationId ??
+              retried.cancellationAttempt.commandId,
+          }),
+          workflowVmCancellationSeal({ jobId: start.jobId, cancellationId: originalId }),
+        );
+        previousCommand = retried.cancellationAttempt.commandId;
+        yield* store.save({
+          ...retried,
+          progress: {
+            ...retried.progress,
+            revision: retried.progress.revision + 1,
+            retryableCancellation: true,
+          },
+        });
+      }
+    }),
+  ),
+);
+
 it.effect.each(["live", "restarted", "unrelated-attempt"] as const)(
   "answers a VM tool request while the current Agent handoff is uncertain (%s)",
   (mode) =>
@@ -1543,7 +1592,7 @@ it.effect.each(["escalates", "unavailable"] as const)(
               requestId: "approval-1",
               requestType: "command_execution_approval",
               verdict: "deny",
-              reasoning: `${outcome === "escalates" ? "Need a decision" : "The supervisor model could not be reached."} Workflow VM tool approvals cannot be handed to a human.`,
+              reasoning: `${outcome === "escalates" ? "Need a decision" : "The supervisor model did not return a usable approval verdict."} Workflow VM tool approvals cannot be handed to a human.`,
               consultedModel: true,
             },
           ],

@@ -2,8 +2,20 @@ import { ownershipReleased } from "../../jobs/workflowOwnership.ts";
 import { ProviderEventBarrier, type ProviderIngestionEvent } from "../ProviderEventBarrier.ts";
 import { exportUnstartedPortableCodexConversation } from "../Drivers/PortableCodexHome.ts";
 import { assertThreadTransferRuntime } from "../../persistence/ThreadTransferRuntime.ts";
-import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
-import { VmWorkloadError, type VmHarnessStopAdmission } from "../../vmWorkload.ts";
+import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import {
+  inspectVmWorkloads,
+  VmWorkloadError,
+  type VmHarnessStopAdmission,
+} from "../../vmWorkload.ts";
+import { ServerSecretStore } from "../../auth/ServerSecretStore.ts";
+import { readInstalledThreadVm } from "../../relay/ThreadVmEnrollment.ts";
+import {
+  workflowVmCancellationOperation,
+  workflowVmCancellationSeal,
+  WorkflowVmCancellationProof,
+} from "../../relay/WorkflowVmCancellation.ts";
+import { ChildProcessSpawner } from "effect/unstable/process";
 /**
  * ProviderServiceLive - Cross-provider orchestration layer.
  *
@@ -141,6 +153,12 @@ const readContinuation = (payload: unknown) =>
 const verifiedShutdown = (metadata: ProviderContinuationMetadata | undefined) =>
   metadata?.shutdownConfirmed === true && metadata.shutdownEvidenceVersion === 2;
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeStoppedVmPayload = Schema.decodeUnknownOption(
+  Schema.Struct({
+    stoppedRuntimeEventsDrained: Schema.optional(Schema.Boolean),
+    workflowVmCancellation: Schema.optional(WorkflowVmCancellationProof),
+  }),
+);
 
 interface SnapShotPromptAccessibilityNode {
   readonly role: string;
@@ -527,6 +545,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
   const vmWorkloads = yield* VmWorkloadTracking;
+  const processSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const controlSpawner = yield* VmControlSpawner;
+  const cancellationSeals = new Map<string, { readonly bootId: string; readonly epoch: number }>();
+  const secretStore = yield* Effect.serviceOption(ServerSecretStore);
   const analytics = yield* Effect.service(AnalyticsService.AnalyticsService);
   const execution = yield* ThreadExecution;
   const admitExecution = makeProviderExecution(execution);
@@ -590,6 +612,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       readonly continuationKey: string;
       readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
       shutdownConfirmed: boolean;
+      writerEventsDrained: boolean;
       readonly runtimeEpisode: string | undefined;
       mcpProviderSessionId: string | undefined;
     }
@@ -705,6 +728,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         (yield* owner.adapter.isSessionStopConfirmed(threadId, owner.runtimeEpisode))
       )
         continue;
+      if (
+        vmWorkloads &&
+        owner.writerEventsDrained &&
+        owner.runtimeEpisode &&
+        owner.continuationKey === policy.continuationKey &&
+        owner.provider === policy.driver &&
+        (yield* (
+          owner.adapter.isSessionWriterStopConfirmed?.(threadId, owner.runtimeEpisode) ??
+            Effect.succeed(false)
+        ))
+      )
+        continue;
       return yield* toValidationError(
         "provider.continuation",
         "The previous workflow runtime shutdown is unconfirmed. Cancel this job before starting again.",
@@ -727,6 +762,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       adapter: route.adapter,
       runtimeEpisode,
       shutdownConfirmed: false,
+      writerEventsDrained: false,
       mcpProviderSessionId: undefined as string | undefined,
     };
     ownedSessions.set(threadId, owner);
@@ -1379,6 +1415,23 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     eventsDrained: boolean,
   ) {
     const metadata = readContinuation(binding.runtimePayload);
+    const confirmed = Option.getOrUndefined(yield* directory.getBinding(binding.threadId));
+    const confirmedMetadata = readContinuation(confirmed?.runtimePayload);
+    if (verifiedShutdown(confirmedMetadata)) {
+      if (
+        confirmed?.status !== "stopped" ||
+        confirmed.provider !== binding.provider ||
+        confirmed.providerInstanceId !== binding.providerInstanceId ||
+        confirmedMetadata?.workflowJobId !== metadata?.workflowJobId ||
+        confirmedMetadata?.runtimeEpisode !== metadata?.runtimeEpisode ||
+        confirmedMetadata?.continuationKey !== metadata?.continuationKey
+      )
+        return yield* toValidationError(
+          "ProviderService.stopSession",
+          "Full shutdown proof belongs to a different runtime.",
+        );
+      return;
+    }
     yield* directory.upsert(
       {
         threadId: binding.threadId,
@@ -2253,6 +2306,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             "Runtime ownership changed while startup was saved.",
           );
         yield* settleSessionInvocation(invocation, sessionWithInstance);
+        if (vmWorkloads) {
+          const previous = Array.from(sessionOwners.get(threadId) ?? []).filter(
+            (prior) => prior !== owner && prior.writerEventsDrained,
+          );
+          yield* clearCapturedOwners(threadId, previous);
+        }
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
           runtimeMode: input.runtimeMode,
@@ -3136,6 +3195,191 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             "The original workflow runtime identity cannot be verified for cleanup.",
           );
         const owners = Array.from(sessionOwners.get(input.threadId)?.values() ?? []);
+        if (vmWorkloads && metadata?.workflowJobId && verifiedShutdown(metadata)) {
+          const stopped =
+            binding && Option.getOrUndefined(decodeStoppedVmPayload(binding.runtimePayload));
+          const proof = stopped?.workflowVmCancellation;
+          if (
+            !binding?.providerInstanceId ||
+            binding.status !== "stopped" ||
+            !retainedOwner?.providerContinuation ||
+            retainedOwner.runtime.kind !== "vm" ||
+            retainedOwner.progress.threadId !== input.threadId ||
+            retainedOwner.jobId !== metadata.workflowJobId ||
+            retainedOwner.providerContinuation.driver !== binding.provider ||
+            retainedOwner.providerContinuation.continuationKey !== metadata.continuationKey ||
+            !stopped ||
+            (metadata.runtimeEpisode !== undefined &&
+              stopped.stoppedRuntimeEventsDrained !== true) ||
+            owners.some(
+              (owner) =>
+                owner.runtimeEpisode !== metadata.runtimeEpisode ||
+                owner.provider !== binding.provider ||
+                owner.instanceId !== binding.providerInstanceId ||
+                owner.continuationKey !== metadata.continuationKey,
+            ) ||
+            (proof &&
+              (proof.jobId !== retainedOwner.jobId ||
+                proof.threadId !== input.threadId ||
+                proof.runtimeEpisode !== metadata.runtimeEpisode ||
+                proof.providerInstanceId !== binding.providerInstanceId ||
+                proof.continuationKey !== metadata.continuationKey ||
+                proof.allocationId !== retainedOwner.runtime.allocationId ||
+                proof.environmentId !== retainedOwner.runtime.environmentId ||
+                proof.generation !== retainedOwner.runtime.generation ||
+                proof.operationId !== retainedOwner.runtime.operationId))
+          )
+            return yield* toValidationError(
+              "ProviderService.stopSession",
+              "The durable workflow VM shutdown proof does not match the current runtime.",
+            );
+          // Full VM proof is monotonic. Recovery may call stop again merely to
+          // reconcile outstanding execution receipts, even after its seal was adopted.
+          yield* clearCapturedOwners(input.threadId, owners);
+          return;
+        }
+        const cancellingVm =
+          vmWorkloads &&
+          retainedOwner?.runtime.kind === "vm" &&
+          retainedOwner.progress.status === "cancelling" &&
+          retainedOwner.cancellationAttempt
+            ? retainedOwner
+            : null;
+        const verifyCancellationOwner = Effect.fnUntraced(function* () {
+          if (
+            !cancellingVm ||
+            cancellingVm.runtime.kind !== "vm" ||
+            !cancellingVm.cancellationAttempt ||
+            !binding?.providerInstanceId ||
+            !metadata?.runtimeEpisode ||
+            Option.isNone(secretStore)
+          )
+            return yield* toValidationError(
+              "ProviderService.stopSession",
+              "The workflow VM shutdown assignment is unavailable.",
+            );
+          const vm = yield* readInstalledThreadVm().pipe(
+            Effect.provideService(ServerSecretStore, secretStore.value),
+            Effect.mapError(
+              () =>
+                new ProviderValidationError({
+                  operation: "ProviderService.stopSession",
+                  issue: "The workflow VM shutdown assignment could not be verified.",
+                }),
+            ),
+          );
+          const current = yield* workflows.get(cancellingVm.jobId);
+          const fence = yield* makeThreadExecutionFence(checkpointSql).get(input.threadId);
+          const runtime = cancellingVm.runtime;
+          const currentBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+          const currentMetadata = readContinuation(currentBinding?.runtimePayload);
+          if (
+            !vm ||
+            !current ||
+            current.runtime.kind !== "vm" ||
+            current.progress.status !== "cancelling" ||
+            current.cancellationAttempt?.commandId !== cancellingVm.cancellationAttempt.commandId ||
+            current.cancellationAttempt?.workloadCancellationId !==
+              cancellingVm.cancellationAttempt.workloadCancellationId ||
+            current.runtime.allocationId !== runtime.allocationId ||
+            current.jobId !== runtime.jobId ||
+            current.progress.threadId !== input.threadId ||
+            current.runtime.projectId !== runtime.projectId ||
+            current.runtime.threadId !== input.threadId ||
+            current.runtime.operationId !== runtime.operationId ||
+            current.runtime.environmentId !== runtime.environmentId ||
+            current.runtime.generation !== runtime.generation ||
+            vm.scope.threadId !== input.threadId ||
+            vm.scope.allocationId !== runtime.allocationId ||
+            vm.scope.repositoryId !== runtime.repositoryId ||
+            vm.scope.generation !== runtime.generation ||
+            vm.environmentId !== runtime.environmentId ||
+            vm.operationId !== runtime.operationId ||
+            !fence ||
+            fence.phase !== "active" ||
+            fence.threadId !== runtime.threadId ||
+            fence.environmentId !== runtime.environmentId ||
+            fence.projectId !== runtime.projectId ||
+            fence.generation !== runtime.generation ||
+            fence.operationId !== runtime.operationId ||
+            fence.relayUrl !== vm.relayUrl ||
+            currentBinding?.providerInstanceId !== binding.providerInstanceId ||
+            currentBinding.provider !== binding.provider ||
+            currentMetadata?.runtimeEpisode !== metadata.runtimeEpisode ||
+            currentMetadata.continuationKey !== metadata.continuationKey ||
+            currentMetadata.workflowJobId !== cancellingVm.jobId ||
+            !owners.some(
+              (owner) =>
+                owner.runtimeEpisode === metadata.runtimeEpisode &&
+                owner.instanceId === binding.providerInstanceId &&
+                owner.continuationKey === metadata.continuationKey,
+            )
+          )
+            return yield* toValidationError(
+              "ProviderService.stopSession",
+              "The workflow VM shutdown ownership changed. Cleanup remains blocked.",
+            );
+          return {
+            jobId: current.jobId,
+            threadId: input.threadId,
+            environmentId: runtime.environmentId,
+            allocationId: runtime.allocationId,
+            generation: runtime.generation,
+            operationId: runtime.operationId,
+            cancellationId:
+              cancellingVm.cancellationAttempt.workloadCancellationId ??
+              cancellingVm.cancellationAttempt.commandId,
+            runtimeEpisode: metadata.runtimeEpisode,
+            continuationKey: metadata.continuationKey,
+            providerInstanceId: binding.providerInstanceId,
+          };
+        });
+        const cancellationProof = cancellingVm
+          ? yield* checkpointSql.withTransaction(
+              Effect.gen(function* () {
+                const identity = yield* verifyCancellationOwner();
+                const before = yield* inspectVmWorkloads({ type: "inspect" });
+                const operationId = workflowVmCancellationOperation(identity);
+                const prior = cancellationSeals.get(operationId);
+                if (
+                  prior &&
+                  (before.bootId !== prior.bootId ||
+                    before.epoch !== prior.epoch ||
+                    before.sealedBy !== workflowVmCancellationSeal(identity))
+                )
+                  return yield* toValidationError(
+                    "ProviderService.stopSession",
+                    "The workflow VM cancellation seal changed before retry.",
+                  );
+                const sealed = yield* inspectVmWorkloads({
+                  type: "seal",
+                  bootId: before.bootId,
+                  operationId,
+                });
+                cancellationSeals.set(operationId, { bootId: sealed.bootId, epoch: sealed.epoch });
+                const stopped = yield* inspectVmWorkloads({
+                  type: "stop",
+                  bootId: sealed.bootId,
+                  operationId,
+                });
+                if (
+                  !stopped.stopped ||
+                  stopped.bootId !== sealed.bootId ||
+                  stopped.epoch !== sealed.epoch ||
+                  stopped.sealedBy !== sealed.sealedBy
+                )
+                  return yield* toValidationError(
+                    "ProviderService.stopSession",
+                    "The workflow VM workloads are not confirmed stopped.",
+                  );
+                return {
+                  ...identity,
+                  bootId: stopped.bootId,
+                  epoch: stopped.epoch,
+                } satisfies WorkflowVmCancellationProof;
+              }),
+            )
+          : null;
         const priorPayload = binding?.runtimePayload;
         let stoppedEventsDrained =
           binding?.status === "stopped" &&
@@ -3164,6 +3408,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             if (alreadyConfirmed) {
               owner.shutdownConfirmed = true;
               yield* drainOwner(owner.adapter);
+              owner.writerEventsDrained ||= owner.adapter.drainRuntimeEvents !== undefined;
+              continue;
+            }
+            if (
+              vmWorkloads &&
+              owner.runtimeEpisode &&
+              (yield* (
+                owner.adapter.isSessionWriterStopConfirmed?.(
+                  input.threadId,
+                  owner.runtimeEpisode,
+                ) ?? Effect.succeed(false)
+              ))
+            ) {
+              yield* drainOwner(owner.adapter);
+              owner.writerEventsDrained ||= owner.adapter.drainRuntimeEvents !== undefined;
               continue;
             }
             {
@@ -3184,11 +3443,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               yield* owner.adapter.stopSession(input.threadId, owner.runtimeEpisode);
               if (
                 strictOwner &&
-                (!owner.adapter.isSessionStopConfirmed ||
-                  !(yield* owner.adapter.isSessionStopConfirmed(
-                    input.threadId,
-                    owner.runtimeEpisode,
-                  )))
+                !(vmWorkloads && owner.runtimeEpisode
+                  ? yield* (
+                      owner.adapter.isSessionWriterStopConfirmed?.(
+                        input.threadId,
+                        owner.runtimeEpisode,
+                      ) ?? Effect.succeed(false)
+                    )
+                  : yield* (
+                      owner.adapter.isSessionStopConfirmed?.(
+                        input.threadId,
+                        owner.runtimeEpisode,
+                      ) ?? Effect.succeed(false)
+                    ))
               )
                 return yield* toValidationError(
                   "ProviderService.stopSession",
@@ -3196,6 +3463,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 );
               if (!vmWorkloads) owner.shutdownConfirmed = true;
               yield* drainOwner(owner.adapter);
+              owner.writerEventsDrained ||= owner.adapter.drainRuntimeEvents !== undefined;
             }
           }
         } else if (strictOwner && !verifiedShutdown(metadata)) {
@@ -3217,6 +3485,53 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
         }
         stoppedEventsDrained ||= hasDrainReceipt;
+        if (cancellationProof) {
+          const barrier = yield* Deferred.make<void, ProviderValidationError>();
+          yield* PubSub.publish(
+            runtimeEventPubSub,
+            new ProviderEventBarrier(input.threadId, barrier),
+          );
+          yield* Deferred.await(barrier).pipe(
+            Effect.timeoutOrElse({
+              duration: "30 seconds",
+              orElse: () =>
+                toValidationError(
+                  "ProviderService.stopSession",
+                  "Stopped provider output has not finished ingestion.",
+                ),
+            }),
+          );
+          yield* verifyCancellationOwner();
+          const final = yield* inspectVmWorkloads({ type: "inspect" }).pipe(
+            Effect.mapError(
+              () =>
+                new ProviderValidationError({
+                  operation: "ProviderService.stopSession",
+                  issue: "The stopped workflow VM inventory is unavailable.",
+                }),
+            ),
+          );
+          if (
+            !stoppedEventsDrained ||
+            !final.stopped ||
+            final.bootId !== cancellationProof.bootId ||
+            final.epoch !== cancellationProof.epoch ||
+            final.sealedBy !== workflowVmCancellationSeal(cancellationProof)
+          )
+            return yield* toValidationError(
+              "ProviderService.stopSession",
+              "The workflow VM shutdown proof changed before persistence.",
+            );
+          yield* directory.upsert(
+            {
+              threadId: input.threadId,
+              provider: binding!.provider,
+              providerInstanceId: binding!.providerInstanceId!,
+              runtimePayload: { workflowVmCancellation: cancellationProof },
+            },
+            { expectedRuntimeEpisode: cancellationProof.runtimeEpisode },
+          );
+        }
         if (binding)
           yield* directory.upsert(
             {
@@ -3232,7 +3547,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               : undefined,
           );
         metricProvider = routed.provider;
-        if (binding && vmWorkloads && !strictOwner) {
+        if (binding && vmWorkloads && !cancellationProof) {
           // Native EOF settles this provider writer. VM workload inventory owns tree proof.
           yield* recordVmWriterStopped(binding, stoppedEventsDrained);
         } else if (metadata && binding?.providerInstanceId) {
@@ -3282,11 +3597,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           timedOutNativeCompactions.delete(input.threadId);
           yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
         }
-        yield* clearCapturedOwners(input.threadId, owners);
+        if (!(vmWorkloads && strictOwner && !cancellationProof))
+          yield* clearCapturedOwners(input.threadId, owners);
+        if (cancellationProof)
+          cancellationSeals.delete(workflowVmCancellationOperation(cancellationProof));
         yield* analytics.record("provider.session.stopped", {
           provider: routed.provider,
         });
       }).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, processSpawner),
+        Effect.provideService(VmControlSpawner, controlSpawner),
+        Effect.catchTag(["SqlError", "VmWorkloadError"], () =>
+          toValidationError(
+            "ProviderService.stopSession",
+            "The workflow VM workloads could not be confirmed stopped.",
+          ),
+        ),
         withMetrics({
           counter: providerSessionsTotal,
           outcomeAttributes: () =>
@@ -3984,7 +4310,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
       const metadata = readContinuation(binding?.runtimePayload);
       let confirmed = true;
-      const writerOnly = vmWorkloads && !metadata?.workflowJobId;
+      const writerOnly = vmWorkloads;
       for (const owner of owners) {
         const result = yield* owner.adapter
           .stopSession(threadId, owner.runtimeEpisode)
