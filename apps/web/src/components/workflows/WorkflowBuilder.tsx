@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import * as Schema from "effect/Schema";
 import { WorkflowAutomation } from "@t3tools/contracts/workflows";
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
@@ -239,14 +240,56 @@ function WorkflowBuilderEditor({
     });
   }, [isNew, id, draft?.baseline, active, scope, key, navigate]);
   if (!canConfigure)
-    return <p>Repository maintainers and organization admins can configure workflows.</p>;
+    return (
+      <div className="p-5">
+        <WorkflowAlert
+          title="Workflow editing requires access"
+          variant="info"
+          actions={
+            <Button
+              variant="outline"
+              onClick={() =>
+                navigate({
+                  to: "/workflows/$repositoryId",
+                  params: { repositoryId: scope.repositoryId },
+                  search: { tab: "workflows" },
+                })
+              }
+            >
+              Back to workflows
+            </Button>
+          }
+        >
+          Repository maintainers and organization admins can configure workflows.
+        </WorkflowAlert>
+      </div>
+    );
   if (!draft)
     return (
-      <p className="text-sm text-muted-foreground">
-        {isNew
-          ? "Update the relay to create a VM workflow, or enroll an organization machine with a checkout of this repository."
-          : "Workflow unavailable."}
-      </p>
+      <div className="p-5">
+        <WorkflowAlert
+          title={isNew ? "No execution target available" : "Workflow unavailable"}
+          variant="warning"
+          actions={
+            <Button
+              variant="outline"
+              onClick={() =>
+                navigate({
+                  to: "/workflows/$repositoryId",
+                  params: { repositoryId: scope.repositoryId },
+                  search: { tab: "workflows" },
+                })
+              }
+            >
+              Back to workflows
+            </Button>
+          }
+        >
+          {isNew
+            ? "Update the relay to create a VM workflow, or enroll an organization machine with a checkout of this repository."
+            : "Workflow unavailable."}
+        </WorkflowAlert>
+      </div>
     );
   const pending = draft.operation?.state === "pending";
   const currentSaved =
@@ -537,7 +580,12 @@ function WorkflowBuilderEditor({
     let inserted = false;
     edit((draft) => {
       const index = workflowInsertionIndex(draft.definition.steps, anchor);
-      if (index === null || draft.definition.steps.length >= 32) return draft;
+      if (
+        index === null ||
+        draft.definition.steps.length >= 32 ||
+        (draft.definition.target.kind === "vm" && step.kind === "action")
+      )
+        return draft;
       inserted = true;
       return {
         ...draft,
@@ -1230,78 +1278,149 @@ function WorkflowBuilderWorkspace({
       models.issues.length ? (
         <div className={styles["workflow-editor-notices"]}>
           {vmRunUnavailable ? (
-            <p id="workflow-vm-run-unavailable" className="text-sm text-muted-foreground">
-              Running VM workflows is not available yet.
-            </p>
+            <div id="workflow-vm-run-unavailable">
+              <WorkflowAlert
+                title="VM execution unavailable"
+                variant="info"
+                actions={
+                  <Button type="button" size="sm" variant="outline" onClick={openSettings}>
+                    Review execution target
+                  </Button>
+                }
+              >
+                Running VM workflows is not available yet. You can keep editing and saving this
+                workflow.
+              </WorkflowAlert>
+            </div>
           ) : null}
           {codexNotice ? (
-            <p role="status" className="text-sm text-muted-foreground">
-              {codexNotice}
-            </p>
-          ) : null}
-          {draft.error || draft.operation?.state === "uncertain" ? (
-            <div role="alert" className="space-y-2">
-              <p className="text-sm text-destructive">
-                {draft.error ??
-                  "Save could not be confirmed. Check the saved version before retrying."}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {!draft.operation ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled={pending}
-                    onClick={() => edit((current) => ({ ...current, error: null }))}
-                  >
-                    Keep editing
-                  </Button>
-                ) : null}
+            <WorkflowAlert
+              title="VM account needs attention"
+              variant="warning"
+              actions={
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
-                  disabled={pending || reading}
-                  onClick={() => void reload()}
+                  onClick={() => navigate({ to: "/settings/organization" })}
                 >
-                  Reload saved version
+                  Organization settings
                 </Button>
-                {draft.operation?.state === "uncertain" ? (
+              }
+            >
+              {codexNotice}
+            </WorkflowAlert>
+          ) : null}
+          {draft.error || draft.operation?.state === "uncertain" ? (
+            <WorkflowAlert
+              title={
+                draft.operation?.state === "uncertain"
+                  ? "Save not confirmed"
+                  : issue?.message === draft.error
+                    ? "Check workflow settings"
+                    : "Could not save workflow"
+              }
+              actions={
+                <>
+                  {!draft.operation ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      disabled={pending}
+                      onClick={() => edit((current) => ({ ...current, error: null }))}
+                    >
+                      Keep editing
+                    </Button>
+                  ) : null}
                   <Button
                     type="button"
                     size="sm"
                     variant="outline"
                     disabled={pending || reading}
-                    onClick={() => void reconcile()}
+                    onClick={() => void reload()}
                   >
-                    Check saved version
+                    Reload saved version
                   </Button>
-                ) : null}
-              </div>
-            </div>
+                  {draft.operation?.state === "uncertain" ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={pending || reading}
+                      onClick={() => void reconcile()}
+                    >
+                      Check saved version
+                    </Button>
+                  ) : null}
+                </>
+              }
+            >
+              {draft.error ??
+                "Save could not be confirmed. Check the saved version before retrying."}{" "}
+              Your edits are kept.
+            </WorkflowAlert>
           ) : null}
           {notice ? (
             <p role="status" className="text-sm text-muted-foreground">
               {notice}
             </p>
           ) : null}
-          {issue ? (
-            <p role="alert" className="text-sm text-warning">
+          {issue && issue.message !== draft.error ? (
+            <WorkflowAlert
+              title="Check workflow settings"
+              variant="warning"
+              actions={
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={pending}
+                  onClick={() => {
+                    if (!issue.stepId && issue.field !== "name") openSettings();
+                    else choose(issue.stepId ?? "");
+                    setFocusRequest({ field: issue.field, stepId: issue.stepId });
+                  }}
+                >
+                  Review settings
+                </Button>
+              }
+            >
               {issue.message}
-            </p>
+            </WorkflowAlert>
           ) : null}
           {models.issues.length ? (
-            <details className="text-xs text-warning">
-              <summary>
-                {models.issues.length} Agent model{" "}
-                {models.issues.length === 1 ? "warning" : "warnings"}
-              </summary>
-              {models.issues.map((issue) => (
-                <p key={issue.stepId} className="mt-1">
-                  {issue.title}: {issue.detail}
-                </p>
-              ))}
-            </details>
+            <WorkflowAlert
+              title="Agent models need attention"
+              variant="warning"
+              actions={
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    const first = models.issues[0];
+                    if (!first) return;
+                    choose(first.stepId);
+                    setFocusRequest({ field: "model", stepId: first.stepId });
+                  }}
+                >
+                  Review model settings
+                </Button>
+              }
+            >
+              <details>
+                <summary>
+                  {models.issues.length} Agent model{" "}
+                  {models.issues.length === 1 ? "warning" : "warnings"}
+                </summary>
+                {models.issues.map((issue) => (
+                  <p key={issue.stepId} className="mt-1">
+                    {issue.title}: {issue.detail}
+                  </p>
+                ))}
+              </details>
+            </WorkflowAlert>
           ) : null}
         </div>
       ) : null}

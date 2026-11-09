@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "../workflows/WorkflowAlert";
 import { useAuth } from "@clerk/react";
 import {
   ManagedRelayTenancy,
@@ -129,17 +130,37 @@ export function WorkflowVmPolicyForm({ controller }: { readonly controller: Cont
               : "VM workflow execution is not available yet."}
         </p>
         {error ? (
-          <p role="alert" className="text-sm text-destructive">
+          <WorkflowAlert
+            title={
+              invalid
+                ? "Check the VM limit"
+                : state.saveError
+                  ? "Could not save the VM limit"
+                  : "Could not load the VM limit"
+            }
+            actions={
+              !invalid ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => void controller.load()}
+                >
+                  Reload limit
+                </Button>
+              ) : undefined
+            }
+          >
             {error}
             {invalid ? "" : " Reload the limit before saving again."}
-          </p>
+          </WorkflowAlert>
         ) : null}
         {state.saved ? (
           <p role="status" className="text-sm text-muted-foreground">
             Limit saved.
           </p>
         ) : null}
-        {(error && !invalid) || !state.record ? (
+        {!error && !state.record ? (
           <Button variant="outline" disabled={busy} onClick={() => void controller.load()}>
             Reload limit
           </Button>

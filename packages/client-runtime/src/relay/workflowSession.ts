@@ -442,6 +442,17 @@ export function hasUnsavedWorkflowWork(state: WorkflowDraftState) {
 
 /** Validate unmounted steps too; the selected inspector's DOM is not the definition. */
 export function workflowDraftIssue(definition: WorkflowDefinition) {
+  const publishing =
+    definition.target.kind === "vm"
+      ? definition.steps.find((step) => step.kind === "action")
+      : undefined;
+  if (publishing)
+    return {
+      message:
+        "Publishing requires a Machine target. Remove Push branch and Open PR steps to use VM.",
+      stepId: publishing.id,
+      field: "title",
+    };
   if (Exit.isSuccess(decodeWorkflowDefinition(definition))) return null;
   if (!definition.name.trim())
     return { message: "Give this workflow a name.", stepId: null, field: "name" };
@@ -648,6 +659,28 @@ export function invalidateWorkflowJobRead(
     sequence: state.sequence + 1,
     jobs: { ...state.jobs, [key]: { ...previous, epoch: state.sequence + 1, reading: false } },
   });
+}
+
+/** Refresh the loaded window so automatic updates do not discard paginated runs. */
+export async function readWorkflowJobPages(
+  readPage: (cursor: string | null) => Promise<WorkflowJobPage>,
+  {
+    cursor = null,
+    minimumCount = 0,
+    isCurrent = () => true,
+  }: {
+    cursor?: string | null;
+    minimumCount?: number;
+    isCurrent?: () => boolean;
+  } = {},
+): Promise<WorkflowJobPage> {
+  let page = await readPage(cursor);
+  const jobs = [...page.jobs];
+  while (page.nextCursor && page.jobs.length && jobs.length < minimumCount && isCurrent()) {
+    page = await readPage(page.nextCursor);
+    jobs.push(...page.jobs);
+  }
+  return { jobs, nextCursor: page.nextCursor };
 }
 
 /** A list request owns exactly one scope/view and cursor. Refresh replaces all loaded pages. */

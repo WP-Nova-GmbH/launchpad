@@ -1,3 +1,5 @@
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { MaterialButton } from "../../components/MaterialButton";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import { WorkflowSourceHealth } from "./WorkflowSourceHealth";
 import { useAtomValue } from "@effect/atom-react";
@@ -22,6 +24,7 @@ import {
   emptyWorkflowJobPageRead,
   beginWorkflowJobPage,
   settleWorkflowJobPage,
+  readWorkflowJobPages,
   type WorkflowJobPageRequest,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -77,11 +80,18 @@ type Props = StaticScreenProps<
   | undefined
 >;
 export function WorkflowJobsScreen(props: Props) {
+  const navigation = useNavigation();
   return hasCloudPublicConfig() ? (
     <ConfiguredWorkflowJobsScreen {...props} />
   ) : (
     <SettingsScreen title="Workflow jobs">
-      <Text className="text-foreground-muted">Launchpad Connect is not configured.</Text>
+      <ErrorBanner
+        title="Workflows unavailable"
+        message="Launchpad Connect is not configured."
+        tone="warning"
+      >
+        <MaterialButton label="Back to settings" onPress={() => navigation.goBack()} />
+      </ErrorBanner>
     </SettingsScreen>
   );
 }
@@ -113,6 +123,10 @@ function WorkflowJobsContent(props: Props) {
   const [recent, setRecent] = useState(emptyWorkflowJobPageRead);
   const [listView, setListView] = useState<WorkflowJobListView>("active");
   const listRequest = useRef<WorkflowJobPageRequest | null>(null);
+  const latestList = useRef(recent);
+  useLayoutEffect(() => {
+    latestList.current = recent;
+  }, [recent]);
   const [projects, setProjects] = useState<ReadonlyArray<RelayOrganizationProject>>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(
     props.route.params?.jobId ?? null,
@@ -163,6 +177,7 @@ function WorkflowJobsContent(props: Props) {
   };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [catalogRefresh, setCatalogRefresh] = useState(0);
   const call = useCallback(
     async <A,>(
       operation: (
@@ -225,20 +240,25 @@ function WorkflowJobsContent(props: Props) {
     return () => {
       disposed = true;
     };
-  }, [isSignedIn, call, props.route.params?.repositoryId]);
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- An explicit recovery action increments catalogRefresh to retry this external read.
+  }, [isSignedIn, call, props.route.params?.repositoryId, catalogRefresh]);
   const loadJobs = useCallback(
-    async (cursor: string | null = null) => {
-      if (!scope || !focused) return;
+    async (cursor: string | null = null, minimumCount = 0) => {
+      if (!scope || !focused || listRequest.current?.key === listKey) return;
       const request = { key: listKey, cursor };
       listRequest.current = request;
       setRecent((previous) => beginWorkflowJobPage(previous, request));
       try {
-        const page = await call((client, clerkToken) =>
-          client.pageWorkflowJobs({
-            clerkToken,
-            repositoryId: scope.repositoryId,
-            query: { view: listView, ...(cursor ? { cursor } : {}) },
-          }),
+        const page = await readWorkflowJobPages(
+          (pageCursor) =>
+            call((client, clerkToken) =>
+              client.pageWorkflowJobs({
+                clerkToken,
+                repositoryId: scope.repositoryId,
+                query: { view: listView, ...(pageCursor ? { cursor: pageCursor } : {}) },
+              }),
+            ),
+          { cursor, minimumCount, isCurrent: () => listRequest.current === request },
         );
         if (listRequest.current === request)
           setRecent((previous) => settleWorkflowJobPage(previous, request, page));
@@ -252,17 +272,34 @@ function WorkflowJobsContent(props: Props) {
               workflowJobAccessLost(cause),
             ),
           );
+      } finally {
+        if (listRequest.current === request) listRequest.current = null;
       }
     },
     [scope, focused, listKey, listView, call],
   );
   useEffect(() => {
-    // oxlint-disable-next-line react/set-state-in-effect -- This effect starts the external relay read for the selected repository and view.
     void loadJobs();
     return () => {
       listRequest.current = null;
     };
   }, [loadJobs]);
+  useEffect(() => {
+    if (!scope || !focused || selectedJobId) return;
+    const refreshVisible = () => {
+      if (AppState.currentState !== "active" || listRequest.current) return;
+      const previous = latestList.current;
+      void loadJobs(null, previous.key === listKey ? (previous.jobs?.length ?? 0) : 0);
+    };
+    const timer = setInterval(refreshVisible, 5000);
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") refreshVisible();
+    });
+    return () => {
+      clearInterval(timer);
+      subscription.remove();
+    };
+  }, [scope, focused, selectedJobId, loadJobs, listKey]);
   const refreshJob = useCallback(async () => {
     if (!scope || !selectedJobId) return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, selectedJobId);
@@ -496,14 +533,41 @@ function WorkflowJobsContent(props: Props) {
   return (
     <SettingsScreen title="Workflow jobs">
       {error ? (
-        <Text accessibilityRole="alert" className="mb-3 text-danger-foreground">
-          {error}
-        </Text>
+        <View className="mb-3">
+          <ErrorBanner title="Workflow request failed" message={error}>
+            <MaterialButton
+              label={
+                selectedJobId && scope
+                  ? "Refresh run"
+                  : selectedRepository
+                    ? "Refresh jobs"
+                    : "Retry repositories"
+              }
+              disabled={busy || read.reading}
+              onPress={() => {
+                setError(null);
+                if (selectedJobId && scope) void refreshJob();
+                else if (selectedRepository) void loadJobs();
+                else setCatalogRefresh((version) => version + 1);
+              }}
+            />
+            <MaterialButton label="Dismiss" tone="text" onPress={() => setError(null)} />
+          </ErrorBanner>
+        </View>
       ) : null}
-      {read.error ? (
-        <Text accessibilityRole="alert" className="mb-3 text-danger-foreground">
-          {read.error}
-        </Text>
+      {read.error && selectedJob ? (
+        <View className="mb-3">
+          <ErrorBanner
+            title="Could not refresh this run"
+            message={`${read.error} Showing the last acknowledged state.`}
+          >
+            <MaterialButton
+              label="Retry refresh"
+              disabled={read.reading}
+              onPress={() => void refreshJob()}
+            />
+          </ErrorBanner>
+        </View>
       ) : null}
       {!isSignedIn ? (
         <Text className="text-foreground-muted">Sign in to view repository jobs.</Text>
@@ -527,14 +591,28 @@ function WorkflowJobsContent(props: Props) {
                     : "Organization execution target"}
               </Text>
               {manualState.message ? (
-                <Text className="text-foreground-muted">{manualState.message}</Text>
+                <ErrorBanner
+                  title="Run needs attention"
+                  message={manualState.message}
+                  tone="warning"
+                />
               ) : null}
               {selectedJob.progress?.manualPause?.state === "paused" ? (
                 <Text className="text-foreground-muted">
                   Next: {manualState.status?.replaceAll("_", " ")}
                 </Text>
               ) : null}
-              {detail ? <Text className="text-foreground-muted">{detail}</Text> : null}
+              {selectedJob.status === "failed" ? (
+                <ErrorBanner
+                  title="Run failed"
+                  message={
+                    detail ??
+                    "This run stopped before completing. Inspect the agent result for details."
+                  }
+                />
+              ) : detail ? (
+                <Text className="text-foreground-muted">{detail}</Text>
+              ) : null}
             </View>
           </SettingsSection>
           <SettingsSection title="Current task">
@@ -547,11 +625,17 @@ function WorkflowJobsContent(props: Props) {
               />
             ) : null}
             {reviewChanged || (checkingReturnedReview && !read.error) ? (
-              <Text accessibilityRole="alert" className="text-foreground-muted">
-                {reviewChanged
-                  ? "Review changed. Inspect the current diff before approving."
-                  : "Checking the current review…"}
-              </Text>
+              <View className="p-4">
+                <ErrorBanner
+                  title={reviewChanged ? "Review changed" : "Checking the current review"}
+                  tone="warning"
+                  message={
+                    reviewChanged
+                      ? "Review changed. Inspect the current diff before approving."
+                      : "Checking the current review…"
+                  }
+                />
+              </View>
             ) : null}
             {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
               <SettingsActionRow
@@ -861,7 +945,19 @@ function WorkflowJobsContent(props: Props) {
         </View>
       ) : selectedJobId && selectedRepository ? (
         <SettingsSection title="Workflow run">
-          <Text className="p-4 text-foreground-muted">{read.error ?? "Loading run…"}</Text>
+          {read.error ? (
+            <View className="p-4">
+              <ErrorBanner title="Could not load this run" message={read.error}>
+                <MaterialButton
+                  label="Retry loading run"
+                  disabled={read.reading}
+                  onPress={() => void refreshJob()}
+                />
+              </ErrorBanner>
+            </View>
+          ) : (
+            <Text className="p-4 text-foreground-muted">Loading run…</Text>
+          )}
           <SettingsActionRow
             icon="chevron.left"
             label="Back to jobs"
@@ -907,10 +1003,21 @@ function WorkflowJobsContent(props: Props) {
               onPress={() => void loadJobs()}
             />
             {recent.key === listKey && recent.error ? (
-              <Text accessibilityRole="alert" className="p-4 text-danger-foreground">
-                {recent.error}
-                {jobs ? " Showing the last available runs." : " Refresh to retry."}
-              </Text>
+              <View className="p-4">
+                <ErrorBanner
+                  title={jobs ? "Could not refresh runs" : "Could not load runs"}
+                  message={
+                    recent.error +
+                    (jobs ? " Showing the last available runs." : " Refresh to retry.")
+                  }
+                >
+                  <MaterialButton
+                    label="Retry loading runs"
+                    disabled={!!recent.request}
+                    onPress={() => void loadJobs()}
+                  />
+                </ErrorBanner>
+              </View>
             ) : null}
             {jobs === null ? (
               recent.key !== listKey || !recent.error ? (
@@ -926,7 +1033,7 @@ function WorkflowJobsContent(props: Props) {
                   key={job.jobId}
                   icon="arrow.triangle.branch"
                   label={job.instruction}
-                  value={`${job.originSummary?.kind === "automation" ? "Started by workflow · " : ""}${workflowStatusLabel(job.status)}`}
+                  value={`${job.originSummary?.workflowName ?? "Workflow run"} · ${workflowStatusLabel(job.status)}${job.originSummary?.kind === "automation" ? " · Started by workflow" : ""}`}
                   disabled={busy}
                   onPress={() => setSelectedJobId(job.jobId)}
                 />

@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import { useEnvironment } from "../../state/environments";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useProject } from "../../state/entities";
@@ -180,13 +181,26 @@ export function WorkflowStepEditor({
                       </SelectPopup>
                     </Select>
                     {vmModelIssue ? (
-                      <p role="alert" className="text-sm text-warning">
+                      <WorkflowAlert
+                        title="Selected model unavailable"
+                        variant="warning"
+                        actions={
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() => patch({ ...step, modelSelection: null })}
+                          >
+                            Use managed default
+                          </Button>
+                        }
+                      >
                         {vmModelIssue.detail}
-                      </p>
+                      </WorkflowAlert>
                     ) : !vmModels ? (
-                      <p className="text-sm text-muted-foreground">
+                      <WorkflowAlert title="VM model choices unavailable" variant="info">
                         VM model choices could not be loaded. The managed default is available.
-                      </p>
+                      </WorkflowAlert>
                     ) : null}
                   </>
                 ) : entries[0] ? (
@@ -221,7 +235,7 @@ export function WorkflowStepEditor({
                     Connect to this environment to choose or verify a model.
                   </p>
                 )}
-                {step.modelSelection ? (
+                {step.modelSelection && !vmModelIssue ? (
                   <Button
                     type="button"
                     size="sm"

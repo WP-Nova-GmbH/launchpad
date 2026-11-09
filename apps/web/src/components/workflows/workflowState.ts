@@ -152,18 +152,20 @@ export function newWorkflowDraft(
   vmAuthoring = false,
 ): WorkflowEditorDraft | null {
   const project = projects[0];
-  const target: WorkflowTarget | null = vmAuthoring
-    ? { kind: "vm", baseBranch: null }
-    : project
-      ? { kind: "machine", environmentId: project.environmentId, projectId: project.projectId }
-      : null;
+  const target: WorkflowTarget | null =
+    template === "publish" || !vmAuthoring
+      ? project
+        ? { kind: "machine", environmentId: project.environmentId, projectId: project.projectId }
+        : null
+      : { kind: "vm", baseBranch: null };
   if (!target) return null;
   return {
     workflowId: randomUUID(),
     automation: normalizeWorkflowAutomation(),
     automationResolved: true,
     baseline: null,
-    targetConfirmed: projects.length + Number(vmAuthoring) === 1,
+    targetConfirmed:
+      template === "publish" ? projects.length === 1 : projects.length + Number(vmAuthoring) === 1,
     selectedStepId: "",
     operation: null,
     error: null,
@@ -207,7 +209,11 @@ export function copiedWorkflowDraft(
   vmAuthoring = false,
 ) {
   if (source.definition.target.kind === "vm" && !vmAuthoring) return null;
-  const draft = newWorkflowDraft(projects, "review", vmAuthoring);
+  const draft = newWorkflowDraft(
+    projects,
+    source.definition.steps.some((step) => step.kind === "action") ? "publish" : "review",
+    vmAuthoring,
+  );
   if (!draft) return null;
   const sourceTarget = source.definition.target;
   const machine =

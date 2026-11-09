@@ -29,6 +29,8 @@ import type {
 const fixture = vi.hoisted(() => ({
   accountId: "account",
   focused: true,
+  appState: "active",
+  appStateListeners: new Set<(state: string) => void>(),
   projectsAvailable: true,
   getToken: vi.fn().mockResolvedValue("fixture-token"),
   list: vi.fn<(repositoryId: string) => Promise<ReadonlyArray<RepositoryWorkflowJobSummary>>>(),
@@ -44,7 +46,10 @@ const host = (name: string) => (props: PropsWithChildren<Record<string, unknown>
   createElement(
     name,
     props,
-    props.children ?? (typeof props.label === "string" ? props.label : null),
+    props.children ?? [
+      typeof props.label === "string" ? props.label : null,
+      typeof props.value === "string" ? props.value : null,
+    ],
   );
 class FixtureReadError extends Data.TaggedError("FixtureReadError")<{ readonly message: string }> {}
 type Request = {
@@ -72,7 +77,15 @@ vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   Linking: { openURL: vi.fn() },
   Platform: { OS: "ios" },
   Alert: { alert: fixture.alert },
-  AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
+  AppState: {
+    get currentState() {
+      return fixture.appState;
+    },
+    addEventListener: (_event: string, listener: (state: string) => void) => {
+      fixture.appStateListeners.add(listener);
+      return { remove: () => fixture.appStateListeners.delete(listener) };
+    },
+  },
 }));
 vi.mock("../../../../mobile/node_modules/@clerk/expo/dist/index.js", () => ({
   useAuth: () => ({ isSignedIn: true, userId: fixture.accountId, getToken: fixture.getToken }),
@@ -231,6 +244,8 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   fixture.accountId = "account";
   fixture.focused = true;
+  fixture.appState = "active";
+  fixture.appStateListeners.clear();
   fixture.projectsAvailable = true;
   fixture.navigate.mockReset();
   fixture.alert.mockReset();
@@ -257,6 +272,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -765,6 +781,75 @@ effectIt.layer(
       expect(content()).not.toContain("Current active run");
     },
   );
+  screenTest("shows frozen workflow names for manual and automatic runs", async () => {
+    fixture.list.mockResolvedValue([
+      {
+        ...summary("Manual task"),
+        originSummary: { kind: "manual", workflowName: "Manual review flow" },
+      },
+      {
+        ...summary("Automatic task"),
+        originSummary: { kind: "automation", workflowName: "Linear review flow" },
+      },
+      summary("Legacy task"),
+    ]);
+    await mount({ repositoryId: "A" });
+    expect(content()).toContain("Manual review flow");
+    expect(content()).toContain("Linear review flow");
+    expect(content()).toContain("Started by workflow");
+    expect(content()).toContain("Workflow run");
+  });
+
+  screenTest(
+    "refreshes foreground list pages and pauses reads in the background and during result inspection",
+    async () => {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+      fixture.page
+        .mockResolvedValueOnce({ jobs: [summary("Old run")], nextCursor: "next" })
+        .mockResolvedValueOnce({ jobs: [summary("Further run")], nextCursor: null })
+        .mockResolvedValueOnce({
+          jobs: [{ ...summary("New review"), status: "awaiting_review" }],
+          nextCursor: "new-next",
+        })
+        .mockResolvedValueOnce({ jobs: [summary("Further run")], nextCursor: null })
+        .mockResolvedValue({ jobs: [summary("Current run")], nextCursor: null });
+      await mount({ repositoryId: "A" });
+      await press("Load more runs");
+      const before = deliveries.length;
+      await act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      await act(async () => {
+        await deliveries[before];
+      });
+      await act(async () => {
+        await deliveries[before + 1];
+      });
+      expect(content()).toContain("New review");
+      expect(content()).toContain("Needs review");
+      expect(content()).toContain("Further run");
+      expect(content()).not.toContain("Old run");
+      fixture.appState = "background";
+      await act(() => {
+        vi.advanceTimersByTime(10000);
+      });
+      expect(fixture.page).toHaveBeenCalledTimes(4);
+      fixture.appState = "active";
+      const returning = deliveries.length;
+      await act(() => fixture.appStateListeners.forEach((listener) => listener("active")));
+      await act(async () => {
+        await deliveries[returning];
+      });
+      expect(content()).toContain("Current run");
+      await press("Current run");
+      const calls = fixture.page.mock.calls.length;
+      await act(() => {
+        vi.advanceTimersByTime(10000);
+      });
+      expect(fixture.page).toHaveBeenCalledTimes(calls);
+    },
+  );
+
   screenTest("loads recent runs after an incoming job route and Back to jobs", async () => {
     fixture.list.mockResolvedValue([summary("Recent A run")]);
     await mount({ repositoryId: "A", jobId: detail.jobId });

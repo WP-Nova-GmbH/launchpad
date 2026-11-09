@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import { useNavigate } from "@tanstack/react-router";
 import { useLayoutEffect, useRef, useState } from "react";
 import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
@@ -33,14 +34,17 @@ export function WorkflowRun(props: WorkflowRunProps) {
   const { workflow, vmExecutionAvailable } = props;
   const kind = workflow.definition.target.kind;
   const vmUnavailable = kind === "vm" && !vmExecutionAvailable;
+  const publishingUnavailable =
+    kind === "vm" && workflow.definition.steps.some((step) => step.kind === "action");
   return (
     <WorkflowRunForm
       key={workflowSessionKey(
         props.scope,
-        `${workflow.workflowId}:${kind}:${workflow.archived}:${vmUnavailable}`,
+        `${workflow.workflowId}:${kind}:${workflow.archived}:${vmUnavailable}:${publishingUnavailable}`,
       )}
       {...props}
       vmUnavailable={vmUnavailable}
+      publishingUnavailable={publishingUnavailable}
     />
   );
 }
@@ -51,7 +55,8 @@ function WorkflowRunForm({
   projects,
   call,
   vmUnavailable,
-}: WorkflowRunProps & { vmUnavailable: boolean }) {
+  publishingUnavailable,
+}: WorkflowRunProps & { vmUnavailable: boolean; publishingUnavailable: boolean }) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
   const submission = useRef<{ draft: WorkflowRunDraft } | null>(null);
@@ -76,7 +81,7 @@ function WorkflowRunForm({
   const pending = draft.operation?.state === "pending";
   const uncertain = draft.operation?.state === "uncertain";
   const uncertainVm = uncertain && draft.operation?.targetKind === "vm";
-  const runBlocked = vmUnavailable || workflow.archived;
+  const runBlocked = vmUnavailable || workflow.archived || publishingUnavailable;
   const replayOnly = runBlocked || savedTarget.kind !== "vm";
   const checkingPrevious = pending && replayOnly && draft.operation?.targetKind === "vm";
   const submit = async (recover: boolean) => {
@@ -141,41 +146,73 @@ function WorkflowRunForm({
     }
   };
   const error = draft.error ? (
-    <p role="alert" className="text-sm text-destructive">
-      {draft.error}
-    </p>
+    <WorkflowAlert
+      title={uncertain ? "Run submission not confirmed" : "Could not start this run"}
+      variant={uncertain ? "warning" : "error"}
+      actions={
+        !runBlocked ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              navigate({
+                to: "/workflows/$repositoryId",
+                params: { repositoryId: scope.repositoryId },
+                search: { tab: "runs" },
+              })
+            }
+          >
+            Check recent runs
+          </Button>
+        ) : undefined
+      }
+    >
+      {draft.error} Your instructions are kept.
+    </WorkflowAlert>
   ) : null;
   const recoverVm = uncertainVm ? (
-    <div className="space-y-2">
-      <p className="text-sm text-warning">The previous VM submission could not be confirmed.</p>
-      <Button
-        type="button"
-        variant="outline"
-        disabled={confirming}
-        onClick={() => void submit(true)}
-      >
-        {replayOnly ? "Check previous submission" : "Retry previous submission"}
-      </Button>
-    </div>
-  ) : null;
-  const recoverMachine =
-    uncertain && !uncertainVm ? (
-      <div className="space-y-2">
-        <p className="text-sm text-warning">Run may have started. Check recent runs to confirm.</p>
+    <WorkflowAlert
+      title="Previous submission not confirmed"
+      variant="warning"
+      actions={
         <Button
           type="button"
           variant="outline"
-          onClick={() =>
-            navigate({
-              to: "/workflows/$repositoryId",
-              params: { repositoryId: scope.repositoryId },
-              search: { tab: "runs" },
-            })
-          }
+          disabled={confirming}
+          onClick={() => void submit(true)}
         >
-          Check recent runs
+          {replayOnly ? "Check previous submission" : "Retry previous submission"}
         </Button>
-      </div>
+      }
+    >
+      The previous VM submission could not be confirmed. Check or retry it before starting another
+      run.
+    </WorkflowAlert>
+  ) : null;
+  const recoverMachine =
+    uncertain && !uncertainVm ? (
+      <WorkflowAlert
+        title="Run may have started"
+        variant="warning"
+        actions={
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              navigate({
+                to: "/workflows/$repositoryId",
+                params: { repositoryId: scope.repositoryId },
+                search: { tab: "runs" },
+              })
+            }
+          >
+            Check recent runs
+          </Button>
+        }
+      >
+        Run may have started. Check recent runs to confirm before submitting again.
+      </WorkflowAlert>
     ) : null;
   const startedJob = draft.startedJobId ? (
     <Button
@@ -195,11 +232,49 @@ function WorkflowRunForm({
     return (
       <div className="mx-auto w-full max-w-xl space-y-2">
         <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
-        <p className="text-sm text-muted-foreground">
+        <WorkflowAlert
+          title={
+            workflow.archived
+              ? "Workflow archived"
+              : publishingUnavailable
+                ? "Publishing requires a Machine"
+                : "VM execution unavailable"
+          }
+          variant="warning"
+          actions={
+            <>
+              <Button
+                variant="outline"
+                onClick={() =>
+                  navigate({
+                    to: "/workflows/$repositoryId/$workflowId/edit",
+                    params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+                  })
+                }
+              >
+                {workflow.archived ? "Open workflow settings" : "Edit workflow"}
+              </Button>
+              <Button
+                variant="ghost"
+                onClick={() =>
+                  navigate({
+                    to: "/workflows/$repositoryId",
+                    params: { repositoryId: scope.repositoryId },
+                    search: { tab: "workflows" },
+                  })
+                }
+              >
+                Back to workflows
+              </Button>
+            </>
+          }
+        >
           {workflow.archived
             ? "Restore this workflow before running it."
-            : "Running VM workflows is not available yet."}
-        </p>
+            : publishingUnavailable
+              ? "Publishing requires a Machine target. Remove Push branch and Open PR steps to use VM."
+              : "Running VM workflows is not available yet."}
+        </WorkflowAlert>
         {draft.instruction.trim() ? (
           <label className="block space-y-2">
             <span className="text-sm font-medium">Retained instructions</span>

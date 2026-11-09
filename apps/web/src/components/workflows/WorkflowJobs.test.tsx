@@ -62,6 +62,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 it("loads further pages and refresh replaces stale loaded pages", async () => {
@@ -136,4 +137,78 @@ it("keeps the frozen automatic workflow name when catalog metadata is unavailabl
   });
   expect(content()).toContain("Frozen workflow");
   expect(content()).toContain("Started by workflow");
+});
+
+function liveBrowser() {
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  const browser = Object.assign(new EventTarget(), { setInterval, clearInterval });
+  const document = Object.assign(new EventTarget(), { visibilityState: "visible" });
+  vi.stubGlobal("window", browser);
+  vi.stubGlobal("document", document);
+  return { browser, document };
+}
+
+it("refreshes visible runs through every loaded page and removes runs that left the view", async () => {
+  liveBrowser();
+  fixture.call
+    .mockResolvedValueOnce({ jobs: [row("Finished run")], nextCursor: "next" })
+    .mockResolvedValueOnce({ jobs: [row("Further run")], nextCursor: null })
+    .mockResolvedValueOnce({
+      jobs: [{ ...row("New review"), status: "awaiting_review" }],
+      nextCursor: "new-next",
+    })
+    .mockResolvedValueOnce({ jobs: [row("Further run")], nextCursor: null });
+  await act(() => {
+    renderer = create(
+      <WorkflowJobs scope={scope} workflows={[]} refreshWorkflows={refreshWorkflows} />,
+    );
+  });
+  await press("Load more runs");
+  await act(() => {
+    vi.advanceTimersByTime(5000);
+  });
+  expect(content()).toContain("New review");
+  expect(content()).toContain("Needs review");
+  expect(content()).toContain("Further run");
+  expect(content()).not.toContain("Finished run");
+  expect(fixture.call).toHaveBeenCalledTimes(4);
+});
+
+it("skips hidden and overlapping list refreshes, refreshes on return, and stops on unmount", async () => {
+  const { browser, document } = liveBrowser();
+  const pending = deferred();
+  fixture.call
+    .mockResolvedValueOnce({ jobs: [row("Old status")], nextCursor: null })
+    .mockReturnValueOnce(pending.promise)
+    .mockResolvedValue({ jobs: [row("Current status")], nextCursor: null });
+  await act(() => {
+    renderer = create(
+      <WorkflowJobs scope={scope} workflows={[]} refreshWorkflows={refreshWorkflows} />,
+    );
+  });
+  await act(() => {
+    vi.advanceTimersByTime(10000);
+  });
+  expect(fixture.call).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    pending.resolve({ jobs: [row("Settled status")], nextCursor: null });
+    await pending.promise;
+  });
+  document.visibilityState = "hidden";
+  await act(() => {
+    vi.advanceTimersByTime(10000);
+  });
+  expect(fixture.call).toHaveBeenCalledTimes(2);
+  document.visibilityState = "visible";
+  await act(() => {
+    browser.dispatchEvent(new Event("focus"));
+  });
+  expect(content()).toContain("Current status");
+  await act(() => renderer.unmount());
+  const calls = fixture.call.mock.calls.length;
+  await act(() => {
+    vi.advanceTimersByTime(10000);
+    browser.dispatchEvent(new Event("focus"));
+  });
+  expect(fixture.call).toHaveBeenCalledTimes(calls);
 });

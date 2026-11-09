@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowSources } from "@t3tools/client-runtime/relay";
 import {
   RelayRepositoryId,
@@ -68,10 +69,22 @@ export function OwnerSources({ accountId }: { accountId: string }) {
           only.
         </p>
         {state.error ? (
-          <p role="alert" className="text-sm text-destructive">
+          <WorkflowAlert
+            title="Could not update Linear connections"
+            actions={
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={state.busy || state.loading}
+                onClick={() => void state.refresh()}
+              >
+                Retry connections
+              </Button>
+            }
+          >
             {state.error}
             {snapshot ? " Showing last available status." : ""}
-          </p>
+          </WorkflowAlert>
         ) : null}
         {!snapshot ? (
           <p className="text-sm text-muted-foreground">
@@ -80,9 +93,10 @@ export function OwnerSources({ accountId }: { accountId: string }) {
         ) : (
           <>
             {!snapshot.configured ? (
-              <p className="text-sm text-muted-foreground">
-                Linear workflow connections are not available on this relay yet.
-              </p>
+              <WorkflowAlert title="Linear workflow connections unavailable" variant="info">
+                Linear workflow connections are not available on this relay yet. Ask your
+                environment administrator to enable them, then refresh connections.
+              </WorkflowAlert>
             ) : (
               <Button disabled={disabled} onClick={() => void connect(null)}>
                 Connect Linear workspace
@@ -119,11 +133,30 @@ export function OwnerSources({ accountId }: { accountId: string }) {
               </Button>
             ) : null}
             {snapshot.attempt?.status === "failed" ? (
-              <p role="status" className="text-sm text-muted-foreground">
+              <WorkflowAlert
+                title="Linear authorization did not finish"
+                variant="warning"
+                actions={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={disabled}
+                    onClick={() =>
+                      snapshot.attempt!.error === "service_configuration"
+                        ? void state.refresh()
+                        : void connect(snapshot.attempt!.connectionId)
+                    }
+                  >
+                    {snapshot.attempt.error === "service_configuration"
+                      ? "Refresh connection status"
+                      : "Retry authorization"}
+                  </Button>
+                }
+              >
                 {snapshot.attempt.error === "service_configuration"
                   ? "Linear service configuration needs attention. Retry after it is restored."
                   : "Authorization did not complete. Your existing sources were preserved."}
-              </p>
+              </WorkflowAlert>
             ) : null}
             {activeAuthorization ? (
               <a

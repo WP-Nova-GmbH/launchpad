@@ -365,8 +365,9 @@ describe("workflow environment settings", () => {
           await click("Replace value");
           expect(field("Secret value").props.value).toBe("test-only secret");
           const alert = renderer.root.findByProps({ role: "alert" });
-          const recovery = alert.parent!;
           const draft = renderer.root.findByProps({ role: "group" });
+          let recovery = alert;
+          while (recovery.parent && recovery.parent !== draft.parent) recovery = recovery.parent;
           expect(visibleText(alert)).not.toContain("test-only secret");
           if (mode === "conflict") {
             expect(visibleText(alert)).toContain("Settings changed");

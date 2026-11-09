@@ -1,3 +1,4 @@
+import { ErrorBanner } from "../../components/ErrorBanner";
 import { useAuth } from "@clerk/expo";
 import {
   ManagedRelayTenancy,
@@ -127,17 +128,31 @@ export function WorkflowVmPolicyForm({ controller }: { readonly controller: Cont
                 : "VM workflow execution is not available yet."}
           </Text>
           {error ? (
-            <Text accessibilityRole="alert" className="text-sm text-danger">
-              {error}
-              {invalid ? "" : " Reload the limit before saving again."}
-            </Text>
+            <ErrorBanner
+              title={
+                invalid
+                  ? "Check the VM limit"
+                  : state.saveError
+                    ? "Could not save the VM limit"
+                    : "Could not load the VM limit"
+              }
+              message={error + (invalid ? "" : " Reload the limit before saving again.")}
+            >
+              {!invalid ? (
+                <MaterialButton
+                  label="Reload limit"
+                  disabled={busy}
+                  onPress={() => void controller.load()}
+                />
+              ) : null}
+            </ErrorBanner>
           ) : null}
           {state.saved ? (
             <Text accessibilityLiveRegion="polite" className="text-sm text-foreground-muted">
               Limit saved.
             </Text>
           ) : null}
-          {(error && !invalid) || !state.record ? (
+          {!error && !state.record ? (
             <MaterialButton
               label="Reload limit"
               disabled={busy}

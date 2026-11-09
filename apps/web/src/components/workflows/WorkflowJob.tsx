@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { useCallback, useEffect, useState, useRef, useLayoutEffect } from "react";
@@ -305,13 +306,33 @@ export function WorkflowJob({
     }));
   };
   if (!selectedJob)
-    return (
-      <div className="space-y-3">
-        <p>{read.error ?? "Loading run…"}</p>
-        <Button variant="outline" onClick={() => void refresh()}>
-          Refresh
-        </Button>
-      </div>
+    return read.error ? (
+      <WorkflowAlert
+        title="Could not load this run"
+        actions={
+          <>
+            <Button variant="outline" disabled={read.reading} onClick={() => void refresh()}>
+              Refresh
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() =>
+                navigate({
+                  to: "/workflows/$repositoryId",
+                  params: { repositoryId: scope.repositoryId },
+                  search: { tab: "runs" },
+                })
+              }
+            >
+              Back to runs
+            </Button>
+          </>
+        }
+      >
+        {read.error}
+      </WorkflowAlert>
+    ) : (
+      <p role="status">Loading run…</p>
     );
   const machine = selectedJob.runtime?.kind === "machine" ? selectedJob.runtime : null;
   const target = projects.find(
@@ -365,9 +386,21 @@ export function WorkflowJob({
         </p>
       </header>
       {read.error ? (
-        <p role="alert" className="text-sm text-destructive">
+        <WorkflowAlert
+          title="Could not refresh this run"
+          actions={
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={read.reading}
+              onClick={() => void refresh()}
+            >
+              Retry refresh
+            </Button>
+          }
+        >
           {read.error} Showing the last acknowledged state.
-        </p>
+        </WorkflowAlert>
       ) : null}
       <div className="grid min-w-0 grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
         <div className="min-w-0 space-y-5">
@@ -384,15 +417,57 @@ export function WorkflowJob({
               </h2>
             </div>
             {manualState.message ? (
-              <p className="text-sm text-warning">{manualState.message}</p>
+              <WorkflowAlert
+                title="Run needs attention"
+                variant="warning"
+                actions={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={read.reading}
+                    onClick={() => void refresh()}
+                  >
+                    Refresh run
+                  </Button>
+                }
+              >
+                {manualState.message}
+              </WorkflowAlert>
             ) : null}
-            {detail ? <p className="text-sm text-muted-foreground">{detail}</p> : null}
+            {selectedJob.status === "failed" ? (
+              <WorkflowAlert
+                title="Run failed"
+                actions={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      navigate({
+                        to: "/workflows/$repositoryId",
+                        params: { repositoryId: scope.repositoryId },
+                        search: { tab: "runs" },
+                      })
+                    }
+                  >
+                    Back to runs
+                  </Button>
+                }
+              >
+                {detail ??
+                  "This run stopped before completing. Open its conversation to review the result."}
+              </WorkflowAlert>
+            ) : detail ? (
+              <p className="text-sm text-muted-foreground">{detail}</p>
+            ) : null}
             {reviewChanged || (checkingReturnedReview && !read.error) ? (
-              <p role="status" className="text-sm text-warning">
+              <WorkflowAlert
+                title={reviewChanged ? "Review changed" : "Checking the current review"}
+                variant={reviewChanged ? "warning" : "info"}
+              >
                 {reviewChanged
                   ? "Review changed. Inspect the current diff before approving."
                   : "Checking the current review…"}
-              </p>
+              </WorkflowAlert>
             ) : null}
             {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
               <div className="flex flex-wrap gap-2">
@@ -417,9 +492,21 @@ export function WorkflowJob({
               </div>
             ) : null}
             {resultError ? (
-              <p role="alert" className="text-sm text-destructive">
+              <WorkflowAlert
+                title="Could not open the result"
+                actions={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={openingResult}
+                    onClick={() => void inspect(false)}
+                  >
+                    Retry opening result
+                  </Button>
+                }
+              >
                 {resultError} Retry opening the result.
-              </p>
+              </WorkflowAlert>
             ) : null}
             {approval ? (
               <div className="flex flex-wrap gap-2">

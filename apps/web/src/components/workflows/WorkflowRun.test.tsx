@@ -1,5 +1,5 @@
 import { act, createElement, startTransition, useEffect, useLayoutEffect } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestRenderer, type ReactTestInstance } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
@@ -91,6 +91,13 @@ const key = workflowSessionKey(scope, workflow.workflowId);
 const otherKey = workflowSessionKey(scope, otherWorkflow.workflowId);
 const draft = () => appAtomRegistry.get(workflowDraftAtom).runs[key]!;
 let renderer: ReactTestRenderer | undefined;
+const visibleText = (node: ReactTestInstance): string =>
+  node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join(" ");
+const alertText = () =>
+  renderer!.root
+    .findAll((node) => typeof node.type === "string" && node.props.role === "alert")
+    .map(visibleText)
+    .join(" ");
 
 function deferred<A>() {
   let resolve!: (value: A) => void;
@@ -181,6 +188,28 @@ afterEach(async () => {
 });
 
 describe("Run receipt and navigation ownership", () => {
+  it("blocks a saved VM publishing workflow before submission and retains its instructions", async () => {
+    await mount({
+      ...base,
+      vmExecutionAvailable: true,
+      workflow: {
+        ...workflow,
+        definition: {
+          ...workflow.definition,
+          target: { kind: "vm", baseBranch: null },
+          steps: [
+            ...workflow.definition.steps,
+            { id: "push", title: "Push branch", kind: "action", action: "push" },
+          ],
+        },
+      },
+    });
+    expect(renderer!.root.findAllByType("form")).toHaveLength(0);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Publishing requires a Machine target");
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+    expect(read).not.toHaveBeenCalled();
+    expect(draft().instruction).toBe("Run A");
+  });
   it("keeps instructions copyable after a rejected Run and a refresh to the VM target", async () => {
     const message = "The workflow execution target changed. Review the saved target and try again.";
     type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
@@ -206,7 +235,7 @@ describe("Run receipt and navigation ownership", () => {
         expectedTargetKind: "machine",
       },
     });
-    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+    expect(alertText()).toContain(message);
     expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
     expect(draft()).toMatchObject({ operation: null, startedJobId: null });
     expect(navigate).not.toHaveBeenCalled();
@@ -354,9 +383,7 @@ describe("VM Run submission recovery", () => {
       expect(getToken).toHaveBeenCalledOnce();
       expect(runPromiseExit).not.toHaveBeenCalled();
       expect(runWorkflow).toHaveBeenCalledOnce();
-      expect(renderer!.root.findByProps({ role: "alert" }).props.children).toContain(
-        "Launchpad Connect",
-      );
+      expect(alertText()).toContain("Launchpad Connect");
 
       await unmount();
       await mount(initial);
@@ -416,7 +443,7 @@ describe("VM Run submission recovery", () => {
     await press("Retry previous submission");
     await submit();
 
-    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+    expect(alertText()).toContain(message);
     expect(renderer!.root.findByType("textarea").props.value).toBe("A different run");
     await press("View started run");
     expect(navigate).toHaveBeenCalledExactlyOnceWith({
@@ -597,7 +624,7 @@ describe("VM Run submission recovery", () => {
       await submit();
       if (gateClosed) await update({ ...initial, vmExecutionAvailable: false });
       await press(retry);
-      expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+      expect(alertText()).toContain(message);
       expect(draft().operation).toMatchObject({ state: "uncertain", targetKind: "vm" });
       expect(navigate).not.toHaveBeenCalled();
       await press(retry);
@@ -618,7 +645,7 @@ describe("VM Run submission recovery", () => {
     await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call });
     await submit();
     expect(draft()).toMatchObject({ operation: null, instruction: "Run A" });
-    expect(renderer!.root.findByProps({ role: "alert" }).props.children).toBe(message);
+    expect(alertText()).toContain(message);
     await submit();
     expect(runWorkflow.mock.calls[0]![0].payload.requestId).not.toBe(
       runWorkflow.mock.calls[1]![0].payload.requestId,

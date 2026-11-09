@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { WorkflowAlert } from "./WorkflowAlert";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { RepositoryWorkflow, WorkflowJobListView } from "@t3tools/contracts/workflows";
 import {
@@ -6,6 +7,7 @@ import {
   emptyWorkflowJobPageRead,
   beginWorkflowJobPage,
   settleWorkflowJobPage,
+  readWorkflowJobPages,
   workflowSessionKey,
   workflowStatusLabel,
   type WorkflowScope,
@@ -28,20 +30,29 @@ export function WorkflowJobs({
   const [view, setView] = useState<WorkflowJobListView>("active");
   const [read, setRead] = useState(emptyWorkflowJobPageRead);
   const current = useRef<WorkflowJobPageRequest | null>(null);
+  const latestRead = useRef(read);
+  useLayoutEffect(() => {
+    latestRead.current = read;
+  }, [read]);
   const key = workflowSessionKey(scope, `runs:${view}`);
   const load = useCallback(
-    async (cursor: string | null = null, refreshMetadata = false) => {
+    async (cursor: string | null = null, refreshMetadata = false, minimumCount = 0) => {
+      if (current.current?.key === key) return;
       const request = { key, cursor };
       current.current = request;
       setRead((previous) => beginWorkflowJobPage(previous, request));
       try {
         const [page] = await Promise.all([
-          call((client, clerkToken) =>
-            client.pageWorkflowJobs({
-              clerkToken,
-              repositoryId: scope.repositoryId,
-              query: { view, ...(cursor ? { cursor } : {}) },
-            }),
+          readWorkflowJobPages(
+            (pageCursor) =>
+              call((client, clerkToken) =>
+                client.pageWorkflowJobs({
+                  clerkToken,
+                  repositoryId: scope.repositoryId,
+                  query: { view, ...(pageCursor ? { cursor: pageCursor } : {}) },
+                }),
+              ),
+            { cursor, minimumCount, isCurrent: () => current.current === request },
           ),
           refreshMetadata ? refreshWorkflows() : undefined,
         ]);
@@ -57,17 +68,34 @@ export function WorkflowJobs({
               workflowJobAccessLost(cause),
             ),
           );
+      } finally {
+        if (current.current === request) current.current = null;
       }
     },
     [call, key, scope.repositoryId, view, refreshWorkflows],
   );
   useEffect(() => {
-    // oxlint-disable-next-line react/set-state-in-effect -- This effect starts the external relay read for the selected repository and view.
     void load();
     return () => {
       current.current = null;
     };
   }, [load]);
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    const refreshVisible = () => {
+      if (document.visibilityState === "hidden" || current.current) return;
+      const previous = latestRead.current;
+      void load(null, false, previous.key === key ? (previous.jobs?.length ?? 0) : 0);
+    };
+    const timer = window.setInterval(refreshVisible, 5000);
+    window.addEventListener("focus", refreshVisible);
+    document.addEventListener("visibilitychange", refreshVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshVisible);
+      document.removeEventListener("visibilitychange", refreshVisible);
+    };
+  }, [load, key]);
   const page = read.key === key ? read : emptyWorkflowJobPageRead;
   const busy = !!page.request;
   return (
@@ -99,10 +127,22 @@ export function WorkflowJobs({
           : "Active runs, oldest first. Load more to see further runs."}
       </p>
       {page.error ? (
-        <p role="alert" className="text-sm text-destructive">
+        <WorkflowAlert
+          title={page.jobs ? "Could not refresh runs" : "Could not load runs"}
+          actions={
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => void load(null, true)}
+            >
+              Retry loading runs
+            </Button>
+          }
+        >
           {page.error}
           {page.jobs ? " Showing the last available runs. Refresh to retry." : ""}
-        </p>
+        </WorkflowAlert>
       ) : null}
       {page.jobs === null && !page.error ? (
         <p>Loading runs…</p>

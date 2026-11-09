@@ -1,5 +1,5 @@
 import { act, type ComponentProps, type ReactNode } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestRenderer, type ReactTestInstance } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { WorkflowVmPolicy } from "@t3tools/client-runtime/relay";
 import { WorkflowVmPolicyForm } from "./WorkflowVmPolicySettings";
@@ -31,6 +31,9 @@ vi.mock("../ui/button", () => ({
   ),
 }));
 vi.mock("../ui/input", () => ({ Input: (props: ComponentProps<"input">) => <input {...props} /> }));
+
+const visibleText = (node: ReactTestInstance): string =>
+  node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join(" ");
 
 const record = { organizationId: "org", revision: 1, maxRunningVms: 10 };
 const capabilities = { configuration: true, execution: false };
@@ -114,7 +117,7 @@ describe("workflow VM settings block", () => {
         .props.onClick();
     });
     expect(view.root.findByType("input").props.value).toBe("4");
-    expect(view.root.findByProps({ role: "alert" }).props.children).toContain("Policy changed");
+    expect(visibleText(view.root.findByProps({ role: "alert" }))).toContain("Policy changed");
     expect(read).toHaveBeenCalledTimes(1);
     await act(async () => {
       view.root

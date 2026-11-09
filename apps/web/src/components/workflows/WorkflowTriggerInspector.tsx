@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import * as Effect from "effect/Effect";
 import { useCallback, useState } from "react";
 import type { WorkflowAutomation, WorkflowTrigger } from "@t3tools/contracts/workflows";
@@ -87,14 +88,32 @@ export function WorkflowTriggerInspector({
             : "Manual Run is always available. Automatic triggering changes after Save."}
         </p>
         {!supported ? (
-          <p role="alert">
+          <WorkflowAlert
+            title="Automatic triggering unavailable"
+            variant="warning"
+            actions={
+              <Button type="button" variant="outline" size="sm" onClick={onClose}>
+                Back to workflow
+              </Button>
+            }
+          >
             Update the relay to configure automatic triggering. Its automation state is unavailable.
-          </p>
+            Manual runs remain available.
+          </WorkflowAlert>
         ) : null}
         {supported && !resolved ? (
-          <p role="alert">
-            Refresh or reload the saved workflow before editing automatic triggering.
-          </p>
+          <WorkflowAlert
+            title="Saved trigger needs refreshing"
+            variant="warning"
+            actions={
+              <Button type="button" variant="outline" size="sm" onClick={onClose}>
+                Back to workflow
+              </Button>
+            }
+          >
+            Refresh or reload the saved workflow before editing automatic triggering. Your
+            selections are kept.
+          </WorkflowAlert>
         ) : null}
         <fieldset disabled={disabled || !supported || !resolved} className="space-y-4">
           <Button
@@ -149,21 +168,60 @@ export function WorkflowTriggerInspector({
               </SelectPopup>
             </Select>
             {source && WorkflowSources.sourceHealthLabel(source.source) !== "Connected" ? (
-              <p role="alert" className="text-sm text-warning">
+              <WorkflowAlert
+                title="Linear source needs attention"
+                variant="warning"
+                actions={
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setConnectionsOpen(true)}
+                  >
+                    Manage source access
+                  </Button>
+                }
+              >
                 {WorkflowSources.sourceHealthLabel(source.source)}. The source owner can reconnect
                 below.
-              </p>
+              </WorkflowAlert>
             ) : null}
             {trigger && !source && !sources.loading ? (
-              <p role="alert" className="text-sm text-warning">
+              <WorkflowAlert
+                title="Repository source access unavailable"
+                variant="warning"
+                actions={
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setConnectionsOpen(true)}
+                  >
+                    Manage source access
+                  </Button>
+                }
+              >
                 The saved repository grant is unavailable. Restore repository permission or choose a
                 source explicitly.
-              </p>
+              </WorkflowAlert>
             ) : null}
             {sources.error ? (
-              <p role="alert" className="text-sm text-destructive">
+              <WorkflowAlert
+                title="Could not load Linear workspaces"
+                actions={
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={sources.loading}
+                    onClick={() => void sources.refresh()}
+                  >
+                    Retry workspaces
+                  </Button>
+                }
+              >
                 {sources.error}
-              </p>
+              </WorkflowAlert>
             ) : null}
             <div className="flex flex-wrap gap-2">
               <Button
@@ -395,31 +453,50 @@ function SelectedCriteria({
               </Button>
             </div>
           ))}
-          {criteria?.issues.map((issue) => (
-            <p key={issue.field} role="alert" className="text-sm text-warning">
-              {issue.message}
-            </p>
-          ))}
+          {criteria?.issues.length ? (
+            <WorkflowAlert title="Check trigger selections" variant="warning">
+              <ul className="list-inside list-disc space-y-1">
+                {criteria.issues.map((issue) => (
+                  <li key={issue.field}>{issue.message}</li>
+                ))}
+              </ul>
+            </WorkflowAlert>
+          ) : null}
           {selected.error ? (
-            <p role="alert" className="text-sm text-destructive">
+            <WorkflowAlert
+              title="Could not verify trigger selections"
+              actions={
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={selected.loading}
+                  onClick={() => void selected.refresh()}
+                >
+                  Retry selection check
+                </Button>
+              }
+            >
               {selected.error} Saved selections are retained.
-            </p>
+            </WorkflowAlert>
           ) : null}
           {!selected.loading && criteria && !criteria.deliveryReady ? (
-            <p className="text-sm text-warning">
+            <WorkflowAlert title="Event delivery not verified" variant="warning">
               Issue creation and status-entry delivery must be verified for this team before
-              enabling.
-            </p>
+              enabling. After delivery is configured, retry the selection check below.
+            </WorkflowAlert>
           ) : null}
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            disabled={selected.loading}
-            onClick={() => void selected.refresh()}
-          >
-            Retry selection check
-          </Button>
+          {!selected.error ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              disabled={selected.loading}
+              onClick={() => void selected.refresh()}
+            >
+              Retry selection check
+            </Button>
+          ) : null}
         </>
       ) : null}
     </>
@@ -491,9 +568,22 @@ function MetadataPicker({
         </SelectPopup>
       </Select>
       {state.error ? (
-        <p role="alert" className="text-sm text-destructive">
-          {state.error}
-        </p>
+        <WorkflowAlert
+          title={`Could not load ${label.toLowerCase()}`}
+          actions={
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={state.loading}
+              onClick={() => void state.refresh()}
+            >
+              Retry
+            </Button>
+          }
+        >
+          {state.error} Your selected value is kept.
+        </WorkflowAlert>
       ) : null}
       <div className="flex gap-2">
         {state.snapshot?.nextCursor ? (
@@ -516,17 +606,6 @@ function MetadataPicker({
             onClick={() => setCursor(undefined)}
           >
             First page
-          </Button>
-        ) : null}
-        {state.error ? (
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            disabled={state.loading}
-            onClick={() => void state.refresh()}
-          >
-            Retry
           </Button>
         ) : null}
       </div>

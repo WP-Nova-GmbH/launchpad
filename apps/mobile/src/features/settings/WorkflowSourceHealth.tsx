@@ -1,3 +1,6 @@
+import { View } from "react-native";
+import { ErrorBanner } from "../../components/ErrorBanner";
+import { MaterialButton } from "../../components/MaterialButton";
 import { useAuth } from "@clerk/expo";
 import { WorkflowSources } from "@t3tools/client-runtime/relay";
 import { type RelayRepositoryId, type WorkflowSourceHealthList } from "@t3tools/contracts/relay";
@@ -64,10 +67,14 @@ export function WorkflowSourceHealth({
   return (
     <SettingsSection title="Workflow sources">
       {read.key === key && read.error ? (
-        <Text accessibilityRole="alert" className="p-4 text-danger-foreground">
-          {read.error}
-          {data ? " Showing last available status." : ""}
-        </Text>
+        <View className="p-4">
+          <ErrorBanner
+            title="Could not refresh workflow sources"
+            message={read.error + (data ? " Showing last available status." : "")}
+          >
+            <MaterialButton label="Retry source refresh" onPress={() => void refresh()} />
+          </ErrorBanner>
+        </View>
       ) : null}
       {!data && !(read.key === key && read.error) ? (
         <Text className="p-4 text-foreground-muted">

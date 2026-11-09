@@ -1,3 +1,5 @@
+import type { ReactNode } from "react";
+import { WorkflowAlert } from "./WorkflowAlert";
 import { useAtomValue } from "@effect/atom-react";
 import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import {
@@ -39,7 +41,6 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
-import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
 import { DiscoveryList, DiscoveryListRow } from "../ui/discovery-list";
 import { Spinner } from "../ui/spinner";
@@ -83,34 +84,62 @@ export function WorkflowsPage({ view = "catalog" }: { view?: WorkflowView }) {
         </div>
       </ClerkLoading>
       <ClerkFailed>
-        <WorkspacePageContainer>
-          <h1 className="text-xl font-semibold">Workflows</h1>
-          <Alert variant="error">
-            <AlertTitle>Could not load Launchpad Connect sign-in</AlertTitle>
-            <AlertDescription>Reload Launchpad to try again.</AlertDescription>
-            <AlertAction>
-              <Button variant="outline" onClick={() => window.location.reload()}>
-                Retry
-              </Button>
-            </AlertAction>
-          </Alert>
-        </WorkspacePageContainer>
+        <WorkflowNotice
+          title="Could not load Launchpad Connect sign-in"
+          message="Reload Launchpad to try again."
+          actions={
+            <Button variant="outline" onClick={() => window.location.reload()}>
+              Retry
+            </Button>
+          }
+        />
       </ClerkFailed>
       <ClerkLoaded>
         <ConfiguredWorkflowsPage view={view} />
       </ClerkLoaded>
     </>
   ) : (
-    <WorkflowNotice message="Launchpad Connect is not configured." />
+    <WorkflowNotice
+      title="Workflows unavailable"
+      message="Launchpad Connect is not configured."
+      variant="info"
+    />
   );
 }
 
-function WorkflowNotice({ message }: { message: string }) {
+function WorkflowNotice({
+  title,
+  message,
+  actions,
+  variant = "error",
+}: {
+  title: string;
+  message: string;
+  actions?: ReactNode;
+  variant?: "error" | "warning" | "info";
+}) {
+  const navigate = useNavigate();
   return (
-    <WorkspacePageContainer>
-      <h1 className="text-xl font-semibold">Workflows</h1>
-      <p className="text-sm text-muted-foreground">{message}</p>
-    </WorkspacePageContainer>
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+      <WorkspacePageHeader electron={isElectron}>
+        <h1 className="text-sm font-medium">Workflows</h1>
+      </WorkspacePageHeader>
+      <WorkspacePageContainer>
+        <WorkflowAlert
+          title={title}
+          variant={variant}
+          actions={
+            actions ?? (
+              <Button variant="outline" onClick={() => navigate({ to: "/" })}>
+                Back to projects
+              </Button>
+            )
+          }
+        >
+          {message}
+        </WorkflowAlert>
+      </WorkspacePageContainer>
+    </div>
   );
 }
 
@@ -143,29 +172,30 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
     );
   if (!isSignedIn || !userId)
     return (
-      <WorkspacePageContainer>
-        <h1 className="text-xl font-semibold">Workflows</h1>
-        <p>Sign in to Launchpad Connect to manage repository workflows.</p>
-        <div>
-          <Button onClick={() => openAuthPrompt()}>Sign in</Button>
-        </div>
-      </WorkspacePageContainer>
+      <WorkflowNotice
+        title="Sign in to use workflows"
+        variant="info"
+        message="Sign in to Launchpad Connect to manage repository workflows."
+        actions={<Button onClick={() => openAuthPrompt()}>Sign in</Button>}
+      />
     );
   if (!catalog.data)
     return (
-      <WorkspacePageContainer>
-        <WorkflowNotice
-          message={catalog.error ?? "Join or create an organization to use repository workflows."}
-        />
-        <div>
-          <Button variant="outline" onClick={catalog.refresh}>
-            Refresh
-          </Button>
-          <Button variant="ghost" onClick={() => navigate({ to: "/settings/organization" })}>
-            Organization settings
-          </Button>
-        </div>
-      </WorkspacePageContainer>
+      <WorkflowNotice
+        title={catalog.error ? "Could not load repositories" : "Organization required"}
+        variant={catalog.error ? "error" : "info"}
+        message={catalog.error ?? "Join or create an organization to use repository workflows."}
+        actions={
+          <>
+            <Button variant="outline" onClick={catalog.refresh}>
+              Refresh
+            </Button>
+            <Button variant="ghost" onClick={() => navigate({ to: "/settings/organization" })}>
+              Organization settings
+            </Button>
+          </>
+        }
+      />
     );
   if (repositoryId && !entry)
     return (
@@ -255,10 +285,26 @@ function UnavailableWorkflowRepository({
   confirmed: boolean;
 }) {
   const { accountId, organizationId, repositoryId } = scope;
+  const navigate = useNavigate();
   useEffect(() => {
     if (confirmed) clearWorkflowScope(appAtomRegistry, { accountId, organizationId, repositoryId });
   }, [confirmed, accountId, organizationId, repositoryId]);
-  return <WorkflowNotice message="This repository is unavailable or you no longer have access." />;
+  return (
+    <WorkflowNotice
+      title="Repository unavailable"
+      message="This repository is unavailable or you no longer have access."
+      actions={
+        <>
+          <Button variant="outline" onClick={() => navigate({ to: "/workflows" })}>
+            Choose a repository
+          </Button>
+          <Button variant="ghost" onClick={() => navigate({ to: "/settings/organization" })}>
+            Organization settings
+          </Button>
+        </>
+      }
+    />
+  );
 }
 
 function WorkflowRepositoryView({
@@ -645,11 +691,26 @@ function WorkflowRepositoryView({
                   ? `${workflowTriggerLabel(workflow.automation?.trigger)} · Automatic triggering ${summary?.state === "on" ? "On" : summary?.state === "off" ? "Off" : summary?.state === "needs_attention" ? "needs attention" : "state unavailable"}`
                   : "Automation state unavailable on this relay"}
               </p>
-              {summary?.reason ? <p className="text-xs text-warning">{summary.reason}</p> : null}
-              {local?.error ? (
-                <p role="alert" className="text-sm text-destructive">
-                  {local.error}
-                </p>
+              {summary?.reason || local?.error ? (
+                <div className="mt-2">
+                  <WorkflowAlert
+                    title={
+                      local?.error
+                        ? "Workflow change not confirmed"
+                        : "Automatic triggering needs attention"
+                    }
+                    variant={local?.error ? "error" : "warning"}
+                    actions={
+                      canConfigure ? (
+                        <Button variant="outline" size="sm" onClick={() => setupTrigger(workflow)}>
+                          Review workflow settings
+                        </Button>
+                      ) : undefined
+                    }
+                  >
+                    {local?.error ?? summary?.reason}
+                  </WorkflowAlert>
+                </div>
               ) : null}
             </div>
             <div className="flex flex-wrap gap-2">
@@ -802,9 +863,18 @@ function WorkflowRepositoryView({
           </div>
         </WorkspacePageHeader>
         {error ? (
-          <p role="alert" className="px-4 py-2 text-sm text-destructive">
-            {error} Showing the last available data.
-          </p>
+          <div className="px-4 py-2">
+            <WorkflowAlert
+              title="Could not refresh workflows"
+              actions={
+                <Button variant="outline" size="sm" onClick={refreshView}>
+                  Retry
+                </Button>
+              }
+            >
+              {error} Showing the last available data. Your edits are kept.
+            </WorkflowAlert>
+          </div>
         ) : null}
         {!loaded ? (
           <Spinner />
@@ -881,9 +951,21 @@ function WorkflowRepositoryView({
                 </SelectPopup>
               </Select>
               {copyError ? (
-                <p role="alert" className="text-sm text-destructive">
+                <WorkflowAlert
+                  title="Could not copy workflow"
+                  actions={
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={copyBusy}
+                      onClick={() => void copySaved()}
+                    >
+                      Retry copy
+                    </Button>
+                  }
+                >
                   {copyError}
-                </p>
+                </WorkflowAlert>
               ) : null}
             </DialogPanel>
             <DialogFooter>
@@ -944,9 +1026,16 @@ function WorkflowRepositoryView({
             ) : null}
           </div>
           {error ? (
-            <p role="alert" className="text-sm text-destructive">
+            <WorkflowAlert
+              title="Could not refresh workflows"
+              actions={
+                <Button variant="outline" size="sm" onClick={refreshView}>
+                  Retry
+                </Button>
+              }
+            >
               {error} Showing the last available data.
-            </p>
+            </WorkflowAlert>
           ) : null}
           {!loaded ? (
             <Spinner />
@@ -960,7 +1049,22 @@ function WorkflowRepositoryView({
                 vmExecutionAvailable={vmExecutionAvailable}
               />
             ) : (
-              <p>Workflow unavailable. Refresh or return to the list.</p>
+              <WorkflowAlert
+                title="Workflow unavailable"
+                actions={
+                  <>
+                    <Button variant="outline" onClick={refreshView}>
+                      Refresh workflows
+                    </Button>
+                    <Button variant="ghost" onClick={back}>
+                      Back to workflows
+                    </Button>
+                  </>
+                }
+              >
+                This workflow may have been removed or your access may have changed. Refresh or
+                return to the list.
+              </WorkflowAlert>
             )
           ) : view === "job" && jobId ? (
             <WorkflowJob
@@ -1015,8 +1119,11 @@ function WorkflowRepositoryView({
                         <MenuItem onClick={() => void useTemplate("review")}>
                           Agent → Review
                         </MenuItem>
-                        <MenuItem onClick={() => void useTemplate("publish")}>
-                          Reviewed implementation → PR
+                        <MenuItem
+                          disabled={!projects.length}
+                          onClick={() => void useTemplate("publish")}
+                        >
+                          Reviewed implementation → PR (Machine)
                         </MenuItem>
                       </MenuPopup>
                     </Menu>

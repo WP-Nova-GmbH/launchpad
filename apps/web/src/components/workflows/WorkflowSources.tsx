@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "./WorkflowAlert";
 import { useAuth } from "@clerk/react";
 import { WorkflowSources } from "@t3tools/client-runtime/relay";
 import {
@@ -83,10 +84,22 @@ export function RepositorySources({
         </Button>
       </div>
       {state.error ? (
-        <p role="alert" className="text-sm text-destructive">
+        <WorkflowAlert
+          title="Could not refresh repository sources"
+          actions={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={state.busy || state.loading}
+              onClick={() => void state.refresh()}
+            >
+              Retry source refresh
+            </Button>
+          }
+        >
           {state.error}
           {snapshot ? " Showing last available status." : ""}
-        </p>
+        </WorkflowAlert>
       ) : null}
       {!snapshot ? (
         <p className="text-sm text-muted-foreground">
@@ -95,9 +108,10 @@ export function RepositorySources({
       ) : (
         <>
           {!snapshot.configured ? (
-            <p className="text-sm text-muted-foreground">
-              Native Linear workflow connections are not configured.
-            </p>
+            <WorkflowAlert title="Workflow sources unavailable" variant="info">
+              Native Linear workflow connections are not configured. Ask your environment
+              administrator to enable them, then refresh sources.
+            </WorkflowAlert>
           ) : null}
           {snapshot.sources.map(({ source, grant }) => (
             <div key={grant.grantId} className="space-y-2 border-b pb-3">
@@ -135,11 +149,11 @@ export function RepositorySources({
                 </Button>
               </div>
               {source.status === "reconnect_required" ? (
-                <p className="text-xs text-muted-foreground">
+                <WorkflowAlert title="Linear source needs reconnection" variant="warning">
                   {source.ownerUserId === accountId
                     ? "Reconnect this workspace in Account connections."
                     : "Ask the connection owner to reconnect this workspace."}
-                </p>
+                </WorkflowAlert>
               ) : null}
             </div>
           ))}

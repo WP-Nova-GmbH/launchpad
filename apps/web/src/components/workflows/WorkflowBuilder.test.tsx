@@ -704,16 +704,50 @@ describe("Editor Run archive eligibility", () => {
 });
 
 describe("workflow templates and copies", () => {
-  it.each(["review", "publish"] as const)(
-    "requires a target for the %s template when both kinds are available",
-    (template) => {
-      expect(newWorkflowDraft([project], template, true)?.targetConfirmed).toBe(false);
-      expect(newWorkflowDraft([], template, true)).toMatchObject({
-        definition: { target: { kind: "vm", baseBranch: null } },
-        targetConfirmed: true,
-      });
-    },
-  );
+  it("requires a target for the review template when both kinds are available", () => {
+    expect(newWorkflowDraft([project], "review", true)?.targetConfirmed).toBe(false);
+    expect(newWorkflowDraft([], "review", true)).toMatchObject({
+      definition: { target: { kind: "vm", baseBranch: null } },
+      targetConfirmed: true,
+    });
+  });
+
+  it("keeps publishing templates on Machine even when VM authoring is available", () => {
+    expect(newWorkflowDraft([project], "publish", true)).toMatchObject({
+      definition: { target: { kind: "machine", projectId: project.projectId } },
+      targetConfirmed: true,
+    });
+    expect(newWorkflowDraft([], "publish", true)).toBeNull();
+  });
+
+  it("blocks saving publishing steps after switching to VM and preserves them for correction", async () => {
+    const draft = newWorkflowDraft([project], "publish")!;
+    startNewWorkflowDraft(appAtomRegistry, scope, () => ({
+      ...draft,
+      definition: { ...draft.definition, target: { kind: "vm", baseBranch: null } },
+    }));
+    read.mockResolvedValue({ status: "connected" });
+    await mount({ ...base, vmAuthoring: { models: null } });
+    const reads = read.mock.calls.length;
+    await submit();
+    expect(read).toHaveBeenCalledTimes(reads);
+    expect(editor(draft.workflowId).error).toContain("Machine");
+    expect(editor(draft.workflowId).selectedStepId).toBe("push");
+    expect(editor(draft.workflowId).definition.steps).toEqual(draft.definition.steps);
+  });
+
+  it("rejects a publishing insertion into a VM draft", async () => {
+    read.mockResolvedValue({ status: "connected" });
+    await mount({ ...base, projects: [], vmAuthoring: { models: null } });
+    const id = newId();
+    const before = editor(id).definition.steps;
+    await act(() => {
+      const canvas = renderer!.root.findByProps({ "data-testid": "canvas-fixture" });
+      canvas.props.onInsert({ edge: "end" }, "action");
+      canvas.props.onInsert({ edge: "end" }, "open_pull_request");
+    });
+    expect(editor(id).definition.steps).toEqual(before);
+  });
 
   it("copies a VM workflow without a machine and keeps the base branch only in the same repository", () => {
     const draft = newWorkflowDraft([], "review", true)!;
@@ -753,7 +787,7 @@ describe("workflow templates and copies", () => {
     expect(draft.targetConfirmed).toBe(true);
   });
   it("copies only saved definition data and binds the destination checkout", () => {
-    const sourceDraft = newWorkflowDraft([project])!;
+    const sourceDraft = newWorkflowDraft([project], "publish")!;
     const source: RepositoryWorkflow = {
       workflowId: "source",
       repositoryId: scope.repositoryId,
@@ -776,6 +810,13 @@ describe("workflow templates and copies", () => {
       kind: "machine",
       projectId: destination.projectId,
     });
+    expect(
+      copiedWorkflowDraft(source, [destination], false, true)?.definition.target,
+    ).toMatchObject({
+      kind: "machine",
+      projectId: destination.projectId,
+    });
+    expect(copiedWorkflowDraft(source, [], false, true)).toBeNull();
     expect(copied.baseline).toBeNull();
     expect(copied.operation).toBeNull();
     expect(copied.definition.steps).toEqual(source.definition.steps);

@@ -1,3 +1,4 @@
+import { WorkflowAlert } from "../workflows/WorkflowAlert";
 import { useAuth } from "@clerk/react";
 import { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
@@ -400,9 +401,10 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
                       )}
                     </div>
                     {kindConflict ? (
-                      <p role="alert" className="text-sm text-destructive">
-                        A {existing.kind} already uses this name.
-                      </p>
+                      <WorkflowAlert title="Environment name already in use" variant="warning">
+                        A {existing.kind} already uses this name. Choose a different name before
+                        saving.
+                      </WorkflowAlert>
                     ) : null}
                   </>
                 )}
@@ -455,36 +457,41 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
           </p>
         ) : null}
         {error || needsReload ? (
-          <div
-            ref={recoveryRef}
-            className="space-y-2 rounded-md border border-destructive/30 bg-destructive/5 p-3"
-          >
-            {error === "changed" ? (
-              <div role="alert" className="space-y-1 text-sm">
-                <p className="font-medium text-destructive">Settings changed</p>
-                <p className="text-muted-foreground">
-                  {draft?.kind === "delete"
-                    ? "Reload the latest settings before confirming the deletion again."
-                    : draft
-                      ? "Reload the latest settings before trying again. Your draft will stay."
-                      : "Reload the latest settings before trying again."}
-                </p>
-              </div>
-            ) : error ? (
-              <p role="alert" className="text-sm text-destructive">
-                {editorErrorMessages[error]}
-              </p>
-            ) : null}
-            {needsReload ? (
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={pending !== null}
-                onClick={() => void run()}
-              >
-                Reload settings
-              </Button>
-            ) : null}
+          <div ref={recoveryRef} className="min-w-0">
+            <WorkflowAlert
+              title={
+                error === "changed"
+                  ? "Workflow environment changed"
+                  : "Could not update workflow environment"
+              }
+              actions={
+                needsReload ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={pending !== null}
+                    onClick={() => void run()}
+                  >
+                    Reload settings
+                  </Button>
+                ) : undefined
+              }
+            >
+              {error === "changed" ? (
+                <div className="space-y-1">
+                  <p className="font-medium">Settings changed</p>
+                  <p className="text-muted-foreground">
+                    {draft?.kind === "delete"
+                      ? "Reload the latest settings before confirming the deletion again."
+                      : draft
+                        ? "Reload the latest settings before trying again. Your draft will stay."
+                        : "Reload the latest settings before trying again."}
+                  </p>
+                </div>
+              ) : error ? (
+                <p>{editorErrorMessages[error]}</p>
+              ) : null}
+            </WorkflowAlert>
           </div>
         ) : null}
         {saved ? (
