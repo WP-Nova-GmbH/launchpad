@@ -72,7 +72,7 @@ it.effect("uses only valid model proof for the explicitly configured template bu
       RELAY_WORKFLOW_VM_EXECUTION_ENABLED: "true",
       E2B_WORKFLOW_MODEL_PROOF: encodeJson({
         ...proof,
-        isolationVersion: WORKFLOW_VM_ISOLATION_VERSION - 1,
+        isolationVersion: 4,
       }),
     });
     expect(previousIsolation?.workflowModelCatalog).toEqual(catalog);

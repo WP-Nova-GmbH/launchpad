@@ -2,7 +2,8 @@ import * as NodeAssert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSpawner from "@effect/platform-node/NodeChildProcessSpawner";
-import { ThreadId } from "@t3tools/contracts";
+import { type RuntimeMode, ThreadId } from "@t3tools/contracts";
+import * as CodexSchema from "effect-codex-app-server/schema";
 import { vi } from "vite-plus/test";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -17,6 +18,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { VmWorkloadError } from "../../vmWorkload.ts";
 import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
 import { makeCodexSessionRuntime } from "./CodexSessionRuntime.ts";
+import wireFixture from "../testFixtures/codexMultiAgentWire.json" with { type: "json" };
 
 const nativeId = "a88473a1-01d4-449a-8194-7d6544d3502d";
 const bootId = "13835087-40ba-45c5-bde6-d0092298eaf5";
@@ -27,10 +29,25 @@ const packet = Schema.decodeSync(
       id: Schema.optionalKey(Schema.Int),
       method: Schema.optionalKey(Schema.String),
       result: Schema.optionalKey(Schema.Unknown),
+      params: Schema.optionalKey(Schema.Unknown),
     }),
   ),
 );
-const fixture = Effect.gen(function* () {
+const decodeTurnRequest = Schema.decodeUnknownEffect(CodexSchema.V2TurnStartParams);
+const decodeResumeRequest = Schema.decodeUnknownEffect(CodexSchema.V2ThreadResumeParams);
+const makeFixture = Effect.fnUntraced(function* (
+  options: {
+    readonly workflow?: boolean;
+    readonly managed?: boolean;
+    readonly tracked?: boolean;
+    readonly control?: boolean;
+    readonly runtimeMode?: RuntimeMode;
+    readonly resume?: boolean;
+    readonly start?: boolean;
+    readonly resumedNativeId?: string;
+    readonly invalidIdentity?: boolean;
+  } = {},
+) {
   const output = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
   const stopRequested = yield* Queue.unbounded<void>();
@@ -39,6 +56,10 @@ const fixture = Effect.gen(function* () {
     decoder = new TextDecoder();
   const send = (value: unknown) => Queue.offer(output, encoder.encode(encode(value) + "\n"));
   const methods: string[] = [];
+  const requests: Array<{ readonly method: string; readonly params: unknown }> = [];
+  const bindPeer = vi.fn();
+  const modelProvider = options.managed || options.workflow ? "launchpad_vm" : "openai";
+  const model = options.managed || options.workflow ? "gpt-6-astra" : "gpt-5.3-codex";
   let admitted = true,
     controlStops = 0,
     nativeStops = 0,
@@ -66,6 +87,7 @@ const fixture = Effect.gen(function* () {
           return;
         }
         methods.push(message.method);
+        requests.push({ method: message.method, params: message.params });
         if (message.id === undefined) return;
         const result =
           message.method === "initialize"
@@ -75,8 +97,17 @@ const fixture = Effect.gen(function* () {
                 platformFamily: "unix",
                 platformOs: "linux",
               }
-            : message.method === "thread/resume"
-              ? { cwd: "/tmp/project", model: "gpt-5.3-codex", thread: { id: nativeId } }
+            : message.method === "thread/start" || message.method === "thread/resume"
+              ? {
+                  ...wireFixture.responses.threadStart,
+                  cwd: "/tmp/project",
+                  model,
+                  modelProvider,
+                  thread: {
+                    ...wireFixture.responses.threadStart.thread,
+                    id: options.resumedNativeId ?? nativeId,
+                  },
+                }
               : message.method === "thread/read"
                 ? {
                     thread: {
@@ -85,7 +116,9 @@ const fixture = Effect.gen(function* () {
                       historyMode: "paginated",
                     },
                   }
-                : {};
+                : message.method === "turn/start"
+                  ? wireFixture.responses.turnStart
+                  : {};
         yield* send({ id: message.id, result });
       }),
     ),
@@ -110,7 +143,13 @@ const fixture = Effect.gen(function* () {
       if (command._tag !== "StandardCommand") return yield* Effect.die("Unexpected control pipe");
       let result: unknown;
       if (command.args[0] === "provider-identity")
-        result = { bootId, groupId, pid: 42, startTicks: "1234", executableSha256: "a".repeat(64) };
+        result = {
+          bootId,
+          groupId,
+          pid: options.invalidIdentity ? 43 : 42,
+          startTicks: "1234",
+          executableSha256: "a".repeat(64),
+        };
       else {
         NodeAssert.equal(command.args[0], "stop-idle-provider");
         controlStops++;
@@ -136,14 +175,26 @@ const fixture = Effect.gen(function* () {
     threadId: ThreadId.make("public-test-thread"),
     binaryPath: "/opt/public-codex",
     cwd: "/tmp/project",
-    runtimeMode: "auto",
-    resumeCursor: { threadId: nativeId },
+    runtimeMode: options.runtimeMode ?? "auto",
+    ...(options.resume === false
+      ? {}
+      : { resumeCursor: { threadId: nativeId, resumePolicy: "require-existing" as const } }),
+    ...(options.managed || options.workflow ? { managedConnectionId: "test-connection" } : {}),
+    ...(options.workflow
+      ? {
+          workflowProxy: {
+            baseUrl: "http://127.0.0.1:1/v1",
+            permitEnv: "TEST_WORKFLOW_PERMIT",
+            bindPeer,
+          },
+        }
+      : {}),
   }).pipe(
     Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    Effect.provideService(VmControlSpawner, control),
-    Effect.provideService(VmWorkloadTracking, true),
+    Effect.provideService(VmControlSpawner, options.control === false ? undefined : control),
+    Effect.provideService(VmWorkloadTracking, options.tracked !== false),
   );
-  yield* runtime.start();
+  if (options.start !== false) yield* runtime.start();
   return {
     runtime,
     send,
@@ -151,6 +202,8 @@ const fixture = Effect.gen(function* () {
     stopRequested,
     responses,
     methods,
+    requests,
+    bindPeer,
     get processOnly() {
       return processOnly;
     },
@@ -168,8 +221,161 @@ const fixture = Effect.gen(function* () {
     },
   };
 });
+const fixture = makeFixture();
 
 it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
+  it.effect(
+    "uses the workflow external sandbox for each actual turn and forwards approval decisions",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* makeFixture({
+            workflow: true,
+            runtimeMode: "approval-required",
+            resume: false,
+          });
+          NodeAssert.equal(f.bindPeer.mock.calls.length, 1);
+          for (const [index, decision] of (["accept", "decline"] as const).entries()) {
+            yield* f.runtime.sendTurn({ input: `Agent ${index + 1}` });
+            const approval = yield* f.runtime.events.pipe(
+              Stream.filter((event) => event.method === "item/commandExecution/requestApproval"),
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkScoped,
+            );
+            yield* f.send({
+              id: 91 + index,
+              method: "item/commandExecution/requestApproval",
+              params: {
+                threadId: nativeId,
+                turnId: wireFixture.responses.turnStart.turn.id,
+                itemId: `command-${index}`,
+                command: "touch marker",
+                cwd: "/tmp/project",
+                startedAtMs: 1,
+              },
+            });
+            const request = (yield* Fiber.join(approval))[0]!;
+            NodeAssert.equal(request.requestKind, "command");
+            NodeAssert.ok(request.requestId);
+            yield* f.runtime.respondToRequest(request.requestId, decision);
+            NodeAssert.deepEqual(yield* Queue.take(f.responses), {
+              id: 91 + index,
+              result: { decision },
+            });
+          }
+          const turns = yield* Effect.forEach(
+            f.requests.filter((request) => request.method === "turn/start"),
+            (request) => decodeTurnRequest(request.params),
+          );
+          NodeAssert.equal(turns.length, 2);
+          for (const turn of turns) {
+            NodeAssert.equal(turn.threadId, nativeId);
+            NodeAssert.deepEqual(turn.sandboxPolicy, {
+              type: "externalSandbox",
+              networkAccess: "enabled",
+            });
+            NodeAssert.equal(turn.approvalPolicy, "untrusted");
+            NodeAssert.equal(turn.approvalsReviewer, "user");
+          }
+          NodeAssert.equal(f.methods.filter((method) => method === "thread/start").length, 1);
+        }),
+      ),
+  );
+  it.effect(
+    "reapplies the workflow policy after replacing and strictly resuming the native runtime",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = yield* makeFixture({
+            workflow: true,
+            runtimeMode: "approval-required",
+            resume: false,
+          });
+          yield* first.runtime.sendTurn({ input: "first Agent" });
+          yield* first.runtime.closeNativeWriter!;
+          const second = yield* makeFixture({ workflow: true, runtimeMode: "approval-required" });
+          yield* second.runtime.sendTurn({ input: "next Agent after Review" });
+          NodeAssert.equal(second.methods.includes("thread/start"), false);
+          NodeAssert.equal(second.methods.filter((method) => method === "thread/resume").length, 1);
+          const resume = yield* decodeResumeRequest(
+            second.requests.find((request) => request.method === "thread/resume")!.params,
+          );
+          NodeAssert.equal(resume.threadId, nativeId);
+          NodeAssert.equal(resume.modelProvider, "launchpad_vm");
+          NodeAssert.equal(resume.approvalPolicy, "untrusted");
+          NodeAssert.equal(resume.approvalsReviewer, "user");
+          const turn = yield* decodeTurnRequest(
+            second.requests.find((request) => request.method === "turn/start")!.params,
+          );
+          NodeAssert.equal(turn.threadId, nativeId);
+          NodeAssert.deepEqual(turn.sandboxPolicy, {
+            type: "externalSandbox",
+            networkAccess: "enabled",
+          });
+          NodeAssert.equal(turn.approvalPolicy, "untrusted");
+          NodeAssert.equal(turn.approvalsReviewer, "user");
+        }),
+      ),
+  );
+  it.effect(
+    "rejects a strict native resume mismatch without opening another workflow conversation",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* makeFixture({
+            workflow: true,
+            runtimeMode: "approval-required",
+            start: false,
+            resumedNativeId: "b88473a1-01d4-449a-8194-7d6544d3502d",
+          });
+          NodeAssert.equal((yield* Effect.result(f.runtime.start()))._tag, "Failure");
+          NodeAssert.equal(f.methods.includes("thread/start"), false);
+          NodeAssert.equal(f.methods.includes("turn/start"), false);
+          NodeAssert.equal(f.bindPeer.mock.calls.length, 0);
+        }),
+      ),
+  );
+  for (const options of [
+    { tracked: false },
+    { tracked: false, managed: true },
+    { tracked: true },
+    { tracked: true, managed: true },
+  ])
+    it.effect(`keeps native sandboxing without a workflow proxy: ${JSON.stringify(options)}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* makeFixture({ ...options, runtimeMode: "approval-required" });
+          yield* f.runtime.sendTurn({ input: "ordinary Agent" });
+          const turn = yield* decodeTurnRequest(
+            f.requests.find((request) => request.method === "turn/start")!.params,
+          );
+          NodeAssert.deepEqual(turn.sandboxPolicy, { type: "readOnly" });
+          NodeAssert.equal(turn.approvalPolicy, "untrusted");
+          NodeAssert.equal(turn.approvalsReviewer, "user");
+          NodeAssert.equal(f.bindPeer.mock.calls.length, 0);
+        }),
+      ),
+    );
+  for (const options of [{ tracked: false }, { control: false }])
+    it.effect(`rejects unverified workflow runtime: ${JSON.stringify(options)}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const error = yield* makeFixture({ ...options, workflow: true }).pipe(Effect.flip);
+          NodeAssert.equal(error._tag, "CodexAppServerSpawnError");
+        }),
+      ),
+    );
+  it.effect("rejects a workflow native identity mismatch before the runtime becomes ready", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true, invalidIdentity: true, start: false });
+        NodeAssert.equal((yield* Effect.result(f.runtime.start()))._tag, "Failure");
+        NodeAssert.equal(f.methods.includes("turn/start"), false);
+        NodeAssert.equal(f.bindPeer.mock.calls.length, 0);
+      }),
+    ),
+  );
   it.effect("settles a blocking native question with no answers", () =>
     Effect.scoped(
       Effect.gen(function* () {

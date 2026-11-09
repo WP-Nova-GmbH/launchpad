@@ -151,6 +151,13 @@ export const WorkflowRun = Schema.Struct({
         commandId: Schema.String,
         createdAt: Schema.String,
         setupCleanup: Schema.optional(SetupCleanup),
+        /** A sequence review advances only after its saved result has been verified. */
+        response: Schema.optional(
+          Schema.Struct({
+            ...WorkflowResponseSummary.fields,
+            operation: Schema.Literal("approve"),
+          }),
+        ),
       }),
     ),
   ),

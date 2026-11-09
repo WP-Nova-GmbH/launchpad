@@ -132,7 +132,7 @@ try {
       ].join("\n"),
       {
         user: "root",
-        timeoutMs: 120_000,
+        timeoutMs: 180_000,
         envs: { LAUNCHPAD_CHECKPOINT_READER_SHA256: receipt.workflowCheckpointReaderSha256 },
       },
     );
@@ -152,6 +152,12 @@ try {
       nativeCodexPeerVerified: true,
       otherCodexPeersDenied: true,
       privateCheckpointReaderVerified: true,
+      nativeCodexCommandExecuted: true,
+      nativeCodexApprovalDenied: true,
+      nativeCodexResumeExecuted: true,
+      nativeCodexDumpabilityProtected: true,
+      nativeCodexStartupHooksExecuted: true,
+      nativeCodexWorkloadsStopped: true,
     };
     NodeAssert.deepEqual(JSON.parse(isolation.stdout), checks);
     await requireBuildTag();
@@ -162,7 +168,9 @@ try {
       templateRef: receipt.templateRef,
       ...checks,
     });
-    console.log("Workflow credential isolation passed inside the packaged launcher.");
+    console.log(
+      "Workflow command execution and credential isolation passed inside the packaged launcher.",
+    );
   }
   modelProof = Schema.decodeUnknownSync(WorkflowVmModelProof)({
     schemaVersion: WORKFLOW_VM_MODEL_PROOF_VERSION,

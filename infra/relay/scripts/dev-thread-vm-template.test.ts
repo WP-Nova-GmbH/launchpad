@@ -235,6 +235,7 @@ describe("local VM runner selection", () => {
       for (const [sidecar, configuredProof, enabled] of [
         [model, isolation, true],
         [isolation, model, true],
+        [{ ...model, isolationVersion: 4 }, model, false],
         [model, { ...isolation, buildId: "other-build" }, false],
         [model, { ...isolation, templateRef: "other:build-selected" }, false],
         [model, { ...isolation, isolationVersion: WORKFLOW_VM_ISOLATION_VERSION + 1 }, false],

@@ -1410,6 +1410,36 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     if (sessionOwners.get(threadId)?.size === 0) sessionOwners.delete(threadId);
   });
 
+  const retireStoppedVmWriters = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    current: NonNullable<ReturnType<typeof ownedSessions.get>>,
+  ) {
+    if (!vmWorkloads) return;
+    const previous = Array.from(sessionOwners.get(threadId) ?? []).filter(
+      (owner) => owner !== current,
+    );
+    for (const owner of previous) {
+      if (
+        !owner.writerEventsDrained &&
+        owner.runtimeEpisode &&
+        (yield* (
+          owner.adapter.isSessionWriterStopConfirmed?.(threadId, owner.runtimeEpisode) ??
+            Effect.succeed(false)
+        )) &&
+        owner.adapter.drainRuntimeEvents
+      ) {
+        // A replacement closes the old writer inside the adapter. Its queued
+        // events must reach ingestion before that ownership record is retired.
+        yield* owner.adapter.drainRuntimeEvents(threadId);
+        owner.writerEventsDrained = true;
+      }
+    }
+    yield* clearCapturedOwners(
+      threadId,
+      previous.filter((owner) => owner.writerEventsDrained),
+    );
+  });
+
   const recordVmWriterStopped = Effect.fnUntraced(function* (
     binding: ProviderSessionDirectory.ProviderRuntimeBinding,
     eventsDrained: boolean,
@@ -1939,12 +1969,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         undefined,
         owner.runtimeEpisode,
       );
-      yield* settleSessionInvocation(invocation, resumed);
+      yield* retireStoppedVmWriters(input.binding.threadId, owner);
       if (owner.shutdownConfirmed || ownedSessions.get(input.binding.threadId) !== owner)
         return yield* toValidationError(
           input.operation,
           "Runtime ownership changed while recovery was saved.",
         );
+      yield* settleSessionInvocation(invocation, resumed);
       yield* analytics.record("provider.session.recovered", {
         provider: resumed.provider,
         strategy: "resume-thread",
@@ -2300,18 +2331,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           },
           owner.runtimeEpisode,
         );
+        yield* retireStoppedVmWriters(threadId, owner);
         if (owner.shutdownConfirmed || ownedSessions.get(threadId) !== owner)
           return yield* toValidationError(
             "ProviderService.startSession",
             "Runtime ownership changed while startup was saved.",
           );
         yield* settleSessionInvocation(invocation, sessionWithInstance);
-        if (vmWorkloads) {
-          const previous = Array.from(sessionOwners.get(threadId) ?? []).filter(
-            (prior) => prior !== owner && prior.writerEventsDrained,
-          );
-          yield* clearCapturedOwners(threadId, previous);
-        }
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
           runtimeMode: input.runtimeMode,

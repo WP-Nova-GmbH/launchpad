@@ -44,6 +44,7 @@ import * as Stream from "effect/Stream";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
+import { WORKFLOW_CHECKPOINT_READ_TIMEOUT_MS } from "../vcs/WorkflowCheckpointReader.ts";
 import { SetupProcessJournal } from "../terminal/SetupProcessJournal.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
@@ -339,6 +340,7 @@ export const make = Effect.gen(function* () {
   const terminal = yield* TerminalManager;
   const runnerScope = yield* Scope.Scope;
   const cleanupWorkers = new Set<string>();
+  const approvalWorkers = new Map<string, { fiber: Fiber.Fiber<void, never> | null }>();
   const engine = yield* OrchestrationEngineService;
   const commandReceipts = yield* OrchestrationCommandReceiptRepository;
   const query = yield* ProjectionSnapshotQuery;
@@ -946,27 +948,148 @@ export const make = Effect.gen(function* () {
         yield* startCleanup(run, "approvalAttempt");
         return run;
       }
-      const settlement = yield* settleApprovedPreparation(run);
-      const detail =
-        settlement ??
-        (attempt.checkpointId !== run.progress.checkpoint?.checkpointId ||
-        attempt.preparedHead !== run.preparedHead
-          ? "The saved review changed. Cancel the job and run it again."
-          : yield* verifyResult(run));
-      return yield* store.save({
-        ...run,
-        approvalAttempt: null,
-        approvedBy: detail ? run.approvedBy : attempt.approvedBy,
-        executionReserved: false,
-        progress: {
-          ...run.progress,
-          revision: run.progress.revision + 1,
-          status: detail ? run.progress.status : "done",
-          approvalPending: false,
-          retryableApproval: !!detail && run.progress.status === "finishing",
-          detail: detail ?? "Workflow completed; setup cleanup and final result verified.",
-        },
-      });
+      if (approvalWorkers.has(run.jobId)) return run;
+      const worker = { fiber: null as Fiber.Fiber<void, never> | null };
+      approvalWorkers.set(run.jobId, worker);
+      // The HTTP request acknowledges the durable intent. Filesystem I/O must
+      // outlive its transport deadline and must not hold the runner's control lock.
+      worker.fiber = yield* Effect.gen(function* () {
+        const settlement = yield* settleApprovedPreparation(run);
+        return (
+          settlement ??
+          (attempt.checkpointId !== run.progress.checkpoint?.checkpointId ||
+          attempt.preparedHead !== run.preparedHead
+            ? "The saved review changed. Cancel the job and run it again."
+            : yield* verifyResult(run))
+        );
+      }).pipe(
+        // Allow the VM reader its full transfer budget in addition to preparation
+        // settlement and Git verification. Machine verification keeps its usual limit.
+        Effect.timeout(
+          3 * 60_000 + (run.runtime.kind === "vm" ? WORKFLOW_CHECKPOINT_READ_TIMEOUT_MS : 0),
+        ),
+        Effect.exit,
+        Effect.flatMap((outcome) =>
+          Exit.isFailure(outcome) && Cause.hasInterrupts(outcome.cause)
+            ? Effect.void
+            : lock.withPermits(1)(
+                Effect.gen(function* () {
+                  const current = yield* store.get(run.jobId);
+                  if (
+                    !current ||
+                    current.approvalAttempt?.commandId !== attempt.commandId ||
+                    !["awaiting_review", "finishing"].includes(current.progress.status) ||
+                    current.progress.retryableApproval
+                  )
+                    return;
+                  const response = attempt.response;
+                  const sequence = current.sequence;
+                  const step = activeWorkflowStep(current);
+                  const failed = Exit.isFailure(outcome);
+                  let detail = failed
+                    ? "Result verification could not finish. Retry approval."
+                    : outcome.value;
+                  if (
+                    current.progress.checkpoint?.checkpointId !== attempt.checkpointId ||
+                    current.preparedHead !== attempt.preparedHead ||
+                    (response &&
+                      (!sequence ||
+                        step?.kind !== "review" ||
+                        step.id !== response.stepId ||
+                        sequence.generation !== response.generation))
+                  )
+                    detail = "The saved review changed. Cancel the job and run it again.";
+                  if (
+                    current.runtime.kind === "vm" &&
+                    !(yield* store.isVmFenceActive(current.runtime))
+                  )
+                    detail = "The VM no longer owns this workflow. Cancel the run.";
+                  let next: WorkflowRun;
+                  if (!detail && response && sequence) {
+                    next = advanceWorkflow({
+                      ...current,
+                      approvalAttempt: null,
+                      sequence: {
+                        ...sequence,
+                        cursor: sequence.cursor + 1,
+                        stepStartedAt: response.createdAt,
+                        responses: [...sequence.responses, response],
+                        completed: [
+                          ...sequence.completed,
+                          {
+                            stepId: response.stepId,
+                            generation: response.generation,
+                            checkpoint: null,
+                            head: null,
+                          },
+                        ],
+                      },
+                    });
+                    if (next.progress.status === "finishing")
+                      next = {
+                        ...next,
+                        progress: {
+                          ...next.progress,
+                          status: "awaiting_review",
+                          checkpoint: current.progress.checkpoint,
+                        },
+                      };
+                  } else {
+                    next = {
+                      ...current,
+                      approvalAttempt: failed ? current.approvalAttempt : null,
+                      approvedBy: detail ? current.approvedBy : attempt.approvedBy,
+                      executionReserved: false,
+                      progress: {
+                        ...current.progress,
+                        revision: current.progress.revision + 1,
+                        status: detail ? current.progress.status : "done",
+                        approvalPending: false,
+                        retryableApproval:
+                          failed || (!!detail && current.progress.status === "finishing"),
+                        detail:
+                          detail ?? "Workflow completed; setup cleanup and final result verified.",
+                      },
+                    };
+                  }
+                  yield* store.save(next);
+                  approvalWorkers.delete(run.jobId);
+                  yield* reconcile(next);
+                  yield* pumpWaiting();
+                }),
+              ),
+        ),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.void
+            : lock.withPermits(1)(
+                Effect.gen(function* () {
+                  const current = yield* store.get(run.jobId);
+                  if (current?.approvalAttempt?.commandId !== attempt.commandId) return;
+                  if (approvalWorkers.get(run.jobId) === worker) approvalWorkers.delete(run.jobId);
+                  yield* store.save({
+                    ...current,
+                    progress: {
+                      ...current.progress,
+                      revision: current.progress.revision + 1,
+                      approvalPending: false,
+                      retryableApproval: true,
+                      detail:
+                        "Approval could not finish. Retry approval; the saved request and cleanup are retained.",
+                    },
+                  });
+                }),
+              ),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (approvalWorkers.get(run.jobId) === worker) approvalWorkers.delete(run.jobId);
+          }),
+        ),
+        Effect.ignoreCause({ log: true }),
+        Effect.forkIn(runnerScope),
+      );
+      return run;
     },
     (effect, run) =>
       effect.pipe(
@@ -1870,6 +1993,8 @@ export const make = Effect.gen(function* () {
               detail: "Waiting for the environment to stop the agent and setup.",
             },
           });
+        const verification = approvalWorkers.get(run.jobId)?.fiber;
+        if (verification) yield* Fiber.interrupt(verification).pipe(Effect.forkIn(runnerScope));
         return result(yield* reconcile(run));
       }
       if (request.control.operation === "pause" || request.control.operation === "resume") {
@@ -1883,6 +2008,12 @@ export const make = Effect.gen(function* () {
             .pipe(Effect.mapError((error) => new WorkflowRunnerError({ message: error.message })));
         if (isTerminalWorkflowJob(run.progress.status) || run.progress.status === "cancelling")
           return result(run, "conflict", "This job is cancelling or has finished.");
+        if (run.progress.approvalPending)
+          return result(
+            run,
+            "conflict",
+            "Wait for approval verification to finish, or cancel the run.",
+          );
         if (!run.sequence || !run.providerContinuation)
           return result(
             run,
@@ -2261,6 +2392,38 @@ export const make = Effect.gen(function* () {
       }
       if (run.manualPause && request.control.operation !== "cancel")
         return result(run, "conflict", "Resume the manual pause before responding or retrying.");
+      if (run.approvalAttempt?.response && request.control.operation === "approve") {
+        const attempt = run.approvalAttempt;
+        const control = request.control;
+        if (
+          control.checkpointId === attempt.checkpointId &&
+          control.expectedRevision === attempt.acceptedRevision &&
+          requestedBy === attempt.response!.userId
+        )
+          return result(run);
+        if (
+          !run.progress.retryableApproval ||
+          control.checkpointId !== attempt.checkpointId ||
+          control.expectedRevision !== run.progress.revision
+        )
+          return result(run, "conflict", "This approval is already being verified or has changed.");
+        run = yield* store.save({
+          ...run,
+          approvalAttempt: {
+            ...attempt,
+            acceptedRevision: control.expectedRevision,
+            commandId: `workflow:${run.jobId}:approve:${control.expectedRevision}`,
+          },
+          progress: {
+            ...run.progress,
+            revision: run.progress.revision + 1,
+            approvalPending: true,
+            retryableApproval: false,
+            detail: "Approval accepted; verifying the approved result.",
+          },
+        });
+        return result(yield* reconcileApproval(run));
+      }
       if (request.control.operation === "retry_action") {
         const response = request.control;
         const action = run.actions?.find((entry) => entry.actionId === response.actionId);
@@ -2391,8 +2554,36 @@ export const make = Effect.gen(function* () {
           )
             return result(run, "conflict", "This checkpoint changed. Refresh before responding.");
           if (control.operation === "approve") {
-            const detail = yield* verifyResult(run);
-            if (detail) return result(run, "conflict", detail);
+            if (!run.worktreePath || !run.preparedHead)
+              return result(run, "conflict", "The saved result is unavailable. Cancel the run.");
+            run = yield* store.save({
+              ...run,
+              approvalAttempt: {
+                approvedBy: requestedBy!,
+                checkpointId: control.checkpointId,
+                preparedHead: run.preparedHead,
+                acceptedRevision: control.expectedRevision,
+                commandId: `workflow:${run.jobId}:approve:${control.expectedRevision}`,
+                createdAt: yield* timestamp,
+                response: {
+                  checkpointId: control.checkpointId,
+                  stepId: step!.id,
+                  generation: run.sequence.generation,
+                  operation: "approve",
+                  userId: requestedBy!,
+                  text: null,
+                  createdAt: yield* timestamp,
+                },
+              },
+              progress: {
+                ...run.progress,
+                revision: run.progress.revision + 1,
+                approvalPending: true,
+                retryableApproval: false,
+                detail: "Approval accepted; verifying the approved result.",
+              },
+            });
+            return result(yield* reconcileApproval(run));
           }
           const sequence = run.sequence;
           const response = {
@@ -2401,7 +2592,7 @@ export const make = Effect.gen(function* () {
             generation: sequence.generation,
             operation: control.operation,
             userId: requestedBy!,
-            text: control.operation === "approve" ? null : control.text,
+            text: control.text,
             createdAt: yield* timestamp,
           };
           if (control.operation === "request_changes" && step?.kind === "review") {
@@ -2436,7 +2627,6 @@ export const make = Effect.gen(function* () {
               },
             });
           } else {
-            const oldCheckpoint = run.progress.checkpoint;
             run = advanceWorkflow({
               ...run,
               sequence: {
@@ -2455,11 +2645,6 @@ export const make = Effect.gen(function* () {
                 ],
               },
             });
-            if (run.progress.status === "finishing" && control.operation === "approve")
-              run = {
-                ...run,
-                progress: { ...run.progress, status: "awaiting_review", checkpoint: oldCheckpoint },
-              };
           }
           yield* store.save(run);
           return result(yield* reconcile(run));
@@ -2484,8 +2669,6 @@ export const make = Effect.gen(function* () {
         (accepted && !run.progress.retryableApproval)
       )
         return result(run, "conflict", "This review changed. Refresh before approving.");
-      const detail = yield* verifyResult(run);
-      if (detail) return result(run, "conflict", detail);
       const preparation = (yield* readThread(run))?.promptQueue?.preparation;
       const commandId = `workflow:${run.jobId}:approve:${request.control.expectedRevision}`;
       run = yield* store.save({

@@ -4,7 +4,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 export const WORKFLOW_VM_MODEL_PROOF_VERSION = 2;
-export const WORKFLOW_VM_ISOLATION_VERSION = 4;
+export const WORKFLOW_VM_ISOLATION_VERSION = 5;
 
 export const WorkflowVmModelProof = Schema.Struct({
   schemaVersion: Schema.Literal(WORKFLOW_VM_MODEL_PROOF_VERSION),

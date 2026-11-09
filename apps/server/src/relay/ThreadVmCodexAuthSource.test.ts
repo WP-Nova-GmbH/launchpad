@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
@@ -140,6 +141,55 @@ it.effect("fails closed for an installed VM when source discovery is unavailable
   );
 });
 
+for (const recover of [true, false])
+  it.effect(`bounds timed-out source lookups and ${recover ? "recovers" : "fails closed"}`, () =>
+    Effect.gen(function* () {
+      const entered = yield* Effect.forEach([0, 1, 2], () => Deferred.make<void>());
+      const f = fixture((requestNumber) =>
+        Deferred.succeed(entered[requestNumber - 1]!, undefined).pipe(
+          Effect.andThen(recover && requestNumber === 3 ? Effect.void : Effect.never),
+        ),
+      );
+      const read = yield* f
+        .provide(readThreadVmCodexAuthSource())
+        .pipe(Effect.result, Effect.forkChild);
+      for (let index = 0; index < 3; index++) {
+        const next = yield* Effect.raceFirst(
+          Deferred.await(entered[index]!).pipe(Effect.as("requested")),
+          Fiber.join(read).pipe(Effect.as("finished")),
+        );
+        expect(next).toBe("requested");
+        if (recover && index === 2) break;
+        yield* TestClock.adjust("5 seconds");
+        if (index < 2) yield* TestClock.adjust("500 millis");
+      }
+      const result = yield* Fiber.join(read);
+      if (recover) {
+        expect(result._tag).toBe("Success");
+        if (result._tag === "Success") expect(result.success).toEqual(managed());
+      } else {
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") expect(result.failure.reason).toBe("unavailable");
+      }
+      expect(f.calls).toHaveLength(3);
+      expect(f.calls.every((call) => call.url.endsWith("/provider-auth/source"))).toBe(true);
+    }),
+  );
+
+it.effect("cancels an in-flight source lookup without retrying", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const f = fixture(() =>
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+    );
+    const read = yield* f.provide(readThreadVmCodexAuthSource()).pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* Fiber.interrupt(read);
+    yield* TestClock.adjust("1 minute");
+    expect(f.calls).toHaveLength(1);
+  }),
+);
+
 for (const [reason, expected] of [
   ["source_unavailable", "account_selection_required"],
   ["not_connected", "reconnect_required"],
@@ -156,6 +206,7 @@ for (const [reason, expected] of [
         const source = yield* makeThreadVmCodexAuthContext;
         expect((yield* source.current.pipe(Effect.flip)).reason).toBe(expected);
         expect((yield* source.refresh.pipe(Effect.flip)).reason).toBe(expected);
+        expect(f.calls).toHaveLength(2);
         f.response({ mode: "personal" });
         expect(yield* source.refresh).toBe(true);
         expect(yield* source.current).toBeNull();

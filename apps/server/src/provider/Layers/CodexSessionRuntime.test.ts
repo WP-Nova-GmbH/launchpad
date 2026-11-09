@@ -223,6 +223,29 @@ function makeThreadOpenResponse(
 }
 
 describe("buildTurnStartParams", () => {
+  for (const [runtimeMode, approvalPolicy, approvalsReviewer] of [
+    ["approval-required", "untrusted", "user"],
+    ["auto-accept-edits", "on-request", "user"],
+    ["auto", "on-request", "auto_review"],
+    ["full-access", "never", "user"],
+  ] as const)
+    it.effect(`preserves ${runtimeMode} approvals with external workflow isolation`, () =>
+      Effect.gen(function* () {
+        const params = yield* buildTurnStartParams({
+          threadId: "workflow-thread",
+          runtimeMode,
+          workflowVm: true,
+          prompt: "Run a command",
+        });
+        NodeAssert.deepEqual(params.sandboxPolicy, {
+          type: "externalSandbox",
+          networkAccess: "enabled",
+        });
+        NodeAssert.equal(params.approvalPolicy, approvalPolicy);
+        NodeAssert.equal(params.approvalsReviewer, approvalsReviewer);
+      }),
+    );
+
   it.effect("sends currency skill aliases in Codex's canonical dollar form", () =>
     Effect.gen(function* () {
       for (const symbol of ["€", "£", "¥", "₹", "₩", "₿", "𑿝"]) {

@@ -32,11 +32,15 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
+import { TestClock } from "effect/testing";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { workflowVmCancellationSeal } from "../relay/WorkflowVmCancellation.ts";
 import * as Store from "./WorkflowRunStore.ts";
-import { type WorkflowRequest } from "./RepositoryWorkflowRunner.ts";
+import {
+  type WorkflowRequest,
+  type RepositoryWorkflowRunnerShape,
+} from "./RepositoryWorkflowRunner.ts";
 import { decidePromptQueueCommand } from "../orchestration/promptQueueDecider.ts";
 import { createEmptyReadModel, projectEvent } from "../orchestration/projector.ts";
 
@@ -872,40 +876,31 @@ it.effect(
         const runner = yield* h.newRunner;
         yield* runner.handle(request());
         yield* h.complete;
-        const review = (yield* runner.handle(control("status"))).progress!;
-        const approve: WorkflowRequest = {
-          ...request(),
-          control: {
-            operation: "approve",
-            organizationId: "org-1",
-            repositoryId: "repo-1",
-            projectId: PROJECT,
-            expectedRevision: review.revision,
-            checkpointId: review.checkpoint!.checkpointId,
-          },
-        };
+        let review = (yield* runner.handle(control("status"))).progress!;
         const stale = {
-          ...approve,
+          ...approve(review),
           control: {
-            ...approve.control,
+            ...approve(review).control,
             operation: "approve" as const,
             expectedRevision: 0,
             checkpointId: "old",
           },
         };
         assert.strictEqual((yield* runner.handle(stale)).outcome, "conflict");
-        yield* Ref.set(h.workspaceTree, "changed-tree");
-        assert.strictEqual((yield* runner.handle(approve)).outcome, "conflict");
-        yield* Ref.set(h.workspaceTree, "prepared-tree");
-        yield* Ref.set(h.head, "changed-head");
-        assert.strictEqual((yield* runner.handle(approve)).outcome, "conflict");
-        yield* Ref.set(h.head, "base-sha");
-        yield* Ref.set(h.headAfterCapture, "changed-during-capture");
-        assert.strictEqual((yield* runner.handle(approve)).outcome, "conflict");
+        for (const change of ["files", "head", "during-capture"]) {
+          yield* Ref.set(h.workspaceTree, change === "files" ? "changed-tree" : "prepared-tree");
+          yield* Ref.set(h.head, change === "head" ? "changed-head" : "base-sha");
+          yield* Ref.set(h.headAfterCapture, change === "during-capture" ? "changed-head" : null);
+          const refused = yield* settleResponse(h, runner, approve(review));
+          assert.equal(refused.progress?.status, "awaiting_review");
+          assert.include(refused.progress?.detail ?? "", "changed");
+          review = refused.progress!;
+        }
         yield* Ref.set(h.head, "base-sha");
         yield* Ref.set(h.headAfterCapture, null);
-        assert.strictEqual((yield* runner.handle(approve)).progress?.status, "done");
-        assert.strictEqual((yield* runner.handle(approve)).progress?.status, "done");
+        const response = approve(review);
+        assert.strictEqual((yield* settleResponse(h, runner, response)).progress?.status, "done");
+        assert.strictEqual((yield* runner.handle(response)).progress?.status, "done");
         assert.strictEqual((yield* runner.handle(control("cancel"))).progress?.status, "done");
       }),
     ),
@@ -1352,6 +1347,34 @@ const approve = (progress: Store.WorkflowRun["progress"]): WorkflowRequest => ({
     checkpointId: progress.checkpoint!.checkpointId,
   },
 });
+const settleResponse = Effect.fn(function* (
+  h: Effect.Success<typeof harness>,
+  runner: RepositoryWorkflowRunnerShape,
+  response: WorkflowRequest,
+) {
+  const reply = yield* runner.handle(response);
+  if (!reply.progress?.approvalPending || reply.outcome !== "accepted") return reply;
+  const revision = reply.progress.revision;
+  yield* h.awaitRun(
+    (run) =>
+      run.progress.revision > revision &&
+      !run.progress.approvalPending &&
+      !(
+        run.sequence?.cursor === run.workflow.definition.steps.length &&
+        run.progress.status === "awaiting_review" &&
+        !run.progress.detail
+      ),
+  );
+  return yield* runner.handle({
+    ...response,
+    control: {
+      operation: "status",
+      organizationId: response.control.organizationId,
+      repositoryId: response.control.repositoryId,
+      projectId: response.control.projectId,
+    },
+  });
+});
 
 const prepareVmWorkflow = Effect.fnUntraced(function* (h: Effect.Success<typeof harness>) {
   const sql = yield* SqlClient.SqlClient;
@@ -1667,11 +1690,20 @@ it.effect.each([true, false])(
           new Map([[`${pin.checkpointRef}^{tree}`, "changed-tree"]]),
         );
         yield* Ref.set(h.workspaceTree, "changed-tree");
-        const refused = yield* runner.handle(respond);
-        assert.equal(refused.outcome, "conflict");
-        assert.include(refused.detail ?? "", "Prepared files changed");
+        const refused = yield* settleResponse(h, runner, respond);
+        assert.include(refused.progress?.detail ?? "", "Prepared files changed");
         yield* Ref.set(h.workspaceTree, pin.treeId);
-        const finished = yield* runner.handle(respond);
+        const finished = yield* settleResponse(h, runner, {
+          ...respond,
+          control: {
+            operation: "approve",
+            organizationId: respond.control.organizationId,
+            repositoryId: respond.control.repositoryId,
+            projectId: respond.control.projectId,
+            checkpointId: refused.progress!.checkpoint!.checkpointId,
+            expectedRevision: refused.progress!.revision,
+          },
+        });
         assert.equal(finished.progress?.status, "done");
         assert.equal((yield* store.get(binding.jobId))?.worktreePath, "/repo");
       }),
@@ -1749,7 +1781,9 @@ it.effect.each(["approve", "changed", "cancel"] as const)(
           yield* Queue.offer(h.cleanupOutcomes, null);
           const finished = yield* h.awaitRun(
             (run) =>
-              run.progress.approvalPending === false && run.progress.revision > pending.revision,
+              run.progress.approvalPending === false &&
+              run.progress.revision > pending.revision &&
+              (run.progress.status === "done" || run.progress.detail !== null),
           );
           assert.strictEqual(
             finished.progress.status,
@@ -1931,7 +1965,7 @@ it.effect.each(["pending", "confirmed"] as const)(
           yield* Queue.offer(h.cleanupOutcomes, null);
           yield* h.awaitRun((run) => run.progress.status === "done");
         } else {
-          assert.strictEqual(state.status, "done");
+          yield* h.awaitRun((run) => run.progress.status === "done");
           assert.strictEqual(yield* Queue.size(h.cleanups), 0);
         }
         const done = (yield* store.get("job-1"))!;
@@ -1984,7 +2018,9 @@ it.effect.each(["projection", "final-write", "race", "replacement"] as const)(
         yield* Queue.offer(h.cleanupOutcomes, null);
         const finished = yield* h.awaitRun(
           (run) =>
-            run.progress.approvalPending === false && run.progress.revision > review.revision + 1,
+            run.progress.approvalPending === false &&
+            run.progress.revision > review.revision + 1 &&
+            (run.progress.status === "done" || run.progress.detail !== null),
         );
         const preparation = (yield* Ref.get(h.currentThread))!.promptQueue!.preparation!;
         if (boundary === "replacement") {
@@ -1999,7 +2035,7 @@ it.effect.each(["projection", "final-write", "race", "replacement"] as const)(
           assert.isTrue(finished.progress.retryableApproval);
           assert.strictEqual(finished.progress.status, "awaiting_review");
           yield* Ref.set(h.settlementMode, "normal");
-          const retried = yield* runner.handle({
+          const retried = yield* settleResponse(h, runner, {
             ...approve(finished.progress),
             userId: "another-maintainer",
           });
@@ -2022,7 +2058,8 @@ it.effect(
     test(
       Effect.gen(function* () {
         const h = yield* harness;
-        const runner = yield* h.newRunner;
+        const scope = yield* Scope.make();
+        const runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
         yield* runner.handle(request());
         yield* h.complete;
         yield* withBackground(h);
@@ -2032,9 +2069,12 @@ it.effect(
         yield* Ref.set(h.finalWriteFailures, 2);
         yield* Queue.offer(h.cleanupOutcomes, null);
         yield* h.awaitRun((run) => run.approvalAttempt?.setupCleanup?.state === "done");
-        // The serialized status call drains pending worker finalization before its own reconciliation.
-        const result = yield* runner.handle(control("status"));
-        assert.strictEqual(result.progress?.status, "done");
+        yield* Queue.take(h.failedFinalWrites);
+        yield* Queue.take(h.failedFinalWrites);
+        yield* Scope.close(scope, Exit.void);
+        const recovered = yield* h.newRunner;
+        yield* recovered.handle(control("status"));
+        yield* h.awaitRun((run) => run.progress.status === "done");
         assert.strictEqual(yield* Queue.size(h.cleanups), 0);
         assert.isTrue((yield* Ref.get(h.currentThread))!.promptQueue!.preparation!.settled);
       }),
@@ -2077,6 +2117,237 @@ const multiRequest = () => ({
   ...request(),
   control: { ...request().control, operation: "start" as const, workflow: multiWorkflow },
 });
+it.effect.each(["review", "finalization", "timeout"] as const)(
+  "gives VM result verification its checkpoint capture budget (%s)",
+  (boundary) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+        yield* fence.activate(binding);
+        const runner = yield* h.newRunner;
+        yield* runner.handle({
+          ...start,
+          control: {
+            ...start.control,
+            operation: "start",
+            runtime: { kind: "vm", threadId: binding.threadId },
+            workflow: {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                target: { kind: "vm", baseBranch: null },
+                steps:
+                  boundary === "finalization"
+                    ? [workflow.definition.steps[0]!]
+                    : [
+                        workflow.definition.steps[0]!,
+                        workflow.definition.steps[1]!,
+                        multiWorkflow.definition.steps[4]!,
+                      ],
+              },
+            },
+          },
+        });
+        yield* h.awaitPrompt;
+        yield* h.completeCurrent;
+        const store = yield* Store.WorkflowRunStore;
+        const checkpoint = (yield* Ref.get(h.currentThread))!.checkpoints[0]!;
+        yield* store.saveCheckpointPin(
+          binding,
+          "",
+          0,
+          {
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/workflow-base"),
+            commitId: "pinned-baseline",
+            treeId: "baseline-tree",
+            baselineCommitId: "pinned-baseline",
+          },
+          null,
+          undefined,
+          new Uint8Array(),
+        );
+        yield* store.saveCheckpointPin(binding, checkpoint.turnId, checkpoint.checkpointTurnCount, {
+          checkpointRef: checkpoint.checkpointRef,
+          commitId: "pinned-commit",
+          treeId: "prepared-tree",
+          baselineCommitId: "pinned-baseline",
+        });
+        const gate = yield* Deferred.make<void>();
+        yield* Ref.set(h.captureGate, gate);
+        const status = { ...control("status"), workflowVm };
+        const result = (yield* runner.handle(status)).progress!;
+        const response = { ...approve(result), workflowVm };
+        if (boundary !== "finalization")
+          assert.isTrue((yield* runner.handle(response)).progress?.approvalPending);
+        yield* Queue.take(h.captureStarted);
+
+        yield* TestClock.adjust("599 seconds");
+        const pending = (yield* runner.handle(status)).progress!;
+        assert.isTrue(pending.approvalPending);
+        assert.isFalse(pending.retryableApproval);
+        assert.lengthOf(yield* h.starts, 1);
+        assert.equal(yield* Ref.get(h.captureCount), 1);
+
+        if (boundary === "timeout") {
+          yield* TestClock.adjust("181 seconds");
+          const failed = yield* h.awaitRun((run) => run.progress.retryableApproval === true);
+          assert.isFalse(failed.progress.approvalPending);
+          assert.include(failed.progress.detail!, "Retry approval");
+          assert.lengthOf(yield* h.starts, 1);
+          assert.equal((yield* runner.handle(response)).outcome, "accepted");
+          assert.equal(yield* Ref.get(h.captureCount), 1);
+          yield* Ref.set(h.captureGate, null);
+          yield* runner.handle({ ...approve(failed.progress), workflowVm });
+        }
+        yield* Ref.set(h.captureGate, null);
+        yield* Deferred.succeed(gate, undefined);
+        if (boundary === "finalization") {
+          const finished = yield* h.awaitRun((run) => run.progress.status === "done");
+          assert.isFalse(finished.progress.approvalPending);
+          assert.isFalse(finished.progress.retryableApproval);
+          assert.lengthOf(yield* h.starts, 1);
+        } else {
+          assert.include((yield* h.awaitPrompt).message.text, "Verify the updated result");
+          assert.lengthOf(yield* h.starts, 2);
+          const advanced = (yield* store.get(binding.jobId))!;
+          assert.lengthOf(advanced.sequence!.responses, 1);
+          assert.isNull(advanced.approvalAttempt);
+          yield* runner.handle(response);
+          assert.lengthOf(yield* h.starts, 2);
+        }
+      }),
+    ),
+);
+it.effect(
+  "accepts approval before verification and keeps status and duplicate delivery responsive",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const runner = yield* h.newRunner;
+        yield* runner.handle(multiRequest());
+        const input = (yield* runner.handle(control("status"))).progress!;
+        yield* runner.handle(checkpointResponse(input, "input", "goal"));
+        yield* h.completeCurrent;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        const gate = yield* Deferred.make<void>();
+        yield* Ref.set(h.captureGate, gate);
+        const response = approve(review);
+        const pending = yield* Effect.scoped(runner.handle(response));
+        assert.equal(pending.outcome, "accepted");
+        assert.isTrue(pending.progress?.approvalPending);
+        yield* Queue.take(h.captureStarted);
+        yield* TestClock.adjust("11 seconds");
+        assert.isTrue((yield* runner.handle(control("status"))).progress?.approvalPending);
+        assert.equal((yield* runner.handle(response)).outcome, "accepted");
+        assert.equal(yield* Ref.get(h.captureCount), 1);
+        assert.lengthOf(yield* h.starts, 1);
+        yield* Ref.set(h.captureGate, null);
+        yield* Deferred.succeed(gate, undefined);
+        const verified = yield* h.awaitRun((run) => run.progress.status === "awaiting_input");
+        assert.isFalse(verified.progress.approvalPending);
+        assert.lengthOf(
+          verified.sequence!.responses.filter((item) => item.operation === "approve"),
+          1,
+        );
+        assert.equal((yield* runner.handle(response)).outcome, "accepted");
+        assert.equal(yield* Ref.get(h.captureCount), 1);
+      }),
+    ),
+);
+it.effect.each(["restart", "cancel", "changed", "timeout"] as const)(
+  "background review verification protects the next Agent across %s",
+  (boundary) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+        let runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        const start = request();
+        yield* runner.handle({
+          ...start,
+          control: {
+            ...start.control,
+            operation: "start",
+            workflow: {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                steps: [
+                  workflow.definition.steps[0]!,
+                  workflow.definition.steps[1]!,
+                  multiWorkflow.definition.steps[4]!,
+                ],
+              },
+            },
+          },
+        });
+        yield* h.awaitPrompt;
+        yield* h.completeCurrent;
+        const review = (yield* runner.handle(control("status"))).progress!;
+        const gate = yield* Deferred.make<void>();
+        yield* Ref.set(h.captureGate, gate);
+        const response = approve(review);
+        assert.isTrue((yield* runner.handle(response)).progress?.approvalPending);
+        yield* Queue.take(h.captureStarted);
+        assert.equal(
+          (yield* runner.handle({ ...response, userId: "another-maintainer" })).outcome,
+          "conflict",
+        );
+        if (boundary === "cancel") {
+          yield* runner.handle(control("cancel"));
+          yield* Ref.update(h.currentThread, (current) => ({
+            ...current!,
+            session: { ...current!.session!, status: "stopped" as const },
+          }));
+          yield* Ref.set(h.providerProof, true);
+          yield* Deferred.succeed(gate, undefined);
+          yield* runner.handle(control("status"));
+          const cancelled = yield* h.awaitRun((run) => run.progress.status === "cancelled");
+          assert.isNull(cancelled.approvalAttempt);
+          assert.lengthOf(yield* h.starts, 1);
+        } else if (boundary === "changed") {
+          yield* Ref.set(h.workspaceTree, "changed-tree");
+          yield* Deferred.succeed(gate, undefined);
+          const changed = yield* h.awaitRun(
+            (run) => run.progress.detail?.includes("files changed") === true,
+          );
+          assert.equal(changed.progress.status, "awaiting_review");
+          assert.isFalse(changed.progress.approvalPending);
+          assert.lengthOf(yield* h.starts, 1);
+          assert.lengthOf(changed.sequence!.responses, 0);
+        } else {
+          if (boundary === "restart") {
+            yield* Scope.close(scope, Exit.void);
+            runner = yield* h.newRunner;
+            assert.isTrue((yield* runner.handle(control("status"))).progress?.approvalPending);
+            yield* Queue.take(h.captureStarted);
+          } else {
+            yield* TestClock.adjust("3 minutes");
+            const failed = yield* h.awaitRun((run) => run.progress.retryableApproval === true);
+            assert.isFalse(failed.progress.approvalPending);
+            assert.include(failed.progress.detail!, "Retry approval");
+            yield* runner.handle(response);
+            assert.equal(yield* Ref.get(h.captureCount), 1);
+            yield* Ref.set(h.captureGate, null);
+            yield* runner.handle({ ...approve(failed.progress), userId: "another-maintainer" });
+          }
+          yield* Ref.set(h.captureGate, null);
+          yield* Deferred.succeed(gate, undefined);
+          const next = yield* h.awaitPrompt;
+          assert.include(next.message.text, "Verify the updated result");
+          assert.lengthOf(yield* h.starts, 2);
+          const saved = (yield* (yield* Store.WorkflowRunStore).get("job-1"))!;
+          assert.lengthOf(saved.sequence!.responses, 1);
+          assert.equal(saved.sequence!.responses[0]!.userId, "user-1");
+          yield* runner.handle(response);
+          assert.lengthOf(yield* h.starts, 2);
+        }
+      }),
+    ),
+);
 function checkpointResponse(
   progress: NonNullable<import("@t3tools/contracts/workflows").WorkflowControlResult["progress"]>,
   operation: "input" | "request_changes",
@@ -2112,7 +2383,7 @@ it.effect(
         yield* withBackground(h);
         const review = (yield* runner.handle(control("status"))).progress!;
         assert.strictEqual(review.status, "awaiting_review");
-        const detail = (yield* runner.handle(approve(review))).progress!;
+        const detail = (yield* settleResponse(h, runner, approve(review))).progress!;
         assert.strictEqual(detail.status, "awaiting_input");
         assert.lengthOf(yield* h.starts, 1);
         assert.strictEqual(yield* Queue.size(h.cleanups), 0);
@@ -2144,7 +2415,7 @@ it.effect(
         const freshReview = (yield* runner.handle(control("status"))).progress!;
         assert.strictEqual(freshReview.generation, 1);
         assert.notEqual(freshReview.checkpoint!.checkpointId, review.checkpoint!.checkpointId);
-        const freshInput = (yield* runner.handle(approve(freshReview))).progress!;
+        const freshInput = (yield* settleResponse(h, runner, approve(freshReview))).progress!;
         assert.strictEqual(freshInput.status, "awaiting_input");
         assert.notEqual(freshInput.checkpoint!.checkpointId, detail.checkpoint!.checkpointId);
         assert.strictEqual(
@@ -2230,7 +2501,7 @@ it.effect(
           },
         });
         yield* h.completeCurrent;
-        const done = (yield* runner.handle(control("status"))).progress!;
+        const done = (yield* settleResponse(h, runner, control("status"))).progress!;
         assert.strictEqual(done.status, "done");
         const progressEvents = (yield* Ref.get(h.commands)).filter(
           (command) =>
@@ -2293,11 +2564,12 @@ it.effect(
         yield* h.completeCurrent;
         const review = (yield* runner.handle(control("status"))).progress!;
         yield* Ref.set(h.workspaceTree, "changed-tree");
-        assert.strictEqual((yield* runner.handle(approve(review))).outcome, "conflict");
+        const changed = (yield* settleResponse(h, runner, approve(review))).progress!;
+        assert.include(changed.detail!, "files changed");
         assert.lengthOf(yield* h.starts, 1);
         assert.strictEqual(
           (yield* runner.handle(
-            checkpointResponse(review, "request_changes", "Include these edits"),
+            checkpointResponse(changed, "request_changes", "Include these edits"),
           )).outcome,
           "accepted",
         );
@@ -2325,11 +2597,14 @@ it.effect(
         });
         yield* h.completeCurrent;
         yield* Ref.set(h.workspaceTree, "changed-tree");
-        const blocked = (yield* runner.handle(control("status"))).progress!;
+        const blocked = (yield* settleResponse(h, runner, control("status"))).progress!;
         assert.strictEqual(blocked.status, "finishing");
         assert.isTrue(blocked.retryableApproval);
         yield* Ref.set(h.workspaceTree, "prepared-tree");
-        assert.strictEqual((yield* runner.handle(approve(blocked))).progress!.status, "done");
+        assert.strictEqual(
+          (yield* settleResponse(h, runner, approve(blocked))).progress!.status,
+          "done",
+        );
         assert.isNull((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.approvedBy);
       }),
     ),
@@ -2391,7 +2666,7 @@ it.effect.each(["before", "after"] as const)(
         yield* runner.handle(checkpointResponse(input, "input", "goal"));
         yield* h.completeCurrent;
         const review = (yield* runner.handle(control("status"))).progress!;
-        const details = (yield* runner.handle(approve(review))).progress!;
+        const details = (yield* settleResponse(h, runner, approve(review))).progress!;
         yield* Ref.set(h.promptOutage, outage);
         assert.strictEqual(
           (yield* Effect.flip(
@@ -2536,7 +2811,7 @@ it.effect(
         assert.deepStrictEqual((yield* h.starts)[0]!.modelSelection, MODEL);
         yield* h.completeCurrent;
         const review = (yield* runner.handle(control("status"))).progress!;
-        const details = (yield* runner.handle(approve(review))).progress!;
+        const details = (yield* settleResponse(h, runner, approve(review))).progress!;
         yield* runner.handle(checkpointResponse(details, "input", "requirements"));
         assert.deepStrictEqual((yield* h.starts)[1]!.modelSelection, secondModel);
         yield* h.completeCurrent;
@@ -2560,7 +2835,10 @@ it.effect.each(["first-agent", "next-agent", "rework", "restart", "legacy"] as c
           yield* runner.handle(checkpointResponse(input, "input", "goal"));
           yield* h.completeCurrent;
           const review = (yield* runner.handle(control("status"))).progress!;
-          pending = kind === "rework" ? review : (yield* runner.handle(approve(review))).progress!;
+          pending =
+            kind === "rework"
+              ? review
+              : (yield* settleResponse(h, runner, approve(review))).progress!;
         }
         const store = yield* Store.WorkflowRunStore;
         const original = (yield* store.get("job-1"))!;
@@ -3251,7 +3529,7 @@ it.effect("publishing runs outside the control mutex and keeps Pause at the acti
           expectedRevision: held.revision,
         },
       });
-      const done = (yield* runner.handle(control("status"))).progress!;
+      const done = (yield* settleResponse(h, runner, control("status"))).progress!;
       assert.equal(done.status, "done");
       assert.equal(
         (yield* (yield* Store.WorkflowRunStore).get("job-1"))?.preparedHead,

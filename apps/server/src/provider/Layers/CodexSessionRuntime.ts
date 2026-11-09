@@ -63,6 +63,7 @@ import {
   MANAGED_CODEX_MODEL_PROVIDER,
   managedCodexModelIssue,
   codexSessionAppServerArgs,
+  workflowCodexSandboxPolicy,
 } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -673,6 +674,7 @@ const SKILL_MENTION_PATTERN =
 export function buildTurnStartParams(input: {
   readonly threadId: string;
   readonly runtimeMode: RuntimeMode;
+  readonly workflowVm?: boolean;
   readonly prompt?: string;
   readonly attachments?: ReadonlyArray<{
     readonly type: "localImage";
@@ -715,7 +717,9 @@ export function buildTurnStartParams(input: {
     input: turnInput,
     approvalPolicy: config.approvalPolicy,
     approvalsReviewer: config.approvalsReviewer,
-    sandboxPolicy: runtimeModeToTurnSandboxPolicy(input.runtimeMode),
+    sandboxPolicy: input.workflowVm
+      ? workflowCodexSandboxPolicy()
+      : runtimeModeToTurnSandboxPolicy(input.runtimeMode),
     ...(input.model ? { model: input.model } : {}),
     ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
@@ -2990,6 +2994,7 @@ export const makeCodexSessionRuntime = (
           const params = yield* buildTurnStartParams({
             threadId: providerThreadId,
             runtimeMode: options.runtimeMode,
+            workflowVm: options.workflowProxy !== undefined,
             ...(input.input ? { prompt: input.input } : {}),
             ...(input.attachments ? { attachments: input.attachments } : {}),
             ...(normalizedModel ? { model: normalizedModel } : {}),

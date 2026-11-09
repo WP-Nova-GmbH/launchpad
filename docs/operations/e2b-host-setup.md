@@ -222,9 +222,11 @@ restart the dev relay to load the proof alongside the template selection. If you
 alternate selection file, set `E2B_TEMPLATE_FILE` for the check too. Workflows can still use the
 managed default while an explicit model catalog is unavailable when authoring.
 
-Manual workflow VM runs require credential isolation proof for the selected build and
+Manual workflow VM runs require execution and credential isolation proof for the selected build and
 `RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true`. Add `--workflow-isolation` to the smoke command to
-verify the installed workflow launcher and its access boundaries in the disposable VM. Rebuild
+verify the installed workflow launcher and its access boundaries in the disposable VM. The check
+also executes native Codex tools with workflow approvals, denies one command and executes another
+after restarting Codex and resuming the same conversation. It needs no provider account. Rebuild
 the runner with the Launchpad builder before regenerating an older isolation proof. The builder
 bakes a fresh marker into each image. The smoke and workflow enrollment both check that marker
 on the booted VM. The smoke publishes the proof after

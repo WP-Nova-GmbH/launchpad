@@ -8,6 +8,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -46,6 +47,7 @@ import { copyWorkflowCheckpointWorkspace } from "./WorkflowCheckpointWorkspace.t
 import {
   readWorkflowCheckpointExclude,
   stageWorkflowCheckpoint,
+  WorkflowCheckpointReadError,
 } from "./WorkflowCheckpointReader.ts";
 import {
   WORKFLOW_REVIEW_SOURCE_REF,
@@ -988,7 +990,9 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         return yield* (
           isolated ? readWorkflowCheckpointExclude(spawner, cwd) : readWorkflowIgnoreRules(cwd)
         ).pipe(
-          Effect.mapError(() => unavailable("The workflow Git ignore rules are unavailable.")),
+          Effect.mapError((_error: unknown) =>
+            unavailable("The workflow Git ignore rules are unavailable."),
+          ),
         );
       });
       const localIgnoreRules = yield* requireLocalIgnoreRules;
@@ -1164,8 +1168,12 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             ? stageWorkflowCheckpoint(spawner, cwd, workTree, candidates)
             : copyWorkflowCheckpointWorkspace(cwd, workTree, candidates)
         ).pipe(
-          Effect.mapError(() =>
-            unavailable("The workflow files could not be safely read for the checkpoint."),
+          Effect.mapError((error: unknown) =>
+            unavailable(
+              Schema.is(WorkflowCheckpointReadError)(error)
+                ? error.message
+                : "The workflow files could not be safely read for the checkpoint.",
+            ),
           ),
         );
       }

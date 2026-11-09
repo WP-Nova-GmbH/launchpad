@@ -24,6 +24,7 @@ import {
 import { type RepositoryWorkflow, type WorkflowControl } from "@t3tools/contracts/workflows";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -253,6 +254,7 @@ export const harness = Effect.gen(function* () {
   const settlementMode = yield* Ref.make<"normal" | "reject" | "race">("normal");
   const promptOutage = yield* Ref.make<"none" | "before" | "after" | "reject">("none");
   const finalWriteFailures = yield* Ref.make(0);
+  const failedFinalWrites = yield* Queue.unbounded<void>();
   const stored = yield* Store.WorkflowRunStore;
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]);
   const dispatched = yield* Queue.unbounded<OrchestrationCommand>();
@@ -271,6 +273,9 @@ export const harness = Effect.gen(function* () {
   >("normal");
   const workspaceTree = yield* Ref.make("prepared-tree");
   const headAfterCapture = yield* Ref.make<string | null>(null);
+  const captureGate = yield* Ref.make<Deferred.Deferred<void> | null>(null);
+  const captureStarted = yield* Queue.unbounded<void>();
+  const captureCount = yield* Ref.make(0);
   const checkpointTrees = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
   const head = yield* Ref.make("base-sha");
   const branch = yield* Ref.make("t3-job/job-1");
@@ -317,6 +322,7 @@ export const harness = Effect.gen(function* () {
           const failures = yield* Ref.get(finalWriteFailures);
           if (failures > 0 && (run.progress.status === "done" || run.progress.retryableApproval)) {
             yield* Ref.update(finalWriteFailures, (n) => n - 1);
+            yield* Queue.offer(failedFinalWrites, undefined);
             return yield* Effect.die("Injected final-state write outage");
           }
           return yield* stored.save(run).pipe(Effect.tap(() => Queue.offer(runs, run)));
@@ -591,6 +597,10 @@ export const harness = Effect.gen(function* () {
     Layer.mock(CheckpointStore)({
       captureCheckpoint: () =>
         Effect.gen(function* () {
+          yield* Ref.update(captureCount, (count) => count + 1);
+          yield* Queue.offer(captureStarted, undefined);
+          const gate = yield* Ref.get(captureGate);
+          if (gate) yield* Deferred.await(gate);
           const changedHead = yield* Ref.get(headAfterCapture);
           if (changedHead !== null) yield* Ref.set(head, changedHead);
           return { commitId: "capture-commit", treeId: yield* Ref.get(workspaceTree) };
@@ -622,6 +632,7 @@ export const harness = Effect.gen(function* () {
     providerProof,
     settlementMode,
     finalWriteFailures,
+    failedFinalWrites,
     promptOutage,
     cleanupOutcomes,
     awaitRun: (predicate: (run: Store.WorkflowRun) => boolean) =>
@@ -649,6 +660,9 @@ export const harness = Effect.gen(function* () {
       }),
     workspaceTree,
     headAfterCapture,
+    captureGate,
+    captureStarted,
+    captureCount,
     checkpointTrees,
     head,
     branch,

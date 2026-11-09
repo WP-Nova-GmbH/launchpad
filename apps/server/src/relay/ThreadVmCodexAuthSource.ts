@@ -4,11 +4,13 @@ import {
   type RelayThreadVmCodexAuthSource,
 } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import type * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as Schedule from "effect/Schedule";
 import * as Semaphore from "effect/Semaphore";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
@@ -93,6 +95,9 @@ export const readThreadVmCodexAuthSource = Effect.fn("ThreadVmCodexAuthSource.re
     });
   },
   Effect.timeout("5 seconds"),
+  // This endpoint only reads the binding. Retry timeouts before any prompt is
+  // admitted; authorization failures and token minting are never retried here.
+  Effect.retry({ times: 2, schedule: Schedule.spaced("500 millis"), while: Cause.isTimeoutError }),
   Effect.mapError(sourceError),
 );
 

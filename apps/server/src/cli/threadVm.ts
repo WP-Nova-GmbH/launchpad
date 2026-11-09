@@ -103,6 +103,10 @@ const encodeCodexModelProbePolicy = Schema.encodeEffect(
       defaultModel: Schema.String,
       modelSlugs: Schema.Array(Schema.String),
       probeArgs: Schema.Array(Schema.String),
+      workflowSandboxPolicy: Schema.Struct({
+        type: Schema.Literal("externalSandbox"),
+        networkAccess: Schema.Literal("enabled"),
+      }),
     }),
   ),
 );

@@ -100,6 +100,10 @@ const decodeGuestCodexModelPolicy = Schema.decodeEffect(
       defaultModel: Schema.String,
       modelSlugs: Schema.Array(Schema.String),
       probeArgs: Schema.Array(Schema.String),
+      workflowSandboxPolicy: Schema.Struct({
+        type: Schema.Literal("externalSandbox"),
+        networkAccess: Schema.Literal("enabled"),
+      }),
     }),
   ),
 );
@@ -931,6 +935,10 @@ it.effect("reports the installed guest's credential-free Codex model policy", ()
     const policy = yield* decodeGuestCodexModelPolicy(output);
     assert.include(policy.modelSlugs, policy.defaultModel);
     assert.equal(policy.probeArgs[0], "app-server");
+    assert.deepEqual(policy.workflowSandboxPolicy, {
+      type: "externalSandbox",
+      networkAccess: "enabled",
+    });
     const configuration = policy.probeArgs.join(" ");
     assert.include(configuration, `model="${policy.defaultModel}"`);
     assert.include(configuration, 'base_url="http://127.0.0.1:1/v1"');

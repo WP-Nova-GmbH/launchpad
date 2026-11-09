@@ -41,11 +41,18 @@ const managedCodexArgs = (connectionId?: string): ReadonlyArray<string> =>
       ])
     : [];
 
+/** Workflow commands run inside Launchpad's isolation rather than a nested Codex sandbox. */
+export const workflowCodexSandboxPolicy = () => ({
+  type: "externalSandbox" as const,
+  networkAccess: "enabled" as const,
+});
+
 /** This policy is emitted by the packaged guest for the offline runner smoke probe. */
 export const managedCodexModelProbePolicy = () => ({
   schemaVersion: 1 as const,
   defaultModel: MANAGED_CODEX_DEFAULT_MODEL,
   modelSlugs: [...MANAGED_CODEX_MODELS],
+  workflowSandboxPolicy: workflowCodexSandboxPolicy(),
   probeArgs: [
     "app-server",
     ...managedCodexProviderArgs("http://127.0.0.1:1/v1", "/usr/bin/false", []),

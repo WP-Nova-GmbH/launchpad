@@ -7281,6 +7281,155 @@ const checkpointHistoryFixture = Effect.fnUntraced(function* (threadId: ThreadId
   return { attachment, file };
 });
 const decodeVmCheckpointSettings = Schema.decodeSync(CodexSettings);
+it.effect.each(["success", "stop-failure", "drain-failure"] as const)(
+  "tracked VM consecutive Agent runtimes retire their stopped writer: %s",
+  (scenario) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const threadId = asThreadId(`vm-agent-handoff-${scenario}`);
+        const run = continuityWorkflow(threadId);
+        const runtimes: Array<{ live: boolean; sends: number }> = [];
+        let failStop = scenario === "stop-failure";
+        let failDrain = scenario === "drain-failure";
+        const native = yield* makeCodexAdapter(decodeVmCheckpointSettings({}), {
+          makeRuntime: (options) =>
+            Effect.gen(function* () {
+              const events = yield* Queue.unbounded<ProviderEvent, Cause.Done<void>>();
+              const state = { live: true, sends: 0 };
+              runtimes.push(state);
+              const session: ProviderSession = {
+                provider: CODEX_DRIVER,
+                threadId,
+                runtimeMode: options.runtimeMode,
+                cwd: options.cwd,
+                resumeCursor: { threadId: "retained-native-conversation" },
+                status: "ready",
+                createdAt: "2026-11-09T10:00:00.000Z",
+                updatedAt: "2026-11-09T10:00:00.000Z",
+              };
+              const close = Effect.gen(function* () {
+                if (failStop)
+                  return yield* new ProviderAdapterProcessError({
+                    provider: CODEX_DRIVER,
+                    threadId,
+                    detail: "Native writer exit is unconfirmed.",
+                  });
+                state.live = false;
+                yield* Queue.end(events);
+              });
+              return {
+                start: () => Effect.succeed(session),
+                getSession: Effect.succeed(session),
+                sendTurn: (input) =>
+                  Effect.gen(function* () {
+                    yield* input.beforeDispatch ?? Effect.void;
+                    state.sends++;
+                    return { threadId, turnId: asTurnId(`agent-${runtimes.length}`) };
+                  }),
+                compactThread: () => Effect.void,
+                interruptTurn: () => Effect.void,
+                readThread: Effect.succeed({ threadId: "retained-native-conversation", turns: [] }),
+                readConversationSource: Effect.succeed({
+                  threadId: "retained-native-conversation",
+                  rolloutPath: "/fixture/unused-rollout.jsonl",
+                }),
+                rollbackThread: () =>
+                  Effect.succeed({ threadId: "retained-native-conversation", turns: [] }),
+                uploadFeedback: () => Effect.succeed({ threadId: "retained-native-conversation" }),
+                respondToRequest: () => Effect.void,
+                respondToUserInput: () => Effect.void,
+                events: Stream.fromQueue(events),
+                close,
+                closeNativeWriter: close,
+              } satisfies CodexSessionRuntimeShape;
+            }),
+        }).pipe(
+          Effect.provide(Layer.mergeAll(NodeServices.layer, serverConfigTestLayer)),
+          Effect.provideService(VmWorkloadTracking, true),
+        );
+        const drain = native.drainRuntimeEvents!;
+        const drainEntered = yield* Deferred.make<void>();
+        const drainRelease = yield* Deferred.make<void>();
+        const adapter = {
+          ...native,
+          drainRuntimeEvents: (id: ThreadId) =>
+            Effect.gen(function* () {
+              if (failDrain)
+                return yield* new ProviderAdapterProcessError({
+                  provider: CODEX_DRIVER,
+                  threadId: id,
+                  detail: "Final writer events could not be drained.",
+                });
+              yield* Deferred.succeed(drainEntered, undefined);
+              yield* Deferred.await(drainRelease);
+              yield* drain(id);
+            }),
+        };
+        const fixture = makeProviderServiceLayer({
+          vmWorkloads: true,
+          workflowRuns: new Map([[run.jobId, run]]),
+          registry: makeStaticInstanceRegistry([[codexInstanceId, adapter]]),
+        });
+        const context = yield* Layer.build(fixture.serviceLayer);
+        const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+        yield* Stream.runForEach(provider.streamIngestionEvents!, (event) =>
+          event instanceof ProviderEventBarrier
+            ? Deferred.succeed(event.done, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        ).pipe(Effect.forkChild({ startImmediately: true }));
+        const start = () =>
+          provider.startSession(threadId, {
+            threadId,
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "approval-required",
+            cwd: fixtureCwd(`vm-agent-handoff-${scenario}`),
+          });
+        try {
+          yield* start();
+          yield* provider.sendTurn({ threadId, input: "First Agent", attachments: [] });
+          const oldEpisode = yield* native.getSessionRuntimeEpisode!(threadId);
+          assert(oldEpisode);
+          if (scenario !== "success") {
+            assert.equal((yield* start().pipe(Effect.result))._tag, "Failure");
+            assert.equal(runtimes[0]!.live, scenario === "stop-failure");
+            assert.equal(
+              runtimes.reduce((sum, runtime) => sum + runtime.sends, 0),
+              1,
+            );
+            return;
+          }
+          const replacing = yield* start().pipe(Effect.forkChild);
+          const handoff = yield* Effect.raceFirst(
+            Deferred.await(drainEntered).pipe(Effect.as("draining")),
+            Fiber.join(replacing).pipe(Effect.as("started")),
+          );
+          assert.equal(handoff, "draining");
+          assert.isFalse(runtimes[0]!.live);
+          assert.equal(runtimes[1]!.sends, 0);
+          assert.isTrue(yield* native.isSessionWriterStopConfirmed!(threadId, oldEpisode));
+          assert.isFalse(yield* native.isSessionStopConfirmed!(threadId, oldEpisode));
+          yield* Deferred.succeed(drainRelease, undefined);
+          yield* Fiber.join(replacing);
+          yield* provider.sendTurn({ threadId, input: "Second Agent", attachments: [] });
+          yield* start();
+          yield* provider.sendTurn({ threadId, input: "Third Agent", attachments: [] });
+          assert.deepEqual(
+            runtimes.map((runtime) => runtime.sends),
+            [1, 1, 1],
+          );
+          assert.deepEqual(
+            runtimes.map((runtime) => runtime.live),
+            [false, false, true],
+          );
+          assert.isFalse(yield* native.isSessionWriterStopConfirmed!(threadId, oldEpisode));
+        } finally {
+          failStop = false;
+          failDrain = false;
+          yield* Deferred.succeed(drainRelease, undefined);
+        }
+      }),
+    ),
+);
 for (const workflowOwned of [false, true])
   it.effect(
     workflowOwned
