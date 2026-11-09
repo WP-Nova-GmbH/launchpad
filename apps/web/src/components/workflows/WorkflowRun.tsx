@@ -298,14 +298,24 @@ function WorkflowRunForm({
     >
       <div>
         <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          {workflow.definition.steps.length} steps ·{" "}
-          {savedTarget.kind === "vm"
-            ? `VM · ${savedTarget.baseBranch ?? "Repository default"}`
-            : target
-              ? target.machineLabel + " · " + target.title
-              : "Saved execution target is unavailable"}
-        </p>
+        <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+          <dt className="text-muted-foreground">Target</dt>
+          <dd className="min-w-0 wrap-anywhere">
+            {savedTarget.kind === "vm"
+              ? "VM"
+              : target
+                ? `${target.machineLabel} / ${target.title}`
+                : "Saved execution target is unavailable"}
+          </dd>
+          {savedTarget.kind === "vm" ? (
+            <>
+              <dt className="text-muted-foreground">Base branch</dt>
+              <dd>{savedTarget.baseBranch ?? "Repository default"}</dd>
+            </>
+          ) : null}
+          <dt className="text-muted-foreground">Steps</dt>
+          <dd>{workflow.definition.steps.length}</dd>
+        </dl>
         <p className="mt-1 text-xs text-muted-foreground">
           Uses the saved workflow. Queued jobs use its current definition when dispatched.
         </p>

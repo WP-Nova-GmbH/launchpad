@@ -82,10 +82,17 @@ export function WorkflowSourceHealth({
         </Text>
       ) : null}
       {data?.sources.map((source) => (
-        <Text key={source.connectionId} className="p-4 text-foreground">
-          {source.workspaceName} · {WorkflowSources.sourceHealthLabel(source)}.{" "}
-          {WorkflowSources.sourceDeliveryLabel(source)}
-        </Text>
+        <View key={source.connectionId} className="gap-1 p-4">
+          <View className="flex-row flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <Text className="shrink font-t3-medium text-foreground">{source.workspaceName}</Text>
+            <Text className="text-xs text-foreground">
+              {WorkflowSources.sourceHealthLabel(source)}
+            </Text>
+          </View>
+          <Text className="text-xs text-foreground-muted">
+            {WorkflowSources.sourceDeliveryLabel(source)}
+          </Text>
+        </View>
       ))}
       {data && !data.sources.length ? (
         <Text className="p-4 text-foreground-muted">No sources allowed for this repository.</Text>

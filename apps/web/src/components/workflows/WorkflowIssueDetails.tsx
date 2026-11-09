@@ -26,12 +26,17 @@ export function WorkflowIssueDetails({ job }: { job: RepositoryWorkflowJob }) {
           {snapshot ? (
             <div className="mt-3 space-y-3">
               <p className="text-xs text-muted-foreground">
-                Saved for this run · {snapshot.retrievedAt}
+                Saved for this run at{" "}
+                <time dateTime={snapshot.retrievedAt}>{snapshot.retrievedAt}</time>
               </p>
-              <p>
-                Team: {snapshot.team.name} · Status: {snapshot.status.name}
-              </p>
-              <p>Labels: {snapshot.labels.map((label) => label.name).join(", ") || "None"}</p>
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
+                <dt className="text-muted-foreground">Team</dt>
+                <dd>{snapshot.team.name}</dd>
+                <dt className="text-muted-foreground">Status</dt>
+                <dd>{snapshot.status.name}</dd>
+                <dt className="text-muted-foreground">Labels</dt>
+                <dd>{snapshot.labels.map((label) => label.name).join(", ") || "None"}</dd>
+              </dl>
               <p className="whitespace-pre-wrap">{snapshot.description || "No description."}</p>
             </div>
           ) : (

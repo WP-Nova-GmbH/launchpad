@@ -366,24 +366,28 @@ export function WorkflowJob({
   return (
     <div className="min-w-0 space-y-6 wrap-anywhere">
       <header>
-        <h1 className="text-xl font-semibold">
-          {selectedJob.workflow?.definition.name ?? "Workflow run"}
-        </h1>
+        <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
+          <h1 className="text-xl font-semibold">
+            {selectedJob.workflow?.definition.name ?? "Workflow run"}
+          </h1>
+          <span role="status" className="text-sm font-medium">
+            {workflowStatusLabel(selectedJob.status)}
+          </span>
+        </div>
         <WorkflowIssueDetails key={key} job={selectedJob} />
         {selectedJob.origin?.kind === "automation" ? (
-          <p className="mt-1 text-xs text-muted-foreground">
-            Started by workflow
-            {selectedJob.workflow ? ` · ${selectedJob.workflow.definition.name}` : ""}
-          </p>
+          <p className="mt-1 text-xs text-muted-foreground">Started by workflow</p>
         ) : null}
-        <p className="mt-2 text-xs text-muted-foreground" role="status">
-          {workflowStatusLabel(selectedJob.status)} ·{" "}
-          {target
-            ? target.machineLabel + (selectedJob.workflow ? " · " + target.title : "")
-            : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
-              ? "Workflow VM"
-              : "Organization execution target"}
-        </p>
+        <dl className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+          <dt className="text-muted-foreground">Target</dt>
+          <dd>
+            {target
+              ? target.machineLabel + (selectedJob.workflow ? " / " + target.title : "")
+              : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
+                ? "Workflow VM"
+                : "Organization execution target"}
+          </dd>
+        </dl>
       </header>
       {read.error ? (
         <WorkflowAlert
@@ -697,16 +701,23 @@ export function WorkflowJob({
                     key={`${response.checkpointId}:${response.operation}`}
                     className="space-y-1 text-sm"
                   >
-                    <p>
-                      {selectedJob.workflow?.definition.steps.find(
-                        (step) => step.id === response.stepId,
-                      )?.title ?? "Checkpoint"}{" "}
-                      · {response.operation.replaceAll("_", " ")} · attempt{" "}
-                      {response.generation + 1}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {response.userId} · {new Date(response.createdAt).toLocaleString()}
-                    </p>
+                    <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                      <p className="font-medium">
+                        {selectedJob.workflow?.definition.steps.find(
+                          (step) => step.id === response.stepId,
+                        )?.title ?? "Checkpoint"}
+                      </p>
+                      <span className="text-xs text-muted-foreground">
+                        Attempt {response.generation + 1}
+                      </span>
+                    </div>
+                    <p>{response.operation.replaceAll("_", " ")}</p>
+                    <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                      <span>{response.userId}</span>
+                      <time dateTime={response.createdAt}>
+                        {new Date(response.createdAt).toLocaleString()}
+                      </time>
+                    </div>
                     {response.text ? <p className="whitespace-pre-wrap">{response.text}</p> : null}
                   </li>
                 ))}

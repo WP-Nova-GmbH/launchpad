@@ -1,5 +1,6 @@
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { MaterialButton } from "../../components/MaterialButton";
+import { SegmentedControl } from "../../components/SegmentedControl";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import { WorkflowSourceHealth } from "./WorkflowSourceHealth";
 import { useAtomValue } from "@effect/atom-react";
@@ -577,19 +578,21 @@ function WorkflowJobsContent(props: Props) {
             <View className="gap-2 p-4">
               <WorkflowIssueDetails key={jobKey} job={selectedJob} />
               {selectedJob.origin?.kind === "automation" ? (
-                <Text className="text-xs text-foreground-muted">
-                  Started by workflow
-                  {selectedJob.workflow ? ` · ${selectedJob.workflow.definition.name}` : ""}
-                </Text>
+                <Text className="text-xs text-foreground-muted">Started by workflow</Text>
               ) : null}
-              <Text className="font-semibold text-foreground">
-                {workflowStatusLabel(selectedJob.status)} ·{" "}
-                {target
-                  ? target.machineLabel + " · " + target.title
-                  : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
-                    ? "Workflow VM"
-                    : "Organization execution target"}
+              <Text accessibilityRole="text" className="font-semibold text-foreground">
+                {workflowStatusLabel(selectedJob.status)}
               </Text>
+              <View className="flex-row flex-wrap gap-x-3 gap-y-1">
+                <Text className="text-xs text-foreground-muted">Target</Text>
+                <Text className="shrink text-xs text-foreground">
+                  {target
+                    ? `${target.machineLabel} / ${target.title}`
+                    : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
+                      ? "Workflow VM"
+                      : "Organization execution target"}
+                </Text>
+              </View>
               {manualState.message ? (
                 <ErrorBanner
                   title="Run needs attention"
@@ -928,15 +931,23 @@ function WorkflowJobsContent(props: Props) {
             <SettingsSection title="Recent checkpoint history">
               {selectedJob.progress.responses.map((response) => (
                 <View key={response.checkpointId} className="gap-1 p-4">
-                  <Text className="text-foreground">
-                    {selectedJob.workflow?.definition.steps.find(
-                      (step) => step.id === response.stepId,
-                    )?.title ?? response.stepId}{" "}
-                    · {response.operation.replaceAll("_", " ")} · attempt {response.generation + 1}
-                  </Text>
-                  <Text className="text-xs text-foreground-muted">
-                    {response.userId} · {new Date(response.createdAt).toLocaleString()}
-                  </Text>
+                  <View className="flex-row flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                    <Text className="shrink font-semibold text-foreground">
+                      {selectedJob.workflow?.definition.steps.find(
+                        (step) => step.id === response.stepId,
+                      )?.title ?? response.stepId}
+                    </Text>
+                    <Text className="text-xs text-foreground-muted">
+                      Attempt {response.generation + 1}
+                    </Text>
+                  </View>
+                  <Text className="text-foreground">{response.operation.replaceAll("_", " ")}</Text>
+                  <View className="flex-row flex-wrap justify-between gap-x-4 gap-y-1">
+                    <Text className="text-xs text-foreground-muted">{response.userId}</Text>
+                    <Text className="text-xs text-foreground-muted">
+                      {new Date(response.createdAt).toLocaleString()}
+                    </Text>
+                  </View>
                   {response.text ? <Text className="text-foreground">{response.text}</Text> : null}
                 </View>
               ))}
@@ -974,27 +985,29 @@ function WorkflowJobsContent(props: Props) {
             repositoryId={selectedRepository.repository.repositoryId}
             focused={focused}
           />
-          <SettingsSection title={selectedRepository.repository.name + " · Runs"}>
-            <View className="flex-row flex-wrap">
-              {(["active", "attention", "history"] as const).map((choice) => (
-                <SettingsActionRow
-                  key={choice}
-                  icon="line.3.horizontal.decrease"
-                  label={
-                    (choice === "active"
-                      ? "Active"
-                      : choice === "attention"
-                        ? "Needs attention"
-                        : "History") + (listView === choice ? " · Selected" : "")
-                  }
-                  onPress={() => setListView(choice)}
-                />
-              ))}
+          <SettingsSection title="Runs">
+            <Text className="px-4 pt-4 text-sm text-foreground-muted">
+              {selectedRepository.repository.name}
+            </Text>
+            <View className="px-4 pt-3">
+              <SegmentedControl
+                role="tab"
+                size="compact"
+                options={[
+                  { value: "active", label: "Active" },
+                  { value: "attention", label: "Needs attention" },
+                  { value: "history", label: "History" },
+                ]}
+                selected={listView}
+                onSelect={setListView}
+              />
             </View>
             <Text className="p-4 text-xs text-foreground-muted">
               {listView === "history"
                 ? "Completed runs, newest first."
-                : "Active runs, oldest first."}
+                : listView === "attention"
+                  ? "Runs that need your attention, oldest first."
+                  : "Active runs, oldest first."}
             </Text>
             <SettingsActionRow
               icon="arrow.clockwise"
@@ -1033,7 +1046,9 @@ function WorkflowJobsContent(props: Props) {
                   key={job.jobId}
                   icon="arrow.triangle.branch"
                   label={job.instruction}
-                  value={`${job.originSummary?.workflowName ?? "Workflow run"} · ${workflowStatusLabel(job.status)}${job.originSummary?.kind === "automation" ? " · Started by workflow" : ""}`}
+                  subtitle={`${job.originSummary?.workflowName ?? "Workflow run"}${job.originSummary?.kind === "automation" ? "\nStarted by workflow" : ""}`}
+                  value={workflowStatusLabel(job.status)}
+                  valuePosition="trailing"
                   disabled={busy}
                   onPress={() => setSelectedJobId(job.jobId)}
                 />

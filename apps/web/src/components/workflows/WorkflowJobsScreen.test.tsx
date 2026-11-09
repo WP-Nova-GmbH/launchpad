@@ -49,6 +49,7 @@ const host = (name: string) => (props: PropsWithChildren<Record<string, unknown>
     props.children ?? [
       typeof props.label === "string" ? props.label : null,
       typeof props.value === "string" ? props.value : null,
+      typeof props.subtitle === "string" ? props.subtitle : null,
     ],
   );
 class FixtureReadError extends Data.TaggedError("FixtureReadError")<{ readonly message: string }> {}
@@ -118,6 +119,26 @@ vi.mock("../../../../mobile/src/features/settings/components/SettingsActionRow",
 }));
 vi.mock("../../../../mobile/src/features/settings/components/SettingsRow", () => ({
   SettingsRow: host("row"),
+}));
+vi.mock("../../../../mobile/src/components/SegmentedControl", () => ({
+  SegmentedControl: ({
+    options,
+    onSelect,
+  }: {
+    options: ReadonlyArray<{ value: string; label: string }>;
+    onSelect: (value: string) => void;
+  }) =>
+    createElement(
+      "segmented",
+      null,
+      options.map((option) =>
+        createElement("action", {
+          key: option.value,
+          label: option.label,
+          onPress: () => onSelect(option.value),
+        }),
+      ),
+    ),
 }));
 vi.mock("../../../../mobile/src/lib/runtime", () => ({
   runtime: {

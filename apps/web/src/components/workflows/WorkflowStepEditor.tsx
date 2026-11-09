@@ -85,17 +85,19 @@ export function WorkflowStepEditor({
                 value={step.title}
                 onChange={(event) => patch({ ...step, title: event.target.value })}
               />
-              <p className="text-xs text-muted-foreground">
-                {step.kind === "agent"
-                  ? "Agent"
-                  : step.kind === "input"
-                    ? "Human input"
-                    : step.kind === "action"
-                      ? step.action === "push"
-                        ? "Push branch"
-                        : "Open PR"
-                      : "Human review"}{" "}
-                · Step {index + 1}
+              <p className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>
+                  {step.kind === "agent"
+                    ? "Agent"
+                    : step.kind === "input"
+                      ? "Human input"
+                      : step.kind === "action"
+                        ? step.action === "push"
+                          ? "Push branch"
+                          : "Open PR"
+                        : "Human review"}
+                </span>
+                <span>Step {index + 1}</span>
               </p>
             </div>
             <Button
@@ -141,7 +143,10 @@ export function WorkflowStepEditor({
             ) : null}
             {step.kind === "agent" ? (
               <div className="space-y-2">
-                <p className="text-sm">Model · approvals required</p>
+                <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                  <p className="text-sm">Model</p>
+                  <span className="text-xs text-muted-foreground">Approvals required</span>
+                </div>
                 {vm ? (
                   <>
                     <Select

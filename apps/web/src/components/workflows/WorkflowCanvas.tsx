@@ -209,7 +209,9 @@ export function WorkflowCanvas({
                     const warning = models.issues.find((issue) => issue.stepId === step.id);
                     const summary =
                       step.kind === "agent"
-                        ? `Agent · ${models.triggerLabel(step) ?? models.effectiveSelection(step)?.model ?? "Project default"}`
+                        ? (models.triggerLabel(step) ??
+                          models.effectiveSelection(step)?.model ??
+                          "Project default")
                         : step.kind === "action"
                           ? step.action === "push"
                             ? "Commit and push branch"

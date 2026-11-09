@@ -335,11 +335,21 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
               <SettingsRow
                 key={invitation.invitationId}
                 title={invitation.email}
-                description={`Invited as ${ORG_ROLE_LABELS[invitation.role].toLowerCase()} · expires ${invitation.expiresAt.slice(0, 10)} · joins on sign-in${
-                  issued
-                    ? "; the token is only needed if they already have an organization of their own"
-                    : ""
-                }`}
+                description={
+                  <span className="block space-y-1">
+                    <span className="flex flex-wrap gap-x-4 gap-y-1">
+                      <span>Role: {ORG_ROLE_LABELS[invitation.role]}</span>
+                      <span>Expires {invitation.expiresAt.slice(0, 10)}</span>
+                    </span>
+                    <span className="block">
+                      Joins on sign-in
+                      {issued
+                        ? "; the token is only needed if they already have an organization of their own"
+                        : ""}
+                      .
+                    </span>
+                  </span>
+                }
                 control={
                   <div className="flex items-center gap-2">
                     {issued ? (
@@ -1337,14 +1347,13 @@ function MachineRow({
   const awaitingSetup =
     machine.status === "awaiting_enrollment" && Date.parse(machine.seedExpiresAt) > nowMs;
   const description = [
-    endpointHost ? `${timeline} · ${endpointHost}` : timeline,
+    timeline,
+    endpointHost,
     selfHosted && awaitingSetup && !enrollment
       ? "the setup command was only shown when the machine was created"
       : null,
     !selfHosted ? "legacy managed compute needs cleanup on its original host" : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  ].filter(Boolean);
 
   return (
     <SettingsRow
@@ -1355,7 +1364,15 @@ function MachineRow({
           {selfHosted ? <RoleBadge>Self-hosted</RoleBadge> : null}
         </span>
       }
-      description={description}
+      description={
+        <span className="block space-y-1">
+          {description.map((line) => (
+            <span key={line} className="block">
+              {line}
+            </span>
+          ))}
+        </span>
+      }
       status={
         status.guidance ? <span className="block text-destructive">{status.guidance}</span> : null
       }

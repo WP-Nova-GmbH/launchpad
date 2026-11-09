@@ -663,7 +663,16 @@ function WorkflowRepositoryView({
         const key = workflowSessionKey(scope, workflow.workflowId);
         const local = drafts.editors[key];
         const runDraft = drafts.runs[key];
-        const vmUnavailable = workflow.definition.target.kind === "vm" && !vmExecutionAvailable;
+        const target = workflow.definition.target;
+        const machineProject =
+          target.kind === "machine"
+            ? projects.find(
+                (project) =>
+                  project.environmentId === target.environmentId &&
+                  project.projectId === target.projectId,
+              )
+            : undefined;
+        const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
         const canStartRun = !archived && !vmUnavailable;
         const hasRunSubmission =
           runDraft?.operation?.targetKind === "vm" ||
@@ -677,20 +686,43 @@ function WorkflowRepositoryView({
             key={workflow.workflowId}
             className="flex flex-wrap items-center justify-between gap-3 border-b py-4 last:border-b-0"
           >
-            <div className="min-w-0">
-              <p className="font-medium">{workflow.definition.name}</p>
-              <p className="text-xs text-muted-foreground">
-                {workflow.definition.steps.length} steps
-                {workflow.definition.target.kind === "vm"
-                  ? ` · VM · ${workflow.definition.target.baseBranch ?? "Repository default"}`
-                  : ""}
-                {local && workflowEditorDirty(local) ? " · Unsaved changes" : ""}
-              </p>
-              <p className="text-xs text-muted-foreground">
-                {automationSupported
-                  ? `${workflowTriggerLabel(workflow.automation?.trigger)} · Automatic triggering ${summary?.state === "on" ? "On" : summary?.state === "off" ? "Off" : summary?.state === "needs_attention" ? "needs attention" : "state unavailable"}`
-                  : "Automation state unavailable on this relay"}
-              </p>
+            <div className="min-w-0 flex-1 basis-64 space-y-1 wrap-anywhere">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                <p className="font-medium">{workflow.definition.name}</p>
+                {local && workflowEditorDirty(local) ? (
+                  <span className="text-xs font-medium">Unsaved changes</span>
+                ) : null}
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>{workflow.definition.steps.length} steps</span>
+                {workflow.definition.target.kind === "vm" ? (
+                  <>
+                    <span>VM</span>
+                    <span>
+                      Base branch: {workflow.definition.target.baseBranch ?? "Repository default"}
+                    </span>
+                  </>
+                ) : machineProject ? (
+                  <>
+                    <span>{machineProject.machineLabel}</span>
+                    <span>{machineProject.title}</span>
+                  </>
+                ) : (
+                  <span>
+                    {projectsUnavailable
+                      ? "Machine target not verified"
+                      : "Machine target unavailable"}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>{workflowTriggerLabel(workflow.automation?.trigger)}</span>
+                <span>
+                  {automationSupported
+                    ? `Automatic triggering ${summary?.state === "on" ? "On" : summary?.state === "off" ? "Off" : summary?.state === "needs_attention" ? "needs attention" : "state unavailable"}`
+                    : "Automation state unavailable on this relay"}
+                </span>
+              </div>
               {summary?.reason || local?.error ? (
                 <div className="mt-2">
                   <WorkflowAlert

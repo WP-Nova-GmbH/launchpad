@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Button } from "../ui/button";
 import { Alert, AlertAction, AlertDescription } from "../ui/alert";
 import { SettingsPageContainer } from "./settingsLayout";
@@ -21,13 +22,19 @@ export function SettingsScopeNotice({
   const { availableEnvironments: environments, groups, selectScope, search } = useSettingsScope();
   const navigate = useNavigate({ from: "/settings" });
   const pathname = useLocation({ select: (location) => location.pathname });
-  const choices: { label: string; search: SettingsScopeSearch }[] =
+  const choices: { label: ReactNode; search: SettingsScopeSearch }[] =
     target === "checkout"
       ? groups
           .filter((group) => !search.project || group.projectKey === search.project)
           .flatMap((group) =>
             group.memberProjects.map((member) => ({
-              label: `${group.displayName} · ${member.environmentLabel ?? "Environment"} · ${member.workspaceRoot}`,
+              label: (
+                <span className="min-w-0">
+                  <span className="block">{group.displayName}</span>
+                  <span className="block">{member.environmentLabel ?? "Environment"}</span>
+                  <span className="block break-all font-mono">{member.workspaceRoot}</span>
+                </span>
+              ),
               search: {
                 project: group.projectKey,
                 machine: member.environmentId,

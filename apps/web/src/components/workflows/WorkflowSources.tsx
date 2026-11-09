@@ -17,10 +17,11 @@ export const confirmChange = (message: string) =>
 export function SourceIdentity({ source }: { source: WorkflowSource }) {
   return (
     <div className="min-w-0 flex-1">
-      <p className="break-words text-sm font-medium">{source.workspaceName}</p>
-      <p className="break-words text-xs text-muted-foreground">
-        {source.viewerName} · {WorkflowSources.sourceHealthLabel(source)}
-      </p>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <p className="break-words text-sm font-medium">{source.workspaceName}</p>
+        <span className="text-xs">{WorkflowSources.sourceHealthLabel(source)}</span>
+      </div>
+      <p className="break-words text-xs text-muted-foreground">{source.viewerName}</p>
       <p className="text-xs text-muted-foreground">{WorkflowSources.sourceDeliveryLabel(source)}</p>
     </div>
   );

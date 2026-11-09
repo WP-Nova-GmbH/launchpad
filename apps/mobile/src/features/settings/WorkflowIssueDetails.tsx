@@ -35,11 +35,10 @@ export function WorkflowIssueDetails({ job }: { job: RepositoryWorkflowJob }) {
             snapshot ? (
               <View className="gap-2">
                 <Text className="text-xs text-foreground-muted">
-                  Saved for this run · {snapshot.retrievedAt}
+                  Saved for this run at {snapshot.retrievedAt}
                 </Text>
-                <Text className="text-foreground">
-                  Team: {snapshot.team.name} · Status: {snapshot.status.name}
-                </Text>
+                <Text className="text-foreground">Team: {snapshot.team.name}</Text>
+                <Text className="text-foreground">Status: {snapshot.status.name}</Text>
                 <Text className="text-foreground">
                   Labels: {snapshot.labels.map((label) => label.name).join(", ") || "None"}
                 </Text>

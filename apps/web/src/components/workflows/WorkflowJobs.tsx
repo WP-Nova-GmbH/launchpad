@@ -156,24 +156,21 @@ export function WorkflowJobs({
         </p>
       ) : null}
       {page.jobs?.map((job) => (
-        <div key={job.jobId} className="flex items-center justify-between gap-4 border-b py-4">
-          <div className="min-w-0">
+        <div key={job.jobId} className="flex flex-wrap items-center gap-4 border-b py-4">
+          <div className="min-w-0 flex-1 basis-48">
             <p className="truncate font-medium">{job.instruction}</p>
             <p className="text-xs text-muted-foreground">
               {job.originSummary?.workflowName ??
                 workflows.find((workflow) => workflow.workflowId === job.workflowId)?.definition
                   .name ??
-                "Workflow run"}{" "}
-              · {workflowStatusLabel(job.status)}
+                "Workflow run"}
             </p>
             {job.originSummary?.kind === "automation" ? (
-              <p className="text-xs text-muted-foreground">
-                Started by workflow
-                {job.originSummary.workflowName ? ` · ${job.originSummary.workflowName}` : ""}
-              </p>
+              <p className="text-xs text-muted-foreground">Started by workflow</p>
             ) : null}
             {job.detail ? <p className="text-xs text-muted-foreground">{job.detail}</p> : null}
           </div>
+          <span className="text-xs font-medium">{workflowStatusLabel(job.status)}</span>
           <Button
             variant="ghost"
             onClick={() =>

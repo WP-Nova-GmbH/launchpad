@@ -1191,21 +1191,15 @@ function WorkflowBuilderWorkspace({
               }))
             }
           />
-          <p className="text-xs text-muted-foreground">
-            <span role="status">
-              {pending
-                ? "Saving…"
-                : draft.operation
-                  ? "Save needs retry"
-                  : workflowEditorDirty(draft)
-                    ? "Unsaved changes"
-                    : "Saved"}
-            </span>{" "}
-            · {draft.definition.steps.length} steps{archived ? " · Archived" : ""}
-            {automationSupported && workflowDraftAutomationResolved(draft)
-              ? ` · Automatic triggering ${draft.baseline?.automation?.enabled ? "On" : "Off"} (saved)`
-              : " · Automation state unavailable"}
-          </p>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span>{draft.definition.steps.length} steps</span>
+            {archived ? <span>Archived</span> : null}
+            <span>
+              {automationSupported && workflowDraftAutomationResolved(draft)
+                ? `Saved automatic triggering: ${draft.baseline?.automation?.enabled ? "On" : "Off"}`
+                : "Automation state unavailable"}
+            </span>
+          </div>
         </div>
         <WorkflowEditorDepartureGuard scope={scope} id={draft.workflowId} onDiscard={onDepart} />
         <div className={styles["workflow-editor-actions"]}>
@@ -1255,9 +1249,20 @@ function WorkflowBuilderWorkspace({
                 ? "View retained instructions"
                 : "Run"}
           </Button>
-          <Button type="submit" disabled={pending}>
-            {draft.operation?.state === "uncertain" ? "Retry save" : "Save"}
-          </Button>
+          <div className="flex items-center gap-2">
+            <span role="status" className="text-xs text-muted-foreground">
+              {pending
+                ? "Saving…"
+                : draft.operation
+                  ? "Save needs retry"
+                  : workflowEditorDirty(draft)
+                    ? "Unsaved changes"
+                    : "Saved"}
+            </span>
+            <Button type="submit" disabled={pending}>
+              {draft.operation?.state === "uncertain" ? "Retry save" : "Save"}
+            </Button>
+          </div>
           <Button
             type="button"
             variant="ghost"
