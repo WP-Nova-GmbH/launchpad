@@ -956,6 +956,14 @@ function WorkflowBuilderWorkspace({
     <WorkflowTriggerInspector
       scope={scope}
       automation={draft.automation ?? draft.baseline?.automation}
+      savedAutomation={draft.baseline?.automation}
+      unsaved={workflowEditorDirty(draft)}
+      retrySave={draft.operation?.state === "uncertain"}
+      onSave={() => void submit()}
+      onChooseMachine={() => {
+        openSettings();
+        setFocusRequest({ field: "target", stepId: null });
+      }}
       supported={automationSupported}
       vmTarget={!!vm && draft.targetConfirmed}
       resolved={workflowDraftAutomationResolved(draft)}

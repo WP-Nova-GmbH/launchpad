@@ -1,3 +1,19 @@
+vi.mock("../ui/checkbox", () => ({
+  Checkbox: ({
+    checked,
+    onCheckedChange,
+    ...props
+  }: {
+    checked: boolean;
+    onCheckedChange: (checked: boolean) => void;
+  }) =>
+    createElement("button", {
+      ...props,
+      role: "checkbox",
+      checked,
+      onClick: () => onCheckedChange(!checked),
+    }),
+}));
 vi.mock("../../cloud/workflowSources", () => ({
   useWorkflowSources: () => ({ snapshot: null, loading: false, refresh: vi.fn() }),
 }));
@@ -1107,7 +1123,7 @@ describe("VM authoring", () => {
     const openTrigger = () =>
       root.findByProps({ "aria-label": "Trigger settings" }).props.onClick();
     const toggle = () =>
-      root.findAllByType("button").find((node) => node.props["aria-pressed"] !== undefined)!;
+      root.findAllByType("button").find((node) => node.props.role === "checkbox")!;
     const selectVm = () =>
       root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange("vm");
     await act(openSettings);
@@ -1123,8 +1139,7 @@ describe("VM authoring", () => {
     read.mockResolvedValueOnce({ status: "connected" });
     await act(selectVm);
     await act(openTrigger);
-    expect(toggle().props.disabled).toBe(true);
-    await act(() => toggle().props.onClick());
+    expect(toggle()).toBeUndefined();
     expect(editor(workflow.workflowId).automation).toEqual({
       enabled: false,
       trigger: recoveryTrigger,
@@ -1403,4 +1418,33 @@ describe("automation state after a relay upgrade", () => {
     expect(editor(legacy.workflowId).baseline?.revision).toBe(1);
     expect(editor(legacy.workflowId).error).toContain("Refresh or reload");
   });
+});
+
+it("cancels only trigger changes while keeping other unsaved workflow edits", async () => {
+  const workflow: RepositoryWorkflow = {
+    workflowId: "workflow",
+    repositoryId: scope.repositoryId,
+    organizationId: scope.organizationId,
+    archived: false,
+    revision: 1,
+    definition: newWorkflowDraft([project])!.definition,
+    createdAt: "now",
+    updatedAt: "now",
+    automation: recoveryAuto,
+  };
+  await mount({ ...base, workflow, isNew: false, automationSupported: true });
+  await rename("Retained workflow name");
+  await act(() => renderer!.root.findByProps({ "aria-label": "Trigger settings" }).props.onClick());
+  await act(() =>
+    renderer!.root
+      .findAllByType("button")
+      .find((node) => node.props.role === "checkbox")!
+      .props.onClick(),
+  );
+  expect(editor(workflow.workflowId).automation?.enabled).toBe(false);
+  await click("Cancel trigger edits");
+  expect(editor(workflow.workflowId).automation).toEqual(recoveryAuto);
+  expect(editor(workflow.workflowId).definition.name).toBe("Retained workflow name");
+  expect(workflowEditorDirty(editor(workflow.workflowId))).toBe(true);
+  expect(read).not.toHaveBeenCalled();
 });

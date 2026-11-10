@@ -25,7 +25,12 @@ const fixture = vi.hoisted(() => ({
   enqueue: (_effect: Effect.Effect<void>) => {},
   repo: null as unknown as WorkflowRepositorySources,
   failRead: false,
+  metadataReads: [] as string[],
   failSelection: false,
+  deliveryReady: true,
+  selectionReply: null as
+    | null
+    | ((body: { teamId: string; stateId?: string; labelIds: string[] }) => Promise<Response>),
   delivery: "unverified" as WorkflowSource["delivery"],
   denyRead: false,
   dropAllow: false,
@@ -46,6 +51,50 @@ vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: () => Promise.reso
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
+vi.mock("../ui/checkbox", () => ({
+  Checkbox: ({
+    checked,
+    onCheckedChange,
+    ...props
+  }: {
+    checked: boolean;
+    onCheckedChange: (checked: boolean) => void;
+  }) =>
+    createElement("button", {
+      ...props,
+      role: "checkbox",
+      checked,
+      onClick: () => onCheckedChange(!checked),
+    }),
+}));
+vi.mock("../ui/combobox", () => {
+  const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
+  return {
+    Combobox: ({
+      value,
+      items,
+      onValueChange,
+      ...props
+    }: PropsWithChildren<{
+      value: { id: string } | null;
+      items: Array<{ id: string; name: string }>;
+      onValueChange: (item: { id: string; name: string }) => void;
+    }>) =>
+      createElement("div", {
+        ...props,
+        "data-picker": true,
+        value: value?.id ?? "",
+        onValueChange: (id: string) =>
+          onValueChange(items.find((item) => item.id === id) ?? { id, name: id }),
+      }),
+    ComboboxTrigger: part,
+    ComboboxPopup: () => null,
+    ComboboxSearchInput: part,
+    ComboboxList: () => null,
+    ComboboxItem: part,
+    ComboboxEmpty: part,
+  };
+});
 vi.mock("../ui/select", () => {
   const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
@@ -130,6 +179,9 @@ vi.mock(
 );
 vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   Text: (props: PropsWithChildren) => createElement("text", props),
+  View: (props: PropsWithChildren) => createElement("view", props),
+  Pressable: ({ onPress, ...props }: PropsWithChildren<{ onPress: () => void }>) =>
+    createElement("button", { ...props, onClick: onPress }),
   Platform: { OS: "ios" },
 }));
 vi.mock("../../../../mobile/node_modules/@clerk/expo/dist/index.js", () => ({
@@ -200,7 +252,10 @@ beforeEach(() => {
     withdrawableGrants: [],
   };
   fixture.failRead = false;
+  fixture.metadataReads = [];
   fixture.failSelection = false;
+  fixture.deliveryReady = true;
+  fixture.selectionReply = null;
   fixture.delivery = "unverified";
   fixture.denyRead = false;
   fixture.dropAllow = false;
@@ -246,11 +301,14 @@ beforeEach(() => {
         request.url.endsWith("/v1/workflow-sources") ? fixture.owner : fixture.repo,
       );
     }
-    if (request.url.endsWith("/metadata"))
+    if (request.url.endsWith("/metadata")) {
+      const body = (await request.json()) as { kind: string };
+      fixture.metadataReads.push(body.kind);
       return Response.json({
         items: [{ id: "new-team", name: "Another page item" }],
         nextCursor: null,
       });
+    }
     if (request.url.endsWith("/selection")) {
       if (fixture.failSelection) return new Response("Unavailable", { status: 503 });
       const body = (await request.json()) as {
@@ -258,6 +316,7 @@ beforeEach(() => {
         stateId?: string;
         labelIds: string[];
       };
+      if (fixture.selectionReply) return fixture.selectionReply(body);
       return Response.json({
         authorizationEpoch: 1,
         team: { id: body.teamId, name: "Saved team" },
@@ -268,7 +327,7 @@ beforeEach(() => {
           teamId: id === "global" ? null : body.teamId,
         })),
         issues: [],
-        deliveryReady: true,
+        deliveryReady: fixture.deliveryReady,
       });
     }
     if (request.url.endsWith("/linear/begin")) {
@@ -754,6 +813,8 @@ it.effect(
                 disabled={false}
                 onChange={setAutomation}
                 onClose={() => {}}
+                onSave={() => {}}
+                onChooseMachine={() => {}}
               />
               <output>{JSON.stringify(automation)}</output>
             </>
@@ -829,6 +890,8 @@ it.effect("keeps selected IDs and shows an error when selection metadata is unav
             disabled={false}
             onChange={change}
             onClose={() => {}}
+            onSave={() => {}}
+            onChooseMachine={() => {}}
           />,
         );
       });
@@ -839,4 +902,215 @@ it.effect("keeps selected IDs and shows an error when selection metadata is unav
       expect(change).not.toHaveBeenCalled();
     });
   }),
+);
+
+const triggerScope = {
+  accountId: "owner",
+  organizationId: "org",
+  repositoryId: RelayRepositoryId.make("repo"),
+};
+const triggerInitial: WorkflowAutomation = {
+  enabled: false,
+  trigger: {
+    provider: "linear",
+    connectionId: "connection",
+    grantId: "grant",
+    teamId: "saved-team",
+    event: "entered_status",
+    stateId: "saved-status",
+    labelIds: ["global", "team-label"],
+  },
+};
+const saveTrigger = vi.fn<(automation: WorkflowAutomation) => void>();
+function TriggerEditor({
+  initial = triggerInitial,
+  vmTarget = false,
+}: {
+  initial?: WorkflowAutomation;
+  vmTarget?: boolean;
+}) {
+  const [automation, setAutomation] = useState(initial);
+  return (
+    <>
+      <WorkflowTriggerInspector
+        scope={triggerScope}
+        automation={automation}
+        savedAutomation={initial}
+        supported
+        resolved
+        disabled={false}
+        vmTarget={vmTarget}
+        onChange={setAutomation}
+        onClose={() => {}}
+        onChooseMachine={() => {}}
+        onSave={() => saveTrigger(automation)}
+      />
+      <output>{JSON.stringify(automation)}</output>
+    </>
+  );
+}
+async function mountTrigger(initial = triggerInitial, vmTarget = false) {
+  fixture.repo = {
+    ...fixture.repo,
+    eligible: [],
+    sources: [
+      {
+        source,
+        grant: {
+          grantId: "grant",
+          connectionId: "connection",
+          organizationId: "org",
+          repositoryId: "repo",
+          ownerUserId: "owner",
+          generation: 1,
+          revoked: false,
+        },
+      },
+    ],
+  };
+  await act(() => {
+    renderer = create(<TriggerEditor initial={initial} vmTarget={vmTarget} />);
+  });
+  await drain();
+}
+const enableControl = () => renderer.root.findByProps({ role: "checkbox" });
+
+for (const enabled of [false, true])
+  it.effect(
+    `can save a valid rule off while delivery is unverified (initially ${enabled ? "on" : "off"})`,
+    () =>
+      Effect.gen(function* () {
+        yield* serveRequests;
+        yield* Effect.promise(async () => {
+          fixture.deliveryReady = false;
+          await mountTrigger({ ...triggerInitial, enabled });
+          expect(words()).toContain("environment administrator");
+          expect(enableControl().props.disabled).toBe(!enabled);
+          if (enabled) await act(() => enableControl().props.onClick());
+          expect(button("Save workflow").props.disabled).toBe(false);
+          await act(() => button("Save workflow").props.onClick());
+          expect(saveTrigger).toHaveBeenCalledWith({ ...triggerInitial, enabled: false });
+        });
+      }),
+  );
+
+it.effect("does not mistake a failed initial workspace check for removed repository access", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.failRead = true;
+      await mountTrigger();
+      expect(words()).toContain("Could not check the workspace");
+      expect(words()).toContain("Connection status unknown");
+      expect(words()).not.toContain("Repository source access unavailable");
+      expect(words()).toContain("saved-team");
+      expect(enableControl().props.disabled).toBe(true);
+    });
+  }),
+);
+
+it.effect("keeps metadata controls mounted when a selected label is removed", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mountTrigger();
+      const reads = [...fixture.metadataReads];
+      await act(() =>
+        renderer.root
+          .findAllByType("button")
+          .find((node) => node.props["aria-label"] === "Remove label Global label")!
+          .props.onClick(),
+      );
+      await drain();
+      expect(fixture.metadataReads).toEqual(reads);
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toMatchObject({
+        trigger: { labelIds: ["team-label"] },
+      });
+      expect(words()).toContain("all labels: Team label");
+    });
+  }),
+);
+
+it.effect("waits for the changed rule's readiness without remounting metadata controls", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mountTrigger();
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      fixture.selectionReply = async (body) => {
+        enter();
+        await gate;
+        return Response.json({
+          authorizationEpoch: 1,
+          team: { id: body.teamId, name: "Saved team" },
+          state: null,
+          labels: [],
+          issues: [],
+          deliveryReady: false,
+        });
+      };
+      await act(() => {
+        renderer.root
+          .findAllByProps({ "data-picker": true })
+          .find((node) => node.props.value === "entered_status")!
+          .props.onValueChange("issue_created");
+      });
+      await act(async () => {
+        await entered;
+      });
+      expect(enableControl().props.disabled).toBe(true);
+      expect(words()).toContain("Checking trigger readiness");
+      await act(async () => release());
+      await drain();
+      expect(enableControl().props.disabled).toBe(true);
+      expect(words()).toContain("Event delivery not verified");
+      expect(button("Save workflow").props.disabled).toBe(false);
+    });
+  }),
+);
+
+it.effect("replaces unusable VM trigger fields with target recovery", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mountTrigger(triggerInitial, true);
+      expect(words()).toContain("Automatic runs need a Machine target");
+      expect(words()).toContain("Choose a Machine target");
+      expect(renderer.root.findAllByProps({ "data-picker": true })).toHaveLength(0);
+      expect(fixture.metadataReads).toHaveLength(0);
+      expect(saveTrigger).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect(
+  "explicitly removes an incomplete off trigger before saving the workflow without it",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountTrigger({
+          enabled: false,
+          trigger: {
+            provider: "linear",
+            connectionId: "connection",
+            grantId: "grant",
+            teamId: "",
+            event: "issue_created",
+            labelIds: [],
+          },
+        });
+        expect(button("Save workflow").props.disabled).toBe(true);
+        await act(() => button("Remove incomplete trigger").props.onClick());
+        expect(button("Save workflow").props.disabled).toBe(false);
+        await act(() => button("Save workflow").props.onClick());
+        expect(saveTrigger).toHaveBeenCalledWith({ enabled: false, trigger: null });
+      });
+    }),
 );

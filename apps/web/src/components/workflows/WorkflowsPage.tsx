@@ -566,7 +566,7 @@ function WorkflowRepositoryView({
     )
       refresh();
   };
-  const setupTrigger = (workflow: RepositoryWorkflow) => {
+  const setupTrigger = (workflow: RepositoryWorkflow, enabled?: boolean) => {
     const key = workflowSessionKey(scope, workflow.workflowId);
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const draft = state.editors[key] ?? savedWorkflowDraft(workflow, automationSupported);
@@ -576,6 +576,9 @@ function WorkflowRepositoryView({
         workflow.definition.target.kind === "vm"
       )
         return { ...state, editors: { ...state.editors, [key]: { ...draft, triggerSetup: true } } };
+      const automation = normalizeWorkflowAutomation(
+        workflowDraftAutomationResolved(draft) ? draft.automation : workflow.automation,
+      );
       return {
         ...state,
         editors: {
@@ -589,10 +592,8 @@ function WorkflowRepositoryView({
               : {}),
             automationResolved: true,
             automation: {
-              ...normalizeWorkflowAutomation(
-                workflowDraftAutomationResolved(draft) ? draft.automation : workflow.automation,
-              ),
-              enabled: true,
+              ...automation,
+              ...(enabled !== undefined ? { enabled: enabled && !!automation.trigger } : {}),
             },
           },
         },
@@ -603,7 +604,7 @@ function WorkflowRepositoryView({
       params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
     });
   };
-  const toggleAutomation = async (workflow: RepositoryWorkflow) => {
+  const toggleAutomation = (workflow: RepositoryWorkflow) => {
     if (
       !automationSupported ||
       error ||
@@ -611,58 +612,17 @@ function WorkflowRepositoryView({
       workflow.definition.target.kind === "vm"
     )
       return;
-    const key = workflowSessionKey(scope, workflow.workflowId);
-    const current = appAtomRegistry.get(workflowDraftAtom).editors[key];
+    const current =
+      appAtomRegistry.get(workflowDraftAtom).editors[
+        workflowSessionKey(scope, workflow.workflowId)
+      ];
     if (
       current?.operation?.state === "pending" ||
       current?.definition.target.kind === "vm" ||
       (current?.baseline && current.baseline.revision > workflow.revision)
     )
       return;
-    if (!current?.operation && !workflow.automation?.enabled && !workflow.automation?.trigger) {
-      setupTrigger(workflow);
-      return;
-    }
-    if (!current?.operation) {
-      if (current && workflowEditorDirty(current)) {
-        setupTrigger(workflow);
-        return;
-      }
-      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
-        ...state,
-        editors: {
-          ...state.editors,
-          [key]: {
-            ...savedWorkflowDraft(workflow, automationSupported),
-            automation: {
-              ...normalizeWorkflowAutomation(workflow.automation),
-              enabled: !workflow.automation?.enabled,
-            },
-          },
-        },
-      }));
-    }
-    const result = await saveWorkflowDraft(
-      scope,
-      workflow.workflowId,
-      (payload) =>
-        call((client, token) =>
-          client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
-        ),
-      undefined,
-      {
-        automationSupported,
-        read: () =>
-          call((client, token) =>
-            client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
-          ),
-      },
-    );
-    if (!active.current) return;
-    const retained = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (!result && !workflow.automation?.enabled && retained?.error && !retained.operation)
-      setupTrigger(workflow);
-    void refresh();
+    setupTrigger(workflow, !workflow.automation?.enabled);
   };
   const rows = (archived: boolean) =>
     workflows
@@ -734,6 +694,7 @@ function WorkflowRepositoryView({
               </div>
               <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 <span>{workflowTriggerLabel(workflow.automation?.trigger)}</span>
+                {canConfigure ? <span>Trigger changes apply after Save.</span> : null}
                 <span>
                   {automationSupported
                     ? `Automatic triggering ${summary?.state === "on" ? "On" : summary?.state === "off" ? "Off" : summary?.state === "needs_attention" ? "needs attention" : "state unavailable"}`

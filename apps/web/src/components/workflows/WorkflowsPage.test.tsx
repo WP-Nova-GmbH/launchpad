@@ -968,7 +968,7 @@ for (const retained of [false, true])
               )
             ];
           expect(draft?.triggerSetup).toBe(true);
-          expect(draft?.automation?.enabled).toBe(true);
+          expect(draft?.automation?.enabled).toBe(false);
           expect(draft?.automationResolved).toBe(true);
           if (retained) expect(draft?.definition.name).toBe("Retained name");
           expect(draft?.baseline?.automation?.enabled).toBe(false);
@@ -994,53 +994,53 @@ it.effect(
       });
     }),
 );
-it.effect(
-  "turns Off the saved complete rule and reconciles a lost reply without a second write",
-  () =>
-    Effect.gen(function* () {
-      yield* serve;
-      yield* Effect.promise(async () => {
-        fixture.tab = "workflows";
-        fixture.supported = true;
-        const trigger = {
-          provider: "linear",
-          connectionId: "connection",
-          grantId: "grant",
-          teamId: "team",
-          event: "issue_created",
-          labelIds: ["label"],
-        } as const;
-        let current: RepositoryWorkflow = { ...workflow, automation: { enabled: true, trigger } };
-        fixture.definitions.mockImplementation(async () => [current]);
-        fixture.save.mockImplementation(async (payload) => {
-          current = {
-            ...current,
-            ...payload,
-            automation: payload.automation ?? current.automation,
-            revision: current.revision + 1,
-          };
-          throw new Error("Reply lost after commit");
-        });
-        await mountCatalog();
-        await press("Turn Off");
-        // Follow-up refresh is queued by the action after its receipt.
-        await act(async () => {
-          await Promise.all(deliveries);
-        });
-        expect(fixture.save).toHaveBeenCalledWith(
-          expect.objectContaining({
-            expectedRevision: 1,
-            definition: workflow.definition,
-            automation: { enabled: false, trigger },
-          }),
-        );
-        expect(content()).toContain("Automatic triggering Off");
-        await press("Retry");
-        await act(async () => {
-          await Promise.all(deliveries);
-        });
-        expect(fixture.save).toHaveBeenCalledTimes(1);
-        expect(button("Turn On")).toBeDefined();
+it.effect("opens an Off draft without saving or discarding other workflow edits", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.supported = true;
+      const trigger = {
+        provider: "linear",
+        connectionId: "connection",
+        grantId: "grant",
+        teamId: "team",
+        event: "issue_created",
+        labelIds: ["label"],
+      } as const;
+      const current: RepositoryWorkflow = { ...workflow, automation: { enabled: true, trigger } };
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      const key = workflowSessionKey(scope, workflow.workflowId);
+      fixture.definitions.mockResolvedValue([current]);
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        editors: {
+          ...state.editors,
+          [key]: {
+            workflowId: workflow.workflowId,
+            baseline: current,
+            definition: { ...workflow.definition, name: "Unsaved name" },
+            automation: { enabled: true, trigger },
+            automationResolved: true,
+            selectedStepId: "",
+            targetConfirmed: true,
+            operation: null,
+            error: null,
+          },
+        },
+      }));
+      await mountCatalog();
+      await press("Turn Off");
+      expect(fixture.save).not.toHaveBeenCalled();
+      expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
+        definition: { name: "Unsaved name" },
+        triggerSetup: true,
+        automation: { enabled: false, trigger },
+        baseline: { automation: { enabled: true, trigger } },
       });
-    }),
+      expect(fixture.navigate).toHaveBeenCalledWith(
+        expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
+      );
+    });
+  }),
 );
