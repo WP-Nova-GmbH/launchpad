@@ -1,0 +1,12 @@
+{
+  "scripts": [
+    {
+      "id": "p05-setup",
+      "name": "P05 acceptance setup",
+      "command": "node -e \"const fs=require('fs'),p='/tmp/launchpad-p05-9_caiifc/setup-count';fs.mkdirSync(require('path').dirname(p),{recursive:true});const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1)+'\\\\n');\"",
+      "icon": "terminal",
+      "runOnWorktreeCreate": true,
+      "async": false
+    }
+  ]
+}
