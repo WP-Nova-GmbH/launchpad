@@ -42,6 +42,8 @@ import {
   PlayIcon,
   MonitorIcon,
   CloudIcon,
+  GitBranchIcon,
+  ChevronRightIcon,
   ChevronDownIcon,
 } from "lucide-react";
 
@@ -1218,13 +1220,20 @@ function WorkflowBuilderWorkspace({
                 <button
                   type="button"
                   className={styles["workflow-target-summary"]}
+                  aria-label={`Execution target: ${targetLabel}`}
                   onClick={openSettings}
                 />
               }
             >
               {vm && draft.targetConfirmed ? <CloudIcon /> : <MonitorIcon />}
-              <span>{targetLabel}</span>
-              <ChevronDownIcon />
+              <span>{vm && draft.targetConfirmed ? "VM" : targetLabel}</span>
+              {vm && draft.targetConfirmed ? (
+                <>
+                  <GitBranchIcon aria-hidden />
+                  <span>{vm.baseBranch ?? "Repository default"}</span>
+                </>
+              ) : null}
+              <ChevronDownIcon aria-hidden />
             </TooltipTrigger>
             <TooltipPopup>{targetLabel}</TooltipPopup>
           </Tooltip>
@@ -1242,7 +1251,11 @@ function WorkflowBuilderWorkspace({
                 });
             }}
           >
-            <PlayIcon />
+            {hasRunSubmission || hasRetainedInstructions ? (
+              <ChevronRightIcon aria-hidden />
+            ) : (
+              <PlayIcon aria-hidden />
+            )}
             {hasRunSubmission
               ? "View run submission"
               : hasRetainedInstructions

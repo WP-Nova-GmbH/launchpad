@@ -295,7 +295,13 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
 }
 const content = () => text(renderer!.toJSON());
 const button = (label: string) =>
-  renderer!.root.findAllByType("button").find((node) => node.props.children === label)!;
+  renderer!.root
+    .findAllByType("button")
+    .find(
+      (node) =>
+        node.props["aria-label"] === label ||
+        node.children.filter((child) => typeof child === "string").join("") === label,
+    )!;
 async function press(label: string, waitForReads = true) {
   const before = deliveries.length;
   await act(async () => {
@@ -570,7 +576,7 @@ it.effect("keeps the Run draft reachable after VM receipt recovery while gated a
       expect(button("Run")).toBeUndefined();
 
       fixture.vmExecutionAvailable = true;
-      await press("Refresh");
+      await press("Refresh workflows");
       await press("Run");
       const route = {
         to: "/workflows/$repositoryId/$workflowId/run",
@@ -599,7 +605,7 @@ it.effect("keeps the Run draft reachable after VM receipt recovery while gated a
         })),
       );
       fixture.vmExecutionAvailable = false;
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(button("Run")).toBeUndefined();
       await press("View run submission");
       expect(fixture.navigate).toHaveBeenLastCalledWith(route);
@@ -624,7 +630,7 @@ it.effect("keeps the Run draft reachable after VM receipt recovery while gated a
 
       fixture.definitions.mockResolvedValue([{ ...vmWorkflow, revision: 2, archived: true }]);
       fixture.vmExecutionAvailable = true;
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(button("Run")).toBeUndefined();
       await press("View retained instructions");
       expect(fixture.navigate).toHaveBeenLastCalledWith(route);
@@ -661,13 +667,13 @@ it.effect("reopens an uncertain Machine submission with no text after a VM switc
       fixture.definitions.mockResolvedValue([
         { ...workflow, definition: vmWorkflow.definition, revision: 2 },
       ]);
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(button("Run")).toBeUndefined();
       await press("View run submission");
       expect(fixture.navigate).toHaveBeenLastCalledWith(route);
 
       fixture.definitions.mockResolvedValue([{ ...workflow, revision: 3, archived: true }]);
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(button("Run")).toBeUndefined();
       await press("View run submission");
       expect(fixture.navigate).toHaveBeenCalledTimes(2);
@@ -690,7 +696,7 @@ it.effect("uses catalog Refresh to recover Machine choices and reload workflow d
         fixture.projectsUnavailable = false;
         fixture.projects = [checkout];
       });
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(content()).toContain(workflow.definition.name);
       await press("Create workflow");
       const scope = { accountId: "account", organizationId: "organization", repositoryId };
@@ -713,7 +719,7 @@ it.effect("copies using the checkout catalog refreshed while the source read is 
 
       const refreshed = deferred<void>();
       fixture.refreshCatalog.mockReturnValueOnce(refreshed.promise);
-      await press("Refresh");
+      await press("Refresh workflows");
       const copy = renderer!.root
         .findAllByType("button")
         .find(
@@ -785,9 +791,9 @@ it.effect("refreshes open editor dependencies and ignores a late Codex status fa
         fixture.projects = [checkout];
       });
       const firstRetry = deliveries.length;
-      await press("Refresh", false);
+      await press("Refresh workflows", false);
       const firstRetryReceipts = deliveries.slice(firstRetry);
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(fixture.codexStatus).toHaveBeenCalledTimes(3);
       expect(content()).not.toContain("Could not check the organization's Codex connection.");
       await act(async () => {
@@ -842,7 +848,7 @@ it.effect("keeps an explicit VM model through a missing proof and saves it once 
           ],
         },
       };
-      await press("Refresh");
+      await press("Refresh workflows");
       expect(content()).toContain("Verified model");
       expect(content()).not.toContain("Select the managed default before saving");
       fixture.save.mockImplementation(async ({ definition }) => ({

@@ -1,4 +1,4 @@
-import { act, createElement } from "react";
+import { act, cloneElement, createElement, type PropsWithChildren, type ReactElement } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import type { WorkflowJobPage } from "@t3tools/contracts/workflows";
@@ -16,6 +16,12 @@ vi.mock("./workflowState", () => ({
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => fixture.navigate }));
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
+}));
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: PropsWithChildren) => children,
+  TooltipTrigger: ({ render, children }: PropsWithChildren<{ render: ReactElement }>) =>
+    cloneElement(render, {}, children),
+  TooltipPopup: () => null,
 }));
 import { WorkflowJobs } from "./WorkflowJobs";
 const scope = {
@@ -45,7 +51,7 @@ const press = (label: string) =>
   act(async () => {
     renderer.root
       .findAllByType("button")
-      .find((button) => button.props.children === label)!
+      .find((button) => button.props["aria-label"] === label || button.props.children === label)!
       .props.onClick();
   });
 function deferred() {

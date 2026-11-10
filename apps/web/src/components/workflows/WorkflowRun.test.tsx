@@ -483,7 +483,9 @@ describe("VM Run submission recovery", () => {
       const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
       read.mockRejectedValueOnce(new Error("Reply lost"));
       await mount(initial);
-      expect(visibleText(renderer!.root)).toContain("Target VM Base branch release/1.x");
+      expect(visibleText(renderer!.root).replace(/\s+/g, " ")).toContain(
+        "Target VM Base branch release/1.x",
+      );
       await submit();
       const captured = runWorkflow.mock.calls[0]![0].payload;
       expect(captured).toEqual({

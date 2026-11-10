@@ -1,3 +1,5 @@
+import { CloudIcon, MonitorIcon, RefreshCwIcon } from "lucide-react";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
@@ -380,12 +382,19 @@ export function WorkflowJob({
         ) : null}
         <dl className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs">
           <dt className="text-muted-foreground">Target</dt>
-          <dd>
-            {target
-              ? target.machineLabel + (selectedJob.workflow ? " / " + target.title : "")
-              : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
-                ? "Workflow VM"
-                : "Organization execution target"}
+          <dd className="flex min-w-0 items-center gap-1.5">
+            {!target && (selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm") ? (
+              <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+            ) : (
+              <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+            )}
+            <span>
+              {target
+                ? target.machineLabel + (selectedJob.workflow ? " / " + target.title : "")
+                : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
+                  ? "Workflow VM"
+                  : "Organization execution target"}
+            </span>
           </dd>
         </dl>
       </header>
@@ -431,6 +440,7 @@ export function WorkflowJob({
                     disabled={read.reading}
                     onClick={() => void refresh()}
                   >
+                    <RefreshCwIcon aria-hidden />
                     Refresh run
                   </Button>
                 }
@@ -653,9 +663,22 @@ export function WorkflowJob({
                 {manualState.canResume ? "Resume workflow" : "Pause workflow"}
               </Button>
             ) : null}
-            <Button variant="ghost" disabled={read.reading} onClick={() => void refresh()}>
-              Refresh
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Refresh run"
+                    disabled={read.reading}
+                    onClick={() => void refresh()}
+                  />
+                }
+              >
+                <RefreshCwIcon aria-hidden />
+              </TooltipTrigger>
+              <TooltipPopup>Refresh run</TooltipPopup>
+            </Tooltip>
             {viewerControls.canCancel && !terminal ? (
               <details>
                 <summary className="cursor-pointer text-sm text-muted-foreground">

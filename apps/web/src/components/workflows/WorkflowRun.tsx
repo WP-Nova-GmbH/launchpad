@@ -1,3 +1,4 @@
+import { CloudIcon, MonitorIcon, GitBranchIcon, PlayIcon } from "lucide-react";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { useNavigate } from "@tanstack/react-router";
 import { useLayoutEffect, useRef, useState } from "react";
@@ -300,17 +301,27 @@ function WorkflowRunForm({
         <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
         <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
           <dt className="text-muted-foreground">Target</dt>
-          <dd className="min-w-0 wrap-anywhere">
-            {savedTarget.kind === "vm"
-              ? "VM"
-              : target
-                ? `${target.machineLabel} / ${target.title}`
-                : "Saved execution target is unavailable"}
+          <dd className="flex min-w-0 items-center gap-1.5 wrap-anywhere">
+            {savedTarget.kind === "vm" ? (
+              <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+            ) : (
+              <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+            )}
+            <span>
+              {savedTarget.kind === "vm"
+                ? "VM"
+                : target
+                  ? `${target.machineLabel} / ${target.title}`
+                  : "Saved execution target is unavailable"}
+            </span>
           </dd>
           {savedTarget.kind === "vm" ? (
             <>
               <dt className="text-muted-foreground">Base branch</dt>
-              <dd>{savedTarget.baseBranch ?? "Repository default"}</dd>
+              <dd className="flex min-w-0 items-center gap-1.5 wrap-anywhere">
+                <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+                <span>{savedTarget.baseBranch ?? "Repository default"}</span>
+              </dd>
             </>
           ) : null}
           <dt className="text-muted-foreground">Steps</dt>
@@ -342,6 +353,7 @@ function WorkflowRunForm({
       {startedJob}
       <div>
         <Button type="submit" disabled={confirming || pending || !draft.instruction.trim()}>
+          <PlayIcon aria-hidden />
           {confirming
             ? "Awaiting confirmation…"
             : checkingPrevious

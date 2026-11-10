@@ -1,5 +1,6 @@
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { MaterialButton } from "../../components/MaterialButton";
+import { SymbolView } from "../../components/AppSymbol";
 import { SegmentedControl } from "../../components/SegmentedControl";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import { WorkflowSourceHealth } from "./WorkflowSourceHealth";
@@ -585,6 +586,15 @@ function WorkflowJobsContent(props: Props) {
               </Text>
               <View className="flex-row flex-wrap gap-x-3 gap-y-1">
                 <Text className="text-xs text-foreground-muted">Target</Text>
+                <SymbolView
+                  name={
+                    !target && (selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm")
+                      ? "cloud"
+                      : "desktopcomputer"
+                  }
+                  size={14}
+                  tintColorClassName="accent-foreground-muted"
+                />
                 <Text className="shrink text-xs text-foreground">
                   {target
                     ? `${target.machineLabel} / ${target.title}`

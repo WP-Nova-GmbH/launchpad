@@ -117,6 +117,7 @@ vi.mock("../../../../mobile/src/features/settings/components/SettingsSection", (
 vi.mock("../../../../mobile/src/features/settings/components/SettingsActionRow", () => ({
   SettingsActionRow: host("action"),
 }));
+vi.mock("../../../../mobile/src/components/AppSymbol", () => ({ SymbolView: host("symbol") }));
 vi.mock("../../../../mobile/src/features/settings/components/SettingsRow", () => ({
   SettingsRow: host("row"),
 }));

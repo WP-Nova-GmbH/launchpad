@@ -1,4 +1,4 @@
-import { act, createElement, type PropsWithChildren } from "react";
+import { act, cloneElement, type PropsWithChildren, type ReactElement, createElement } from "react";
 import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
@@ -34,6 +34,12 @@ vi.mock("./workflowState", async () => ({
   useWorkflowClient: () => fixture.call,
 }));
 vi.mock("./WorkflowFlow", () => ({ WorkflowFlow: () => null }));
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: PropsWithChildren) => children,
+  TooltipTrigger: ({ render, children }: PropsWithChildren<{ render: ReactElement }>) =>
+    cloneElement(render, {}, children),
+  TooltipPopup: () => null,
+}));
 vi.mock("../ui/button", () => ({
   Button: (props: PropsWithChildren<Record<string, unknown>>) => createElement("button", props),
 }));

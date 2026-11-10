@@ -8,6 +8,12 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   FolderGit2Icon,
+  PencilIcon,
+  PlayIcon,
+  RefreshCwIcon,
+  CloudIcon,
+  MonitorIcon,
+  GitBranchIcon,
 } from "lucide-react";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
@@ -42,6 +48,7 @@ import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
 import { Button } from "../ui/button";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { DiscoveryList, DiscoveryListRow } from "../ui/discovery-list";
 import { Spinner } from "../ui/spinner";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
@@ -188,6 +195,7 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
         actions={
           <>
             <Button variant="outline" onClick={catalog.refresh}>
+              <RefreshCwIcon aria-hidden />
               Refresh
             </Button>
             <Button variant="ghost" onClick={() => navigate({ to: "/settings/organization" })}>
@@ -662,6 +670,7 @@ function WorkflowRepositoryView({
       .map((workflow) => {
         const key = workflowSessionKey(scope, workflow.workflowId);
         const local = drafts.editors[key];
+        const editorDirty = !!local && workflowEditorDirty(local);
         const runDraft = drafts.runs[key];
         const target = workflow.definition.target;
         const machineProject =
@@ -689,22 +698,30 @@ function WorkflowRepositoryView({
             <div className="min-w-0 flex-1 basis-64 space-y-1 wrap-anywhere">
               <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
                 <p className="font-medium">{workflow.definition.name}</p>
-                {local && workflowEditorDirty(local) ? (
-                  <span className="text-xs font-medium">Unsaved changes</span>
-                ) : null}
+                {editorDirty ? <span className="text-xs font-medium">Unsaved changes</span> : null}
               </div>
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 <span>{workflow.definition.steps.length} steps</span>
                 {workflow.definition.target.kind === "vm" ? (
                   <>
-                    <span>VM</span>
-                    <span>
-                      Base branch: {workflow.definition.target.baseBranch ?? "Repository default"}
+                    <span className="inline-flex items-center gap-1.5">
+                      <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+                      VM
+                    </span>
+                    <span className="inline-flex min-w-0 items-center gap-1.5">
+                      <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+                      <span>
+                        <span className="sr-only">Base branch: </span>
+                        {workflow.definition.target.baseBranch ?? "Repository default"}
+                      </span>
                     </span>
                   </>
                 ) : machineProject ? (
                   <>
-                    <span>{machineProject.machineLabel}</span>
+                    <span className="inline-flex items-center gap-1.5">
+                      <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                      {machineProject.machineLabel}
+                    </span>
                     <span>{machineProject.title}</span>
                   </>
                 ) : (
@@ -799,17 +816,30 @@ function WorkflowRepositoryView({
                 </Button>
               ) : null}
               {canConfigure ? (
-                <Button
-                  variant="ghost"
-                  onClick={() =>
-                    navigate({
-                      to: "/workflows/$repositoryId/$workflowId/edit",
-                      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
-                    })
-                  }
-                >
-                  {local && workflowEditorDirty(local) ? "Resume editing" : "Edit"}
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        size={editorDirty ? "default" : "icon"}
+                        aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${workflow.definition.name}`}
+                        onClick={() =>
+                          navigate({
+                            to: "/workflows/$repositoryId/$workflowId/edit",
+                            params: {
+                              repositoryId: scope.repositoryId,
+                              workflowId: workflow.workflowId,
+                            },
+                          })
+                        }
+                      />
+                    }
+                  >
+                    <PencilIcon aria-hidden />
+                    {editorDirty ? "Resume editing" : null}
+                  </TooltipTrigger>
+                  <TooltipPopup>{editorDirty ? "Resume editing" : "Edit workflow"}</TooltipPopup>
+                </Tooltip>
               ) : null}
               {archived ? (
                 canConfigure ? (
@@ -837,6 +867,11 @@ function WorkflowRepositoryView({
                     })
                   }
                 >
+                  {hasRunSubmission || hasRetainedInstructions ? (
+                    <ChevronRightIcon aria-hidden />
+                  ) : (
+                    <PlayIcon aria-hidden />
+                  )}
                   {hasRunSubmission
                     ? "View run submission"
                     : hasRetainedInstructions
@@ -889,9 +924,22 @@ function WorkflowRepositoryView({
                 </SelectPopup>
               </Select>
             </div>
-            <Button type="button" variant="ghost" size="sm" onClick={refreshView}>
-              Refresh
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Refresh workflows"
+                    onClick={refreshView}
+                  />
+                }
+              >
+                <RefreshCwIcon aria-hidden />
+              </TooltipTrigger>
+              <TooltipPopup>Refresh workflows</TooltipPopup>
+            </Tooltip>
           </div>
         </WorkspacePageHeader>
         {error ? (
@@ -1052,9 +1100,21 @@ function WorkflowRepositoryView({
               </div>
             </div>
             {view !== "catalog" || tab !== "runs" ? (
-              <Button variant="ghost" onClick={refreshView}>
-                Refresh
-              </Button>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Refresh workflows"
+                      onClick={refreshView}
+                    />
+                  }
+                >
+                  <RefreshCwIcon aria-hidden />
+                </TooltipTrigger>
+                <TooltipPopup>Refresh workflows</TooltipPopup>
+              </Tooltip>
             ) : null}
           </div>
           {error ? (
@@ -1086,6 +1146,7 @@ function WorkflowRepositoryView({
                 actions={
                   <>
                     <Button variant="outline" onClick={refreshView}>
+                      <RefreshCwIcon aria-hidden />
                       Refresh workflows
                     </Button>
                     <Button variant="ghost" onClick={back}>

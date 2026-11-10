@@ -1,3 +1,5 @@
+import { ChevronRightIcon, RefreshCwIcon } from "lucide-react";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
@@ -117,9 +119,22 @@ export function WorkflowJobs({
             </Button>
           ))}
         </div>
-        <Button variant="outline" disabled={busy} onClick={() => void load(null, true)}>
-          Refresh runs
-        </Button>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                variant="outline"
+                size="icon"
+                aria-label="Refresh runs"
+                disabled={busy}
+                onClick={() => void load(null, true)}
+              />
+            }
+          >
+            <RefreshCwIcon aria-hidden />
+          </TooltipTrigger>
+          <TooltipPopup>Refresh runs</TooltipPopup>
+        </Tooltip>
       </div>
       <p className="text-xs text-muted-foreground">
         {view === "history"
@@ -171,17 +186,26 @@ export function WorkflowJobs({
             {job.detail ? <p className="text-xs text-muted-foreground">{job.detail}</p> : null}
           </div>
           <span className="text-xs font-medium">{workflowStatusLabel(job.status)}</span>
-          <Button
-            variant="ghost"
-            onClick={() =>
-              navigate({
-                to: "/workflows/$repositoryId/jobs/$jobId",
-                params: { repositoryId: scope.repositoryId, jobId: job.jobId },
-              })
-            }
-          >
-            View
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Open run: ${job.instruction}`}
+                  onClick={() =>
+                    navigate({
+                      to: "/workflows/$repositoryId/jobs/$jobId",
+                      params: { repositoryId: scope.repositoryId, jobId: job.jobId },
+                    })
+                  }
+                />
+              }
+            >
+              <ChevronRightIcon aria-hidden />
+            </TooltipTrigger>
+            <TooltipPopup>Open run</TooltipPopup>
+          </Tooltip>
         </div>
       ))}
       {page.nextCursor ? (
