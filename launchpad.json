@@ -1,12 +1,11 @@
 {
-  "$schema": "https://t3.codes/schema/t3.json",
-  "iconPath": "assets/dev/blueprint-web-apple-touch-180.png",
   "scripts": [
     {
-      "name": "Setup Worktree",
-      "command": "node scripts/setup-worktree.ts",
+      "name": "P05 acceptance setup",
+      "command": "node -e \"const fs=require('fs'),p='/tmp/launchpad-p05-9_caiifc/setup-count';fs.mkdirSync(require('path').dirname(p),{recursive:true});const n=fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0;fs.writeFileSync(p,String(n+1)+'\\\\n');\"",
       "icon": "configure",
-      "runOnWorktreeCreate": true
+      "runOnWorktreeCreate": true,
+      "async": false
     }
   ]
 }
