@@ -1,4 +1,13 @@
-import { CloudIcon, MonitorIcon, GitBranchIcon, PlayIcon } from "lucide-react";
+import {
+  CloudIcon,
+  MonitorIcon,
+  GitBranchIcon,
+  PlayIcon,
+  BotIcon,
+  HandIcon,
+  UploadIcon,
+  RefreshCwIcon,
+} from "lucide-react";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { useNavigate } from "@tanstack/react-router";
 import { useLayoutEffect, useRef, useState } from "react";
@@ -6,6 +15,7 @@ import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
 import {
   workflowSessionKey,
   emptyWorkflowRun,
+  sameWorkflowDefinition,
   workflowDraftAtom,
   type WorkflowScope,
   type WorkflowRunDraft,
@@ -29,6 +39,7 @@ type WorkflowRunProps = {
   projects: ReadonlyArray<RelayOrganizationProject>;
   call: ReturnType<typeof useWorkflowClient>;
   vmExecutionAvailable?: boolean;
+  canConfigure?: boolean;
 };
 
 export function WorkflowRun(props: WorkflowRunProps) {
@@ -57,6 +68,7 @@ function WorkflowRunForm({
   call,
   vmUnavailable,
   publishingUnavailable,
+  canConfigure = false,
 }: WorkflowRunProps & { vmUnavailable: boolean; publishingUnavailable: boolean }) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
@@ -73,6 +85,26 @@ function WorkflowRunForm({
   const key = workflowSessionKey(scope, workflow.workflowId);
   const draft =
     (drafts.accountId === scope.accountId ? drafts.runs[key] : undefined) ?? emptyWorkflowRun;
+  const editor = drafts.accountId === scope.accountId ? drafts.editors[key] : undefined;
+  const unsavedDefinition =
+    !!editor && !sameWorkflowDefinition(editor.definition, workflow.definition);
+  const editWorkflow = () =>
+    navigate({
+      to: "/workflows/$repositoryId/$workflowId/edit",
+      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+    });
+  const backToWorkflows = () =>
+    navigate({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId: scope.repositoryId },
+      search: { tab: "workflows" },
+    });
+  const checkRuns = () =>
+    navigate({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId: scope.repositoryId },
+      search: { tab: "runs" },
+    });
   const savedTarget = workflow.definition.target;
   const machine = savedTarget.kind === "machine" ? savedTarget : null;
   const target = projects.find(
@@ -146,75 +178,70 @@ function WorkflowRunForm({
       }
     }
   };
-  const error = draft.error ? (
+  const previousSubmission =
+    uncertain || checkingPrevious || (pending && draft.operation?.instruction !== draft.instruction)
+      ? draft.operation
+      : null;
+  const error =
+    draft.error && !uncertain ? (
+      <WorkflowAlert
+        title="Could not start this run"
+        actions={
+          <Button type="button" variant="outline" size="sm" onClick={checkRuns}>
+            Check runs
+          </Button>
+        }
+      >
+        {draft.error} Your instructions are kept.
+      </WorkflowAlert>
+    ) : null;
+  const recovery = previousSubmission ? (
     <WorkflowAlert
-      title={uncertain ? "Run submission not confirmed" : "Could not start this run"}
-      variant={uncertain ? "warning" : "error"}
+      title={pending ? "Waiting for submission confirmation" : "Previous submission not confirmed"}
+      variant={pending ? "info" : "warning"}
       actions={
-        !runBlocked ? (
+        !pending ? (
           <Button
             type="button"
-            variant="outline"
             size="sm"
-            onClick={() =>
-              navigate({
-                to: "/workflows/$repositoryId",
-                params: { repositoryId: scope.repositoryId },
-                search: { tab: "runs" },
-              })
-            }
+            disabled={confirming}
+            onClick={() => (uncertainVm ? void submit(true) : checkRuns())}
           >
-            Check recent runs
+            {uncertainVm ? <RefreshCwIcon aria-hidden /> : null}
+            {uncertainVm
+              ? replayOnly
+                ? "Check previous submission"
+                : "Retry previous submission"
+              : "Check runs"}
           </Button>
         ) : undefined
       }
     >
-      {draft.error} Your instructions are kept.
+      <div className="space-y-3">
+        {draft.error ? (
+          <details>
+            <summary className="cursor-pointer">Error details</summary>
+            <p className="mt-2">{draft.error}</p>
+          </details>
+        ) : null}
+        <p>
+          {pending
+            ? "Your instructions are kept while confirmation is pending."
+            : uncertainVm
+              ? "This run may already exist. Retry the same submission before starting another."
+              : "This run may already exist. Check Active and History before starting another."}
+        </p>
+        <details open={previousSubmission.instruction.length < 400}>
+          <summary className="cursor-pointer font-medium">
+            Previously submitted instructions
+          </summary>
+          <p className="mt-2 whitespace-pre-wrap rounded-md bg-muted p-3 text-foreground">
+            {previousSubmission.instruction}
+          </p>
+        </details>
+      </div>
     </WorkflowAlert>
   ) : null;
-  const recoverVm = uncertainVm ? (
-    <WorkflowAlert
-      title="Previous submission not confirmed"
-      variant="warning"
-      actions={
-        <Button
-          type="button"
-          variant="outline"
-          disabled={confirming}
-          onClick={() => void submit(true)}
-        >
-          {replayOnly ? "Check previous submission" : "Retry previous submission"}
-        </Button>
-      }
-    >
-      The previous VM submission could not be confirmed. Check or retry it before starting another
-      run.
-    </WorkflowAlert>
-  ) : null;
-  const recoverMachine =
-    uncertain && !uncertainVm ? (
-      <WorkflowAlert
-        title="Run may have started"
-        variant="warning"
-        actions={
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() =>
-              navigate({
-                to: "/workflows/$repositoryId",
-                params: { repositoryId: scope.repositoryId },
-                search: { tab: "runs" },
-              })
-            }
-          >
-            Check recent runs
-          </Button>
-        }
-      >
-        Run may have started. Check recent runs to confirm before submitting again.
-      </WorkflowAlert>
-    ) : null;
   const startedJob = draft.startedJobId ? (
     <Button
       type="button"
@@ -231,7 +258,7 @@ function WorkflowRunForm({
   ) : null;
   if (runBlocked)
     return (
-      <div className="mx-auto w-full max-w-xl space-y-2">
+      <div className="mx-auto w-full max-w-xl space-y-5">
         <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
         <WorkflowAlert
           title={
@@ -244,27 +271,12 @@ function WorkflowRunForm({
           variant="warning"
           actions={
             <>
-              <Button
-                variant="outline"
-                onClick={() =>
-                  navigate({
-                    to: "/workflows/$repositoryId/$workflowId/edit",
-                    params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
-                  })
-                }
-              >
-                {workflow.archived ? "Open workflow settings" : "Edit workflow"}
-              </Button>
-              <Button
-                variant="ghost"
-                onClick={() =>
-                  navigate({
-                    to: "/workflows/$repositoryId",
-                    params: { repositoryId: scope.repositoryId },
-                    search: { tab: "workflows" },
-                  })
-                }
-              >
+              {canConfigure ? (
+                <Button variant="outline" onClick={editWorkflow}>
+                  {workflow.archived ? "Open workflow settings" : "Edit workflow"}
+                </Button>
+              ) : null}
+              <Button variant="ghost" onClick={backToWorkflows}>
                 Back to workflows
               </Button>
             </>
@@ -276,6 +288,7 @@ function WorkflowRunForm({
               ? "Publishing requires a Machine target. Remove Push branch and Open PR steps to use VM."
               : "Running VM workflows is not available yet."}
         </WorkflowAlert>
+        {recovery}
         {draft.instruction.trim() ? (
           <label className="block space-y-2">
             <span className="text-sm font-medium">Retained instructions</span>
@@ -283,8 +296,6 @@ function WorkflowRunForm({
           </label>
         ) : null}
         {error}
-        {recoverVm}
-        {recoverMachine}
         {checkingPrevious ? <p role="status">Checking previous submission…</p> : null}
         {startedJob}
       </div>
@@ -297,15 +308,32 @@ function WorkflowRunForm({
         void submit(false);
       }}
     >
-      <div>
+      <header className="space-y-4">
         <h1 className="text-xl font-semibold">Run {workflow.definition.name}</h1>
-        <dl className="mt-3 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="space-y-1">
+            <p className="text-xs font-medium">Saved workflow</p>
+            <p className="text-xs text-muted-foreground">Revision {workflow.revision}</p>
+          </div>
+          {canConfigure ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={pending || confirming}
+              onClick={editWorkflow}
+            >
+              Edit workflow
+            </Button>
+          ) : null}
+        </div>
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
           <dt className="text-muted-foreground">Target</dt>
-          <dd className="flex min-w-0 items-center gap-1.5 wrap-anywhere">
+          <dd className="flex min-w-0 items-start gap-1.5 wrap-anywhere">
             {savedTarget.kind === "vm" ? (
-              <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+              <CloudIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
             ) : (
-              <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+              <MonitorIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
             )}
             <span>
               {savedTarget.kind === "vm"
@@ -318,50 +346,118 @@ function WorkflowRunForm({
           {savedTarget.kind === "vm" ? (
             <>
               <dt className="text-muted-foreground">Base branch</dt>
-              <dd className="flex min-w-0 items-center gap-1.5 wrap-anywhere">
-                <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+              <dd className="flex min-w-0 items-start gap-1.5 wrap-anywhere">
+                <GitBranchIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
                 <span>{savedTarget.baseBranch ?? "Repository default"}</span>
               </dd>
             </>
           ) : null}
-          <dt className="text-muted-foreground">Steps</dt>
-          <dd>{workflow.definition.steps.length}</dd>
         </dl>
-        <p className="mt-1 text-xs text-muted-foreground">
-          Uses the saved workflow. Queued jobs use its current definition when dispatched.
-        </p>
-      </div>
+      </header>
+      {!uncertain && unsavedDefinition ? (
+        <WorkflowAlert
+          title="Your draft changes are not included"
+          variant="warning"
+          actions={
+            canConfigure ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={pending || confirming}
+                onClick={editWorkflow}
+              >
+                Review draft
+              </Button>
+            ) : undefined
+          }
+        >
+          This run uses the saved workflow.
+        </WorkflowAlert>
+      ) : null}
+      {!uncertain ? (
+        <details className="space-y-3">
+          <summary className="cursor-pointer text-sm font-medium">
+            Workflow steps ({workflow.definition.steps.length})
+          </summary>
+          <p className="text-xs text-muted-foreground">
+            Uses the saved definition available at dispatch.
+          </p>
+          <ol className="mt-3 space-y-3">
+            {workflow.definition.steps.map((step, index) => {
+              const Icon =
+                step.kind === "agent" ? BotIcon : step.kind === "action" ? UploadIcon : HandIcon;
+              return (
+                <li key={step.id} className="flex items-start gap-3 text-sm">
+                  <span className="w-5 shrink-0 text-xs text-muted-foreground">{index + 1}</span>
+                  <Icon className="mt-0.5 size-4 shrink-0" aria-hidden />
+                  <div className="min-w-0">
+                    <p className="font-medium">{step.title}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {step.kind === "agent"
+                        ? "Automatic work"
+                        : step.kind === "action"
+                          ? step.action === "push"
+                            ? "Push branch"
+                            : "Open pull request"
+                          : step.kind === "review"
+                            ? step.role === "member"
+                              ? "Repository member approval"
+                              : "Maintainer approval"
+                            : step.role === "member"
+                              ? "Input from a repository member"
+                              : "Input from a maintainer"}
+                    </p>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </details>
+      ) : null}
+      {error}
+      {recovery}
+      {startedJob}
       <label className="block space-y-2">
-        <span className="text-sm font-medium">What should this run accomplish?</span>
+        <span className="text-sm font-medium">
+          {uncertain ? "New run instructions" : "Run instructions"}
+        </span>
         <Textarea
           required
-          rows={6}
+          rows={4}
           maxLength={32000}
           disabled={pending}
           value={draft.instruction}
           onChange={(event) =>
-            editWorkflowRun(scope, workflow.workflowId, (draft) => ({
-              ...draft,
+            editWorkflowRun(scope, workflow.workflowId, (current) => ({
+              ...current,
               instruction: event.target.value,
             }))
           }
         />
       </label>
-      {error}
-      {recoverVm}
-      {recoverMachine}
-      {startedJob}
-      <div>
-        <Button type="submit" disabled={confirming || pending || !draft.instruction.trim()}>
+      <p className="text-xs text-muted-foreground">
+        {uncertain ? "Creates a separate run." : "For this run only."}
+      </p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <Button type="button" variant="ghost" size="sm" onClick={backToWorkflows}>
+          Back to workflows
+        </Button>
+        <Button
+          type="submit"
+          size="sm"
+          variant={uncertain ? "outline" : "default"}
+          disabled={confirming || pending || !draft.instruction.trim()}
+        >
           <PlayIcon aria-hidden />
           {confirming
             ? "Awaiting confirmation…"
             : checkingPrevious
               ? "Checking previous submission…"
               : pending
-                ? "Starting…"
+                ? "Submitting…"
                 : uncertain
-                  ? "Start another run"
+                  ? "Start an additional run"
                   : "Run workflow"}
         </Button>
       </div>

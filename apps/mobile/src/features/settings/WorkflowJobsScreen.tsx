@@ -167,7 +167,14 @@ function WorkflowJobsContent(props: Props) {
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
   const responseDrafts = drafts.responses[jobKey] ?? {};
-  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackView, setFeedbackView] = useState<{ key: string; open: boolean } | null>(null);
+  const [expandedProgressKey, setExpandedProgressKey] = useState<string | null>(null);
+  const checkpoint = selectedJob?.progress?.checkpoint;
+  const feedbackKey = `${jobKey}:${checkpoint?.checkpointId ?? ""}`;
+  const feedbackOpen =
+    feedbackView?.key === feedbackKey
+      ? feedbackView.open
+      : !!(checkpoint && responseDrafts[checkpoint.checkpointId]);
   const setResponseDrafts = (
     update: (previous: Record<string, string>) => Record<string, string>,
   ) => {
@@ -360,6 +367,15 @@ function WorkflowJobsContent(props: Props) {
     : undefined;
   const canConfigure = membership?.role === "admin" || selectedRepository?.role === "maintainer";
   const viewerControls = workflowViewerControls(selectedJob, canConfigure);
+  const composingFeedback =
+    !terminal &&
+    manualState.status === "awaiting_review" &&
+    feedbackOpen &&
+    viewerControls.canRespond &&
+    !approvalPending;
+  const completed = selectedJob?.status === "done";
+  const confirmationPending =
+    approvalPending || manualState.responsePending || !!selectedJob?.pendingManualControl;
   const reviewChanged = reviewApproval === "inspect";
   const respond = (
     operation:
@@ -603,7 +619,17 @@ function WorkflowJobsContent(props: Props) {
                       : "Organization execution target"}
                 </Text>
               </View>
-              {manualState.message ? (
+              <Text className="text-xs text-foreground-muted">
+                Submitted {new Date(selectedJob.createdAt).toLocaleString()}
+              </Text>
+              {selectedJob.status === "queued" ? (
+                <Text className="text-foreground-muted">
+                  Waiting for an execution target. No steps have started.
+                </Text>
+              ) : null}
+              {manualState.message && confirmationPending ? (
+                <Text className="text-foreground-muted">{manualState.message}</Text>
+              ) : manualState.message ? (
                 <ErrorBanner
                   title="Run needs attention"
                   message={manualState.message}
@@ -628,106 +654,157 @@ function WorkflowJobsContent(props: Props) {
               ) : null}
             </View>
           </SettingsSection>
-          <SettingsSection title="Current task">
-            {checkingReturnedReview && read.error ? (
-              <SettingsActionRow
-                icon="arrow.clockwise"
-                label="Refresh run"
-                disabled={read.reading}
-                onPress={() => void refreshJob()}
-              />
-            ) : null}
-            {reviewChanged || (checkingReturnedReview && !read.error) ? (
-              <View className="p-4">
-                <ErrorBanner
-                  title={reviewChanged ? "Review changed" : "Checking the current review"}
-                  tone="warning"
-                  message={
-                    reviewChanged
-                      ? "Review changed. Inspect the current diff before approving."
-                      : "Checking the current review…"
-                  }
+          {!composingFeedback || reviewChanged || checkingReturnedReview ? (
+            <SettingsSection title={terminal ? "Result" : "Current task"}>
+              {completed && selectedJob.progress?.pullRequestUrl ? (
+                <View className="p-4">
+                  <MaterialButton
+                    tone="primary"
+                    label="Open pull request"
+                    onPress={() => void Linking.openURL(selectedJob.progress!.pullRequestUrl!)}
+                  />
+                </View>
+              ) : null}
+              {checkingReturnedReview && read.error ? (
+                <SettingsActionRow
+                  icon="arrow.clockwise"
+                  label="Refresh run"
+                  disabled={read.reading}
+                  onPress={() => void refreshJob()}
                 />
-              </View>
-            ) : null}
-            {selectedJob.progress && selectedJob.progress.hasThread !== false ? (
-              <SettingsActionRow
-                icon="text.bubble"
-                label="Inspect agent result"
-                disabled={busy || openingResult === jobKey}
-                onPress={() => openResult(false)}
-              />
-            ) : null}
-            {selectedJob.progress?.hasThread !== false &&
-            selectedJob.progress?.checkpoint &&
-            selectedJob.progress.checkpoint.kind !== "input" ? (
-              <SettingsActionRow
-                icon="doc.text"
-                label={
-                  selectedJob.runtime?.kind === "vm" ? "Inspect live diff" : "Inspect saved diff"
-                }
-                disabled={busy || openingResult === jobKey || checkingReturnedReview}
-                onPress={() => openResult(true)}
-              />
-            ) : null}
-            {!terminal &&
-            selectedJob.progress?.checkpoint &&
-            viewerControls.canApprove &&
-            (manualState.status === "awaiting_review" ||
-              (canConfigure &&
-                selectedJob.status === "finishing" &&
-                selectedJob.progress?.retryableApproval)) ? (
-              <SettingsActionRow
-                icon="checkmark.circle"
-                label={
-                  approvalPending
-                    ? "Approval pending"
-                    : manualState.responsePending
-                      ? "Response pending"
-                      : selectedJob.progress?.retryableApproval
-                        ? selectedJob.status === "finishing"
-                          ? "Retry completion"
-                          : "Retry approval"
-                        : "Approve result"
-                }
-                disabled={
-                  busy ||
-                  reviewChanged ||
-                  checkingReturnedReview ||
-                  manualState.checkpointBlocked ||
-                  approvalPending
-                }
-                onPress={() => respond("approve")}
-              />
-            ) : null}
-            {manualState.status === "awaiting_review" &&
-            viewerControls.canRespond &&
-            !approvalPending ? (
-              <SettingsActionRow
-                icon="pencil"
-                label="Request changes"
-                disabled={busy || manualState.checkpointBlocked}
-                onPress={() => setFeedbackOpen(true)}
-              />
-            ) : null}
-          </SettingsSection>
+              ) : null}
+              {reviewChanged || (checkingReturnedReview && !read.error) ? (
+                <View className="p-4">
+                  <ErrorBanner
+                    title={reviewChanged ? "Review changed" : "Checking the current review"}
+                    tone="warning"
+                    message={
+                      reviewChanged
+                        ? "Review changed. Inspect the current diff before approving."
+                        : "Checking the current review…"
+                    }
+                  />
+                </View>
+              ) : null}
+
+              {!composingFeedback &&
+              completed &&
+              selectedJob.progress &&
+              selectedJob.progress.hasThread !== false &&
+              !selectedJob.progress.pullRequestUrl ? (
+                <View className="p-4">
+                  <MaterialButton
+                    tone="primary"
+                    label={
+                      checkpoint && checkpoint.kind !== "input"
+                        ? "Inspect result"
+                        : "Inspect agent result"
+                    }
+                    disabled={busy || openingResult === jobKey}
+                    onPress={() => openResult(!!checkpoint && checkpoint.kind !== "input")}
+                  />
+                </View>
+              ) : null}
+              {!composingFeedback &&
+              selectedJob.progress &&
+              selectedJob.progress.hasThread !== false &&
+              (!completed ||
+                !!selectedJob.progress.pullRequestUrl ||
+                (!!checkpoint && checkpoint.kind !== "input")) ? (
+                <SettingsActionRow
+                  icon="text.bubble"
+                  label="Inspect agent result"
+                  disabled={busy || openingResult === jobKey}
+                  onPress={() => openResult(false)}
+                />
+              ) : null}
+              {!composingFeedback &&
+              (!completed || !!selectedJob.progress?.pullRequestUrl) &&
+              selectedJob.progress?.hasThread !== false &&
+              selectedJob.progress?.checkpoint &&
+              selectedJob.progress.checkpoint.kind !== "input" ? (
+                <SettingsActionRow
+                  icon="doc.text"
+                  label={
+                    completed
+                      ? "Inspect result"
+                      : selectedJob.runtime?.kind === "vm"
+                        ? "Inspect live diff"
+                        : "Inspect saved diff"
+                  }
+                  disabled={busy || openingResult === jobKey || checkingReturnedReview}
+                  onPress={() => openResult(true)}
+                />
+              ) : null}
+              {!terminal &&
+              !composingFeedback &&
+              selectedJob.progress?.checkpoint &&
+              viewerControls.canApprove &&
+              (manualState.status === "awaiting_review" ||
+                (canConfigure &&
+                  selectedJob.status === "finishing" &&
+                  selectedJob.progress?.retryableApproval)) ? (
+                <SettingsActionRow
+                  icon="checkmark.circle"
+                  label={
+                    approvalPending
+                      ? "Approval pending"
+                      : manualState.responsePending
+                        ? "Response pending"
+                        : selectedJob.progress?.retryableApproval
+                          ? selectedJob.status === "finishing"
+                            ? "Retry completion"
+                            : "Retry approval"
+                          : "Approve result"
+                  }
+                  disabled={
+                    busy ||
+                    reviewChanged ||
+                    checkingReturnedReview ||
+                    manualState.checkpointBlocked ||
+                    approvalPending
+                  }
+                  onPress={() => respond("approve")}
+                />
+              ) : null}
+              {!terminal &&
+              !composingFeedback &&
+              manualState.status === "awaiting_review" &&
+              viewerControls.canRespond &&
+              !approvalPending ? (
+                <SettingsActionRow
+                  icon="pencil"
+                  label="Request changes"
+                  disabled={busy || manualState.checkpointBlocked}
+                  onPress={() => setFeedbackView({ key: feedbackKey, open: true })}
+                />
+              ) : null}
+            </SettingsSection>
+          ) : null}
           {!terminal &&
           (manualState.status === "awaiting_input" || manualState.status === "awaiting_review") &&
           viewerControls.canRespond &&
           selectedJob.progress?.checkpoint &&
           !approvalPending &&
-          (manualState.status === "awaiting_input" ||
-            feedbackOpen ||
-            !!responseDrafts[selectedJob.progress.checkpoint.checkpointId]) ? (
+          (manualState.status === "awaiting_input" || feedbackOpen) ? (
             <SettingsSection
               title={manualState.status === "awaiting_input" ? "Required input" : "Request changes"}
+              trailing={
+                manualState.status !== "awaiting_input" ? (
+                  <MaterialButton
+                    tone="text"
+                    label="Back to review"
+                    onPress={() => setFeedbackView({ key: feedbackKey, open: false })}
+                  />
+                ) : undefined
+              }
             >
               <View className="gap-2 p-4">
-                <Text className="text-foreground">
-                  {selectedJob.progress?.checkpoint?.kind === "input"
-                    ? selectedJob.progress.checkpoint.question
-                    : "Feedback for the agent"}
-                </Text>
+                {selectedJob.progress?.checkpoint?.kind === "input" ? (
+                  <Text className="text-foreground">
+                    {selectedJob.progress.checkpoint.question}
+                  </Text>
+                ) : null}
                 <TextInput
                   accessibilityLabel={
                     manualState.status === "awaiting_input"
@@ -746,7 +823,7 @@ function WorkflowJobsContent(props: Props) {
                   }
                 />
                 <Text className="text-xs text-foreground-muted">
-                  Your draft is kept until the environment acknowledges it.
+                  Draft kept until acknowledged.
                 </Text>
               </View>
               <SettingsActionRow
@@ -756,7 +833,7 @@ function WorkflowJobsContent(props: Props) {
                     ? "Response pending"
                     : manualState.status === "awaiting_input"
                       ? "Submit answer"
-                      : "Request changes"
+                      : "Send changes"
                 }
                 disabled={
                   busy ||
@@ -826,7 +903,7 @@ function WorkflowJobsContent(props: Props) {
                 onPress={() => respond("retry_action")}
               />
             ) : null}
-            {selectedJob.progress?.pullRequestUrl ? (
+            {!completed && selectedJob.progress?.pullRequestUrl ? (
               <SettingsRow
                 icon="link"
                 label="Pull request"
@@ -847,7 +924,15 @@ function WorkflowJobsContent(props: Props) {
             {canConfigure && (manualState.canPause || manualState.canResume) ? (
               <SettingsActionRow
                 icon={manualState.canResume ? "play" : "pause"}
-                label={manualState.canResume ? "Resume workflow" : "Pause workflow"}
+                label={
+                  manualState.canResume
+                    ? "Resume workflow"
+                    : ["preparing", "running", "waiting_capacity"].includes(
+                          manualState.status ?? "",
+                        )
+                      ? "Pause after current step"
+                      : "Pause workflow"
+                }
                 disabled={busy}
                 onPress={() => respond(manualState.canResume ? "resume" : "pause")}
               />
@@ -898,6 +983,23 @@ function WorkflowJobsContent(props: Props) {
             />
           </SettingsSection>
           {selectedJob.workflow ? (
+            <SettingsSection title="Run progress">
+              <SettingsActionRow
+                icon={expandedProgressKey === jobKey ? "chevron.up" : "chevron.down"}
+                label={
+                  expandedProgressKey === jobKey
+                    ? "Hide workflow steps"
+                    : terminal
+                      ? "View completed workflow steps"
+                      : "View workflow steps"
+                }
+                onPress={() =>
+                  setExpandedProgressKey(expandedProgressKey === jobKey ? null : jobKey)
+                }
+              />
+            </SettingsSection>
+          ) : null}
+          {selectedJob.workflow && expandedProgressKey === jobKey ? (
             <View className="gap-3">
               {workflowZones(selectedJob.workflow.definition.steps).map((zone) => (
                 <View
@@ -929,7 +1031,15 @@ function WorkflowJobsContent(props: Props) {
                     >
                       <Text className="font-semibold text-foreground">{step.title}</Text>
                       <Text className="text-foreground-muted">
-                        {workflowStepState(selectedJob, step.id)}
+                        {workflowStepState(selectedJob, step.id) === "completed"
+                          ? "Completed"
+                          : !terminal &&
+                              (selectedJob.progress?.stepId === step.id ||
+                                checkpoint?.stepId === step.id)
+                            ? workflowStatusLabel(selectedJob.status)
+                            : workflowStepState(selectedJob, step.id) === "pending"
+                              ? "Upcoming"
+                              : workflowStatusLabel(workflowStepState(selectedJob, step.id))}
                       </Text>
                     </View>
                   ))}
@@ -1056,7 +1166,7 @@ function WorkflowJobsContent(props: Props) {
                   key={job.jobId}
                   icon="arrow.triangle.branch"
                   label={job.instruction}
-                  subtitle={`${job.originSummary?.workflowName ?? "Workflow run"}${job.originSummary?.kind === "automation" ? "\nStarted by workflow" : ""}`}
+                  subtitle={`${job.originSummary?.workflowName ?? "Workflow run"}${job.originSummary?.kind === "automation" ? "\nStarted by workflow" : ""}\nSubmitted ${new Date(job.createdAt).toLocaleString()}`}
                   value={workflowStatusLabel(job.status)}
                   valuePosition="trailing"
                   disabled={busy}

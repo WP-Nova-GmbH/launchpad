@@ -1095,6 +1095,7 @@ function WorkflowRepositoryView({
           ) : view === "run" ? (
             workflow ? (
               <WorkflowRun
+                canConfigure={canConfigure}
                 scope={scope}
                 workflow={workflow}
                 projects={projects}

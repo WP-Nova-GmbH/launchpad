@@ -1,4 +1,10 @@
-import { act, createElement, type ComponentType, type PropsWithChildren } from "react";
+import {
+  act,
+  createElement,
+  type ComponentType,
+  type PropsWithChildren,
+  type ReactNode,
+} from "react";
 import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
 import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
@@ -70,6 +76,7 @@ vi.mock(
   "../../../../mobile/node_modules/@effect/atom-react",
   async () => await vi.importActual("@effect/atom-react"),
 );
+
 vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   View: host("view"),
   Text: host("text"),
@@ -112,7 +119,8 @@ vi.mock("../../../../mobile/src/features/settings/components/SettingsScreen", ()
   SettingsScreen: host("screen"),
 }));
 vi.mock("../../../../mobile/src/features/settings/components/SettingsSection", () => ({
-  SettingsSection: host("section"),
+  SettingsSection: (props: PropsWithChildren<{ trailing?: ReactNode }>) =>
+    createElement("section", props, props.trailing, props.children),
 }));
 vi.mock("../../../../mobile/src/features/settings/components/SettingsActionRow", () => ({
   SettingsActionRow: host("action"),
@@ -253,7 +261,9 @@ async function press(label: string, waitForRead = true) {
   const before = deliveries.length;
   await act(async () => {
     renderer!.root
-      .findAll((node) => ["action", "row"].includes(String(node.type)))
+      .findAll(
+        (node) => typeof node.props.label === "string" && typeof node.props.onPress === "function",
+      )
       .find((node) => node.props.label === label)!
       .props.onPress();
   });
@@ -446,7 +456,7 @@ effectIt.layer(
     async () => {
       fixture.job.mockReturnValue(resultJob);
       await mount({ repositoryId: "A", jobId: resultJob.jobId });
-      await press("Inspect saved diff");
+      await press("Inspect result");
       expect(fixture.review).toHaveBeenCalledWith("moved-vm:thread", "turn:3");
       expect(fixture.navigate).toHaveBeenCalledWith(
         "ThreadReview",
@@ -470,10 +480,10 @@ effectIt.layer(
     fixture.job.mockReturnValue(resultJob);
     fixture.openResult.mockRejectedValueOnce(new Error("Cannot resolve result location"));
     await mount({ repositoryId: "A", jobId: resultJob.jobId });
-    await press("Inspect saved diff");
+    await press("Inspect result");
     expect(content()).toContain("Cannot resolve result location");
     expect(fixture.navigate).not.toHaveBeenCalled();
-    await press("Inspect saved diff");
+    await press("Inspect result");
     expect(fixture.navigate).toHaveBeenCalledWith(
       "ThreadReview",
       expect.objectContaining({ environmentId: "moved-vm" }),
@@ -547,6 +557,45 @@ effectIt.layer(
     await press("Inspect agent result");
     expect(fixture.navigate).toHaveBeenCalledTimes(1);
   });
+  screenTest(
+    "preserves native feedback when returning to review and keeps it closed across refresh",
+    async () => {
+      const review: RepositoryWorkflowJob = {
+        ...resultJob,
+        status: "awaiting_review",
+        progress: {
+          ...resultJob.progress!,
+          status: "awaiting_review",
+          checkpoint: {
+            checkpointId: "checkpoint",
+            turnId: "turn",
+            checkpointRef: "ref",
+            checkpointTurnCount: 3,
+            kind: "review",
+            role: "member",
+          },
+        },
+      };
+      fixture.job.mockReturnValue(review);
+      await mount({ repositoryId: "A", jobId: review.jobId });
+      await press("Request changes");
+      await act(() =>
+        renderer!.root.findByType("input").props.onChangeText("Explain the migration"),
+      );
+      expect(content()).not.toContain("Approve result");
+      await press("Back to review");
+      expect(renderer!.root.findAllByType("input")).toHaveLength(0);
+      expect(content()).toContain("Approve result");
+      const before = deliveries.length;
+      await act(() => fixture.appStateListeners.forEach((listener) => listener("active")));
+      await act(async () => {
+        await Promise.all(deliveries.slice(before));
+      });
+      expect(renderer!.root.findAllByType("input")).toHaveLength(0);
+      await press("Request changes");
+      expect(renderer!.root.findByType("input").props.value).toBe("Explain the migration");
+    },
+  );
   for (const operation of ["approve", "input", "request_changes"] as const) {
     screenTest(
       `keeps native controls blocked after a saved ${operation} until a refreshed acknowledgement`,
@@ -613,7 +662,7 @@ effectIt.layer(
                   ? "Approve result"
                   : operation === "input"
                     ? "Submit answer"
-                    : "Request changes"),
+                    : "Send changes"),
             )!
             .props.onPress();
         });
@@ -672,7 +721,7 @@ effectIt.layer(
         expect(
           renderer!.root
             .findAll((node) => String(node.type) === "action")
-            .find((node) => node.props.label === "Pause workflow")!.props.disabled,
+            .find((node) => node.props.label === "Pause after current step")!.props.disabled,
         ).toBe(false);
       },
     );

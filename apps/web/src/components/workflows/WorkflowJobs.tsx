@@ -15,6 +15,7 @@ import {
   type WorkflowScope,
   type WorkflowJobPageRequest,
 } from "@t3tools/client-runtime/relay/workflow-session";
+import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { Button } from "../ui/button";
 import { useWorkflowClient, workflowError } from "./workflowState";
 
@@ -139,7 +140,9 @@ export function WorkflowJobs({
       <p className="text-xs text-muted-foreground">
         {view === "history"
           ? "Completed runs, newest first."
-          : "Active runs, oldest first. Load more to see further runs."}
+          : view === "attention"
+            ? "Runs needing attention, oldest first."
+            : "Active runs, oldest first. Load more to see further runs."}
       </p>
       {page.error ? (
         <WorkflowAlert
@@ -183,6 +186,11 @@ export function WorkflowJobs({
             {job.originSummary?.kind === "automation" ? (
               <p className="text-xs text-muted-foreground">Started by workflow</p>
             ) : null}
+            <p className="text-xs text-muted-foreground">
+              <time dateTime={job.createdAt}>
+                Submitted {formatRelativeTimeLabel(job.createdAt)}
+              </time>
+            </p>
             {job.detail ? <p className="text-xs text-muted-foreground">{job.detail}</p> : null}
           </div>
           <span className="text-xs font-medium">{workflowStatusLabel(job.status)}</span>

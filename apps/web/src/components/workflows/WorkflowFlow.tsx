@@ -16,7 +16,10 @@ import {
   type WorkflowDefinition,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
-import { workflowStepState } from "@t3tools/client-runtime/relay/workflow-session";
+import {
+  workflowStepState,
+  workflowStatusLabel,
+} from "@t3tools/client-runtime/relay/workflow-session";
 import { Button } from "../ui/button";
 
 export function WorkflowFlow({
@@ -105,9 +108,13 @@ export function WorkflowFlow({
                       </span>
                       <span className="block text-xs text-muted-foreground">
                         {job
-                          ? state === "pending"
-                            ? "Upcoming"
-                            : state
+                          ? state === "completed"
+                            ? "Completed"
+                            : current
+                              ? workflowStatusLabel(job.status)
+                              : state === "pending"
+                                ? "Upcoming"
+                                : workflowStatusLabel(state)
                           : step.kind === "agent"
                             ? "Agent"
                             : step.kind === "action"

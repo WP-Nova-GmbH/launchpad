@@ -8,6 +8,9 @@ import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
 import {
   recordWorkflowReviewDiff,
+  updateWorkflowDrafts,
+  workflowDraftAtom,
+  workflowSessionKey,
   setWorkflowSessionAccount,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry";
@@ -33,6 +36,7 @@ vi.mock("./workflowState", async () => ({
   ...(await vi.importActual("./workflowState")),
   useWorkflowClient: () => fixture.call,
 }));
+
 vi.mock("./WorkflowFlow", () => ({ WorkflowFlow: () => null }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
@@ -110,7 +114,7 @@ async function press(label: string) {
   await act(async () => {
     renderer!.root
       .findAllByType("button")
-      .find((button) => button.props.children === label)!
+      .find((button) => button.props["aria-label"] === label || button.props.children === label)!
       .props.onClick();
   });
 }
@@ -275,7 +279,7 @@ describe("workflow result location navigation", () => {
 
   it("opens conversation and the original saved turn at the current destination", async () => {
     await mount();
-    await press("Inspect saved diff");
+    await press("Inspect result");
     expect(fixture.select).toHaveBeenCalledWith(
       { environmentId: "moved-vm", threadId: "thread" },
       "saved-turn",
@@ -302,11 +306,11 @@ describe("workflow result location navigation", () => {
   it("keeps a failed location lookup visible and retries without opening a stale route", async () => {
     fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));
     await mount();
-    await press("Inspect saved diff");
+    await press("Inspect result");
     expect(text(renderer!.toJSON())).toContain("Location unavailable");
     expect(fixture.navigate).not.toHaveBeenCalled();
     expect(fixture.select).not.toHaveBeenCalled();
-    await press("Inspect saved diff");
+    await press("Inspect result");
     expect(fixture.navigate).toHaveBeenCalledTimes(1);
   });
   it("clears a failed result lookup when another run is selected", async () => {
@@ -381,5 +385,78 @@ describe("workflow result location navigation", () => {
       await reply.promise;
     });
     expect(fixture.navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("workflow run presentation", () => {
+  const review: RepositoryWorkflowJob = {
+    ...job,
+    status: "awaiting_review",
+    progress: {
+      ...job.progress!,
+      status: "awaiting_review",
+      checkpoint: {
+        checkpointId: "checkpoint",
+        turnId: "saved-turn",
+        checkpointRef: "ref",
+        checkpointTurnCount: 3,
+        kind: "review",
+        role: "member",
+      },
+    },
+    viewerControls: { canApprove: true, canRespond: true, canCancel: true },
+  };
+  it("returns to review without losing feedback, stays closed on refresh, and restores it on request", async () => {
+    fixture.call.mockResolvedValue(review);
+    await mount();
+    await press("Request changes");
+    await act(() =>
+      renderer!.root
+        .findByType("textarea")
+        .props.onChange({ target: { value: "Add a regression test" } }),
+    );
+    expect(text(renderer!.toJSON())).not.toContain("Approve result");
+    await press("Back to review");
+    expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
+    expect(text(renderer!.toJSON())).toContain("Approve result");
+    await press("Refresh run");
+    expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
+    await press("Request changes");
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Add a regression test");
+    expect(fixture.call).toHaveBeenCalledTimes(2);
+  });
+  it("reopens a retained draft for a new checkpoint instead of inheriting the previous Back choice", async () => {
+    const key = workflowSessionKey(scope, job.jobId);
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      responses: { [key]: { checkpoint: "First draft", next: "Next review feedback" } },
+    }));
+    fixture.call.mockResolvedValue(review);
+    await mount();
+    await press("Back to review");
+    fixture.call.mockResolvedValue({
+      ...review,
+      progress: {
+        ...review.progress!,
+        revision: 4,
+        checkpoint: { ...review.progress!.checkpoint!, checkpointId: "next" },
+      },
+    });
+    await press("Refresh run");
+    expect(
+      renderer!.root
+        .findAllByType("textarea")
+        .some((node) => node.props.value === "Next review feedback"),
+    ).toBe(true);
+    expect(appAtomRegistry.get(workflowDraftAtom).responses[key]?.checkpoint).toBe("First draft");
+  });
+  it("explains an accepted queued run without displaying a speculative step plan", async () => {
+    fixture.call.mockResolvedValue({ ...job, status: "queued", progress: null, workflow: null });
+    await mount();
+    expect(text(renderer!.toJSON())).toContain("Waiting for execution");
+    expect(text(renderer!.toJSON())).toContain("No steps have started");
+    expect(
+      renderer!.root.findAll((node) => node.props["aria-label"] === "Run progress"),
+    ).toHaveLength(0);
   });
 });

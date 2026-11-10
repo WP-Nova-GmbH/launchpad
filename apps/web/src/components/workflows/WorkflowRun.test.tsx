@@ -349,7 +349,7 @@ describe("VM Run submission recovery", () => {
     act(async () => {
       renderer!.root
         .findAllByType("button")
-        .find((node) => node.props.children === label)!
+        .find((node) => visibleText(node).replace(/\s+/g, " ").trim() === label)!
         .props.onClick();
     });
 
@@ -391,7 +391,7 @@ describe("VM Run submission recovery", () => {
         await press("Retry previous submission");
         expect(runWorkflow.mock.calls[1]![0].payload).toEqual(original);
       } else {
-        await press("Check recent runs");
+        await press("Check runs");
         expect(runWorkflow).toHaveBeenCalledOnce();
         expect(navigate).toHaveBeenCalledExactlyOnceWith({
           to: "/workflows/$repositoryId",
@@ -466,7 +466,7 @@ describe("VM Run submission recovery", () => {
 
       expect(renderer!.root.findAllByType("form")).toHaveLength(0);
       expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
-      await press("Check recent runs");
+      await press("Check runs");
       expect(navigate).toHaveBeenCalledExactlyOnceWith({
         to: "/workflows/$repositoryId",
         params: { repositoryId: scope.repositoryId },
@@ -814,5 +814,51 @@ describe("Ownership invalidation before passive cleanup", () => {
     expect(navigate).not.toHaveBeenCalled();
     if (kind === "confirmation") expect(read).not.toHaveBeenCalled();
     else expect(draft().startedJobId).toBe(job.jobId);
+  });
+});
+
+describe("saved workflow run context", () => {
+  it("keeps the run draft while opening unsaved definition changes for review", async () => {
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      editors: {
+        [key]: {
+          workflowId: workflow.workflowId,
+          definition: { ...workflow.definition, name: "Unsaved name" },
+          baseline: workflow,
+          selectedStepId: "agent",
+          targetConfirmed: true,
+          operation: null,
+          error: null,
+        },
+      },
+    }));
+    await mount({ ...base, canConfigure: true });
+    expect(alertText()).toContain("Your draft changes are not included");
+    expect(visibleText(renderer!.root).replace(/\s+/g, " ")).toContain("Run Workflow A");
+    await act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => visibleText(button) === "Review draft")!
+        .props.onClick(),
+    );
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
+    );
+    expect(draft().instruction).toBe("Run A");
+  });
+  it("shows one recovery alert with the captured submission separate from newer instructions", async () => {
+    read.mockRejectedValueOnce(new Error("Reply lost"));
+    await mount();
+    await submit();
+    await edit("Newer draft");
+    const alerts = renderer!.root.findAll(
+      (node) => typeof node.type === "string" && node.props.role === "alert",
+    );
+    expect(alerts).toHaveLength(1);
+    expect(visibleText(alerts[0]!)).toContain("Previously submitted instructions");
+    expect(visibleText(alerts[0]!)).toContain("Run A");
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Newer draft");
+    expect(draft().operation?.instruction).toBe("Run A");
   });
 });
