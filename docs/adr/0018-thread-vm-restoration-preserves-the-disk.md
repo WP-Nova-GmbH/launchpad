@@ -65,9 +65,11 @@ disks without that retention period or a final recovery save. Its confirmation m
 that VM-only work is lost; retaining a recoverable conversation is the purpose of archive.
 Conversation history and the provider state required to resume it must be preserved separately
 from the expiring disk, so **Reset VM** can recreate the workspace while retaining the agent
-conversation. Uploaded screenshots and file attachments follow the thread's lifetime and remain
-readable under its access rules after disk expiry; keeping only message text would leave the
-conversation incomplete. This requires independent attachment storage as well as verified
+conversation. Uploaded screenshots, file attachments and saved workflow results follow the
+thread's lifetime and remain readable under its access rules after disk expiry. Earlier reviewed
+versions remain part of that history after rework; permanent thread deletion removes them.
+Keeping only message text would leave the work history incomplete. This requires independent
+attachment and result storage as well as verified
 provider-specific transfer support; existing resume
 cursors alone do not establish portability. Workspace data stored only on the saved disk is
 no longer recoverable after expiry. The initial Git baseline has independent thread-lifetime

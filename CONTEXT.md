@@ -125,6 +125,10 @@ requirement.
 **Review checkpoint**:
 A human checkpoint for approving prepared work or requesting changes to it.
 
+**Workflow result**:
+A job's preserved file changes from an Agent turn, including partial work captured after failure
+or cancellation. It belongs to the thread's work history, distinct from a recoverable VM disk.
+
 **Input checkpoint**:
 A human checkpoint for supplying information required by later steps.
 

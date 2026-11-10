@@ -53,6 +53,8 @@ import {
   WorkflowInvalidError,
   WorkflowSubmissionPendingError,
   WorkflowVmDispatchBinding,
+  WorkflowSavedResult,
+  WorkflowSaveReceipt,
 } from "./workflows.ts";
 import {
   RepositoryPolicyProof,
@@ -3727,6 +3729,34 @@ export type RelayThreadArtifactReceipt = typeof RelayThreadArtifactReceipt.Type;
 /** Upload bytes with an environment credential; clients never receive private storage URLs. */
 const RelayThreadArtifactsGroup = HttpApiGroup.make("threadArtifacts")
   .add(
+    HttpApiEndpoint.post(
+      "reserveWorkflowResult",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/result-reservation",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          publicationId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: RelayThreadArtifactId,
+        }),
+        success: Schema.Void,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "publishWorkflowResult",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/result",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          publicationId: RelayThreadArtifactId,
+          manifestArtifactId: RelayThreadArtifactId,
+        }),
+        success: WorkflowSaveReceipt,
+        error: RelayTenancyErrors,
+      },
+    ),
     HttpApiEndpoint.put(
       "upload",
       "/v1/environments/:environmentId/threads/:threadId/artifacts/:artifactId",
@@ -4336,6 +4366,79 @@ const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
         headers: RelayBearerRequestHeaders,
         params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
         success: RelayAssignedWorkflowThreadPlacement,
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.get(
+      "listSavedResults",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/saved-results",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+        query: Schema.Struct({
+          before: Schema.optionalKey(
+            Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThan(0)),
+          ),
+        }),
+        success: Schema.Struct({
+          results: Schema.Array(WorkflowSavedResult),
+          nextCursor: Schema.NullOr(Schema.Int),
+          threadId: ThreadId,
+          generation: Schema.Int,
+        }),
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.get(
+      "getSavedHistory",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/saved-results/:resultId/history",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({
+          repositoryId: RelayRepositoryId,
+          jobId: TrimmedNonEmptyString,
+          resultId: RelayThreadArtifactId,
+        }),
+        query: Schema.Struct({
+          after: Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0)),
+          limit: Schema.NumberFromString.check(
+            Schema.isInt(),
+            Schema.isBetween({ minimum: 1, maximum: 200 }),
+          ),
+        }),
+        success: RelayThreadHistoryPage,
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.get(
+      "getSavedAttachment",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/saved-results/:resultId/attachments/:attachmentId",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({
+          repositoryId: RelayRepositoryId,
+          jobId: TrimmedNonEmptyString,
+          resultId: RelayThreadArtifactId,
+          attachmentId: TrimmedNonEmptyString.check(
+            Schema.isMaxLength(128),
+            Schema.isPattern(/^[a-z0-9_-]+$/iu),
+          ),
+        }),
+        success: HttpApiSchema.StreamUint8Array({ contentType: "application/octet-stream" }),
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.get(
+      "readSavedResult",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/saved-results/:resultId",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({
+          repositoryId: RelayRepositoryId,
+          jobId: TrimmedNonEmptyString,
+          resultId: RelayThreadArtifactId,
+        }),
+        success: Schema.Struct({ result: WorkflowSavedResult, patch: Schema.String }),
         error: WorkflowErrors,
       },
     ),

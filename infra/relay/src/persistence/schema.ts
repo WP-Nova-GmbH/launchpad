@@ -4,6 +4,8 @@ import type {
   RepositoryWorkflowJob,
   RepositoryWorkflowJobSummary,
   RespondToWorkflowJob,
+  WorkflowSavedResult,
+  WorkflowRecoveryManifest,
 } from "@t3tools/contracts/workflows";
 import type {
   RelayAgentActivityAggregateState,
@@ -40,6 +42,44 @@ import {
   uniqueIndex,
   varchar,
 } from "drizzle-orm/pg-core";
+
+export const relayWorkflowSavedResults = pgTable(
+  "relay_workflow_saved_results",
+  {
+    resultId: text("result_id").primaryKey(),
+    jobId: text("job_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    turnId: text("turn_id").notNull(),
+    revision: integer("revision").notNull(),
+    result: jsonb("result").notNull().$type<WorkflowSavedResult>(),
+    nativeCheckpointOperationId: text("native_checkpoint_operation_id").notNull(),
+  },
+  (t) => [
+    uniqueIndex("workflow_saved_result_turn").on(t.jobId, t.turnId),
+    uniqueIndex("workflow_saved_result_order").on(t.jobId, t.revision),
+  ],
+);
+
+export const relayWorkflowRecoveryRecords = pgTable(
+  "relay_workflow_recovery_records",
+  {
+    publicationId: text("publication_id").primaryKey(),
+    jobId: text("job_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    revision: integer("revision").notNull(),
+    manifestArtifactId: text("manifest_artifact_id").notNull(),
+    manifestSha256: text("manifest_sha256").notNull(),
+    manifestSizeBytes: integer("manifest_size_bytes").notNull(),
+    manifest: jsonb("manifest").notNull().$type<WorkflowRecoveryManifest>(),
+  },
+  (t) => [uniqueIndex("workflow_recovery_revision").on(t.jobId, t.revision)],
+);
+
+export const relayWorkflowRecoveryHeads = pgTable("relay_workflow_recovery_heads", {
+  jobId: text("job_id").primaryKey(),
+  publicationId: text("publication_id").notNull(),
+  revision: integer("revision").notNull(),
+});
 
 // A moved VM finishes the move importer, not initial repository setup. Lifecycle
 // and connection readers use the same derived receipt for either activation path.
@@ -2550,7 +2590,12 @@ export const relayThreadDeletions = pgTable(
       .primaryKey()
       .references(() => relayThreadPlacements.threadId),
     operationId: varchar("operation_id", { length: 191 }).notNull().unique(),
-    ownerUserId: varchar("owner_user_id", { length: 191 }).notNull(),
+    ownerUserId: varchar("owner_user_id", { length: 191 }),
+    requesterUserId: varchar("requester_user_id", { length: 191 }).notNull(),
+    audience: varchar("audience", { length: 16 }).notNull().default("private"),
+    organizationId: text("organization_id"),
+    repositoryId: text("repository_id"),
+    workflowJobId: text("workflow_job_id"),
     generation: integer("generation").notNull(),
     hostId: varchar("host_id", { length: 191 }).notNull(),
     phase: varchar("phase", { length: 16 })

@@ -149,6 +149,7 @@ try {
       detachedWorkloadStopped: true,
       unrelatedWorkloadPreserved: true,
       setupOwnerVerified: true,
+      workflowRecoveryInspectionVerified: true,
       nativeCodexPeerVerified: true,
       otherCodexPeersDenied: true,
       privateCheckpointReaderVerified: true,

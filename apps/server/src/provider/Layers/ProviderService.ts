@@ -2,9 +2,10 @@ import { ownershipReleased } from "../../jobs/workflowOwnership.ts";
 import { ProviderEventBarrier, type ProviderIngestionEvent } from "../ProviderEventBarrier.ts";
 import { exportUnstartedPortableCodexConversation } from "../Drivers/PortableCodexHome.ts";
 import { assertThreadTransferRuntime } from "../../persistence/ThreadTransferRuntime.ts";
-import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import { VmControlSpawner, VmWorkloadTracking, WorkflowVmGuest } from "../../vmWorkloadCommand.ts";
 import {
   inspectVmWorkloads,
+  inspectWorkflowVmRecovery,
   VmWorkloadError,
   type VmHarnessStopAdmission,
 } from "../../vmWorkload.ts";
@@ -28,12 +29,16 @@ import { ChildProcessSpawner } from "effect/unstable/process";
  * @module ProviderServiceLive
  */
 import { CodexResumeCursorSchema } from "./CodexSessionRuntime.ts";
-import { makeThreadAttachmentCheckpoint } from "../../relay/ThreadAttachmentCheckpoint.ts";
+import {
+  makeThreadAttachmentCheckpoint,
+  ThreadAttachmentCheckpointError,
+} from "../../relay/ThreadAttachmentCheckpoint.ts";
 import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
 import { workflowVmSecretMask } from "../workflowVmSecretMask.ts";
 import {
   makeThreadNativeCheckpoint,
   digestNativeCheckpointArchive,
+  ThreadNativeCheckpointError,
 } from "../../relay/ThreadNativeCheckpoint.ts";
 import { collectThreadAttachmentReferences } from "../../relay/ThreadAttachmentReferences.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
@@ -62,6 +67,7 @@ import {
   ProviderUploadFeedbackInput,
   ThreadId,
   TurnId,
+  ThreadPromptQueue,
   type ProjectId,
   type ProviderInstanceId,
   type ProviderDriverKind,
@@ -90,7 +96,14 @@ import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
 
-import { workflowPromptId, workflowAllowsPrompt } from "../../jobs/workflowSequence.ts";
+import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import {
+  activeWorkflowStep,
+  admittedWorkflowTurnId,
+  canRecoverPausedWorkflowTurn,
+  workflowPromptId,
+  workflowAllowsPrompt,
+} from "../../jobs/workflowSequence.ts";
 import { WorkflowRunStore } from "../../jobs/WorkflowRunStore.ts";
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -135,6 +148,8 @@ import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 const isModelSelection = Schema.is(ModelSelection);
+const sameWorkflowVmBinding = Schema.toEquivalence(WorkflowVmDispatchBinding);
+const decodeCaptureQueue = Schema.decodeUnknownEffect(Schema.fromJsonString(ThreadPromptQueue));
 const ProviderContinuationMetadata = Schema.Struct({
   continuationKey: Schema.String,
   workflowJobId: Schema.optional(Schema.String),
@@ -159,6 +174,13 @@ const decodeStoppedVmPayload = Schema.decodeUnknownOption(
     workflowVmCancellation: Schema.optional(WorkflowVmCancellationProof),
   }),
 );
+const hasDrainedWorkflowWriter = (
+  binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
+) =>
+  binding?.status === "stopped" &&
+  !!readContinuation(binding.runtimePayload)?.runtimeEpisode &&
+  Option.getOrUndefined(decodeStoppedVmPayload(binding.runtimePayload))
+    ?.stoppedRuntimeEventsDrained === true;
 
 interface SnapShotPromptAccessibilityNode {
   readonly role: string;
@@ -545,6 +567,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   options?: ProviderServiceLiveOptions,
 ) {
   const vmWorkloads = yield* VmWorkloadTracking;
+  const workflowGuest = yield* WorkflowVmGuest;
   const processSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const controlSpawner = yield* VmControlSpawner;
   const cancellationSeals = new Map<string, { readonly bootId: string; readonly epoch: number }>();
@@ -701,6 +724,96 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     return policy;
   });
+  const recoverStoppedWorkflowVmOwner = Effect.fn("ProviderService.recoverStoppedWorkflowVmOwner")(
+    function* (
+      threadId: ThreadId,
+      binding: ProviderSessionDirectory.ProviderRuntimeBinding,
+      policy: ProviderService.WorkflowProviderContinuation,
+    ) {
+      const invalid = () =>
+        toValidationError(
+          "provider.continuation",
+          "The previous workflow VM runtime could not be confirmed stopped after the controller restarted.",
+        );
+      if (!workflowGuest || !vmWorkloads || Option.isNone(secretStore)) return yield* invalid();
+      const metadata = readContinuation(binding.runtimePayload);
+      if (!hasDrainedWorkflowWriter(binding) || !metadata?.runtimeEpisode) return yield* invalid();
+      const cursor = yield* decodeCheckpointCursor(binding.resumeCursor).pipe(
+        Effect.mapError(invalid),
+      );
+      if (!cursor.threadId) return yield* invalid();
+      const vm = yield* readInstalledThreadVm().pipe(
+        Effect.provideService(ServerSecretStore, secretStore.value),
+        Effect.mapError(invalid),
+      );
+      const authorize = Effect.fnUntraced(function* () {
+        const run = yield* workflows.get(policy.jobId);
+        const fence = yield* makeThreadExecutionFence(checkpointSql).get(threadId);
+        const current = Option.getOrUndefined(yield* directory.getBinding(threadId));
+        const continuation = readContinuation(current?.runtimePayload);
+        if (
+          !vm ||
+          !run ||
+          run.runtime.kind !== "vm" ||
+          run.workflow.definition.target.kind !== "vm" ||
+          run.progress.threadId !== threadId ||
+          run.runtime.threadId !== threadId ||
+          run.runtime.jobId !== run.jobId ||
+          run.runtime.organizationId !== run.workflow.organizationId ||
+          run.runtime.repositoryId !== run.workflow.repositoryId ||
+          run.modelSelection.instanceId !== binding.providerInstanceId ||
+          !run.executionReserved ||
+          run.cancellationAttempt ||
+          !["preparing", "running"].includes(run.progress.status) ||
+          run.providerContinuation?.driver !== "codex" ||
+          run.providerContinuation.continuationKey !== policy.continuationKey ||
+          binding.provider !== "codex" ||
+          metadata.workflowJobId !== run.jobId ||
+          metadata.continuationKey !== policy.continuationKey ||
+          vm.scope.threadId !== threadId ||
+          vm.scope.allocationId !== run.runtime.allocationId ||
+          vm.scope.repositoryId !== run.runtime.repositoryId ||
+          vm.scope.generation !== run.runtime.generation ||
+          vm.environmentId !== run.runtime.environmentId ||
+          vm.operationId !== run.runtime.operationId ||
+          !fence ||
+          fence.phase !== "active" ||
+          fence.environmentId !== run.runtime.environmentId ||
+          fence.projectId !== run.runtime.projectId ||
+          fence.generation !== run.runtime.generation ||
+          fence.operationId !== run.runtime.operationId ||
+          fence.relayUrl !== vm.relayUrl ||
+          !current ||
+          current.provider !== binding.provider ||
+          current.providerInstanceId !== binding.providerInstanceId ||
+          !hasDrainedWorkflowWriter(current) ||
+          !continuation ||
+          continuation.runtimeEpisode !== metadata.runtimeEpisode ||
+          continuation.workflowJobId !== policy.jobId ||
+          continuation.continuationKey !== policy.continuationKey ||
+          !NodeUtil.isDeepStrictEqual(current.resumeCursor, binding.resumeCursor) ||
+          Predicate.hasProperty(current.runtimePayload, "workflowVmCancellation")
+        )
+          return yield* invalid();
+        return { runtime: run.runtime, prompt: workflowPromptId(run) };
+      });
+      const before = yield* authorize();
+      yield* inspectWorkflowVmRecovery().pipe(
+        Effect.provideService(VmControlSpawner, controlSpawner),
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, processSpawner),
+      );
+      const after = yield* authorize();
+      if (!sameWorkflowVmBinding(before.runtime, after.runtime) || before.prompt !== after.prompt)
+        return yield* invalid();
+    },
+    Effect.mapError((cause) =>
+      toValidationError(
+        "provider.continuation",
+        "The previous workflow VM runtime could not be confirmed stopped after the controller restarted.",
+        cause,
+      ),
+    ),
+  );
   const requireRecoverableOwner = Effect.fnUntraced(function* (
     threadId: ThreadId,
     binding: ProviderSessionDirectory.ProviderRuntimeBinding | undefined,
@@ -710,6 +823,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     if (!policy || !binding) return;
     const owners = Array.from(sessionOwners.get(threadId)?.values() ?? []);
     if (owners.length === 0 && verifiedShutdown(readContinuation(binding.runtimePayload))) return;
+    const previousEpisode = readContinuation(binding.runtimePayload)?.runtimeEpisode;
+    if (
+      workflowGuest &&
+      owners.every(
+        (owner) =>
+          owner.runtimeEpisode === acquiringEpisode &&
+          acquiringEpisode !== undefined &&
+          owner.runtimeEpisode !== previousEpisode,
+      )
+    )
+      return yield* recoverStoppedWorkflowVmOwner(threadId, binding, policy);
     if (owners.length === 0)
       return yield* toValidationError(
         "provider.continuation",
@@ -780,21 +904,39 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     runtimeEpisode: string,
   ) {
     // Invalidate old proof before this exact native episode can spawn.
-    yield* directory.upsert({
-      threadId,
-      provider: route.driverKind,
-      providerInstanceId: route.instanceId,
-      runtimeMode,
-      ...(binding ? {} : { status: "starting" as const }),
-      runtimePayload: {
-        providerContinuation: {
-          continuationKey: route.continuationIdentity.continuationKey,
-          ...(policy ? { workflowJobId: policy.jobId } : {}),
-          runtimeEpisode,
-          shutdownConfirmed: false,
+    const vmClaim = workflowGuest && policy !== undefined;
+    const previousEpisode = readContinuation(binding?.runtimePayload)?.runtimeEpisode;
+    yield* directory.upsert(
+      {
+        threadId,
+        provider: route.driverKind,
+        providerInstanceId: route.instanceId,
+        runtimeMode,
+        ...(vmClaim || !binding ? { status: "starting" as const } : {}),
+        runtimePayload: {
+          ...(vmClaim ? { stoppedRuntimeEventsDrained: false, activeTurnId: null } : {}),
+          providerContinuation: {
+            continuationKey: route.continuationIdentity.continuationKey,
+            ...(policy ? { workflowJobId: policy.jobId } : {}),
+            runtimeEpisode,
+            shutdownConfirmed: false,
+          },
         },
       },
-    });
+      vmClaim && previousEpisode ? { expectedRuntimeEpisode: previousEpisode } : undefined,
+    );
+    if (vmClaim) {
+      const current = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      if (
+        current?.provider !== route.driverKind ||
+        current.providerInstanceId !== route.instanceId ||
+        readContinuation(current.runtimePayload)?.runtimeEpisode !== runtimeEpisode
+      )
+        return yield* toValidationError(
+          "provider.continuation",
+          "Workflow runtime ownership changed before native startup.",
+        );
+    }
   });
   const beforeRuntimeStart = (
     threadId: ThreadId,
@@ -817,57 +959,63 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const owner = rememberSession(threadId, route, runtimeEpisode);
         onStarting?.(owner);
         return Effect.gen(function* () {
-          const currentRoute = yield* registry.resolveInstance(route.instanceId);
-          if (currentRoute.adapter !== route.adapter)
-            return yield* toValidationError(
-              "provider.continuation",
-              "The provider instance changed before session startup.",
+          const claim = Effect.gen(function* () {
+            const currentRoute = yield* registry.resolveInstance(route.instanceId);
+            if (currentRoute.adapter !== route.adapter)
+              return yield* toValidationError(
+                "provider.continuation",
+                "The provider instance changed before session startup.",
+              );
+            const currentBinding =
+              Option.getOrUndefined(yield* directory.getBinding(threadId)) ?? binding;
+            const currentPolicy = yield* validateContinuation(
+              threadId,
+              currentBinding,
+              currentRoute,
+              initialAcquisition ? expected : undefined,
             );
-          const currentBinding =
-            Option.getOrUndefined(yield* directory.getBinding(threadId)) ?? binding;
-          const currentPolicy = yield* validateContinuation(
-            threadId,
-            currentBinding,
-            currentRoute,
-            initialAcquisition ? expected : undefined,
-          );
-          if (currentPolicy?.jobId !== policy?.jobId) {
-            const released =
-              !initialAcquisition && !currentPolicy && policy
-                ? yield* workflows.get(policy.jobId)
-                : null;
-            if (
-              !released ||
-              released.progress.threadId !== threadId ||
-              !ownershipReleased(released)
-            )
-              return yield* toValidationError(
-                "provider.continuation",
-                "Workflow ownership changed before session startup.",
-              );
-          }
-          if (currentPolicy) {
-            const run = yield* workflows.get(currentPolicy.jobId);
-            if (!run || run.progress.status === "cancelling" || ownershipReleased(run))
-              return yield* toValidationError(
-                "provider.continuation",
-                "The workflow no longer admits native acquisition.",
-              );
-          }
-          yield* requireRecoverableOwner(
-            threadId,
-            currentBinding,
-            currentPolicy ?? policy,
-            runtimeEpisode,
-          );
-          yield* beginWorkflowRuntime(
-            threadId,
-            currentBinding,
-            currentRoute,
-            currentPolicy,
-            runtimeMode,
-            runtimeEpisode,
-          );
+            if (currentPolicy?.jobId !== policy?.jobId) {
+              const released =
+                !initialAcquisition && !currentPolicy && policy
+                  ? yield* workflows.get(policy.jobId)
+                  : null;
+              if (
+                !released ||
+                released.progress.threadId !== threadId ||
+                !ownershipReleased(released)
+              )
+                return yield* toValidationError(
+                  "provider.continuation",
+                  "Workflow ownership changed before session startup.",
+                );
+            }
+            if (currentPolicy) {
+              const run = yield* workflows.get(currentPolicy.jobId);
+              if (!run || run.progress.status === "cancelling" || ownershipReleased(run))
+                return yield* toValidationError(
+                  "provider.continuation",
+                  "The workflow no longer admits native acquisition.",
+                );
+            }
+            yield* requireRecoverableOwner(
+              threadId,
+              currentBinding,
+              currentPolicy ?? policy,
+              runtimeEpisode,
+            );
+            yield* beginWorkflowRuntime(
+              threadId,
+              currentBinding,
+              currentRoute,
+              currentPolicy,
+              runtimeMode,
+              runtimeEpisode,
+            );
+            return currentPolicy;
+          });
+          // Protect the authoritative ownership check and episode claim together.
+          // MCP setup and output ingestion must run after the SQL writer is released.
+          const currentPolicy = yield* workflowGuest ? checkpointSql.withTransaction(claim) : claim;
           const preparation = prepareMcpSession(threadId, route.instanceId);
           const credential = yield* initialAcquisition && invocation
             ? rejectOnPreflightFailure(invocation, preparation)
@@ -890,7 +1038,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 issue: cause.message,
               }),
           ),
-          Effect.onError(() => clearMcpSession(threadId, owner.mcpProviderSessionId)),
+          Effect.onError(() =>
+            Effect.gen(function* () {
+              const current = Option.getOrUndefined(yield* directory.getBinding(threadId));
+              if (
+                workflowGuest &&
+                readContinuation(current?.runtimePayload)?.runtimeEpisode !== runtimeEpisode
+              ) {
+                // A rejected pre-start placeholder never owned a native process.
+                // Retire it so it cannot hide the prior stopped episode from cancellation.
+                yield* clearCapturedOwners(threadId, [owner]);
+              } else {
+                yield* clearMcpSession(threadId, owner.mcpProviderSessionId);
+              }
+            }).pipe(Effect.ignoreCause({ log: true })),
+          ),
         );
       });
   };
@@ -3221,6 +3383,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             "The original workflow runtime identity cannot be verified for cleanup.",
           );
         const owners = Array.from(sessionOwners.get(input.threadId)?.values() ?? []);
+        const coldVmWriter =
+          workflowGuest && owners.length === 0 && hasDrainedWorkflowWriter(binding);
         if (vmWorkloads && metadata?.workflowJobId && verifiedShutdown(metadata)) {
           const stopped =
             binding && Option.getOrUndefined(decodeStoppedVmPayload(binding.runtimePayload));
@@ -3334,11 +3498,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             currentMetadata?.runtimeEpisode !== metadata.runtimeEpisode ||
             currentMetadata.continuationKey !== metadata.continuationKey ||
             currentMetadata.workflowJobId !== cancellingVm.jobId ||
-            !owners.some(
-              (owner) =>
-                owner.runtimeEpisode === metadata.runtimeEpisode &&
-                owner.instanceId === binding.providerInstanceId &&
-                owner.continuationKey === metadata.continuationKey,
+            !(
+              owners.some(
+                (owner) =>
+                  owner.runtimeEpisode === metadata.runtimeEpisode &&
+                  owner.instanceId === binding.providerInstanceId &&
+                  owner.continuationKey === metadata.continuationKey,
+              ) ||
+              (coldVmWriter &&
+                hasDrainedWorkflowWriter(currentBinding) &&
+                NodeUtil.isDeepStrictEqual(currentBinding?.resumeCursor, binding.resumeCursor))
             )
           )
             return yield* toValidationError(
@@ -3492,7 +3661,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               owner.writerEventsDrained ||= owner.adapter.drainRuntimeEvents !== undefined;
             }
           }
-        } else if (strictOwner && !verifiedShutdown(metadata)) {
+        } else if (
+          strictOwner &&
+          !verifiedShutdown(metadata) &&
+          !(cancellationProof && coldVmWriter)
+        ) {
           return yield* toValidationError(
             "ProviderService.stopSession",
             "The original provider runtime ownership was lost after restart. Cleanup remains blocked.",
@@ -3963,6 +4136,370 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     },
   );
 
+  const flushRuntimeEvents: NonNullable<ProviderServiceMethod<"flushRuntimeEvents">> =
+    Effect.fnUntraced(
+      function* (threadId: ThreadId) {
+        const binding = yield* directory.getBinding(threadId);
+        const stoppedAndDrained =
+          Option.isSome(binding) &&
+          binding.value.status === "stopped" &&
+          binding.value.runtimePayload !== null &&
+          typeof binding.value.runtimePayload === "object" &&
+          "stoppedRuntimeEventsDrained" in binding.value.runtimePayload &&
+          binding.value.runtimePayload.stoppedRuntimeEventsDrained === true;
+        if (Option.isSome(binding) && !stoppedAndDrained) {
+          const instanceId = yield* requireBindingInstanceId(
+            "ProviderService.flushRuntimeEvents",
+            binding.value,
+          );
+          const adapter = yield* registry.getByInstance(instanceId);
+          if (!adapter.drainRuntimeEvents)
+            return yield* new ProviderValidationError({
+              operation: "ProviderService.flushRuntimeEvents",
+              issue: "This adapter cannot confirm stopped output.",
+            });
+          yield* adapter.drainRuntimeEvents(threadId);
+        }
+        const done = yield* Deferred.make<void, ProviderValidationError>();
+        yield* PubSub.publish(runtimeEventPubSub, new ProviderEventBarrier(threadId, done));
+        yield* Deferred.await(done);
+      },
+      Effect.timeout("30 seconds"),
+      Effect.mapError(
+        (cause) =>
+          new ProviderValidationError({
+            operation: "ProviderService.flushRuntimeEvents",
+            issue: "Stopped provider output has not finished ingestion.",
+            cause,
+          }),
+      ),
+    );
+
+  const captureConversation = Effect.fn("ProviderService.captureConversation")(function* (
+    input: Parameters<NonNullable<ProviderServiceMethod<"checkpointConversation">>>[0],
+    workflow?: {
+      authorize: Effect.Effect<void, ProviderValidationError>;
+      nativeThreadId: string;
+      cwd: string;
+    },
+  ) {
+    return yield* nativeCheckpoints
+      .capture(
+        {
+          ...input,
+          artifactRoot: pathService.join(serverConfig.stateDir, "native-checkpoints"),
+          ...(workflow
+            ? {
+                authorize: workflow.authorize.pipe(
+                  Effect.mapError(
+                    () =>
+                      new ThreadNativeCheckpointError({
+                        message: "Workflow capture ownership changed.",
+                      }),
+                  ),
+                ),
+              }
+            : {}),
+        },
+        (artifactRoot) =>
+          Effect.gen(function* () {
+            const routed = yield* resolveRoutableSession({
+              threadId: input.threadId,
+              operation: "checkpointConversation",
+              allowRecovery: false,
+            });
+            if (
+              pendingCompactions.has(input.threadId) ||
+              timedOutNativeCompactions.has(input.threadId)
+            )
+              return yield* toValidationError(
+                "checkpointConversation",
+                "Native compaction still needs to settle before checkpointing.",
+              );
+            if (input.captureOperationId !== undefined) {
+              const binding = yield* directory.getBinding(input.threadId);
+              const fence = yield* makeThreadExecutionFence(checkpointSql).get(input.threadId);
+              const point = fence
+                ? yield* nativeCheckpoints.get(input.threadId, fence.generation, input.turnId)
+                : null;
+              if (
+                routed.isActive ||
+                routed.adapter.provider !== "codex" ||
+                Option.isNone(binding) ||
+                binding.value.status !== "stopped" ||
+                !fence ||
+                (point &&
+                  (point.environmentId !== fence.environmentId ||
+                    point.captureOperationId !== null ||
+                    point.turnId !== input.turnId))
+              )
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "Final recovery requires a stopped Codex binding and its settled native checkpoint.",
+                );
+              const cursor = yield* decodeCheckpointCursor(binding.value.resumeCursor);
+              if (!point) {
+                const cwd = readPersistedCwd(binding.value.runtimePayload);
+                const [local] = yield* checkpointSql`SELECT 1 FROM thread_local_enrollments
+                    WHERE thread_id=${input.threadId} AND phase='active'
+                    AND environment_id=${fence.environmentId} AND project_id=${fence.projectId}
+                    AND relay_url=${fence.relayUrl}`;
+                const [latestLocal] = yield* checkpointSql<{
+                  turnId: string;
+                }>`SELECT turn_id AS "turnId" FROM projection_turns
+                    WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL
+                    AND state IN ('completed','failed','interrupted')
+                    ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
+                const unsettled =
+                  yield* checkpointSql`SELECT 1 FROM projection_turns WHERE thread_id=${input.threadId}
+                    AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending') LIMIT 1`;
+                if (
+                  fence.generation === 1 &&
+                  local &&
+                  !cursor.portableStateId &&
+                  cwd &&
+                  latestLocal?.turnId === input.turnId &&
+                  !unsettled.length &&
+                  routed.adapter.checkpointConversation &&
+                  Option.isSome(checkpointEvents)
+                ) {
+                  const attachments = yield* collectThreadAttachmentReferences(
+                    input.threadId,
+                    checkpointEvents.value.readAggregateRange({
+                      aggregateKind: "thread",
+                      aggregateId: input.threadId,
+                      fromSequenceExclusive: 0,
+                      toSequenceInclusive: fence.frozenSequence!,
+                    }),
+                  );
+                  const archive = yield* routed.adapter.checkpointConversation({
+                    threadId: input.threadId,
+                    artifactRoot,
+                    stoppedSource: { nativeThreadId: cursor.threadId, cwd },
+                    referencedFiles: attachments.flatMap((attachment) => {
+                      const file = resolveAttachmentPath({
+                        attachmentsDir: serverConfig.attachmentsDir,
+                        attachment,
+                      });
+                      return file ? [file] : [];
+                    }),
+                  });
+                  if (archive.nativeThreadId !== cursor.threadId)
+                    return yield* toValidationError(
+                      "checkpointConversation",
+                      "The stopped native conversation identity changed.",
+                    );
+                  yield* directory.upsert({
+                    ...binding.value,
+                    resumeCursor: { ...cursor, resumePolicy: "require-existing" },
+                  });
+                  return archive;
+                }
+                const [baseline] = yield* checkpointSql<{
+                  operationId: string;
+                  sequence: number;
+                }>`SELECT operation_id AS "operationId",destination_sequence AS sequence FROM thread_transfer_baselines WHERE thread_id=${input.threadId} AND generation=${fence.generation} AND native_runtime_json IS NOT NULL ORDER BY destination_sequence DESC LIMIT 1`;
+                const [settled] = yield* checkpointSql<{
+                  turnId: string;
+                }>`SELECT turn_id AS "turnId" FROM projection_turns WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL AND state NOT IN ('pending','running') ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
+                if (
+                  !baseline ||
+                  !cursor.portableStateId ||
+                  cursor.resumePolicy !== "require-existing" ||
+                  settled?.turnId !== input.turnId
+                )
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "Final recovery needs its verified imported native state and actual settled source turn.",
+                  );
+                const [laterWork] =
+                  yield* checkpointSql`SELECT 1 FROM orchestration_events WHERE aggregate_kind='thread' AND stream_id=${input.threadId} AND sequence>${baseline.sequence} AND (event_type IN ('thread.turn-start-requested','thread.session-set') OR (event_type='thread.message-sent' AND json_extract(payload_json,'$.role')='assistant')) LIMIT 1`;
+                if (laterWork)
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "Destination provider work must have its own settled checkpoint before final recovery.",
+                  );
+                yield* assertThreadTransferRuntime(checkpointSql, baseline.operationId);
+                const archive = yield* exportUnstartedPortableCodexConversation({
+                  stateDir: serverConfig.stateDir,
+                  threadId: input.threadId,
+                  providerInstanceId: routed.instanceId,
+                  nativeThreadId: cursor.threadId,
+                  portableStateId: cursor.portableStateId,
+                  artifactRoot,
+                });
+                return {
+                  directory: archive.directory,
+                  nativeThreadId: archive.manifest.threadId,
+                };
+              }
+              const [latest] = yield* checkpointSql<{
+                turnId: string;
+              }>`SELECT turn_id AS "turnId" FROM thread_native_checkpoints
+                  WHERE thread_id=${input.threadId} AND generation=${fence!.generation} AND capture_operation_id IS NULL
+                  ORDER BY source_sequence DESC LIMIT 1`;
+              if (
+                cursor.threadId !== point.nativeThreadId ||
+                cursor.resumePolicy !== "require-existing" ||
+                latest?.turnId !== input.turnId
+              )
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "The stopped native conversation does not match its latest settled checkpoint.",
+                );
+              // Settled capture closed the provider writer. Preserve those exact native bytes while
+              // the final point captures the newer chat watermark; never reopen a provider to save it.
+              if ((yield* digestNativeCheckpointArchive(point.directory)) !== point.archiveSha256)
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "The settled native checkpoint is damaged.",
+                );
+              const archiveDirectory = pathService.join(artifactRoot, "conversation");
+              yield* fileSystem.copy(point.directory, archiveDirectory);
+              if (
+                (yield* digestNativeCheckpointArchive(point.directory)) !== point.archiveSha256 ||
+                (yield* digestNativeCheckpointArchive(archiveDirectory)) !== point.archiveSha256
+              )
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "The settled native checkpoint changed during final capture.",
+                );
+              return { directory: archiveDirectory, nativeThreadId: point.nativeThreadId };
+            }
+            const capture = routed.adapter.checkpointConversation;
+            if (!capture || (!routed.isActive && !workflow) || Option.isNone(checkpointEvents))
+              return yield* toValidationError(
+                "checkpointConversation",
+                "A settled native Codex conversation and retained history are required.",
+              );
+            if (routed.adapter.provider !== "codex")
+              return yield* toValidationError(
+                "checkpointConversation",
+                "Portable recovery requires a native Codex session.",
+              );
+            const session = routed.isActive
+              ? (yield* routed.adapter.listSessions()).find((s) => s.threadId === input.threadId)
+              : null;
+            const binding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+            if (!binding || (routed.isActive && !session))
+              return yield* toValidationError(
+                "checkpointConversation",
+                "The native source binding is unavailable.",
+              );
+            const cursor = yield* decodeCheckpointCursor(
+              session?.resumeCursor ?? binding.resumeCursor,
+            );
+            if (workflow && cursor.threadId !== workflow.nativeThreadId)
+              return yield* toValidationError(
+                "checkpointConversation",
+                "The workflow native conversation changed.",
+              );
+            if (
+              !routed.isActive &&
+              (binding.status !== "stopped" ||
+                !Predicate.hasProperty(binding.runtimePayload, "stoppedRuntimeEventsDrained") ||
+                binding.runtimePayload.stoppedRuntimeEventsDrained !== true ||
+                !readContinuation(binding.runtimePayload)?.runtimeEpisode)
+            )
+              return yield* toValidationError(
+                "checkpointConversation",
+                "The original native writer has not been confirmed closed.",
+              );
+            if (session)
+              yield* upsertSessionBinding(
+                {
+                  ...session,
+                  providerInstanceId: routed.instanceId,
+                  resumeCursor: { ...cursor, resumePolicy: "require-existing" },
+                },
+                input.threadId,
+              );
+            const attachments = yield* collectThreadAttachmentReferences(
+              input.threadId,
+              checkpointEvents.value.readAggregateRange({
+                aggregateKind: "thread",
+                aggregateId: input.threadId,
+                fromSequenceExclusive: 0,
+                toSequenceInclusive: Number.MAX_SAFE_INTEGER,
+              }),
+            );
+            const referencedFiles = attachments.flatMap((attachment) => {
+              const file = resolveAttachmentPath({
+                attachmentsDir: serverConfig.attachmentsDir,
+                attachment,
+              });
+              return file ? [file] : [];
+            });
+            return yield* capture({
+              threadId: input.threadId,
+              artifactRoot,
+              referencedFiles,
+              ...(!routed.isActive && workflow
+                ? { stoppedSource: { nativeThreadId: workflow.nativeThreadId, cwd: workflow.cwd } }
+                : {}),
+            }).pipe(
+              Effect.onExit(() =>
+                routed.adapter
+                  .hasSession(input.threadId)
+                  .pipe(
+                    Effect.flatMap((active) =>
+                      active ? Effect.void : stopSession({ threadId: input.threadId }),
+                    ),
+                  ),
+              ),
+              // Writer EOF only reaches the provider stream. Persist its final output
+              // before the native catalog fixes the shared history/attachment watermark.
+              Effect.tap(() => (workflow ? flushRuntimeEvents(input.threadId) : Effect.void)),
+            );
+          }),
+      )
+      .pipe(
+        Effect.tap(
+          Effect.fnUntraced(function* (point) {
+            if (!point) return;
+            if (Option.isNone(checkpointEvents))
+              return yield* toValidationError(
+                "checkpointConversation",
+                "Retained thread history is required to save chat attachments.",
+              );
+            yield* makeThreadAttachmentCheckpoint(checkpointSql, checkpointEvents.value).capture({
+              threadId: input.threadId,
+              generation: point.generation,
+              turnId: input.turnId,
+              ...(input.captureOperationId === undefined
+                ? {}
+                : { captureOperationId: input.captureOperationId }),
+              artifactRoot: pathService.join(serverConfig.stateDir, "attachment-checkpoints"),
+              attachmentsDir: serverConfig.attachmentsDir,
+              ...(workflow
+                ? {
+                    authorize: workflow.authorize.pipe(
+                      Effect.mapError(
+                        () =>
+                          new ThreadAttachmentCheckpointError({
+                            message: "Workflow attachment capture ownership changed.",
+                          }),
+                      ),
+                    ),
+                  }
+                : {}),
+            });
+          }),
+        ),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, pathService),
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterProcessError({
+              provider: "codex",
+              threadId: input.threadId,
+              detail: cause.message,
+              cause,
+            }),
+        ),
+      );
+  });
+
   const checkpointConversation: NonNullable<ProviderServiceMethod<"checkpointConversation">> =
     Effect.fn("ProviderService.checkpointConversation")(function* (input) {
       if (yield* workflows.isWorkflowVmThread(input.threadId)) {
@@ -3972,264 +4509,136 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "Native provider history cannot leave a workflow VM.",
         );
       }
-      return yield* nativeCheckpoints
-        .capture(
-          { ...input, artifactRoot: pathService.join(serverConfig.stateDir, "native-checkpoints") },
-          (artifactRoot) =>
-            Effect.gen(function* () {
-              const routed = yield* resolveRoutableSession({
-                threadId: input.threadId,
-                operation: "checkpointConversation",
-                allowRecovery: false,
-              });
-              if (
-                pendingCompactions.has(input.threadId) ||
-                timedOutNativeCompactions.has(input.threadId)
-              )
-                return yield* toValidationError(
-                  "checkpointConversation",
-                  "Native compaction still needs to settle before checkpointing.",
-                );
-              if (input.captureOperationId !== undefined) {
-                const binding = yield* directory.getBinding(input.threadId);
-                const fence = yield* makeThreadExecutionFence(checkpointSql).get(input.threadId);
-                const point = fence
-                  ? yield* nativeCheckpoints.get(input.threadId, fence.generation, input.turnId)
-                  : null;
-                if (
-                  routed.isActive ||
-                  routed.adapter.provider !== "codex" ||
-                  Option.isNone(binding) ||
-                  binding.value.status !== "stopped" ||
-                  !fence ||
-                  (point &&
-                    (point.environmentId !== fence.environmentId ||
-                      point.captureOperationId !== null ||
-                      point.turnId !== input.turnId))
-                )
-                  return yield* toValidationError(
-                    "checkpointConversation",
-                    "Final recovery requires a stopped Codex binding and its settled native checkpoint.",
-                  );
-                const cursor = yield* decodeCheckpointCursor(binding.value.resumeCursor);
-                if (!point) {
-                  const cwd = readPersistedCwd(binding.value.runtimePayload);
-                  const [local] = yield* checkpointSql`SELECT 1 FROM thread_local_enrollments
-                    WHERE thread_id=${input.threadId} AND phase='active'
-                    AND environment_id=${fence.environmentId} AND project_id=${fence.projectId}
-                    AND relay_url=${fence.relayUrl}`;
-                  const [latestLocal] = yield* checkpointSql<{
-                    turnId: string;
-                  }>`SELECT turn_id AS "turnId" FROM projection_turns
-                    WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL
-                    AND state IN ('completed','failed','interrupted')
-                    ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
-                  const unsettled =
-                    yield* checkpointSql`SELECT 1 FROM projection_turns WHERE thread_id=${input.threadId}
-                    AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending') LIMIT 1`;
-                  if (
-                    fence.generation === 1 &&
-                    local &&
-                    !cursor.portableStateId &&
-                    cwd &&
-                    latestLocal?.turnId === input.turnId &&
-                    !unsettled.length &&
-                    routed.adapter.checkpointConversation &&
-                    Option.isSome(checkpointEvents)
-                  ) {
-                    const attachments = yield* collectThreadAttachmentReferences(
-                      input.threadId,
-                      checkpointEvents.value.readAggregateRange({
-                        aggregateKind: "thread",
-                        aggregateId: input.threadId,
-                        fromSequenceExclusive: 0,
-                        toSequenceInclusive: fence.frozenSequence!,
-                      }),
-                    );
-                    const archive = yield* routed.adapter.checkpointConversation({
-                      threadId: input.threadId,
-                      artifactRoot,
-                      stoppedSource: { nativeThreadId: cursor.threadId, cwd },
-                      referencedFiles: attachments.flatMap((attachment) => {
-                        const file = resolveAttachmentPath({
-                          attachmentsDir: serverConfig.attachmentsDir,
-                          attachment,
-                        });
-                        return file ? [file] : [];
-                      }),
-                    });
-                    if (archive.nativeThreadId !== cursor.threadId)
-                      return yield* toValidationError(
-                        "checkpointConversation",
-                        "The stopped native conversation identity changed.",
-                      );
-                    yield* directory.upsert({
-                      ...binding.value,
-                      resumeCursor: { ...cursor, resumePolicy: "require-existing" },
-                    });
-                    return archive;
-                  }
-                  const [baseline] = yield* checkpointSql<{
-                    operationId: string;
-                    sequence: number;
-                  }>`SELECT operation_id AS "operationId",destination_sequence AS sequence FROM thread_transfer_baselines WHERE thread_id=${input.threadId} AND generation=${fence.generation} AND native_runtime_json IS NOT NULL ORDER BY destination_sequence DESC LIMIT 1`;
-                  const [settled] = yield* checkpointSql<{
-                    turnId: string;
-                  }>`SELECT turn_id AS "turnId" FROM projection_turns WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL AND state NOT IN ('pending','running') ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
-                  if (
-                    !baseline ||
-                    !cursor.portableStateId ||
-                    cursor.resumePolicy !== "require-existing" ||
-                    settled?.turnId !== input.turnId
-                  )
-                    return yield* toValidationError(
-                      "checkpointConversation",
-                      "Final recovery needs its verified imported native state and actual settled source turn.",
-                    );
-                  const [laterWork] =
-                    yield* checkpointSql`SELECT 1 FROM orchestration_events WHERE aggregate_kind='thread' AND stream_id=${input.threadId} AND sequence>${baseline.sequence} AND (event_type IN ('thread.turn-start-requested','thread.session-set') OR (event_type='thread.message-sent' AND json_extract(payload_json,'$.role')='assistant')) LIMIT 1`;
-                  if (laterWork)
-                    return yield* toValidationError(
-                      "checkpointConversation",
-                      "Destination provider work must have its own settled checkpoint before final recovery.",
-                    );
-                  yield* assertThreadTransferRuntime(checkpointSql, baseline.operationId);
-                  const archive = yield* exportUnstartedPortableCodexConversation({
-                    stateDir: serverConfig.stateDir,
-                    threadId: input.threadId,
-                    providerInstanceId: routed.instanceId,
-                    nativeThreadId: cursor.threadId,
-                    portableStateId: cursor.portableStateId,
-                    artifactRoot,
-                  });
-                  return {
-                    directory: archive.directory,
-                    nativeThreadId: archive.manifest.threadId,
-                  };
-                }
-                const [latest] = yield* checkpointSql<{
-                  turnId: string;
-                }>`SELECT turn_id AS "turnId" FROM thread_native_checkpoints
-                  WHERE thread_id=${input.threadId} AND generation=${fence!.generation} AND capture_operation_id IS NULL
-                  ORDER BY source_sequence DESC LIMIT 1`;
-                if (
-                  cursor.threadId !== point.nativeThreadId ||
-                  cursor.resumePolicy !== "require-existing" ||
-                  latest?.turnId !== input.turnId
-                )
-                  return yield* toValidationError(
-                    "checkpointConversation",
-                    "The stopped native conversation does not match its latest settled checkpoint.",
-                  );
-                // Settled capture closed the provider writer. Preserve those exact native bytes while
-                // the final point captures the newer chat watermark; never reopen a provider to save it.
-                if ((yield* digestNativeCheckpointArchive(point.directory)) !== point.archiveSha256)
-                  return yield* toValidationError(
-                    "checkpointConversation",
-                    "The settled native checkpoint is damaged.",
-                  );
-                const archiveDirectory = pathService.join(artifactRoot, "conversation");
-                yield* fileSystem.copy(point.directory, archiveDirectory);
-                if (
-                  (yield* digestNativeCheckpointArchive(point.directory)) !== point.archiveSha256 ||
-                  (yield* digestNativeCheckpointArchive(archiveDirectory)) !== point.archiveSha256
-                )
-                  return yield* toValidationError(
-                    "checkpointConversation",
-                    "The settled native checkpoint changed during final capture.",
-                  );
-                return { directory: archiveDirectory, nativeThreadId: point.nativeThreadId };
-              }
-              const capture = routed.adapter.checkpointConversation;
-              if (!capture || !routed.isActive || Option.isNone(checkpointEvents))
-                return yield* toValidationError(
-                  "checkpointConversation",
-                  "A settled native conversation and its retained history are required for recovery.",
-                );
-              const session = (yield* routed.adapter.listSessions()).find(
-                (s) => s.threadId === input.threadId,
-              );
-              if (!session || routed.adapter.provider !== "codex")
-                return yield* toValidationError(
-                  "checkpointConversation",
-                  "Portable recovery currently requires a native Codex session.",
-                );
-              const cursor = yield* decodeCheckpointCursor(session.resumeCursor);
-              yield* upsertSessionBinding(
-                {
-                  ...session,
-                  providerInstanceId: routed.instanceId,
-                  resumeCursor: { ...cursor, resumePolicy: "require-existing" },
-                },
-                input.threadId,
-              );
-              const attachments = yield* collectThreadAttachmentReferences(
-                input.threadId,
-                checkpointEvents.value.readAggregateRange({
-                  aggregateKind: "thread",
-                  aggregateId: input.threadId,
-                  fromSequenceExclusive: 0,
-                  toSequenceInclusive: Number.MAX_SAFE_INTEGER,
-                }),
-              );
-              const referencedFiles = attachments.flatMap((attachment) => {
-                const file = resolveAttachmentPath({
-                  attachmentsDir: serverConfig.attachmentsDir,
-                  attachment,
-                });
-                return file ? [file] : [];
-              });
-              return yield* capture({
-                threadId: input.threadId,
-                artifactRoot,
-                referencedFiles,
-              }).pipe(
-                Effect.onExit(() =>
-                  routed.adapter
-                    .hasSession(input.threadId)
-                    .pipe(
-                      Effect.flatMap((active) =>
-                        active ? Effect.void : stopSession({ threadId: input.threadId }),
-                      ),
-                    ),
-                ),
-              );
-            }),
-        )
-        .pipe(
-          Effect.tap(
-            Effect.fnUntraced(function* (point) {
-              if (!point) return;
-              if (Option.isNone(checkpointEvents))
-                return yield* toValidationError(
-                  "checkpointConversation",
-                  "Retained thread history is required to save chat attachments.",
-                );
-              yield* makeThreadAttachmentCheckpoint(checkpointSql, checkpointEvents.value).capture({
-                threadId: input.threadId,
-                generation: point.generation,
-                turnId: input.turnId,
-                ...(input.captureOperationId === undefined
-                  ? {}
-                  : { captureOperationId: input.captureOperationId }),
-                artifactRoot: pathService.join(serverConfig.stateDir, "attachment-checkpoints"),
-                attachmentsDir: serverConfig.attachmentsDir,
-              });
-            }),
-          ),
-          Effect.provideService(FileSystem.FileSystem, fileSystem),
-          Effect.provideService(Path.Path, pathService),
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapterProcessError({
-                provider: "codex",
-                threadId: input.threadId,
-                detail: cause.message,
-                cause,
-              }),
-          ),
-          Effect.asVoid,
+      yield* captureConversation(input);
+    });
+
+  const checkpointWorkflowConversation: ProviderServiceMethod<"checkpointWorkflowConversation"> =
+    Effect.fn("ProviderService.checkpointWorkflowConversation")(function* ({ binding, turnId }) {
+      const invalid = () =>
+        toValidationError(
+          "checkpointWorkflowConversation",
+          "The workflow's admitted turn and VM checkpoint ownership could not be verified.",
         );
+      if (!workflowGuest || !vmWorkloads || Option.isNone(secretStore)) return yield* invalid();
+      const vm = yield* readInstalledThreadVm().pipe(
+        Effect.provideService(ServerSecretStore, secretStore.value),
+        Effect.mapError(invalid),
+      );
+      if (
+        !vm ||
+        vm.environmentId !== binding.environmentId ||
+        vm.operationId !== binding.operationId ||
+        vm.scope.threadId !== binding.threadId ||
+        vm.scope.repositoryId !== binding.repositoryId ||
+        vm.scope.allocationId !== binding.allocationId ||
+        vm.scope.generation !== binding.generation
+      )
+        return yield* invalid();
+      const source = Option.getOrUndefined(
+        yield* directory.getBinding(binding.threadId).pipe(Effect.mapError(invalid)),
+      );
+      if (!source) return yield* invalid();
+      const cursor = yield* decodeCheckpointCursor(source.resumeCursor).pipe(
+        Effect.mapError(invalid),
+      );
+      const episode = readContinuation(source.runtimePayload)?.runtimeEpisode;
+      if (!episode) return yield* invalid();
+      // These checks run again inside both catalog transactions. An active VM fence alone
+      // survives cancellation and does not authorize a new workflow capture.
+      const authorize = Effect.fnUntraced(function* () {
+        const run = yield* workflows.get(binding.jobId);
+        const owner = yield* makeThreadExecutionFence(checkpointSql)
+          .get(binding.threadId)
+          .pipe(Effect.mapError(invalid));
+        const current = Option.getOrUndefined(
+          yield* directory.getBinding(binding.threadId).pipe(Effect.mapError(invalid)),
+        );
+        const metadata = readContinuation(current?.runtimePayload);
+        const [queue] = yield* checkpointSql<{
+          state: string;
+        }>`SELECT state_json AS state FROM projection_thread_prompt_queues WHERE thread_id=${binding.threadId}`.pipe(
+          Effect.mapError(invalid),
+        );
+        const prompts = queue
+          ? yield* decodeCaptureQueue(queue.state).pipe(Effect.mapError(invalid))
+          : null;
+        if (
+          !run ||
+          run.runtime.kind !== "vm" ||
+          !sameWorkflowVmBinding(run.runtime, binding) ||
+          run.workflow.organizationId !== binding.organizationId ||
+          run.workflow.repositoryId !== binding.repositoryId ||
+          run.workflow.definition.target.kind !== "vm" ||
+          run.progress.threadId !== binding.threadId ||
+          !run.executionReserved ||
+          run.cancellationAttempt ||
+          // Admission can precede enqueue acknowledgement and the Running projection.
+          !(
+            run.progress.status === "preparing" ||
+            run.progress.status === "running" ||
+            canRecoverPausedWorkflowTurn(run)
+          ) ||
+          activeWorkflowStep(run)?.kind !== "agent" ||
+          !workflowAllowsPrompt(run, workflowPromptId(run)) ||
+          admittedWorkflowTurnId(prompts ?? undefined, workflowPromptId(run)) !== turnId ||
+          !run.worktreePath ||
+          !owner ||
+          owner.phase !== "active" ||
+          owner.environmentId !== binding.environmentId ||
+          owner.generation !== binding.generation ||
+          owner.operationId !== binding.operationId ||
+          owner.projectId !== binding.projectId ||
+          owner.relayUrl !== vm.relayUrl ||
+          !current ||
+          current.provider !== "codex" ||
+          current.providerInstanceId !== run.modelSelection.instanceId ||
+          current.providerInstanceId !== source.providerInstanceId ||
+          run.providerContinuation?.driver !== "codex" ||
+          metadata?.workflowJobId !== binding.jobId ||
+          metadata.continuationKey !== run.providerContinuation.continuationKey ||
+          metadata.runtimeEpisode !== episode ||
+          Predicate.hasProperty(current.runtimePayload, "workflowVmCancellation")
+        )
+          return yield* invalid();
+        const native = yield* decodeCheckpointCursor(current.resumeCursor).pipe(
+          Effect.mapError(invalid),
+        );
+        if (native.threadId !== cursor.threadId) return yield* invalid();
+        return run.worktreePath;
+      });
+      const cwd = yield* authorize();
+      const point = yield* captureConversation(
+        { threadId: binding.threadId, turnId },
+        {
+          nativeThreadId: cursor.threadId,
+          cwd,
+          authorize: authorize().pipe(Effect.asVoid),
+        },
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: "2 minutes",
+          orElse: () =>
+            toValidationError(
+              "checkpointWorkflowConversation",
+              "Workflow checkpoint capture timed out; the Agent has not been rerun.",
+            ),
+        }),
+      );
+      yield* authorize();
+      if (
+        !point ||
+        point.turnId !== turnId ||
+        point.generation !== binding.generation ||
+        point.environmentId !== binding.environmentId ||
+        point.nativeThreadId !== cursor.threadId
+      )
+        return yield* invalid();
+      return {
+        threadId: binding.threadId,
+        turnId,
+        generation: point.generation,
+        sourceSequence: point.sourceSequence,
+      };
     });
 
   const runStopAll = Effect.fn("runStopAll")(function* () {
@@ -4429,46 +4838,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     rollbackConversation,
     uploadFeedback,
     checkpointConversation,
+    checkpointWorkflowConversation,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.
-    flushRuntimeEvents: (threadId) =>
-      Effect.gen(function* () {
-        const binding = yield* directory.getBinding(threadId);
-        const stoppedAndDrained =
-          Option.isSome(binding) &&
-          binding.value.status === "stopped" &&
-          binding.value.runtimePayload !== null &&
-          typeof binding.value.runtimePayload === "object" &&
-          "stoppedRuntimeEventsDrained" in binding.value.runtimePayload &&
-          binding.value.runtimePayload.stoppedRuntimeEventsDrained === true;
-        if (Option.isSome(binding) && !stoppedAndDrained) {
-          const instanceId = yield* requireBindingInstanceId(
-            "ProviderService.flushRuntimeEvents",
-            binding.value,
-          );
-          const adapter = yield* registry.getByInstance(instanceId);
-          if (!adapter.drainRuntimeEvents)
-            return yield* new ProviderValidationError({
-              operation: "ProviderService.flushRuntimeEvents",
-              issue: "This adapter cannot confirm stopped output.",
-            });
-          yield* adapter.drainRuntimeEvents(threadId);
-        }
-        const done = yield* Deferred.make<void, ProviderValidationError>();
-        yield* PubSub.publish(runtimeEventPubSub, new ProviderEventBarrier(threadId, done));
-        yield* Deferred.await(done);
-      }).pipe(
-        Effect.timeout("30 seconds"),
-        Effect.mapError(
-          (cause) =>
-            new ProviderValidationError({
-              operation: "ProviderService.flushRuntimeEvents",
-              issue: "Stopped provider output has not finished ingestion.",
-              cause,
-            }),
-        ),
-      ),
+    flushRuntimeEvents,
     get streamIngestionEvents() {
       return Stream.fromPubSub(runtimeEventPubSub);
     },

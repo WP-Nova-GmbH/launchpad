@@ -21,6 +21,8 @@ import { makeThreadArtifactTransfer } from "../ThreadArtifactTransfer.ts";
 import { makeLocalThreadArtifactObjects } from "../ThreadArtifactLocalObjects.ts";
 import { makeThreadNativeCheckpointStore } from "../ThreadNativeCheckpointStore.ts";
 
+// Exposes the test connection to cross-package capture integration fixtures.
+export const nativeCheckpointTestDatabase = PgClient.PgClient;
 const databaseUrl = process.env.LAUNCHPAD_VM_TEST_DATABASE_URL;
 export const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 export const decodeChunkManifest = Schema.decodeEffect(

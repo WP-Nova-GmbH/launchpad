@@ -9,6 +9,21 @@ const failed = (operation: string) => new ThreadArtifactObjectError({ operation 
 const hex = (bytes: Uint8Array) =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 
+/** Fail startup rather than accepting results onto an unavailable persistent disk. */
+export const verifyLocalThreadArtifactRoot = Effect.fn("relay.thread_artifact.local.startup")(
+  function* (fs: FileSystem.FileSystem, root: string) {
+    if (!root.startsWith("/")) return yield* failed("artifact root must be absolute");
+    yield* fs.makeDirectory(root, { recursive: true, mode: 0o700 });
+    const probe = `${root}/.${NodeCrypto.randomUUID()}.probe`;
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const handle = yield* fs.open(probe, { flag: "wx", mode: 0o600 });
+        yield* handle.sync;
+      }),
+    ).pipe(Effect.ensuring(fs.remove(probe, { force: true }).pipe(Effect.ignore)));
+  },
+);
+
 /** Persistent private files for the Node development relay; the Worker uses R2. */
 export function makeLocalThreadArtifactObjects(fs: FileSystem.FileSystem, root: string) {
   const file = (key: string) => {

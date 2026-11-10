@@ -37,6 +37,14 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { workflowVmCancellationSeal } from "../relay/WorkflowVmCancellation.ts";
 import * as Store from "./WorkflowRunStore.ts";
+import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
+import { make as makeCheckpointDiffQuery } from "../checkpointing/CheckpointDiffQuery.ts";
+import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
+import { decodeWorkflowResultCapture } from "./WorkflowResultOutbox.ts";
+const decodeRecovery = Schema.decodeUnknownEffect(Schema.fromJsonString(Store.WorkflowRunRecovery));
 import {
   type WorkflowRequest,
   type RepositoryWorkflowRunnerShape,
@@ -1675,7 +1683,11 @@ it.effect.each([true, false])(
           ),
           pin,
         );
-        const review = yield* runner.handle({ ...control("status"), workflowVm });
+        let review = yield* runner.handle({ ...control("status"), workflowVm });
+        if (matchingPin) {
+          yield* (yield* SqlClient.SqlClient)`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${binding.jobId}`;
+          review = yield* runner.handle({ ...control("status"), workflowVm });
+        }
         if (!matchingPin) {
           assert.equal(review.progress?.status, "paused");
           assert.include(review.progress?.detail, "The result checkpoint could not be saved");
@@ -2176,6 +2188,8 @@ it.effect.each(["review", "finalization", "timeout"] as const)(
         const gate = yield* Deferred.make<void>();
         yield* Ref.set(h.captureGate, gate);
         const status = { ...control("status"), workflowVm };
+        yield* runner.handle(status);
+        yield* (yield* SqlClient.SqlClient)`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${binding.jobId}`;
         const result = (yield* runner.handle(status)).progress!;
         const response = { ...approve(result), workflowVm };
         if (boundary !== "finalization")
@@ -4671,3 +4685,267 @@ it.effect.each([
     }),
   ),
 );
+
+it.effect(
+  "waits for each saved VM result before a second Agent and Review, while Cancel remains responsive",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+        yield* fence.activate(binding);
+        const runner = yield* h.newRunner;
+        const first = workflow.definition.steps[0]!;
+        const reviewStep = workflow.definition.steps[1]!;
+        yield* runner.handle({
+          ...start,
+          control: {
+            ...start.control,
+            operation: "start",
+            runtime: { kind: "vm", threadId: binding.threadId },
+            workflow: {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                target: { kind: "vm", baseBranch: null },
+                steps: [first, { ...first, id: "agent-2" }, reviewStep],
+              },
+            },
+          },
+        });
+        yield* h.awaitPrompt;
+        const store = yield* Store.WorkflowRunStore;
+        const sql = yield* SqlClient.SqlClient;
+        yield* store.saveCheckpointPin(
+          binding,
+          "",
+          0,
+          {
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/workflow-base"),
+            commitId: "baseline",
+            treeId: "baseline-tree",
+            baselineCommitId: "baseline",
+          },
+          null,
+          undefined,
+          new Uint8Array(),
+        );
+        const status = { ...control("status"), workflowVm };
+        for (let n = 1; n <= 2; n++) {
+          yield* h.completeCurrent;
+          const point = (yield* Ref.get(h.currentThread))!.checkpoints.at(-1)!;
+          yield* store.saveCheckpointPin(binding, point.turnId, point.checkpointTurnCount, {
+            checkpointRef: point.checkpointRef,
+            commitId: `commit-${n}`,
+            treeId: "prepared-tree",
+            baselineCommitId: n === 1 ? "baseline" : "commit-1",
+          });
+          const saving = yield* runner.handle(status);
+          assert.equal(saving.progress?.resultSaving?.state, "saving");
+          assert.lengthOf(yield* h.starts, n);
+          const queued = yield* store.getSaveResult(binding.jobId, point.turnId);
+          assert.isNotNull(queued);
+          const [intent] = yield* sql<{
+            recordJson: string;
+          }>`SELECT record_json AS "recordJson" FROM workflow_result_outbox WHERE publication_id=${queued!.publicationId}`;
+          const recovery = yield* decodeRecovery(intent!.recordJson);
+          assert.equal(recovery.run.jobId, binding.jobId);
+          assert.equal(recovery.frozenConfiguration.jobId, binding.jobId);
+          assert.equal(recovery.workflowIgnoreRulesBase64, "");
+          assert.deepEqual(
+            recovery.checkpointPins.map((pin) => pin.commitId),
+            ["baseline", `commit-${n}`],
+          );
+          yield* runner.handle(status);
+          assert.lengthOf(yield* h.starts, n);
+          yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${binding.jobId}`;
+          const next = yield* runner.handle(status);
+          if (n === 1) {
+            yield* h.awaitPrompt;
+            assert.lengthOf(yield* h.starts, 2);
+          } else {
+            assert.equal(next.progress?.status, "awaiting_review");
+            assert.equal(next.progress?.checkpoint?.stepId, reviewStep.id);
+          }
+        }
+        const cancelled = yield* runner.handle({ ...control("cancel"), workflowVm });
+        assert.oneOf(cancelled.progress?.status, ["cancelled", "cancelling"]);
+        assert.lengthOf(yield* h.starts, 2);
+      }),
+    ),
+);
+
+it.effect(
+  "cancels while an Agent result is waiting for storage and never advances on a late receipt",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+        yield* fence.activate(binding);
+        const runner = yield* h.newRunner;
+        yield* runner.handle(start);
+        yield* h.awaitPrompt;
+        yield* h.completeCurrent;
+        const store = yield* Store.WorkflowRunStore;
+        const sql = yield* SqlClient.SqlClient;
+        const point = (yield* Ref.get(h.currentThread))!.checkpoints.at(-1)!;
+        yield* store.saveCheckpointPin(
+          binding,
+          "",
+          0,
+          {
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/workflow-base"),
+            commitId: "baseline",
+            treeId: "baseline-tree",
+            baselineCommitId: "baseline",
+          },
+          null,
+          undefined,
+          new Uint8Array(),
+        );
+        yield* store.saveCheckpointPin(binding, point.turnId, point.checkpointTurnCount, {
+          checkpointRef: point.checkpointRef,
+          commitId: "result",
+          treeId: "prepared-tree",
+          baselineCommitId: "baseline",
+        });
+        const status = { ...control("status"), workflowVm };
+        assert.equal((yield* runner.handle(status)).progress?.resultSaving?.state, "saving");
+        yield* Ref.set(h.providerProof, true);
+        yield* Ref.update(h.currentThread, (current) => ({ ...current!, session: null }));
+        yield* runner.handle({ ...control("cancel"), workflowVm });
+        assert.equal((yield* runner.handle(status)).progress?.status, "cancelled");
+        assert.equal((yield* store.getSaveResult(binding.jobId, point.turnId))?.status, "pending");
+        yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${binding.jobId}`;
+        assert.equal((yield* runner.handle(status)).progress?.status, "cancelled");
+        assert.lengthOf(yield* h.starts, 1);
+      }),
+    ),
+);
+
+for (const captured of [true, false])
+  it.effect(
+    `archives an errored turn on cancellation only with its protected pin (${captured})`,
+    () =>
+      test(
+        Effect.gen(function* () {
+          const h = yield* harness;
+          const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
+          yield* fence.activate(binding);
+          const runner = yield* h.newRunner;
+          yield* runner.handle(start);
+          yield* h.awaitPrompt;
+          yield* h.completeCurrent;
+          const store = yield* Store.WorkflowRunStore;
+          const sql = yield* SqlClient.SqlClient;
+          const point = (yield* Ref.get(h.currentThread))!.checkpoints.at(-1)!;
+          const pin = {
+            checkpointRef: point.checkpointRef,
+            commitId: "partial-commit",
+            treeId: "partial-tree",
+            baselineCommitId: "base",
+          };
+          if (captured)
+            yield* store.saveCheckpointPin(binding, point.turnId, point.checkpointTurnCount, pin);
+          // CheckpointReactor marks provider failure as error even when Git capture succeeded.
+          yield* Ref.update(h.currentThread, (current) => ({
+            ...current!,
+            session: null,
+            latestTurn: { ...current!.latestTurn!, state: "error" as const },
+            checkpoints: current!.checkpoints.map((c) => ({ ...c, status: "error" as const })),
+          }));
+          yield* Ref.set(h.providerProof, true);
+          const cancelled = yield* runner.handle({ ...control("cancel"), workflowVm });
+          assert.equal(cancelled.progress?.status, "cancelled");
+          const saved = yield* store.getSaveResult(binding.jobId, point.turnId);
+          assert.equal(!!saved, captured);
+          if (captured) {
+            const [row] = yield* sql<{
+              result: string;
+            }>`SELECT result_json AS result FROM workflow_result_outbox WHERE publication_id=${saved!.publicationId}`;
+            const capture = yield* decodeWorkflowResultCapture(row!.result);
+            assert.equal(capture.outcome, "cancelled");
+            assert.equal(capture.turnId, point.turnId);
+            const query = yield* makeCheckpointDiffQuery.pipe(
+              Effect.provide(
+                Layer.mergeAll(
+                  h.mocks,
+                  Layer.mock(ProjectionSnapshotQuery)({
+                    getThreadCheckpointContext: () =>
+                      Ref.get(h.currentThread).pipe(
+                        Effect.map((current) =>
+                          Option.some({
+                            threadId: binding.threadId,
+                            projectId: PROJECT,
+                            workspaceRoot: "/repo",
+                            worktreePath: "/jobs/job-1",
+                            checkpoints: current!.checkpoints,
+                          }),
+                        ),
+                      ),
+                  }),
+                  Layer.mock(CheckpointStore)({
+                    diffCheckpoints: (input) =>
+                      Effect.sync(() => {
+                        assert.equal(input.fromCheckpointRef, pin.baselineCommitId);
+                        assert.equal(input.toCheckpointRef, pin.commitId);
+                        assert.isTrue(input.pinned);
+                        assert.isTrue(input.requireComplete);
+                        assert.isFalse(input.ignoreWhitespace);
+                        assert.isFalse(input.fallbackFromToHead);
+                        return "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+partial  \n";
+                      }),
+                  }),
+                  Layer.succeed(WorkflowVmAttempts, {
+                    resolve: () => Effect.die("No new execution"),
+                    readReviewSecrets: () => Effect.succeed(Redacted.make([])),
+                  }),
+                ),
+              ),
+            );
+            assert.include(
+              yield* query.getSavedWorkflowCaptureDiff(binding, capture),
+              "+partial  \n",
+            );
+            for (const changed of [
+              { ...capture, commitId: "wrong" },
+              { ...capture, turnId: "unrelated" },
+              { ...capture, outcome: "completed" as const },
+            ]) {
+              assert.isTrue(
+                Exit.isFailure(
+                  yield* Effect.exit(query.getSavedWorkflowCaptureDiff(binding, changed)),
+                ),
+              );
+            }
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  query.getSavedWorkflowCaptureDiff({ ...binding, generation: 2 }, capture),
+                ),
+              ),
+            );
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(
+                  query.getTurnDiff({
+                    threadId: binding.threadId,
+                    fromTurnCount: 0,
+                    toTurnCount: point.checkpointTurnCount,
+                    strictWorkflowReview: true,
+                    expectedTurnId: point.turnId,
+                  }),
+                ),
+              ),
+            );
+            yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${binding.jobId}`;
+            assert.equal(
+              (yield* runner.handle({ ...control("status"), workflowVm })).progress?.status,
+              "cancelled",
+            );
+          }
+          assert.lengthOf(yield* h.starts, 1);
+        }),
+      ),
+  );

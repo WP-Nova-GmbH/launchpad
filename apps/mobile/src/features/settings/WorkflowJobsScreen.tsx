@@ -1,3 +1,4 @@
+import { SavedWorkflowResults } from "./SavedWorkflowResults";
 import { ErrorBanner } from "../../components/ErrorBanner";
 import { MaterialButton } from "../../components/MaterialButton";
 import { SymbolView } from "../../components/AppSymbol";
@@ -343,7 +344,7 @@ function WorkflowJobsContent(props: Props) {
   useEffect(() => {
     if (!scope || !selectedJobId || read.mutation || !focused) return;
     void refreshJob();
-    if (terminal) return;
+    if (terminal && selectedJob?.progress?.resultSaving?.state !== "saving") return;
     const timer = setInterval(() => {
       if (AppState.currentState === "active") void refreshJob();
     }, 5000);
@@ -356,7 +357,15 @@ function WorkflowJobsContent(props: Props) {
       subscription.remove();
       invalidateWorkflowJobRead(appAtomRegistry, scope, selectedJobId);
     };
-  }, [refreshJob, terminal, read.mutation, scope, selectedJobId, focused]);
+  }, [
+    refreshJob,
+    terminal,
+    selectedJob?.progress?.resultSaving?.state,
+    read.mutation,
+    scope,
+    selectedJobId,
+    focused,
+  ]);
   const machine = selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime : null;
   const target = machine
     ? projects.find(
@@ -384,6 +393,7 @@ function WorkflowJobsContent(props: Props) {
       | "request_changes"
       | "cancel"
       | "retry_action"
+      | "retry_saving"
       | "retry_preparation"
       | "retry_cancellation"
       | "pause"
@@ -395,6 +405,11 @@ function WorkflowJobsContent(props: Props) {
         !selectedRepository ||
         !scope ||
         (manualState.responsePending && operation !== "cancel")
+      )
+        return;
+      if (
+        operation === "retry_saving" &&
+        (!canConfigure || !selectedJob.progress?.resultSaving?.retryable)
       )
         return;
       const checkpoint = selectedJob.progress?.checkpoint;
@@ -424,30 +439,36 @@ function WorkflowJobsContent(props: Props) {
         }));
       }
       const payload =
-        operation === "pause" || operation === "resume"
-          ? intent!.control
-          : operation === "input" || operation === "request_changes"
-            ? {
-                operation,
-                checkpointId: checkpoint!.checkpointId,
-                expectedRevision: selectedJob.progress!.revision,
-                text: responseDrafts[checkpoint!.checkpointId] ?? "",
-              }
-            : operation === "approve"
-              ? ({
+        operation === "retry_saving"
+          ? {
+              operation,
+              publicationId: selectedJob.progress!.resultSaving!.publicationId,
+              expectedRevision: selectedJob.progress!.revision,
+            }
+          : operation === "pause" || operation === "resume"
+            ? intent!.control
+            : operation === "input" || operation === "request_changes"
+              ? {
                   operation,
                   checkpointId: checkpoint!.checkpointId,
                   expectedRevision: selectedJob.progress!.revision,
-                } as const)
-              : operation === "retry_action"
-                ? {
+                  text: responseDrafts[checkpoint!.checkpointId] ?? "",
+                }
+              : operation === "approve"
+                ? ({
                     operation,
-                    actionId: actionState.action!.actionId,
+                    checkpointId: checkpoint!.checkpointId,
                     expectedRevision: selectedJob.progress!.revision,
-                  }
-                : operation === "retry_preparation" || operation === "retry_cancellation"
-                  ? { operation, expectedRevision: selectedJob.progress!.revision }
-                  : { operation };
+                  } as const)
+                : operation === "retry_action"
+                  ? {
+                      operation,
+                      actionId: actionState.action!.actionId,
+                      expectedRevision: selectedJob.progress!.revision,
+                    }
+                  : operation === "retry_preparation" || operation === "retry_cancellation"
+                    ? { operation, expectedRevision: selectedJob.progress!.revision }
+                    : { operation };
       const submitted = {
         checkpointId: checkpoint?.checkpointId ?? null,
         operation,
@@ -654,7 +675,10 @@ function WorkflowJobsContent(props: Props) {
               ) : null}
             </View>
           </SettingsSection>
-          {!composingFeedback || reviewChanged || checkingReturnedReview ? (
+          {!composingFeedback ||
+          reviewChanged ||
+          checkingReturnedReview ||
+          selectedJob.progress?.resultSaving ? (
             <SettingsSection title={terminal ? "Result" : "Current task"}>
               {completed && selectedJob.progress?.pullRequestUrl ? (
                 <View className="p-4">
@@ -686,8 +710,42 @@ function WorkflowJobsContent(props: Props) {
                   />
                 </View>
               ) : null}
-
+              {!composingFeedback && scope && selectedJob.runtime?.kind === "vm" ? (
+                <SavedWorkflowResults
+                  key={`${scope.accountId}:${scope.repositoryId}:${selectedJob.jobId}`}
+                  scope={scope}
+                  job={selectedJob}
+                  call={call}
+                  refresh={refreshJob}
+                  canConfigure={canConfigure}
+                />
+              ) : null}
+              {selectedJob.progress?.resultSaving ? (
+                <View className="p-4">
+                  <Text
+                    accessibilityRole="header"
+                    className="font-t3-medium text-sm text-foreground"
+                  >
+                    {selectedJob.progress.resultSaving.state === "failed"
+                      ? "Couldn’t save result"
+                      : "Saving result"}
+                  </Text>
+                  <Text className="text-sm text-foreground-muted">
+                    {selectedJob.progress.resultSaving.detail ??
+                      "The next step starts after this result is saved."}
+                  </Text>
+                  {canConfigure && selectedJob.progress.resultSaving.retryable ? (
+                    <SettingsActionRow
+                      icon="arrow.clockwise"
+                      label="Retry saving"
+                      disabled={busy}
+                      onPress={() => respond("retry_saving")}
+                    />
+                  ) : null}
+                </View>
+              ) : null}
               {!composingFeedback &&
+              selectedJob.runtime?.kind !== "vm" &&
               completed &&
               selectedJob.progress &&
               selectedJob.progress.hasThread !== false &&
@@ -706,6 +764,7 @@ function WorkflowJobsContent(props: Props) {
                 </View>
               ) : null}
               {!composingFeedback &&
+              selectedJob.runtime?.kind !== "vm" &&
               selectedJob.progress &&
               selectedJob.progress.hasThread !== false &&
               (!completed ||
@@ -719,19 +778,14 @@ function WorkflowJobsContent(props: Props) {
                 />
               ) : null}
               {!composingFeedback &&
+              selectedJob.runtime?.kind !== "vm" &&
               (!completed || !!selectedJob.progress?.pullRequestUrl) &&
               selectedJob.progress?.hasThread !== false &&
               selectedJob.progress?.checkpoint &&
               selectedJob.progress.checkpoint.kind !== "input" ? (
                 <SettingsActionRow
                   icon="doc.text"
-                  label={
-                    completed
-                      ? "Inspect result"
-                      : selectedJob.runtime?.kind === "vm"
-                        ? "Inspect live diff"
-                        : "Inspect saved diff"
-                  }
+                  label={completed ? "Inspect result" : "Inspect saved diff"}
                   disabled={busy || openingResult === jobKey || checkingReturnedReview}
                   onPress={() => openResult(true)}
                 />

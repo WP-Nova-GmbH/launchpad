@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./relay/workflow-saved-results": {
+      "types": "./src/relay/workflowSavedResults.ts",
+      "default": "./src/relay/workflowSavedResults.ts"
+    },
     "./provider-update": {
       "types": "./src/providerUpdate.ts",
       "default": "./src/providerUpdate.ts"

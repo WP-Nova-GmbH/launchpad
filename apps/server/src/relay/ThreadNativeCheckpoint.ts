@@ -103,11 +103,13 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
       readonly turnId: string;
       readonly artifactRoot: string;
       readonly captureOperationId?: string;
+      readonly authorize?: Effect.Effect<void, ThreadNativeCheckpointError>;
     },
     exportConversation: (artifactRoot: string) => Effect.Effect<NativeConversationArchive, E, R>,
   ) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    if (input.authorize) yield* input.authorize;
     const fence = yield* fences.get(input.threadId);
     if (!fence) {
       if (input.captureOperationId !== undefined)
@@ -119,6 +121,7 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
     const checkpointId = threadCheckpointId(input.turnId, input.captureOperationId);
     const frozen = input.captureOperationId !== undefined;
     const assertOwner = Effect.fnUntraced(function* () {
+      if (input.authorize) yield* input.authorize;
       const owner = yield* fences.get(input.threadId);
       if (
         !owner ||
@@ -186,6 +189,7 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
       yield* fs.makeTempDirectory({ directory: root, prefix: "checkpoint-" }),
     );
     return yield* Effect.gen(function* () {
+      yield* assertOwner();
       const archive = yield* exportConversation(stage);
       const canonical = yield* fs.realPath(archive.directory);
       const canonicalStage = yield* fs.realPath(stage);

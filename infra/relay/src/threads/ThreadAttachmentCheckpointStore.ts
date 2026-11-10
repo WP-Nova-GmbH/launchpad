@@ -49,6 +49,16 @@ export function makeThreadAttachmentCheckpointStore(
     const row = yield* getStored(nativeCheckpointOperationId);
     return row?.retained ? yield* decodeReceipt(row) : null;
   });
+  const getForResult = Effect.fn("relay.attachment_checkpoint.result.get")(function* (input: {
+    threadId: string;
+    resultId: string;
+  }) {
+    const [result] = yield* sql<{
+      nativeOperationId: string;
+    }>`SELECT native_checkpoint_operation_id AS "nativeOperationId" FROM relay_workflow_saved_results WHERE thread_id=${input.threadId} AND result_id=${input.resultId}`;
+    const point = result ? yield* getStored(result.nativeOperationId) : null;
+    return point?.threadId === input.threadId ? yield* decodeReceipt(point) : null;
+  });
   const getForOperation = Effect.fn("relay.attachment_checkpoint.operation.get")(function* (input: {
     readonly threadId: string;
     readonly operationId: string;
@@ -61,12 +71,15 @@ export function makeThreadAttachmentCheckpointStore(
     const point = operation ? yield* getStored(operation.checkpointOperationId) : null;
     return point ? yield* decodeReceipt(point) : null;
   });
-  const publish = Effect.fn("relay.attachment_checkpoint.publish")(function* (input: {
-    readonly threadId: string;
-    readonly operationId: string;
-    readonly manifestArtifactId: string;
-    readonly nativeCheckpointOperationId: string;
-  }) {
+  const publish = Effect.fn("relay.attachment_checkpoint.publish")(function* <E = never, R = never>(
+    input: {
+      readonly threadId: string;
+      readonly operationId: string;
+      readonly manifestArtifactId: string;
+      readonly nativeCheckpointOperationId: string;
+    },
+    authorize: Effect.Effect<void, E, R> = Effect.void,
+  ) {
     return yield* checkpointObjects.withPinned(
       {
         ...input,
@@ -111,6 +124,7 @@ export function makeThreadAttachmentCheckpointStore(
           });
           return yield* sql.withTransaction(
             Effect.gen(function* () {
+              yield* authorize;
               const [placement] = yield* sql<{
                 environmentId: string;
                 generation: number;
@@ -183,5 +197,5 @@ export function makeThreadAttachmentCheckpointStore(
         }),
     );
   });
-  return { get, getForOperation, publish };
+  return { getForResult, get, getForOperation, publish };
 }

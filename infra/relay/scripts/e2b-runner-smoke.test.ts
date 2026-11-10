@@ -25,6 +25,7 @@ const legacyChecks = {
   privateCheckpointReaderVerified: true,
 };
 const executionChecks = {
+  workflowRecoveryInspectionVerified: true,
   nativeCodexCommandExecuted: true,
   nativeCodexApprovalDenied: true,
   nativeCodexResumeExecuted: true,

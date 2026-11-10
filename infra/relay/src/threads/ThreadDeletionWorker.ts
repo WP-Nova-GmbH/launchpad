@@ -131,6 +131,7 @@ export function makeThreadDeletionWorker(
             operationId: allocation.operationId,
             generation: allocation.generation,
             computeRef: allocation.computeRef,
+            resourceKind: allocation.resourceKind,
           }))
         ) {
           yield* store.defer(claim, "identity_conflict");

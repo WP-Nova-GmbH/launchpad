@@ -1,3 +1,4 @@
+import { SavedWorkflowResults } from "./SavedWorkflowResults";
 import { CloudIcon, MonitorIcon, RefreshCwIcon } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
@@ -146,7 +147,7 @@ export function WorkflowJob({
   useEffect(() => {
     if (read.mutation) return;
     void refresh();
-    if (terminal) return;
+    if (terminal && selectedJob?.progress?.resultSaving?.state !== "saving") return;
     const timer = window.setInterval(() => {
       if (document.visibilityState !== "hidden") void refresh();
     }, 5000);
@@ -162,7 +163,7 @@ export function WorkflowJob({
       document.removeEventListener("visibilitychange", focus);
       invalidateWorkflowJobRead(appAtomRegistry, scope, jobId);
     };
-  }, [refresh, terminal, read.mutation, scope, jobId]);
+  }, [refresh, terminal, selectedJob?.progress?.resultSaving?.state, read.mutation, scope, jobId]);
   const respond = async (operation: Operation) => {
     if (!selectedJob || busy || (manualState.responsePending && operation !== "cancel")) return;
     const currentRead = appAtomRegistry.get(workflowJobReadAtom).jobs[key] ?? emptyWorkflowJobRead;
@@ -181,6 +182,11 @@ export function WorkflowJob({
       (!selectedJob.progress?.checkpoint || isTerminalWorkflowJob(selectedJob.status))
     )
       return;
+    if (
+      operation === "retry_saving" &&
+      (!canConfigure || !selectedJob.progress?.resultSaving?.retryable)
+    )
+      return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId, randomUUID());
     if (!request) return;
     const current = appAtomRegistry.get(workflowDraftAtom);
@@ -194,30 +200,36 @@ export function WorkflowJob({
       }));
     }
     const payload =
-      operation === "pause" || operation === "resume"
-        ? intent!.control
-        : operation === "input" || operation === "request_changes"
-          ? {
-              operation,
-              checkpointId: checkpoint!.checkpointId,
-              expectedRevision: selectedJob.progress!.revision,
-              text: current.responses[key]?.[checkpoint!.checkpointId] ?? "",
-            }
-          : operation === "approve"
+      operation === "retry_saving"
+        ? {
+            operation,
+            publicationId: selectedJob.progress!.resultSaving!.publicationId,
+            expectedRevision: selectedJob.progress!.revision,
+          }
+        : operation === "pause" || operation === "resume"
+          ? intent!.control
+          : operation === "input" || operation === "request_changes"
             ? {
                 operation,
                 checkpointId: checkpoint!.checkpointId,
                 expectedRevision: selectedJob.progress!.revision,
+                text: current.responses[key]?.[checkpoint!.checkpointId] ?? "",
               }
-            : operation === "retry_action"
+            : operation === "approve"
               ? {
                   operation,
-                  actionId: actionState.action!.actionId,
+                  checkpointId: checkpoint!.checkpointId,
                   expectedRevision: selectedJob.progress!.revision,
                 }
-              : operation === "retry_preparation" || operation === "retry_cancellation"
-                ? { operation, expectedRevision: selectedJob.progress!.revision }
-                : { operation };
+              : operation === "retry_action"
+                ? {
+                    operation,
+                    actionId: actionState.action!.actionId,
+                    expectedRevision: selectedJob.progress!.revision,
+                  }
+                : operation === "retry_preparation" || operation === "retry_cancellation"
+                  ? { operation, expectedRevision: selectedJob.progress!.revision }
+                  : { operation };
     const submitted = {
       checkpointId: checkpoint?.checkpointId ?? null,
       operation,
@@ -571,8 +583,42 @@ export function WorkflowJob({
               Open pull request
             </Button>
           ) : null}
-
+          {!composingFeedback && selectedJob.runtime?.kind === "vm" ? (
+            <SavedWorkflowResults
+              key={`${scope.accountId}:${scope.repositoryId}:${jobId}`}
+              scope={scope}
+              job={selectedJob}
+              refresh={refresh}
+              canConfigure={canConfigure}
+            />
+          ) : null}
+          {selectedJob.progress?.resultSaving ? (
+            <WorkflowAlert
+              title={
+                selectedJob.progress.resultSaving.state === "failed"
+                  ? "Couldn’t save result"
+                  : "Saving result"
+              }
+              variant={selectedJob.progress.resultSaving.state === "failed" ? "error" : "info"}
+              actions={
+                canConfigure && selectedJob.progress.resultSaving.retryable ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => void respond("retry_saving")}
+                  >
+                    Retry saving
+                  </Button>
+                ) : undefined
+              }
+            >
+              {selectedJob.progress.resultSaving.detail ??
+                "The next step starts after this result is saved. Cancel remains available."}
+            </WorkflowAlert>
+          ) : null}
           {!composingFeedback &&
+          selectedJob.runtime?.kind !== "vm" &&
           selectedJob.progress &&
           selectedJob.progress.hasThread !== false ? (
             <div className="flex flex-wrap gap-2">
@@ -586,11 +632,7 @@ export function WorkflowJob({
                   disabled={openingResult || checkingReturnedReview}
                   onClick={() => void inspect(true)}
                 >
-                  {completed
-                    ? "Inspect result"
-                    : selectedJob.runtime?.kind === "vm"
-                      ? "Inspect live diff"
-                      : "Inspect saved diff"}
+                  {completed ? "Inspect result" : "Inspect saved diff"}
                 </Button>
               ) : null}
               <Button

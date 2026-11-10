@@ -1346,3 +1346,32 @@ it.effect("a frozen automation offer remains pinned until its executor can recon
     );
   }),
 );
+
+it.effect("never prepares or wakes a terminal VM just to refresh a pending saved result", () =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    const record = {
+      ...vmReviewJob.record,
+      status: "cancelled" as const,
+      progress: {
+        ...vmReviewJob.record.progress!,
+        status: "cancelled" as const,
+        resultSaving: {
+          publicationId: "11111111-1111-4111-8111-111111111111",
+          state: "saving" as const,
+          resultId: null,
+          detail: null,
+          retryable: false,
+        },
+      },
+    };
+    yield* Ref.set(h.row, { ...vmReviewJob, pendingControl: null, status: "cancelled", record });
+    const result = yield* h.refresh.pipe(
+      Effect.provideService(WorkflowVmPreparation, {
+        advance: () => Effect.die("Saving must never wake or recreate terminal compute"),
+      }),
+    );
+    assert.deepEqual(result, record);
+    assert.equal((yield* Ref.get(h.controls)).length, 0);
+  }),
+);

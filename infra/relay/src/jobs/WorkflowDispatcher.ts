@@ -90,7 +90,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     pending = previous.pendingControl,
     release = false,
   ) => store.updateJob(previous, record, pending, release, leaseUntil);
-  if (isTerminalWorkflowJob(row.record.status)) {
+  if (
+    isTerminalWorkflowJob(row.record.status) &&
+    !row.record.progress?.resultSaving &&
+    row.pendingControl?.response.operation !== "retry_saving"
+  ) {
     yield* store.release(jobId, leaseUntil);
     return row.record;
   }
@@ -143,7 +147,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         !vm ||
         (row!.pendingControl?.response.operation === "cancel" && job.startAttempted === false)
       ) {
-        if (Option.isSome(preparation)) return yield* preparation.value.advance(row!, leaseUntil);
+        if (!isTerminalWorkflowJob(job.status) && Option.isSome(preparation))
+          return yield* preparation.value.advance(row!, leaseUntil);
         return job;
       }
     }

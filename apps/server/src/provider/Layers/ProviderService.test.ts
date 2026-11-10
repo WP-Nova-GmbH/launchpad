@@ -8,12 +8,13 @@ import {
 } from "../Drivers/PortableCodexHome.ts";
 import * as NodeCrypto from "node:crypto";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
-import { attachmentRelativePath } from "../../attachmentStore.ts";
+import { attachmentRelativePath, toSafeThreadAttachmentSegment } from "../../attachmentStore.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import {
   VmControlSpawner,
   VmWorkloadMaintenance,
   VmWorkloadTracking,
+  WorkflowVmGuest,
 } from "../../vmWorkloadCommand.ts";
 import type { InstalledThreadVm } from "../../relay/ThreadVmEnrollment.ts";
 import { THREAD_VM_IDENTITY_SECRET } from "../../relay/ThreadVmEnrollment.ts";
@@ -64,7 +65,9 @@ import {
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderItemId,
   ProviderSessionStartInput,
+  ServerProvider,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -90,6 +93,7 @@ import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Redacted from "effect/Redacted";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -565,6 +569,7 @@ const hasMetricSnapshot = (
 function makeProviderServiceLayer(
   input: {
     readonly vmWorkloads?: boolean;
+    readonly workflowGuest?: boolean;
     readonly installedVm?: InstalledThreadVm;
     readonly workloadControl?: ChildProcessSpawner.ChildProcessSpawner["Service"];
     readonly nativeHistory?: boolean;
@@ -575,6 +580,7 @@ function makeProviderServiceLayer(
     readonly analyticsLayer?: Layer.Layer<AnalyticsService.AnalyticsService>;
     readonly registry?: ProviderAdapterRegistry.ProviderAdapterRegistry["Service"];
     readonly workflowRuns?: Map<string, WorkflowRun>;
+    readonly workflowStoreLayer?: Layer.Layer<never>;
     readonly issueMcpCredential?: ProviderServiceLiveOptions["issueMcpCredential"];
     readonly projection?: ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"];
     readonly settingsLayer?: typeof defaultServerSettingsLayer;
@@ -614,6 +620,7 @@ function makeProviderServiceLayer(
       Layer.provide(input.executionLayer ?? SqlitePersistenceMemory),
       Layer.provide(historyLayer),
       Layer.provide(Layer.succeed(VmWorkloadTracking, input.vmWorkloads ?? false)),
+      Layer.provide(Layer.succeed(WorkflowVmGuest, input.workflowGuest ?? false)),
       Layer.provide(Layer.succeed(VmControlSpawner, input.workloadControl)),
       Layer.provide(
         input.installedVm
@@ -636,31 +643,32 @@ function makeProviderServiceLayer(
       ),
       Layer.provide(providerAdapterLayer),
       Layer.provide(
-        Layer.effect(
-          WorkflowRunStore,
-          Effect.gen(function* () {
-            const base = yield* WorkflowRunStore;
-            return {
-              ...base,
-              isWorkflowVmThread: (id: string) =>
-                Effect.succeed(
-                  Array.from(input.workflowRuns?.values() ?? []).some(
-                    (run) => run.runtime.kind === "vm" && run.progress.threadId === id,
+        input.workflowStoreLayer ??
+          Layer.effect(
+            WorkflowRunStore,
+            Effect.gen(function* () {
+              const base = yield* WorkflowRunStore;
+              return {
+                ...base,
+                isWorkflowVmThread: (id: string) =>
+                  Effect.succeed(
+                    Array.from(input.workflowRuns?.values() ?? []).some(
+                      (run) => run.runtime.kind === "vm" && run.progress.threadId === id,
+                    ),
                   ),
-                ),
-              get: (id: string) => Effect.sync(() => input.workflowRuns?.get(id) ?? null),
-              getByThread: (id: string) =>
-                Effect.sync(
-                  () =>
-                    Array.from(input.workflowRuns?.values() ?? []).find(
-                      (run) =>
-                        run.progress.threadId === id &&
-                        !["done", "cancelled", "failed"].includes(run.progress.status),
-                    ) ?? null,
-                ),
-            };
-          }),
-        ),
+                get: (id: string) => Effect.sync(() => input.workflowRuns?.get(id) ?? null),
+                getByThread: (id: string) =>
+                  Effect.sync(
+                    () =>
+                      Array.from(input.workflowRuns?.values() ?? []).find(
+                        (run) =>
+                          run.progress.threadId === id &&
+                          !["done", "cancelled", "failed"].includes(run.progress.status),
+                      ) ?? null,
+                  ),
+              };
+            }),
+          ),
       ),
       Layer.provide(directoryLayer),
       Layer.provide(input.settingsLayer ?? defaultServerSettingsLayer),
@@ -674,6 +682,7 @@ function makeProviderServiceLayer(
       ),
     ),
     input.executionLayer ?? Layer.empty,
+    input.workflowStoreLayer ?? Layer.empty,
     historyLayer,
     configLayer,
     SqlitePersistenceMemory,
@@ -7227,7 +7236,7 @@ const checkpointHistoryFixture = Effect.fnUntraced(function* (threadId: ThreadId
     name: "notes.txt",
     mimeType: "text/plain",
     sizeBytes: 5,
-    id: `${threadId}-00000000-0000-4000-8000-000000000001-txt`,
+    id: `${toSafeThreadAttachmentSegment(threadId)}-00000000-0000-4000-8000-000000000001-txt`,
   };
   const at = "2026-10-05T10:00:00.000Z";
   const append = (type: string, payload: unknown, suffix: string) =>
@@ -10491,4 +10500,1823 @@ it.effect.each([
       yield* Scope.close(scope, Exit.void);
     }
   }),
+);
+
+import { workflowPromptId } from "../../jobs/workflowSequence.ts";
+const makeWorkflowCaptureFixture = Effect.fnUntraced(function* (
+  options: { externalIngestion?: boolean } = {},
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = yield* fs.realPath(
+    yield* fs.makeTempDirectoryScoped({ prefix: "workflow-native-capture-" }),
+  );
+  const home = path.join(root, "codex");
+  const privateHome = "/home/launchpad-workflow/.codex";
+  const rollout = path.join(
+    home,
+    "sessions",
+    "2026",
+    "10",
+    "05",
+    `rollout-2026-10-05T10-00-00-${nativeIdForCheckpoint}.jsonl`,
+  );
+  const privateRollout = path.join(privateHome, path.relative(home, rollout));
+  const rawSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const checkpointReader = path.resolve(
+    import.meta.dirname,
+    "../../../../../infra/e2b/template/workflow-checkpoint-reader.py",
+  );
+  // Preserve the guest's private native paths while running the fixed reader locally.
+  const workflowSpawner = ChildProcessSpawner.make((command) => {
+    if (ChildProcess.isPipedCommand(command)) return rawSpawner.spawn(command);
+    return rawSpawner.spawn(
+      ChildProcess.make(
+        command.command,
+        command.args.map((arg) =>
+          arg === "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py"
+            ? checkpointReader
+            : arg,
+        ),
+        {
+          ...command.options,
+          ...(command.options.cwd === privateHome ? { cwd: home } : {}),
+        },
+      ),
+    );
+  });
+  yield* fs.makeDirectory(path.dirname(rollout), { recursive: true });
+  yield* fs.writeFileString(
+    rollout,
+    encodeJson({
+      type: "session_meta",
+      payload: { id: nativeIdForCheckpoint, cli_version: "0.159.3", history_mode: "paginated" },
+    }) + "\n",
+  );
+  yield* fs.writeFileString(path.join(home, "auth.json"), "fixture-private-auth-must-not-export");
+  const threadId = asThreadId("workflow:trusted-native-capture");
+  const original = continuityWorkflow(threadId);
+  const binding = {
+    jobId: original.jobId,
+    threadId,
+    organizationId: "org",
+    repositoryId: "repo",
+    allocationId: "allocation",
+    environmentId: EnvironmentId.make("environment"),
+    generation: 1,
+    operationId: "enroll",
+    projectId: ProjectId.make("project"),
+  };
+  const run = decodeContinuityWorkflowRun({
+    ...original,
+    worktreePath: root,
+    runtime: { kind: "vm", ...binding },
+    workflow: {
+      ...original.workflow,
+      definition: { ...original.workflow.definition, target: { kind: "vm", baseBranch: null } },
+    },
+    progress: { ...original.progress, status: "running" },
+  });
+  const configLayer = ServerConfig.layerTest(root, { prefix: "workflow-native-" }).pipe(
+    Layer.provide(NodeServices.layer),
+  );
+  let sends = 0,
+    closes = 0,
+    opens = 0;
+  const binary = path.join(root, "read-only-codex");
+  const requests = path.join(root, "read-only-requests.jsonl");
+  yield* fs.writeFileString(
+    binary,
+    [
+      `#!${process.execPath}`,
+      "const fs=require('node:fs'),readline=require('node:readline');",
+      "readline.createInterface({input:process.stdin}).on('line',line=>{const q=JSON.parse(line);fs.appendFileSync(" +
+        encodeJson(requests) +
+        ",line+'\\n');if(q.id===undefined)return;",
+      "const result=q.method==='initialize'?{codexHome:process.env.CODEX_HOME,userAgent:'codex/0.159.3',platformFamily:'unix',platformOs:'macos'}:{thread:{id:" +
+        encodeJson(nativeIdForCheckpoint) +
+        ",path:" +
+        encodeJson(privateRollout) +
+        ",historyMode:'paginated'}};",
+      "process.stdout.write(JSON.stringify({id:q.id,result})+'\\n');});",
+    ].join("\n"),
+    { mode: 0o700 },
+  );
+  let beforeRead: Effect.Effect<void> = Effect.void;
+  const sentTurns = yield* Queue.unbounded<TurnId>();
+  let runtimeEvents: Queue.Queue<ProviderEvent, Cause.Done<void>> | undefined;
+  const adapter = yield* makeCodexAdapter(
+    decodeVmCheckpointSettings({ homePath: home, binaryPath: binary }),
+    {
+      managedAuth: {
+        connectionId: "connection",
+        label: "Fixture account",
+        status: Effect.die("No auth probe"),
+        preflight: Effect.void,
+        mintToken: Effect.succeed(Redacted.make("fixture-token")),
+      },
+      makeRuntime: (options) =>
+        Effect.gen(function* () {
+          opens++;
+          if (opens > 1) {
+            assert.deepInclude(options.resumeCursor, { threadId: nativeIdForCheckpoint });
+            assert.isTrue(options.requireResume);
+          }
+          const events = yield* Queue.unbounded<ProviderEvent, Cause.Done<void>>();
+          runtimeEvents = events;
+          const session: ProviderSession = {
+            provider: CODEX_DRIVER,
+            threadId,
+            runtimeMode: options.runtimeMode,
+            cwd: root,
+            resumeCursor: { threadId: nativeIdForCheckpoint },
+            status: "ready",
+            createdAt: run.createdAt,
+            updatedAt: run.createdAt,
+          };
+          return {
+            start: () => Effect.succeed(session),
+            getSession: Effect.succeed(session),
+            sendTurn: () =>
+              Effect.gen(function* () {
+                const turnId = asTurnId(`turn-${++sends}`);
+                yield* Queue.offer(sentTurns, turnId);
+                return { threadId, turnId };
+              }),
+            compactThread: () => Effect.void,
+            interruptTurn: () => Effect.void,
+            readThread: Effect.succeed({ threadId: nativeIdForCheckpoint, turns: [] }),
+            readConversationSource: Effect.suspend(() =>
+              beforeRead.pipe(
+                Effect.as({ threadId: nativeIdForCheckpoint, rolloutPath: privateRollout }),
+              ),
+            ),
+            rollbackThread: () => Effect.succeed({ threadId: nativeIdForCheckpoint, turns: [] }),
+            uploadFeedback: () => Effect.succeed({ threadId: nativeIdForCheckpoint }),
+            respondToRequest: () => Effect.void,
+            respondToUserInput: () => Effect.void,
+            events: Stream.fromQueue(events),
+            close: Effect.die("Writer closure cannot claim descendant termination"),
+            closeNativeWriter: Effect.gen(function* () {
+              closes++;
+              yield* Queue.end(events);
+            }),
+          } satisfies CodexSessionRuntimeShape;
+        }),
+    },
+  ).pipe(
+    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, workflowSpawner),
+    Effect.provide(Layer.mergeAll(NodeServices.layer, configLayer)),
+    Effect.provideService(VmWorkloadTracking, true),
+    Effect.provideService(WorkflowVmGuest, true),
+  );
+  const fixture = makeProviderServiceLayer({
+    vmWorkloads: true,
+    workflowGuest: true,
+    nativeHistory: true,
+    configLayer,
+    workflowStoreLayer: WorkflowRunStoreLayer.pipe(
+      Layer.provide(Layer.mergeAll(NodeServices.layer, SqlitePersistenceMemory)),
+      Layer.orDie,
+    ),
+    installedVm: {
+      operationId: binding.operationId,
+      scope: { allocationId: binding.allocationId, threadId, repositoryId: "repo", generation: 1 },
+      environmentId: binding.environmentId,
+      relayUrl: "https://relay.invalid",
+      relayIssuer: "https://relay.invalid",
+      environmentCredential: "fixture",
+      cloudMintPublicKey: "fixture",
+    },
+    executionLayer: Layer.effect(
+      ThreadExecution,
+      Effect.map(SqlClient.SqlClient, (sql) =>
+        makeThreadExecutionRelay(sql, {
+          admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
+          complete: () => Effect.void,
+        }),
+      ),
+    ).pipe(Layer.provideMerge(SqlitePersistenceMemory), Layer.orDie),
+    registry: makeStaticInstanceRegistry([[codexInstanceId, adapter]]),
+  });
+  const context = yield* Layer.build(fixture.serviceLayer);
+  const sql = yield* SqlClient.SqlClient.pipe(Effect.provide(context));
+  const store = yield* WorkflowRunStore.pipe(Effect.provide(context));
+  const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+  if (!options.externalIngestion) {
+    // Store-focused tests seed history directly. The integration fixture below
+    // uses the real ingestion worker to acknowledge this persistence barrier.
+    yield* provider.streamIngestionEvents!.pipe(
+      Stream.runForEach((event) =>
+        event instanceof ProviderEventBarrier
+          ? Deferred.succeed(event.done, undefined)
+          : Effect.void,
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+  }
+  const history = yield* checkpointHistoryFixture(threadId).pipe(Effect.provide(context));
+  yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES('project','Workflow native',${root},'[]',${run.createdAt},${run.createdAt})`;
+  yield* sql`INSERT INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at,worktree_path) VALUES(${threadId},'project','Workflow native','{"instanceId":"codex","model":"gpt-test"}','full-access','default',${run.createdAt},${run.createdAt},${root})`;
+  yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase) VALUES(${threadId},'https://relay.invalid',${binding.environmentId},'project',1,'enroll','active')`;
+  yield* store.save(run);
+  const queue = {
+    ...emptyThreadPromptQueue(),
+    enabled: true,
+    awaitingTurnId: asTurnId("turn-1"),
+    admissions: [
+      {
+        attemptId: CommandId.make("attempt-1"),
+        messageId: MessageId.make(workflowPromptId(run)),
+        turnId: asTurnId("turn-1"),
+        evidence: "provider-ack" as const,
+      },
+    ],
+  };
+  yield* sql`INSERT INTO projection_thread_prompt_queues(thread_id,state_json) VALUES(${threadId},${encodeJson(queue)})`;
+  return {
+    root,
+    home,
+    rollout,
+    requests,
+    gateRead: (effect: Effect.Effect<void>) => {
+      beforeRead = effect;
+    },
+    binding,
+    run,
+    context,
+    sql,
+    store,
+    provider,
+    adapter,
+    queue,
+    history,
+    fs: yield* FileSystem.FileSystem.pipe(Effect.provide(context)),
+    counts: () => ({ opens, sends, closes }),
+    sentTurns,
+    emit: (event: ProviderEvent) =>
+      Effect.suspend(() =>
+        runtimeEvents ? Queue.offer(runtimeEvents, event) : Effect.die("No native runtime"),
+      ),
+    start: provider.startSession(threadId, {
+      threadId,
+      providerInstanceId: codexInstanceId,
+      runtimeMode: "full-access",
+      cwd: root,
+    }),
+  };
+});
+const workflowCaptureFixture = makeWorkflowCaptureFixture();
+
+it.effect(
+  "captures native and attachment prerequisites through the real workflow VM provider path",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        const result = yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "First Agent",
+          attachments: [],
+        });
+        assert.equal(result.turnId, "turn-1");
+        const proof = yield* f.provider.checkpointWorkflowConversation({
+          binding: f.binding,
+          turnId: result.turnId,
+        });
+        assert.equal(proof.generation, 1);
+        assert.equal(proof.turnId, result.turnId);
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          1,
+        );
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          1,
+        );
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+        yield* f.provider.checkpointWorkflowConversation({
+          binding: f.binding,
+          turnId: result.turnId,
+        });
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([true, false])(
+  "captures an admitted preparing turn before prompt acknowledgement=%s",
+  (promptDispatched) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Fast Agent",
+          attachments: [],
+        });
+        yield* f.store.save({
+          ...f.run,
+          promptDispatched,
+          progress: { ...f.run.progress, status: "preparing" },
+        });
+        yield* f.sql`UPDATE projection_thread_prompt_queues SET state_json=${encodeJson({ ...f.queue, admissions: [] })} WHERE thread_id=${f.binding.threadId}`;
+        assert.equal(
+          (yield* f.provider
+            .checkpointWorkflowConversation({
+              binding: f.binding,
+              turnId: asTurnId("turn-1"),
+            })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+        assert.equal(f.counts().closes, 0);
+        yield* f.sql`UPDATE projection_thread_prompt_queues SET state_json=${encodeJson(f.queue)} WHERE thread_id=${f.binding.threadId}`;
+        const proof = yield* f.provider.checkpointWorkflowConversation({
+          binding: f.binding,
+          turnId: asTurnId("turn-1"),
+        });
+        assert.equal(proof.turnId, "turn-1");
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "rejects stale workflow capture identities and keeps generic VM native export restricted",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Agent",
+          attachments: [],
+        });
+        const changed = [
+          { ...f.binding, generation: 2 },
+          { ...f.binding, allocationId: "other" },
+          { ...f.binding, jobId: "other" },
+          { ...f.binding, organizationId: "other" },
+          { ...f.binding, repositoryId: "other" },
+          { ...f.binding, operationId: "other" },
+          { ...f.binding, projectId: ProjectId.make("other") },
+          { ...f.binding, environmentId: EnvironmentId.make("other") },
+          { ...f.binding, threadId: asThreadId("other") },
+        ];
+        for (const binding of changed)
+          assert.equal(
+            (yield* f.provider
+              .checkpointWorkflowConversation({ binding, turnId: asTurnId("turn-1") })
+              .pipe(Effect.result))._tag,
+            "Failure",
+          );
+        assert.equal(
+          (yield* f.provider
+            .checkpointWorkflowConversation({ binding: f.binding, turnId: asTurnId("unrelated") })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+        yield* f.provider.checkpointConversation!({
+          threadId: f.binding.threadId,
+          turnId: asTurnId("turn-1"),
+        });
+        assert.equal(
+          (yield* f.provider.checkpointConversation!({
+            threadId: f.binding.threadId,
+            turnId: asTurnId("turn-1"),
+            captureOperationId: NodeCrypto.randomUUID(),
+          }).pipe(Effect.result))._tag,
+          "Failure",
+        );
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 0 });
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          0,
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.effect(
+  "retries missing attachments from the same retained native capture without another Agent",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Agent",
+          attachments: [],
+        });
+        const original = f.fs.makeDirectory;
+        let moved = false;
+        const hook = vi.spyOn(f.fs, "makeDirectory").mockImplementation((directory, options) => {
+          const create = original(directory, options);
+          if (moved || !directory.endsWith("/attachment-checkpoints")) return create;
+          moved = true;
+          return create.pipe(Effect.andThen(f.fs.rename(f.history.file, f.history.file + ".held")));
+        });
+        try {
+          assert.equal(
+            (yield* f.provider
+              .checkpointWorkflowConversation({ binding: f.binding, turnId: asTurnId("turn-1") })
+              .pipe(Effect.result))._tag,
+            "Failure",
+          );
+          assert.equal(
+            (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+              .length,
+            1,
+          );
+          assert.equal(
+            (yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${f.binding.threadId}`)
+              .length,
+            0,
+          );
+        } finally {
+          hook.mockRestore();
+        }
+        yield* f.fs.rename(f.history.file + ".held", f.history.file);
+        yield* f.provider.checkpointWorkflowConversation({
+          binding: f.binding,
+          turnId: asTurnId("turn-1"),
+        });
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+for (const stage of ["before capture", "native", "attachment"] as const)
+  it.effect(`cancellation rejects a new workflow catalog commit at ${stage}`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Agent",
+          attachments: [],
+        });
+        const cancel = f.store.save({
+          ...f.run,
+          progress: { ...f.run.progress, status: "cancelling" },
+        });
+        if (stage === "before capture") yield* cancel;
+        const original = f.fs.readFileString;
+        let cancelled = stage === "before capture";
+        const hook = vi.spyOn(f.fs, "readFileString").mockImplementation((file, encoding) => {
+          const read = original(file, encoding);
+          if (
+            cancelled ||
+            !file.endsWith("/manifest.json") ||
+            !file.includes(`/${stage}-checkpoints/`)
+          )
+            return read;
+          cancelled = true;
+          return read.pipe(Effect.tap(() => cancel));
+        });
+        const originalBytes = f.fs.readFile;
+        const bytesHook = vi.spyOn(f.fs, "readFile").mockImplementation((file) => {
+          const read = originalBytes(file);
+          if (cancelled || stage !== "attachment" || !file.includes("/attachment-checkpoints/"))
+            return read;
+          cancelled = true;
+          return read.pipe(Effect.tap(() => cancel));
+        });
+        try {
+          assert.equal(
+            (yield* f.provider
+              .checkpointWorkflowConversation({ binding: f.binding, turnId: asTurnId("turn-1") })
+              .pipe(Effect.result))._tag,
+            "Failure",
+          );
+          assert.isTrue(cancelled);
+          assert.equal(
+            (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+              .length,
+            stage === "attachment" ? 1 : 0,
+          );
+          assert.equal(
+            (yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${f.binding.threadId}`)
+              .length,
+            0,
+          );
+          assert.equal(f.counts().sends, 1);
+        } finally {
+          hook.mockRestore();
+          bytesHook.mockRestore();
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+it.effect.each(["failed", "timed out", "cancelled"] as const)(
+  "does not commit a workflow checkpoint when ingestion is %s",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeWorkflowCaptureFixture({ externalIngestion: true });
+        const received = yield* Deferred.make<ProviderEventBarrier>();
+        yield* f.provider.streamIngestionEvents!.pipe(
+          Stream.runForEach((event) =>
+            event instanceof ProviderEventBarrier ? Deferred.succeed(received, event) : Effect.void,
+          ),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Agent",
+          attachments: [],
+        });
+        const saving = yield* f.provider
+          .checkpointWorkflowConversation({
+            binding: f.binding,
+            turnId: asTurnId("turn-1"),
+          })
+          .pipe(Effect.result, Effect.forkChild);
+        const barrier = yield* Deferred.await(received);
+        if (mode === "failed")
+          yield* Deferred.fail(
+            barrier.done,
+            new ProviderValidationError({
+              operation: "fixture ingestion",
+              issue: "Output persistence failed",
+            }),
+          );
+        else if (mode === "timed out") yield* TestClock.adjust("30 seconds");
+        else {
+          yield* f.store.save({ ...f.run, progress: { ...f.run.progress, status: "cancelling" } });
+          yield* Deferred.succeed(barrier.done, undefined);
+        }
+        assert.equal((yield* Fiber.join(saving))._tag, "Failure");
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          0,
+        );
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          0,
+        );
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+        if (mode === "failed") {
+          yield* f.provider.streamIngestionEvents!.pipe(
+            Stream.runForEach((event) =>
+              event instanceof ProviderEventBarrier
+                ? Deferred.succeed(event.done, undefined)
+                : Effect.void,
+            ),
+            Effect.forkScoped({ startImmediately: true }),
+          );
+          yield* f.provider.checkpointWorkflowConversation({
+            binding: f.binding,
+            turnId: asTurnId("turn-1"),
+          });
+          assert.equal(
+            (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+              .length,
+            1,
+          );
+          assert.equal(
+            (yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${f.binding.threadId}`)
+              .length,
+            1,
+          );
+          assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+import * as Crypto from "effect/Crypto";
+import * as NodeChildProcess from "node:child_process";
+import {
+  nativeCheckpointCatalogTestLayer,
+  nativeCheckpointTestDatabase,
+} from "../../../../../infra/relay/src/threads/testUtils/nativeCheckpointCatalog.ts";
+import { makeThreadPlacementStore } from "../../../../../infra/relay/src/threads/ThreadPlacementStore.ts";
+import { makeThreadJournalStore } from "../../../../../infra/relay/src/threads/ThreadJournalStore.ts";
+import { makeLocalThreadArtifactObjects } from "../../../../../infra/relay/src/threads/ThreadArtifactLocalObjects.ts";
+import { makeThreadArtifactTransfer } from "../../../../../infra/relay/src/threads/ThreadArtifactTransfer.ts";
+import { makeThreadNativeCheckpointStore } from "../../../../../infra/relay/src/threads/ThreadNativeCheckpointStore.ts";
+import { makeThreadAttachmentCheckpointStore } from "../../../../../infra/relay/src/threads/ThreadAttachmentCheckpointStore.ts";
+import { makeWorkflowResults } from "../../../../../infra/relay/src/jobs/WorkflowResults.ts";
+import {
+  makeThreadCheckpointPublisher,
+  ThreadCheckpointPublishError,
+  type ThreadCheckpointTransport,
+} from "../../relay/ThreadCheckpointPublisher.ts";
+import { makeThreadHistorySync } from "../../relay/ThreadHistorySync.ts";
+import {
+  makeWorkflowResultPublisher,
+  WorkflowResultSaveError,
+} from "../../relay/WorkflowResultPublisher.ts";
+import { makeWorkflowResultOutbox } from "../../jobs/WorkflowResultOutbox.ts";
+import {
+  make as makeWorkflowDiffQuery,
+  CheckpointDiffQuery,
+} from "../../checkpointing/CheckpointDiffQuery.ts";
+import { CheckpointStore } from "../../checkpointing/CheckpointStore.ts";
+import { checkpointRefForThreadTurn } from "../../checkpointing/Utils.ts";
+import * as ThreadBackgroundLiveness from "../../orchestration/ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "../../orchestration/ThreadPlanProgress.ts";
+import { RepositoryIdentityResolver } from "../../project/RepositoryIdentityResolver.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "../../orchestration/Layers/ProjectionSnapshotQuery.ts";
+import { WorkflowVmAttempts } from "../../relay/WorkflowVmAttempts.ts";
+import {
+  layer as WorkflowRunnerLayer,
+  RepositoryWorkflowRunner,
+} from "../../jobs/RepositoryWorkflowRunner.ts";
+import { OrchestrationEngineLive } from "../../orchestration/Layers/OrchestrationEngine.ts";
+import { OrchestrationProjectionPipelineLive } from "../../orchestration/Layers/ProjectionPipeline.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { CheckpointReactorLive } from "../../orchestration/Layers/CheckpointReactor.ts";
+import { CheckpointReactor } from "../../orchestration/Services/CheckpointReactor.ts";
+import { ProviderCommandReactorLive } from "../../orchestration/Layers/ProviderCommandReactor.ts";
+import { ProviderCommandReactor } from "../../orchestration/Services/ProviderCommandReactor.ts";
+import { ProviderRuntimeIngestionLive } from "../../orchestration/Layers/ProviderRuntimeIngestion.ts";
+import { ProviderRuntimeIngestionService } from "../../orchestration/Services/ProviderRuntimeIngestion.ts";
+import { ProviderAuthService } from "../Services/ProviderAuthService.ts";
+import { ThreadDeletionReactor } from "../../orchestration/Services/ThreadDeletionReactor.ts";
+import { RuntimeReceiptBusLive } from "../../orchestration/Layers/RuntimeReceiptBus.ts";
+import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
+import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
+import { GitVcsDriver } from "../../vcs/GitVcsDriver.ts";
+import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+import { WorkspaceEntries } from "../../workspace/WorkspaceEntries.ts";
+import { PullRequestService } from "../../pullRequest/PullRequestService.ts";
+import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
+import { makeProviderRegistryLayer } from "../testUtils/providerRegistryMock.ts";
+import { jobBranchName } from "@t3tools/shared/workflowStorage";
+const decodeCaptureProvider = Schema.decodeUnknownEffect(ServerProvider);
+
+describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
+  "workflow VM capture to relay publication (Postgres)",
+  () => {
+    it.layer(nativeCheckpointCatalogTestLayer)((it) => {
+      it.effect(
+        "saves two actual VM Agent captures with verified relay receipts and the same conversation",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* makeWorkflowCaptureFixture({ externalIngestion: true });
+              const pg = yield* nativeCheckpointTestDatabase;
+              const crypto = yield* Crypto.Crypto;
+              const events = yield* OrchestrationEventStore.pipe(Effect.provide(f.context));
+              const { binding } = f;
+              const userId = "owner";
+              const relayJob = {
+                jobId: binding.jobId,
+                workflowId: "workflow",
+                repositoryId: "repo",
+                origin: { kind: "manual", userId },
+                status: "running",
+                runtime: { kind: "vm", threadId: binding.threadId },
+                instruction: "test",
+                workflow: f.run.workflow,
+                progress: null,
+                detail: null,
+                createdAt: f.run.createdAt,
+                updatedAt: f.run.createdAt,
+              };
+              yield* pg`INSERT INTO relay_workflow_jobs(job_id,organization_id,repository_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES(${binding.jobId},'org','repo',${userId},'running',${pg.json(relayJob)},0,'now','now')`;
+              yield* makeThreadPlacementStore(pg).enroll({
+                threadId: binding.threadId,
+                organizationId: "org",
+                repositoryId: "repo",
+                ownerUserId: userId,
+                environmentId: binding.environmentId,
+                projectId: binding.projectId,
+              });
+              yield* pg`UPDATE relay_thread_placements SET audience='repository',owner_user_id=NULL,workflow_job_id=${binding.jobId} WHERE thread_id=${binding.threadId}`;
+              const objects = makeLocalThreadArtifactObjects(f.fs, f.root + "/relay-objects");
+              const transfer = makeThreadArtifactTransfer(pg, objects);
+              const native = makeThreadNativeCheckpointStore(pg, objects);
+              const attachments = makeThreadAttachmentCheckpointStore(pg, objects);
+              const results = makeWorkflowResults(pg, objects);
+              const journal = makeThreadJournalStore(pg);
+              const checkpointTransport: ThreadCheckpointTransport = {
+                upload: (owner, input, stream) =>
+                  Effect.gen(function* () {
+                    const bytes = Buffer.concat(
+                      Array.from(yield* Stream.runCollect(stream.pipe(Stream.orDie))),
+                    );
+                    const uploaded = yield* transfer.upload({
+                      ...input,
+                      threadId: owner.threadId,
+                      retentionDays: 1,
+                      body: new ReadableStream({
+                        start(controller) {
+                          controller.enqueue(bytes);
+                          controller.close();
+                        },
+                      }),
+                    });
+                    assert.equal(uploaded.state, "complete");
+                    return {
+                      ...uploaded,
+                      threadId: ThreadId.make(uploaded.threadId),
+                      state: "complete" as const,
+                    };
+                  }).pipe(
+                    Effect.provideService(Crypto.Crypto, crypto),
+                    Effect.tapError((cause) => Effect.logError("P05 relay boundary", cause)),
+                    Effect.mapError(
+                      () =>
+                        new ThreadCheckpointPublishError({
+                          threadId: owner.threadId,
+                          detail: "fixture transfer failed",
+                        }),
+                    ),
+                  ),
+                publishNative: (owner, input) =>
+                  native.publish({ ...input, threadId: owner.threadId }).pipe(
+                    Effect.provideService(Crypto.Crypto, crypto),
+                    Effect.tapError((cause) => Effect.logError("P05 relay boundary", cause)),
+                    Effect.mapError(
+                      () =>
+                        new ThreadCheckpointPublishError({
+                          threadId: owner.threadId,
+                          detail: "native publication failed",
+                        }),
+                    ),
+                  ),
+                publishAttachments: (owner, input) =>
+                  attachments.publish({ ...input, threadId: owner.threadId }).pipe(
+                    Effect.provideService(Crypto.Crypto, crypto),
+                    Effect.tapError((cause) => Effect.logError("P05 relay boundary", cause)),
+                    Effect.mapError(
+                      () =>
+                        new ThreadCheckpointPublishError({
+                          threadId: owner.threadId,
+                          detail: "attachment publication failed",
+                        }),
+                    ),
+                  ),
+              };
+              const head = f.sql<{
+                value: number;
+              }>`SELECT COALESCE(MAX(sequence),0) AS value FROM orchestration_events`.pipe(
+                Effect.map((rows) => rows[0]!.value),
+                Effect.orDie,
+              );
+              const history = makeThreadHistorySync(
+                f.sql,
+                {
+                  latestSequence: head,
+                  readThreadEvents: (input) =>
+                    events.readAggregateRange({
+                      aggregateKind: "thread",
+                      aggregateId: input.threadId,
+                      fromSequenceExclusive: input.fromSequenceExclusive,
+                      toSequenceInclusive: input.toSequenceInclusive,
+                    }),
+                },
+                {
+                  append: (owner, event) =>
+                    journal.append({ ...owner, event }).pipe(Effect.asVoid, Effect.orDie),
+                  confirmThrough: (owner, sourceSequence) =>
+                    journal
+                      .confirmThrough({ ...owner, sourceSequence })
+                      .pipe(Effect.asVoid, Effect.orDie),
+                },
+              );
+              const checkpoints = makeThreadCheckpointPublisher(
+                f.sql,
+                checkpointTransport,
+                f.root + "/transfers",
+                events,
+              );
+              const reached = yield* Deferred.make<void>(),
+                release = yield* Deferred.make<void>();
+              let held = false;
+              const publisher = makeWorkflowResultPublisher(
+                f.sql,
+                {
+                  reserve: (owner, input) =>
+                    results.reserve({ ...owner, ...input }).pipe(
+                      Effect.provideService(Crypto.Crypto, crypto),
+                      Effect.tapError((cause) => Effect.logError("P05 relay boundary", cause)),
+                      Effect.mapError(
+                        () =>
+                          new WorkflowResultSaveError({
+                            detail: "reserve failed",
+                            permanent: false,
+                          }),
+                      ),
+                    ),
+                  publish: (owner, input) =>
+                    Effect.gen(function* () {
+                      const receipt = yield* results.publish(
+                        { ...input, threadId: owner.threadId },
+                        () => Effect.void,
+                      );
+                      if (!held && receipt.resultId) {
+                        held = true;
+                        yield* Deferred.succeed(reached, undefined);
+                        yield* Deferred.await(release);
+                      }
+                      return receipt;
+                    }).pipe(
+                      Effect.provideService(Crypto.Crypto, crypto),
+                      Effect.tapError((cause) => Effect.logError("P05 relay boundary", cause)),
+                      Effect.mapError(
+                        () =>
+                          new WorkflowResultSaveError({
+                            detail: "publication failed",
+                            permanent: false,
+                          }),
+                      ),
+                    ),
+                },
+                checkpointTransport,
+                {
+                  synchronize: (threadId) =>
+                    history.synchronize(threadId).pipe(
+                      Effect.mapError(
+                        () =>
+                          new ThreadCheckpointPublishError({
+                            threadId,
+                            detail: "History publication failed",
+                          }),
+                      ),
+                      Effect.andThen(checkpoints.synchronize(threadId)),
+                    ),
+                },
+                f.root + "/results",
+              );
+              const git = (...args: string[]) =>
+                NodeChildProcess.execFileSync(
+                  "git",
+                  [
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    ...args,
+                  ],
+                  { cwd: f.root, encoding: "utf8" },
+                ).trim();
+              git("init", "--quiet");
+              NodeFS.writeFileSync(NodePath.join(f.root, "work.txt"), "baseline\n");
+              git("add", "work.txt");
+              git("commit", "--quiet", "-m", "Baseline");
+              const prior = git("rev-parse", "HEAD");
+              const baselineRef = checkpointRefForThreadTurn(binding.threadId, 0);
+              yield* f.store.saveCheckpointPin(
+                binding,
+                "",
+                0,
+                {
+                  checkpointRef: baselineRef,
+                  commitId: prior,
+                  baselineCommitId: prior,
+                  treeId: git("rev-parse", "HEAD^{tree}"),
+                },
+                null,
+                undefined,
+                new Uint8Array(),
+              );
+              const checkpointStore = Layer.mock(CheckpointStore)({
+                isGitRepository: () => Effect.succeed(true),
+                hasCheckpointRef: () => Effect.succeed(true),
+                captureCheckpoint: (input) =>
+                  Effect.sync(() => {
+                    git("add", "work.txt");
+                    git("commit", "--quiet", "--allow-empty", "-m", "Agent checkpoint");
+                    const commitId = git("rev-parse", "HEAD");
+                    git("update-ref", String(input.checkpointRef), commitId);
+                    return { commitId, treeId: git("rev-parse", "HEAD^{tree}") };
+                  }),
+                resolvePinnedTree: (input) =>
+                  Effect.sync(() => git("rev-parse", `${input.checkpointRef}^{tree}`)),
+                diffCheckpoints: (input) =>
+                  Effect.sync(() =>
+                    git(
+                      "diff",
+                      ...(input.format === "numstat" ? ["--numstat"] : []),
+                      String(input.fromCheckpointRef),
+                      String(input.toCheckpointRef),
+                      "--",
+                      "work.txt",
+                    ),
+                  ),
+              });
+              const ingestionReached = yield* Deferred.make<void>();
+              const releaseIngestion = yield* Deferred.make<void>();
+              const persistenceRequested = yield* Deferred.make<void>();
+              // Observe without acknowledging: only the real ingestion worker can
+              // prove that the delayed output reached the event store.
+              yield* f.provider.streamIngestionEvents!.pipe(
+                Stream.runForEach((event) =>
+                  event instanceof ProviderEventBarrier
+                    ? Deferred.succeed(persistenceRequested, undefined)
+                    : Effect.void,
+                ),
+                Effect.forkScoped({ startImmediately: true }),
+              );
+              const delayedProvider = {
+                ...f.provider,
+                get streamIngestionEvents() {
+                  return f.provider.streamIngestionEvents!.pipe(
+                    Stream.mapEffect((event) =>
+                      event instanceof ProviderEventBarrier ||
+                      event.type !== "content.delta" ||
+                      event.turnId !== "turn-1"
+                        ? Effect.succeed(event)
+                        : Deferred.succeed(ingestionReached, undefined).pipe(
+                            Effect.andThen(Deferred.await(releaseIngestion)),
+                            Effect.as(event),
+                          ),
+                    ),
+                  );
+                },
+              };
+              const services = Layer.mergeAll(
+                Layer.succeed(ProviderService.ProviderService, delayedProvider),
+                Layer.succeed(WorkflowRunStore, f.store),
+                Layer.succeed(SqlClient.SqlClient, f.sql),
+                Layer.succeed(OrchestrationEventStore, events),
+                Layer.succeed(
+                  ServerConfig.ServerConfig,
+                  yield* ServerConfig.ServerConfig.pipe(Effect.provide(f.context)),
+                ),
+                NodeServices.layer,
+                defaultServerSettingsLayer,
+                ThreadBackgroundLiveness.layer,
+                ThreadPlanProgress.layer,
+                checkpointStore,
+                Layer.mock(RepositoryIdentityResolver)({
+                  resolve: () =>
+                    Effect.succeed({
+                      canonicalKey: f.run.repositoryCanonicalKey,
+                      rootPath: f.root,
+                      locator: {
+                        source: "git-remote",
+                        remoteName: "origin",
+                        remoteUrl: "https://github.com/acme/repo.git",
+                      },
+                    }),
+                }),
+                Layer.mock(SetupProcessJournal)({}),
+                Layer.mock(TerminalManager)({}),
+                Layer.mock(TextGeneration)({}),
+                Layer.mock(WorkspaceEntries)({ refresh: () => Effect.void }),
+                Layer.mock(PullRequestService)({ refreshAfterTurn: () => Effect.void }),
+                Layer.mock(VcsStatusBroadcaster)({}),
+                Layer.mock(GitWorkflowService.GitWorkflowService)({}),
+                Layer.mock(ProviderAuthService)({
+                  tryHandlePromptCommand: () => Effect.succeed(false),
+                }),
+                Layer.mock(ThreadDeletionReactor)({ drainThrough: () => Effect.void }),
+                Layer.succeed(WorkflowVmAttempts, {
+                  resolve: () =>
+                    Effect.succeed({ environment: {}, hasSecrets: false, secretNames: [] }),
+                  readReviewSecrets: () => Effect.succeed(Redacted.make([])),
+                }),
+                Layer.mock(GitVcsDriver)({
+                  execute: (input) =>
+                    Effect.sync(() => {
+                      const result = NodeChildProcess.spawnSync("git", input.args, {
+                        cwd: input.cwd,
+                        encoding: "utf8",
+                      });
+                      return {
+                        exitCode: ChildProcessSpawner.ExitCode(result.status ?? 1),
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                        stdoutTruncated: false,
+                        stderrTruncated: false,
+                      };
+                    }),
+                }),
+                makeProviderRegistryLayer([
+                  yield* decodeCaptureProvider({
+                    instanceId: codexInstanceId,
+                    driver: "codex",
+                    enabled: true,
+                    installed: true,
+                    version: "fixture",
+                    status: "ready",
+                    auth: { status: "authenticated" },
+                    checkedAt: f.run.createdAt,
+                    models: [],
+                    slashCommands: [],
+                    skills: [],
+                  }),
+                ]),
+                RuntimeReceiptBusLive,
+              );
+              // Let the real projector rebuild the seed history and its empty prompt queue.
+              yield* f.sql`DELETE FROM projection_thread_prompt_queues WHERE thread_id=${binding.threadId}`;
+              const core = Layer.mergeAll(
+                OrchestrationProjectionSnapshotQueryLive,
+                OrchestrationProjectionPipelineLive,
+                OrchestrationCommandReceiptRepositoryLive,
+              ).pipe(Layer.provideMerge(services));
+              const engineLayer = OrchestrationEngineLive.pipe(Layer.provideMerge(core));
+              const engineContext = yield* Layer.build(engineLayer);
+              const engine = yield* OrchestrationEngineService.pipe(Effect.provide(engineContext));
+              const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery.pipe(
+                Effect.provide(engineContext),
+              );
+              const failed = yield* Deferred.make<never, Error>();
+              yield* engine.streamDomainEvents.pipe(
+                Stream.runForEach((event) =>
+                  event.type === "thread.activity-appended" &&
+                  event.payload.activity.kind.endsWith(".failed")
+                    ? Deferred.fail(failed, new Error(encodeJson(event.payload.activity)))
+                    : Effect.void,
+                ),
+                Effect.forkScoped({ startImmediately: true }),
+              );
+              yield* engine.dispatch({
+                type: "thread.meta.update",
+                commandId: CommandId.make("fixture-worktree"),
+                threadId: binding.threadId,
+                worktreePath: f.root,
+                branch: jobBranchName(binding.jobId),
+              });
+              git("checkout", "--quiet", "-b", jobBranchName(binding.jobId));
+              const run = decodeContinuityWorkflowRun({
+                ...f.run,
+                modelSelection: { ...f.run.modelSelection, model: "gpt-6-astra" },
+                baseSha: prior,
+                promptDispatched: false,
+                progress: { ...f.run.progress, status: "preparing" },
+                workflow: {
+                  ...f.run.workflow,
+                  definition: {
+                    ...f.run.workflow.definition,
+                    steps: [
+                      f.run.workflow.definition.steps[0],
+                      { ...f.run.workflow.definition.steps[0], id: "agent-2" },
+                      f.run.workflow.definition.steps[1],
+                    ],
+                  },
+                },
+                sequence: {
+                  cursor: 0,
+                  generation: 0,
+                  started: true,
+                  stepStartedAt: f.run.createdAt,
+                  completed: [],
+                  responses: [],
+                  feedback: null,
+                },
+              });
+              yield* f.store.save(run);
+              const query = yield* makeWorkflowDiffQuery.pipe(Effect.provide(engineContext));
+              const sync = publisher
+                .synchronize(binding.threadId)
+                .pipe(Effect.provideService(CheckpointDiffQuery, query));
+              const outbox = makeWorkflowResultOutbox(f.sql);
+              const drain = Effect.gen(function* () {
+                for (
+                  let attempts = 0;
+                  attempts < 12 && (yield* outbox.next(binding.threadId));
+                  attempts++
+                )
+                  yield* sync;
+                const remaining = yield* outbox.next(binding.threadId);
+                assert.isNull(remaining, remaining ? encodeJson(remaining) : undefined);
+              });
+              const reactors = Layer.mergeAll(
+                CheckpointReactorLive,
+                ProviderCommandReactorLive,
+                ProviderRuntimeIngestionLive,
+              ).pipe(Layer.provide(Layer.succeedContext(engineContext)));
+              const reactorContext = yield* Layer.build(reactors);
+              const capture = yield* CheckpointReactor.pipe(Effect.provide(reactorContext));
+              const commands = yield* ProviderCommandReactor.pipe(Effect.provide(reactorContext));
+              const ingestion = yield* ProviderRuntimeIngestionService.pipe(
+                Effect.provide(reactorContext),
+              );
+              yield* capture.start();
+              yield* ingestion.start();
+              yield* commands.start();
+              const runnerContext = yield* Layer.build(
+                WorkflowRunnerLayer.pipe(Layer.provide(Layer.succeedContext(engineContext))),
+              );
+              const runner = yield* RepositoryWorkflowRunner.pipe(Effect.provide(runnerContext));
+              const request = {
+                jobId: run.jobId,
+                userId: run.userId!,
+                instruction: run.instruction,
+                repositoryCanonicalKey: run.repositoryCanonicalKey,
+                workflowVm: {
+                  binding,
+                  workspaceRoot: f.root,
+                  baseBranch: run.baseBranch,
+                  baseSha: prior,
+                },
+                control: {
+                  operation: "status" as const,
+                  organizationId: binding.organizationId,
+                  repositoryId: binding.repositoryId,
+                  projectId: binding.projectId,
+                },
+              };
+              const milestone = (predicate: (event: OrchestrationEvent) => boolean) =>
+                Effect.gen(function* () {
+                  const subscribed = yield* engine.subscribeDomainEvents;
+                  return yield* subscribed.pipe(
+                    Stream.filter(predicate),
+                    Stream.take(1),
+                    Stream.runDrain,
+                    Effect.forkScoped({ startImmediately: true }),
+                  );
+                });
+              const complete = Effect.fnUntraced(function* (turnId: TurnId, n: number) {
+                NodeFS.writeFileSync(NodePath.join(f.root, "work.txt"), `Agent ${n}\n`);
+                yield* f.fs.writeFileString(
+                  f.rollout,
+                  encodeJson({
+                    type: "response_item",
+                    payload: {
+                      type: "message",
+                      role: "assistant",
+                      content: [{ type: "output_text", text: `Agent ${n} completed` }],
+                    },
+                  }) + "\n",
+                  { flag: "a" },
+                );
+                const finalized = yield* milestone(
+                  (event) =>
+                    event.type === "thread.prompt-queue-changed" &&
+                    event.payload.finalization?.turnId === turnId,
+                );
+                for (const method of [
+                  "turn/started",
+                  "item/agentMessage/delta",
+                  "turn/completed",
+                ] as const)
+                  yield* f.emit({
+                    id: EventId.make(`${turnId}-${method}`),
+                    kind: "notification",
+                    provider: CODEX_DRIVER,
+                    threadId: binding.threadId,
+                    turnId,
+                    method,
+                    itemId: ProviderItemId.make(`agent-${n}`),
+                    createdAt: f.run.createdAt,
+                    payload:
+                      method === "turn/started"
+                        ? {}
+                        : method === "item/agentMessage/delta"
+                          ? {
+                              threadId: nativeIdForCheckpoint,
+                              turnId,
+                              itemId: `agent-${n}`,
+                              delta: `Agent ${n} completed`,
+                            }
+                          : {
+                              threadId: nativeIdForCheckpoint,
+                              turn: { id: turnId, items: [], status: "completed" },
+                            },
+                  });
+                yield* Fiber.join(finalized);
+                yield* capture.drain;
+                yield* ingestion.drain;
+                yield* commands.drain;
+                yield* runner.handle(request);
+              });
+              const admitted = Effect.fnUntraced(function* (turnId: TurnId) {
+                // Subscribe before the snapshot so admission cannot fall between the two.
+                const events = yield* engine.subscribeDomainEvents;
+                const current = Option.getOrThrow(
+                  yield* snapshots.getThreadDetailById(binding.threadId),
+                );
+                if (current.promptQueue?.admissions.some((entry) => entry.turnId === turnId))
+                  return;
+                yield* events.pipe(
+                  Stream.filter(
+                    (event) =>
+                      event.type === "thread.prompt-queue-changed" &&
+                      event.payload.admission?.turnId === turnId,
+                  ),
+                  Stream.take(1),
+                  Stream.runDrain,
+                );
+              });
+              yield* runner.handle(request);
+              const first = yield* Effect.raceFirst(
+                Queue.take(f.sentTurns),
+                Deferred.await(failed),
+              );
+              yield* Effect.raceFirst(admitted(first), Deferred.await(failed));
+              yield* commands.drain;
+              const completing = yield* complete(first, 1).pipe(Effect.forkChild);
+              yield* Deferred.await(ingestionReached);
+              yield* Effect.raceFirst(
+                Deferred.await(persistenceRequested),
+                Fiber.join(completing).pipe(
+                  Effect.andThen(
+                    Effect.die("Checkpoint finalized before its output persistence barrier"),
+                  ),
+                ),
+              );
+              assert.equal(
+                (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${binding.threadId}`)
+                  .length,
+                0,
+              );
+              assert.equal(
+                (yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${binding.threadId}`)
+                  .length,
+                0,
+              );
+              assert.isNull(yield* f.store.getSaveResult(run.jobId, first));
+              assert.equal(f.counts().sends, 1);
+              yield* drain;
+              assert.equal((yield* results.list(run.jobId)).results.length, 0);
+              yield* Deferred.succeed(releaseIngestion, undefined);
+              yield* Fiber.join(completing);
+              const saving = yield* drain.pipe(Effect.forkChild);
+              yield* Effect.raceFirst(
+                Deferred.await(reached),
+                Fiber.join(saving).pipe(
+                  Effect.andThen(Effect.die("Save worker ended before its acknowledgement gate")),
+                ),
+              );
+              yield* runner.handle(request);
+              yield* commands.drain;
+              assert.equal(f.counts().sends, 1);
+              assert.equal((yield* f.store.get(run.jobId))?.sequence?.cursor, 0);
+              assert.equal((yield* f.store.getSaveResult(run.jobId, first))?.status, "pending");
+              assert.include(
+                encodeJson(
+                  yield* journal.history({ threadId: binding.threadId, after: 0, limit: 200 }),
+                ),
+                "Agent 1 completed",
+              );
+              yield* Deferred.succeed(release, undefined);
+              yield* Fiber.join(saving);
+              yield* runner.handle(request);
+              const second = yield* Effect.raceFirst(
+                Queue.take(f.sentTurns),
+                Deferred.await(failed),
+              );
+              yield* Effect.raceFirst(admitted(second), Deferred.await(failed));
+              yield* commands.drain;
+              assert.equal((yield* f.store.get(run.jobId))?.sequence?.cursor, 1);
+              assert.equal(f.counts().sends, 2);
+              yield* complete(second, 2);
+              yield* drain;
+              yield* runner.handle(request);
+              const finished = yield* f.store.get(run.jobId);
+              assert.equal(finished?.progress.status, "awaiting_review");
+              assert.equal(finished?.progress.checkpoint?.stepId, "review");
+              assert.deepEqual(f.counts(), { opens: 2, sends: 2, closes: 2 });
+              const saved = yield* results.list(binding.jobId);
+              assert.equal(saved.results.length, 2);
+              assert.include(
+                (yield* results.read(binding.jobId, saved.results[0]!.resultId)).patch,
+                "+Agent 2",
+              );
+              assert.include(
+                (yield* results.read(binding.jobId, saved.results[1]!.resultId)).patch,
+                "+Agent 1",
+              );
+              assert.include(
+                encodeJson(
+                  yield* journal.history({ threadId: binding.threadId, after: 0, limit: 200 }),
+                ),
+                "Agent 2 completed",
+              );
+              assert.equal(
+                (yield* pg`SELECT 1 FROM relay_thread_vm_allocations WHERE thread_id=${binding.threadId}`)
+                  .length,
+                0,
+              );
+              const source = Option.getOrThrow(
+                yield* (yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+                  Effect.provide(f.context),
+                )).getBinding(binding.threadId),
+              );
+              assert.deepInclude(source.resumeCursor, { threadId: nativeIdForCheckpoint });
+              const [archive] = yield* f.sql<{
+                directory: string;
+              }>`SELECT directory FROM thread_native_checkpoints WHERE thread_id=${binding.threadId} AND turn_id='turn-2'`;
+              assert.include(
+                yield* f.fs.readFileString(archive!.directory + "/rollout.jsonl"),
+                "Agent 1 completed",
+              );
+              assert.isFalse(yield* f.fs.exists(archive!.directory + "/auth.json"));
+            }),
+          ),
+      );
+    });
+  },
+);
+
+it.effect(
+  "retries an interrupted native catalog commit from stopped metadata without another Agent",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Agent",
+          attachments: [],
+        });
+        const original = f.fs.readFileString;
+        let failed = false;
+        const hook = vi.spyOn(f.fs, "readFileString").mockImplementation((file, encoding) => {
+          if (failed || !file.endsWith("/manifest.json") || !file.includes("/native-checkpoints/"))
+            return original(file, encoding);
+          failed = true;
+          return f.fs.rename(file, file + ".held").pipe(Effect.andThen(original(file, encoding)));
+        });
+        try {
+          assert.equal(
+            (yield* f.provider
+              .checkpointWorkflowConversation({ binding: f.binding, turnId: asTurnId("turn-1") })
+              .pipe(Effect.result))._tag,
+            "Failure",
+          );
+        } finally {
+          hook.mockRestore();
+        }
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          0,
+        );
+        yield* f.provider.checkpointWorkflowConversation({
+          binding: f.binding,
+          turnId: asTurnId("turn-1"),
+        });
+        assert.deepEqual(f.counts(), { opens: 1, sends: 1, closes: 1 });
+        const requests = yield* f.fs.readFileString(f.requests);
+        assert.include(requests, '"method":"thread/read"');
+        assert.notInclude(requests, '"method":"turn/start"');
+        assert.notInclude(requests, '"method":"thread/resume"');
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.effect(
+  "bounds a stalled workflow native capture without acknowledging or rerunning its Agent",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* workflowCaptureFixture;
+        yield* f.start;
+        yield* f.provider.sendTurn({
+          threadId: f.binding.threadId,
+          input: "Agent",
+          attachments: [],
+        });
+        const entered = yield* Deferred.make<void>();
+        f.gateRead(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)));
+        const pending = yield* f.provider
+          .checkpointWorkflowConversation({ binding: f.binding, turnId: asTurnId("turn-1") })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("2 minutes");
+        assert.equal((yield* Fiber.join(pending))._tag, "Failure");
+        assert.equal(f.counts().sends, 1);
+        assert.equal(
+          (yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${f.binding.threadId}`)
+            .length,
+          0,
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+const makeWorkflowControllerRestartFixture = Effect.fnUntraced(function* (
+  options: { readonly workflowGuest?: boolean } = {},
+) {
+  const root = fixtureCwd(`vm-controller-restart-${NodeCrypto.randomUUID()}`);
+  const persistence = makeSqlitePersistenceLive(NodePath.join(root, "state.sqlite"));
+  const jobs = WorkflowRunStoreLayer.pipe(
+    Layer.provide(persistence),
+    Layer.provide(NodeServices.layer),
+  );
+  const directoryLayer = ProviderSessionDirectoryLive.pipe(
+    Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(persistence))),
+  );
+  const persisted = yield* Layer.build(Layer.mergeAll(jobs, directoryLayer, persistence));
+  const sql = yield* SqlClient.SqlClient.pipe(Effect.provide(persisted));
+  const store = yield* WorkflowRunStore.pipe(Effect.provide(persisted));
+  const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+    Effect.provide(persisted),
+  );
+  const threadId = asThreadId(`workflow:controller-restart:${NodeCrypto.randomUUID()}`);
+  const original = continuityWorkflow(threadId);
+  const binding = {
+    jobId: original.jobId,
+    threadId,
+    organizationId: "org",
+    repositoryId: "repo",
+    allocationId: "allocation",
+    environmentId: EnvironmentId.make("environment"),
+    generation: 1,
+    operationId: "enroll",
+    projectId: ProjectId.make("project"),
+  };
+  const run = decodeContinuityWorkflowRun({
+    ...original,
+    worktreePath: root,
+    runtime: { kind: "vm", ...binding },
+    workflow: {
+      ...original.workflow,
+      definition: { ...original.workflow.definition, target: { kind: "vm", baseBranch: null } },
+    },
+    progress: { ...original.progress, status: "running" },
+  });
+  const installed: InstalledThreadVm = {
+    operationId: binding.operationId,
+    scope: { allocationId: binding.allocationId, threadId, repositoryId: "repo", generation: 1 },
+    environmentId: binding.environmentId,
+    relayUrl: "https://relay.invalid",
+    relayIssuer: "https://relay.invalid",
+    environmentCredential: "fixture",
+    cloudMintPublicKey: "fixture",
+  };
+  const bootId = "cb7c9212-2128-478f-9d11-6e4c8ed6f882";
+  const kernel = {
+    bootId,
+    epoch: 0,
+    sealedBy: null as string | null,
+    groups: [{ id: "a".repeat(32), bootId, kind: "terminal", leaderPid: 42 }],
+    stopped: false,
+    recoverable: true,
+  };
+  const commands: string[] = [];
+  let beforeInspection: Effect.Effect<void> = Effect.void;
+  const control = ChildProcessSpawner.make((command) => {
+    if (!ChildProcess.isStandardCommand(command)) throw new Error("Expected one native control");
+    const action = command.args[0]!;
+    commands.push(action);
+    return Effect.gen(function* () {
+      if (action === "workflow-recovery-state") yield* beforeInspection;
+      if (action === "seal") {
+        kernel.epoch++;
+        kernel.sealedBy = command.args[2]!;
+      }
+      if (action === "stop") {
+        kernel.groups = [];
+        kernel.stopped = true;
+      }
+      const bytes = new TextEncoder().encode(encodeJson(kernel));
+      return ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(90),
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+        isRunning: Effect.succeed(false),
+        kill: () => Effect.void,
+        unref: Effect.succeed(Effect.void),
+        stdin: Sink.drain,
+        stdout: Stream.make(bytes),
+        stderr: Stream.empty,
+        all: Stream.make(bytes),
+        getInputFd: () => Sink.drain,
+        getOutputFd: () => Stream.empty,
+      });
+    });
+  });
+  const build = (adapter: ProviderAdapterShape<ProviderAdapterError>) =>
+    Layer.build(
+      makeProviderServiceLive().pipe(
+        Layer.provide(persistence),
+        Layer.provide(
+          Layer.effect(
+            ThreadExecution,
+            Effect.map(SqlClient.SqlClient, (db) =>
+              makeThreadExecutionRelay(db, {
+                admit: () => Effect.succeed({ completed: false, newlyAdmitted: true }),
+                complete: () => Effect.void,
+              }),
+            ),
+          ).pipe(Layer.provide(persistence)),
+        ),
+        Layer.provide(Layer.succeed(WorkflowRunStore, store)),
+        Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+        Layer.provide(
+          Layer.succeed(
+            ProviderAdapterRegistry.ProviderAdapterRegistry,
+            makeStaticInstanceRegistry([[codexInstanceId, adapter]]),
+          ),
+        ),
+        Layer.provide(Layer.succeed(VmWorkloadTracking, true)),
+        Layer.provide(Layer.succeed(WorkflowVmGuest, options.workflowGuest ?? true)),
+        Layer.provide(Layer.succeed(VmControlSpawner, control)),
+        Layer.provide(
+          Layer.mock(ServerSecretStore.ServerSecretStore)({
+            get: (name) =>
+              Effect.succeed(
+                name === THREAD_VM_IDENTITY_SECRET
+                  ? Option.some(new TextEncoder().encode(encodeJson(installed)))
+                  : Option.none(),
+              ),
+          }),
+        ),
+        Layer.provide(NodeServices.layer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      ),
+    );
+  yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES('project','Controller restart',${root},'[]',${run.createdAt},${run.createdAt})`;
+  yield* sql`INSERT INTO projection_threads(thread_id,project_id,title,model_selection_json,runtime_mode,interaction_mode,created_at,updated_at,worktree_path) VALUES(${threadId},'project','Controller restart','{"instanceId":"codex","model":"gpt-test"}','full-access','default',${run.createdAt},${run.createdAt},${root})`;
+  yield* sql`INSERT INTO thread_execution_fences(thread_id,relay_url,environment_id,project_id,generation,operation_id,phase) VALUES(${threadId},'https://relay.invalid',${binding.environmentId},'project',1,'enroll','active')`;
+  yield* store.save(run);
+  const first = makeFakeCodexAdapter();
+  const writerStopped = first.adapter.isSessionStopConfirmed!;
+  const firstContext = yield* build({
+    ...first.adapter,
+    isSessionStopConfirmed: () => Effect.succeed(false),
+    isSessionWriterStopConfirmed: writerStopped,
+    drainRuntimeEvents: () => Effect.void,
+  });
+  const firstService = yield* ProviderService.ProviderService.pipe(Effect.provide(firstContext));
+  const startInput = {
+    threadId,
+    providerInstanceId: codexInstanceId,
+    runtimeMode: "full-access" as const,
+    cwd: root,
+  };
+  yield* firstService.startSession(threadId, startInput);
+  const cursor = { threadId: "e5ef20ec-b982-4912-9cd2-7504f16ffabc" };
+  first.updateSession(threadId, (session) => ({ ...session, resumeCursor: cursor }));
+  yield* firstService.sendTurn({ threadId, input: "First Agent completed", attachments: [] });
+  yield* firstService.stopSession({ threadId });
+  const stopped = Option.getOrThrow(yield* directory.getBinding(threadId));
+  assert.equal(stopped.status, "stopped");
+  assert.deepInclude(stopped.runtimePayload, { stoppedRuntimeEventsDrained: true });
+  assert.deepInclude(
+    (yield* decodeRuntimeContinuation(stopped.runtimePayload)).providerContinuation,
+    { shutdownConfirmed: false },
+  );
+  const second = makeFakeCodexAdapter();
+  // Runtime episodes are fresh across real processes; prime this deterministic fake.
+  yield* second.adapter.startSession({ ...startInput, threadId: asThreadId("unrelated-prime") });
+  yield* second.adapter.stopSession(asThreadId("unrelated-prime"));
+  second.startSession.mockClear();
+  const secondContext = yield* build(second.adapter);
+  const service = yield* ProviderService.ProviderService.pipe(Effect.provide(secondContext));
+  return {
+    root,
+    threadId,
+    binding,
+    installed,
+    cursor,
+    run,
+    sql,
+    store,
+    directory,
+    second,
+    stopped,
+    kernel,
+    commands,
+    build,
+    service,
+    start: service.startSession(threadId, startInput),
+    startInput,
+    beforeInspection: (effect: Effect.Effect<void>) => {
+      beforeInspection = effect;
+    },
+  };
+});
+
+it.effect(
+  "workflow controller restart resumes the saved native cursor after kernel verification",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeWorkflowControllerRestartFixture();
+        yield* f.start;
+        assert.deepEqual(f.second.startSession.mock.calls[0]![0].resumeCursor, f.cursor);
+        assert.equal(f.second.startSession.mock.calls[0]![1]?.requireResume, true);
+        assert.equal(f.commands.filter((action) => action === "workflow-recovery-state").length, 2);
+        yield* f.service.sendTurn({ threadId: f.threadId, input: "Rework", attachments: [] });
+        assert.equal(f.second.sendTurn.mock.calls.length, 1);
+        const current = Option.getOrThrow(yield* f.directory.getBinding(f.threadId));
+        assert.notDeepInclude(current.runtimePayload, { stoppedRuntimeEventsDrained: true });
+        assert.deepInclude(
+          (yield* decodeRuntimeContinuation(current.runtimePayload)).providerContinuation,
+          { shutdownConfirmed: false },
+        );
+        assert.equal(f.commands.includes("stop"), false);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each([
+  "missing-drain",
+  "active-writer",
+  "missing-cursor",
+  "unverified-kernel",
+  "fence",
+  "machine",
+] as const)("workflow controller restart rejects %s without starting a native runtime", (mode) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* makeWorkflowControllerRestartFixture({ workflowGuest: mode !== "machine" });
+      if (mode === "missing-drain")
+        yield* f.directory.upsert({
+          threadId: f.threadId,
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          runtimePayload: { stoppedRuntimeEventsDrained: false },
+        });
+      if (mode === "active-writer")
+        yield* f.directory.upsert({
+          threadId: f.threadId,
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          status: "running",
+        });
+      if (mode === "missing-cursor")
+        yield* f.directory.upsert({
+          threadId: f.threadId,
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          resumeCursor: null,
+        });
+      if (mode === "machine")
+        yield* f.store.save({ ...continuityWorkflow(f.threadId), worktreePath: f.root });
+      if (mode === "unverified-kernel") f.kernel.recoverable = false;
+      if (mode === "fence")
+        yield* f.sql`UPDATE thread_execution_fences SET phase='retired' WHERE thread_id=${f.threadId}`;
+      const result = yield* f.start.pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      assert.equal(f.second.startSession.mock.calls.length, 0);
+      assert.equal(f.second.sendTurn.mock.calls.length, 0);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["episode", "cursor", "fence", "cancel"] as const)(
+  "workflow controller restart rejects authority changed during the native probe: %s",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeWorkflowControllerRestartFixture();
+        const entered = yield* Deferred.make<void>();
+        const released = yield* Deferred.make<void>();
+        f.beforeInspection(
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(released))),
+        );
+        const starting = yield* f.start.pipe(Effect.result, Effect.forkChild);
+        const observed = yield* Effect.raceFirst(
+          Deferred.await(entered).pipe(Effect.as("inspecting")),
+          Fiber.join(starting).pipe(Effect.as("rejected-before-inspection")),
+        );
+        assert.equal(observed, "inspecting");
+        if (mode === "episode") {
+          const payload = yield* decodeRuntimeContinuation(f.stopped.runtimePayload);
+          yield* f.directory.upsert({
+            threadId: f.threadId,
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            runtimePayload: {
+              providerContinuation: {
+                ...(payload.providerContinuation as object),
+                runtimeEpisode: "replacement-native",
+              },
+            },
+          });
+        }
+        if (mode === "cursor")
+          yield* f.directory.upsert({
+            threadId: f.threadId,
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            resumeCursor: { threadId: "replacement-conversation" },
+          });
+        if (mode === "fence")
+          yield* f.sql`UPDATE thread_execution_fences SET generation=2 WHERE thread_id=${f.threadId}`;
+        if (mode === "cancel")
+          yield* f.store.save({ ...f.run, progress: { ...f.run.progress, status: "cancelling" } });
+        yield* Deferred.succeed(released, undefined);
+        assert.equal((yield* Fiber.join(starting))._tag, "Failure");
+        assert.equal(f.second.startSession.mock.calls.length, 0);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("workflow controller restart repeats the kernel probe before a new native episode", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* makeWorkflowControllerRestartFixture();
+      let inspections = 0;
+      f.beforeInspection(
+        Effect.sync(() => {
+          if (++inspections === 2) f.kernel.recoverable = false;
+        }),
+      );
+      assert.equal((yield* f.start.pipe(Effect.result))._tag, "Failure");
+      assert.equal(inspections, 2);
+      assert.equal(yield* f.second.adapter.hasSession(f.threadId), false);
+      assert.equal(f.second.sendTurn.mock.calls.length, 0);
+      const current = Option.getOrThrow(yield* f.directory.getBinding(f.threadId));
+      assert.deepEqual(current.resumeCursor, f.cursor);
+      yield* f.store.save({
+        ...f.run,
+        cancellationAttempt: { commandId: "cancel-rejected-recovery", createdAt: f.run.createdAt },
+        progress: { ...f.run.progress, status: "cancelling" },
+      });
+      yield* f.service.streamIngestionEvents!.pipe(
+        Stream.runForEach((event) =>
+          event instanceof ProviderEventBarrier
+            ? Deferred.succeed(event.done, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        ),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* f.service.stopSession({ threadId: f.threadId });
+      assert.equal(f.commands.filter((action) => action === "stop").length, 1);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "workflow controller restart cannot reuse drained output after interrupted acquisition",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeWorkflowControllerRestartFixture();
+        let claimed = false;
+        f.second.startSession.mockImplementationOnce((input, options) =>
+          Effect.gen(function* () {
+            yield* options?.beforeStart?.("interrupted-native") ?? Effect.void;
+            const current = Option.getOrThrow(
+              yield* f.directory.getBinding(input.threadId).pipe(Effect.orDie),
+            );
+            assert.equal(current.status, "starting");
+            assert.deepInclude(current.runtimePayload, { stoppedRuntimeEventsDrained: false });
+            claimed = true;
+            return yield* new ProviderAdapterProcessError({
+              provider: CODEX_DRIVER,
+              threadId: input.threadId,
+              detail: "Controller exited before native startup completed",
+            });
+          }),
+        );
+        assert.equal((yield* f.start.pipe(Effect.result))._tag, "Failure");
+        assert.equal(claimed, true);
+        const third = makeFakeCodexAdapter();
+        const rebuilt = yield* f.build(third.adapter);
+        const service = yield* ProviderService.ProviderService.pipe(Effect.provide(rebuilt));
+        assert.equal(
+          (yield* service.startSession(f.threadId, f.startInput).pipe(Effect.result))._tag,
+          "Failure",
+        );
+        assert.equal(third.startSession.mock.calls.length, 0);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "workflow controller restart cancels a stopped writer using the native stop receipt",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeWorkflowControllerRestartFixture();
+        yield* f.store.save({
+          ...f.run,
+          cancellationAttempt: { commandId: "cold-cancel", createdAt: f.run.createdAt },
+          progress: { ...f.run.progress, status: "cancelling" },
+        });
+        yield* f.service.streamIngestionEvents!.pipe(
+          Stream.runForEach((event) =>
+            event instanceof ProviderEventBarrier
+              ? Deferred.succeed(event.done, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* f.service.stopSession({ threadId: f.threadId });
+        const current = Option.getOrThrow(yield* f.directory.getBinding(f.threadId));
+        assert.deepInclude(
+          (yield* decodeRuntimeContinuation(current.runtimePayload)).providerContinuation,
+          { shutdownConfirmed: true, shutdownEvidenceVersion: 2 },
+        );
+        assert.equal(f.commands.filter((action) => action === "stop").length, 1);
+        assert.equal(f.kernel.stopped, true);
+        assert.equal(f.second.startSession.mock.calls.length, 0);
+        yield* f.service.stopSession({ threadId: f.threadId });
+        assert.equal(f.commands.filter((action) => action === "stop").length, 1);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );

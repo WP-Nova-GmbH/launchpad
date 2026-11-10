@@ -119,7 +119,9 @@ export function makeThreadAttachmentCheckpoint(
     generation: number;
     turnId: string;
     captureOperationId?: string;
+    authorize?: Effect.Effect<void, ThreadAttachmentCheckpointError>;
   }) {
+    if (input.authorize) yield* input.authorize;
     const fence = yield* fences.get(input.threadId),
       point = yield* native.get(
         input.threadId,
@@ -162,6 +164,7 @@ export function makeThreadAttachmentCheckpoint(
     readonly captureOperationId?: string;
     readonly artifactRoot: string;
     readonly attachmentsDir: string;
+    readonly authorize?: Effect.Effect<void, ThreadAttachmentCheckpointError>;
   }) {
     const fs = yield* FileSystem.FileSystem,
       path = yield* Path.Path;

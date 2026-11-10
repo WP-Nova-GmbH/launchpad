@@ -340,11 +340,52 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
     const relayUrl = normalizeSecureRelayUrl(new TextDecoder().decode(url.value));
     return relayUrl ? { environmentId, relayUrl, threadId: "", generation: 1 } : null;
   });
+  const workflowResults: WorkflowResultTransport = {
+    reserve: Effect.fn("ThreadExecutionAuthority.reserveWorkflowResult")(
+      function* (owner, input) {
+        const client = yield* configuredClient(owner, "history");
+        yield* client.threadArtifacts.reserveWorkflowResult({
+          params: {
+            environmentId: EnvironmentId.make(owner.environmentId),
+            threadId: ThreadId.make(owner.threadId),
+          },
+          payload: { generation: owner.generation, ...input },
+        });
+      },
+      Effect.mapError(
+        () =>
+          new WorkflowResultSaveError({
+            detail: "Could not retain the result's conversation checkpoint.",
+            permanent: false,
+          }),
+      ),
+    ),
+    publish: Effect.fn("ThreadExecutionAuthority.publishWorkflowResult")(
+      function* (owner, input) {
+        const client = yield* configuredClient(owner, "history");
+        return yield* client.threadArtifacts.publishWorkflowResult({
+          params: {
+            environmentId: EnvironmentId.make(owner.environmentId),
+            threadId: ThreadId.make(owner.threadId),
+          },
+          payload: { generation: owner.generation, ...input },
+        });
+      },
+      Effect.mapError(
+        () =>
+          new WorkflowResultSaveError({
+            detail: "The relay has not acknowledged this saved result.",
+            permanent: false,
+          }),
+      ),
+    ),
+  };
   return {
     ...authority,
     history,
     commands,
     checkpoints,
+    workflowResults,
     discoveryOwner,
     backups: makeThreadBackupSourceTransport((owner) => configuredClient(owner, "history")),
     pauses: makeThreadPauseTransport((owner) => configuredClient(owner, "history")),
@@ -356,3 +397,7 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
     ),
   };
 });
+import {
+  WorkflowResultSaveError,
+  type WorkflowResultTransport,
+} from "./WorkflowResultPublisher.ts";

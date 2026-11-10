@@ -1,3 +1,6 @@
+import { ThreadArtifactObjectStorage } from "./ThreadArtifactObjects.ts";
+import { make as makeWorkflows } from "../jobs/Workflows.ts";
+import { listSavedWorkflowResults } from "../http/WorkflowResultsApi.ts";
 import * as NodeCrypto from "node:crypto";
 import { describe, expect, layer } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -38,6 +41,7 @@ const fixture = Effect.fnUntraced(function* () {
   ) =>
     action.pipe(
       Effect.provideService(RelayDb, db),
+      Effect.provideService(ThreadArtifactObjectStorage, f.objects),
       Effect.provideService(RelayClientPrincipal, { userId, token: "fixture-token" }),
       Effect.provideService(ThreadVmRuntimeConfiguration, {
         settings: {
@@ -613,6 +617,134 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               yield* f.sql`UPDATE relay_thread_vm_backups SET phase='failed',source_receipt=NULL WHERE operation_id=${capture.operationId}`;
               yield* Effect.flip(f.deletions.begin(f.deletionInput));
               expect((yield* f.allocations.get(f.allocationId))?.state).toBe("running");
+            }),
+          ),
+      );
+      it.effect(
+        "deletes a shared workflow through the real API and worker after confirmed cleanup",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              const jobId = NodeCrypto.randomUUID();
+              const userId = f.deletionInput.ownerUserId;
+              const record = {
+                jobId,
+                workflowId: "workflow",
+                repositoryId: "repo",
+                origin: { kind: "manual", userId },
+                instruction: "test",
+                workflow: null,
+                vmAdmission: { codexConnectionId: NodeCrypto.randomUUID(), hasSecrets: false },
+                detail: null,
+                status: "done",
+                runtime: { kind: "vm", threadId: f.threadId },
+                progress: {
+                  revision: 1,
+                  threadId: f.threadId,
+                  status: "done",
+                  detail: null,
+                  checkpoint: null,
+                  hasThread: true,
+                  executionReleased: false,
+                  resultSaving: {
+                    publicationId: NodeCrypto.randomUUID(),
+                    resultId: null,
+                    state: "saving",
+                    detail: null,
+                    retryable: false,
+                  },
+                },
+                createdAt: "now",
+                updatedAt: "now",
+              };
+              yield* f.sql`INSERT INTO relay_workflow_jobs(job_id,organization_id,repository_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES(${jobId},'org','repo',${userId},'done',${f.sql.json(record)},0,'now','now')`;
+              yield* f.sql`UPDATE relay_thread_placements SET audience='repository',owner_user_id=NULL,workflow_job_id=${jobId} WHERE thread_id=${f.threadId}`;
+              yield* f.sql`UPDATE relay_thread_vm_allocations SET resource_kind='organization_workflow',owner_user_id=NULL WHERE allocation_id=${f.allocationId}`;
+              const scope = { repositoryId: "repo", jobId };
+              // A repository member may inspect results, but cannot destroy the shared thread.
+              expect(yield* f.authorized(listSavedWorkflowResults(scope))).toMatchObject({
+                results: [],
+              });
+              expect(
+                (yield* Effect.result(f.authorized(permanentlyDeleteThread(f.threadId, f.payload))))
+                  ._tag,
+              ).toBe("Failure");
+              yield* f.sql`UPDATE relay_repository_access SET role='maintainer' WHERE repository_id='repo' AND user_id=${userId}`;
+              // Terminal status does not substitute for the executor's stopping proof.
+              expect(
+                (yield* Effect.result(f.authorized(permanentlyDeleteThread(f.threadId, f.payload))))
+                  ._tag,
+              ).toBe("Failure");
+              yield* f.sql`UPDATE relay_workflow_jobs SET record=jsonb_set(record,'{progress,executionReleased}','true') WHERE job_id=${jobId}`;
+              const wrongGeneration = { ...f.payload, expectedGeneration: 2 };
+              expect(
+                (yield* Effect.result(
+                  f.authorized(permanentlyDeleteThread(f.threadId, wrongGeneration)),
+                ))._tag,
+              ).toBe("Failure");
+              // Saved catalog ownership is retired by the same physical deletion worker.
+              const publicationId = NodeCrypto.randomUUID(),
+                resultId = NodeCrypto.randomUUID();
+              yield* f.sql`INSERT INTO relay_workflow_saved_results(result_id,job_id,thread_id,turn_id,revision,result,native_checkpoint_operation_id)
+                VALUES(${resultId},${jobId},${f.threadId},'turn',1,${f.sql.json({ resultId })},${f.native.header.operationId})`;
+              yield* f.sql`INSERT INTO relay_workflow_recovery_records(publication_id,job_id,thread_id,revision,manifest_artifact_id,manifest_sha256,manifest_size_bytes,manifest)
+                VALUES(${publicationId},${jobId},${f.threadId},1,${f.native.artifactId},${"a".repeat(64)},1,${f.sql.json({ publicationId })})`;
+              yield* f.sql`INSERT INTO relay_workflow_recovery_heads(job_id,publication_id,revision) VALUES(${jobId},${publicationId},1)`;
+              yield* f.sql`INSERT INTO relay_thread_artifact_pins(artifact_id,operation_id) VALUES(${f.native.artifactId},${`workflow-result:${resultId}`}) ON CONFLICT DO NOTHING`;
+              const jobs = yield* f.authorized(makeWorkflows);
+              const stale = (yield* jobs.claim(jobId))!;
+              const deleted = yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
+              expect((yield* jobs.getJob(jobId))?.record.progress).toMatchObject({
+                hasThread: false,
+                threadDeletionRequested: true,
+              });
+              expect(
+                (yield* Effect.result(
+                  jobs.updateJob(stale, stale.record, null, true, stale.leaseUntil!),
+                ))._tag,
+              ).toBe("Failure");
+              expect((yield* jobs.getJob(jobId))?.record.progress?.threadDeletionRequested).toBe(
+                true,
+              );
+              expect(yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload))).toEqual(
+                deleted,
+              );
+              expect(yield* f.deletions.get(f.threadId)).toMatchObject({
+                audience: "repository",
+                ownerUserId: null,
+                requesterUserId: userId,
+                workflowJobId: jobId,
+              });
+              expect(
+                (yield* Effect.result(f.authorized(listSavedWorkflowResults(scope))))._tag,
+              ).toBe("Failure");
+              yield* f.sql`DELETE FROM relay_repository_access WHERE user_id=${userId}`;
+              const worker = makeThreadDeletionWorker(
+                f.sql,
+                f.objects,
+                nativeCompute(f),
+                f.hostId,
+                () => Effect.succeed(true),
+              );
+              yield* drain(f, worker);
+              expect((yield* f.allocations.getAny(f.allocationId))?.state).toBe("deleted");
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_thread_artifacts WHERE thread_id=${f.threadId} AND state!='deleted'`,
+              ).toHaveLength(0);
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_workflow_saved_results WHERE thread_id=${f.threadId}`,
+              ).toHaveLength(0);
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_workflow_recovery_records WHERE thread_id=${f.threadId}`,
+              ).toHaveLength(0);
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_workflow_recovery_heads WHERE job_id=${jobId}`,
+              ).toHaveLength(0);
+              expect(
+                yield* f.sql`SELECT 1 FROM relay_thread_artifact_pins WHERE operation_id=${`workflow-result:${resultId}`}`,
+              ).toHaveLength(0);
+              expect((yield* f.authorized(getThreadDeletion(f.threadId))).phase).toBe("completed");
             }),
           ),
       );

@@ -237,6 +237,18 @@ before explicitly starting another; it may create an additional job.
 Runs marked **Started by workflow** and their automatic prompts identify the workflow that
 started them. Human checkpoint responses still identify the person who responded.
 
+For VM workflows, **Saved results** keeps each Agent's exact changes, conversation and captured
+attachments readable without connecting to the VM, including after its disk expires. Choose an
+Agent result to inspect an earlier version or load older results after rework. These results remain
+with the thread until it is permanently deleted.
+
+A VM workflow waits for **Saving result** before advancing. If saving fails, maintainers and admins
+can use **Retry saving** without rerunning the Agent. Cancel remains available. Patches larger than
+10 MB or containing restricted/binary output cannot count as a complete saved review; the error
+explains when a new run is required. Safely captured failed or cancelled Agent results are labelled
+with their outcome. After confirmed execution cleanup, maintainers and admins can permanently
+delete the workflow thread and its results/workspace from the saved-result view.
+
 Request changes sends feedback to the Review's chosen earlier Agent step in the same worktree.
 Earlier inputs and results remain valid; later steps run again and need fresh human responses.
 Rework retains the files already prepared rather than restoring an older copy. Setup and background

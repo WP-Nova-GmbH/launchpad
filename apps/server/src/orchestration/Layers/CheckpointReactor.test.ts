@@ -127,6 +127,8 @@ function createProviderServiceHarness(
         ] satisfies ReadonlyArray<ProviderSession>)
       : Effect.succeed([] as ReadonlyArray<ProviderSession>);
   const service: ProviderServiceShape = {
+    checkpointWorkflowConversation: () =>
+      Effect.die("Workflow capture must be explicitly provided"),
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
     compactThread: () => unsupported(),
@@ -404,6 +406,18 @@ describe("CheckpointReactor", () => {
           ...(options?.nativeCheckpoint
             ? { checkpointConversation: options.nativeCheckpoint }
             : {}),
+          checkpointWorkflowConversation: ({ binding, turnId }) =>
+            (
+              options?.nativeCheckpoint?.({ threadId: binding.threadId, turnId }) ??
+              Effect.die("Missing workflow capture fixture")
+            ).pipe(
+              Effect.as({
+                threadId: binding.threadId,
+                turnId,
+                generation: binding.generation,
+                sourceSequence: 1,
+              }),
+            ),
         }),
       ),
       Layer.provideMerge(Layer.mock(PullRequestService)({ refreshAfterTurn })),
@@ -680,6 +694,7 @@ describe("CheckpointReactor", () => {
           });
         const complete = (turnId: TurnId, checkpointTurnCount: number) =>
           Effect.gen(function* () {
+            expect(yield* store.getByThread(threadId)).not.toBeNull();
             publishCompletion(turnId);
             expect(yield* Queue.take(observedCompletions)).toBe(turnId);
             expect(yield* harness.nextReceipt).toMatchObject({
@@ -783,6 +798,25 @@ describe("CheckpointReactor", () => {
           outcome: "completed",
           checkpoint: "ready",
         });
+        const checkpoint = (yield* Effect.promise(harness.readModel)).threads[0]!.checkpoints[0]!;
+        yield* store.save({
+          ...running,
+          executionReserved: false,
+          progress: {
+            ...running.progress,
+            status: "awaiting_review",
+            checkpoint: {
+              checkpointId: "saved-result",
+              turnId: firstTurn,
+              checkpointTurnCount: 1,
+              checkpointRef: checkpoint.checkpointRef,
+            },
+          },
+        });
+        expect(yield* store.getSaveResult(binding.jobId, firstTurn)).not.toBeNull();
+        publishCompletion(firstTurn);
+        yield* Effect.promise(harness.drain);
+        expect(yield* Queue.size(observedCompletions)).toBe(0);
         yield* store.save(running);
         const first = yield* store.getCheckpointPinForTurn(threadId, firstTurn, 1);
         expect(first?.baselineCommitId).toBe(baseline.commitId);
@@ -822,8 +856,8 @@ describe("CheckpointReactor", () => {
         });
         expect(yield* store.getByThread(threadId)).toBeNull();
         publishCompletion(secondTurn);
-        expect(yield* Queue.take(observedCompletions)).toBe(secondTurn);
         yield* Effect.promise(harness.drain);
+        expect(yield* Queue.size(observedCompletions)).toBe(0);
         expect(gitStatusRefreshCalls).toEqual([]);
         expect(yield* store.getCheckpointPinForTurn(threadId, secondTurn, 2)).toEqual(saved);
         expect(yield* store.getCheckpointPinForTurn(threadId, reusedCountTurn, 2)).toEqual(reused);
@@ -845,8 +879,8 @@ describe("CheckpointReactor", () => {
           turnId: lateTurn,
         });
         publishCompletion(lateTurn);
-        expect(yield* Queue.take(observedCompletions)).toBe(lateTurn);
         yield* Effect.promise(harness.drain);
+        expect(yield* Queue.size(observedCompletions)).toBe(0);
         expect(gitRefExists(harness.cwd, secondRef)).toBe(false);
         expect(gitRefExists(harness.cwd, checkpointRefForThreadTurn(threadId, 3))).toBe(false);
         expect(NodeFS.existsSync(NodePath.join(harness.cwd, "filter-ran"))).toBe(false);

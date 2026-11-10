@@ -76,7 +76,9 @@ vi.mock(
   "../../../../mobile/node_modules/@effect/atom-react",
   async () => await vi.importActual("@effect/atom-react"),
 );
-
+vi.mock("../../../../mobile/src/features/settings/SavedWorkflowResults", () => ({
+  SavedWorkflowResults: () => null,
+}));
 vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   View: host("view"),
   Text: host("text"),
@@ -382,30 +384,19 @@ effectIt.layer(
       expect(approval.props.disabled).toBe(true);
       await press("Approve result");
       expect(fixture.respond).not.toHaveBeenCalled();
-      await press("Inspect agent result");
-      expect(fixture.navigate.mock.lastCall![1].workflowOrigin.reviewCheckpoint).toBeUndefined();
+      expect(content()).not.toContain("Inspect agent result");
+      expect(content()).not.toContain("Inspect live diff");
+      expect(fixture.openResult).not.toHaveBeenCalled();
       await act(() => renderer!.unmount());
       await mount({ repositoryId: "A", jobId: vmReview.jobId });
       expect(content()).toContain("Review changed");
-      await press("Inspect live diff");
-      expect(fixture.review).not.toHaveBeenCalled();
-      expect(fixture.openResult).toHaveBeenCalledWith(
-        expect.objectContaining({
-          workflowResult: expect.objectContaining({ jobId: vmReview.jobId, repositoryId: "A" }),
-        }),
-      );
-      expect(fixture.navigate).toHaveBeenCalledWith(
-        "ThreadReview",
-        expect.objectContaining({
-          workflowOrigin: expect.objectContaining({
-            reviewCheckpoint: {
-              checkpointId: "checkpoint",
-              turnId: "turn",
-              checkpointTurnCount: 3,
-            },
-          }),
-        }),
-      );
+      const returnedApproval = renderer!.root
+        .findAll((node) => String(node.type) === "action")
+        .find((node) => node.props.label === "Approve result")!;
+      expect(returnedApproval.props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.respond).not.toHaveBeenCalled();
+      expect(fixture.openResult).not.toHaveBeenCalled();
     },
   );
 

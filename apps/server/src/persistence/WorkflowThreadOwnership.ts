@@ -32,4 +32,12 @@ export const assertWorkflowThreadReleased = Effect.fn("assertWorkflowThreadRelea
           "This thread belongs to a workflow. Finish or cancel its run and confirm cleanup before moving it.",
       });
   }
+  if (
+    (yield* sql`SELECT 1 FROM workflow_result_outbox WHERE thread_id=${threadId} AND status!='acknowledged' LIMIT 1`)
+      .length
+  )
+    return yield* new WorkflowThreadOwnershipError({
+      threadId,
+      message: "Save this workflow's pending result before moving or discarding its workspace.",
+    });
 });

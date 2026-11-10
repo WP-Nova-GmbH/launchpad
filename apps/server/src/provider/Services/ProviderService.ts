@@ -30,6 +30,7 @@ import type {
   TurnId,
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
+import type { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
@@ -153,6 +154,20 @@ export interface ProviderServiceShape {
     readonly threadId: ThreadId;
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
+
+  /** Internal workflow capture; generic native export remains unavailable for workflow VMs. */
+  readonly checkpointWorkflowConversation: (input: {
+    readonly binding: WorkflowVmDispatchBinding;
+    readonly turnId: TurnId;
+  }) => Effect.Effect<
+    {
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly generation: number;
+      readonly sourceSequence: number;
+    },
+    ProviderServiceError
+  >;
 
   /** Retain a settled turn, or a fresh final point under an already frozen operation. */
   readonly checkpointConversation?: (input: {

@@ -90,8 +90,10 @@ const withViewerControls = Effect.fnUntraced(function* (
     ...job,
     viewerControls: {
       canCancel: canManage || (yield* mayCancelOwnVm(row, membership.userId)),
-      canApprove: canManage || memberCheckpoint,
-      canRespond: canManage || (memberCheckpoint && !(yield* hasFrozenVmSecrets(row.jobId))),
+      canApprove: !job.progress?.resultSaving && (canManage || memberCheckpoint),
+      canRespond:
+        !job.progress?.resultSaving &&
+        (canManage || (memberCheckpoint && !(yield* hasFrozenVmSecrets(row.jobId)))),
     },
   };
 });
@@ -229,11 +231,17 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
         message: "This job cannot change its manual pause in the current state.",
       });
   }
-  if (row.record.progress?.manualPause && !manual && payload.operation !== "cancel")
+  if (
+    row.record.progress?.manualPause &&
+    !manual &&
+    payload.operation !== "cancel" &&
+    payload.operation !== "retry_saving"
+  )
     return yield* new WorkflowConflictError({
       message: "Resume the manual pause before responding or retrying.",
     });
-  if (isTerminalWorkflowJob(row.status)) return yield* withViewerControls(row, membership);
+  if (isTerminalWorkflowJob(row.status) && payload.operation !== "retry_saving")
+    return yield* withViewerControls(row, membership);
   if (payload.operation === "cancel" && row.status === "cancelling")
     return yield* withViewerControls(row, membership);
   if (
@@ -243,6 +251,15 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
   )
     return yield* new WorkflowConflictError({
       message: "A response is already waiting for acknowledgement. Refresh the job.",
+    });
+  if (
+    payload.operation === "retry_saving" &&
+    (row.record.progress?.revision !== payload.expectedRevision ||
+      row.record.progress.resultSaving?.publicationId !== payload.publicationId ||
+      !row.record.progress.resultSaving.retryable)
+  )
+    return yield* new WorkflowConflictError({
+      message: "This saved result changed. Refresh before retrying.",
     });
   if (payload.operation === "retry_action") {
     const progress = row.record.progress;
@@ -659,5 +676,19 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
           .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
       }).pipe(errors),
     )
+    .handle("listSavedResults", ({ params, query }) =>
+      listSavedWorkflowResults({ ...params, ...query }),
+    )
+    .handle("readSavedResult", ({ params }) => readSavedWorkflowResult(params))
+    .handle("getSavedHistory", ({ params, query }) =>
+      getSavedWorkflowHistory({ ...params, ...query }),
+    )
+    .handle("getSavedAttachment", ({ params }) => getSavedWorkflowAttachment(params))
     .handle("respond", ({ params, payload }) => respondToWorkflowJob(params, payload).pipe(errors)),
 );
+import {
+  listSavedWorkflowResults,
+  readSavedWorkflowResult,
+  getSavedWorkflowHistory,
+  getSavedWorkflowAttachment,
+} from "./WorkflowResultsApi.ts";

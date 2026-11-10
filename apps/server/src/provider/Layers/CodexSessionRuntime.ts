@@ -2757,18 +2757,18 @@ export const makeCodexSessionRuntime = (
       if (trackedLaunch && controlSpawner) {
         const identity = yield* readVmHarnessIdentity(trackedLaunch.workloadId, child.pid).pipe(
           Effect.provideService(VmControlSpawner, controlSpawner),
-          Effect.option,
+          Effect.result,
         );
-        if (identity._tag === "Some") harnessIdentity = identity.value;
+        if (identity._tag === "Success") harnessIdentity = identity.success;
         if (options.workflowProxy) {
-          if (identity._tag === "None")
+          if (identity._tag === "Failure")
             return yield* new CodexErrors.CodexAppServerSpawnError({
               command: `${options.binaryPath} app-server`,
-              cause: "The workflow Codex process could not be verified.",
+              cause: identity.failure,
             });
           options.workflowProxy.bindPeer((listenerPort, clientPort, signal) =>
             Effect.runPromise(
-              verifyWorkflowVmHarnessPeer(identity.value, listenerPort, clientPort).pipe(
+              verifyWorkflowVmHarnessPeer(identity.success, listenerPort, clientPort).pipe(
                 Effect.provideService(VmControlSpawner, controlSpawner),
               ),
               { signal },

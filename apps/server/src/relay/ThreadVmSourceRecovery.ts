@@ -58,6 +58,14 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     )
       return yield* fail(threadId, "VM recovery belongs to another source.");
     if (owner.phase === "active") {
+      if (
+        (yield* sql`SELECT 1 FROM workflow_result_outbox WHERE thread_id=${threadId} AND status!='acknowledged' LIMIT 1`)
+          .length
+      )
+        return yield* fail(
+          threadId,
+          "Save the pending workflow result before freezing or discarding this workspace.",
+        );
       if (owner.operationId !== input.previousOperationId)
         return yield* fail(
           threadId,

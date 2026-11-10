@@ -16,7 +16,8 @@ import {
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
-import type { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import type { WorkflowResultCapture } from "../jobs/WorkflowResultOutbox.ts";
 import { parseGitPatchHeaderPaths, unquoteGitPatchPath } from "@t3tools/shared/gitPatchPath";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -27,7 +28,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
-import { WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
+import { WorkflowCheckpointPin, WorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
 import { workflowReviewSecretMatcher, WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
 import { withWorkflowVmCancelledCheckpointRead } from "../relay/WorkflowVmCancellation.ts";
 import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
@@ -65,10 +66,17 @@ export class CheckpointDiffQuery extends Context.Service<
     readonly getFullThreadDiff: (
       input: OrchestrationGetFullThreadDiffInput,
     ) => Effect.Effect<OrchestrationGetFullThreadDiffResult, CheckpointServiceError>;
+    /** Internal archival read of an existing failed/cancelled capture; never Review evidence. */
+    readonly getSavedWorkflowCaptureDiff: (
+      binding: WorkflowVmDispatchBinding,
+      capture: WorkflowResultCapture,
+    ) => Effect.Effect<string, CheckpointServiceError>;
   }
 >()("t3/checkpointing/CheckpointDiffQuery") {}
 
 const isTurnDiffResult = Schema.is(OrchestrationGetTurnDiffResult);
+const sameVmBinding = Schema.toEquivalence(WorkflowVmDispatchBinding);
+const samePin = Schema.toEquivalence(WorkflowCheckpointPin);
 function patchContainsWorkflowSecret(values: ReadonlyArray<string>, patch: string): boolean {
   if (values.length === 0) return false;
   const containsSecret = workflowReviewSecretMatcher(values);
@@ -84,7 +92,7 @@ function patchContainsWorkflowSecret(values: ReadonlyArray<string>, patch: strin
       const context = /^@@ .*? @@ (.*)$/su.exec(line)?.[1];
       if (context && containsSecret(context)) return true;
     } else if (inHunk) {
-      if (/^[ +\-]/u.test(line) && containsSecret(line.slice(1))) return true;
+      if (/^[ +-]/u.test(line) && containsSecret(line.slice(1))) return true;
     } else if (line.startsWith("--- ") || line.startsWith("+++ ")) {
       const token = line.slice(4).split("\t", 1)[0]!;
       if (token !== "/dev/null" && containsSecret(unquoteGitPatchPath(token).slice(2))) return true;
@@ -182,6 +190,42 @@ export const make = Effect.gen(function* () {
       );
     if (patchContainsWorkflowSecret(Redacted.value(secrets), patch))
       return yield* new CheckpointWorkflowDiffRestrictedError({ reason: "contains_secret" });
+  });
+
+  const getSavedWorkflowCaptureDiff = Effect.fn("getSavedWorkflowCaptureDiff")(function* (
+    binding: WorkflowVmDispatchBinding,
+    capture: WorkflowResultCapture,
+  ) {
+    const threadId = binding.threadId;
+    const unavailable = () =>
+      new CheckpointWorkflowPinUnavailableError({ threadId, turnCount: capture.turnCount });
+    const current = yield* workflowRuns.getVmBindingForThread(threadId);
+    const pin = yield* workflowRuns.getCapturedWorkflowTurn(binding, capture.turnId);
+    if (
+      capture.outcome === "completed" ||
+      !current ||
+      !sameVmBinding(binding, current) ||
+      !(yield* workflowRuns.isVmFenceActive(binding)) ||
+      !pin ||
+      pin.turnCount !== capture.turnCount ||
+      !samePin(pin, capture)
+    )
+      return yield* unavailable();
+    const context = yield* projectionSnapshotQuery.getThreadCheckpointContext(threadId);
+    if (Option.isNone(context)) return yield* unavailable();
+    const cwd = context.value.worktreePath ?? context.value.workspaceRoot;
+    if (!cwd) return yield* unavailable();
+    const diff = yield* readDiff(binding, threadId, capture.turnCount, {
+      cwd,
+      fromCheckpointRef: CheckpointRef.make(pin.baselineCommitId),
+      toCheckpointRef: CheckpointRef.make(pin.commitId),
+      pinned: true,
+      requireComplete: true,
+      ignoreWhitespace: false,
+      fallbackFromToHead: false,
+    });
+    yield* verifySharedPatch(binding, diff);
+    return diff;
   });
 
   const getTurnDiff: CheckpointDiffQuery["Service"]["getTurnDiff"] = Effect.fn("getTurnDiff")(
@@ -444,6 +488,7 @@ export const make = Effect.gen(function* () {
   return CheckpointDiffQuery.of({
     getTurnDiff,
     getFullThreadDiff,
+    getSavedWorkflowCaptureDiff,
   });
 });
 

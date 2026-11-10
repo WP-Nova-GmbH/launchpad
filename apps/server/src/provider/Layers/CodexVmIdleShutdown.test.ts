@@ -20,6 +20,7 @@ import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts
 import { makeCodexSessionRuntime } from "./CodexSessionRuntime.ts";
 import wireFixture from "../testFixtures/codexMultiAgentWire.json" with { type: "json" };
 
+const isVmWorkloadError = Schema.is(VmWorkloadError);
 const nativeId = "a88473a1-01d4-449a-8194-7d6544d3502d";
 const bootId = "13835087-40ba-45c5-bde6-d0092298eaf5";
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -46,6 +47,7 @@ const makeFixture = Effect.fnUntraced(function* (
     readonly start?: boolean;
     readonly resumedNativeId?: string;
     readonly invalidIdentity?: boolean;
+    readonly identityExitCode?: number;
   } = {},
 ) {
   const output = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
@@ -158,7 +160,11 @@ const makeFixture = Effect.fnUntraced(function* (
       }
       return ChildProcessSpawner.makeHandle({
         pid: ChildProcessSpawner.ProcessId(100),
-        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+        exitCode: Effect.succeed(
+          ChildProcessSpawner.ExitCode(
+            command.args[0] === "provider-identity" ? (options.identityExitCode ?? 0) : 0,
+          ),
+        ),
         isRunning: Effect.succeed(false),
         kill: () => Effect.void,
         unref: Effect.succeed(Effect.void),
@@ -373,6 +379,22 @@ it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
         NodeAssert.equal((yield* Effect.result(f.runtime.start()))._tag, "Failure");
         NodeAssert.equal(f.methods.includes("turn/start"), false);
         NodeAssert.equal(f.bindPeer.mock.calls.length, 0);
+      }),
+    ),
+  );
+  it.effect("retains a native verification helper failure in the startup error", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true, identityExitCode: 74, start: false });
+        const error = yield* Effect.flip(f.runtime.start());
+        NodeAssert.equal(error._tag, "CodexAppServerSpawnError");
+        if (error._tag !== "CodexAppServerSpawnError") return;
+        NodeAssert.ok(isVmWorkloadError(error.cause));
+        if (!isVmWorkloadError(error.cause)) return;
+        NodeAssert.equal(error.cause.reason, "command_exit");
+        NodeAssert.equal(error.cause.exitCode, 74);
+        NodeAssert.equal(f.bindPeer.mock.calls.length, 0);
+        NodeAssert.equal(f.methods.includes("turn/start"), false);
       }),
     ),
   );

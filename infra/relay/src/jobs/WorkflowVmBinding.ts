@@ -158,6 +158,20 @@ export const requireWorkflowVmViewer = Effect.fnUntraced(function* (
   if (!grant) return yield* tenancyNotFound("thread_not_found");
 });
 
+export const requireWorkflowVmMaintainer = Effect.fnUntraced(function* (
+  sql: PgClient,
+  scope: { organizationId: string; repositoryId: string },
+  userId: string,
+) {
+  yield* requireWorkflowVmViewer(sql, scope, userId);
+  const [access] = yield* sql`SELECT 1 FROM relay_organization_members m
+    WHERE m.organization_id=${scope.organizationId} AND m.user_id=${userId}
+      AND (m.role='admin' OR EXISTS(SELECT 1 FROM relay_repository_access r
+        WHERE r.organization_id=m.organization_id AND r.repository_id=${scope.repositoryId}
+          AND r.user_id=m.user_id AND r.role='maintainer')) FOR SHARE OF m`;
+  if (!access) return yield* tenancyNotFound("thread_not_found");
+});
+
 export const authorizeWorkflowVmGuest = Effect.fnUntraced(function* (
   input: { threadId: string; environmentId: string; generation: number; jobId?: string },
   stage: "active" | "enrolled" = "active",

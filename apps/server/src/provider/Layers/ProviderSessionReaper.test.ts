@@ -190,6 +190,7 @@ describe("ProviderSessionReaper", () => {
     );
 
     const providerService: ProviderServiceShape = {
+      checkpointWorkflowConversation: () => Effect.die("Unexpected workflow capture"),
       startSession: () => unsupported(),
       sendTurn: () => unsupported(),
       compactThread: () => unsupported(),

@@ -411,6 +411,7 @@ export function makeThreadJournalStore(sql: PgClient) {
     readonly threadId: string;
     readonly after: number;
     readonly limit: number;
+    readonly through?: number;
   }) {
     if (
       !Number.isSafeInteger(input.after) ||
@@ -421,7 +422,7 @@ export function makeThreadJournalStore(sql: PgClient) {
     )
       return yield* conflict("Invalid history page");
     return yield* sql<HistoryEntry>`SELECT cursor, environment_id AS "environmentId", event_json AS event
-      FROM relay_thread_history WHERE thread_id = ${input.threadId} AND cursor > ${input.after} ORDER BY cursor LIMIT ${input.limit}`;
+      FROM relay_thread_history WHERE thread_id = ${input.threadId} AND cursor > ${input.after} AND (${input.through ?? null}::bigint IS NULL OR cursor<=${input.through ?? null}) ORDER BY cursor LIMIT ${input.limit}`;
   });
   return {
     command,

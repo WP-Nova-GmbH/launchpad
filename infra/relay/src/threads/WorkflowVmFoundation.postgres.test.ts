@@ -3,12 +3,16 @@ import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodeEffectCrypto from "@effect/platform-node/NodeCrypto";
 import * as PgClient from "@effect/sql-pg/PgClient";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { RelayEnvironmentPrincipal } from "@t3tools/contracts/relay";
+import { RelayEnvironmentPrincipal, RelayClientPrincipal } from "@t3tools/contracts/relay";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import { DateTime, Deferred, Effect, Fiber, FileSystem, Layer, Redacted } from "effect";
 import type { SandboxInfo } from "e2b";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeCrypto from "node:crypto";
+import * as Stream from "effect/Stream";
+import { uploadPortableThreadArtifact } from "../http/ThreadArtifactsApi.ts";
+import { ThreadArtifactObjectStorage } from "./ThreadArtifactObjects.ts";
+import { makeLocalThreadArtifactObjects } from "./ThreadArtifactLocalObjects.ts";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmActivityStore } from "./ThreadVmActivityStore.ts";
@@ -27,7 +31,17 @@ import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
 import { RelayDb } from "../db.ts";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import { advanceWorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
-import { Workflows, layer as workflows } from "../jobs/Workflows.ts";
+import type { WorkflowResultSaving } from "@t3tools/contracts/workflows";
+import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
+import { Organizations } from "../tenancy/Organizations.ts";
+import { Repositories } from "../tenancy/Repositories.ts";
+import { Machines } from "../machines/Machines.ts";
+import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
+import { WorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
+import { deliverPendingWorkflowJobs } from "../jobs/WorkflowDispatcher.ts";
+import { WorkflowWake } from "../jobs/WorkflowWake.ts";
+import { refreshWorkflowJobForClient, respondToWorkflowJob } from "../http/WorkflowsApi.ts";
+import { Workflows, type WorkflowDispatchScope, layer as workflows } from "../jobs/Workflows.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { ThreadVmRuntimeConfiguration } from "./ThreadVmRuntime.ts";
 import {
@@ -61,6 +75,7 @@ const seed = Effect.fnUntraced(function* (input: {
   hostId: string;
   organizationId?: string;
   personal?: boolean;
+  automatic?: boolean;
   kind?: "create" | "resume";
 }) {
   const sql = yield* PgClient.PgClient;
@@ -111,7 +126,23 @@ const seed = Effect.fnUntraced(function* (input: {
       workflowId: workflow.workflowId,
       repositoryId,
       runtime: { kind: "vm", threadId },
-      origin: { kind: "manual", userId: ownerUserId },
+      origin: input.automatic
+        ? {
+            kind: "automation",
+            organizationId,
+            repositoryId,
+            workflowId: workflow.workflowId,
+            occurrenceId: NodeCrypto.randomUUID(),
+            source: {
+              provider: "linear",
+              applicationId: "app",
+              workspaceId: "workspace",
+              connectionId: NodeCrypto.randomUUID(),
+              grantId: "grant",
+            },
+          }
+        : { kind: "manual", userId: ownerUserId },
+      requiredProtocol: 9,
       instruction: "Implement",
       status: "preparing",
       detail: null,
@@ -122,7 +153,7 @@ const seed = Effect.fnUntraced(function* (input: {
     };
     yield* sql`INSERT INTO relay_workflow_jobs
       (job_id,repository_id,organization_id,submitter_user_id,status,record,revision,created_at,checked_at)
-      VALUES(${workflowJobId},${repositoryId},${organizationId},${ownerUserId},'preparing',${sql.json(record)},0,'2026','2026')`;
+      VALUES(${workflowJobId},${repositoryId},${organizationId},${input.automatic ? null : ownerUserId},'preparing',${sql.json(record)},0,'2026','2026')`;
     yield* placements.prepareWorkflow({
       threadId,
       workflowJobId,
@@ -156,8 +187,8 @@ const seed = Effect.fnUntraced(function* (input: {
   };
 });
 
-const activeWorkflow = Effect.fnUntraced(function* () {
-  const f = yield* seed({ hostId: NodeCrypto.randomUUID() });
+const activeWorkflow = Effect.fnUntraced(function* (automatic = false) {
+  const f = yield* seed({ hostId: NodeCrypto.randomUUID(), automatic });
   const environmentId = NodeCrypto.randomUUID();
   const credentialId = NodeCrypto.randomUUID();
   const connectionId = NodeCrypto.randomUUID();
@@ -1264,6 +1295,49 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       }),
     );
 
+    it.effect("uploads saved artifacts only through the exact current shared VM credential", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const fs = yield* FileSystem.FileSystem;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "p05-guest-upload-" });
+          const objects = makeLocalThreadArtifactObjects(fs, root);
+          const asVm = <A, E, R>(action: Effect.Effect<A, E, R>) =>
+            action.pipe(
+              Effect.provideService(RelayEnvironmentPrincipal, f.principal),
+              Effect.provideService(ThreadArtifactObjectStorage, objects),
+            );
+          const bytes = new TextEncoder().encode("saved diff");
+          const input = {
+            ...f.owner,
+            artifactId: NodeCrypto.randomUUID(),
+            operationId: NodeCrypto.randomUUID(),
+            kind: "workspace" as const,
+            sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+            sizeBytes: bytes.length,
+            body: Stream.succeed(bytes),
+          };
+          expect(yield* asVm(uploadPortableThreadArtifact(input))).toMatchObject({
+            artifactId: input.artifactId,
+            state: "complete",
+          });
+          expect(
+            (yield* Effect.result(asVm(uploadPortableThreadArtifact({ ...input, generation: 2 }))))
+              ._tag,
+          ).toBe("Failure");
+          yield* f.sql`UPDATE relay_environment_credentials SET revoked_at='now' WHERE credential_id=${f.principal.credentialId}`;
+          const artifactId = NodeCrypto.randomUUID();
+          expect(
+            (yield* Effect.result(asVm(uploadPortableThreadArtifact({ ...input, artifactId }))))
+              ._tag,
+          ).toBe("Failure");
+          expect(
+            yield* f.sql`SELECT 1 FROM relay_thread_artifacts WHERE artifact_id=${artifactId}`,
+          ).toHaveLength(0);
+        }),
+      ).pipe(Effect.provide(NodeFileSystem.layer)),
+    );
+
     it.effect("admits and completes workflow setup and successive Agent work idempotently", () =>
       Effect.gen(function* () {
         const f = yield* activeWorkflow();
@@ -1520,8 +1594,8 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
         ).toBeNull();
         for (const fixture of [workflow, personal])
           yield* fixture.sql`INSERT INTO relay_thread_deletions
-            (thread_id,operation_id,owner_user_id,generation,host_id,phase)
-            VALUES(${fixture.threadId},${NodeCrypto.randomUUID()},${fixture.ownerUserId},1,${hostId},'stopping')`;
+            (thread_id,operation_id,owner_user_id,requester_user_id,generation,host_id,phase)
+            VALUES(${fixture.threadId},${NodeCrypto.randomUUID()},${fixture.ownerUserId},${fixture.ownerUserId},1,${hostId},'stopping')`;
         expect(yield* makeThreadDeletionStore(workflow.sql).claim(hostId)).toMatchObject({
           threadId: personal.threadId,
         });
@@ -1680,6 +1754,225 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect((yield* Fiber.join(edit)).maxRunningVms).toBe(0);
           expect((yield* personal.capacity.get(nextOperationId))?.state).toBe("waiting");
         }),
+    );
+    it.effect(
+      "selects only unfinished terminal VM saves and requested retries with the existing scopes",
+      () =>
+        Effect.gen(function* () {
+          const store = yield* Workflows;
+          for (const status of ["done", "failed", "cancelled"] as const) {
+            for (const automatic of [false, true]) {
+              const f = yield* activeWorkflow(automatic);
+              const current = (yield* store.getJob(f.workflowJobId))!;
+              const occurrenceId =
+                current.record.origin?.kind === "automation"
+                  ? current.record.origin.occurrenceId
+                  : NodeCrypto.randomUUID();
+              const connectionId =
+                current.record.origin?.kind === "automation"
+                  ? current.record.origin.source.connectionId
+                  : NodeCrypto.randomUUID();
+              const record = {
+                ...current.record,
+                status,
+                requiredProtocol: 9,
+                progress: {
+                  revision: 1,
+                  threadId: ThreadId.make(f.threadId),
+                  status,
+                  detail: null,
+                  checkpoint: null,
+                  hasThread: true,
+                  executionReleased: true,
+                  resultSaving: {
+                    publicationId: NodeCrypto.randomUUID(),
+                    resultId: null,
+                    state: "saving" as const,
+                    detail: null,
+                    retryable: false,
+                  },
+                },
+              };
+              yield* f.sql`UPDATE relay_workflow_jobs SET status=${status},record=${f.sql.json(record)},submitter_user_id=${automatic ? null : f.ownerUserId} WHERE job_id=${f.workflowJobId}`;
+              yield* f.sql`INSERT INTO relay_workflow_admissions VALUES(${occurrenceId},${record.workflowId},${f.workflowJobId},${f.organizationId},${f.repositoryId},${connectionId},'grant',1,1,1,1)`;
+              const ids = (scope = {}) =>
+                store.pendingJobs(scope).pipe(Effect.map((rows) => rows.map((row) => row.jobId)));
+              expect(yield* ids()).toContain(f.workflowJobId);
+              expect(yield* ids({ occurrenceId })).toEqual([f.workflowJobId]);
+              expect(yield* ids({ connectionId })).toEqual([f.workflowJobId]);
+              expect(yield* ids({ occurrenceId: "another-event" })).not.toContain(f.workflowJobId);
+              expect(yield* ids({ connectionId: "another-connection" })).not.toContain(
+                f.workflowJobId,
+              );
+              expect(yield* ids({ environmentId: "another-environment" })).not.toContain(
+                f.workflowJobId,
+              );
+              yield* f.sql`UPDATE relay_workflow_jobs SET record=jsonb_set(record,'{progress,resultSaving,state}','"failed"') WHERE job_id=${f.workflowJobId}`;
+              expect(yield* ids({ occurrenceId })).toEqual([]);
+              const retry = {
+                userId: f.ownerUserId,
+                response: {
+                  operation: "retry_saving",
+                  publicationId: record.progress.resultSaving.publicationId,
+                  expectedRevision: 1,
+                },
+              };
+              yield* f.sql`UPDATE relay_workflow_jobs SET pending_control=${f.sql.json(retry)} WHERE job_id=${f.workflowJobId}`;
+              expect(yield* ids({ occurrenceId })).toEqual([f.workflowJobId]);
+              yield* f.sql`UPDATE relay_workflow_jobs SET pending_control=NULL,record=record #- '{progress,resultSaving}' WHERE job_id=${f.workflowJobId}`;
+              expect(yield* ids({ occurrenceId })).toEqual([]);
+            }
+          }
+        }).pipe(Effect.provide(workflows)),
+    );
+
+    it.effect(
+      "reconciles automatic terminal save, failure, retry and acknowledgement through the worker without reopening execution",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow(true);
+          const current = yield* (yield* Workflows).getJob(f.workflowJobId);
+          const origin = current!.record.origin!;
+          if (origin.kind !== "automation") return yield* Effect.die("Expected automatic fixture");
+          const occurrenceId = origin.occurrenceId;
+          const connectionId = origin.source.connectionId;
+          const publicationId = NodeCrypto.randomUUID();
+          const record = {
+            ...current!.record,
+            status: "cancelled" as const,
+            requiredProtocol: 9,
+            progress: {
+              revision: 1,
+              threadId: ThreadId.make(f.threadId),
+              status: "cancelled" as const,
+              detail: null,
+              checkpoint: null,
+              hasThread: true,
+              executionReleased: true,
+              resultSaving: {
+                publicationId,
+                resultId: null,
+                state: "saving" as const,
+                detail: null,
+                retryable: false,
+              },
+            },
+          };
+          yield* f.sql`UPDATE relay_workflow_jobs SET status='cancelled',record=${f.sql.json(record)},submitter_user_id=NULL WHERE job_id=${f.workflowJobId}`;
+          yield* f.sql`INSERT INTO relay_workflow_admissions VALUES(${occurrenceId},${record.workflowId},${f.workflowJobId},${f.organizationId},${f.repositoryId},${connectionId},'grant',1,1,1,1)`;
+          const operations: string[] = [];
+          const wakeScopes: unknown[] = [];
+          let saving: WorkflowResultSaving | undefined = {
+            ...record.progress.resultSaving,
+            state: "failed",
+            retryable: true,
+            detail: "Upload failed",
+          };
+          const proof = Effect.gen(function* () {
+            const store = yield* Workflows;
+            const context =
+              yield* Effect.context<
+                Effect.Services<ReturnType<typeof deliverPendingWorkflowJobs>>
+              >();
+            const wake = {
+              wake: (scope?: WorkflowDispatchScope) => {
+                wakeScopes.push(scope);
+                return deliverPendingWorkflowJobs(scope).pipe(Effect.provide(context));
+              },
+            };
+            yield* refreshWorkflowJobForClient(f.workflowJobId).pipe(
+              Effect.provideService(WorkflowWake, wake),
+            );
+            let saved = (yield* store.getJob(f.workflowJobId))!;
+            expect(saved.record.progress?.resultSaving?.state).toBe("failed");
+            expect(yield* store.pendingJobs({ occurrenceId })).toHaveLength(0);
+            saving = { ...record.progress.resultSaving };
+            yield* respondToWorkflowJob(
+              { repositoryId: f.repositoryId, jobId: f.workflowJobId },
+              {
+                operation: "retry_saving",
+                publicationId,
+                expectedRevision: saved.record.progress!.revision,
+              },
+            ).pipe(
+              Effect.provideService(WorkflowWake, wake),
+              Effect.provideService(RelayClientPrincipal, { userId: f.ownerUserId, token: "test" }),
+            );
+            saved = (yield* store.getJob(f.workflowJobId))!;
+            expect(saved.pendingControl).toBeNull();
+            expect(saved.record.progress?.resultSaving?.state).toBe("saving");
+            saving = undefined;
+            // The periodic worker also settles storage without an open client view.
+            yield* deliverPendingWorkflowJobs({ occurrenceId });
+            saved = (yield* store.getJob(f.workflowJobId))!;
+            expect(saved.record.progress?.resultSaving).toBeUndefined();
+            expect(saved.record.status).toBe("cancelled");
+            expect(saved.record.progress?.status).toBe("cancelled");
+            expect(saved.record.progress?.revision).toBe(1);
+            expect(yield* store.pendingJobs({ occurrenceId })).toHaveLength(0);
+            expect(operations).toEqual(["status", "retry_saving", "status"]);
+            expect(wakeScopes).toEqual([{ occurrenceId }, { occurrenceId }]);
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.mock(EnvironmentConnector)({
+                  dispatchJob: (input) =>
+                    Effect.sync(() => {
+                      operations.push(input.workflowControl!.operation);
+                      return {
+                        accepted: true,
+                        workflowResult: {
+                          protocol: 9,
+                          outcome: "accepted",
+                          detail: null,
+                          // A guest cannot reopen terminal execution, even with a newer revision.
+                          progress: {
+                            ...record.progress,
+                            revision: 2,
+                            status: "running",
+                            resultSaving: saving,
+                          },
+                        },
+                      };
+                    }),
+                }),
+                Layer.mock(Organizations)({
+                  getMembershipForUser: ({ userId }) =>
+                    Effect.succeed({
+                      userId,
+                      role: "admin",
+                      joinedAt: "now",
+                      organization: {
+                        organizationId: f.organizationId,
+                        name: "Test",
+                        createdAt: "now",
+                      },
+                    }),
+                }),
+                Layer.mock(Repositories)({
+                  getById: () =>
+                    Effect.succeed({
+                      repositoryId: f.repositoryId,
+                      organizationId: f.organizationId,
+                      name: "Test",
+                      canonicalKeys: [],
+                      createdAt: "now",
+                    }),
+                  getAccess: () => Effect.succeed("maintainer"),
+                }),
+                Layer.mock(Machines)({}),
+                Layer.mock(OrganizationProjectCatalog)({}),
+                Layer.succeed(WorkflowVmPreparation, {
+                  advance: () =>
+                    Effect.die(
+                      "Storage reconciliation cannot provision, resume, run setup or start an Agent",
+                    ),
+                }),
+              ),
+            ),
+          );
+          yield* proof;
+        }).pipe(Effect.provide(workflows)),
     );
   });
 });

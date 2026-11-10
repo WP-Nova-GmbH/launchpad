@@ -250,6 +250,58 @@ export const getPortableThreadHistory = Effect.fn("relay.api.thread_history.read
 const decodeAttachmentHeader = Schema.decodeEffect(
   Schema.fromJsonString(ThreadAttachmentCheckpointArchiveManifest),
 );
+
+/** Caller has authorized the thread/result; this opens only its retained attachment manifest. */
+export const openRetainedThreadAttachment = Effect.fn("relay.thread_history.retained_attachment")(
+  function* (
+    input: { threadId: string; attachmentId: string },
+    point: import("@t3tools/contracts/relay").ThreadAttachmentCheckpointPublicationReceipt,
+  ) {
+    const sql = (yield* RelayDb).$client;
+    const objects = yield* ThreadArtifactObjectStorage;
+    return yield* makeThreadCheckpointObjects(
+      sql,
+      objects,
+      (message) => new ThreadArtifactObjectError({ operation: message }),
+    ).openFile(
+      {
+        threadId: input.threadId,
+        operationId: point.operationId,
+        manifestArtifactId: point.manifestArtifactId,
+        kind: "attachment",
+        maxBytes: THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES + 64 * 1024 * 1024,
+      },
+      (view) =>
+        Effect.gen(function* () {
+          const header = yield* decodeAttachmentHeader(
+            yield* view.readMetadata("manifest.json", 32 * 1024 * 1024),
+          );
+          if (
+            header.threadId !== input.threadId ||
+            header.operationId !== point.operationId ||
+            header.sourceEnvironmentId !== point.sourceEnvironmentId ||
+            header.generation !== point.generation ||
+            header.nativeArchiveSha256 !== point.nativeArchiveSha256 ||
+            view.artifact.sha256 !== point.manifestSha256 ||
+            view.byName.get("manifest.json")?.sha256 !== view.manifest.transferManifestSha256
+          )
+            return yield* tenancyConflict("thread_checkpoint_conflict");
+          const descriptor = header.attachments.files.find(
+            (file) => file.attachment.id === input.attachmentId,
+          );
+          const relative = descriptor ? attachmentRelativePath(descriptor.attachment) : null;
+          const file = relative ? view.byName.get(`attachments/${relative}`) : null;
+          if (!descriptor || !file) return yield* tenancyNotFound("thread_not_found");
+          if (
+            file.sha256 !== descriptor.sha256 ||
+            file.sizeBytes !== descriptor.attachment.sizeBytes
+          )
+            return yield* tenancyConflict("thread_checkpoint_conflict");
+          return file;
+        }),
+    );
+  },
+);
 export const readPortableThreadAttachment = Effect.fn("relay.api.thread_history.attachment")(
   function* (input: { threadId: string; attachmentId: string }) {
     const sql = (yield* RelayDb).$client,
@@ -263,47 +315,7 @@ export const readPortableThreadAttachment = Effect.fn("relay.api.thread_history.
           ? yield* makeThreadAttachmentCheckpointStore(sql, objects).get(native.operationId)
           : null;
         if (!native || !point) return yield* tenancyNotFound("thread_not_found");
-        return yield* makeThreadCheckpointObjects(
-          sql,
-          objects,
-          (message) => new ThreadArtifactObjectError({ operation: message }),
-        ).openFile(
-          {
-            threadId: input.threadId,
-            operationId: point.operationId,
-            manifestArtifactId: point.manifestArtifactId,
-            kind: "attachment",
-            maxBytes: THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES + 64 * 1024 * 1024,
-          },
-          (view) =>
-            Effect.gen(function* () {
-              const header = yield* decodeAttachmentHeader(
-                yield* view.readMetadata("manifest.json", 32 * 1024 * 1024),
-              );
-              if (
-                header.threadId !== input.threadId ||
-                header.operationId !== point.operationId ||
-                header.sourceEnvironmentId !== point.sourceEnvironmentId ||
-                header.generation !== point.generation ||
-                header.nativeArchiveSha256 !== point.nativeArchiveSha256 ||
-                view.artifact.sha256 !== point.manifestSha256 ||
-                view.byName.get("manifest.json")?.sha256 !== view.manifest.transferManifestSha256
-              )
-                return yield* tenancyConflict("thread_checkpoint_conflict");
-              const descriptor = header.attachments.files.find(
-                (file) => file.attachment.id === input.attachmentId,
-              );
-              const relative = descriptor ? attachmentRelativePath(descriptor.attachment) : null;
-              const file = relative ? view.byName.get(`attachments/${relative}`) : null;
-              if (!descriptor || !file) return yield* tenancyNotFound("thread_not_found");
-              if (
-                file.sha256 !== descriptor.sha256 ||
-                file.sizeBytes !== descriptor.attachment.sizeBytes
-              )
-                return yield* tenancyConflict("thread_checkpoint_conflict");
-              return file;
-            }),
-        );
+        return yield* openRetainedThreadAttachment(input, point);
       }),
     );
   },

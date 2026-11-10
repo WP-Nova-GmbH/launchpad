@@ -25,7 +25,10 @@ import {
   reconcileThreadArtifacts,
 } from "../src/threads/ThreadVmRuntime.ts";
 import { ThreadArtifactObjectStorage } from "../src/threads/ThreadArtifactObjects.ts";
-import { makeLocalThreadArtifactObjects } from "../src/threads/ThreadArtifactLocalObjects.ts";
+import {
+  makeLocalThreadArtifactObjects,
+  verifyLocalThreadArtifactRoot,
+} from "../src/threads/ThreadArtifactLocalObjects.ts";
 import * as Cause from "effect/Cause";
 import { threadVmEnrollmentApi } from "../src/http/ThreadVmEnrollmentApi.ts";
 import { threadEnvironmentApi } from "../src/http/ThreadEnvironmentApi.ts";
@@ -453,13 +456,14 @@ const runtimeLayerBase = WorkflowWake.layer
     Layer.provideMerge(
       Layer.effect(
         ThreadArtifactObjectStorage,
-        Effect.map(FileSystem.FileSystem, (fs) =>
-          makeLocalThreadArtifactObjects(
-            fs,
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const root =
             process.env.DEV_RELAY_ARTIFACT_ROOT?.trim() ||
-              NodeURL.fileURLToPath(new URL("../../../.t3/relay-artifacts", import.meta.url)),
-          ),
-        ),
+            NodeURL.fileURLToPath(new URL("../../../.t3/relay-artifacts", import.meta.url));
+          yield* verifyLocalThreadArtifactRoot(fs, root);
+          return makeLocalThreadArtifactObjects(fs, root);
+        }),
       ),
     ),
     Layer.provideMerge(LiveActivities.layer),

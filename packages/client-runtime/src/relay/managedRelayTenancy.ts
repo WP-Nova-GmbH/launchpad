@@ -104,6 +104,7 @@ import {
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import type {
+  WorkflowSavedResult,
   RepositoryWorkflow,
   RepositoryWorkflowJob,
   RepositoryWorkflowJobSummary,
@@ -207,6 +208,41 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly repositoryId: RelayRepositoryId;
       readonly jobId: string;
     }) => Effect.Effect<RelayAssignedWorkflowThreadPlacement, ManagedRelayClientError>;
+    readonly listSavedWorkflowResults: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      before?: number;
+    }) => Effect.Effect<
+      {
+        results: ReadonlyArray<WorkflowSavedResult>;
+        nextCursor: number | null;
+        threadId: ThreadId;
+        generation: number;
+      },
+      ManagedRelayClientError
+    >;
+    readonly readSavedWorkflowResult: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      resultId: string;
+    }) => Effect.Effect<{ result: WorkflowSavedResult; patch: string }, ManagedRelayClientError>;
+    readonly getSavedWorkflowHistory: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      resultId: string;
+      after: number;
+      limit: number;
+    }) => Effect.Effect<RelayThreadHistoryPage, ManagedRelayClientError>;
+    readonly downloadSavedWorkflowAttachment: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      resultId: string;
+      attachmentId: string;
+    }) => Effect.Effect<Uint8Array, ManagedRelayClientError>;
     readonly respondToWorkflowJob: (input: {
       readonly clerkToken: string;
       readonly repositoryId: RelayRepositoryId;
@@ -628,6 +664,18 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     runWorkflow: unavailable("clientRuntime.managedRelayTenancy.runWorkflow"),
     getWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJob"),
     getWorkflowJobResult: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJobResult"),
+    listSavedWorkflowResults: unavailable(
+      "clientRuntime.managedRelayTenancy.listSavedWorkflowResults",
+    ),
+    readSavedWorkflowResult: unavailable(
+      "clientRuntime.managedRelayTenancy.readSavedWorkflowResult",
+    ),
+    getSavedWorkflowHistory: unavailable(
+      "clientRuntime.managedRelayTenancy.getSavedWorkflowHistory",
+    ),
+    downloadSavedWorkflowAttachment: unavailable(
+      "clientRuntime.managedRelayTenancy.downloadSavedWorkflowAttachment",
+    ),
     respondToWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.respondToWorkflowJob"),
     renameOrganization: unavailable("clientRuntime.managedRelayTenancy.renameOrganization"),
     listMembers: unavailable("clientRuntime.managedRelayTenancy.listMembers"),
@@ -914,6 +962,98 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
     ),
+    listSavedWorkflowResults: Effect.fn(
+      "clientRuntime.managedRelayTenancy.listSavedWorkflowResults",
+    )(function* (input) {
+      return yield* client.workflows
+        .listSavedResults({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          query: input.before === undefined ? {} : { before: input.before },
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("listSavedWorkflowResults")),
+          timeoutRelayRequest("listSavedWorkflowResults"),
+        );
+    }),
+    readSavedWorkflowResult: Effect.fn("clientRuntime.managedRelayTenancy.readSavedWorkflowResult")(
+      function* (input) {
+        return yield* client.workflows
+          .readSavedResult({
+            headers: bearerHeaders(input.clerkToken),
+            params: {
+              repositoryId: input.repositoryId,
+              jobId: input.jobId,
+              resultId: input.resultId,
+            },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("readSavedWorkflowResult")),
+            timeoutRelayRequest("readSavedWorkflowResult"),
+          );
+      },
+    ),
+    getSavedWorkflowHistory: Effect.fn("clientRuntime.managedRelayTenancy.getSavedWorkflowHistory")(
+      function* (input) {
+        return yield* client.workflows
+          .getSavedHistory({
+            headers: bearerHeaders(input.clerkToken),
+            params: {
+              repositoryId: input.repositoryId,
+              jobId: input.jobId,
+              resultId: input.resultId,
+            },
+            query: { after: input.after, limit: input.limit },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("getSavedWorkflowHistory")),
+            timeoutRelayRequest("getSavedWorkflowHistory"),
+          );
+      },
+    ),
+    downloadSavedWorkflowAttachment: Effect.fnUntraced(
+      function* (input) {
+        const body = yield* client.workflows
+          .getSavedAttachment({
+            headers: bearerHeaders(input.clerkToken),
+            params: {
+              repositoryId: input.repositoryId,
+              jobId: input.jobId,
+              resultId: input.resultId,
+              attachmentId: input.attachmentId,
+            },
+          })
+          .pipe(Effect.mapError(relayRequestError("read saved thread attachment")));
+        const parts: Uint8Array[] = [];
+        let size = 0;
+        yield* body.pipe(
+          Stream.mapError(relayRequestError("read saved thread attachment")),
+          Stream.runForEach((part) =>
+            Effect.gen(function* () {
+              size += part.length;
+              if (size > 50 * 1024 * 1024)
+                return yield* Effect.fail(
+                  new ManagedRelayRequestFailedError({
+                    action: "read saved thread attachment",
+                    cause: new Error("Attachment exceeded the download limit."),
+                  }),
+                );
+              parts.push(part);
+            }),
+          ),
+        );
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const part of parts) {
+          bytes.set(part, offset);
+          offset += part.length;
+        }
+        return bytes;
+      },
+      timeoutRelayRequest("Saved thread attachment download"),
+      Effect.withSpan("clientRuntime.managedRelayTenancy.downloadSavedWorkflowAttachment"),
+      withRelayClientTracing,
+    ),
     respondToWorkflowJob: Effect.fn("clientRuntime.managedRelayTenancy.respondToWorkflowJob")(
       function* (input) {
         const request = {
@@ -923,6 +1063,8 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
         const payload = input.payload;
         const response = (() => {
           switch (payload.operation) {
+            case "retry_saving":
+              return client.workflows.respond({ ...request, payload });
             case "pause":
               return client.workflows.respond({ ...request, payload });
             case "resume":

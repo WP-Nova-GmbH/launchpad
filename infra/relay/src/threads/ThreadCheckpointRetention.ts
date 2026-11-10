@@ -12,6 +12,10 @@ export const retireThreadCheckpoints = Effect.fnUntraced(function* (
       ORDER BY generation DESC,source_sequence DESC,published_at DESC,operation_id DESC LIMIT 2)
     UNION
     (SELECT n.operation_id FROM relay_thread_native_checkpoints n
+      JOIN relay_thread_native_checkpoint_operations o ON o.checkpoint_operation_id=n.operation_id
+      WHERE n.thread_id=${threadId} AND o.phase='active')
+    UNION
+    (SELECT n.operation_id FROM relay_thread_native_checkpoints n
       JOIN relay_thread_attachment_checkpoints a ON a.native_checkpoint_operation_id=n.operation_id
       WHERE n.thread_id=${threadId} AND n.retained
       ORDER BY n.generation DESC,n.source_sequence DESC,n.published_at DESC,n.operation_id DESC LIMIT 1)

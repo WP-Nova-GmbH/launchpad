@@ -430,6 +430,37 @@ def require_live_setup_owner(gate, work_id, pid, ticks):
     return group
 
 
+def workflow_recovery_state(gate):
+    if os.getuid() != 0 or not workflow_guest():
+        raise RuntimeError('Workflow recovery inspection is unavailable')
+    if (gate['bootId'] != BOOT.read_text().strip() or gate['sealedBy'] is not None
+            or type(gate['epoch']) is not int or gate['epoch'] < 0):
+        raise RuntimeError('Workflow recovery gate changed')
+    current = inventory(gate)
+    if len(current['groups']) > 1:
+        raise RuntimeError('Workflow workloads are still active')
+    for record in current['groups']:
+        if record.get('kind') != 'terminal' or record.get('setupOwner') is not True:
+            raise RuntimeError('Workflow workloads are still active')
+        work_id, pid, ticks = record['id'], record['leaderPid'], record['startTicks']
+        # The fixed owner retains its script FD through arm and recipe spawn.
+        # Once closed it can only wait/park; a singleton cannot later fork a recipe.
+        for _ in range(2):
+            group = require_live_setup_owner(gate, work_id, pid, ticks)
+            try:
+                Path(f'/proc/{pid}/fd/3').lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError('Workflow setup may still start a recipe')
+            if (any(path.is_dir() for path in group.iterdir())
+                    or set(map(int, (group / 'cgroup.procs').read_text().split())) != {pid}):
+                raise RuntimeError('Workflow setup descendants are still active')
+    if gate['bootId'] != BOOT.read_text().strip() or gate['sealedBy'] is not None:
+        raise RuntimeError('Workflow recovery gate changed')
+    return {**current, 'recoverable': True}
+
+
 def workflow_setup_control(args):
     if os.getuid() != 0 or not workflow_guest():
         raise RuntimeError('Workflow setup control is unavailable')
@@ -828,10 +859,15 @@ def main(args):
         os.execvpe(command[0], command, os.environ)
     if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'verify-workflow-provider-peer', 'workflow-setup-control'} and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, *args])
+    if action == 'workflow-recovery-state' and len(args) == 1 and os.getuid() == COORDINATOR_UID and workflow_guest():
+        os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, action])
     if action == 'workflow-setup-control':
         print(json.dumps(workflow_setup_control(args[1:])))
         return
     with locked() as gate:
+        if action == 'workflow-recovery-state' and len(args) == 1:
+            print(json.dumps(workflow_recovery_state(gate)))
+            return
         if action == 'verify-workflow-provider-peer' and len(args) == 6:
             if os.getuid() != 0 or not workflow_guest():
                 raise RuntimeError('Workflow socket attribution is unavailable')

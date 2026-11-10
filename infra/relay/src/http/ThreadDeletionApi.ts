@@ -7,6 +7,8 @@ import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { withPrivateThreadAccess } from "./privateThreadAccess.ts";
 import { tenancyNotFound, tenancyConflict } from "./tenancyErrors.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
+import { withSavedWorkflowThread } from "./WorkflowResultsApi.ts";
+import { requireWorkflowVmMaintainer } from "../jobs/WorkflowVmBinding.ts";
 const serialize = (row: ThreadDeletion) => ({
   threadId: ThreadId.make(row.threadId),
   operationId: row.operationId,
@@ -24,16 +26,47 @@ export const permanentlyDeleteThread = Effect.fn("relay.api.thread.permanently_d
       store = makeThreadDeletionStore(sql);
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        const [hint] = yield* sql<{
+          jobId: string | null;
+          repositoryId: string;
+        }>`SELECT workflow_job_id AS "jobId",repository_id AS "repositoryId" FROM relay_thread_placements WHERE thread_id=${threadId} AND audience='repository'`;
+        if (hint?.jobId)
+          yield* sql`SELECT job_id FROM relay_workflow_jobs WHERE job_id=${hint.jobId} FOR UPDATE`;
         yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${threadId} FOR UPDATE`;
         const prior = yield* store.get(threadId);
         if (prior) {
-          if (prior.ownerUserId !== userId) return yield* tenancyNotFound("thread_not_found");
+          if (prior.requesterUserId !== userId) return yield* tenancyNotFound("thread_not_found");
           if (
             prior.operationId !== input.operationId ||
             prior.generation !== input.expectedGeneration
           )
             return yield* tenancyConflict("thread_placement_changed");
           return serialize(prior);
+        }
+        if (hint?.jobId) {
+          const jobId = hint.jobId;
+          return yield* withSavedWorkflowThread(
+            { jobId, repositoryId: hint.repositoryId },
+            (thread) =>
+              Effect.gen(function* () {
+                yield* requireWorkflowVmMaintainer(sql, thread, userId);
+                return serialize(
+                  yield* store.begin({
+                    threadId,
+                    operationId: input.operationId,
+                    ownerUserId: null,
+                    requesterUserId: userId,
+                    generation: input.expectedGeneration,
+                    hostId: settings.hostId,
+                    workflow: {
+                      jobId,
+                      organizationId: thread.organizationId,
+                      repositoryId: thread.repositoryId,
+                    },
+                  }),
+                );
+              }),
+          );
         }
         return yield* withPrivateThreadAccess(threadId, "write", () =>
           store
@@ -60,7 +93,7 @@ export const getThreadDeletion = Effect.fn("relay.api.thread.deletion_status")(
   function* (threadId: string) {
     const { userId } = yield* RelayClientPrincipal,
       row = yield* makeThreadDeletionStore((yield* RelayDb).$client).get(threadId);
-    if (!row || row.ownerUserId !== userId) return yield* tenancyNotFound("thread_not_found");
+    if (!row || row.requesterUserId !== userId) return yield* tenancyNotFound("thread_not_found");
     return serialize(row);
   },
   Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),

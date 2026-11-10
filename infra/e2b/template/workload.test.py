@@ -8,6 +8,8 @@ import tempfile
 import os
 import json
 import select
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -279,6 +281,202 @@ class CoordinatorLaunchTest(unittest.TestCase):
             with mock.patch.object(workload,'COORDINATOR_STATE',root),mock.patch.object(workload,'immutable'):
                 with self.assertRaises(RuntimeError):workload.coordinator_admission(source)
                 workload.coordinator_admission(target)
+
+
+class WorkflowRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='launchpad-workflow-recovery-')))
+        self.groups, self.state = self.root / 'groups', self.root / 'state'
+        self.groups.mkdir(); self.state.mkdir()
+        self.group_id = 'a' * 32
+        self.group = self.groups / self.group_id
+        self.proc = self.root / 'proc' / '42'
+        (self.proc / 'fd').mkdir(parents=True)
+        (self.proc / 'cgroup').write_text('0::' + str(self.group))
+        self.boot = self.root / 'boot'
+        self.boot.write_text('current-boot\n')
+        dump_policy = self.root / 'dump-policy'
+        dump_policy.write_text('0\n')
+        self.gate = {'bootId': 'current-boot', 'epoch': 4, 'sealedBy': None}
+        self.owner = types.SimpleNamespace(st_uid=10001, st_gid=10001)
+        self.environment = types.SimpleNamespace(st_uid=0, st_mode=0o400)
+        native = types.SimpleNamespace(st_gid=1000, st_mode=0o751)
+        self.stack.enter_context(mock.patch.object(workload, 'ROOT', self.groups))
+        self.stack.enter_context(mock.patch.object(workload, 'STATE', self.state))
+        self.stack.enter_context(mock.patch.object(workload, 'BOOT', self.boot))
+        self.stack.enter_context(mock.patch.object(workload, 'DUMP_POLICY', dump_policy))
+        self.stack.enter_context(mock.patch.object(workload, 'locked', lambda: contextlib.nullcontext(self.gate)))
+        self.uid = self.stack.enter_context(mock.patch.object(os, 'getuid', return_value=0))
+        self.marked = self.stack.enter_context(mock.patch.object(workload, 'workflow_guest', return_value=True))
+        self.identity = self.stack.enter_context(mock.patch.object(workload, 'process_identity', return_value={'startTicks': '42', 'state': 'S'}))
+        self.immutable = self.stack.enter_context(mock.patch.object(workload, 'immutable', return_value=native))
+        self.same_executable = self.stack.enter_context(mock.patch.object(os.path, 'samestat', return_value=True))
+        stat = Path.stat
+        def proc_stat(path, *args, **kwargs):
+            if path == self.proc: return self.owner
+            if path == self.proc / 'environ': return self.environment
+            if path == self.proc / 'exe': return native
+            return stat(path, *args, **kwargs)
+        self.stack.enter_context(mock.patch.object(Path, 'stat', proc_stat))
+        self.stack.enter_context(mock.patch.object(workload, 'Path', side_effect=lambda value: self.root / value.removeprefix('/') if str(value).startswith('/proc/42') else Path(value)))
+
+    def add_group(self, kind='terminal', *, setup_owner=True):
+        self.group.mkdir()
+        (self.group / 'cgroup.events').write_text('populated 1\n')
+        (self.group / 'cgroup.procs').write_text('42\n')
+        self.record = {'id': self.group_id, 'kind': kind, 'leaderPid': 42, 'startTicks': '42',
+                       'bootId': 'current-boot', 'workflow': True}
+        if setup_owner: self.record['setupOwner'] = True
+        self.save_record()
+
+    def save_record(self):
+        (self.state / (self.group_id + '.json')).write_text(json.dumps(self.record))
+
+    def inspect(self):
+        return workload.workflow_recovery_state(self.gate)
+
+    def test_empty_workloads_and_single_passive_setup_owner_can_recover_without_killing(self):
+        self.assertTrue(self.inspect()['recoverable'])
+        self.add_group()
+        value = self.inspect()
+        self.assertTrue(value['recoverable'])
+        self.assertFalse(value['stopped'])
+        self.assertEqual(value['groups'], [self.record])
+        self.assertEqual(value['epoch'], 4)
+        self.assertFalse((self.group / 'cgroup.kill').exists())
+        self.assertEqual((self.group / 'cgroup.procs').read_text(), '42\n')
+
+    def test_provider_orphans_and_unknown_workloads_are_not_empty(self):
+        self.add_group('provider', setup_owner=False)
+        for kind in ['provider', 'process', 'terminal', 'transfer']:
+            with self.subTest(kind=kind):
+                self.record['kind'] = kind; self.save_record()
+                with self.assertRaises(RuntimeError): self.inspect()
+        self.assertFalse((self.group / 'cgroup.kill').exists())
+
+    def test_setup_waiting_for_arm_or_about_to_fork_does_not_pass_singleton_check(self):
+        self.add_group()
+        script = self.proc / 'fd' / '3'
+        script.write_text('protected script')
+        with self.assertRaises(RuntimeError): self.inspect()
+        script.unlink()
+        script.symlink_to('/unlinked-protected-script')
+        with self.assertRaises(RuntimeError): self.inspect()
+
+    def test_setup_descendants_and_nested_cgroups_block_recovery(self):
+        self.add_group()
+        (self.group / 'cgroup.procs').write_text('42\n43\n')
+        with self.assertRaises(RuntimeError): self.inspect()
+        (self.group / 'cgroup.procs').write_text('42\n')
+        (self.group / 'child').mkdir()
+        with self.assertRaises(RuntimeError): self.inspect()
+
+    def test_closed_script_descriptor_must_be_observable(self):
+        self.add_group()
+        lstat = Path.lstat
+        def denied(path, *args, **kwargs):
+            if path == self.proc / 'fd' / '3': raise PermissionError('not readable')
+            return lstat(path, *args, **kwargs)
+        with mock.patch.object(Path, 'lstat', denied):
+            with self.assertRaises(PermissionError): self.inspect()
+
+    def test_changed_boot_seal_or_setup_identity_never_authorizes_recovery(self):
+        self.add_group()
+        for field, value in [('bootId', 'other-boot'), ('sealedBy', 'b' * 32), ('epoch', -1)]:
+            with self.subTest(field=field):
+                before = dict(self.gate); self.gate[field] = value
+                with self.assertRaises((RuntimeError, ValueError)): self.inspect()
+                self.gate.update(before)
+        self.identity.return_value = {'startTicks': '99', 'state': 'S'}
+        with self.assertRaises(RuntimeError): self.inspect()
+        self.identity.return_value = {'startTicks': '42', 'state': 'S'}
+        self.same_executable.return_value = False
+        with self.assertRaises(RuntimeError): self.inspect()
+        self.same_executable.return_value = True
+        self.owner.st_uid = 1000
+        with self.assertRaises(RuntimeError): self.inspect()
+
+    def test_identity_and_membership_are_checked_again_before_returning(self):
+        self.add_group()
+        self.identity.side_effect = [{'startTicks': '42', 'state': 'S'}, {'startTicks': '99', 'state': 'S'}]
+        with self.assertRaises(RuntimeError): self.inspect()
+
+    def test_setup_record_requires_the_original_complete_identity(self):
+        self.add_group()
+        for field, value in [('leaderPid', 43), ('startTicks', '99'), ('bootId', 'other'), ('workflow', False)]:
+            with self.subTest(field=field):
+                before = dict(self.record); self.record[field] = value; self.save_record()
+                with self.assertRaises((RuntimeError, FileNotFoundError)): self.inspect()
+                self.record = before; self.save_record()
+        (self.state / (self.group_id + '.json')).write_text('{malformed')
+        with self.assertRaises(ValueError): self.inspect()
+
+    def test_native_action_is_root_only_and_coordinator_delegates_exact_shape(self):
+        self.uid.return_value = 1000
+        with mock.patch.object(os, 'execv', side_effect=RuntimeError('delegated')) as execute:
+            with self.assertRaisesRegex(RuntimeError, 'delegated'):
+                workload.main(['workflow-recovery-state'])
+        execute.assert_called_once_with(workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'workflow-recovery-state'])
+        self.uid.return_value = 10001
+        with self.assertRaises(RuntimeError): workload.main(['workflow-recovery-state'])
+        self.uid.return_value = 0
+        self.marked.return_value = False
+        with self.assertRaises(RuntimeError): workload.main(['workflow-recovery-state'])
+        self.marked.return_value = True
+        with self.assertRaises(ValueError): workload.main(['workflow-recovery-state', 'unexpected'])
+
+
+class WorkflowBrokerRecoveryTest(unittest.TestCase):
+    def test_real_entrypoint_limits_recovery_to_coordinator_and_zero_arguments(self):
+        cc = shutil.which('cc')
+        if not cc: self.skipTest('C compiler unavailable')
+        # Compile the actual entry point with OS identity/control sinks. No setuid
+        # installation or Linux guest is needed to exercise its allowlist.
+        entry = Path(__file__).with_name('workflow-exec.c').read_text().split('int main(int argc, char **argv)', 1)[1]
+        harness = r'''
+#include <stdio.h>
+#include <limits.h>
+#include <string.h>
+#include <assert.h>
+#define COORDINATOR_ID 1000
+#define STDIN_FILENO 0
+#define CHECKPOINT_PYTHON "python"
+#define CHECKPOINT_READER "reader"
+#define WORKFLOW_GIT "git"
+#define SETUP_OWNER "owner"
+enum workload_kind { ordinary, provider, checkpoint_reader, workflow_git, setup_owner };
+static int uid=1000, euid=0, marked=1, calls=0;
+static int getuid(void){return uid;} static int geteuid(void){return euid;}
+static int workflow_enabled(void){return marked;}
+static int inspect_provider_peer(char **args){(void)args;return -1;}
+static int number(char *s,int min,int max){(void)s;(void)min;(void)max;return -1;}
+static int duplicate_fd(int a,int b){(void)a;(void)b;return -1;}
+static int close(int fd){(void)fd;return 0;}
+static int prepare_workspace(void){return -1;}
+static int open_setup_script(char *s){(void)s;return -1;}
+static int exec_workload(char *cwd,char **cmd,enum workload_kind kind){(void)cwd;(void)cmd;(void)kind;return -1;}
+static int exec_control(int count,char **args){assert(count==1);assert(!strcmp(args[0],"workflow-recovery-state"));calls++;return -1;}
+int broker_main(int argc,char **argv)
+''' + entry + r'''
+int main(void){
+ char *args[]={"broker","workflow-recovery-state","unexpected",NULL};
+ broker_main(2,args);assert(calls==1);
+ broker_main(3,args);assert(calls==1);
+ uid=10001;broker_main(2,args);assert(calls==1);
+ uid=1000;euid=1000;broker_main(2,args);assert(calls==1);
+ euid=0;marked=0;broker_main(2,args);assert(calls==1);
+ uid=0;marked=1;broker_main(2,args);assert(calls==1);
+ return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='launchpad-broker-recovery-') as temporary:
+            source = Path(temporary) / 'broker.c'; source.write_text(harness)
+            binary = Path(temporary) / 'broker'
+            compiled = subprocess.run([cc, '-std=c11', '-Wall', '-Werror', str(source), '-o', str(binary)], capture_output=True, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            subprocess.run([str(binary)], check=True, capture_output=True)
 
 
 class WorkflowWorkloadTest(unittest.TestCase):

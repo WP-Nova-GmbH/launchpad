@@ -317,7 +317,7 @@ export const harness = Effect.gen(function* () {
     Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) }),
     Layer.succeed(Store.WorkflowRunStore, {
       ...stored,
-      save: (run) =>
+      save: (run, captured) =>
         Effect.gen(function* () {
           const failures = yield* Ref.get(finalWriteFailures);
           if (failures > 0 && (run.progress.status === "done" || run.progress.retryableApproval)) {
@@ -325,7 +325,7 @@ export const harness = Effect.gen(function* () {
             yield* Queue.offer(failedFinalWrites, undefined);
             return yield* Effect.die("Injected final-state write outage");
           }
-          return yield* stored.save(run).pipe(Effect.tap(() => Queue.offer(runs, run)));
+          return yield* stored.save(run, captured).pipe(Effect.tap(() => Queue.offer(runs, run)));
         }),
     }),
     Layer.succeed(SetupProcessJournal, {

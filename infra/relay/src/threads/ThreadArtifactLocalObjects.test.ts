@@ -4,7 +4,10 @@ import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Stream from "effect/Stream";
-import { makeLocalThreadArtifactObjects } from "./ThreadArtifactLocalObjects.ts";
+import {
+  makeLocalThreadArtifactObjects,
+  verifyLocalThreadArtifactRoot,
+} from "./ThreadArtifactLocalObjects.ts";
 
 const hex = (bytes: Uint8Array) =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -15,6 +18,35 @@ const body = (bytes: Uint8Array) =>
       controller.close();
     },
   });
+
+it.effect("checks persistent storage before startup and reads it from a fresh adapter", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "launchpad-persistent-" });
+    const root = `${directory}/artifacts`;
+    yield* verifyLocalThreadArtifactRoot(fs, root);
+    expect(yield* fs.readDirectory(root)).toEqual([]);
+    const key = "thread-artifacts/v1/33333333-3333-4333-8333-333333333333";
+    const bytes = new TextEncoder().encode("saved result");
+    yield* makeLocalThreadArtifactObjects(fs, root).put({
+      key,
+      body: body(bytes),
+      sizeBytes: bytes.length,
+    });
+    yield* verifyLocalThreadArtifactRoot(fs, root);
+    yield* makeLocalThreadArtifactObjects(fs, root).verify({
+      key,
+      sizeBytes: bytes.length,
+      sha256: hex(sha256(bytes)),
+    });
+    expect(yield* Effect.flip(verifyLocalThreadArtifactRoot(fs, "relative"))).toMatchObject({
+      _tag: "ThreadArtifactObjectError",
+    });
+    const blocked = `${directory}/file`;
+    yield* fs.writeFileString(blocked, "not a directory");
+    expect((yield* Effect.result(verifyLocalThreadArtifactRoot(fs, blocked)))._tag).toBe("Failure");
+  }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+);
 
 it.effect("stores private development artifacts without overwriting an existing upload", () =>
   Effect.gen(function* () {

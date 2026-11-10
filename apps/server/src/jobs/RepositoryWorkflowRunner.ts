@@ -42,6 +42,8 @@ import * as Scope from "effect/Scope";
 import * as Exit from "effect/Exit";
 import * as Stream from "effect/Stream";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
+import type { WorkflowResultCapture } from "./WorkflowResultOutbox.ts";
+import { ownershipReleased } from "./workflowOwnership.ts";
 import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
 import { WORKFLOW_CHECKPOINT_READ_TIMEOUT_MS } from "../vcs/WorkflowCheckpointReader.ts";
@@ -370,9 +372,12 @@ export const make = Effect.gen(function* () {
   const actionCleanupWorkers = new Set<string>();
   const store = {
     ...persistence,
-    save: Effect.fn("RepositoryWorkflowRunner.save")(function* (run: WorkflowRun) {
+    save: Effect.fn("RepositoryWorkflowRunner.save")(function* (
+      run: WorkflowRun,
+      captured?: WorkflowResultCapture,
+    ) {
       const previous = yield* persistence.get(run.jobId);
-      yield* persistence.save(run);
+      yield* persistence.save(run, captured);
       if (
         previous &&
         (previous.progress.status !== run.progress.status ||
@@ -1724,11 +1729,18 @@ export const make = Effect.gen(function* () {
     }
     if (
       next.sequence &&
-      run.progress.status !== "awaiting_review" &&
+      (run.runtime.kind === "vm" || run.progress.status !== "awaiting_review") &&
       next.progress.status === "awaiting_review" &&
       next.progress.checkpoint?.kind !== "input"
     ) {
       const step = activeWorkflowStep(next);
+      if (step?.kind === "agent" && run.runtime.kind === "vm" && next.progress.checkpoint) {
+        const saved = yield* store.getSaveResult(next.jobId, next.progress.checkpoint.turnId);
+        if (saved?.status !== "acknowledged") {
+          if (!saved) yield* store.save(next);
+          return next;
+        }
+      }
       if (step?.kind === "agent")
         next = advanceWorkflow({
           ...next,
@@ -1756,7 +1768,27 @@ export const make = Effect.gen(function* () {
       const scope = detachSupervisor(run.jobId);
       if (scope) yield* Scope.close(scope, Exit.void);
     }
-    if (!equivalentRuns(next, run)) yield* store.save(next);
+    let partial: WorkflowResultCapture | undefined;
+    if (
+      next.runtime.kind === "vm" &&
+      ["failed", "cancelled"].includes(next.progress.status) &&
+      thread
+    ) {
+      const turnId = resolvedWorkflowTurnId(thread, workflowPromptId(next));
+      const step = activeWorkflowStep(next);
+      if (turnId && step?.kind === "agent" && !(yield* store.getSaveResult(next.jobId, turnId))) {
+        const pin = yield* store.getCapturedWorkflowTurn(next.runtime, turnId);
+        if (pin)
+          partial = {
+            resultId: yield* crypto.randomUUIDv4,
+            stepId: step.id,
+            outcome: next.progress.status === "cancelled" ? "cancelled" : "failed",
+            createdAt: next.sequence?.stepStartedAt ?? next.createdAt,
+            ...pin,
+          };
+      }
+    }
+    if (partial || !equivalentRuns(next, run)) yield* store.save(next, partial);
     if (
       next.manualPause?.state === "requested" &&
       !next.executionReserved &&
@@ -1853,7 +1885,9 @@ export const make = Effect.gen(function* () {
             : [],
         outcome,
         detail,
-        progress: run ? workflowProgress(run) : null,
+        progress: run
+          ? { ...workflowProgress(run), executionReleased: ownershipReleased(run) }
+          : null,
       });
       if (
         vm &&
@@ -2074,7 +2108,24 @@ export const make = Effect.gen(function* () {
         return result(yield* reconcile(run));
       }
       if (run) run = yield* reconcile(run);
+      if (request.control.operation === "retry_saving") {
+        if (!vm || !run || run.progress.revision !== request.control.expectedRevision)
+          return result(run, "conflict", "This result changed. Refresh before retrying.");
+        const retried = yield* store.retryResultSaving(run.jobId, request.control.publicationId);
+        return result(
+          run,
+          retried ? "accepted" : "conflict",
+          retried ? null : "This result cannot retry saving.",
+        );
+      }
       if (request.control.operation === "status") return result(run);
+      if (
+        run?.runtime.kind === "vm" &&
+        activeWorkflowStep(run)?.kind === "agent" &&
+        run.progress.status === "awaiting_review" &&
+        request.control.operation !== "cancel"
+      )
+        return result(run, "busy", "The Agent result must finish saving before the next step.");
       if (
         !vm &&
         run &&
@@ -2707,9 +2758,20 @@ export const make = Effect.gen(function* () {
       // Cleanup workers wait for exit outside the control mutex.
       return result(yield* reconcileApproval(run));
     },
-    (effect) =>
+    (effect, request) =>
       Deferred.await(recovered).pipe(
         Effect.andThen(lock.withPermits(1)(effect.pipe(Effect.tap(() => pumpWaiting())))),
+        Effect.flatMap((response) =>
+          store.getResultSaving(request.jobId).pipe(
+            Effect.map((saving) => ({
+              ...response,
+              progress:
+                response.progress && saving
+                  ? { ...response.progress, resultSaving: saving }
+                  : response.progress,
+            })),
+          ),
+        ),
       ),
     Effect.catchCause((cause) =>
       Effect.fail(new WorkflowRunnerError({ message: Cause.pretty(cause) })),

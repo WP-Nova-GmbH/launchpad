@@ -1,4 +1,10 @@
-import { VmControlSpawner, VmWorkloadTracking, WorkflowVmGuest } from "../../vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  WorkflowVmGuest,
+  workflowVmBaseEnvironment,
+} from "../../vmWorkloadCommand.ts";
+import { exportWorkflowCodexConversation } from "../Drivers/WorkflowCodexConversation.ts";
 import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
 import {
   openWorkflowCodexProxy,
@@ -2304,6 +2310,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const controlSpawner = yield* VmControlSpawner;
   const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("codex");
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const exportConversation = (input: Parameters<typeof exportCodexConversation>[0]) =>
+    workflowGuest
+      ? exportWorkflowCodexConversation(childProcessSpawner, input)
+      : exportCodexConversation(input);
   const crypto = yield* Crypto.Crypto;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -2752,7 +2762,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           turnTokenUsage,
           codexHome: path.resolve(
             expandHomePath(
-              runtimeInput.homePath ||
+              (workflowGuest ? workflowVmBaseEnvironment.CODEX_HOME : undefined) ||
+                runtimeInput.homePath ||
                 runtimeInput.environment?.CODEX_HOME ||
                 process.env.CODEX_HOME ||
                 path.join(NodeOS.homedir(), ".codex"),
@@ -3145,7 +3156,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         const source = input.stoppedSource;
         const home = path.resolve(
           expandHomePath(
-            codexConfig.homePath ||
+            (workflowGuest ? workflowVmBaseEnvironment.CODEX_HOME : undefined) ||
+              codexConfig.homePath ||
               options?.environment?.CODEX_HOME ||
               process.env.CODEX_HOME ||
               path.join(NodeOS.homedir(), ".codex"),
@@ -3169,7 +3181,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               return yield* readCodexConversationSource(client, source.nativeThreadId);
             }).pipe(Effect.timeout("20 seconds")),
           );
-          const archive = yield* exportCodexConversation({
+          const archive = yield* exportConversation({
             codexHome: home,
             rolloutPath: native.rolloutPath,
             threadId: native.threadId,
@@ -3202,7 +3214,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // It is not proof that detached tools stopped; the workload supervisor owns that evidence.
         session.checkpointClose.value = true;
         yield* stopSessionInternal(session);
-        const archive = yield* exportCodexConversation({
+        const archive = yield* exportConversation({
           codexHome: session.codexHome,
           rolloutPath: source.rolloutPath,
           threadId: source.threadId,

@@ -6,7 +6,12 @@ import { makeThreadFinalSaveWorker } from "./ThreadFinalSaveWorker.ts";
 import { makeThreadLocalEnrollmentWorker } from "./ThreadLocalEnrollmentWorker.ts";
 import { makeThreadMoveWorker } from "./ThreadMoveWorker.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
-import { makeThreadCheckpointPublisher } from "./ThreadCheckpointPublisher.ts";
+import {
+  makeThreadCheckpointPublisher,
+  ThreadCheckpointPublishError,
+} from "./ThreadCheckpointPublisher.ts";
+import { makeWorkflowResultPublisher } from "./WorkflowResultPublisher.ts";
+import { CheckpointDiffQuery } from "../checkpointing/CheckpointDiffQuery.ts";
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import { ServerConfig } from "../config.ts";
 import * as FileSystem from "effect/FileSystem";
@@ -174,6 +179,28 @@ export const layer = Layer.effect(
       path.join(config.stateDir, "checkpoint-transfers"),
       yield* OrchestrationEventStore,
     );
+    const resultContext = yield* Effect.context<
+      FileSystem.FileSystem | Path.Path | CheckpointDiffQuery
+    >();
+    const workflowResults = makeWorkflowResultPublisher(
+      sql,
+      authority.workflowResults,
+      authority.checkpoints,
+      {
+        synchronize: (threadId) =>
+          history.synchronize(threadId).pipe(
+            Effect.andThen(checkpoints.synchronize(threadId)),
+            Effect.mapError(
+              () =>
+                new ThreadCheckpointPublishError({
+                  threadId,
+                  detail: "Conversation publication failed.",
+                }),
+            ),
+          ),
+      },
+      path.join(config.stateDir, "workflow-results"),
+    );
     const receipts = yield* OrchestrationCommandReceiptRepository;
     const normalizerContext =
       yield* Effect.context<Effect.Services<ReturnType<typeof normalizeDispatchCommand>>>();
@@ -263,8 +290,13 @@ export const layer = Layer.effect(
       yield* Effect.forEach(
         owners,
         (owner) =>
-          checkpoints.synchronize(owner.threadId).pipe(
-            Effect.provideContext(checkpointContext),
+          Effect.gen(function* () {
+            const workflow =
+              yield* sql`SELECT 1 FROM repository_workflow_jobs WHERE thread_id=${owner.threadId} AND json_extract(record_json,'$.runtime.kind')='vm'`;
+            if (workflow.length) yield* workflowResults.synchronize(owner.threadId);
+            else yield* checkpoints.synchronize(owner.threadId);
+          }).pipe(
+            Effect.provideContext(resultContext),
             Effect.catch(() =>
               Effect.logDebug("Portable checkpoints awaiting relay acknowledgement", {
                 threadId: owner.threadId,

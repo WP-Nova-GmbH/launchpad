@@ -28,6 +28,7 @@ import {
   beginWorkflowReview,
   bindWorkflowReviewPlacement,
   recordWorkflowReviewDiff,
+  recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
   workflowReviewApprovalState,
 } from "./workflowSession.ts";
@@ -105,7 +106,7 @@ describe("workflow session and request ownership", () => {
       progress: { ...job(2).progress!, checkpoint: { ...checkpoint, checkpointRef: "ref" } },
     } satisfies RepositoryWorkflowJob;
     settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, current);
-    expect(state()).toBe("allowed");
+    expect(state()).toBe("inspect");
 
     beginWorkflowReview(registry, scope, "job", "old", checkpoint);
     bindWorkflowReviewPlacement(registry, scope, "job", "old", placement);
@@ -154,6 +155,74 @@ describe("workflow session and request ownership", () => {
     expect(state()).toBe("allowed");
     clearWorkflowScope(registry, scope);
     expect(registry.get(workflowDraftAtom).reviews[key]).toBeUndefined();
+  });
+
+  it("accepts only the current complete saved Agent result and requires a fresh job read", () => {
+    const registry = setup();
+    const checkpoint = {
+      kind: "review" as const,
+      checkpointId: "current",
+      turnId: "turn-2",
+      checkpointTurnCount: 2,
+      checkpointRef: "ref-2",
+    };
+    const current: RepositoryWorkflowJob = {
+      ...job(2),
+      status: "awaiting_review",
+      runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+      progress: { ...job(2).progress!, status: "awaiting_review", checkpoint },
+    };
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, current);
+    const key = workflowSessionKey(scope, "job");
+    const state = () =>
+      workflowReviewApprovalState(
+        registry.get(workflowDraftAtom).reviews[key],
+        registry.get(workflowJobReadAtom).jobs[key]!,
+      );
+    expect(state()).toBe("inspect");
+    beginWorkflowReview(registry, scope, "job", "visit", checkpoint);
+    const result = {
+      resultId: "11111111-1111-4111-8111-111111111111",
+      stepId: "agent",
+      turnId: "turn-2",
+      turnCount: 2,
+      outcome: "completed" as const,
+      createdAt: "now",
+      checkpointRef: "ref-2",
+      baselineCommitId: "base",
+      commitId: "commit",
+      treeId: "tree",
+      patch: {
+        artifactId: "22222222-2222-4222-8222-222222222222",
+        sha256: "a".repeat(64),
+        sizeBytes: 0,
+      },
+    };
+    for (const other of [
+      { ...result, turnId: "turn-1" },
+      { ...result, checkpointRef: "old-ref" },
+      { ...result, outcome: "cancelled" as const },
+    ])
+      expect(recordSavedWorkflowReviewDiff(registry, scope, "job", "visit", other)).toBe(false);
+    expect(recordSavedWorkflowReviewDiff(registry, scope, "job", "visit", result)).toBe(true);
+    expect(state()).toBe("checking");
+    requireFreshWorkflowReviewRead(registry, scope, "job");
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, current);
+    expect(state()).toBe("allowed");
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, "job")!, {
+      ...current,
+      progress: {
+        ...current.progress!,
+        revision: 3,
+        checkpoint: {
+          ...checkpoint,
+          checkpointId: "new",
+          turnId: "turn-3",
+          checkpointTurnCount: 3,
+        },
+      },
+    });
+    expect(state()).toBe("inspect");
   });
 
   it("resumes one new workflow slot without allocating another editor", () => {

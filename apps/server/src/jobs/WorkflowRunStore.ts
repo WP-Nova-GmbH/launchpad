@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+import { makeWorkflowResultOutbox, type WorkflowResultCapture } from "./WorkflowResultOutbox.ts";
 import {
   ModelSelection,
   ProviderDriverKind,
@@ -249,12 +251,27 @@ const decode = (json: string): WorkflowRun => {
 };
 const encode = Schema.encodeSync(Schema.fromJsonString(WorkflowRun));
 
-export interface WorkflowCheckpointPin {
-  readonly checkpointRef: string;
-  readonly commitId: string;
-  readonly treeId: string;
-  readonly baselineCommitId: string;
-}
+export const WorkflowCheckpointPin = Schema.Struct({
+  checkpointRef: Schema.String,
+  commitId: Schema.String,
+  treeId: Schema.String,
+  baselineCommitId: Schema.String,
+});
+export type WorkflowCheckpointPin = typeof WorkflowCheckpointPin.Type;
+export const WorkflowRunRecovery = Schema.Struct({
+  format: Schema.Literal("workflow-run-recovery-v1"),
+  run: WorkflowRun,
+  frozenConfiguration: Schema.Struct({ jobId: Schema.String, repositoryId: Schema.String }),
+  checkpointPins: Schema.Array(
+    Schema.Struct({
+      ...WorkflowCheckpointPin.fields,
+      turnId: Schema.String,
+      turnCount: Schema.Int,
+    }),
+  ),
+  workflowIgnoreRulesBase64: Schema.NullOr(Schema.String),
+});
+const encodeRecovery = Schema.encodeSync(Schema.fromJsonString(WorkflowRunRecovery));
 
 export type LegacyWorkflowTurnOutcome = "completed" | "failed" | "checkpoint-error";
 
@@ -297,6 +314,28 @@ export const make = Effect.gen(function* () {
     WHERE aggregate_kind='thread' AND stream_id=${threadId}
       AND event_type='thread.prompt-queue-changed'
       AND json_extract(payload_json, '$.handoff.attemptId') IS NOT NULL)`;
+  const recoveryRecord = Effect.fn("WorkflowRunStore.recoveryRecord")(function* (run: WorkflowRun) {
+    if (run.runtime.kind !== "vm")
+      return yield* Effect.die("Only VM runs have saved recovery records.");
+    const binding = run.runtime;
+    const pins = yield* sql<
+      WorkflowCheckpointPin & { turnId: string; turnCount: number; ignoreRules: Uint8Array | null }
+    >`
+      SELECT ${pinColumns},p.turn_id AS "turnId",p.turn_count AS "turnCount",p.workflow_ignore_rules AS "ignoreRules"
+      FROM workflow_vm_checkpoint_pins p WHERE p.job_id=${run.jobId} AND p.thread_id=${binding.threadId}
+        AND p.allocation_id=${binding.allocationId} AND p.operation_id=${binding.operationId}
+        AND p.environment_id=${binding.environmentId} AND p.generation=${binding.generation}
+        AND (p.turn_id='' OR p.turn_count=(SELECT MAX(latest.turn_count) FROM workflow_vm_checkpoint_pins latest WHERE latest.job_id=p.job_id))
+      ORDER BY p.turn_count,p.turn_id`;
+    const rules = pins.find((pin) => pin.turnId === "")?.ignoreRules;
+    return encodeRecovery({
+      format: "workflow-run-recovery-v1",
+      run,
+      frozenConfiguration: { jobId: run.jobId, repositoryId: run.workflow.repositoryId },
+      checkpointPins: pins.map(({ ignoreRules: _rules, ...pin }) => pin),
+      workflowIgnoreRulesBase64: rules ? Buffer.from(rules).toString("base64") : null,
+    });
+  });
   const canonicalPath = (cwd: string) =>
     fs.realPath(path.resolve(cwd)).pipe(Effect.orElseSucceed(() => path.resolve(cwd)));
   const get = (jobId: string) =>
@@ -364,6 +403,12 @@ export const make = Effect.gen(function* () {
   });
   return {
     get,
+    getSaveResult: (jobId: string, turnId: string) =>
+      makeWorkflowResultOutbox(sql).result(jobId, turnId).pipe(Effect.orDie),
+    getResultSaving: (jobId: string) =>
+      makeWorkflowResultOutbox(sql).saving(jobId).pipe(Effect.orDie),
+    retryResultSaving: (jobId: string, publicationId: string) =>
+      makeWorkflowResultOutbox(sql).retry(jobId, publicationId).pipe(Effect.orDie),
     getLegacyTurnOutcome: (threadId: string, turnId: string) =>
       sql<{ pauseCode: string | null; wasEnabled: number }>`
         SELECT json_extract(e.payload_json, '$.control.pauseReason.code') AS "pauseCode",
@@ -394,6 +439,23 @@ export const make = Effect.gen(function* () {
         Effect.orDie,
       ),
     getCheckpointPinForRun,
+    getCapturedWorkflowTurn: (binding: WorkflowVmDispatchBinding, turnId: string) =>
+      sql<WorkflowCheckpointPin & { turnId: string; turnCount: number }>`
+        SELECT ${pinColumns},p.turn_id AS "turnId",p.turn_count AS "turnCount"
+        FROM workflow_vm_checkpoint_pins p
+        JOIN repository_workflow_jobs j ON j.job_id=p.job_id AND j.thread_id=p.thread_id
+        WHERE ${pinBinding(binding)} AND p.turn_id=${turnId} AND p.turn_count>0
+          AND json_extract(j.record_json,'$.runtime.kind')='vm'
+          AND json_extract(j.record_json,'$.runtime.organizationId')=${binding.organizationId}
+          AND json_extract(j.record_json,'$.runtime.repositoryId')=${binding.repositoryId}
+          AND json_extract(j.record_json,'$.runtime.projectId')=${binding.projectId}
+          AND json_extract(j.record_json,'$.runtime.allocationId')=p.allocation_id
+          AND json_extract(j.record_json,'$.runtime.operationId')=p.operation_id
+          AND json_extract(j.record_json,'$.runtime.environmentId')=p.environment_id
+          AND json_extract(j.record_json,'$.runtime.generation')=p.generation`.pipe(
+        Effect.map(([pin]) => pin ?? null),
+        Effect.orDie,
+      ),
     getWorkflowIgnoreRules: (binding: WorkflowVmDispatchBinding) =>
       sql<{ workflowIgnoreRules: Uint8Array | null }>`
         SELECT p.workflow_ignore_rules AS "workflowIgnoreRules" FROM workflow_vm_checkpoint_pins p
@@ -522,14 +584,24 @@ export const make = Effect.gen(function* () {
     active,
     owners,
     tryAccept: (run: WorkflowRun) =>
-      sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json)
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const rows =
+              yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json)
         SELECT ${run.jobId}, ${run.progress.threadId}, ${run.progress.status}, ${run.executionReserved ? 1 : 0}, ${encode({ ...run, origin: workflowRunOrigin(run) })}
         WHERE NOT EXISTS (SELECT 1 FROM repository_workflow_cancellations WHERE job_id = ${run.jobId})
           AND ${run.runtime.kind === "vm" ? activeVmFence(run.runtime) : sql`TRUE`}
-        ON CONFLICT DO NOTHING RETURNING job_id`.pipe(
-        Effect.orDie,
-        Effect.map((rows) => rows.length > 0),
-      ),
+        ON CONFLICT DO NOTHING RETURNING job_id`;
+            if (rows.length && run.runtime.kind === "vm")
+              yield* makeWorkflowResultOutbox(sql).enqueue({
+                binding: run.runtime,
+                recordJson: yield* recoveryRecord(run),
+              });
+            return rows.length > 0;
+          }),
+        )
+        .pipe(Effect.orDie),
     getByThread: (threadId: string) =>
       sql<{
         record_json: string;
@@ -554,24 +626,59 @@ export const make = Effect.gen(function* () {
         Effect.orDie,
         Effect.map((rows) => rows.length > 0),
       ),
-    save: (run: WorkflowRun) =>
-      Effect.gen(function* () {
-        const origin = workflowRunOrigin(run);
-        const previous = yield* get(run.jobId);
-        if (previous && !sameWorkflowOrigin(workflowRunOrigin(previous), origin))
-          return yield* Effect.die("Workflow origin is immutable.");
-        run = decode(encode({ ...run, origin }));
-        return yield* sql`INSERT INTO repository_workflow_jobs ${sql.insert({
-          job_id: run.jobId,
-          thread_id: run.progress.threadId,
-          status: run.progress.status,
-          execution_reserved: run.executionReserved ? 1 : 0,
-          record_json: encode(run),
-        })} ON CONFLICT(job_id) DO UPDATE SET status = excluded.status, execution_reserved = excluded.execution_reserved, record_json = excluded.record_json`.pipe(
-          Effect.orDie,
-          Effect.as(run),
-        );
-      }),
+    save: (run: WorkflowRun, captured?: WorkflowResultCapture) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const origin = workflowRunOrigin(run);
+            const previous = yield* get(run.jobId);
+            if (previous && !sameWorkflowOrigin(workflowRunOrigin(previous), origin))
+              return yield* Effect.die("Workflow origin is immutable.");
+            run = decode(encode({ ...run, origin }));
+            yield* sql`INSERT INTO repository_workflow_jobs ${sql.insert({
+              job_id: run.jobId,
+              thread_id: run.progress.threadId,
+              status: run.progress.status,
+              execution_reserved: run.executionReserved ? 1 : 0,
+              record_json: encode(run),
+            })} ON CONFLICT(job_id) DO UPDATE SET status = excluded.status, execution_reserved = excluded.execution_reserved, record_json = excluded.record_json`;
+            if (run.runtime.kind === "vm") {
+              const checkpoint = run.progress.checkpoint;
+              const step = run.workflow.definition.steps[run.sequence?.cursor ?? 0];
+              let result = captured;
+              if (
+                !result &&
+                checkpoint &&
+                checkpoint.kind !== "input" &&
+                step?.kind === "agent" &&
+                run.progress.status === "awaiting_review"
+              ) {
+                const pin = yield* getCheckpointPinForRun(
+                  run.runtime,
+                  checkpoint.turnId,
+                  checkpoint.checkpointRef,
+                );
+                if (pin)
+                  result = {
+                    resultId: NodeCrypto.randomUUID(),
+                    stepId: step.id,
+                    turnId: checkpoint.turnId,
+                    turnCount: checkpoint.checkpointTurnCount,
+                    outcome: "completed",
+                    createdAt: run.sequence?.stepStartedAt ?? run.createdAt,
+                    ...pin,
+                  };
+              }
+              yield* makeWorkflowResultOutbox(sql).enqueue({
+                binding: run.runtime,
+                recordJson: yield* recoveryRecord(run),
+                ...(result ? { result } : {}),
+              });
+            }
+            return run;
+          }),
+        )
+        .pipe(Effect.orDie),
     requireCommand: Effect.fn("WorkflowRunStore.requireCommand")(function* (
       command: OrchestrationCommand,
     ) {
@@ -673,8 +780,12 @@ export class WorkflowRunStore extends Context.Reference<WorkflowRunStoreShape>(
   {
     defaultValue: () => ({
       get: () => Effect.succeed(null),
+      getSaveResult: () => Effect.succeed(null),
+      getResultSaving: () => Effect.succeed(undefined),
+      retryResultSaving: () => Effect.succeed(false),
       getLegacyTurnOutcome: () => Effect.succeed(null),
       getCheckpointPinForRun: () => Effect.succeed(null),
+      getCapturedWorkflowTurn: () => Effect.succeed(null),
       getWorkflowIgnoreRules: () => Effect.succeed(null),
       canPinInitialCheckpoint: () => Effect.succeed(false),
       getCheckpointPinForTurn: () => Effect.succeed(null),

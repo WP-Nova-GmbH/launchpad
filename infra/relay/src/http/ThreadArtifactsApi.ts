@@ -13,9 +13,10 @@ import { makeThreadArtifactTransfer } from "../threads/ThreadArtifactTransfer.ts
 import type { ThreadArtifactKind } from "../threads/ThreadArtifactStore.ts";
 import { makeThreadNativeCheckpointStore } from "../threads/ThreadNativeCheckpointStore.ts";
 import { makeThreadAttachmentCheckpointStore } from "../threads/ThreadAttachmentCheckpointStore.ts";
-import { withEnvironmentThread } from "./ThreadEnvironmentApi.ts";
+import { withThreadArtifactWriter } from "./threadArtifactWriter.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { tenancyConflict } from "./tenancyErrors.ts";
+import { reserveWorkflowResult, publishWorkflowResult } from "./WorkflowResultsApi.ts";
 
 type Owner = {
   readonly threadId: string;
@@ -28,6 +29,7 @@ const artifactErrors = {
   ThreadArtifactObjectError: () => relayInternalErrorResponse("persistence_failed"),
 };
 const checkpointErrors = {
+  SqlError: () => relayInternalErrorResponse("persistence_failed"),
   ...artifactErrors,
   SchemaError: () => tenancyConflict("thread_checkpoint_conflict"),
   PlatformError: () => relayInternalErrorResponse("persistence_failed"),
@@ -72,7 +74,7 @@ export const uploadPortableThreadArtifact = Effect.fn("relay.api.thread_artifact
     const sql = (yield* RelayDb).$client;
     const objects = yield* ThreadArtifactObjectStorage;
     const transfer = makeThreadArtifactTransfer(sql, objects);
-    const artifact = yield* withEnvironmentThread(input, true, transfer.prepare(input));
+    const artifact = yield* withThreadArtifactWriter(input, transfer.prepare(input));
     if (artifact.state !== "pending" && artifact.state !== "complete")
       return yield* tenancyConflict("thread_artifact_conflict");
     const body = yield* Stream.toReadableStreamEffect(
@@ -81,9 +83,8 @@ export const uploadPortableThreadArtifact = Effect.fn("relay.api.thread_artifact
     yield* transfer
       .uploadBytes(artifact, body)
       .pipe(Effect.ensuring(Effect.promise(() => body.cancel().catch(() => {}))));
-    const completed = yield* withEnvironmentThread(
+    const completed = yield* withThreadArtifactWriter(
       input,
-      true,
       transfer.complete({ ...input, retentionDays: 1 }),
     );
     // Keep internal storage keys and credentials inside the relay.
@@ -109,10 +110,10 @@ export const publishPortableThreadNativeCheckpoint = Effect.fn(
   function* (input: Owner & { readonly operationId: string; readonly manifestArtifactId: string }) {
     const sql = (yield* RelayDb).$client;
     const objects = yield* ThreadArtifactObjectStorage;
-    return yield* withEnvironmentThread(
+    yield* withThreadArtifactWriter(input, Effect.void);
+    return yield* makeThreadNativeCheckpointStore(sql, objects).publish(
       input,
-      true,
-      makeThreadNativeCheckpointStore(sql, objects).publish(input),
+      withThreadArtifactWriter(input, Effect.void),
     );
   },
   Effect.catchTags({
@@ -132,10 +133,10 @@ export const publishPortableThreadAttachmentCheckpoint = Effect.fn(
   ) {
     const sql = (yield* RelayDb).$client;
     const objects = yield* ThreadArtifactObjectStorage;
-    return yield* withEnvironmentThread(
+    yield* withThreadArtifactWriter(input, Effect.void);
+    return yield* makeThreadAttachmentCheckpointStore(sql, objects).publish(
       input,
-      true,
-      makeThreadAttachmentCheckpointStore(sql, objects).publish(input),
+      withThreadArtifactWriter(input, Effect.void),
     );
   },
   Effect.catchTags({
@@ -146,6 +147,12 @@ export const publishPortableThreadAttachmentCheckpoint = Effect.fn(
 
 export const threadArtifactsApi = HttpApiBuilder.group(RelayApi, "threadArtifacts", (handlers) =>
   handlers
+    .handle("reserveWorkflowResult", ({ params, payload }) =>
+      reserveWorkflowResult({ ...params, ...payload }),
+    )
+    .handle("publishWorkflowResult", ({ params, payload }) =>
+      publishWorkflowResult({ ...params, ...payload }),
+    )
     .handle("upload", ({ params, query }) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;

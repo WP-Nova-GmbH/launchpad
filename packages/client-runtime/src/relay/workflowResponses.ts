@@ -15,6 +15,10 @@ export interface WorkflowDraftSubmission {
 }
 
 export function workflowViewerControls(job: RepositoryWorkflowJob | null, canConfigure: boolean) {
+  if (job?.progress?.resultSaving && job.progress.resultSaving.state !== "saved") {
+    const controls = job.viewerControls;
+    return { canCancel: controls?.canCancel ?? canConfigure, canApprove: false, canRespond: false };
+  }
   if (job?.viewerControls) return job.viewerControls;
   if (!job || job.vmAdmission || job.runtime?.kind === "vm")
     return { canCancel: false, canApprove: false, canRespond: false };

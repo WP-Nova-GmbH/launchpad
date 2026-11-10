@@ -1,5 +1,6 @@
 import type {
   RepositoryWorkflow,
+  WorkflowSavedResult,
   WorkflowAutomation,
   RepositoryWorkflowJob,
   WorkflowDefinition,
@@ -305,11 +306,54 @@ export function requireFreshWorkflowReviewRead(
   });
 }
 
+/** Evidence comes from the visible immutable saved diff, without a VM placement. */
+export function recordSavedWorkflowReviewDiff(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  jobId: string,
+  visitId: string,
+  result: WorkflowSavedResult,
+) {
+  const key = workflowSessionKey(scope, jobId);
+  const state = registry.get(workflowDraftAtom);
+  const review = state.reviews[key];
+  const read = registry.get(workflowJobReadAtom).jobs[key];
+  const current = workflowResultCheckpoint(read?.job?.progress?.checkpoint);
+  if (
+    state.accountId !== scope.accountId ||
+    !review ||
+    review.id !== visitId ||
+    !current ||
+    !sameWorkflowResultCheckpoint(current, review.checkpoint) ||
+    result.outcome !== "completed" ||
+    result.turnId !== current.turnId ||
+    result.turnCount !== current.checkpointTurnCount ||
+    read?.job?.progress?.checkpoint?.kind === "input" ||
+    result.checkpointRef !== read?.job?.progress?.checkpoint?.checkpointRef
+  )
+    return false;
+  registry.set(workflowDraftAtom, {
+    ...state,
+    reviews: {
+      ...state.reviews,
+      [key]: {
+        ...review,
+        verified: true,
+        readAfterEpoch: registry.get(workflowJobReadAtom).sequence,
+      },
+    },
+  });
+  return true;
+}
+
 export function workflowReviewApprovalState(
   review: WorkflowReviewVisit | undefined,
   read: WorkflowJobRead,
 ) {
-  if (!review) return "allowed";
+  if (!review)
+    return read.job?.runtime?.kind === "vm" && read.job.progress?.checkpoint?.kind !== "input"
+      ? "inspect"
+      : "allowed";
   if (read.acceptedReadEpoch <= review.readAfterEpoch) return "checking";
   const checkpoint = workflowResultCheckpoint(read.job?.progress?.checkpoint);
   return review.verified &&

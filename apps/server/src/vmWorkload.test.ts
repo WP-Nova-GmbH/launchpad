@@ -13,6 +13,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as ProcessRunner from "./processRunner.ts";
 import {
   inspectVmWorkloads,
+  inspectWorkflowVmRecovery,
   withSealedVmWorkloads,
   withVmWorkloadMaintenance,
   readVmHarnessIdentity,
@@ -140,6 +141,94 @@ describe("VM workload inventory", () => {
         Effect.exit,
       );
       expect(Exit.isFailure(changedBoot)).toBe(true);
+    }),
+  );
+});
+
+describe("workflow VM recovery inspection", () => {
+  it.effect(
+    "requires a native recovery receipt even with an empty or retained setup inventory",
+    () =>
+      Effect.gen(function* () {
+        const retainedSetup = {
+          ...empty,
+          groups: [{ ...group, kind: "terminal" }],
+          stopped: false,
+        };
+        const commands: ReadonlyArray<string>[] = [];
+        const control = ChildProcessSpawner.make((command) => {
+          if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipeline");
+          commands.push(command.args);
+          return respond(json({ ...retainedSetup, recoverable: true })).spawn(command);
+        });
+        const retained = yield* inspectWorkflowVmRecovery().pipe(
+          Effect.provideService(VmControlSpawner, control),
+          Effect.provideService(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() => Effect.die("Recovery must use privileged control")),
+          ),
+        );
+        expect(retained).toEqual({ ...retainedSetup, recoverable: true });
+        expect(commands).toEqual([["workflow-recovery-state"]]);
+        expect(
+          yield* inspectWorkflowVmRecovery().pipe(
+            Effect.provideService(VmControlSpawner, respond(json({ ...empty, recoverable: true }))),
+          ),
+        ).toEqual({ ...empty, recoverable: true });
+        for (const report of [empty, retainedSetup]) {
+          const error = yield* Effect.flip(
+            inspectWorkflowVmRecovery().pipe(
+              Effect.provideService(VmControlSpawner, respond(json(report))),
+            ),
+          );
+          expect(error.reason).toBe("decode");
+        }
+      }),
+  );
+
+  it.effect("rejects negative, sealed, mixed-boot and contradictory native receipts", () =>
+    Effect.gen(function* () {
+      for (const report of [
+        "not-json",
+        json({ ...empty, recoverable: false }),
+        json({ ...empty, recoverable: true, sealedBy: "b".repeat(32) }),
+        json({ ...empty, recoverable: true, epoch: -1 }),
+        json({ ...empty, recoverable: true, groups: [group] }),
+        json({ ...empty, recoverable: true, stopped: false }),
+        json({ ...empty, recoverable: true, stopped: false, groups: [group, group] }),
+        json({
+          ...empty,
+          recoverable: true,
+          stopped: false,
+          groups: [{ ...group, bootId: "ab7c9212-2128-478f-9d11-6e4c8ed6f882" }],
+        }),
+      ]) {
+        const result = yield* inspectWorkflowVmRecovery().pipe(
+          Effect.provideService(VmControlSpawner, respond(report)),
+          Effect.result,
+        );
+        expect(result._tag).toBe("Failure");
+      }
+    }),
+  );
+
+  it.effect("preserves missing privileged control and native helper errors", () =>
+    Effect.gen(function* () {
+      const unavailable = yield* Effect.flip(
+        inspectWorkflowVmRecovery().pipe(Effect.provideService(VmControlSpawner, undefined)),
+      );
+      expect(unavailable).toMatchObject({
+        reason: "control_unavailable",
+        action: "workflow-recovery-state",
+      });
+      const exited = yield* Effect.flip(
+        inspectWorkflowVmRecovery().pipe(Effect.provideService(VmControlSpawner, respond("", 74))),
+      );
+      expect(exited).toMatchObject({
+        reason: "command_exit",
+        action: "workflow-recovery-state",
+        exitCode: 74,
+      });
     }),
   );
 });
@@ -629,4 +718,46 @@ it.effect(
         ),
       ).toBe(true);
     }),
+);
+
+it.effect("retains the verification command's exit and decoding failure", () =>
+  Effect.gen(function* () {
+    const exited = yield* Effect.flip(
+      readVmHarnessIdentity(group.id, 123).pipe(
+        Effect.provideService(VmControlSpawner, respond("", 74)),
+      ),
+    );
+    expect(exited).toMatchObject({
+      reason: "command_exit",
+      action: "provider-identity",
+      exitCode: 74,
+    });
+    const decoded = yield* Effect.flip(
+      readVmHarnessIdentity(group.id, 123).pipe(
+        Effect.provideService(VmControlSpawner, respond("{}")),
+      ),
+    );
+    expect(decoded).toMatchObject({ reason: "decode", cause: { _tag: "SchemaError" } });
+  }),
+);
+
+it.effect("retains the underlying timeout instead of disguising it as a decode error", () =>
+  Effect.gen(function* () {
+    const spawned = yield* Deferred.make<void>();
+    const raw = ChildProcessSpawner.make(() =>
+      Deferred.succeed(spawned, undefined).pipe(Effect.andThen(Effect.never)),
+    );
+    const pending = yield* readVmHarnessIdentity(group.id, 123).pipe(
+      Effect.provideService(VmControlSpawner, raw),
+      Effect.flip,
+      Effect.forkChild,
+    );
+    yield* Deferred.await(spawned);
+    yield* TestClock.adjust("10 seconds");
+    expect(yield* Fiber.join(pending)).toMatchObject({
+      reason: "timeout",
+      action: "provider-identity",
+      cause: { _tag: "ProcessTimeoutError", timeoutMs: 10_000 },
+    });
+  }),
 );

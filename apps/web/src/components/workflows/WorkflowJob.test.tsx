@@ -1,13 +1,15 @@
 import { act, cloneElement, type PropsWithChildren, type ReactElement, createElement } from "react";
 import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
 import {
-  recordWorkflowReviewDiff,
+  recordSavedWorkflowReviewDiff,
+  requireFreshWorkflowReviewRead,
+  beginWorkflowReview,
   updateWorkflowDrafts,
   workflowDraftAtom,
   workflowSessionKey,
@@ -36,7 +38,9 @@ vi.mock("./workflowState", async () => ({
   ...(await vi.importActual("./workflowState")),
   useWorkflowClient: () => fixture.call,
 }));
-
+vi.mock("./SavedWorkflowResults", () => ({
+  SavedWorkflowResults: () => createElement("section", {}, "Saved results"),
+}));
 vi.mock("./WorkflowFlow", () => ({ WorkflowFlow: () => null }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
@@ -158,67 +162,38 @@ describe("workflow result location navigation", () => {
     viewerControls: { canApprove: true, canRespond: false, canCancel: true },
   } satisfies RepositoryWorkflowJob;
 
-  it("opens the exact VM checkpoint and carries its identity back to the run", async () => {
+  it("inspects VM results passively without registering or opening a live environment", async () => {
     fixture.call.mockResolvedValue(vmReview);
     await mount(false);
+    expect(text(renderer!.toJSON())).toContain("Saved results");
     expect(text(renderer!.toJSON())).toContain("Approve result");
-    expect(text(renderer!.toJSON())).toContain("Cancel run");
-    expect(text(renderer!.toJSON())).not.toContain("Request changes");
-    await press("Inspect live diff");
-    expect(fixture.open).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workflowResult: { ...scope, jobId: job.jobId },
-      }),
-    );
-    expect(fixture.select).toHaveBeenCalledWith(
-      { environmentId: "moved-vm", threadId: "thread" },
-      "saved-turn",
-      undefined,
-      3,
-    );
-    const destination = fixture.navigate.mock.calls[0]![0];
-    expect(destination.state({}).workflowOrigin.reviewCheckpoint).toEqual({
-      checkpointId: "checkpoint",
-      turnId: "saved-turn",
-      checkpointTurnCount: 3,
-    });
+    expect(text(renderer!.toJSON())).not.toContain("Inspect live diff");
+    expect(text(renderer!.toJSON())).not.toContain("Open conversation");
+    expect(fixture.open).not.toHaveBeenCalled();
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    const approval = renderer!.root
+      .findAllByType("button")
+      .find((b) => b.props.children === "Approve result")!;
+    expect(approval.props.disabled).toBe(true);
   });
 
-  it("keeps stale approval blocked after opening the conversation and returning", async () => {
-    fixture.call.mockResolvedValue({
-      ...vmReview,
-      progress: {
-        ...vmReview.progress,
-        checkpoint: {
-          checkpointId: "previous",
-          turnId: "old-turn",
-          checkpointTurnCount: 2,
-          checkpointRef: "old-ref",
-        },
-      },
+  it("keeps a previously inspected version from approving a new VM review", async () => {
+    beginWorkflowReview(appAtomRegistry, scope, job.jobId, "previous-visit", {
+      checkpointId: "previous",
+      turnId: "old-turn",
+      checkpointTurnCount: 2,
     });
-    await mount(false);
-    await press("Inspect live diff");
-    await act(() => renderer!.unmount());
     fixture.call.mockResolvedValue(vmReview);
     await mount(false);
     expect(text(renderer!.toJSON())).toContain("Review changed");
     const approval = renderer!.root
       .findAllByType("button")
-      .find((button) => button.props.children === "Approve result")!;
+      .find((b) => b.props.children === "Approve result")!;
     expect(approval.props.disabled).toBe(true);
     const before = fixture.call.mock.calls.length;
     await press("Approve result");
     expect(fixture.call).toHaveBeenCalledTimes(before);
-    await press("Open conversation");
-    expect(
-      fixture.navigate.mock.lastCall![0].state({}).workflowOrigin.reviewCheckpoint,
-    ).toBeUndefined();
-    await act(() => renderer!.unmount());
-    await mount(false);
-    expect(text(renderer!.toJSON())).toContain("Review changed");
-    await press("Inspect live diff");
-    expect(fixture.select).toHaveBeenCalledWith(expect.anything(), "saved-turn", undefined, 3);
+    expect(fixture.open).not.toHaveBeenCalled();
   });
 
   it("shows a queued VM approval as pending before the guest acknowledges it", async () => {
@@ -234,31 +209,35 @@ describe("workflow result location navigation", () => {
     expect(approval.props.disabled).toBe(true);
   });
 
-  it("refreshes a cached matching checkpoint before enabling approval on return", async () => {
+  it("refreshes a matching saved checkpoint before enabling approval", async () => {
     fixture.call.mockResolvedValue(vmReview);
     await mount(false);
-    await press("Inspect live diff");
-    const origin = fixture.navigate.mock.lastCall![0].state({}).workflowOrigin;
     await act(() => {
+      beginWorkflowReview(appAtomRegistry, scope, "job", "saved-visit", {
+        checkpointId: "checkpoint",
+        turnId: "saved-turn",
+        checkpointTurnCount: 3,
+      });
       expect(
-        recordWorkflowReviewDiff(
-          appAtomRegistry,
-          origin,
-          {
-            environmentId: EnvironmentId.make("moved-vm"),
-            threadId: ThreadId.make("thread"),
-            generation: 1,
+        recordSavedWorkflowReviewDiff(appAtomRegistry, scope, "job", "saved-visit", {
+          resultId: "11111111-1111-4111-8111-111111111111",
+          stepId: "agent",
+          turnId: "saved-turn",
+          turnCount: 3,
+          outcome: "completed",
+          createdAt: "now",
+          checkpointRef: "ref",
+          baselineCommitId: "base",
+          commitId: "commit",
+          treeId: "tree",
+          patch: {
+            artifactId: "22222222-2222-4222-8222-222222222222",
+            sha256: "a".repeat(64),
+            sizeBytes: 0,
           },
-          {
-            threadId: ThreadId.make("thread"),
-            fromTurnCount: 2,
-            toTurnCount: 3,
-            diff: "",
-            completeWorkflowReview: true,
-            targetTurnId: TurnId.make("saved-turn"),
-          },
-        ),
+        }),
       ).toBe(true);
+      requireFreshWorkflowReviewRead(appAtomRegistry, scope, "job");
     });
     await act(() => renderer!.unmount());
     const reply = deferred();

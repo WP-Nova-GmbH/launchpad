@@ -452,6 +452,8 @@ describe("ProviderCommandReactor", () => {
 
     const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
     const service: ProviderServiceShape = {
+      checkpointWorkflowConversation: () =>
+        Effect.die("Workflow capture must be explicitly provided"),
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
       compactThread,
@@ -8471,14 +8473,36 @@ describe("ProviderCommandReactor", () => {
           slashCommands: [],
           skills: [],
         });
+        const capturedTurns: TurnId[] = [];
+        // This queue recovery test stubs storage boundaries. The provider/relay
+        // integration test verifies actual native captures and publication receipts.
+        const savedResults: typeof store = {
+          ...store,
+          getSaveResult: (jobId, turnId) =>
+            store
+              .getSaveResult(jobId, turnId)
+              .pipe(
+                Effect.map((saved) =>
+                  saved ? { ...saved, status: "acknowledged" as const } : null,
+                ),
+              ),
+        };
         const reactors = Layer.merge(CheckpointReactorLive, WorkflowRunnerLayer).pipe(
           Layer.provide(
             Layer.mergeAll(
               Layer.succeed(OrchestrationEngineService, harness.engine),
               Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery),
-              Layer.succeed(ProviderService, harness.providerService),
+              Layer.succeed(ProviderService, {
+                ...harness.providerService,
+                checkpointWorkflowConversation: ({ binding, turnId }) =>
+                  Effect.sync(() => {
+                    expect(binding).toEqual(runtime);
+                    capturedTurns.push(turnId);
+                    return { threadId, turnId, generation: runtime.generation, sourceSequence: 0 };
+                  }),
+              }),
               Layer.succeed(SqlClient.SqlClient, harness.sql),
-              Layer.succeed(WorkflowRunStore, store),
+              Layer.succeed(WorkflowRunStore, savedResults),
               Layer.mock(CheckpointStore, {
                 isGitRepository: () => Effect.succeed(true),
                 captureCheckpoint: () =>
@@ -8639,6 +8663,7 @@ describe("ProviderCommandReactor", () => {
           const saved = yield* store.get(run.jobId);
           expect(saved?.progress.status).toBe("done");
           expect(saved?.executionReserved).toBe(false);
+          expect(capturedTurns).toEqual([admission.turnId, second!.turnId]);
         }).pipe(Effect.provide(reactors));
       }),
   );

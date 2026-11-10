@@ -1,3 +1,5 @@
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { makeWorkflowResultOutbox } from "../jobs/WorkflowResultOutbox.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
@@ -155,4 +157,39 @@ it.effect("fails closed for a malformed terminal workflow record", () =>
       "workflow",
     );
   }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
+
+it.effect(
+  "keeps pending saved results during transfer without pretending execution is running",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const fence = makeThreadExecutionFence(sql);
+      yield* fence.prepare(enrollment);
+      yield* fence.activate(enrollment);
+      const run = released();
+      yield* sql`INSERT INTO repository_workflow_jobs VALUES (${run.jobId},${run.progress.threadId},'done',0,${encode(run)})`;
+      yield* makeWorkflowResultOutbox(sql).enqueue({
+        binding: {
+          jobId: run.jobId,
+          organizationId: "org",
+          repositoryId: "repo",
+          allocationId: "allocation",
+          threadId: ThreadId.make("thread"),
+          projectId: ProjectId.make("project"),
+          environmentId: EnvironmentId.make("environment"),
+          generation: 1,
+          operationId: "enroll",
+        },
+        recordJson: "{}",
+      });
+      const store = yield* makeStore;
+      assert.isNull(yield* store.getByThread("thread"));
+      assert.deepEqual(yield* store.owners(), []);
+      assert.include((yield* Effect.flip(fence.beginDrain(move))).message, "pending result");
+      assert.equal((yield* fence.get("thread"))?.phase, "active");
+      yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${run.jobId}`;
+      yield* fence.beginDrain(move);
+      assert.equal(yield* fence.freeze(move), 0);
+    }).pipe(Effect.provide(Layer.mergeAll(SqlitePersistenceMemory, NodeServices.layer))),
 );

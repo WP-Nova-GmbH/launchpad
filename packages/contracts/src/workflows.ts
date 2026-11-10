@@ -105,6 +105,66 @@ export const WorkflowVmDispatchBinding = Schema.Struct({
 export type WorkflowVmDispatchBinding = typeof WorkflowVmDispatchBinding.Type;
 export const WORKFLOW_PROTOCOL = 9;
 
+export const WORKFLOW_RESULT_MAX_BYTES = 10_000_000;
+export const WorkflowResultObject = Schema.Struct({
+  artifactId: Schema.String.check(Schema.isUUID()),
+  sha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  sizeBytes: Schema.Int.check(
+    Schema.isGreaterThanOrEqualTo(0),
+    Schema.isLessThanOrEqualTo(64 * 1024 * 1024),
+  ),
+});
+export const WorkflowSavedResult = Schema.Struct({
+  resultId: Schema.String.check(Schema.isUUID()),
+  stepId: TrimmedNonEmptyString,
+  turnId: TrimmedNonEmptyString,
+  turnCount: Schema.Int.check(Schema.isGreaterThan(0)),
+  outcome: Schema.Literals(["completed", "failed", "cancelled"]),
+  createdAt: Schema.String,
+  checkpointRef: TrimmedNonEmptyString,
+  baselineCommitId: TrimmedNonEmptyString,
+  commitId: TrimmedNonEmptyString,
+  treeId: TrimmedNonEmptyString,
+  patch: Schema.Struct({
+    ...WorkflowResultObject.fields,
+    sizeBytes: Schema.Int.check(
+      Schema.isGreaterThanOrEqualTo(0),
+      Schema.isLessThanOrEqualTo(WORKFLOW_RESULT_MAX_BYTES),
+    ),
+  }),
+});
+export type WorkflowSavedResult = typeof WorkflowSavedResult.Type;
+/** One current format. The runner payload remains opaque to the relay. */
+export const WorkflowRecoveryManifest = Schema.Struct({
+  format: Schema.Literal("workflow-recovery-v1"),
+  publicationId: Schema.String.check(Schema.isUUID()),
+  binding: WorkflowVmDispatchBinding,
+  revision: Schema.Int.check(Schema.isGreaterThan(0)),
+  state: WorkflowResultObject,
+  sourceSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  nativeCheckpointOperationId: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+  result: Schema.NullOr(WorkflowSavedResult),
+});
+export type WorkflowRecoveryManifest = typeof WorkflowRecoveryManifest.Type;
+export const WorkflowSaveReceipt = Schema.Struct({
+  publicationId: Schema.String.check(Schema.isUUID()),
+  jobId: TrimmedNonEmptyString,
+  threadId: ThreadId,
+  revision: Schema.Int.check(Schema.isGreaterThan(0)),
+  manifest: WorkflowResultObject,
+  binding: WorkflowVmDispatchBinding,
+  resultId: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+});
+export type WorkflowSaveReceipt = typeof WorkflowSaveReceipt.Type;
+export const WorkflowResultSaving = Schema.Struct({
+  publicationId: Schema.String.check(Schema.isUUID()),
+  resultId: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+  state: Schema.Literals(["saving", "failed", "saved"]),
+  detail: Schema.NullOr(Schema.String),
+  retryable: Schema.Boolean,
+});
+export type WorkflowResultSaving = typeof WorkflowResultSaving.Type;
+
 export const WorkflowDefinition = Schema.Struct({
   name: Label,
   target: WorkflowTarget,
@@ -288,6 +348,10 @@ export const WorkflowActionProgress = Schema.Struct({
   retryable: Schema.Boolean,
 });
 export const WorkflowJobProgress = Schema.Struct({
+  resultSaving: Schema.optional(WorkflowResultSaving),
+  executionReleased: Schema.optional(Schema.Boolean),
+  /** Set by relay deletion admission, independently of whether an Agent ever started. */
+  threadDeletionRequested: Schema.optional(Schema.Boolean),
   pullRequestUrl: Schema.optional(Schema.NullOr(Schema.String)),
   actions: Schema.optional(Schema.Array(WorkflowActionProgress)),
   revision: Revision,
@@ -410,6 +474,12 @@ const ControlBinding = {
 export const WorkflowControl = Schema.Union([
   Schema.Struct({
     ...ControlBinding,
+    operation: Schema.Literal("retry_saving"),
+    publicationId: Schema.String.check(Schema.isUUID()),
+    expectedRevision: Revision,
+  }),
+  Schema.Struct({
+    ...ControlBinding,
     operation: Schema.Literal("retry_action"),
     actionId: TrimmedNonEmptyString,
     expectedRevision: Revision,
@@ -476,6 +546,11 @@ export const RunRepositoryWorkflow = Schema.Struct({
   replayOnly: Schema.optional(Schema.Boolean),
 });
 export const RespondToWorkflowJob = Schema.Union([
+  Schema.Struct({
+    operation: Schema.Literal("retry_saving"),
+    publicationId: Schema.String.check(Schema.isUUID()),
+    expectedRevision: Revision,
+  }),
   Schema.Struct({
     operation: Schema.Literal("retry_action"),
     actionId: TrimmedNonEmptyString,

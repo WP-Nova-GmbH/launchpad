@@ -232,7 +232,23 @@ export const make = Effect.gen(function* () {
     releaseLease = true,
     expectedLease?: string,
   ) {
-    if (isTerminalWorkflowJob(previous.record.status)) return previous;
+    if (isTerminalWorkflowJob(previous.record.status)) {
+      if (
+        !previous.record.vmAdmission ||
+        (!previous.record.progress?.resultSaving &&
+          pendingControl?.response.operation !== "retry_saving")
+      )
+        return previous;
+      // Terminal execution never reopens. Only its independent storage state can settle.
+      record = {
+        ...previous.record,
+        updatedAt: record.updatedAt,
+        progress: previous.record.progress
+          ? { ...previous.record.progress, resultSaving: record.progress?.resultSaving }
+          : null,
+      };
+      if (pendingControl && pendingControl.response.operation !== "retry_saving") return previous;
+    }
     record = yield* persist(
       Effect.try(() => {
         const saved = validateOrigin(previous);
@@ -557,18 +573,25 @@ export const make = Effect.gen(function* () {
                 ? sql`(${relayWorkflowJobs.record}#>>'{runtime,environmentId}'=${scope.environmentId} OR (${relayWorkflowJobs.record}->'workflow'='null'::jsonb AND ${relayWorkflowJobs.record}->>'workflowId' IN (SELECT workflow_id FROM relay_repository_workflows WHERE record#>>'{definition,target,environmentId}'=${scope.environmentId})))`
                 : undefined,
               sql`(${relayWorkflowJobs.pendingControl} IS NOT NULL OR ${relayWorkflowJobs.record}->'workflow'<>'null'::jsonb OR COALESCE((${relayWorkflowJobs.record}#>>'{queueReason,retryAt}')::double precision,0)<=extract(epoch FROM clock_timestamp())*1000)`,
-              inArray(relayWorkflowJobs.status, [
-                "queued",
-                "dispatching",
-                "preparing",
-                "running",
-                "awaiting_review",
-                "awaiting_input",
-                "waiting_capacity",
-                "finishing",
-                "paused",
-                "cancelling",
-              ]),
+              or(
+                inArray(relayWorkflowJobs.status, [
+                  "queued",
+                  "dispatching",
+                  "preparing",
+                  "running",
+                  "awaiting_review",
+                  "awaiting_input",
+                  "waiting_capacity",
+                  "finishing",
+                  "paused",
+                  "cancelling",
+                ]),
+                and(
+                  inArray(relayWorkflowJobs.status, ["done", "failed", "cancelled"]),
+                  sql`${relayWorkflowJobs.record}->'vmAdmission' IS NOT NULL AND ${relayWorkflowJobs.record}->'vmAdmission'<>'null'::jsonb`,
+                  sql`(${relayWorkflowJobs.record}#>>'{progress,resultSaving,state}'='saving' OR ${relayWorkflowJobs.pendingControl}#>>'{response,operation}'='retry_saving')`,
+                ),
+              ),
             ),
           )
           .orderBy(asc(relayWorkflowJobs.checkedAt), asc(relayWorkflowJobs.createdAt))

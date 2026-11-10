@@ -54,6 +54,7 @@ export const releaseThreadNativeCheckpointOperation = Effect.fn(
       if (operation.phase === "released") return;
       yield* sql`UPDATE relay_thread_native_checkpoint_operations SET phase='released',released_at=clock_timestamp() WHERE operation_id=${input.operationId} AND phase='active'`;
       yield* sql`DELETE FROM relay_thread_artifact_pins WHERE operation_id=${`native-recovery:${input.operationId}`}`;
+      yield* retireThreadCheckpoints(sql, input.threadId);
     }),
   );
 });
@@ -96,11 +97,14 @@ export function makeThreadNativeCheckpointStore(
       ORDER BY n.generation DESC,n.source_sequence DESC,n.published_at DESC,n.operation_id DESC LIMIT 1`;
     return row ? yield* get(row.operationId) : null;
   });
-  const publish = Effect.fn("relay.native_checkpoint.publish")(function* (input: {
-    readonly threadId: string;
-    readonly operationId: string;
-    readonly manifestArtifactId: string;
-  }) {
+  const publish = Effect.fn("relay.native_checkpoint.publish")(function* <E = never, R = never>(
+    input: {
+      readonly threadId: string;
+      readonly operationId: string;
+      readonly manifestArtifactId: string;
+    },
+    authorize: Effect.Effect<void, E, R> = Effect.void,
+  ) {
     return yield* checkpointObjects.withPinned(
       { ...input, kind: "native", maxBytes: 770 * 1024 * 1024 },
       ({ artifact, readPinId, manifest, entries, byName, readFile, streamFile, readMetadata }) =>
@@ -193,6 +197,7 @@ export function makeThreadNativeCheckpointStore(
           });
           return yield* sql.withTransaction(
             Effect.gen(function* () {
+              yield* authorize;
               const [placement] = yield* sql<{
                 environmentId: string;
                 generation: number;

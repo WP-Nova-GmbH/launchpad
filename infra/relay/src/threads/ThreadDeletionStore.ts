@@ -17,7 +17,12 @@ const fail = () =>
 export interface ThreadDeletion {
   readonly threadId: string;
   readonly operationId: string;
-  readonly ownerUserId: string;
+  readonly ownerUserId: string | null;
+  readonly requesterUserId: string;
+  readonly audience: "private" | "repository";
+  readonly organizationId: string | null;
+  readonly repositoryId: string | null;
+  readonly workflowJobId: string | null;
   readonly generation: number;
   readonly hostId: string;
   readonly phase: "stopping" | "cleaning" | "completed";
@@ -32,16 +37,23 @@ export interface ThreadDeletionClaim {
 export function makeThreadDeletionStore(sql: PgClient) {
   const get = Effect.fn("relay.thread.delete.get")(function* (threadId: string) {
     const [row] =
-      yield* sql<ThreadDeletion>`SELECT thread_id AS "threadId",operation_id AS "operationId",owner_user_id AS "ownerUserId",generation,host_id AS "hostId",phase,error_code AS "errorCode" FROM relay_thread_deletions WHERE thread_id=${threadId}`;
+      yield* sql<ThreadDeletion>`SELECT thread_id AS "threadId",operation_id AS "operationId",owner_user_id AS "ownerUserId",requester_user_id AS "requesterUserId",audience,organization_id AS "organizationId",repository_id AS "repositoryId",workflow_job_id AS "workflowJobId",generation,host_id AS "hostId",phase,error_code AS "errorCode" FROM relay_thread_deletions WHERE thread_id=${threadId}`;
     return row ?? null;
   });
   const begin = Effect.fn("relay.thread.delete.begin")(function* (
-    input: Omit<ThreadDeletion, "phase" | "errorCode"> & {
+    input: Pick<
+      ThreadDeletion,
+      "threadId" | "operationId" | "ownerUserId" | "generation" | "hostId"
+    > & {
+      readonly requesterUserId?: string;
+      readonly workflow?: { jobId: string; organizationId: string; repositoryId: string };
       readonly sourceDeleted?: boolean;
     },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        if (input.workflow)
+          yield* sql`SELECT job_id FROM relay_workflow_jobs WHERE job_id=${input.workflow.jobId} FOR UPDATE`;
         yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
         const legacy = yield* sql`SELECT 1 FROM relay_thread_vm_allocations
           WHERE thread_id=${input.threadId} AND runtime_protocol!='native-v1'`;
@@ -86,8 +98,14 @@ export function makeThreadDeletionStore(sql: PgClient) {
           )
             return yield* fail();
         }
+        const identity = input.workflow
+          ? sql`t.audience='repository' AND t.owner_user_id IS NULL AND t.workflow_job_id=${input.workflow.jobId} AND t.organization_id=${input.workflow.organizationId} AND t.repository_id=${input.workflow.repositoryId}
+            AND EXISTS(SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id AND j.status IN ('done','failed','cancelled') AND j.record#>>'{progress,executionReleased}'='true')`
+          : sql`t.audience='private' AND t.owner_user_id=${input.ownerUserId}`;
+        const requester = input.requesterUserId ?? input.ownerUserId;
+        if (!requester) return yield* fail();
         const valid =
-          yield* sql`SELECT 1 FROM relay_thread_placements t WHERE thread_id=${input.threadId} AND owner_user_id=${input.ownerUserId} AND generation=${input.generation} AND operation_id IS NULL
+          yield* sql`SELECT 1 FROM relay_thread_placements t WHERE thread_id=${input.threadId} AND ${identity} AND generation=${input.generation} AND operation_id IS NULL
     AND NOT EXISTS(SELECT 1 FROM relay_thread_local_enrollments e WHERE e.thread_id=t.thread_id AND e.phase='aborted')
     AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.thread_id=t.thread_id)
     AND (${input.sourceDeleted === true} OR EXISTS(SELECT 1 FROM relay_thread_vm_bindings b WHERE b.thread_id=t.thread_id AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.revoked_at IS NULL)
@@ -108,11 +126,16 @@ export function makeThreadDeletionStore(sql: PgClient) {
         yield* sql`UPDATE relay_thread_vm_backups x SET phase='retired',claim_id=NULL,claim_until=NULL
           FROM relay_thread_vm_allocations a WHERE a.allocation_id=x.allocation_id AND a.thread_id=${input.threadId}
             AND x.phase='pending' AND x.snapshot_id IS NULL AND x.source_template_id IS NULL AND x.source_build_id IS NULL AND x.probe_receipt IS NULL`;
-        yield* sql`INSERT INTO relay_thread_deletions(thread_id,operation_id,owner_user_id,generation,host_id,phase,allow_uncertain_capture_cleanup) VALUES(${input.threadId},${input.operationId},${input.ownerUserId},${input.generation},${input.hostId},'stopping',false)`;
+        yield* sql`INSERT INTO relay_thread_deletions(thread_id,operation_id,owner_user_id,requester_user_id,audience,organization_id,repository_id,workflow_job_id,generation,host_id,phase,allow_uncertain_capture_cleanup) VALUES(${input.threadId},${input.operationId},${input.ownerUserId},${requester},${input.workflow ? "repository" : "private"},${input.workflow?.organizationId ?? null},${input.workflow?.repositoryId ?? null},${input.workflow?.jobId ?? null},${input.generation},${input.hostId},'stopping',false)`;
         yield* sql`UPDATE relay_thread_placements SET operation_id=${input.operationId} WHERE thread_id=${input.threadId}`;
         yield* sql`UPDATE relay_thread_vm_allocations SET state='deleting' WHERE thread_id=${input.threadId} AND deleted_at IS NULL`;
         yield* sql`UPDATE relay_environment_credentials SET revoked_at=COALESCE(revoked_at,to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) WHERE credential_id IN(SELECT credential_id FROM relay_thread_vm_bindings WHERE thread_id=${input.threadId})`;
         yield* sql`UPDATE relay_thread_vm_bindings SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE thread_id=${input.threadId}`;
+        if (input.workflow)
+          yield* sql`UPDATE relay_workflow_jobs
+          SET record=jsonb_set(jsonb_set(record #- '{progress,resultSaving}','{progress,hasThread}','false'),'{progress,threadDeletionRequested}','true'),
+            pending_control=NULL,revision=revision+1,lease_until=NULL
+          WHERE job_id=${input.workflow.jobId}`;
         return (yield* get(input.threadId))!;
       }),
     );
@@ -156,7 +179,9 @@ export function makeThreadDeletionStore(sql: PgClient) {
           threadId: string;
         }>`SELECT d.thread_id AS "threadId" FROM relay_thread_deletions d
         JOIN relay_thread_placements t ON t.thread_id=d.thread_id
-        WHERE t.audience='private' AND t.owner_user_id=d.owner_user_id
+        WHERE ((t.audience='private' AND d.audience='private' AND t.owner_user_id=d.owner_user_id)
+          OR (t.audience='repository' AND d.audience='repository' AND t.owner_user_id IS NULL
+            AND t.workflow_job_id=d.workflow_job_id AND t.organization_id=d.organization_id AND t.repository_id=d.repository_id))
           AND d.host_id=${hostId} AND d.phase!='completed' AND d.retry_at<=clock_timestamp() AND (d.claim_until IS NULL OR d.claim_until<=clock_timestamp())
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.thread_id=d.thread_id AND a.runtime_protocol!='native-v1')
           ORDER BY d.retry_at,d.created_at,d.thread_id LIMIT 1 FOR UPDATE OF d SKIP LOCKED`;
@@ -170,9 +195,15 @@ export function makeThreadDeletionStore(sql: PgClient) {
   const authorize = Effect.fn("relay.thread.delete.authorize")(function* (
     input: ThreadDeletionClaim,
   ) {
+    const hint = yield* get(input.threadId);
+    if (hint?.workflowJobId)
+      yield* sql`SELECT job_id FROM relay_workflow_jobs WHERE job_id=${hint.workflowJobId} FOR UPDATE`;
     yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
     const rows =
       yield* sql`SELECT 1 FROM relay_thread_deletions d JOIN relay_thread_placements t USING(thread_id) WHERE d.thread_id=${input.threadId} AND d.claim_id=${input.claimId} AND d.claim_until>clock_timestamp() AND d.phase!='completed' AND t.operation_id=d.operation_id AND t.generation=d.generation
+        AND ((d.audience='private' AND t.audience='private' AND t.owner_user_id=d.owner_user_id)
+          OR (d.audience='repository' AND t.audience='repository' AND t.owner_user_id IS NULL
+            AND t.workflow_job_id=d.workflow_job_id AND t.organization_id=d.organization_id AND t.repository_id=d.repository_id))
         AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.thread_id=d.thread_id AND a.runtime_protocol!='native-v1')`;
     if (!rows.length) return yield* fail();
     return (yield* get(input.threadId))!;
@@ -185,12 +216,13 @@ export function makeThreadDeletionStore(sql: PgClient) {
         yield* authorize(input);
         const [row] = yield* sql<{
           allocationId: string;
+          resourceKind: "personal" | "organization_workflow";
           computeRef: string | null;
           operationId: string | null;
           generation: number | null;
           provisionPhase: string | null;
           needsCaptureCleanup: boolean;
-        }>`SELECT a.allocation_id AS "allocationId",a.compute_ref AS "computeRef",p.operation_id AS "operationId",p.generation,p.phase AS "provisionPhase",
+        }>`SELECT a.allocation_id AS "allocationId",a.resource_kind AS "resourceKind",a.compute_ref AS "computeRef",p.operation_id AS "operationId",p.generation,p.phase AS "provisionPhase",
           EXISTS(SELECT 1 FROM relay_thread_vm_backups x WHERE x.allocation_id=a.allocation_id AND (x.phase IN ('creating','captured','verifying','cleanup') OR (x.phase='failed' AND x.native_capture_receipt IS NULL AND (x.capture_started_at IS NOT NULL OR x.snapshot_id IS NOT NULL OR x.source_template_id IS NOT NULL OR x.source_build_id IS NOT NULL)))) AS "needsCaptureCleanup"
           FROM relay_thread_vm_allocations a LEFT JOIN relay_thread_vm_provisions p USING(allocation_id)
           JOIN relay_thread_deletions d ON d.thread_id=a.thread_id
@@ -212,7 +244,8 @@ export function makeThreadDeletionStore(sql: PgClient) {
         const [valid] = yield* sql<{
           sourceOperationId: string;
           generation: number;
-        }>`SELECT p.operation_id AS "sourceOperationId",p.generation
+          resourceKind: "personal" | "organization_workflow";
+        }>`SELECT p.operation_id AS "sourceOperationId",p.generation,a.resource_kind AS "resourceKind"
           FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING(allocation_id)
           WHERE a.thread_id=${claim.threadId} AND a.allocation_id=${allocationId} AND a.compute_ref=${computeRef} AND a.state IN ('deleting','deleted') AND a.runtime_protocol='native-v1'
             AND p.ingress_recovery_claim_id IS NULL
@@ -227,7 +260,11 @@ export function makeThreadDeletionStore(sql: PgClient) {
                 (x.phase='pending' AND (x.snapshot_id IS NOT NULL OR x.source_template_id IS NOT NULL OR x.source_build_id IS NOT NULL OR x.probe_receipt IS NOT NULL))))
           FOR UPDATE OF a`;
         if (!valid || !deletion) return yield* fail();
-        yield* makeThreadVmAllocationStore(sql).confirmDeleted({ allocationId, computeRef });
+        yield* makeThreadVmAllocationStore(sql).confirmDeleted({
+          allocationId,
+          computeRef,
+          resourceKind: valid.resourceKind,
+        });
         // Keep historical certificates as recorded for the later data migration.
         yield* sql`UPDATE relay_thread_vm_allocations SET deletion_stop_receipt=COALESCE(deletion_stop_receipt,${sql.json({ kind: "native-delete-acknowledgement", operationId: deletion.operationId, allocationId, computeRef, ...valid, acknowledged: true })}) WHERE allocation_id=${allocationId}`;
       }),
@@ -243,6 +280,9 @@ export function makeThreadDeletionStore(sql: PgClient) {
         )
           return yield* fail();
         yield* sql`UPDATE relay_thread_deletions SET phase='cleaning' WHERE thread_id=${claim.threadId}`;
+        yield* sql`DELETE FROM relay_workflow_recovery_heads WHERE job_id IN(SELECT job_id FROM relay_workflow_recovery_records WHERE thread_id=${claim.threadId})`;
+        yield* sql`DELETE FROM relay_workflow_saved_results WHERE thread_id=${claim.threadId}`;
+        yield* sql`DELETE FROM relay_workflow_recovery_records WHERE thread_id=${claim.threadId}`;
         yield* sql`UPDATE relay_thread_native_checkpoints SET retained=false WHERE thread_id=${claim.threadId}`;
         yield* sql`UPDATE relay_thread_move_checkpoints SET repository_retained=false,repository_upload=NULL WHERE thread_id=${claim.threadId}`;
         yield* sql`UPDATE relay_thread_native_checkpoint_operations SET phase='released',released_at=COALESCE(released_at,clock_timestamp()) WHERE checkpoint_operation_id IN(SELECT operation_id FROM relay_thread_native_checkpoints WHERE thread_id=${claim.threadId})`;

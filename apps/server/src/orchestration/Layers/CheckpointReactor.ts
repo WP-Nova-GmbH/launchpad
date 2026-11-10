@@ -489,16 +489,42 @@ const make = Effect.gen(function* () {
         return "skipped" as const;
       }
 
-      // Portable native capture must finish before queue finalization. A duplicate
-      // Git checkpoint does not prove that independently retained native state exists.
-      yield* (
-        providerService.checkpointConversation?.({ threadId: event.threadId, turnId }) ??
-          Effect.void
-      );
+      const existing = thread.checkpoints.find((checkpoint) => checkpoint.turnId === turnId);
+      // A workflow result intent is created only after native, attachment and Git capture.
+      // Replaying that turn while its save is pending must not acquire another writer.
+      const run = yield* workflows.getByThread(event.threadId);
+      if (
+        run?.runtime.kind === "vm" &&
+        existing &&
+        existing.status !== "missing" &&
+        (yield* workflows.getSaveResult(run.jobId, turnId))
+      )
+        return existing.status;
+      // A Git checkpoint alone does not prove the independently retained native state exists.
+      if (run?.runtime.kind === "vm") {
+        const proof = yield* providerService.checkpointWorkflowConversation({
+          binding: run.runtime,
+          turnId,
+        });
+        if (
+          proof.threadId !== event.threadId ||
+          proof.turnId !== turnId ||
+          proof.generation !== run.runtime.generation
+        )
+          return yield* new CheckpointWorkflowPinUnavailableError({
+            threadId: event.threadId,
+            turnCount: 0,
+          });
+      } else if (yield* workflows.isWorkflowVmThread(event.threadId)) {
+        return "skipped" as const;
+      } else
+        yield* (
+          providerService.checkpointConversation?.({ threadId: event.threadId, turnId }) ??
+            Effect.void
+        );
 
       // A replay must finalize with the result already saved for this turn.
       // Runtime placeholders still require real Git capture.
-      const existing = thread.checkpoints.find((checkpoint) => checkpoint.turnId === turnId);
       if (existing && existing.status !== "missing") return existing.status;
 
       const projects = yield* resolveThreadProjects(thread.projectId);

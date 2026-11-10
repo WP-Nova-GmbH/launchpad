@@ -65,6 +65,9 @@ if [[ ! -f /var/lib/launchpad-relay/cloud-mint-private.pem ]] \
 fi
 chmod 600 /var/lib/launchpad-relay/cloud-mint-private.pem 2>/dev/null || true
 
+echo "deploy: preserving thread artifacts"
+bash infra/hetzner/preserve-relay-artifacts.sh
+
 echo "deploy: restarting relay"
 systemctl restart launchpad-relay
 for _ in $(seq 30); do

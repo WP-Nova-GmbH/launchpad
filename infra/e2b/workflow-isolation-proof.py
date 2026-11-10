@@ -567,7 +567,20 @@ def workload_command(kind, *command):
     return work_id, [WORKLOAD, "run-workflow", work_id, kind, str(CHECKOUT), "--", *command]
 
 
-def prove_setup_owner():
+def prove_workflow_recovery_state():
+    state = json.loads(run([*COORDINATOR, WORKLOAD, "workflow-recovery-state"]).stdout)
+    assert state["recoverable"] and state["stopped"] and not state["groups"]
+    assert state["sealedBy"] is None
+    for command in (
+        [*COORDINATOR, BROKER, "workflow-recovery-state", "unexpected"],
+        ["/usr/sbin/runuser", "-u", "launchpad-workflow", "--", BROKER, "workflow-recovery-state"],
+        ["/usr/sbin/runuser", "-u", "launchpad-workflow", "--", WORKLOAD, "workflow-recovery-state"],
+    ):
+        rejected = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        assert rejected.returncode != 0, "Workflow recovery allowed an unauthorized control"
+
+
+def prove_setup_owner(detached_child=True):
     nonce = uuid.uuid4().hex
     detached = """
 import os, signal
@@ -590,7 +603,7 @@ else:
         'test -z "${LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN+x}" || exit 91',
         'IFS= read -r input && test "$input" = "from the PTY" || exit 93',
         'printf "__T3_SETUP_DONE___forged:0\\n"',
-        '/usr/bin/python3 -c ' + shlex.quote(detached) + ' || exit 92',
+        *(['/usr/bin/python3 -c ' + shlex.quote(detached) + ' || exit 92'] if detached_child else []),
         'exit 7',
     ])
     staged = Path(f"/tmp/launchpad-workflow-setup-{uuid.uuid4().hex}.sh")
@@ -626,6 +639,9 @@ else:
         captured = control("capture")
         identity = captured["identity"]
         assert identity.startswith(f"workflow-vm:{work_id}:") and captured["owned"]
+        pending = subprocess.run([*COORDINATOR, WORKLOAD, "workflow-recovery-state"],
+                                 capture_output=True, text=True, timeout=10)
+        assert pending.returncode != 0, "An unarmed setup owner permitted recovery"
         assert not staged.exists(), "Setup script remained on disk after owner capture"
         argv = Path(f"/proc/{pid}/cmdline").read_bytes()
         assert nonce.encode() not in argv and str(staged).encode() not in argv
@@ -662,10 +678,19 @@ with socket.socket(socket.AF_UNIX) as peer:
             output += os.read(terminal, 4096)
             assert len(output) < 65536
         assert b"__T3_SETUP_DONE___forged:0" in output
-        line = next(line for line in output.splitlines() if line.startswith(b"DETACHED_SETUP_CHILD "))
-        detached_pid = int(line.split()[1])
-        assert os.getsid(detached_pid) == detached_pid
-        assert str(detached_pid) in (group / "cgroup.procs").read_text().split()
+        if detached_child:
+            line = next(line for line in output.splitlines() if line.startswith(b"DETACHED_SETUP_CHILD "))
+            detached_pid = int(line.split()[1])
+            assert os.getsid(detached_pid) == detached_pid
+            assert str(detached_pid) in (group / "cgroup.procs").read_text().split()
+            busy = subprocess.run([*COORDINATOR, WORKLOAD, "workflow-recovery-state"],
+                                  capture_output=True, text=True, timeout=10)
+            assert busy.returncode != 0, "A detached setup child permitted recovery"
+        else:
+            idle = json.loads(run([*COORDINATOR, WORKLOAD, "workflow-recovery-state"]).stdout)
+            assert idle["recoverable"] and not idle["stopped"]
+            assert len(idle["groups"]) == 1 and idle["groups"][0]["id"] == work_id
+            assert idle["groups"][0]["leaderPid"] == pid, "Recovery replaced the passive setup owner"
         for _ in range(2):
             stopped = control("stop", identity)
             assert stopped["fullStop"] and stopped["owned"] and stopped["identity"] is None
@@ -934,6 +959,7 @@ def proof():
     marker_info = MARKER.lstat()
     assert stat.S_ISREG(marker_info.st_mode) and marker_info.st_uid == 0
     assert stat.S_IMODE(marker_info.st_mode) == 0o644
+    prove_workflow_recovery_state()
     run([*COORDINATOR, "/usr/bin/python3", "-c", (
         f"import os; fd=os.open({str(CODEX_CREDENTIAL)!r}, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600);"
         "os.write(fd, b'workflow-isolation-fixture'); os.close(fd)"
@@ -982,6 +1008,7 @@ def proof():
             coordinator.wait(timeout=10)
     prove_workload_signals()
     prove_setup_owner()
+    prove_setup_owner(detached_child=False)
     prove_native_codex_peer()
     prove_private_checkpoint_reader()
     print(json.dumps({
@@ -997,6 +1024,7 @@ def proof():
         "detachedWorkloadStopped": True,
         "unrelatedWorkloadPreserved": True,
         "setupOwnerVerified": True,
+        "workflowRecoveryInspectionVerified": True,
         "nativeCodexPeerVerified": True,
         "otherCodexPeersDenied": True,
         "nativeCodexCommandExecuted": True,
