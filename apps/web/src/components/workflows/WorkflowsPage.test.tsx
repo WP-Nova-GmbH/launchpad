@@ -5,7 +5,9 @@ import {
   createElement,
   useCallback,
   useContext,
+  useMemo,
   useState,
+  type ComponentProps,
   type PropsWithChildren,
   type ReactElement,
 } from "react";
@@ -35,6 +37,8 @@ import {
   workflowDraftAtom,
   workflowSessionKey,
   updateWorkflowDrafts,
+  type WorkflowEditorDraft,
+  type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { workflowVmCodexInstanceId } from "../settings/workflowModels";
@@ -53,6 +57,7 @@ const fixture = vi.hoisted(() => ({
   vmAutomationAvailable: false,
   projectsUnavailable: false,
   projects: [] as ReadonlyArray<RelayOrganizationProject>,
+  repositories: undefined as typeof catalog.repositories | undefined,
   repositoryError: null as string | null,
   authStatus: "ready" as "loading" | "error" | "ready",
   signedIn: true,
@@ -94,6 +99,7 @@ vi.mock("../../cloud/managedRelayState", () => ({
         ? undefined
         : {
             ...catalog,
+            repositories: fixture.repositories ?? catalog.repositories,
             projects: fixture.projects,
             ...(fixture.projectsUnavailable ? { projectsUnavailable: true } : {}),
           },
@@ -127,6 +133,46 @@ vi.mock("../ui/button", () => ({
 vi.mock("../ui/input", () => ({
   Input: (props: Record<string, unknown>) => createElement("input", props),
 }));
+vi.mock("../ui/collapsible", () => {
+  const Context = createContext({ open: false, setOpen: (_open: boolean) => {} });
+  return {
+    Collapsible: ({
+      children,
+      open,
+      onOpenChange,
+    }: PropsWithChildren<{ open?: boolean; onOpenChange?: (open: boolean) => void }>) => {
+      const [internalOpen, setInternalOpen] = useState(false);
+      const context = useMemo(
+        () => ({
+          open: open ?? internalOpen,
+          setOpen(next: boolean) {
+            setInternalOpen(next);
+            onOpenChange?.(next);
+          },
+        }),
+        [open, internalOpen, onOpenChange],
+      );
+      return <Context.Provider value={context}>{children}</Context.Provider>;
+    },
+    CollapsibleTrigger: ({
+      render,
+      children,
+      ...props
+    }: PropsWithChildren<
+      ComponentProps<"button"> & { render?: ReactElement<ComponentProps<"button">> }
+    >) => {
+      const { open, setOpen } = useContext(Context);
+      const triggerProps = { ...props, "aria-expanded": open, onClick: () => setOpen(!open) };
+      return render ? (
+        cloneElement(render, triggerProps, children)
+      ) : (
+        <button {...triggerProps}>{children}</button>
+      );
+    },
+    CollapsiblePanel: ({ children }: PropsWithChildren) =>
+      useContext(Context).open ? <div>{children}</div> : null,
+  };
+});
 vi.mock("../ui/dialog", () => {
   const part = ({ children }: PropsWithChildren) => children;
   return {
@@ -189,6 +235,7 @@ vi.mock("../ui/select", () => {
   return {
     Select: ({ children, ...props }: PropsWithChildren) =>
       createElement("div", { ...props, "data-workflow-select": true }, children),
+    SelectButton: "button",
     SelectTrigger: component,
     SelectValue: component,
     SelectPopup: component,
@@ -198,7 +245,7 @@ vi.mock("../ui/select", () => {
 });
 
 import { WorkflowsPage } from "./WorkflowsPage";
-import type { useWorkflowClient } from "./workflowState";
+import { newWorkflowDraft, type useWorkflowClient } from "./workflowState";
 
 const repositoryId = RelayRepositoryId.make("repository");
 const canonicalKey = "github.com/launchpad/example";
@@ -381,6 +428,7 @@ beforeEach(() => {
   fixture.vmAutomationAvailable = false;
   fixture.projectsUnavailable = false;
   fixture.projects = [];
+  fixture.repositories = undefined;
   fixture.repositoryError = null;
   fixture.authStatus = "ready";
   fixture.signedIn = true;
@@ -770,7 +818,7 @@ it.effect("copies using the checkout catalog refreshed while the source read is 
       const source = deferred<ReadonlyArray<RepositoryWorkflow>>();
       fixture.definitions.mockReturnValueOnce(source.promise);
       const beforeCopy = deliveries.length;
-      await press("Copy saved workflow", false);
+      await press("Create draft", false);
       const copyReads = deliveries.slice(beforeCopy);
       await act(() => {
         fixture.projects = [];
@@ -797,6 +845,314 @@ it.effect("copies using the checkout catalog refreshed while the source read is 
       });
     });
   }),
+);
+
+const otherRepositoryId = RelayRepositoryId.make("other-repository");
+const otherRemote = "github.com/partner/example";
+const otherRepository = {
+  ...catalog.repositories[0]!,
+  repository: {
+    ...catalog.repositories[0]!.repository,
+    repositoryId: otherRepositoryId,
+    canonicalKeys: [otherRemote],
+  },
+};
+const destinationCheckout = {
+  ...checkout,
+  projectId: ProjectId.make("destination-project"),
+  repositoryCanonicalKey: otherRemote,
+};
+const sourceScope = { accountId: "account", organizationId: "organization", repositoryId };
+const destinationScope = { ...sourceScope, repositoryId: otherRepositoryId };
+const copySource: RepositoryWorkflow = {
+  ...vmWorkflow,
+  definition: { ...vmWorkflow.definition, target: { kind: "vm", baseBranch: "release" } },
+  automation: {
+    enabled: true,
+    trigger: {
+      provider: "linear",
+      connectionId: "connection",
+      grantId: "grant",
+      teamId: "team",
+      event: "issue_created",
+      labelIds: ["label"],
+    },
+  },
+};
+
+const publishingCopySource: RepositoryWorkflow = {
+  ...workflow,
+  revision: workflow.revision + 1,
+  definition: {
+    ...workflow.definition,
+    name: "Publish release",
+    steps: [
+      ...workflow.definition.steps,
+      { id: "push", kind: "action", title: "Push branch", action: "push" },
+    ],
+  },
+};
+
+async function openCopyDialog(source = copySource, vmAuthoring = true) {
+  fixture.tab = "workflows";
+  fixture.repositories = [...catalog.repositories, otherRepository];
+  fixture.vmAuthoring = vmAuthoring ? { models: null } : undefined;
+  fixture.definitions.mockResolvedValue([source]);
+  await mountCatalog();
+  await press(`More actions for ${source.definition.name}`);
+  await press("Copy workflow");
+}
+
+function copyOption(remote: string) {
+  return renderer!.root
+    .findAllByType("button")
+    .find(
+      (node) =>
+        typeof node.props["aria-pressed"] === "boolean" &&
+        node.findAllByType("span").some((span) => span.children.includes(remote)),
+    );
+}
+
+async function openCopyDestinationPicker() {
+  const picker = renderer!.root
+    .findAllByType("button")
+    .find((node) => node.props["aria-expanded"] === false && node.props["aria-labelledby"])!;
+  await act(() => picker.props.onClick());
+  return renderer!.root
+    .findAllByType("input")
+    .find((node) => node.props["aria-label"] === "Search destination repositories")!;
+}
+
+async function chooseOtherCopyDestination() {
+  const search = await openCopyDestinationPicker();
+  expect(copyOption(canonicalKey)?.props["aria-pressed"]).toBe(true);
+  expect(copyOption(otherRemote)?.props["aria-pressed"]).toBe(false);
+
+  await act(() => search.props.onChange({ currentTarget: { value: "partner/example" } }));
+  expect(copyOption(canonicalKey)).toBeUndefined();
+  await act(() => copyOption(otherRemote)!.props.onClick());
+  expect(copyOption(otherRemote)?.props["aria-pressed"]).toBe(true);
+}
+
+function retainedCopyDraft(scope: WorkflowScope) {
+  const state = appAtomRegistry.get(workflowDraftAtom);
+  const id = state.newWorkflowIds[workflowSessionKey(scope, "new")];
+  return id ? state.editors[workflowSessionKey(scope, id)] : undefined;
+}
+
+function setDestinationDraft(draft: WorkflowEditorDraft) {
+  updateWorkflowDrafts(appAtomRegistry, destinationScope.accountId, (state) => ({
+    ...state,
+    newWorkflowIds: {
+      ...state.newWorkflowIds,
+      [workflowSessionKey(destinationScope, "new")]: draft.workflowId,
+    },
+    editors: {
+      ...state.editors,
+      [workflowSessionKey(destinationScope, draft.workflowId)]: draft,
+    },
+  }));
+}
+
+it.effect.each(["same", "another"] as const)(
+  "creates an unsaved VM workflow copy in the %s repository",
+  (destination) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        await openCopyDialog();
+        expect(content()).toContain("Latest saved version of");
+        expect(content()).toContain("Current repository");
+        const same = destination === "same";
+        if (!same) await chooseOtherCopyDestination();
+
+        await press("Create draft");
+
+        const scope = same ? sourceScope : destinationScope;
+        expect(retainedCopyDraft(scope)).toMatchObject({
+          baseline: null,
+          automation: { enabled: false, trigger: null },
+          definition: {
+            name: `Copy of ${copySource.definition.name}`,
+            target: { kind: "vm", baseBranch: same ? "release" : null },
+            steps: copySource.definition.steps,
+          },
+        });
+        expect(retainedCopyDraft(same ? destinationScope : sourceScope)).toBeUndefined();
+        expect(fixture.save).not.toHaveBeenCalled();
+        expect(fixture.navigate).toHaveBeenLastCalledWith({
+          to: "/workflows/$repositoryId/new",
+          params: { repositoryId: scope.repositoryId },
+        });
+      });
+    }),
+);
+
+it.effect("keeps search announcements in the same status region as results change", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      await openCopyDialog();
+      const search = await openCopyDestinationPicker();
+      const statusFor = (message: string) =>
+        renderer!.root
+          .findAllByProps({ role: "status" })
+          .find(
+            (status) => status.findAll((node) => node.children.join("") === message).length > 0,
+          );
+
+      await act(() => search.props.onChange({ currentTarget: { value: "partner/example" } }));
+      const results = statusFor("1 repository found.");
+      expect(results).toBeDefined();
+      expect(copyOption(otherRemote)).toBeDefined();
+
+      await act(() => search.props.onChange({ currentTarget: { value: "not-a-repository" } }));
+      expect(statusFor("No repositories match your search.")).toBe(results);
+      expect(copyOption(otherRemote)).toBeUndefined();
+
+      await act(() => search.props.onChange({ currentTarget: { value: "partner/example" } }));
+      expect(statusFor("1 repository found.")).toBe(results);
+    });
+  }),
+);
+
+it.effect("lets users review a changed saved execution target before copying", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.projects = [checkout, destinationCheckout];
+      await openCopyDialog();
+      await chooseOtherCopyDestination();
+      expect(content()).toContain("The VM draft starts from the destination’s default branch.");
+
+      fixture.definitions.mockResolvedValue([publishingCopySource]);
+      await press("Create draft");
+
+      expect(content()).toContain(
+        "The saved workflow’s execution target changed. Review the copy before continuing.",
+      );
+      expect(content()).toContain("Publish release");
+      expect(content()).not.toContain("The VM draft starts from the destination’s default branch.");
+      expect(retainedCopyDraft(destinationScope)).toBeUndefined();
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Create draft");
+      expect(retainedCopyDraft(destinationScope)?.definition.target).toEqual({
+        kind: "machine",
+        environmentId: destinationCheckout.environmentId,
+        projectId: destinationCheckout.projectId,
+      });
+      expect(fixture.navigate).toHaveBeenCalledWith({
+        to: "/workflows/$repositoryId/new",
+        params: { repositoryId: otherRepositoryId },
+      });
+    });
+  }),
+);
+
+it.effect.each([
+  { projectsUnavailable: false, source: publishingCopySource, vmAuthoring: true },
+  { projectsUnavailable: true, source: publishingCopySource, vmAuthoring: true },
+  { projectsUnavailable: true, source: workflow, vmAuthoring: false },
+])(
+  "distinguishes missing and unavailable destination checkouts (unavailable=$projectsUnavailable, VM authoring=$vmAuthoring)",
+  ({ projectsUnavailable, source, vmAuthoring }) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.projectsUnavailable = projectsUnavailable;
+        fixture.projects = [checkout];
+        await openCopyDialog(source, vmAuthoring);
+        await chooseOtherCopyDestination();
+
+        const missingCheckout =
+          "Enroll an organization machine with a checkout in the destination repository first.";
+        if (projectsUnavailable) {
+          expect(content()).not.toContain(missingCheckout);
+          expect(content()).toContain("Could not load Machine checkouts");
+          expect(button("Create draft").props.disabled).toBe(true);
+          fixture.refreshCatalog.mockImplementationOnce(() => {
+            fixture.projectsUnavailable = false;
+            fixture.projects = [checkout, destinationCheckout];
+          });
+          await press("Retry loading checkouts");
+          expect(content()).not.toContain("Could not load Machine checkouts");
+          expect(content()).not.toContain(missingCheckout);
+          expect(button("Create draft").props.disabled).toBe(false);
+        } else {
+          expect(content()).toContain(missingCheckout);
+          expect(button("Create draft").props.disabled).toBe(true);
+        }
+        expect(retainedCopyDraft(destinationScope)).toBeUndefined();
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+it.effect("preserves a destination draft edited while replacing the copy", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      const draft = newWorkflowDraft([], "review", true)!;
+      const retained = { ...draft, definition: { ...draft.definition, name: "Release notes" } };
+      setDestinationDraft(retained);
+      await openCopyDialog();
+      await chooseOtherCopyDestination();
+      expect(content()).toContain("Release notes");
+
+      const source = deferred<ReadonlyArray<RepositoryWorkflow>>();
+      fixture.definitions.mockReturnValueOnce(source.promise);
+      const beforeCopy = deliveries.length;
+      await press("Replace draft", false);
+      const revised = {
+        ...retained,
+        definition: { ...retained.definition, name: "Revised notes" },
+      };
+      await act(async () => {
+        setDestinationDraft(revised);
+        source.resolve([copySource]);
+        await Promise.all(deliveries.slice(beforeCopy));
+      });
+
+      expect(content()).toContain(
+        "The destination draft changed while copying. Review it before continuing.",
+      );
+      expect(content()).toContain("Revised notes");
+      expect(retainedCopyDraft(destinationScope)).toBe(revised);
+      await press("Keep existing draft");
+      expect(button("Replace draft")).toBeUndefined();
+      expect(retainedCopyDraft(destinationScope)).toBe(revised);
+      expect(fixture.navigate).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect.each(["pending", "uncertain"] as const)(
+  "prevents replacing a destination draft with a %s save",
+  (state) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        const draft = newWorkflowDraft([], "review", true)!;
+        setDestinationDraft({
+          ...draft,
+          operation: {
+            requestId: "save",
+            state,
+            definition: draft.definition,
+            archived: false,
+            expectedRevision: 0,
+          },
+        });
+        await openCopyDialog();
+        await chooseOtherCopyDestination();
+
+        const replacement = button("Replace draft") ?? button("Create draft");
+        expect(replacement === undefined || replacement.props.disabled).toBe(true);
+        expect(retainedCopyDraft(destinationScope)?.operation?.state).toBe(state);
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      });
+    }),
 );
 
 it.effect("refreshes open editor dependencies and ignores a late Codex status failure", () =>

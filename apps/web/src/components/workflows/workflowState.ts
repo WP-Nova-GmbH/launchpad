@@ -146,18 +146,21 @@ export const savedWorkflowDraft = (
   error: null,
 });
 
+function workflowTemplateNeedsCheckout(template: "review" | "publish", vmAuthoring: boolean) {
+  return template === "publish" || !vmAuthoring;
+}
+
 export function newWorkflowDraft(
   projects: ReadonlyArray<RelayOrganizationProject>,
   template: "review" | "publish" = "review",
   vmAuthoring = false,
 ): WorkflowEditorDraft | null {
   const project = projects[0];
-  const target: WorkflowTarget | null =
-    template === "publish" || !vmAuthoring
-      ? project
-        ? { kind: "machine", environmentId: project.environmentId, projectId: project.projectId }
-        : null
-      : { kind: "vm", baseBranch: null };
+  const target: WorkflowTarget | null = workflowTemplateNeedsCheckout(template, vmAuthoring)
+    ? project
+      ? { kind: "machine", environmentId: project.environmentId, projectId: project.projectId }
+      : null
+    : { kind: "vm", baseBranch: null };
   if (!target) return null;
   return {
     workflowId: randomUUID(),
@@ -202,6 +205,15 @@ export function newWorkflowDraft(
   };
 }
 
+function workflowCopyTemplate(source: RepositoryWorkflow) {
+  return source.definition.steps.some((step) => step.kind === "action") ? "publish" : "review";
+}
+
+export function workflowCopyNeedsCheckout(source: RepositoryWorkflow, vmAuthoring: boolean) {
+  if (source.definition.target.kind === "vm" && !vmAuthoring) return false;
+  return workflowTemplateNeedsCheckout(workflowCopyTemplate(source), vmAuthoring);
+}
+
 export function copiedWorkflowDraft(
   source: RepositoryWorkflow,
   projects: ReadonlyArray<RelayOrganizationProject>,
@@ -209,11 +221,7 @@ export function copiedWorkflowDraft(
   vmAuthoring = false,
 ) {
   if (source.definition.target.kind === "vm" && !vmAuthoring) return null;
-  const draft = newWorkflowDraft(
-    projects,
-    source.definition.steps.some((step) => step.kind === "action") ? "publish" : "review",
-    vmAuthoring,
-  );
+  const draft = newWorkflowDraft(projects, workflowCopyTemplate(source), vmAuthoring);
   if (!draft) return null;
   const sourceTarget = source.definition.target;
   const machine =

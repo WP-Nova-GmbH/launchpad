@@ -38,6 +38,7 @@ import {
   workflowDraftAutomationResolved,
   clearWorkflowScope,
   startNewWorkflowDraft,
+  replaceNewWorkflowDraft,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
@@ -52,16 +53,7 @@ import { Button } from "../ui/button";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { Spinner } from "../ui/spinner";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
-import {
-  Dialog,
-  DialogPopup,
-  DialogTitle,
-  DialogDescription,
-  DialogHeader,
-  DialogPanel,
-  DialogFooter,
-} from "../ui/dialog";
-import { Select, SelectPopup, SelectTrigger, SelectValue, SelectItem } from "../ui/select";
+import { WorkflowCopyDialog } from "./WorkflowCopyDialog";
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
 import { WorkflowJob } from "./WorkflowJob";
@@ -74,6 +66,7 @@ import {
   savedWorkflowDraft,
   newWorkflowDraft,
   copiedWorkflowDraft,
+  workflowCopyNeedsCheckout,
   openNewWorkflowDraft,
   useActiveWorkflowView,
   confirmWorkflow,
@@ -309,6 +302,17 @@ function UnavailableWorkflowRepository({
   );
 }
 
+function workflowCopyCheckouts(
+  projects: ReadonlyArray<RelayOrganizationProject>,
+  destination: RelayRepositorySummary,
+) {
+  return projects.filter(
+    (project) =>
+      project.repositoryCanonicalKey !== null &&
+      destination.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
+  );
+}
+
 function WorkflowRepositoryView({
   scope,
   entry,
@@ -358,14 +362,46 @@ function WorkflowRepositoryView({
   const [codexRefreshVersion, setCodexRefreshVersion] = useState(0);
   const active = useActiveWorkflowView();
   const [copy, setCopy] = useState<RepositoryWorkflow | null>(null);
-  const [copyDestination, setCopyDestination] = useState<string>(scope.repositoryId);
+  const listedCopySource =
+    copy && workflows.find((workflow) => workflow.workflowId === copy.workflowId);
+  const copySource =
+    copy && listedCopySource && listedCopySource.revision > copy.revision ? listedCopySource : copy;
+  const [copyDestination, setCopyDestination] = useState<RelayRepositoryId>(scope.repositoryId);
+  const copyDestinationScope = { ...scope, repositoryId: copyDestination };
+  const copyRepository = copyRepositories.find(
+    (entry) => entry.repository.repositoryId === copyDestination,
+  );
+  const copyCheckoutIssue =
+    copySource &&
+    copyRepository &&
+    workflowCopyNeedsCheckout(copySource, !!vmAuthoring) &&
+    workflowCopyCheckouts(allProjects, copyRepository).length === 0
+      ? projectsUnavailable
+        ? "unavailable"
+        : "missing"
+      : null;
+  const copyDraftId = drafts.newWorkflowIds[workflowSessionKey(copyDestinationScope, "new")];
+  const copyDraft =
+    copyRepository && copyDraftId
+      ? drafts.editors[workflowSessionKey(copyDestinationScope, copyDraftId)]
+      : undefined;
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const copyRequest = useRef<object | null>(null);
-  const copyCatalog = useRef({ allProjects, copyRepositories, vmAuthoring });
+  const copyCatalog = useRef({
+    allProjects,
+    copyRepositories,
+    copySource,
+    vmAuthoring,
+  });
   useLayoutEffect(() => {
-    copyCatalog.current = { allProjects, copyRepositories, vmAuthoring };
-  }, [allProjects, copyRepositories, vmAuthoring]);
+    copyCatalog.current = {
+      allProjects,
+      copyRepositories,
+      copySource,
+      vmAuthoring,
+    };
+  }, [allProjects, copyRepositories, copySource, vmAuthoring]);
   useLayoutEffect(
     () => () => {
       copyRequest.current = null;
@@ -379,14 +415,13 @@ function WorkflowRepositoryView({
     setCopyError(null);
   };
   const copySaved = async () => {
-    if (!copy || copyBusy) return;
-    const destination = copyRepositories.find(
-      (entry) => entry.repository.repositoryId === copyDestination,
-    );
-    if (!destination) {
+    if (!copySource || copyRequest.current || copyDraft?.operation || copyCheckoutIssue) return;
+    if (!copyRepository) {
       setCopyError("Choose a repository you can configure.");
       return;
     }
+    // A replacement only authorizes the draft shown when the user pressed the button.
+    const expectedDraft = copyDraft;
     const request = {};
     copyRequest.current = request;
     setCopyBusy(true);
@@ -397,42 +432,41 @@ function WorkflowRepositoryView({
         await call((client, token) =>
           client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
         )
-      ).find((entry) => entry.workflowId === copy.workflowId);
+      ).find((entry) => entry.workflowId === copySource.workflowId);
       if (!owns()) return;
       if (!saved) throw new Error("The saved source workflow is no longer available.");
-      const destinationScope = { ...scope, repositoryId: destination.repository.repositoryId };
-      const readCopyOptions = () => {
-        const current = copyCatalog.current;
-        const currentDestination = current.copyRepositories.find(
-          (entry) => entry.repository.repositoryId === destinationScope.repositoryId,
+      const current = copyCatalog.current;
+      if (saved.revision < (current.copySource?.revision ?? copySource.revision))
+        throw new Error("The saved workflow changed while loading. Try again.");
+      setCopy(saved);
+      if (saved.definition.target.kind !== copySource.definition.target.kind)
+        throw new Error(
+          "The saved workflow’s execution target changed. Review the copy before continuing.",
         );
-        if (!currentDestination) throw new Error("Choose a repository you can configure.");
-        if (saved.definition.target.kind === "vm" && !current.vmAuthoring)
-          throw new Error("Update the relay to copy a VM workflow.");
-        return { current, currentDestination };
-      };
-      readCopyOptions();
-      const id = await openNewWorkflowDraft(destinationScope, () => {
-        if (!owns()) return null;
-        // A draft replacement confirmation can outlive another refresh.
-        const { current, currentDestination } = readCopyOptions();
-        const targets = current.allProjects.filter(
-          (project) =>
-            project.repositoryCanonicalKey !== null &&
-            currentDestination.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
+      const currentDestination = current.copyRepositories.find(
+        (entry) => entry.repository.repositoryId === copyDestination,
+      );
+      if (!currentDestination) throw new Error("Choose a repository you can configure.");
+      if (saved.definition.target.kind === "vm" && !current.vmAuthoring)
+        throw new Error("Update the relay to copy a VM workflow.");
+      const targets = workflowCopyCheckouts(current.allProjects, currentDestination);
+      // The dialog will show the checkout requirement for the newly read source and catalog.
+      if (workflowCopyNeedsCheckout(saved, !!current.vmAuthoring) && targets.length === 0) return;
+      const draft = copiedWorkflowDraft(
+        saved,
+        targets,
+        copyDestination === scope.repositoryId,
+        !!current.vmAuthoring,
+      );
+      if (!draft) throw new Error("Could not prepare a draft for the destination repository.");
+      if (!replaceNewWorkflowDraft(appAtomRegistry, copyDestinationScope, expectedDraft, draft))
+        throw new Error(
+          "The destination draft changed while copying. Review it before continuing.",
         );
-        return copiedWorkflowDraft(
-          saved,
-          targets,
-          destinationScope.repositoryId === scope.repositoryId,
-          !!current.vmAuthoring,
-        );
-      });
-      if (!owns() || !id) return;
       closeCopy();
       void navigate({
         to: "/workflows/$repositoryId/new",
-        params: { repositoryId: destinationScope.repositoryId },
+        params: { repositoryId: copyDestination },
       });
     } catch (cause) {
       if (owns()) setCopyError(workflowError(cause));
@@ -992,75 +1026,25 @@ function WorkflowRepositoryView({
     );
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-      {copy ? (
-        <Dialog
-          open
-          onOpenChange={(open) => {
-            if (!open) closeCopy();
+      {copySource ? (
+        <WorkflowCopyDialog
+          source={copySource}
+          sourceRepositoryId={scope.repositoryId}
+          repositories={copyRepositories}
+          destination={copyRepository}
+          existingDraft={copyDraft}
+          checkoutIssue={copyCheckoutIssue}
+          onRefreshCheckouts={refreshOrganizationCatalog}
+          busy={copyBusy}
+          error={copyError}
+          onSelectDestination={(id) => {
+            if (copyRequest.current) return;
+            setCopyDestination(id);
+            setCopyError(null);
           }}
-        >
-          <DialogPopup>
-            <DialogHeader>
-              <DialogTitle>Copy workflow</DialogTitle>
-              <DialogDescription>
-                Copy the latest saved version into an independent, unsaved draft. Your source edits
-                and run history stay here.
-              </DialogDescription>
-            </DialogHeader>
-            <DialogPanel>
-              <Select
-                value={copyDestination}
-                onValueChange={(id) => {
-                  if (id) setCopyDestination(id);
-                }}
-                disabled={copyBusy}
-              >
-                <SelectTrigger aria-label="Copy destination repository">
-                  <SelectValue>
-                    {copyRepositories.find(
-                      (entry) => entry.repository.repositoryId === copyDestination,
-                    )?.repository.name ?? "Choose a repository"}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectPopup>
-                  {copyRepositories.map((entry) => (
-                    <SelectItem
-                      key={entry.repository.repositoryId}
-                      value={entry.repository.repositoryId}
-                    >
-                      {entry.repository.name}
-                    </SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-              {copyError ? (
-                <WorkflowAlert
-                  title="Could not copy workflow"
-                  actions={
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={copyBusy}
-                      onClick={() => void copySaved()}
-                    >
-                      Retry copy
-                    </Button>
-                  }
-                >
-                  {copyError}
-                </WorkflowAlert>
-              ) : null}
-            </DialogPanel>
-            <DialogFooter>
-              <Button variant="ghost" onClick={closeCopy}>
-                Cancel
-              </Button>
-              <Button disabled={copyBusy} onClick={() => void copySaved()}>
-                {copyBusy ? "Reading saved workflow…" : "Copy saved workflow"}
-              </Button>
-            </DialogFooter>
-          </DialogPopup>
-        </Dialog>
+          onClose={closeCopy}
+          onCopy={() => void copySaved()}
+        />
       ) : null}
       <WorkspacePageHeader electron={isElectron}>
         <h1 className="text-sm font-medium">Workflows</h1>
