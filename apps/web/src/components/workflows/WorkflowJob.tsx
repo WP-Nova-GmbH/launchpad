@@ -65,7 +65,7 @@ import { useRightPanelStore } from "../../rightPanelStore";
 import { cn, randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
-import { WorkflowFlow } from "./WorkflowFlow";
+import { WorkflowProgress } from "./WorkflowProgress";
 import {
   useWorkflowClient,
   useWorkflowDrafts,
@@ -1041,16 +1041,7 @@ export function WorkflowJob({
           </a>
         ) : null}
         <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-2 border-t pt-3">
-          {selectedJob.workflow ? (
-            <details className="min-w-0 flex-[1_1_15rem]" aria-label="Run progress">
-              <summary className="cursor-pointer py-1 text-sm font-medium">
-                Workflow progress
-              </summary>
-              <div className="mt-3">
-                <WorkflowFlow definition={selectedJob.workflow.definition} job={selectedJob} />
-              </div>
-            </details>
-          ) : null}
+          <WorkflowProgress key={key} job={selectedJob} />
           {!paused ? resumeAction : null}
           {(viewerControls.canCancel || (canConfigure && manualState.canPause)) && !terminal ? (
             <details className="ml-auto min-w-0">

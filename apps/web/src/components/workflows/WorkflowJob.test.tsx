@@ -6,7 +6,12 @@ import {
   type Ref,
   createElement,
 } from "react";
-import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
+import {
+  create,
+  type ReactTestInstance,
+  type ReactTestRenderer,
+  type ReactTestRendererJSON,
+} from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
@@ -60,7 +65,6 @@ vi.mock("./workflowState", async () => ({
 vi.mock("./SavedWorkflowResults", () => ({
   SavedWorkflowResults: () => createElement("section", {}, "Saved results"),
 }));
-vi.mock("./WorkflowFlow", () => ({ WorkflowFlow: () => null }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
   TooltipTrigger: ({ render, children }: PropsWithChildren<{ render: ReactElement }>) =>
@@ -112,7 +116,9 @@ const job: RepositoryWorkflowJob = {
   updatedAt: "2026-10-27",
 };
 let renderer: ReactTestRenderer | undefined;
-function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | null): string {
+function text(
+  node: ReactTestInstance | ReactTestRendererJSON | ReactTestRendererJSON[] | string | null,
+): string {
   if (!node) return "";
   if (typeof node === "string") return node;
   return Array.isArray(node) ? node.map(text).join(" ") : (node.children ?? []).map(text).join(" ");
@@ -850,6 +856,355 @@ describe("workflow run outcomes", () => {
       ],
     },
   };
+
+  it("updates the ordered progress rows as a run moves through checkpoints and fails", async () => {
+    const runWorkflow = {
+      ...workflow,
+      definition: {
+        ...workflow.definition,
+        steps: [
+          workflow.definition.steps[0]!,
+          {
+            id: "scope",
+            title: "Confirm rollout scope",
+            kind: "input",
+            question: "Which rollout scope should we use?",
+            role: "member",
+          },
+          { id: "review", title: "Review changes", kind: "review", role: "member" },
+          {
+            id: "prepare",
+            title: "Prepare publishing",
+            kind: "agent",
+            instruction: "Prepare the reviewed change for publishing",
+            modelSelection: null,
+          },
+          workflow.definition.steps[1]!,
+          { id: "pr", title: "Open PR", kind: "action", action: "open_pull_request" },
+        ],
+      },
+    } satisfies NonNullable<RepositoryWorkflowJob["workflow"]>;
+    const phases = [
+      {
+        status: "awaiting_input",
+        completed: 1,
+        rowStatus: "waiting",
+        label: "Waiting for input",
+        summary: "Confirm rollout scope needs an answer",
+        checkpoint: {
+          kind: "input",
+          checkpointId: "scope-checkpoint",
+          stepId: "scope",
+          generation: 0,
+          role: "member",
+          question: "Which rollout scope should we use?",
+        },
+      },
+      {
+        status: "awaiting_review",
+        completed: 2,
+        rowStatus: "waiting",
+        label: "Waiting for review",
+        summary: "Review changes needs a decision",
+        checkpoint: {
+          ...job.progress!.checkpoint!,
+          stepId: "review",
+          generation: 0,
+          role: "member",
+        },
+      },
+      {
+        status: "running",
+        completed: 3,
+        rowStatus: "running",
+        label: "Running",
+        summary: "Prepare publishing is running",
+        checkpoint: null,
+      },
+      {
+        status: "running",
+        completed: 4,
+        rowStatus: "running",
+        label: "Running",
+        summary: "Push branch is running",
+        checkpoint: null,
+      },
+      {
+        status: "failed",
+        completed: 4,
+        rowStatus: "pending",
+        label: "Failed",
+        summary: "Failed at Push branch",
+        checkpoint: null,
+      },
+    ] as const;
+
+    let liveProgress: ReactTestInstance | undefined;
+    for (const [index, phase] of phases.entries()) {
+      const { completed, status } = phase;
+      const stepId = runWorkflow.definition.steps[completed]!.id;
+      fixture.call.mockResolvedValue({
+        ...job,
+        workflow: runWorkflow,
+        status,
+        progress: {
+          ...job.progress!,
+          revision: job.progress!.revision + index,
+          status,
+          stepId: status === "awaiting_review" ? undefined : stepId,
+          checkpoint: phase.checkpoint,
+          steps: runWorkflow.definition.steps.map((step, stepIndex) => ({
+            stepId: step.id,
+            generation: 0,
+            status:
+              stepIndex < completed
+                ? "completed"
+                : step.id === stepId
+                  ? phase.rowStatus
+                  : "pending",
+          })),
+        },
+      } satisfies RepositoryWorkflowJob);
+      if (index === 0) await mount();
+      else await pollRun();
+
+      const progress = renderer!.root.findByProps({ "aria-label": "Run progress" });
+      const summary = text(progress.findByType("summary")).replace(/\s+/g, " ");
+      const count = `${completed} of ${runWorkflow.definition.steps.length} steps complete`;
+      expect(summary).toContain(count);
+      expect(summary).toContain(phase.summary);
+      const currentAnnouncement = progress.parent!.findByProps({ role: "status" });
+      expect(currentAnnouncement.parent).toBe(progress.parent);
+      liveProgress ??= currentAnnouncement;
+      expect(currentAnnouncement).toBe(liveProgress);
+      const announcement = text(currentAnnouncement).replace(/\s+/g, " ");
+      expect(announcement).toContain(count);
+      expect(announcement).toContain(phase.summary);
+      const rows = progress.findByProps({ "aria-label": "Workflow steps" }).findAllByType("li");
+      expect(rows).toHaveLength(runWorkflow.definition.steps.length);
+      for (const [stepIndex, step] of runWorkflow.definition.steps.entries()) {
+        const row = text(rows[stepIndex]!);
+        expect(row).toContain(step.title);
+        expect(row).toContain(
+          stepIndex < completed
+            ? "Completed"
+            : stepIndex === completed
+              ? phase.label
+              : status === "failed"
+                ? "Not reached"
+                : "Upcoming",
+        );
+      }
+      const activeRows = progress.findAllByProps({ "aria-current": "step" });
+      expect(activeRows).toEqual(status === "failed" ? [] : [rows[completed]]);
+    }
+  });
+
+  it("does not infer a completion count or current step from missing legacy progress", async () => {
+    fixture.call.mockResolvedValue({
+      ...job,
+      workflow,
+      status: "running",
+      progress: { ...job.progress!, status: "running", checkpoint: null },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    const progress = renderer!.root.findByProps({ "aria-label": "Run progress" });
+    expect(text(progress.findByType("summary"))).not.toMatch(/steps complete/);
+    expect(progress.findAllByProps({ "aria-current": "step" })).toHaveLength(0);
+  });
+
+  const reviewWorkflow = {
+    ...workflow,
+    definition: {
+      ...workflow.definition,
+      steps: [
+        workflow.definition.steps[0]!,
+        { id: "review", title: "Review changes", kind: "review", role: "member" },
+      ],
+    },
+  } satisfies NonNullable<RepositoryWorkflowJob["workflow"]>;
+  const awaitingReview = {
+    ...job,
+    workflow: reviewWorkflow,
+    status: "awaiting_review",
+    progress: {
+      ...job.progress!,
+      status: "awaiting_review",
+      stepId: "review",
+      checkpoint: {
+        kind: "review",
+        checkpointId: "checkpoint",
+        turnId: "saved-turn",
+        checkpointRef: "ref",
+        checkpointTurnCount: 3,
+        stepId: "review",
+      },
+      steps: [
+        { stepId: "agent", generation: 0, status: "completed" },
+        { stepId: "review", generation: 0, status: "waiting" },
+      ],
+    },
+  } satisfies RepositoryWorkflowJob;
+  const vmAwaitingReview = {
+    ...awaitingReview,
+    runtime: { kind: "vm", threadId: awaitingReview.progress.threadId },
+    workflow: {
+      ...reviewWorkflow,
+      definition: {
+        ...reviewWorkflow.definition,
+        target: { kind: "vm", baseBranch: "main" },
+      },
+    },
+  } satisfies RepositoryWorkflowJob;
+  const savingAgentResult = (state: "saving" | "failed") =>
+    ({
+      ...vmAwaitingReview,
+      progress: {
+        ...vmAwaitingReview.progress,
+        stepId: "agent",
+        checkpoint: { ...awaitingReview.progress.checkpoint, stepId: "agent" },
+        hasThread: true,
+        resultSaving: {
+          publicationId: "c5540cf3-802e-41c9-b6b6-832d2f6ba867",
+          resultId: null,
+          state,
+          detail: null,
+          retryable: state === "failed",
+        },
+        steps: [
+          { stepId: "agent", generation: 0, status: "waiting" },
+          { stepId: "review", generation: 0, status: "pending" },
+        ],
+      },
+    }) satisfies RepositoryWorkflowJob;
+  const finishing = (needsRetry: boolean) =>
+    ({
+      ...awaitingReview,
+      status: "awaiting_review",
+      progress: {
+        ...awaitingReview.progress,
+        stepId: undefined,
+        approvalPending: !needsRetry,
+        retryableApproval: needsRetry,
+        steps: [
+          { stepId: "agent", generation: 0, status: "completed" },
+          { stepId: "review", generation: 0, status: "completed" },
+        ],
+      },
+    }) satisfies RepositoryWorkflowJob;
+
+  it.each([
+    [
+      "Pause requested",
+      {
+        ...awaitingReview,
+        responsePending: true,
+        pendingManualControl: { operation: "pause", controlId: "pause", expectedRevision: 3 },
+      },
+    ],
+    [
+      "Resume requested",
+      {
+        ...awaitingReview,
+        status: "paused",
+        pendingManualControl: { operation: "resume", controlId: "resume", expectedRevision: 3 },
+        progress: {
+          ...awaitingReview.progress,
+          status: "paused",
+          underlyingStatus: "awaiting_review",
+          manualPause: { state: "paused" },
+        },
+      },
+    ],
+    ["Saving result", savingAgentResult("saving"), "Agent"],
+    ["Couldn’t save result", savingAgentResult("failed"), "Agent"],
+    ["Finishing", finishing(false)],
+    ["Completion needs attention", finishing(true)],
+    [
+      "Finishing",
+      { ...finishing(true), responsePending: true, pendingResponseOperation: "approve" },
+    ],
+  ] satisfies readonly (readonly [string, RepositoryWorkflowJob, string?])[])(
+    "shows %s in workflow progress",
+    async (label, run, activeStep?: string) => {
+      fixture.call.mockResolvedValue(run);
+      await mount();
+
+      const progress = renderer!.root.findByProps({ "aria-label": "Run progress" });
+      const summary = text(progress.findByType("summary"));
+      expect(summary).toContain(label);
+      expect(summary).not.toContain("needs a decision");
+      if (activeStep) {
+        const current = progress.findByProps({ "aria-current": "step" });
+        expect(text(current)).toContain(activeStep);
+        expect(text(current)).toContain(label);
+      }
+    },
+  );
+
+  it("labels later steps as not reached on this attempt after a rework failure", async () => {
+    fixture.call.mockResolvedValue({
+      ...awaitingReview,
+      status: "failed",
+      progress: {
+        ...awaitingReview.progress,
+        status: "failed",
+        checkpoint: null,
+        stepId: "agent",
+        generation: 1,
+        hasThread: true,
+        steps: [
+          { stepId: "agent", generation: 1, status: "pending" },
+          { stepId: "review", generation: 1, status: "pending" },
+        ],
+        responses: [
+          {
+            checkpointId: "first-review",
+            stepId: "review",
+            generation: 0,
+            operation: "request_changes",
+            userId: scope.accountId,
+            text: "Refine the implementation",
+            createdAt: job.createdAt,
+          },
+        ],
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    const progress = renderer!.root.findByProps({ "aria-label": "Run progress" });
+    const [agent, review] = progress
+      .findByProps({ "aria-label": "Workflow steps" })
+      .findAllByType("li");
+    expect(text(agent!)).toContain("Failed");
+    expect(text(review!)).toContain("Not reached on this attempt");
+  });
+
+  it("marks later steps not reached when cancellation precedes the first Agent", async () => {
+    fixture.call.mockResolvedValue({
+      ...awaitingReview,
+      status: "cancelled",
+      progress: {
+        ...awaitingReview.progress,
+        status: "cancelled",
+        checkpoint: null,
+        stepId: "agent",
+        hasThread: false,
+        steps: reviewWorkflow.definition.steps.map((step) => ({
+          stepId: step.id,
+          generation: 0,
+          status: "pending",
+        })),
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    const progress = renderer!.root.findByProps({ "aria-label": "Run progress" });
+    expect(text(progress.findByType("summary"))).toContain("Canceled");
+    expect(text(progress.findByType("summary"))).not.toContain("Canceled at");
+    expect(text(progress.findAllByType("li")[1]!)).toContain("Not reached");
+  });
 
   const publishingFailure = (state: "failed" | "uncertain"): RepositoryWorkflowJob => ({
     ...job,
