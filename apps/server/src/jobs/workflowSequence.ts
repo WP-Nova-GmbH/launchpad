@@ -1,5 +1,8 @@
 import type { ThreadPromptQueue } from "@t3tools/contracts";
-import { WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_RESPONSE_SUMMARY_COUNT_LIMIT,
+  WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT,
+} from "@t3tools/contracts/workflows";
 import type { WorkflowRun } from "./WorkflowRunStore.ts";
 
 export const activeWorkflowStep = (run: WorkflowRun) =>
@@ -151,7 +154,7 @@ export function workflowProgress(run: WorkflowRun): WorkflowRun["progress"] {
       pullRequestUrl: action.pullRequestUrl,
       retryable: ["uncertain", "failed"].includes(action.state),
     })),
-    responses: sequence.responses.slice(-100).map((response) => ({
+    responses: sequence.responses.slice(-WORKFLOW_RESPONSE_SUMMARY_COUNT_LIMIT).map((response) => ({
       ...response,
       text: response.text?.slice(0, WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT) ?? null,
     })),

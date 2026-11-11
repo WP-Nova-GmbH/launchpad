@@ -16,6 +16,11 @@ import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
+import {
+  WorkflowCheckpointHistory,
+  WorkflowUnsentDrafts,
+  type RetainedCheckpointDraft,
+} from "./WorkflowCheckpoints";
 import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { useCallback, useEffect, useState, useRef, useLayoutEffect, type RefObject } from "react";
@@ -25,6 +30,7 @@ import { openPortableThreadChat } from "../../state/threads";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
+  clearAcknowledgedWorkflowDraft,
   workflowManualControlState,
   workflowActionState,
   workflowManualSubmission,
@@ -473,14 +479,48 @@ export function WorkflowJob({
       (canConfigure &&
         selectedJob.status === "finishing" &&
         selectedJob.progress?.retryableApproval));
-  const oldDrafts = Object.entries(responseDrafts).filter(
-    ([id, text]) =>
-      (!waiting ||
-        !viewerControls.canRespond ||
-        approvalPending ||
-        id !== checkpoint?.checkpointId) &&
-      !!text.trim(),
-  );
+  const oldDrafts = Object.entries(responseDrafts)
+    .filter(
+      ([id, text]) =>
+        (!waiting ||
+          !viewerControls.canRespond ||
+          approvalPending ||
+          id !== checkpoint?.checkpointId) &&
+        !!text.trim(),
+    )
+    .map(([id, text]) => ({
+      id,
+      text,
+      deliveryUnconfirmed: drafts.submitted[key]?.[id]?.text === text,
+    }));
+  const changeRetainedDraft = (draft: RetainedCheckpointDraft, restore: boolean) => {
+    const currentReads = appAtomRegistry.get(workflowJobReadAtom);
+    const currentJob = currentReads.jobs[key]?.job;
+    if (currentReads.activeKey !== key || !currentJob) return false;
+
+    let changed = false;
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+      const current = state.responses[key] ?? {};
+      const existing = current[draft.id];
+      if (restore ? existing !== undefined : existing !== draft.text) return state;
+
+      const next = { ...current };
+      if (restore) {
+        next[draft.id] = draft.text;
+        const submission = state.submitted[key]?.[draft.id];
+        if (
+          submission &&
+          clearAcknowledgedWorkflowDraft(next, submission, currentJob.progress) !== next
+        )
+          return state;
+      } else {
+        delete next[draft.id];
+      }
+      changed = true;
+      return { ...state, responses: { ...state.responses, [key]: next } };
+    });
+    return changed;
+  };
   const stepIndex =
     selectedJob.workflow?.definition.steps.findIndex((step) => step.id === checkpointStep?.id) ??
     -1;
@@ -982,69 +1022,19 @@ export function WorkflowJob({
             </Button>
           ) : null}
         </section>
-        {oldDrafts.length ? (
-          <details className="space-y-3 rounded-lg border p-4">
-            <summary className="cursor-pointer text-sm">Retained checkpoint drafts</summary>
-            {oldDrafts.map(([id, text]) => (
-              <div key={id} className="space-y-2">
-                <Textarea readOnly aria-label="Previous checkpoint draft" value={text} />
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={async () => {
-                    if (
-                      !(await confirmWorkflow(
-                        "Discard this draft? This removes the unsent response.",
-                      ))
-                    )
-                      return;
-                    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
-                      const previous = { ...state.responses[key] };
-                      delete previous[id];
-                      return { ...state, responses: { ...state.responses, [key]: previous } };
-                    });
-                  }}
-                >
-                  Discard previous draft
-                </Button>
-              </div>
-            ))}
-          </details>
-        ) : null}
-        {selectedJob.progress?.responses?.length ? (
-          <details className="border-t pt-4">
-            <summary className="cursor-pointer text-sm text-muted-foreground">
-              Checkpoint history
-            </summary>
-            <ol className="mt-3 space-y-3">
-              {selectedJob.progress.responses.map((response) => (
-                <li
-                  key={`${response.checkpointId}:${response.operation}`}
-                  className="space-y-1 text-sm"
-                >
-                  <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                    <p className="font-medium">
-                      {selectedJob.workflow?.definition.steps.find(
-                        (step) => step.id === response.stepId,
-                      )?.title ?? "Checkpoint"}
-                    </p>
-                    <span className="text-xs text-muted-foreground">
-                      Attempt {response.generation + 1}
-                    </span>
-                  </div>
-                  <p>{response.operation.replaceAll("_", " ")}</p>
-                  <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    <span>{response.userId}</span>
-                    <time dateTime={response.createdAt}>
-                      {new Date(response.createdAt).toLocaleString()}
-                    </time>
-                  </div>
-                  {response.text ? <p className="whitespace-pre-wrap">{response.text}</p> : null}
-                </li>
-              ))}
-            </ol>
-          </details>
-        ) : null}
+        <WorkflowUnsentDrafts
+          key={`drafts:${key}`}
+          drafts={oldDrafts}
+          fallbackFocus={runHeading}
+          onDiscard={(draft) => changeRetainedDraft(draft, false)}
+          onRestore={(draft) => changeRetainedDraft(draft, true)}
+        />
+        <WorkflowCheckpointHistory
+          key={`history:${key}`}
+          responses={selectedJob.progress?.responses}
+          steps={selectedJob.workflow?.definition.steps}
+          accountId={scope.accountId}
+        />
         {!completed && selectedJob.progress?.pullRequestUrl ? (
           <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer">
             Open pull request

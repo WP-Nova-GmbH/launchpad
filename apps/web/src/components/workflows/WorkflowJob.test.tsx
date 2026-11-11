@@ -492,6 +492,184 @@ describe("workflow run presentation", () => {
     ).toBe(true);
     expect(appAtomRegistry.get(workflowDraftAtom).responses[key]?.checkpoint).toBe("First draft");
   });
+  it.each(["no conflict", "newer draft", "acknowledged response"] as const)(
+    "discards only the confirmed draft and guards undo against %s",
+    async (stateAtUndo) => {
+      const key = workflowSessionKey(scope, job.jobId);
+      const original = "Earlier feedback";
+      const untouched = { checkpoint: "Current feedback", another: "Another retained draft" };
+      const currentDrafts = () => appAtomRegistry.get(workflowDraftAtom).responses[key];
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        responses: { [key]: { ...untouched, earlier: original } },
+        submitted: {
+          [key]: {
+            earlier: {
+              checkpointId: "earlier",
+              operation: "request_changes",
+              userId: scope.accountId,
+              text: original,
+            },
+          },
+        },
+      }));
+      fixture.call.mockResolvedValue(review);
+      await mount();
+      const reads = fixture.call.mock.calls.length;
+      const discardEarlier = async () => {
+        const row = renderer!.root
+          .findAllByType("p")
+          .find((paragraph) => paragraph.children.includes(original))!.parent!;
+        await act(() =>
+          row
+            .findAllByType("button")
+            .find((button) => button.children.includes("Discard draft"))!
+            .props.onClick(),
+        );
+      };
+
+      await discardEarlier();
+      expect(text(renderer!.toJSON())).toContain("Discard this draft?");
+      expect(currentDrafts()).toEqual({ ...untouched, earlier: original });
+      await press("Keep draft");
+      expect(currentDrafts()).toEqual({ ...untouched, earlier: original });
+
+      await discardEarlier();
+      await discardEarlier();
+      expect(currentDrafts()).toEqual(untouched);
+      expect(text(renderer!.toJSON())).toContain("Draft discarded");
+      expect(fixture.call).toHaveBeenCalledTimes(reads);
+
+      if (stateAtUndo === "newer draft") {
+        await act(() =>
+          updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+            ...state,
+            responses: { [key]: { ...untouched, earlier: "New feedback" } },
+          })),
+        );
+      } else if (stateAtUndo === "acknowledged response") {
+        fixture.call.mockResolvedValue({
+          ...review,
+          progress: {
+            ...review.progress!,
+            revision: 4,
+            responses: [
+              {
+                checkpointId: "earlier",
+                stepId: "review",
+                generation: 0,
+                operation: "request_changes",
+                userId: scope.accountId,
+                text: original,
+                createdAt: job.createdAt,
+              },
+            ],
+          },
+        });
+        await press("Refresh run");
+        expect(text(renderer!.toJSON())).toContain("Changes requested");
+      }
+
+      await press("Undo");
+      expect(currentDrafts()).toEqual(
+        stateAtUndo === "acknowledged response"
+          ? untouched
+          : { ...untouched, earlier: stateAtUndo === "newer draft" ? "New feedback" : original },
+      );
+    },
+  );
+
+  it("expands a long retained draft and copies its exact text from the preview", async () => {
+    const key = workflowSessionKey(scope, job.jobId);
+    const draft = "First line\rSecond line\rThird line\rFeedback after the preview";
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      responses: { [key]: { earlier: draft } },
+    }));
+    fixture.call.mockResolvedValue(review);
+    await mount();
+
+    const content = () => text(renderer!.toJSON());
+    expect(content()).toContain("Third line");
+    expect(content()).not.toContain("Feedback after the preview");
+    await press("Copy draft");
+    expect(writeText).toHaveBeenCalledWith(draft);
+
+    await press("Show full draft");
+    expect(content()).toContain(draft);
+    await press("Show preview");
+    expect(content()).not.toContain("Feedback after the preview");
+  });
+
+  it("keeps focus on the drafts section when polling removes a row with an unrelated Undo", async () => {
+    const key = workflowSessionKey(scope, job.jobId);
+    const nextDraft = "Feedback for the next checkpoint";
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      responses: { [key]: { earlier: "Feedback to discard", next: nextDraft } },
+    }));
+    fixture.call.mockResolvedValue(review);
+
+    const body = {};
+    let focused = body;
+    const rowActions: object[] = [];
+    const ownerDocument = {
+      body,
+      get activeElement() {
+        // A focused control loses DOM focus once its draft row has been removed.
+        const content = text(renderer?.toJSON() ?? null);
+        if (focused === rowActions[0] && !content.includes("Feedback to discard")) return body;
+        if (focused === rowActions[1] && !content.includes(nextDraft)) return body;
+        return focused;
+      },
+    };
+    const focusTarget = () => {
+      const node = {
+        ownerDocument,
+        focus() {
+          focused = node;
+        },
+      };
+      return node;
+    };
+    const heading = focusTarget();
+    const undo = focusTarget();
+    await mount(true, {
+      createNodeMock(element) {
+        const props = element.props as PropsWithChildren<{ role?: string }>;
+        if (element.type === "h2") return heading;
+        if (element.type === "button" && props.children === "Undo") return undo;
+        if (props.role !== "group") return null;
+        const action = {};
+        rowActions.push(action);
+        return { ownerDocument, contains: (target: unknown) => target === action };
+      },
+    });
+    expect(rowActions).toHaveLength(2);
+
+    await press("Discard draft");
+    focused = rowActions[0]!;
+    await press("Discard draft");
+    expect(ownerDocument.activeElement).toBe(undo);
+    focused = rowActions[1]!;
+
+    fixture.call.mockResolvedValue({
+      ...review,
+      progress: {
+        ...review.progress!,
+        revision: 4,
+        checkpoint: { ...review.progress!.checkpoint!, checkpointId: "next" },
+      },
+    });
+    await pollRun();
+
+    expect(findButton("Undo")).toBeDefined();
+    expect(renderer!.root.findByType("textarea").props.value).toBe(nextDraft);
+    expect(ownerDocument.activeElement).toBe(heading);
+  });
+
   it("shows capture progress and preserves focus when an automatic VM start is refused", async () => {
     const preparing: RepositoryWorkflowJob = {
       ...job,
@@ -615,6 +793,32 @@ describe("workflow run presentation", () => {
     expect(
       renderer!.root.findAll((node) => node.props["aria-label"] === "Run progress"),
     ).toHaveLength(0);
+  });
+
+  it("labels capped checkpoint history and distinguishes response previews", async () => {
+    const preview = "x".repeat(500);
+    fixture.call.mockResolvedValue({
+      ...job,
+      progress: {
+        ...job.progress!,
+        responses: Array.from({ length: 100 }, (_, index) => ({
+          checkpointId: `checkpoint-${index}`,
+          stepId: "review",
+          generation: index,
+          operation: "request_changes",
+          userId: scope.accountId,
+          text: index === 99 ? preview : `Response ${index + 1}`,
+          createdAt: job.createdAt,
+        })),
+      },
+    });
+    await mount();
+
+    const content = text(renderer!.toJSON());
+    expect(content).toMatch(/100\s+recent responses/);
+    expect(content).toContain("Response 99");
+    expect(content).toContain(preview);
+    expect(content.match(/Response preview/g)).toEqual(["Response preview"]);
   });
 });
 
