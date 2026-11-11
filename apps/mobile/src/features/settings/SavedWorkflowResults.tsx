@@ -8,6 +8,7 @@ import type { RepositoryWorkflowJob, WorkflowSavedResult } from "@t3tools/contra
 import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
   makeWorkflowSavedResultReader,
+  currentWorkflowSavedResult,
   savedWorkflowThreadState,
   canDeleteSavedWorkflowThread,
   type SavedWorkflowResultRead,
@@ -129,12 +130,14 @@ export function SavedWorkflowResults({
   call,
   refresh,
   canConfigure,
+  onReviewTargetChange,
 }: {
   scope: WorkflowScope;
   job: RepositoryWorkflowJob;
   call: Call;
   refresh: () => Promise<void>;
   canConfigure: boolean;
+  onReviewTargetChange?: (current: boolean) => void;
 }) {
   const [index, setIndex] = useState<{
     relayUrl: string;
@@ -144,6 +147,7 @@ export function SavedWorkflowResults({
     generation: number;
   } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [browsingHistory, setBrowsingHistory] = useState(false);
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
   const [view, setView] = useState<"changes" | "conversation">("changes");
@@ -153,6 +157,7 @@ export function SavedWorkflowResults({
     history: PortableThreadHistory;
     more: boolean;
   } | null>(null);
+  const [moreControlsOpen, setMoreControlsOpen] = useState(false);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -239,12 +244,33 @@ export function SavedWorkflowResults({
     job.jobId,
     job.progress?.resultSaving?.publicationId,
     job.progress?.resultSaving?.state,
+    job.progress?.checkpoint?.checkpointId,
     reader,
     retry,
     deleted,
     waitingForThread,
   ]);
   const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
+  const currentResult = currentWorkflowSavedResult(job, index?.results ?? []);
+  const reviewingCurrent = !!result && result.resultId === currentResult?.resultId;
+  useLayoutEffect(() => {
+    onReviewTargetChange?.(reviewingCurrent);
+  }, [onReviewTargetChange, reviewingCurrent]);
+  const selectResult = (id: string | null) => {
+    setBrowsingHistory(true);
+    setSelected(id);
+  };
+  const returnToCurrent = () => {
+    setView("changes");
+    setBrowsingHistory(false);
+    if (currentResult) setSelected(currentResult.resultId);
+    else setRetry((n) => n + 1);
+  };
+  const resultLabel = reviewingCurrent
+    ? job.status === "awaiting_review"
+      ? "Current review result"
+      : "Latest result"
+    : "Earlier result";
   const stepTitle = (stepId: string) =>
     job.workflow?.definition.steps.find((step) => step.id === stepId)?.title ?? stepId;
   useEffect(() => {
@@ -454,9 +480,44 @@ export function SavedWorkflowResults({
     );
   return (
     <View className="gap-3 p-4">
-      <Text accessibilityRole="header" className="font-t3-medium text-sm text-foreground">
-        Saved results
-      </Text>
+      {result ? (
+        <View className="gap-1">
+          <Text accessibilityRole="header" className="font-t3-medium text-sm text-foreground">
+            {stepTitle(result.stepId)}
+          </Text>
+          <Text className="text-xs text-foreground-muted">{resultLabel}</Text>
+          <Text className="text-xs text-foreground-muted">
+            Saved{" "}
+            {new Date(result.createdAt).toLocaleString(undefined, {
+              dateStyle: "medium",
+              timeStyle: "short",
+            })}
+          </Text>
+        </View>
+      ) : null}
+      {job.status === "awaiting_review" && result && !reviewingCurrent ? (
+        <View className="gap-1">
+          <Text className="font-t3-medium text-sm text-foreground">
+            {browsingHistory ? "Earlier result" : "A newer result needs review"}
+          </Text>
+          <Text className="text-sm text-foreground-muted">
+            {browsingHistory
+              ? "This saved result is read-only. Decisions apply to the current review."
+              : "Your opened result has been kept in place. Open the current result before deciding."}
+          </Text>
+          <SettingsActionRow
+            icon="arrow.uturn.backward"
+            label={
+              currentResult
+                ? browsingHistory
+                  ? "Return to current review"
+                  : "Review latest"
+                : "Refresh results"
+            }
+            onPress={returnToCurrent}
+          />
+        </View>
+      ) : null}
       {error ? (
         <ErrorBanner message={error}>
           <SettingsActionRow
@@ -476,10 +537,16 @@ export function SavedWorkflowResults({
             accessibilityRole="button"
             accessibilityState={{ selected: entry.resultId === selected }}
             className="mr-2 min-h-11 justify-center rounded-lg bg-card px-3"
-            onPress={() => setSelected(entry.resultId)}
+            onPress={() => selectResult(entry.resultId)}
           >
-            <Text className="text-sm text-foreground">
-              {entry.turnCount}. {stepTitle(entry.stepId)} · {entry.outcome}
+            <Text className="text-sm text-foreground">{stepTitle(entry.stepId)}</Text>
+            <Text className="text-xs text-foreground-muted">
+              {new Date(entry.createdAt).toLocaleString(undefined, {
+                dateStyle: "medium",
+                timeStyle: "short",
+              })}{" "}
+              / {entry.outcome}
+              {entry.resultId === currentResult?.resultId ? " / Current" : " / Earlier"}
             </Text>
           </Pressable>
         ))}
@@ -487,18 +554,9 @@ export function SavedWorkflowResults({
       {index?.nextCursor ? (
         <SettingsActionRow
           icon="arrow.down"
-          label="Load older Agent results"
+          label="Load older results"
           disabled={busy}
           onPress={() => void moreResults()}
-        />
-      ) : null}
-      {canDelete ? (
-        <SettingsActionRow
-          icon="trash"
-          label="Delete thread permanently"
-          tone="danger"
-          disabled={busy}
-          onPress={() => void deleteThread()}
         />
       ) : null}
       <SegmentedControl
@@ -556,6 +614,27 @@ export function SavedWorkflowResults({
               label="Load more"
               disabled={busy}
               onPress={() => void history(true)}
+            />
+          ) : null}
+        </View>
+      ) : null}
+      {canDelete ? (
+        <View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded: moreControlsOpen }}
+            className="min-h-11 justify-center"
+            onPress={() => setMoreControlsOpen((open) => !open)}
+          >
+            <Text className="text-sm text-foreground-muted">More controls</Text>
+          </Pressable>
+          {moreControlsOpen ? (
+            <SettingsActionRow
+              icon="trash"
+              label="Delete thread permanently"
+              tone="danger"
+              disabled={busy}
+              onPress={() => void deleteThread()}
             />
           ) : null}
         </View>

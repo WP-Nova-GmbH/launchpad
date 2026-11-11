@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useId, useMemo, useRef, useState } from "react";
 import * as Effect from "effect/Effect";
 import { useAtomValue } from "@effect/atom-react";
 import { threadVmControls } from "../../state/threads";
@@ -6,6 +6,7 @@ import { ThreadId, type ChatAttachment } from "@t3tools/contracts";
 import type { RepositoryWorkflowJob, WorkflowSavedResult } from "@t3tools/contracts/workflows";
 import {
   makeWorkflowSavedResultReader,
+  currentWorkflowSavedResult,
   savedWorkflowThreadState,
   canDeleteSavedWorkflowThread,
   type SavedWorkflowResultRead,
@@ -18,6 +19,9 @@ import {
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
+import { Columns2Icon, Rows3Icon } from "lucide-react";
+import { ToggleGroup, Toggle } from "../ui/toggle-group";
+import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
 import { useIsMobile } from "../../hooks/useMediaQuery";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { getRenderablePatch } from "../../lib/diffRendering";
@@ -34,14 +38,20 @@ export function SavedWorkflowResults({
   job,
   refresh,
   canConfigure,
+  onReviewTargetChange,
 }: {
   scope: WorkflowScope;
   job: RepositoryWorkflowJob;
   refresh: () => Promise<void>;
   canConfigure: boolean;
+  onReviewTargetChange?: (current: boolean) => void;
 }) {
   const call = useWorkflowClient(scope);
   const narrow = useIsMobile();
+  const { diffLayout } = useClientSettings();
+  const updateClientSettings = useUpdateClientSettings();
+  const tabId = useId();
+  const changesTab = useRef<HTMLButtonElement>(null);
   const [index, setIndex] = useState<{
     relayUrl: string;
     results: ReadonlyArray<WorkflowSavedResult>;
@@ -50,6 +60,7 @@ export function SavedWorkflowResults({
     generation: number;
   } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [browsingHistory, setBrowsingHistory] = useState(false);
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
   const [view, setView] = useState<"changes" | "conversation">("changes");
@@ -143,12 +154,34 @@ export function SavedWorkflowResults({
     job.jobId,
     job.progress?.resultSaving?.publicationId,
     job.progress?.resultSaving?.state,
+    job.progress?.checkpoint?.checkpointId,
     retry,
     reader,
     deleted,
     waitingForThread,
   ]);
   const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
+  const currentResult = currentWorkflowSavedResult(job, index?.results ?? []);
+  const reviewingCurrent = !!result && result.resultId === currentResult?.resultId;
+  useLayoutEffect(() => {
+    onReviewTargetChange?.(reviewingCurrent);
+  }, [onReviewTargetChange, reviewingCurrent]);
+  const selectResult = (id: string | null) => {
+    setBrowsingHistory(true);
+    setSelected(id);
+  };
+  const returnToCurrent = () => {
+    setView("changes");
+    changesTab.current?.focus();
+    setBrowsingHistory(false);
+    if (currentResult) setSelected(currentResult.resultId);
+    else setRetry((n) => n + 1);
+  };
+  const resultLabel = reviewingCurrent
+    ? job.status === "awaiting_review"
+      ? "Current review result"
+      : "Latest result"
+    : "Earlier result";
   const stepTitle = (stepId: string) =>
     job.workflow?.definition.steps.find((step) => step.id === stepId)?.title ?? stepId;
   useEffect(() => {
@@ -237,10 +270,10 @@ export function SavedWorkflowResults({
   }, [recordVisible]);
   const diffOptions = useMemo(
     () => ({
-      diffStyle: narrow ? ("unified" as const) : ("split" as const),
+      diffStyle: !narrow && diffLayout === "split" ? ("split" as const) : ("unified" as const),
       onPostRender: () => setRenderedId(loaded?.result.resultId ?? null),
     }),
-    [loaded?.result, narrow],
+    [loaded?.result, narrow, diffLayout],
   );
   const readConversation = useCallback(
     async (more = false) => {
@@ -409,133 +442,242 @@ export function SavedWorkflowResults({
     );
   return (
     <section aria-label="Saved workflow results" className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <h3 className="text-sm font-medium">Saved results</h3>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        {result ? (
+          <div className="min-w-0 space-y-1">
+            <h3 className="text-sm font-medium">{stepTitle(result.stepId)}</h3>
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              <span>{resultLabel}</span>
+              <time dateTime={result.createdAt}>
+                Saved{" "}
+                {new Date(result.createdAt).toLocaleString(undefined, {
+                  dateStyle: "medium",
+                  timeStyle: "short",
+                })}
+              </time>
+              {result.outcome !== "completed" ? <span>{result.outcome}</span> : null}
+            </div>
+          </div>
+        ) : null}
         {index?.results.length ? (
-          <div className="min-w-48">
-            <Select value={selected} onValueChange={setSelected}>
-              <SelectTrigger aria-label="Agent result" size="sm">
+          <div className="w-full min-w-0 sm:w-auto sm:max-w-96">
+            <Select value={selected} onValueChange={selectResult}>
+              <SelectTrigger aria-label="Saved result" size="sm">
                 <SelectValue>
                   {result
-                    ? `${stepTitle(result.stepId)} · ${result.outcome}`
-                    : "Choose an Agent result"}
+                    ? `Saved ${new Date(result.createdAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`
+                    : "Choose a saved result"}
                 </SelectValue>
               </SelectTrigger>
               <SelectPopup>
                 {index.results.map((entry) => (
                   <SelectItem key={entry.resultId} value={entry.resultId}>
-                    {entry.turnCount}. {stepTitle(entry.stepId)} · {entry.outcome}
+                    <div>
+                      <p>{stepTitle(entry.stepId)}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {new Date(entry.createdAt).toLocaleString(undefined, {
+                          dateStyle: "medium",
+                          timeStyle: "short",
+                        })}{" "}
+                        / {entry.outcome}
+                        {entry.resultId === currentResult?.resultId ? " / Current" : " / Earlier"}
+                      </p>
+                    </div>
                   </SelectItem>
                 ))}
               </SelectPopup>
             </Select>
           </div>
         ) : null}
-        <Button
-          size="sm"
-          variant={view === "changes" ? "secondary" : "ghost"}
-          onClick={() => setView("changes")}
-        >
-          Changes
-        </Button>
-        <Button
-          size="sm"
-          variant={view === "conversation" ? "secondary" : "ghost"}
-          onClick={() => setView("conversation")}
-        >
-          Conversation
-        </Button>
       </div>
-      {index?.nextCursor ? (
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => void moreResults()}>
-          Load older Agent results
-        </Button>
-      ) : null}
-      {canDelete ? (
-        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void deleteThread()}>
-          Delete thread permanently
-        </Button>
-      ) : null}
-      {error ? (
+      {job.status === "awaiting_review" && result && !reviewingCurrent ? (
         <WorkflowAlert
-          title="Could not read saved results"
+          title={browsingHistory ? "Earlier result" : "A newer result needs review"}
+          variant="info"
           actions={
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                setError(null);
-                setRetry((n) => n + 1);
-              }}
-            >
-              Retry
+            <Button size="sm" variant="outline" onClick={returnToCurrent}>
+              {currentResult
+                ? browsingHistory
+                  ? "Return to current review"
+                  : "Review latest"
+                : "Refresh results"}
             </Button>
           }
         >
-          {error}
+          {browsingHistory
+            ? "This saved result is read-only. Decisions apply to the current review."
+            : "Your opened result has been kept in place. Open the current result before deciding."}
         </WorkflowAlert>
       ) : null}
-      {!waitingForThread && !index && !error ? (
-        <p role="status" className="text-sm text-muted-foreground">
-          Loading saved results…
-        </p>
+      {index?.nextCursor ? (
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void moreResults()}>
+          Load older results
+        </Button>
       ) : null}
-      {(waitingForThread || index) && !result ? (
-        <p className="text-sm text-muted-foreground">
-          {job.status === "failed" || job.status === "cancelled"
-            ? "No safely captured Agent result is available."
-            : "No Agent result has been saved yet."}
-        </p>
-      ) : null}
-      {busy ? (
-        <p role="status" className="text-sm text-muted-foreground">
-          Loading {view}…
-        </p>
-      ) : null}
-      {view === "changes" && loaded && loaded.result.resultId === result?.resultId ? (
-        <div className="max-h-[36rem] overflow-auto rounded-lg border">
-          {loaded.patch === "" ? (
-            <p className="p-4 text-sm text-muted-foreground">No file changes.</p>
-          ) : patch?.kind === "files" ? (
-            <StyledDiffCodeView
-              options={diffOptions}
-              items={patch.files.map((fileDiff, n) => ({
-                id: `${result!.resultId}:${n}`,
-                type: "diff",
-                fileDiff,
-              }))}
-            />
-          ) : (
-            <pre className="overflow-auto p-4 text-xs">{loaded.patch}</pre>
-          )}
+      {result ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
+          <div
+            role="tablist"
+            aria-label="Saved result content"
+            className="flex gap-1"
+            onKeyDown={(event) => {
+              if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+              event.preventDefault();
+              const next =
+                event.key === "Home"
+                  ? "changes"
+                  : event.key === "End"
+                    ? "conversation"
+                    : view === "changes"
+                      ? "conversation"
+                      : "changes";
+              setView(next);
+              event.currentTarget
+                .querySelector<HTMLButtonElement>(`[id="${tabId}-${next}"]`)
+                ?.focus();
+            }}
+          >
+            {(["changes", "conversation"] as const).map((tab) => (
+              <Button
+                key={tab}
+                ref={tab === "changes" ? changesTab : undefined}
+                id={`${tabId}-${tab}`}
+                role="tab"
+                size="sm"
+                variant={view === tab ? "secondary" : "ghost"}
+                aria-selected={view === tab}
+                aria-controls={`${tabId}-panel`}
+                tabIndex={view === tab ? 0 : -1}
+                onClick={() => setView(tab)}
+              >
+                {tab === "changes" ? "Changes" : "Conversation"}
+              </Button>
+            ))}
+          </div>
+          {view === "changes" && !narrow && patch?.kind === "files" ? (
+            <ToggleGroup
+              aria-label="Diff layout"
+              variant="segmented"
+              value={[diffLayout]}
+              onValueChange={(value) => {
+                const next = value[0];
+                if (next === "stacked" || next === "split")
+                  void updateClientSettings({ diffLayout: next });
+              }}
+            >
+              <Toggle aria-label="Stacked diff view" value="stacked">
+                <Rows3Icon className="size-3.5" />
+              </Toggle>
+              <Toggle aria-label="Split diff view" value="split">
+                <Columns2Icon className="size-3.5" />
+              </Toggle>
+            </ToggleGroup>
+          ) : null}
         </div>
       ) : null}
-      {view === "conversation" && conversation && conversation.resultId === result?.resultId ? (
-        <div className="max-h-[36rem] space-y-3 overflow-auto rounded-lg border p-3">
-          {!conversation.history.thread?.messages.length ? (
-            <p className="text-sm text-muted-foreground">
-              No saved messages for this Agent result.
-            </p>
-          ) : null}
-          {conversation.history.thread?.messages.map((message) => (
-            <SavedConversationMessage
-              key={message.id}
-              message={message}
-              busy={busy}
-              onDownload={download}
-            />
-          ))}
-          {conversation.more ? (
+      <div
+        id={`${tabId}-panel`}
+        role={result ? "tabpanel" : undefined}
+        aria-labelledby={result ? `${tabId}-${view}` : undefined}
+        tabIndex={result ? 0 : undefined}
+        className="space-y-3"
+      >
+        {error ? (
+          <WorkflowAlert
+            title="Could not read saved results"
+            actions={
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setError(null);
+                  setRetry((n) => n + 1);
+                }}
+              >
+                Retry
+              </Button>
+            }
+          >
+            {error}
+          </WorkflowAlert>
+        ) : null}
+        {!waitingForThread && !index && !error ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            Loading saved results…
+          </p>
+        ) : null}
+        {(waitingForThread || index) && !result ? (
+          <p className="text-sm text-muted-foreground">
+            {job.status === "failed" || job.status === "cancelled"
+              ? "No safely captured Agent result is available."
+              : "No Agent result has been saved yet."}
+          </p>
+        ) : null}
+        {busy ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            Loading {view}…
+          </p>
+        ) : null}
+        {view === "changes" && loaded && loaded.result.resultId === result?.resultId ? (
+          <div className="min-w-0 overflow-hidden">
+            {loaded.patch === "" ? (
+              <p className="p-4 text-sm text-muted-foreground">No file changes.</p>
+            ) : patch?.kind === "files" ? (
+              <StyledDiffCodeView
+                options={diffOptions}
+                items={patch.files.map((fileDiff, n) => ({
+                  id: `${result!.resultId}:${n}`,
+                  type: "diff",
+                  fileDiff,
+                }))}
+              />
+            ) : (
+              <pre className="overflow-auto p-4 text-xs">{loaded.patch}</pre>
+            )}
+          </div>
+        ) : null}
+        {view === "conversation" && conversation && conversation.resultId === result?.resultId ? (
+          <div className="space-y-4 py-2">
+            {!conversation.history.thread?.messages.length ? (
+              <p className="text-sm text-muted-foreground">
+                No saved messages for this Agent result.
+              </p>
+            ) : null}
+            {conversation.history.thread?.messages.map((message) => (
+              <SavedConversationMessage
+                key={message.id}
+                message={message}
+                busy={busy}
+                onDownload={download}
+              />
+            ))}
+            {conversation.more ? (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy}
+                onClick={() => void readConversation(true)}
+              >
+                Load more
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      {canDelete ? (
+        <details className="border-t pt-3">
+          <summary className="cursor-pointer text-sm text-muted-foreground">More controls</summary>
+          <div className="mt-2">
             <Button
               size="sm"
-              variant="outline"
+              variant="destructive-outline"
               disabled={busy}
-              onClick={() => void readConversation(true)}
+              onClick={() => void deleteThread()}
             >
-              Load more
+              Delete thread permanently
             </Button>
-          ) : null}
-        </div>
+          </div>
+        </details>
       ) : null}
     </section>
   );

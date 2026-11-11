@@ -53,6 +53,7 @@ vi.mock("../ui/button", () => ({
 }));
 vi.mock("../ui/textarea", () => ({ Textarea: "textarea" }));
 import { WorkflowJob } from "./WorkflowJob";
+import { SavedWorkflowResults } from "./SavedWorkflowResults";
 
 const scope = {
   accountId: "account",
@@ -185,7 +186,7 @@ describe("workflow result location navigation", () => {
     });
     fixture.call.mockResolvedValue(vmReview);
     await mount(false);
-    expect(text(renderer!.toJSON())).toContain("Review changed");
+    expect(text(renderer!.toJSON())).not.toContain("Review changed");
     const approval = renderer!.root
       .findAllByType("button")
       .find((b) => b.props.children === "Approve result")!;
@@ -194,6 +195,25 @@ describe("workflow result location navigation", () => {
     await press("Approve result");
     expect(fixture.call).toHaveBeenCalledTimes(before);
     expect(fixture.open).not.toHaveBeenCalled();
+  });
+
+  it("hides decisions while an earlier result is displayed and restores them on return", async () => {
+    fixture.call.mockResolvedValue({
+      ...vmReview,
+      viewerControls: { ...vmReview.viewerControls, canRespond: true },
+    });
+    await mount(false);
+    const saved = renderer!.root.findByType(SavedWorkflowResults);
+    await act(() => saved.props.onReviewTargetChange(false));
+    expect(text(renderer!.toJSON())).not.toContain("Approve result");
+    expect(text(renderer!.toJSON())).not.toContain("Request changes");
+    await act(() => saved.props.onReviewTargetChange(true));
+    expect(text(renderer!.toJSON())).toContain("Approve result");
+    expect(text(renderer!.toJSON())).toContain("Request changes");
+    const approval = renderer!.root
+      .findAllByType("button")
+      .find((b) => b.props.children === "Approve result")!;
+    expect(approval.props.disabled).toBe(true);
   });
 
   it("shows a queued VM approval as pending before the guest acknowledges it", async () => {

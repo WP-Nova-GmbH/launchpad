@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
-import type { WorkflowSavedResult } from "@t3tools/contracts/workflows";
-import { makeWorkflowSavedResultReader } from "./workflowSavedResults.ts";
+import type { WorkflowSavedResult, RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import {
+  makeWorkflowSavedResultReader,
+  currentWorkflowSavedResult,
+} from "./workflowSavedResults.ts";
 const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b  \n";
 const result: WorkflowSavedResult = {
   resultId: "11111111-1111-4111-8111-111111111111",
@@ -65,4 +68,30 @@ describe("saved workflow result reader", () => {
       await expect(reader.read(result, async () => response)).rejects.toThrow("does not match");
     expect((await reader.read(result, async () => ({ result, patch }))).patch).toBe(patch);
   });
+});
+
+it("identifies the current review by exact checkpoint rather than result order or turn ordinal", () => {
+  const job = {
+    status: "awaiting_review",
+    progress: {
+      checkpoint: {
+        kind: "review",
+        checkpointId: "review",
+        turnId: result.turnId,
+        checkpointTurnCount: result.turnCount,
+        checkpointRef: result.checkpointRef,
+      },
+    },
+  } as RepositoryWorkflowJob;
+  const others = [
+    { ...result, outcome: "failed" as const },
+    { ...result, turnId: "other" },
+    { ...result, turnCount: 9 },
+    { ...result, checkpointRef: "other" },
+  ];
+  expect(currentWorkflowSavedResult(job, [...others, result])).toBe(result);
+  expect(currentWorkflowSavedResult(job, others)).toBeNull();
+  expect(currentWorkflowSavedResult({ ...job, status: "done" }, [others[0]!, result])).toBe(
+    others[0],
+  );
 });

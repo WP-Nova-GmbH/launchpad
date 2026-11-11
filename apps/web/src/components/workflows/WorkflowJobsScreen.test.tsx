@@ -375,7 +375,7 @@ effectIt.layer(
         repositoryId: "A",
         jobId: vmReview.jobId,
       });
-      expect(content()).toContain("Review changed");
+      expect(content()).not.toContain("Review changed");
       expect(content()).toContain("Cancel job");
       expect(content()).not.toContain("Request changes");
       const approval = renderer!.root
@@ -389,7 +389,7 @@ effectIt.layer(
       expect(fixture.openResult).not.toHaveBeenCalled();
       await act(() => renderer!.unmount());
       await mount({ repositoryId: "A", jobId: vmReview.jobId });
-      expect(content()).toContain("Review changed");
+      expect(content()).not.toContain("Review changed");
       const returnedApproval = renderer!.root
         .findAll((node) => String(node.type) === "action")
         .find((node) => node.props.label === "Approve result")!;

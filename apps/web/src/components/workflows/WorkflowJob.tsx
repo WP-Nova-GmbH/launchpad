@@ -91,6 +91,7 @@ export function WorkflowJob({
   const manualState = workflowManualControlState(selectedJob);
   const actionState = workflowActionState(selectedJob);
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
+  const [reviewingCurrentResult, setReviewingCurrentResult] = useState(true);
   const [feedbackView, setFeedbackView] = useState<{ key: string; open: boolean } | null>(null);
   const feedbackInput = useRef<HTMLTextAreaElement>(null);
   const feedbackButton = useRef<HTMLButtonElement>(null);
@@ -557,7 +558,8 @@ export function WorkflowJob({
           ) : detail ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
-          {reviewChanged || (checkingReturnedReview && !read.error) ? (
+          {(reviewChanged && selectedJob.runtime?.kind !== "vm") ||
+          (checkingReturnedReview && reviewingCurrentResult && !read.error) ? (
             <WorkflowAlert
               title={reviewChanged ? "Review changed" : "Checking the current review"}
               variant={reviewChanged ? "warning" : "info"}
@@ -567,7 +569,11 @@ export function WorkflowJob({
                 : "Checking the current review…"}
             </WorkflowAlert>
           ) : null}
-          {waiting && !input && !composingFeedback && stepIndex >= 0 ? (
+          {waiting &&
+          !input &&
+          !composingFeedback &&
+          (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) &&
+          stepIndex >= 0 ? (
             <p className="text-sm text-muted-foreground">
               {nextStep
                 ? `Approval continues to “${nextStep.title}”.`
@@ -590,6 +596,7 @@ export function WorkflowJob({
               job={selectedJob}
               refresh={refresh}
               canConfigure={canConfigure}
+              onReviewTargetChange={setReviewingCurrentResult}
             />
           ) : null}
           {selectedJob.progress?.resultSaving ? (
@@ -668,7 +675,8 @@ export function WorkflowJob({
             </WorkflowAlert>
           ) : null}
           {(approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
-          !composingFeedback ? (
+          !composingFeedback &&
+          (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) ? (
             <div className="flex flex-wrap gap-2">
               {approval ? (
                 <Button

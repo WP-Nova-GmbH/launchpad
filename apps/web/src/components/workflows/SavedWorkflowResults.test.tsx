@@ -22,6 +22,7 @@ const fixture = vi.hoisted(() => ({
   read: vi.fn(),
   deletion: vi.fn(),
   refresh: vi.fn(),
+  target: vi.fn(),
 }));
 const capability = (permanentDelete = true): ThreadVmCapabilities => ({
   configured: true,
@@ -55,6 +56,14 @@ vi.mock("../diffs/StyledDiffCodeView", () => ({
   StyledDiffCodeView: (props: Record<string, unknown>) => createElement("pre", props),
 }));
 vi.mock("../chat/SavedConversationMessage", () => ({ SavedConversationMessage: () => null }));
+vi.mock("../../hooks/useSettings", () => ({
+  useClientSettings: () => ({ diffLayout: "split" }),
+  useUpdateClientSettings: () => vi.fn(),
+}));
+vi.mock("../ui/toggle-group", () => ({
+  ToggleGroup: ({ children }: PropsWithChildren) => children,
+  Toggle: ({ children }: PropsWithChildren) => children,
+}));
 vi.mock("../ui/button", () => ({
   Button: (props: PropsWithChildren<Record<string, unknown>>) => createElement("button", props),
 }));
@@ -78,7 +87,7 @@ const result: WorkflowSavedResult = {
   turnId: "turn",
   turnCount: 1,
   outcome: "completed",
-  createdAt: "now",
+  createdAt: "2026-11-10T11:00:00Z",
   checkpointRef: "ref",
   baselineCommitId: "base",
   commitId: "commit",
@@ -125,6 +134,7 @@ const view = (currentJob = job, canConfigure = true) =>
       job: currentJob,
       refresh: fixture.refresh,
       canConfigure,
+      onReviewTargetChange: fixture.target,
     }),
   );
 async function mount(currentJob = job, canConfigure = true) {
@@ -254,6 +264,89 @@ it("reconciles deletion with the same operation after an uncertain reply", () =>
     expect(fixture.confirm).toHaveBeenCalledOnce();
     expect(JSON.stringify(renderer.toJSON())).toContain("Thread deletion requested");
     expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+  }));
+
+it("keeps earlier results read-only and returns to the exact current review", () =>
+  withClient(async () => {
+    const earlier = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      turnId: "earlier",
+      turnCount: 2,
+      createdAt: "2026-11-10T10:40:00Z",
+    };
+    fixture.list.mockResolvedValue({
+      results: [result, earlier],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+      relayUrl: "https://relay.invalid",
+    });
+    fixture.read.mockImplementation(({ resultId }: { resultId: string }) =>
+      Promise.resolve({ result: resultId === result.resultId ? result : earlier, patch }),
+    );
+    await mount();
+    await act(() => renderer.root.findByType("pre").props.options.onPostRender());
+    expect(fixture.target).toHaveBeenLastCalledWith(true);
+    await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
+    await act(() => renderer.root.findByType("pre").props.options.onPostRender());
+    expect(fixture.target).toHaveBeenLastCalledWith(false);
+    expect(JSON.stringify(renderer.toJSON())).toContain("This saved result is read-only");
+    await press("Return to current review");
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    expect(fixture.target).toHaveBeenLastCalledWith(true);
+    await act(() => renderer.root.findByType("pre").props.options.onPostRender());
+    expect(fixture.refresh).toHaveBeenCalledTimes(2);
+  }));
+it("keeps an opened diff in place when a new checkpoint arrives until Review latest", () =>
+  withClient(async () => {
+    await mount();
+    const next = {
+      ...result,
+      resultId: "44444444-4444-4444-8444-444444444444",
+      turnId: "new-turn",
+      turnCount: 5,
+      checkpointRef: "new-ref",
+      createdAt: "2026-11-10T11:15:00Z",
+    };
+    fixture.list.mockResolvedValue({
+      results: [next, result],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+      relayUrl: "https://relay.invalid",
+    });
+    fixture.read.mockImplementation(({ resultId }: { resultId: string }) =>
+      Promise.resolve({ result: resultId === next.resultId ? next : result, patch }),
+    );
+    const nextJob = {
+      ...job,
+      progress: {
+        ...job.progress!,
+        checkpoint: {
+          ...job.progress!.checkpoint!,
+          checkpointId: "next",
+          turnId: next.turnId,
+          checkpointTurnCount: next.turnCount,
+          checkpointRef: next.checkpointRef,
+        },
+      },
+    };
+    await act(() => renderer.update(view(nextJob)));
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    expect(JSON.stringify(renderer.toJSON())).toContain("A newer result needs review");
+    expect(fixture.target).toHaveBeenLastCalledWith(false);
+    await press("Review latest");
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(next.resultId);
+    expect(fixture.target).toHaveBeenLastCalledWith(true);
+  }));
+it("retries the selected result after a load failure without jumping to another result", () =>
+  withClient(async () => {
+    fixture.read.mockRejectedValueOnce(new Error("Disconnected"));
+    await mount();
+    expect(JSON.stringify(renderer.toJSON())).toContain("Disconnected");
+    await press("Retry");
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
   }));
 
 it("keeps Input-first runs empty until an Agent creates results, rather than calling them deleted", () =>

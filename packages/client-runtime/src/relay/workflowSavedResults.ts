@@ -38,6 +38,33 @@ export function canDeleteSavedWorkflowThread(
   );
 }
 
+/** Presentation only; approval still requires a rendered diff and a fresh checkpoint read. */
+export function isCurrentWorkflowReviewResult(
+  job: RepositoryWorkflowJob,
+  result: WorkflowSavedResult,
+) {
+  const checkpoint = job.progress?.checkpoint;
+  return (
+    !!checkpoint &&
+    checkpoint.kind !== "input" &&
+    result.outcome === "completed" &&
+    result.turnId === checkpoint.turnId &&
+    result.turnCount === checkpoint.checkpointTurnCount &&
+    result.checkpointRef === checkpoint.checkpointRef
+  );
+}
+
+export function currentWorkflowSavedResult(
+  job: RepositoryWorkflowJob,
+  results: ReadonlyArray<WorkflowSavedResult>,
+) {
+  return (
+    (job.status === "awaiting_review"
+      ? results.find((result) => isCurrentWorkflowReviewResult(job, result))
+      : results[0]) ?? null
+  );
+}
+
 const sameResult = Schema.toEquivalence(WorkflowSavedResult);
 export type SavedWorkflowResultRead = { result: WorkflowSavedResult; patch: string };
 

@@ -168,6 +168,7 @@ function WorkflowJobsContent(props: Props) {
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
   const responseDrafts = drafts.responses[jobKey] ?? {};
+  const [reviewingCurrentResult, setReviewingCurrentResult] = useState(true);
   const [feedbackView, setFeedbackView] = useState<{ key: string; open: boolean } | null>(null);
   const [expandedProgressKey, setExpandedProgressKey] = useState<string | null>(null);
   const checkpoint = selectedJob?.progress?.checkpoint;
@@ -697,7 +698,8 @@ function WorkflowJobsContent(props: Props) {
                   onPress={() => void refreshJob()}
                 />
               ) : null}
-              {reviewChanged || (checkingReturnedReview && !read.error) ? (
+              {(reviewChanged && selectedJob.runtime?.kind !== "vm") ||
+              (checkingReturnedReview && reviewingCurrentResult && !read.error) ? (
                 <View className="p-4">
                   <ErrorBanner
                     title={reviewChanged ? "Review changed" : "Checking the current review"}
@@ -718,6 +720,7 @@ function WorkflowJobsContent(props: Props) {
                   call={call}
                   refresh={refreshJob}
                   canConfigure={canConfigure}
+                  onReviewTargetChange={setReviewingCurrentResult}
                 />
               ) : null}
               {selectedJob.progress?.resultSaving ? (
@@ -792,6 +795,7 @@ function WorkflowJobsContent(props: Props) {
               ) : null}
               {!terminal &&
               !composingFeedback &&
+              (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) &&
               selectedJob.progress?.checkpoint &&
               viewerControls.canApprove &&
               (manualState.status === "awaiting_review" ||
@@ -823,6 +827,7 @@ function WorkflowJobsContent(props: Props) {
               ) : null}
               {!terminal &&
               !composingFeedback &&
+              (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) &&
               manualState.status === "awaiting_review" &&
               viewerControls.canRespond &&
               !approvalPending ? (
