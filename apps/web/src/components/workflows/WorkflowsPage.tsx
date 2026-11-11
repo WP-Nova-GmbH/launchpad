@@ -3,6 +3,8 @@ import { WorkflowAlert } from "./WorkflowAlert";
 import { useAtomValue } from "@effect/atom-react";
 import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
   ArrowLeftIcon,
   CopyIcon,
   EllipsisIcon,
@@ -50,6 +52,7 @@ import { searchableSetting } from "../settings/settingsSearch";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { Spinner } from "../ui/spinner";
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
 import { WorkflowCopyDialog } from "./WorkflowCopyDialog";
 import { WorkflowCatalogEmpty, WorkflowTemplateDialog } from "./WorkflowTemplateDialog";
@@ -63,6 +66,7 @@ import {
   useWorkflowDrafts,
   workflowError,
   savedWorkflowDraft,
+  restoreCheckoutIssue,
   newWorkflowDraft,
   copiedWorkflowDraft,
   workflowCopyNeedsCheckout,
@@ -358,11 +362,28 @@ function WorkflowRepositoryView({
     const baseline = drafts.editors[workflowSessionKey(scope, workflow.workflowId)]?.baseline;
     return baseline && baseline.revision > workflow.revision ? baseline : workflow;
   });
+  const archivedWorkflows = workflows.filter((workflow) => workflow.archived);
+  const archivedOnly =
+    archivedWorkflows.length > 0 && archivedWorkflows.length === workflows.length;
+  const [archiveExpanded, setArchiveExpanded] = useState<boolean | null>(null);
+  const archiveOpen = archiveExpanded ?? archivedOnly;
+  const [restoreNotice, setRestoreNotice] = useState("");
+  const [restoreFocusId, setRestoreFocusId] = useState<string | null>(null);
+  const restoreFocus = useRef<HTMLButtonElement | null>(null);
+  const restoredWorkflowEdit = useRef<HTMLButtonElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [codexRefreshVersion, setCodexRefreshVersion] = useState(0);
   const active = useActiveWorkflowView();
   const canChooseTemplate = canConfigure && view === "catalog" && tab === "workflows";
+  useLayoutEffect(() => {
+    if (!restoreFocusId) return;
+    const source = restoreFocus.current;
+    restoreFocus.current = null;
+    if (!source || !canChooseTemplate) return;
+    const { activeElement, body } = source.ownerDocument;
+    if (activeElement === source || activeElement === body) restoredWorkflowEdit.current?.focus();
+  }, [restoreFocusId, canChooseTemplate]);
   const [templateOpen, setTemplateOpen] = useState(false);
   const [templateBusy, setTemplateBusy] = useState(false);
   const [templateError, setTemplateError] = useState<string | null>(null);
@@ -633,62 +654,72 @@ function WorkflowRepositoryView({
     (workflowId
       ? (drafts.editors[workflowSessionKey(scope, workflowId)]?.baseline ?? undefined)
       : undefined);
-  const archive = async (workflow: RepositoryWorkflow) => {
+  const restore = async (workflow: RepositoryWorkflow, button: HTMLButtonElement) => {
+    const hadFocus = button.ownerDocument.activeElement === button;
     const key = workflowSessionKey(scope, workflow.workflowId);
-    const existing = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (existing?.operation?.state === "pending") return;
-    if (existing?.operation) {
-      await saveWorkflowDraft(
-        scope,
-        workflow.workflowId,
-        (payload) =>
-          call((client, token) =>
-            client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
-          ),
-        undefined,
-        {
-          automationSupported,
-          read: () =>
-            call((client, token) =>
-              client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
-            ),
-        },
+    const state = appAtomRegistry.get(workflowDraftAtom);
+    const existing = state.editors[key];
+    if (state.accountId !== scope.accountId || existing?.operation?.state === "pending") return;
+    const canRestore = () => {
+      const catalog = templateCatalog.current;
+      return (
+        active.current &&
+        catalog.canChooseTemplate &&
+        (!!existing?.operation ||
+          !restoreCheckoutIssue(workflow, catalog.projects, catalog.projectsUnavailable))
       );
-      if (active.current) void refresh();
-      return;
-    }
-    if (
-      existing &&
-      workflowEditorDirty(existing) &&
-      !(await confirmWorkflow(
-        "Discard your unsaved edits before changing this workflow's archive state?",
-      ))
-    )
-      return;
-    if (appAtomRegistry.get(workflowDraftAtom).editors[key] !== existing) return;
-    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
-      ...state,
-      editors: { ...state.editors, [key]: savedWorkflowDraft(workflow, automationSupported) },
-    }));
-    if (
-      await saveWorkflowDraft(
-        scope,
-        workflow.workflowId,
-        (payload) =>
-          call((client, token) =>
-            client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
-          ),
-        !workflow.archived,
-        {
-          automationSupported,
-          read: () =>
-            call((client, token) =>
-              client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
-            ),
-        },
+    };
+    if (!canRestore()) return;
+    if (!existing?.operation) {
+      if (
+        existing &&
+        workflowEditorDirty(existing) &&
+        !(await confirmWorkflow("Discard your unsaved edits before restoring this workflow?"))
       )
-    )
-      refresh();
+        return;
+      const current = appAtomRegistry.get(workflowDraftAtom);
+      if (
+        !canRestore() ||
+        current.accountId !== scope.accountId ||
+        current.editors[key] !== existing
+      )
+        return;
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        editors: { ...state.editors, [key]: savedWorkflowDraft(workflow, automationSupported) },
+      }));
+    }
+    if (hadFocus) {
+      restoreFocus.current = button;
+      setRestoreFocusId(null);
+    }
+    setRestoreNotice("");
+    const saved = await saveWorkflowDraft(
+      scope,
+      workflow.workflowId,
+      (payload) =>
+        call((client, token) =>
+          client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
+        ),
+      existing?.operation ? undefined : false,
+      {
+        automationSupported,
+        read: () =>
+          call((client, token) =>
+            client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+          ),
+      },
+    );
+    if (!active.current) return;
+    if (saved && !saved.archived) {
+      setArchiveExpanded((expanded) => expanded ?? true);
+      if (hadFocus && restoreFocus.current === button) setRestoreFocusId(saved.workflowId);
+      setRestoreNotice(`${saved.definition.name} restored. Automatic triggering is off.`);
+    } else if (restoreFocus.current === button) {
+      restoreFocus.current = null;
+    }
+    if (saved || existing?.operation) void refresh();
+    if (!saved) refreshOrganizationCatalog();
   };
   const canEnableTarget = (
     workflow: RepositoryWorkflow,
@@ -776,6 +807,16 @@ function WorkflowRepositoryView({
                       project.projectId === target.projectId,
                   )
                 : undefined;
+            const restoreIssue =
+              archived && restoreCheckoutIssue(workflow, projects, projectsUnavailable);
+            const restoreBlocked = !!restoreIssue && !local?.operation;
+            const canRecoverInVm =
+              restoreIssue === "missing" &&
+              projects.length === 0 &&
+              !!vmAuthoring &&
+              vmExecutionAvailable &&
+              !steps.some((step) => step.kind === "action");
+            const restoreHint = `workflow-restore-${workflow.workflowId}`;
             const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
             const canStartRun = !archived && !vmUnavailable;
             const hasRunSubmission =
@@ -793,17 +834,21 @@ function WorkflowRepositoryView({
             );
             const trigger = workflow.automation?.trigger;
             const triggerState = automationSupported ? summary?.state : undefined;
-            const triggerLabel = !automationSupported
-              ? "Automation state unavailable on this relay"
-              : triggerState === "on"
-                ? "Automatic"
-                : triggerState === "off"
-                  ? trigger
-                    ? "Automatic triggering off"
-                    : "Manual run"
-                  : triggerState === "needs_attention"
-                    ? "Needs attention"
-                    : "Automation state unavailable";
+            const triggerLabel = archived
+              ? trigger
+                ? "Automatic triggering off"
+                : "Manual run"
+              : !automationSupported
+                ? "Automation state unavailable on this relay"
+                : triggerState === "on"
+                  ? "Automatic"
+                  : triggerState === "off"
+                    ? trigger
+                      ? "Automatic triggering off"
+                      : "Manual run"
+                    : triggerState === "needs_attention"
+                      ? "Needs attention"
+                      : "Automation state unavailable";
             const triggerIssue = local?.error ?? summary?.reason;
             const canToggle =
               canConfigure &&
@@ -850,6 +895,11 @@ function WorkflowRepositoryView({
                           {machineProject.machineLabel} / {machineProject.title}
                         </span>
                       </span>
+                    ) : canConfigure && restoreBlocked ? (
+                      <span className="inline-flex items-center gap-1.5">
+                        <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                        Machine
+                      </span>
                     ) : (
                       <span>
                         {projectsUnavailable
@@ -879,11 +929,11 @@ function WorkflowRepositoryView({
                         {workflowTriggerLabel(trigger)}
                       </p>
                     ) : null}
-                    {triggerIssue && !local?.error ? (
+                    {!archived && triggerIssue && !local?.error ? (
                       <p className="text-xs text-muted-foreground">{triggerIssue}</p>
                     ) : null}
                   </div>
-                  {local?.error ? (
+                  {!archived && local?.error ? (
                     <div role="alert" className="text-xs">
                       <p className="font-medium text-error-foreground">
                         Workflow change not confirmed
@@ -891,7 +941,9 @@ function WorkflowRepositoryView({
                       <p className="text-muted-foreground">{local.error}</p>
                     </div>
                   ) : null}
-                  {canConfigure && (triggerIssue || triggerState === "needs_attention") ? (
+                  {!archived &&
+                  canConfigure &&
+                  (triggerIssue || triggerState === "needs_attention") ? (
                     <div className="pt-1">
                       <Button
                         variant="outline"
@@ -910,6 +962,11 @@ function WorkflowRepositoryView({
                       variant="ghost"
                       size="compact"
                       aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
+                      ref={
+                        !archived && restoreFocusId === workflow.workflowId
+                          ? restoredWorkflowEdit
+                          : undefined
+                      }
                       onClick={() =>
                         navigate({
                           to: "/workflows/$repositoryId/$workflowId/edit",
@@ -928,10 +985,23 @@ function WorkflowRepositoryView({
                     <Button
                       variant="outline"
                       size="compact"
-                      disabled={local?.operation?.state === "pending"}
-                      onClick={() => void archive(workflow)}
+                      aria-label={
+                        local?.operation?.state === "pending"
+                          ? `Saving ${name}`
+                          : local?.operation
+                            ? `Retry save for ${name}`
+                            : `Restore ${name}`
+                      }
+                      aria-describedby={restoreBlocked ? restoreHint : undefined}
+                      disabled={restoreBlocked || local?.operation?.state === "pending"}
+                      onClick={(event) => void restore(workflow, event.currentTarget)}
                     >
-                      {local?.operation ? "Retry save" : "Restore"}
+                      <ArchiveRestoreIcon aria-hidden />
+                      {local?.operation?.state === "pending"
+                        ? "Saving…"
+                        : local?.operation
+                          ? "Retry save"
+                          : "Restore"}
                     </Button>
                   ) : null}
                   {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
@@ -1014,6 +1084,83 @@ function WorkflowRepositoryView({
                     </Menu>
                   ) : null}
                 </div>
+                {archived && local?.error ? (
+                  <div className="col-span-full">
+                    <WorkflowAlert title="Workflow change not confirmed">
+                      {local.error}
+                    </WorkflowAlert>
+                  </div>
+                ) : null}
+                {canConfigure && restoreBlocked ? (
+                  <div id={restoreHint} className="col-span-full">
+                    <WorkflowAlert
+                      title={
+                        restoreIssue === "unavailable"
+                          ? "Could not load Machine checkouts"
+                          : "Machine checkout unavailable"
+                      }
+                      variant="warning"
+                      actions={
+                        restoreIssue === "unavailable" ? (
+                          <Button size="sm" variant="outline" onClick={refreshOrganizationCatalog}>
+                            <RefreshCwIcon aria-hidden />
+                            Retry loading checkouts
+                          </Button>
+                        ) : projects.length || canRecoverInVm ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            aria-label={
+                              canRecoverInVm
+                                ? `Choose execution target for ${name}`
+                                : `Choose checkout for ${name}`
+                            }
+                            onClick={() =>
+                              void navigate({
+                                to: "/workflows/$repositoryId/$workflowId/edit",
+                                params: {
+                                  repositoryId: scope.repositoryId,
+                                  workflowId: workflow.workflowId,
+                                },
+                                search: { settings: "execution" },
+                              })
+                            }
+                          >
+                            {canRecoverInVm ? (
+                              <CloudIcon aria-hidden />
+                            ) : (
+                              <MonitorIcon aria-hidden />
+                            )}
+                            {canRecoverInVm ? "Choose execution target" : "Choose checkout"}
+                          </Button>
+                        ) : organizationAdmin ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              void navigate({
+                                to: "/settings/organization",
+                                hash: searchableSetting("organization-machines").id,
+                              })
+                            }
+                          >
+                            Machines settings
+                          </Button>
+                        ) : null
+                      }
+                    >
+                      {restoreIssue === "unavailable"
+                        ? "Reload the checkout list before restoring this workflow."
+                        : projects.length
+                          ? "Choose and save a checkout in Workflow settings before restoring."
+                          : canRecoverInVm
+                            ? "Choose VM in Workflow settings and save before restoring."
+                            : organizationAdmin
+                              ? "To keep this workflow on a Machine, connect one with a checkout of this repository."
+                              : "To keep this workflow on a Machine, ask an organization admin to connect one with a checkout of this repository."}
+                    </WorkflowAlert>
+                  </div>
+                ) : null}
               </li>
             );
           })}
@@ -1096,6 +1243,7 @@ function WorkflowRepositoryView({
             workflow={workflow}
             workflowId={workflowId}
             isNew={!workflowId}
+            openExecutionSettings={"settings" in search && search.settings === "execution"}
             projects={projects}
             projectsUnavailable={projectsUnavailable}
             refreshProjects={refreshOrganizationCatalog}
@@ -1306,17 +1454,58 @@ function WorkflowRepositoryView({
                           : undefined
                       }
                     />
-                  ) : workflows.length > 0 && workflows.every((workflow) => workflow.archived) ? (
-                    <p className="py-6 text-sm text-muted-foreground">No active workflows.</p>
+                  ) : archivedOnly ? (
+                    <div className="flex items-start gap-3 rounded-lg border bg-card p-4 text-card-foreground">
+                      <ArchiveIcon
+                        aria-hidden
+                        className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+                      />
+                      <div className="space-y-1">
+                        <h2 className="text-sm font-semibold">No active workflows</h2>
+                        <p className="text-sm text-muted-foreground">
+                          {canConfigure
+                            ? "Restore an archived workflow to make it available again."
+                            : "A repository maintainer or organization admin can restore a workflow."}
+                        </p>
+                      </div>
+                    </div>
                   ) : null}
-                  {workflows.some((workflow) => workflow.archived) ? (
-                    <details className="mt-6">
-                      <summary className="cursor-pointer text-sm text-muted-foreground">
+                  {archivedWorkflows.length ? (
+                    <Collapsible
+                      open={archiveOpen}
+                      onOpenChange={setArchiveExpanded}
+                      className="mt-6"
+                    >
+                      <CollapsibleTrigger
+                        aria-label="Archived workflows"
+                        aria-description={`${archivedWorkflows.length} archived`}
+                        className="flex w-full items-center gap-2 rounded-md py-2 text-start text-sm font-medium"
+                      >
+                        <ChevronRightIcon
+                          aria-hidden
+                          className={archiveOpen ? "size-4 rotate-90" : "size-4"}
+                        />
                         Archived workflows
-                      </summary>
-                      {rows(true)}
-                    </details>
+                        <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                          {archivedWorkflows.length}
+                        </span>
+                      </CollapsibleTrigger>
+                      <CollapsiblePanel>
+                        {canConfigure ? (
+                          <p className="pb-3 text-xs text-muted-foreground">
+                            Automatic triggering stays off when you restore a workflow.
+                          </p>
+                        ) : null}
+                        {rows(true)}
+                      </CollapsiblePanel>
+                    </Collapsible>
                   ) : null}
+                  <p
+                    role="status"
+                    className={restoreNotice ? "mt-3 text-sm text-muted-foreground" : "sr-only"}
+                  >
+                    {restoreNotice}
+                  </p>
                 </div>
               ) : (
                 <WorkflowJobs scope={scope} workflows={workflows} refreshWorkflows={refresh} />

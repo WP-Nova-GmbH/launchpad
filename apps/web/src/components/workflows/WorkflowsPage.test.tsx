@@ -633,13 +633,18 @@ const serve = Effect.gen(function* () {
     Queue.take(reads).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
   ).pipe(Effect.forkScoped);
 });
-async function mountCatalog(view: "catalog" | "builder" = "catalog") {
+async function mountCatalog(
+  view: "catalog" | "builder" = "catalog",
+  options: Parameters<typeof create>[1] = {
+    createNodeMock: (element) => (element.type === "form" ? {} : null),
+  },
+) {
   await act(() => {
     renderer = create(
       <AppAtomRegistryProvider>
         <WorkflowsPage view={view} />
       </AppAtomRegistryProvider>,
-      { createNodeMock: (element) => (element.type === "form" ? {} : null) },
+      options,
     );
   });
   await act(async () => {
@@ -678,6 +683,201 @@ async function mountVmEditor(saved = vmWorkflow) {
     await Promise.all(deliveries);
   });
 }
+
+const archivedWorkflow: RepositoryWorkflow = {
+  ...workflow,
+  archived: true,
+  definition: { ...workflow.definition, name: "Archived review" },
+  automation: {
+    enabled: false,
+    trigger: {
+      provider: "linear",
+      connectionId: "connection",
+      grantId: "grant",
+      teamId: "team",
+      event: "issue_created",
+      labelIds: [],
+    },
+  },
+};
+
+it.effect.each([true, false])(
+  "shows the archive count and chooses an initial disclosure state (active workflows: %s)",
+  (hasActive) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.projects = [checkout];
+        const activeWorkflow = { ...workflow, workflowId: "active" };
+        fixture.definitions.mockResolvedValue(
+          hasActive ? [activeWorkflow, archivedWorkflow] : [archivedWorkflow],
+        );
+        await mountCatalog();
+
+        expect(content()).toMatch(/Archived workflows\s+1/);
+        expect(button("Archived workflows").props["aria-expanded"]).toBe(!hasActive);
+        if (hasActive) {
+          expect(content()).not.toContain("No active workflows");
+          expect(button("Restore Archived review")).toBeUndefined();
+          await press("Archived workflows");
+        } else {
+          expect(content()).toContain("No active workflows");
+        }
+        expect(button("Restore Archived review")).toBeDefined();
+      });
+    }),
+);
+
+it.effect("keeps automatic triggering off and retains its rule when restoring a workflow", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.supported = true;
+      fixture.projects = [checkout];
+      fixture.definitions.mockResolvedValue([archivedWorkflow]);
+      fixture.save.mockImplementation(async () => {
+        const restored = {
+          ...archivedWorkflow,
+          revision: archivedWorkflow.revision + 1,
+          archived: false,
+          automation: archivedWorkflow.automation,
+        };
+        fixture.definitions.mockResolvedValue([restored]);
+        return restored;
+      });
+
+      const ownerDocument = { body: {}, activeElement: {} };
+      const restoreButton = { ownerDocument };
+      const focusRestoredEdit = vi.fn();
+      await mountCatalog("catalog", {
+        createNodeMock: (element) =>
+          element.type === "button" &&
+          (element.props as { "aria-label"?: string })["aria-label"] === "Edit Archived review"
+            ? { focus: focusRestoredEdit }
+            : null,
+      });
+      expect(content()).toContain("Automatic triggering stays off");
+      ownerDocument.activeElement = restoreButton;
+      await act(async () => {
+        button("Restore Archived review").props.onClick({ currentTarget: restoreButton });
+        // Disabling/removing the Restore control returns focus to the document.
+        ownerDocument.activeElement = ownerDocument.body;
+      });
+      await act(async () => {
+        await Promise.all(deliveries);
+      });
+      expect(focusRestoredEdit).toHaveBeenCalledOnce();
+      expect(fixture.save).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          workflowId: archivedWorkflow.workflowId,
+          expectedRevision: archivedWorkflow.revision,
+          archived: false,
+          automation: archivedWorkflow.automation,
+        }),
+      );
+      expect(button("Restore Archived review")).toBeUndefined();
+      expect(button("Run for Archived review")).toBeDefined();
+    });
+  }),
+);
+
+it.effect("opens execution settings instead of restoring an unavailable Machine target", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.projects = [{ ...checkout, projectId: ProjectId.make("replacement-project") }];
+      fixture.definitions.mockResolvedValue([archivedWorkflow]);
+      await mountCatalog();
+
+      expect(content()).toContain("Machine checkout unavailable");
+      expect(button("Restore Archived review").props.disabled).toBe(true);
+      await press("Choose checkout for Archived review");
+      expect(fixture.navigate).toHaveBeenCalledWith({
+        to: "/workflows/$repositoryId/$workflowId/edit",
+        params: { repositoryId, workflowId: archivedWorkflow.workflowId },
+        search: { settings: "execution" },
+      });
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect.each([
+  { hasPublishingStep: false, vmAvailable: true },
+  { hasPublishingStep: true, vmAvailable: true },
+  { hasPublishingStep: false, vmAvailable: false },
+])(
+  "offers VM recovery without a checkout when compatible and available ($hasPublishingStep, $vmAvailable)",
+  ({ hasPublishingStep, vmAvailable }) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.vmAuthoring = { models: null };
+        fixture.vmExecutionAvailable = vmAvailable;
+        fixture.projects = [];
+        const publishingStep = {
+          id: "push",
+          title: "Push branch",
+          kind: "action",
+          action: "push",
+        } as const;
+        fixture.definitions.mockResolvedValue([
+          hasPublishingStep
+            ? {
+                ...archivedWorkflow,
+                definition: {
+                  ...archivedWorkflow.definition,
+                  steps: [...archivedWorkflow.definition.steps, publishingStep],
+                },
+              }
+            : archivedWorkflow,
+        ]);
+        await mountCatalog();
+
+        expect(button("Restore Archived review").props.disabled).toBe(true);
+        if (hasPublishingStep || !vmAvailable) {
+          expect(button("Choose execution target for Archived review")).toBeUndefined();
+          expect(content()).toContain("To keep this workflow on a Machine");
+        } else {
+          expect(content()).toContain("Choose VM in Workflow settings and save before restoring.");
+          await press("Choose execution target for Archived review");
+          expect(fixture.navigate).toHaveBeenCalledWith({
+            to: "/workflows/$repositoryId/$workflowId/edit",
+            params: { repositoryId, workflowId: archivedWorkflow.workflowId },
+            search: { settings: "execution" },
+          });
+        }
+        expect(fixture.save).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+it.effect("retries the checkout catalog before allowing restore when it could not be loaded", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.projectsUnavailable = true;
+      fixture.definitions.mockResolvedValue([archivedWorkflow]);
+      await mountCatalog();
+
+      expect(content()).not.toContain("Machine checkout unavailable");
+      expect(button("Restore Archived review").props.disabled).toBe(true);
+      expect(button("Choose checkout for Archived review")).toBeUndefined();
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projectsUnavailable = false;
+        fixture.projects = [checkout];
+      });
+      await press("Retry loading checkouts");
+      expect(button("Restore Archived review").props.disabled).toBeFalsy();
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
 
 it.effect("keeps the Run draft reachable after VM receipt recovery while gated and archived", () =>
   Effect.gen(function* () {

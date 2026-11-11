@@ -62,6 +62,7 @@ import {
   editWorkflowDraft,
   selectWorkflowStep,
   savedWorkflowDraft,
+  restoreCheckoutIssue,
   newWorkflowDraft,
   saveWorkflowDraft,
   confirmWorkflow,
@@ -83,6 +84,7 @@ type WorkflowBuilderProps = {
   repositoryName: string;
   workflow: RepositoryWorkflow | undefined;
   workflowId?: string | undefined;
+  openExecutionSettings?: boolean;
   isNew: boolean;
   projects: ReadonlyArray<RelayOrganizationProject>;
   projectsUnavailable?: boolean | undefined;
@@ -128,6 +130,7 @@ function WorkflowBuilderEditor({
   repositoryName,
   workflow,
   isNew,
+  openExecutionSettings = false,
   projects,
   projectsUnavailable,
   refreshProjects,
@@ -153,6 +156,10 @@ function WorkflowBuilderEditor({
   const state = useWorkflowDrafts();
   const key = workflowSessionKey(scope, id ?? "missing");
   const draft = id ? state.editors[key] : undefined;
+  const restoreCatalog = useRef({ projects, projectsUnavailable });
+  useLayoutEffect(() => {
+    restoreCatalog.current = { projects, projectsUnavailable };
+  }, [projects, projectsUnavailable]);
   const readRequest = useRef<{ draft: WorkflowEditorDraft } | null>(null);
   const [reading, setReading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -539,6 +546,14 @@ function WorkflowBuilderEditor({
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
     const baseline = captured?.baseline;
     if (!captured || !baseline || captured.operation) return;
+    const restoreBlocked = () =>
+      baseline.archived &&
+      !!restoreCheckoutIssue(
+        baseline,
+        restoreCatalog.current.projects,
+        restoreCatalog.current.projectsUnavailable,
+      );
+    if (restoreBlocked()) return;
     if (
       workflowEditorDirty(captured) &&
       !(await confirmWorkflow(
@@ -546,7 +561,12 @@ function WorkflowBuilderEditor({
       ))
     )
       return;
-    if (!active.current || appAtomRegistry.get(workflowDraftAtom).editors[key] !== captured) return;
+    if (
+      !active.current ||
+      appAtomRegistry.get(workflowDraftAtom).editors[key] !== captured ||
+      restoreBlocked()
+    )
+      return;
     edit(() => savedWorkflowDraft(baseline, workflowDraftAutomationResolved(captured)));
     if (
       await saveWorkflowDraft(
@@ -642,6 +662,7 @@ function WorkflowBuilderEditor({
   return (
     <WorkflowBuilderWorkspace
       repositoryName={repositoryName}
+      openExecutionSettings={openExecutionSettings}
       automationSupported={automationSupported}
       automationReason={automationReason}
       onDepart={onDepart}
@@ -687,6 +708,7 @@ type WorkflowFieldFocus = {
 
 function WorkflowBuilderWorkspace({
   repositoryName,
+  openExecutionSettings,
   draft,
   automationSupported,
   automationReason,
@@ -717,6 +739,7 @@ function WorkflowBuilderWorkspace({
   scope,
 }: {
   repositoryName: string;
+  openExecutionSettings: boolean;
   draft: WorkflowEditorDraft;
   automationSupported: boolean;
   automationReason?: string | null | undefined;
@@ -757,8 +780,10 @@ function WorkflowBuilderWorkspace({
     !!draft.baseline && (hasRunSubmission || hasRetainedInstructions || (!pending && !runBlocked));
   const vm = draft.definition.target.kind === "vm" ? draft.definition.target : null;
   const models = useWorkflowEditorModels(draft.definition, vmAuthoring?.models);
-  const [settingsOpen, setSettingsOpen] = useState(!!vmAuthoring && !draft.targetConfirmed);
-  const triggerOpen = draft.triggerSetup === true;
+  const [settingsOpen, setSettingsOpen] = useState(
+    openExecutionSettings || (!!vmAuthoring && !draft.targetConfirmed),
+  );
+  const triggerOpen = draft.triggerSetup === true && !(openExecutionSettings && settingsOpen);
   const setTriggerOpen = (open: boolean) =>
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const key = workflowSessionKey(scope, draft.workflowId),
@@ -819,9 +844,34 @@ function WorkflowBuilderWorkspace({
         ? `${target.machineLabel} · ${target.title}`
         : "Saved execution target is unavailable"
     : "Choose an execution target";
+  const restoreIssue = draft.baseline?.archived
+    ? restoreCheckoutIssue(draft.baseline, projects, projectsUnavailable)
+    : null;
+  const restoreWarning =
+    restoreIssue === "unavailable"
+      ? "Reload Machine checkouts before restoring this workflow."
+      : draft.targetConfirmed && (target || vm)
+        ? "Save the execution target before restoring this workflow."
+        : "Choose and save an available execution target before restoring this workflow.";
   const canChooseVm = !!vmAuthoring && (vmAutomationAvailable || !automation.enabled);
   const showCheckout = (!vmAuthoring || !!machine) && projects.length > 0;
+  const machineSettingsField = showCheckout
+    ? "checkout"
+    : vmAuthoring && projects.length
+      ? "target:machine"
+      : projectsUnavailable
+        ? "refresh-checkouts"
+        : "close-settings";
   const hasPublishingSteps = draft.definition.steps.some((step) => step.kind === "action");
+  const recoveryField =
+    !projectsUnavailable && !projects.length && canChooseVm && !hasPublishingSteps
+      ? "target:vm"
+      : machineSettingsField;
+  const entryFocus = useRef<WorkflowFieldFocus | null>(
+    openExecutionSettings
+      ? { field: pending ? "close-settings" : recoveryField, stepId: null }
+      : null,
+  );
   const machineDescription = projects.length
     ? "Use an enrolled repository checkout."
     : projectsUnavailable
@@ -892,6 +942,7 @@ function WorkflowBuilderWorkspace({
   }, []);
   useLayoutEffect(() => {
     mounted.current = true;
+    focusRequest.current = entryFocus.current;
     return () => {
       mounted.current = false;
       focusRequest.current = null;
@@ -984,16 +1035,7 @@ function WorkflowBuilderWorkspace({
   };
   const openMachineSettings = () => {
     openSettings();
-    setFocusRequest({
-      field: showCheckout
-        ? "checkout"
-        : vmAuthoring && projects.length
-          ? "target:machine"
-          : projectsUnavailable
-            ? "refresh-checkouts"
-            : "close-settings",
-      stepId: null,
-    });
+    setFocusRequest({ field: machineSettingsField, stepId: null });
   };
   const focusIssue = (problem: NonNullable<typeof issue>) => {
     setFocusRequest({
@@ -1388,6 +1430,15 @@ function WorkflowBuilderWorkspace({
           />
         </section>
         <footer className={styles["workflow-settings-row"]}>
+          {restoreIssue ? (
+            <p
+              id={`${settingsId}-restore-warning`}
+              role="status"
+              className="basis-full text-xs text-warning-foreground"
+            >
+              {restoreWarning}
+            </p>
+          ) : null}
           <Button type="button" variant="ghost" size="sm" onClick={() => void discard()}>
             Discard changes
           </Button>
@@ -1396,7 +1447,8 @@ function WorkflowBuilderWorkspace({
               type="button"
               variant="ghost"
               size="sm"
-              disabled={!!draft.operation}
+              disabled={!!draft.operation || !!restoreIssue}
+              aria-describedby={restoreIssue ? `${settingsId}-restore-warning` : undefined}
               onClick={() => void archive()}
             >
               {draft.baseline.archived ? "Restore workflow" : "Archive workflow"}

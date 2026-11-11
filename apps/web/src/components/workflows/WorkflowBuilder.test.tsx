@@ -912,6 +912,70 @@ describe("VM authoring", () => {
       }),
     );
 
+  it("keeps the checkout repair as a draft until saved and restores with the saved replacement", async () => {
+    const workflow = {
+      ...saved("archived-machine", 1, newWorkflowDraft([project])!.definition),
+      archived: true,
+    };
+    const replacement = { ...project, projectId: ProjectId.make("replacement") };
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      projects: [replacement],
+    });
+
+    expect(JSON.stringify(renderer!.toJSON())).toContain(
+      "Saved checkout unavailable. Choose another checkout.",
+    );
+    const restore = () =>
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => button.props.children === "Restore workflow")!;
+    expect(restore().props.disabled).toBe(true);
+    expect(editor(workflow.workflowId).definition.target).toEqual(workflow.definition.target);
+    await act(() =>
+      renderer!.root
+        .findByProps({ "data-workflow-select": true })
+        .props.onValueChange(`${replacement.environmentId}:${replacement.projectId}`),
+    );
+    const repaired = editor(workflow.workflowId).definition;
+    expect(repaired.target).toEqual({
+      kind: "machine",
+      environmentId: replacement.environmentId,
+      projectId: replacement.projectId,
+    });
+    expect(restore().props.disabled).toBe(true);
+    expect(JSON.stringify(renderer!.toJSON())).toContain(
+      "Save the execution target before restoring this workflow.",
+    );
+    await click("Restore workflow");
+    expect(confirmation).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+    expect(editor(workflow.workflowId).definition).toEqual(repaired);
+
+    const savedRepair = { ...workflow, revision: 2, definition: repaired };
+    read.mockResolvedValueOnce(savedRepair);
+    await submit();
+    expect(restore().props.disabled).toBe(false);
+
+    const restored = { ...savedRepair, revision: 3, archived: false };
+    read.mockResolvedValueOnce(restored);
+    await click("Restore workflow");
+    expect(editor(workflow.workflowId).baseline).toEqual(restored);
+  });
+
+  it("allows archiving an active workflow with a missing checkout", async () => {
+    const workflow = saved("active-machine", 1, newWorkflowDraft([project])!.definition);
+    await mount({ ...base, workflow, isNew: false, openExecutionSettings: true, projects: [] });
+
+    const archived = { ...workflow, revision: 2, archived: true };
+    read.mockResolvedValueOnce(archived);
+    await click("Archive workflow");
+    expect(editor(workflow.workflowId).baseline).toEqual(archived);
+  });
+
   it.each([true, false])(
     "keeps the saved Machine target and accounts for VM execution availability (%s)",
     async (vmExecutionAvailable) => {

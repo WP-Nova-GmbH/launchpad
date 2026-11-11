@@ -31,6 +31,22 @@ import {
 import { requestConfirmDialog } from "../../confirmDialog";
 import { WorkflowRequestNotSentError } from "./workflowOperations";
 
+export function restoreCheckoutIssue(
+  workflow: RepositoryWorkflow,
+  projects: ReadonlyArray<RelayOrganizationProject>,
+  projectsUnavailable = false,
+) {
+  const { target } = workflow.definition;
+  if (target.kind !== "machine") return null;
+  if (projectsUnavailable) return "unavailable";
+  return projects.some(
+    (project) =>
+      project.environmentId === target.environmentId && project.projectId === target.projectId,
+  )
+    ? null
+    : "missing";
+}
+
 type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
 const isCloudPublicConfigMissing = Schema.is(CloudPublicConfigMissingError);
 export const workflowError = (cause: unknown) =>
