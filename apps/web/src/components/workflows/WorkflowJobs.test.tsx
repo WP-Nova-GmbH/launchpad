@@ -145,6 +145,37 @@ it("keeps the frozen automatic workflow name when catalog metadata is unavailabl
   expect(content()).toContain("Started by workflow");
 });
 
+it("lets viewers distinguish runs awaiting input and open the intended run", async () => {
+  fixture.call.mockResolvedValueOnce({
+    jobs: [
+      {
+        ...row("first"),
+        instruction: "Check checkout",
+        status: "awaiting_input",
+        originSummary: { kind: "manual", workflowName: "Run smoke checks" },
+      },
+      {
+        ...row("second"),
+        instruction: "Check pairing",
+        status: "awaiting_input",
+        originSummary: { kind: "manual", workflowName: "Run smoke checks" },
+      },
+    ],
+    nextCursor: null,
+  });
+  await act(async () => {
+    renderer = create(
+      <WorkflowJobs scope={scope} workflows={[]} refreshWorkflows={refreshWorkflows} />,
+    );
+  });
+  await press("View run for Run smoke checks: Check checkout");
+  await press("View run for Run smoke checks: Check pairing");
+  expect(fixture.navigate.mock.calls.map(([route]) => route.params.jobId)).toEqual([
+    "first",
+    "second",
+  ]);
+});
+
 function liveBrowser() {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const browser = Object.assign(new EventTarget(), { setInterval, clearInterval });

@@ -504,7 +504,7 @@ it.effect(
         });
         expect(content()).toContain("Recovered workflow");
         expect(content()).toContain("Refreshed history run");
-        expect(content()).toContain("Completed runs, newest first.");
+        expect(button("History").props["aria-pressed"]).toBe(true);
         expect(content()).not.toContain("Metadata offline");
         expect(content()).not.toContain("Older history run");
         expect(button("Refresh runs").props.disabled).toBe(false);
