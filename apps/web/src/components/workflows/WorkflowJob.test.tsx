@@ -19,6 +19,7 @@ import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry
 
 const fixture = vi.hoisted(() => ({
   call: vi.fn(),
+  refreshCatalog: vi.fn(),
   open: vi.fn(),
   navigate: vi.fn(),
   select: vi.fn(),
@@ -96,12 +97,18 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
 }
 const view = (jobId = "job", canConfigure = true) => (
   <AppAtomRegistryProvider>
-    <WorkflowJob scope={scope} jobId={jobId} projects={[]} canConfigure={canConfigure} />
+    <WorkflowJob
+      scope={scope}
+      jobId={jobId}
+      projects={[]}
+      canConfigure={canConfigure}
+      refreshCatalog={fixture.refreshCatalog}
+    />
   </AppAtomRegistryProvider>
 );
-async function mount(canConfigure = true) {
+async function mount(canConfigure = true, options?: Parameters<typeof create>[1]) {
   await act(async () => {
-    renderer = create(view("job", canConfigure));
+    renderer = create(view("job", canConfigure), options);
   });
 }
 function deferred() {
@@ -111,16 +118,18 @@ function deferred() {
   });
   return { promise, resolve };
 }
-const conversationButton = () =>
+const findButton = (label: string) =>
   renderer!.root
     .findAllByType("button")
-    .find((button) => button.props.children === "Open conversation")!;
+    .find(
+      (button) =>
+        button.props["aria-label"] === label ||
+        button.children.filter((child) => typeof child === "string").join("") === label,
+    )!;
+const conversationButton = () => findButton("Open conversation");
 async function press(label: string) {
   await act(async () => {
-    renderer!.root
-      .findAllByType("button")
-      .find((button) => button.props["aria-label"] === label || button.props.children === label)!
-      .props.onClick();
+    findButton(label).props.onClick();
   });
 }
 beforeEach(() => {
@@ -140,6 +149,7 @@ beforeEach(() => {
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
   fixture.call.mockReset().mockResolvedValue(job);
+  fixture.refreshCatalog.mockReset();
   fixture.open.mockReset().mockResolvedValue({
     _tag: "Success",
     value: { environmentId: "moved-vm", threadId: "thread", workflowVmGeneration: 1 },
@@ -458,4 +468,206 @@ describe("workflow run presentation", () => {
       renderer!.root.findAll((node) => node.props["aria-label"] === "Run progress"),
     ).toHaveLength(0);
   });
+});
+
+it("resumes a paused input checkpoint with its answer draft intact", async () => {
+  const question = "Which environment should we roll out to first?";
+  const checkpoint = {
+    checkpointId: "rollout",
+    kind: "input",
+    role: "member",
+    stepId: "rollout",
+    generation: 0,
+    question,
+  } as const;
+  const paused: RepositoryWorkflowJob = {
+    ...job,
+    status: "paused",
+    workflow: {
+      workflowId: job.workflowId!,
+      repositoryId: job.repositoryId,
+      organizationId: scope.organizationId,
+      archived: false,
+      revision: 1,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      definition: {
+        name: "Reviewed implementation",
+        target: {
+          kind: "machine",
+          environmentId: EnvironmentId.make("original"),
+          projectId: ProjectId.make("project"),
+        },
+        steps: [
+          {
+            id: "prepare",
+            title: "Prepare changes",
+            kind: "agent",
+            instruction: "Prepare the fix.",
+            modelSelection: null,
+          },
+          { id: "rollout", title: "Confirm rollout", kind: "input", role: "member", question },
+        ],
+      },
+    },
+    progress: {
+      ...job.progress!,
+      status: "paused",
+      underlyingStatus: "awaiting_input",
+      manualPause: { state: "paused" },
+      manualPauseSupported: true,
+      checkpoint,
+    },
+  };
+  const resumed: RepositoryWorkflowJob = {
+    ...paused,
+    status: "awaiting_input",
+    progress: {
+      ...paused.progress!,
+      revision: paused.progress!.revision + 1,
+      status: "awaiting_input",
+      manualPause: null,
+    },
+  };
+  fixture.call.mockResolvedValue(paused);
+  await mount();
+  const answer = () => renderer!.root.findByType("textarea");
+  const submit = () => renderer!.root.findByProps({ type: "submit" });
+  await act(() => answer().props.onChange({ target: { value: "Staging first." } }));
+  expect(submit().props.disabled).toBe(true);
+
+  const resume = vi.fn().mockResolvedValue(resumed);
+  fixture.call
+    .mockResolvedValue(resumed)
+    .mockImplementationOnce((request) => request({ respondToWorkflowJob: resume }, "token"));
+  await press("Resume workflow");
+
+  expect(resume).toHaveBeenCalledWith(
+    expect.objectContaining({
+      jobId: job.jobId,
+      payload: expect.objectContaining({
+        operation: "resume",
+        expectedRevision: paused.progress!.revision,
+      }),
+    }),
+  );
+  expect(answer().props.value).toBe("Staging first.");
+  expect(submit().props.disabled).toBe(false);
+});
+
+it("reloads the catalog with a manual run refresh", async () => {
+  await mount();
+  expect(fixture.refreshCatalog).not.toHaveBeenCalled();
+  const reads = fixture.call.mock.calls.length;
+
+  await press("Refresh run");
+
+  expect(fixture.refreshCatalog).toHaveBeenCalledOnce();
+  expect(fixture.call).toHaveBeenCalledTimes(reads + 1);
+});
+
+it.each([
+  { action: "Open conversation", status: "awaiting_input" },
+  { action: "Resume workflow", status: "paused" },
+] as const)("keeps focus on $action when the run becomes $status", async ({ action, status }) => {
+  const pausing = status === "paused";
+  fixture.call.mockResolvedValue({
+    ...job,
+    status: "running",
+    progress: {
+      ...job.progress!,
+      status: "running",
+      checkpoint: null,
+      manualPauseSupported: true,
+      manualPause: pausing ? { state: "requested" } : null,
+    },
+  });
+  const body = {};
+  const ownerDocument = { body, activeElement: body };
+  const nodes: object[] = [];
+  await mount(true, {
+    createNodeMock(element) {
+      const { children } = element.props as PropsWithChildren;
+      if (element.type !== "button" || !Array.isArray(children) || !children.includes(action))
+        return null;
+      // Detaching the old focused element sends DOM focus back to the body.
+      if (nodes.includes(ownerDocument.activeElement)) ownerDocument.activeElement = body;
+      const node = {
+        ownerDocument,
+        disabled: false,
+        focus() {
+          ownerDocument.activeElement = node;
+        },
+      };
+      nodes.push(node);
+      return node;
+    },
+  });
+  expect(nodes).toHaveLength(1);
+  ownerDocument.activeElement = nodes[0]!;
+  fixture.call.mockResolvedValue({
+    ...job,
+    status,
+    progress: {
+      ...job.progress!,
+      revision: job.progress!.revision + 1,
+      status,
+      underlyingStatus: pausing ? "waiting_capacity" : status,
+      checkpoint: pausing
+        ? null
+        : {
+            kind: "input",
+            checkpointId: "rollout",
+            role: "member",
+            generation: 0,
+            stepId: "rollout",
+            question: "Where should this run first?",
+          },
+      manualPauseSupported: true,
+      manualPause: pausing ? { state: "paused" } : null,
+    },
+  });
+  const poll = vi.mocked(window.setInterval).mock.lastCall?.[0];
+  if (typeof poll !== "function") throw new Error("Expected a live run poll");
+  await act(() => poll());
+
+  expect(nodes).toHaveLength(2);
+  expect(ownerDocument.activeElement).toBe(nodes[1]);
+  expect(fixture.refreshCatalog).not.toHaveBeenCalled();
+});
+
+it("shows the manual hold instead of a stale capacity wait and keeps recovery details", async () => {
+  const capacityDetail = "Waiting for executor capacity.";
+  const paused = {
+    ...job,
+    status: "paused",
+    detail: capacityDetail,
+    progress: {
+      ...job.progress!,
+      status: "paused",
+      checkpoint: null,
+      detail: capacityDetail,
+      underlyingStatus: "waiting_capacity",
+      manualPauseSupported: true,
+      manualPause: { state: "paused" },
+    },
+  } satisfies RepositoryWorkflowJob;
+  fixture.call.mockResolvedValue(paused);
+  await mount();
+  const content = () => text(renderer!.toJSON());
+  expect(content()).toContain("Resume workflow");
+  expect(content()).not.toContain(capacityDetail);
+
+  const recoveryDetail = "The environment lost access to this checkout.";
+  fixture.call.mockResolvedValue({
+    ...paused,
+    detail: recoveryDetail,
+    progress: {
+      ...paused.progress,
+      revision: paused.progress.revision + 1,
+      detail: recoveryDetail,
+    },
+  });
+  await press("Refresh run");
+  expect(content()).toContain(recoveryDetail);
 });

@@ -1,5 +1,15 @@
 import { SavedWorkflowResults } from "./SavedWorkflowResults";
-import { CloudIcon, MonitorIcon, RefreshCwIcon } from "lucide-react";
+import {
+  ActivityIcon,
+  ArrowLeftIcon,
+  ArrowUpRightIcon,
+  CloudIcon,
+  MessageSquareIcon,
+  MonitorIcon,
+  PauseIcon,
+  PlayIcon,
+  RefreshCwIcon,
+} from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { WorkflowAlert } from "./WorkflowAlert";
@@ -43,7 +53,7 @@ import { TurnId } from "@t3tools/contracts";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { useDiffPanelStore } from "../../diffPanelStore";
 import { useRightPanelStore } from "../../rightPanelStore";
-import { randomUUID } from "../../lib/utils";
+import { cn, randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
 import { WorkflowFlow } from "./WorkflowFlow";
@@ -57,16 +67,47 @@ import {
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
 
+/** A run update can move an action between the task card and the secondary controls. */
+function useRunActionFocus(runKey: string) {
+  const button = useRef<HTMLButtonElement | null>(null);
+  const focusedRun = useRef<string | null>(null);
+  const registerButton = useCallback(
+    (node: HTMLButtonElement | null) => {
+      const previous = button.current;
+      if (!node && previous && previous.ownerDocument.activeElement === previous) {
+        focusedRun.current = runKey;
+      }
+      button.current = node;
+    },
+    [runKey],
+  );
+  useLayoutEffect(() => {
+    const node = button.current;
+    if (
+      focusedRun.current === runKey &&
+      node &&
+      !node.disabled &&
+      node.ownerDocument.activeElement === node.ownerDocument.body
+    ) {
+      node.focus();
+    }
+    focusedRun.current = null;
+  });
+  return registerButton;
+}
+
 export function WorkflowJob({
   scope,
   jobId,
   projects,
   canConfigure,
+  refreshCatalog,
 }: {
   scope: WorkflowScope;
   jobId: string;
   projects: ReadonlyArray<RelayOrganizationProject>;
   canConfigure: boolean;
+  refreshCatalog: () => void;
 }) {
   const navigate = useNavigate();
   const openResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
@@ -76,6 +117,8 @@ export function WorkflowJob({
   const reads = useWorkflowJobReads();
   const drafts = useWorkflowDrafts();
   const key = workflowSessionKey(scope, jobId);
+  const conversationButton = useRunActionFocus(key);
+  const resumeButton = useRunActionFocus(key);
   const resultRequest = useRef<{ key: string } | null>(null);
   useLayoutEffect(
     () => () => {
@@ -339,34 +382,60 @@ export function WorkflowJob({
       },
     }));
   };
-  if (!selectedJob)
-    return read.error ? (
-      <WorkflowAlert
-        title="Could not load this run"
-        actions={
-          <>
-            <Button variant="outline" disabled={read.reading} onClick={() => void refresh()}>
-              Refresh
-            </Button>
+  const backToRuns = () =>
+    navigate({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId: scope.repositoryId },
+      search: { tab: "runs" },
+    });
+  const refreshRun = () => {
+    refreshCatalog();
+    void refresh();
+  };
+  const runNavigation = (
+    <nav className="flex items-center justify-between gap-2" aria-label="Run navigation">
+      <Button type="button" variant="ghost" size="sm" onClick={backToRuns}>
+        <ArrowLeftIcon aria-hidden />
+        Back to runs
+      </Button>
+      <Tooltip>
+        <TooltipTrigger
+          render={
             <Button
+              type="button"
               variant="ghost"
-              onClick={() =>
-                navigate({
-                  to: "/workflows/$repositoryId",
-                  params: { repositoryId: scope.repositoryId },
-                  search: { tab: "runs" },
-                })
-              }
-            >
-              Back to runs
-            </Button>
-          </>
-        }
-      >
-        {read.error}
-      </WorkflowAlert>
-    ) : (
-      <p role="status">Loading run…</p>
+              size="icon-sm"
+              aria-label="Refresh run"
+              disabled={read.reading || busy}
+              onClick={refreshRun}
+            />
+          }
+        >
+          <RefreshCwIcon aria-hidden />
+        </TooltipTrigger>
+        <TooltipPopup>Refresh run</TooltipPopup>
+      </Tooltip>
+    </nav>
+  );
+  if (!selectedJob)
+    return (
+      <div className="mx-auto w-full max-w-3xl space-y-4">
+        {runNavigation}
+        {read.error ? (
+          <WorkflowAlert
+            title="Could not load this run"
+            actions={
+              <Button variant="outline" disabled={read.reading} onClick={refreshRun}>
+                Retry refresh
+              </Button>
+            }
+          >
+            {read.error}
+          </WorkflowAlert>
+        ) : (
+          <p role="status">Loading run…</p>
+        )}
+      </div>
     );
   const machine = selectedJob.runtime?.kind === "machine" ? selectedJob.runtime : null;
   const target = projects.find(
@@ -402,16 +471,152 @@ export function WorkflowJob({
   const completed = selectedJob.status === "done";
   const confirmationPending =
     approvalPending || manualState.responsePending || !!selectedJob.pendingManualControl;
+  const running = selectedJob.status === "running";
+  const needsInput = selectedJob.status === "awaiting_input";
+  const paused = selectedJob.status === "paused";
+  const StatusIcon = running
+    ? ActivityIcon
+    : needsInput
+      ? MessageSquareIcon
+      : paused
+        ? PauseIcon
+        : null;
+  const manualHold = paused && selectedJob.progress?.manualPause?.state === "paused";
+  const pausedBeforeStep = manualHold && manualState.status === "waiting_capacity" && !checkpoint;
+  const showPauseDetail = manualHold && !confirmationPending;
+  const statusLabel = workflowStatusLabel(selectedJob.status);
+  const taskTitle = composingFeedback
+    ? "Request changes"
+    : terminal
+      ? completed
+        ? "Workflow completed"
+        : statusLabel
+      : selectedJob.status === "queued"
+        ? "Waiting for execution"
+        : stepRepeatsWorkflowName
+          ? null
+          : (checkpointStep?.title ??
+            (StatusIcon ? null : workflowStatusLabel(manualState.status ?? selectedJob.status)));
+  const conversationInTask = running && !checkpoint;
+  const inputInTask = !!StatusIcon && input;
+  const resumeAction =
+    canConfigure && manualState.canResume ? (
+      <Button
+        type="button"
+        ref={resumeButton}
+        variant={paused ? "default" : "outline"}
+        disabled={busy}
+        onClick={() => void respond("resume")}
+      >
+        <PlayIcon aria-hidden />
+        Resume workflow
+      </Button>
+    ) : null;
+  const conversationActions =
+    !composingFeedback &&
+    selectedJob.runtime?.kind !== "vm" &&
+    selectedJob.progress &&
+    selectedJob.progress.hasThread !== false ? (
+      <div className="flex flex-wrap gap-2">
+        {checkpoint && checkpoint.kind !== "input" ? (
+          <Button
+            variant={
+              (waiting && !input) || (completed && !selectedJob.progress.pullRequestUrl)
+                ? "default"
+                : "outline"
+            }
+            disabled={openingResult || checkingReturnedReview}
+            onClick={() => void inspect(true)}
+          >
+            {completed ? "Inspect result" : "Inspect saved diff"}
+          </Button>
+        ) : null}
+        <Button
+          ref={conversationButton}
+          variant={
+            completed &&
+            !selectedJob.progress.pullRequestUrl &&
+            (!checkpoint || checkpoint.kind === "input")
+              ? "default"
+              : conversationInTask
+                ? "outline"
+                : "ghost"
+          }
+          disabled={openingResult}
+          onClick={() => void inspect(false)}
+        >
+          Open conversation
+          {conversationInTask ? <ArrowUpRightIcon aria-hidden /> : null}
+        </Button>
+      </div>
+    ) : null;
+  const checkpointResponse =
+    waiting &&
+    checkpoint &&
+    viewerControls.canRespond &&
+    !approvalPending &&
+    (input || feedbackOpen) ? (
+      <form
+        className="space-y-3"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void respond(input ? "input" : "request_changes");
+        }}
+      >
+        <label className="block space-y-2">
+          {input ? (
+            <span className="text-sm font-medium">{checkpoint.question}</span>
+          ) : (
+            <span className="sr-only">Feedback for the agent</span>
+          )}
+          <Textarea
+            ref={feedbackInput}
+            aria-label={input ? "Checkpoint answer" : "Rework feedback"}
+            placeholder={input ? undefined : "Describe the changes…"}
+            rows={input ? 3 : 5}
+            maxLength={8000}
+            value={response}
+            onChange={(event) => setResponse(event.target.value)}
+          />
+        </label>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-xs text-muted-foreground">Draft kept until acknowledged.</p>
+          <div className="ml-auto">
+            <Button
+              type="submit"
+              size="sm"
+              disabled={busy || manualState.checkpointBlocked || !response.trim()}
+            >
+              {manualState.responsePending
+                ? "Response pending"
+                : input
+                  ? "Submit answer"
+                  : "Send changes"}
+            </Button>
+          </div>
+        </div>
+      </form>
+    ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
+      <p className="text-sm text-muted-foreground">
+        This checkpoint requires a repository maintainer.
+      </p>
+    ) : null;
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl space-y-6 wrap-anywhere">
+      {runNavigation}
       <header>
+        <span role="status" className="sr-only">
+          {statusLabel}
+        </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 className="text-xl font-semibold">
             {selectedJob.workflow?.definition.name ?? "Workflow run"}
           </h1>
-          <span role="status" className="text-sm font-medium">
-            {workflowStatusLabel(selectedJob.status)}
-          </span>
+          {!StatusIcon ? (
+            <span aria-hidden className="text-sm font-medium">
+              {statusLabel}
+            </span>
+          ) : null}
         </div>
         <WorkflowIssueDetails key={key} job={selectedJob} />
         {selectedJob.origin?.kind === "automation" ? (
@@ -444,12 +649,7 @@ export function WorkflowJob({
         <WorkflowAlert
           title="Could not refresh this run"
           actions={
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={read.reading}
-              onClick={() => void refresh()}
-            >
+            <Button variant="outline" size="sm" disabled={read.reading} onClick={refreshRun}>
               Retry refresh
             </Button>
           }
@@ -458,53 +658,56 @@ export function WorkflowJob({
         </WorkflowAlert>
       ) : null}
       <div className="min-w-0 space-y-5">
-        <section className="space-y-4 border-t pt-5" aria-label="Current workflow task">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            {!terminal && stepIndex >= 0 ? (
-              <div className="min-w-0 space-y-1">
-                <p className="text-xs text-muted-foreground">
-                  Step {stepIndex + 1} of {selectedJob.workflow!.definition.steps.length}
-                </p>
-                {composingFeedback && checkpointStep && !stepRepeatsWorkflowName ? (
-                  <p className="text-sm text-muted-foreground">{checkpointStep.title}</p>
+        <section className="space-y-4" aria-label="Current workflow task">
+          <div
+            className={
+              StatusIcon
+                ? "space-y-3 rounded-lg border bg-card p-4 text-card-foreground"
+                : "space-y-3 border-t pt-5"
+            }
+          >
+            {StatusIcon || (!terminal && stepIndex >= 0) ? (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                {StatusIcon ? (
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "inline-flex items-center gap-2 text-sm font-medium",
+                      needsInput && "text-warning-foreground",
+                      running && "text-info-foreground",
+                    )}
+                  >
+                    <StatusIcon aria-hidden className="size-4" />
+                    {statusLabel}
+                  </span>
+                ) : null}
+                {!terminal && stepIndex >= 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    {pausedBeforeStep ? "Next step" : "Step"} {stepIndex + 1} of{" "}
+                    {selectedJob.workflow!.definition.steps.length}
+                  </p>
                 ) : null}
               </div>
-            ) : (
-              <span />
-            )}
-            <div className="ml-auto">
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label="Refresh run"
-                      disabled={read.reading}
-                      onClick={() => void refresh()}
-                    />
-                  }
-                >
-                  <RefreshCwIcon aria-hidden />
-                </TooltipTrigger>
-                <TooltipPopup>Refresh run</TooltipPopup>
-              </Tooltip>
-            </div>
-          </div>
-          {!stepRepeatsWorkflowName || composingFeedback || terminal ? (
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-sm font-medium">
-                {composingFeedback
-                  ? "Request changes"
-                  : terminal
-                    ? completed
-                      ? "Workflow completed"
-                      : workflowStatusLabel(selectedJob.status)
-                    : selectedJob.status === "queued"
-                      ? "Waiting for execution"
-                      : (checkpointStep?.title ??
-                        workflowStatusLabel(manualState.status ?? selectedJob.status))}
-              </h2>
+            ) : null}
+            {composingFeedback && checkpointStep && !stepRepeatsWorkflowName ? (
+              <p className="text-sm text-muted-foreground">{checkpointStep.title}</p>
+            ) : null}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0 space-y-1">
+                {taskTitle ? (
+                  <h2 className={StatusIcon ? "text-base font-semibold" : "text-sm font-medium"}>
+                    {taskTitle}
+                  </h2>
+                ) : null}
+                {conversationInTask && nextStep ? (
+                  <p className="text-xs text-muted-foreground">Up next is {nextStep.title}.</p>
+                ) : null}
+                {showPauseDetail ? (
+                  <p className="text-xs text-muted-foreground">
+                    Setup and previews remain running.
+                  </p>
+                ) : null}
+              </div>
               {composingFeedback ? (
                 <Button
                   type="button"
@@ -518,14 +721,17 @@ export function WorkflowJob({
                   Back to review
                 </Button>
               ) : null}
+              {conversationInTask ? conversationActions : null}
+              {paused ? resumeAction : null}
             </div>
-          ) : null}
+            {inputInTask ? checkpointResponse : null}
+          </div>
           {selectedJob.status === "queued" ? (
             <p className="text-sm text-muted-foreground">
               Waiting for an execution target. No steps have started.
             </p>
           ) : null}
-          {manualState.message ? (
+          {manualState.message && !showPauseDetail ? (
             <WorkflowAlert
               title={confirmationPending ? "Waiting for confirmation" : "Run needs attention"}
               variant={confirmationPending ? "info" : "warning"}
@@ -537,17 +743,7 @@ export function WorkflowJob({
             <WorkflowAlert
               title="Run failed"
               actions={
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    navigate({
-                      to: "/workflows/$repositoryId",
-                      params: { repositoryId: scope.repositoryId },
-                      search: { tab: "runs" },
-                    })
-                  }
-                >
+                <Button variant="outline" size="sm" onClick={backToRuns}>
                   Back to runs
                 </Button>
               }
@@ -555,7 +751,7 @@ export function WorkflowJob({
               {detail ??
                 "This run stopped before completing. Open its conversation to review the result."}
             </WorkflowAlert>
-          ) : detail ? (
+          ) : detail && !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
           {(reviewChanged && selectedJob.runtime?.kind !== "vm") ||
@@ -624,39 +820,7 @@ export function WorkflowJob({
                 "The next step starts after this result is saved. Cancel remains available."}
             </WorkflowAlert>
           ) : null}
-          {!composingFeedback &&
-          selectedJob.runtime?.kind !== "vm" &&
-          selectedJob.progress &&
-          selectedJob.progress.hasThread !== false ? (
-            <div className="flex flex-wrap gap-2">
-              {checkpoint && checkpoint.kind !== "input" ? (
-                <Button
-                  variant={
-                    (waiting && !input) || (completed && !selectedJob.progress.pullRequestUrl)
-                      ? "default"
-                      : "outline"
-                  }
-                  disabled={openingResult || checkingReturnedReview}
-                  onClick={() => void inspect(true)}
-                >
-                  {completed ? "Inspect result" : "Inspect saved diff"}
-                </Button>
-              ) : null}
-              <Button
-                variant={
-                  completed &&
-                  !selectedJob.progress.pullRequestUrl &&
-                  (!checkpoint || checkpoint.kind === "input")
-                    ? "default"
-                    : "ghost"
-                }
-                disabled={openingResult}
-                onClick={() => void inspect(false)}
-              >
-                Open conversation
-              </Button>
-            </div>
-          ) : null}
+          {!conversationInTask ? conversationActions : null}
           {resultError ? (
             <WorkflowAlert
               title="Could not open the result"
@@ -723,56 +887,7 @@ export function WorkflowJob({
               ) : null}
             </div>
           ) : null}
-          {waiting &&
-          checkpoint &&
-          viewerControls.canRespond &&
-          !approvalPending &&
-          (input || feedbackOpen) ? (
-            <form
-              className="space-y-3"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void respond(input ? "input" : "request_changes");
-              }}
-            >
-              <label className="block space-y-2">
-                {input ? (
-                  <span className="text-sm font-medium">{checkpoint.question}</span>
-                ) : (
-                  <span className="sr-only">Feedback for the agent</span>
-                )}
-                <Textarea
-                  ref={feedbackInput}
-                  aria-label={input ? "Checkpoint answer" : "Rework feedback"}
-                  placeholder={input ? undefined : "Describe the changes…"}
-                  rows={5}
-                  maxLength={8000}
-                  value={response}
-                  onChange={(event) => setResponse(event.target.value)}
-                />
-              </label>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <p className="text-xs text-muted-foreground">Draft kept until acknowledged.</p>
-                <div className="ml-auto">
-                  <Button
-                    type="submit"
-                    size="sm"
-                    disabled={busy || manualState.checkpointBlocked || !response.trim()}
-                  >
-                    {manualState.responsePending
-                      ? "Response pending"
-                      : input
-                        ? "Submit answer"
-                        : "Send changes"}
-                  </Button>
-                </div>
-              </div>
-            </form>
-          ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
-            <p className="text-sm text-muted-foreground">
-              This checkpoint requires a repository maintainer.
-            </p>
-          ) : null}
+          {!inputInTask ? checkpointResponse : null}
           {canConfigure &&
           manualState.status === "paused" &&
           selectedJob.progress?.retryablePreparation ? (
@@ -848,49 +963,31 @@ export function WorkflowJob({
             </ol>
           </details>
         ) : null}
-        {selectedJob.workflow ? (
-          <details className="border-t pt-4" aria-label="Run progress">
-            <summary className="cursor-pointer text-sm font-medium">Workflow progress</summary>
-            <div className="mt-4">
-              <WorkflowFlow definition={selectedJob.workflow.definition} job={selectedJob} />
-            </div>
-          </details>
-        ) : null}
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <Button
-            variant="ghost"
-            onClick={() =>
-              navigate({
-                to: "/workflows/$repositoryId",
-                params: { repositoryId: scope.repositoryId },
-                search: { tab: "runs" },
-              })
-            }
-          >
-            Back to runs
+        {canConfigure && actionState.canRetry ? (
+          <Button variant="outline" disabled={busy} onClick={() => void respond("retry_action")}>
+            Retry publishing action
           </Button>
-          {canConfigure && actionState.canRetry ? (
-            <Button variant="outline" disabled={busy} onClick={() => void respond("retry_action")}>
-              Retry publishing action
-            </Button>
+        ) : null}
+        {!completed && selectedJob.progress?.pullRequestUrl ? (
+          <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer">
+            Open pull request
+          </a>
+        ) : null}
+        <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-2 border-t pt-3">
+          {selectedJob.workflow ? (
+            <details className="min-w-0 flex-[1_1_15rem]" aria-label="Run progress">
+              <summary className="cursor-pointer py-1 text-sm font-medium">
+                Workflow progress
+              </summary>
+              <div className="mt-3">
+                <WorkflowFlow definition={selectedJob.workflow.definition} job={selectedJob} />
+              </div>
+            </details>
           ) : null}
-          {!completed && selectedJob.progress?.pullRequestUrl ? (
-            <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer">
-              Open pull request
-            </a>
-          ) : null}
-          {canConfigure && manualState.canResume ? (
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => void respond(manualState.canResume ? "resume" : "pause")}
-            >
-              Resume workflow
-            </Button>
-          ) : null}
+          {!paused ? resumeAction : null}
           {(viewerControls.canCancel || (canConfigure && manualState.canPause)) && !terminal ? (
-            <details>
-              <summary className="cursor-pointer text-sm text-muted-foreground">
+            <details className="ml-auto min-w-0">
+              <summary className="cursor-pointer py-1 text-sm text-muted-foreground">
                 More controls
               </summary>
               <div className="mt-2 flex flex-wrap gap-2">

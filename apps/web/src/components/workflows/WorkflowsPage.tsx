@@ -1083,59 +1083,61 @@ function WorkflowRepositoryView({
       </WorkspacePageHeader>
       <div className="min-h-0 flex-1 overflow-y-auto">
         <WorkspacePageContainer width="expanded">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              {view !== "catalog" ? (
-                <Button variant="ghost" onClick={back}>
-                  ← Workflows
-                </Button>
-              ) : null}
-              <div className="w-64 max-w-full">
-                <Select
-                  value={scope.repositoryId}
-                  onValueChange={(id) => {
-                    if (id)
-                      void navigate({
-                        to: "/workflows/$repositoryId",
-                        params: { repositoryId: id },
-                        search: { tab },
-                      });
-                  }}
-                >
-                  <SelectTrigger aria-label="Workflow repository">
-                    <SelectValue>{entry.repository.name}</SelectValue>
-                  </SelectTrigger>
-                  <SelectPopup>
-                    {repositories.map((entry) => (
-                      <SelectItem
-                        key={entry.repository.repositoryId}
-                        value={entry.repository.repositoryId}
-                      >
-                        {entry.repository.name}
-                      </SelectItem>
-                    ))}
-                  </SelectPopup>
-                </Select>
+          {!(view === "job" && jobId && loaded) ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                {view !== "catalog" ? (
+                  <Button variant="ghost" onClick={back}>
+                    {view === "job" ? "← Back to runs" : "← Workflows"}
+                  </Button>
+                ) : null}
+                <div className="w-64 max-w-full">
+                  <Select
+                    value={scope.repositoryId}
+                    onValueChange={(id) => {
+                      if (id)
+                        void navigate({
+                          to: "/workflows/$repositoryId",
+                          params: { repositoryId: id },
+                          search: { tab },
+                        });
+                    }}
+                  >
+                    <SelectTrigger aria-label="Workflow repository">
+                      <SelectValue>{entry.repository.name}</SelectValue>
+                    </SelectTrigger>
+                    <SelectPopup>
+                      {repositories.map((entry) => (
+                        <SelectItem
+                          key={entry.repository.repositoryId}
+                          value={entry.repository.repositoryId}
+                        >
+                          {entry.repository.name}
+                        </SelectItem>
+                      ))}
+                    </SelectPopup>
+                  </Select>
+                </div>
               </div>
+              {view !== "catalog" || tab !== "runs" ? (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label="Refresh workflows"
+                        onClick={refreshView}
+                      />
+                    }
+                  >
+                    <RefreshCwIcon aria-hidden />
+                  </TooltipTrigger>
+                  <TooltipPopup>Refresh workflows</TooltipPopup>
+                </Tooltip>
+              ) : null}
             </div>
-            {view !== "catalog" || tab !== "runs" ? (
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label="Refresh workflows"
-                      onClick={refreshView}
-                    />
-                  }
-                >
-                  <RefreshCwIcon aria-hidden />
-                </TooltipTrigger>
-                <TooltipPopup>Refresh workflows</TooltipPopup>
-              </Tooltip>
-            ) : null}
-          </div>
+          ) : null}
           {error ? (
             <WorkflowAlert
               title="Could not refresh workflows"
@@ -1185,6 +1187,7 @@ function WorkflowRepositoryView({
               jobId={jobId}
               projects={projects}
               canConfigure={canConfigure}
+              refreshCatalog={refreshView}
             />
           ) : (
             <>
