@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeHttp from "node:http";
 import * as NodeCrypto from "node:crypto";
+import * as NodeDiagnosticsChannel from "node:diagnostics_channel";
 import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import { describe, expect, it, layer } from "@effect/vitest";
 import { vi } from "vite-plus/test";
@@ -154,6 +155,7 @@ const fixture = Effect.gen(function* () {
     allowed = true,
     inspections = 0;
   let afterInspect: (() => void) | undefined;
+  let responseAuthorization = Effect.void;
   const firstCheck = yield* Deferred.make<void>();
   const upstreamClosed = yield* Deferred.make<void>();
   app.on("request", (req, res) => {
@@ -221,6 +223,7 @@ const fixture = Effect.gen(function* () {
         if (!allowed || snapshot.state !== "running")
           return yield* new ThreadVmConnectionUnavailable();
         yield* Deferred.succeed(firstCheck, undefined);
+        if (paths.length > 0) yield* responseAuthorization;
         return snapshot;
       }),
     inspect: async (_settings, sandboxId, identity) => {
@@ -251,6 +254,9 @@ const fixture = Effect.gen(function* () {
     change: (value: typeof target) => (current = value),
     revoke: () => (allowed = false),
     afterInspect: (action: () => void) => (afterInspect = action),
+    setResponseAuthorization: (check: Effect.Effect<void>) => {
+      responseAuthorization = check;
+    },
   };
 });
 
@@ -279,7 +285,8 @@ describe("local VM connection configuration", () => {
 const ingressTestLayer = Layer.mergeAll(
   Layer.succeed(RelayDb, {
     $client: (_strings: TemplateStringsArray, ...values: ReadonlyArray<unknown>) => {
-      const [allocationId, threadId, computeRef] = values;
+      const [allocationId, threadId, resourceKind, computeRef] = values;
+      expect(resourceKind).toBe("personal");
       return Effect.succeed([
         {
           sealed: JSON.stringify({
@@ -428,6 +435,59 @@ layer(ingressTestLayer)("private local client proxy", (it) => {
       }),
     ),
   );
+
+  for (const failingStream of ["request", "response"] as const)
+    it.effect(
+      `returns one gateway error when the upstream ${failingStream} fails during response authorization`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const checkingResponse = yield* Deferred.make<void>();
+            const upstream = yield* Deferred.make<{
+              request: NodeHttp.ClientRequest;
+              response: NodeHttp.IncomingMessage;
+            }>();
+            const requests = NodeDiagnosticsChannel.channel("http.client.request.start");
+            const captureUpstream = (message: unknown) => {
+              const { request } = message as { request: NodeHttp.ClientRequest };
+              if (request.getHeader("e2b-sandbox-id") !== target.sandboxId) return;
+              request.once("response", (response) => {
+                Deferred.doneUnsafe(upstream, Effect.succeed({ request, response }));
+              });
+            };
+            requests.subscribe(captureUpstream);
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => requests.unsubscribe(captureUpstream)),
+            );
+            f.setResponseAuthorization(
+              Deferred.succeed(checkingResponse, undefined).pipe(Effect.andThen(Effect.never)),
+            );
+            const path = "/api/auth/session";
+            const headers = (jti: string) => ({
+              authorization: `DPoP ${credential}`,
+              dpop: proof(f.endpoint.httpBaseUrl + path, jti),
+            });
+            const interrupted = yield* request(
+              f.endpoint.httpBaseUrl,
+              path,
+              headers("interrupted"),
+            ).pipe(Effect.forkScoped);
+            const streams = yield* Deferred.await(upstream);
+            yield* Deferred.await(checkingResponse);
+            const transportError = new Error("fixture upstream connection lost");
+            if (failingStream === "request") streams.request.destroy(transportError);
+            else streams.response.emit("error", transportError);
+            expect(yield* Fiber.join(interrupted)).toMatchObject({ status: 502, body: "" });
+
+            f.setResponseAuthorization(Effect.void);
+            expect(yield* request(f.endpoint.httpBaseUrl, path, headers("retry"))).toMatchObject({
+              status: 200,
+              body: '{"ok":true}',
+            });
+          }),
+        ),
+    );
 
   it.effect("reclaims two paused status entries before admitting a new thread after deletion", () =>
     Effect.scoped(

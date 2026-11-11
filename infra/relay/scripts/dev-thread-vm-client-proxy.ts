@@ -284,6 +284,11 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
             activeRequests--;
             abort.abort();
           });
+          const failResponse = (status: 403 | 502) => {
+            if (response.destroyed || response.writableEnded) return;
+            if (response.headersSent) response.destroy();
+            else response.writeHead(status, { "cache-control": "no-store" }).end();
+          };
           void (async () => {
             const { url, headers } = await prepare(request, abort.signal);
             if (response.destroyed) return;
@@ -295,12 +300,14 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
                 signal: abort.signal,
               },
               (received) => {
+                received.once("error", () => failResponse(502));
                 void run(verify, { signal: abort.signal })
                   .then(() => {
-                    if (response.destroyed) {
+                    if (response.destroyed || response.writableEnded || response.headersSent) {
                       received.destroy();
                       return;
                     }
+                    if (received.destroyed) return failResponse(502);
                     response.writeHead(
                       received.statusCode ?? 502,
                       filteredHeaders(received.headers),
@@ -308,23 +315,17 @@ export const makeDevThreadVmClientProxy = <E, R>(input: {
                     received.pipe(response);
                   })
                   .catch(() => {
+                    failResponse(403);
                     received.destroy();
-                    response.writeHead(403).end();
                   });
               },
             );
             upstreams.add(upstream);
             upstream.once("close", () => upstreams.delete(upstream));
             upstream.setTimeout(30_000, () => upstream.destroy());
-            upstream.on("error", () => {
-              if (!response.headersSent) response.writeHead(502, { "cache-control": "no-store" });
-              response.end();
-            });
+            upstream.on("error", () => failResponse(502));
             request.pipe(upstream);
-          })().catch(() => {
-            if (!response.headersSent) response.writeHead(403, { "cache-control": "no-store" });
-            response.end();
-          });
+          })().catch(() => failResponse(403));
         });
         server.on("upgrade", (request, socket, head) => {
           if (activeRequests >= MAX_REQUESTS || request.url?.split("?")[0] !== "/ws") {
