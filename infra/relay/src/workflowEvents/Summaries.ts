@@ -1,13 +1,21 @@
 import type { RepositoryWorkflow, WorkflowAutomationSummary } from "@t3tools/contracts/workflows";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { RelayDb } from "../db.ts";
+import { selectWorkflowVmGitHubBinding } from "../jobs/WorkflowVmGithub.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
 import type { Connection, Grant } from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";
 import { EnableProof, targetKey, triggerKey, automation } from "./Routing.ts";
+import {
+  establishedWorkflowVmCodex,
+  vmAutomationAvailable,
+  vmAutomationDefinitionIssue,
+} from "./VmAutomation.ts";
 
 const decodeProof = Schema.decodeUnknownOption(EnableProof);
-/** One repository-scoped query. Readiness never refreshes credentials or probes an environment. */
+/** Readiness only uses local state. */
 export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: string) {
   const sql = (yield* RelayDb).$client;
   const config = yield* Fence.configuration;
@@ -34,16 +42,46 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
     LEFT JOIN relay_workflow_connections c ON c.connection_id=g.connection_id AND c.organization_id=g.organization_id
     LEFT JOIN relay_workflow_authorizations a ON a.organization_id=c.organization_id AND a.application_id=c.application_id
     WHERE w.repository_id=${repo}`;
+  const vmOrganization = rows.find(
+    ({ record }) => record.automation?.enabled && record.definition.target.kind === "vm",
+  )?.record.organizationId;
+  const vm = Option.getOrUndefined(yield* Effect.serviceOption(ThreadVmRuntimeConfiguration));
+  const vmEnabled = vmOrganization !== undefined && (yield* vmAutomationAvailable(vmOrganization));
+  const vmGithub =
+    vmOrganization !== undefined && vmEnabled
+      ? yield* selectWorkflowVmGitHubBinding(
+          sql,
+          { organizationId: vmOrganization, repositoryId: repo },
+          false,
+        ).pipe(Effect.catchTag("WorkflowInvalidError", () => Effect.succeed(null)))
+      : null;
+  const vmCodex =
+    vmOrganization !== undefined && vmEnabled
+      ? yield* establishedWorkflowVmCodex(sql, vmOrganization)
+      : null;
   return rows.map((row): WorkflowAutomationSummary => {
     const saved = automation(row.record.automation);
     const trigger = saved.trigger;
     const c = row.connection,
       g = row.grant;
     const proof = decodeProof(row.target_capability);
+    const { target, steps } = row.record.definition;
+    const vmIssue =
+      target.kind === "vm"
+        ? vmAutomationDefinitionIssue(target, steps, vm?.settings?.workflowModelCatalog ?? null)
+        : null;
+    const targetBound =
+      target.kind === "vm"
+        ? vmGithub !== null &&
+          proof._tag === "Some" &&
+          vmGithub.canonicalKey === proof.value.canonicalKey
+        : row.target_bound;
     let reason: string | null = null;
     if (saved.enabled) {
       if (!config?.admissionEnabled)
         reason = "Automatic event admission is unavailable on this relay.";
+      else if (target.kind === "vm" && !vmEnabled)
+        reason = "Automatic VM runs are unavailable for this repository.";
       else if (!trigger || !g || g.revoked || !c || c.connection_id !== trigger.connectionId)
         reason = "Repository source permission needs attention.";
       else if (
@@ -62,8 +100,13 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
             : "Linear is currently unavailable.";
       else if (!Fence.covers(c, config.generation, trigger.teamId))
         reason = "Event delivery is not verified for the selected team.";
+      else if (vmIssue) reason = vmIssue;
+      else if (target.kind === "vm" && !vmCodex)
+        reason = "Connect Codex for this organization before running this workflow.";
+      else if (target.kind === "vm" && vmCodex?.status !== "connected")
+        reason = "An organization admin must reconnect Codex.";
       else if (
-        !row.target_bound ||
+        !targetBound ||
         proof._tag !== "Some" ||
         proof.value.targetKey !== targetKey(row.record.definition) ||
         proof.value.triggerKey !== triggerKey(trigger) ||

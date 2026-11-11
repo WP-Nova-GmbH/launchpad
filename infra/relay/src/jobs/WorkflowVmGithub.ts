@@ -33,7 +33,7 @@ function gitHubReadFailure(error: GithubRequestFailed) {
   return tryAgain();
 }
 
-const selectWorkflowVmGitHubBinding = Effect.fnUntraced(function* (
+export const selectWorkflowVmGitHubBinding = Effect.fnUntraced(function* (
   sql: PgClient,
   input: RepositoryScope,
   lockInstallation: boolean,

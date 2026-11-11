@@ -4,6 +4,8 @@ import { RelayClientPrincipal } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Redacted from "effect/Redacted";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { RelayConfiguration } from "../Config.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
@@ -13,7 +15,10 @@ import { layer as machines } from "../machines/Machines.ts";
 import { layer as catalog } from "../projects/OrganizationProjectCatalog.ts";
 import { layer as organizations } from "../tenancy/Organizations.ts";
 import { layer as repositories } from "../tenancy/Repositories.ts";
-import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
+import {
+  ThreadVmRuntimeConfiguration,
+  type ThreadVmRuntimeSettings,
+} from "../threads/ThreadVmRuntimeConfiguration.ts";
 import * as Layer from "effect/Layer";
 import * as Routing from "./Routing.ts";
 import { RelayDb } from "../db.ts";
@@ -218,16 +223,235 @@ const vmInput = {
   definition: { ...definition, target: { kind: "vm", baseBranch: "release/1.x" } },
   archived: false,
 } as const;
-const testVmAuthoring = <A, E, R>(program: Effect.Effect<A, E, R>) =>
+const testVmAuthoring = <A, E, R>(
+  program: Effect.Effect<A, E, R>,
+  settings?: ThreadVmRuntimeSettings,
+) =>
   testDb(
     program.pipe(
       Effect.provide([workflows, organizations, repositories, machines, catalog, noSummaryIo]),
-      Effect.provideService(ThreadVmRuntimeConfiguration, { settings: undefined }),
+      Effect.provideService(ThreadVmRuntimeConfiguration, { settings }),
       Effect.provideService(RelayClientPrincipal, { userId: "maintainer", token: "fixture" }),
     ),
   );
 
+const vmSettings = {
+  compute: {
+    apiUrl: "https://compute.test",
+    sandboxUrl: "https://sandbox.test",
+    apiKey: Redacted.make("fixture"),
+    templateId: "runner:fixture",
+    hostAddresses: ["192.0.2.10"],
+    timeoutMs: 600_000,
+  },
+  templateBuildId: "fixture",
+  workflowExecutionEnabled: true,
+  workflowModelCatalog: {
+    defaultModel: "fixture-model",
+    models: [{ slug: "fixture-model", name: "Fixture", isCustom: false, capabilities: null }],
+  },
+  hostId: "host",
+  maxRunningVms: 1,
+  publicRelayUrl: "https://relay.test",
+  autoPauseEnabled: false,
+  autoBackupEnabled: false,
+  autoDeleteEnabled: false,
+  replacementEnabled: false,
+  restoreEnabled: false,
+  resetEnabled: false,
+} satisfies ThreadVmRuntimeSettings;
+
+const seedVmAutomation = Effect.gen(function* () {
+  const sql = (yield* RelayDb).$client;
+  const fs = yield* FileSystem.FileSystem;
+  for (const name of ["20260819121924_amused_blue_blade", "20261028130056_codex_vm_connections"]) {
+    const migration = new URL(`../../migrations/postgres/${name}/migration.sql`, import.meta.url);
+    for (const statement of (yield* fs.readFileString(migration.pathname)).split(
+      "--> statement-breakpoint",
+    )) {
+      if (statement.trim()) yield* sql.unsafe(statement);
+    }
+  }
+  yield* seed;
+  yield* sql`INSERT INTO relay_github_installations VALUES ('org','42','example','Organization','owner','2026','2026')`;
+  yield* sql`INSERT INTO relay_codex_vm_connections
+    (organization_id,connection_id,issuer,subject,client_id,status,updated_at)
+    VALUES ('org','codex','issuer','subject','client','disconnected','2026')`;
+});
+
+const readSelection = transport((request) => {
+  if (request.url !== "https://api.linear.app/graphql")
+    throw new Error("Expected a Linear selection check");
+  return Response.json(selected);
+});
+
+const enableVmAutomation = (
+  input: typeof import("@t3tools/contracts/workflows").SaveRepositoryWorkflow.Type,
+) =>
+  saveRepositoryWorkflow("repo", {
+    ...input,
+    automation: { enabled: true, trigger },
+  }).pipe(Effect.provide(readSelection));
+
 describe("VM workflow authoring (PostgreSQL)", () => {
+  it.live(
+    "enables from a local binding and advances the cutoff when an On rule changes target",
+    () =>
+      testVmAuthoring(
+        Effect.gen(function* () {
+          yield* seedVmAutomation;
+          const before = yield* save();
+          const sql = (yield* RelayDb).$client;
+          const cutoff = Store.iso((yield* clock) - 5_000);
+          yield* sql`UPDATE relay_repository_workflows SET effective_after=${cutoff} WHERE workflow_id='flow'`;
+          const original = (yield* Routing.read("flow"))!;
+          const vm = yield* enableVmAutomation({ ...vmInput, expectedRevision: before.revision });
+          expect(vm.automation?.enabled).toBe(true);
+          const switched = (yield* Routing.read("flow"))!;
+          expect(switched.routing_generation).toBe(original.routing_generation + 1);
+          expect(Date.parse(switched.effective_after!)).toBeGreaterThan(Date.parse(cutoff));
+          expect((yield* receive(issue(Date.parse(cutoff) + 1))).status).toBe(200);
+          expect((yield* counts).jobs).toBe(0);
+          expect((yield* summaries("repo"))[0]).toMatchObject({
+            state: "needs_attention",
+            reason: expect.stringContaining("reconnect Codex"),
+          });
+          yield* sql`UPDATE relay_codex_vm_connections SET status='connected',payload_sealed='sealed',expires_at='2099-01-01' WHERE organization_id='org'`;
+          expect((yield* summaries("repo"))[0]).toMatchObject({ state: "on", reason: null });
+          expect(yield* (yield* Workflows).listJobs("repo")).toEqual([]);
+        }),
+        vmSettings,
+      ),
+  );
+
+  it.live("rejects a placeholder Codex account, invalid VM model, and unsupported VM steps", () =>
+    testVmAuthoring(
+      Effect.gen(function* () {
+        yield* seedVmAutomation;
+        const sql = (yield* RelayDb).$client;
+        yield* sql`UPDATE relay_codex_vm_connections SET subject=NULL`;
+        expect(yield* enableVmAutomation(vmInput).pipe(Effect.flip)).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: expect.stringContaining("Connect Codex"),
+        });
+        yield* sql`UPDATE relay_codex_vm_connections SET subject='subject'`;
+        expect(
+          yield* enableVmAutomation({
+            ...vmInput,
+            definition: {
+              ...vmInput.definition,
+              steps: [
+                {
+                  kind: "agent",
+                  id: "agent",
+                  title: "Agent",
+                  instruction: "Implement",
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("codex"),
+                    model: "stale-model",
+                  },
+                },
+              ],
+            },
+          }).pipe(Effect.flip),
+        ).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: expect.stringContaining("model supported"),
+        });
+        expect(
+          yield* enableVmAutomation({
+            ...vmInput,
+            definition: { ...vmInput.definition, target: { kind: "vm", baseBranch: "HEAD" } },
+          }).pipe(Effect.flip),
+        ).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: expect.stringContaining("valid Git branch"),
+        });
+        expect(
+          yield* enableVmAutomation({
+            ...vmInput,
+            definition: {
+              ...vmInput.definition,
+              steps: [
+                ...vmInput.definition.steps,
+                { kind: "action", id: "push", title: "Push", action: "push" },
+              ],
+            },
+          }).pipe(Effect.flip),
+        ).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: expect.stringContaining("Remove Push"),
+        });
+        expect(yield* (yield* Workflows).get("flow")).toBeNull();
+      }),
+      vmSettings,
+    ),
+  );
+
+  it.live("can save only Off after losing source access, model catalog and rollout", () =>
+    testVmAuthoring(
+      Effect.gen(function* () {
+        yield* seedVmAutomation;
+        const enabled = yield* enableVmAutomation({
+          ...vmInput,
+          definition: {
+            ...vmInput.definition,
+            steps: [
+              {
+                kind: "agent",
+                id: "agent",
+                title: "Agent",
+                instruction: "Implement",
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "fixture-model",
+                },
+              },
+            ],
+          },
+        });
+        yield* Store.withdraw("admin", "grant", "repo");
+        const off = {
+          ...vmInput,
+          expectedRevision: enabled.revision,
+          definition: enabled.definition,
+          automation: { enabled: false, trigger },
+        };
+        const withoutRuntime = Effect.provideService(ThreadVmRuntimeConfiguration, {
+          settings: undefined,
+        });
+        expect(
+          yield* saveRepositoryWorkflow("repo", {
+            ...off,
+            definition: { ...off.definition, name: "Changed" },
+          }).pipe(withoutRuntime, Effect.flip),
+        ).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: expect.stringContaining("no verified model catalog"),
+        });
+        expect(
+          yield* saveRepositoryWorkflow("repo", off).pipe(
+            Effect.provideService(RelayClientPrincipal, { userId: "reader", token: "fixture" }),
+            withoutRuntime,
+            Effect.flip,
+          ),
+        ).toMatchObject({ _tag: "RelayTenancyForbiddenError" });
+        const saved = yield* saveRepositoryWorkflow("repo", off).pipe(withoutRuntime);
+        expect(saved).toMatchObject({
+          definition: enabled.definition,
+          automation: { enabled: false, trigger },
+          revision: enabled.revision + 1,
+        });
+        expect(
+          yield* saveRepositoryWorkflow("repo", off).pipe(withoutRuntime, Effect.flip),
+        ).toMatchObject({
+          _tag: "WorkflowConflictError",
+        });
+      }),
+      vmSettings,
+    ),
+  );
+
   it.live("saves without a machine or model catalog and rejects Run before creating a job", () =>
     testVmAuthoring(
       Effect.gen(function* () {

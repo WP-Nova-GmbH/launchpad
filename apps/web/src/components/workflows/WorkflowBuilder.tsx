@@ -25,6 +25,8 @@ import {
   workflowDraftAutomation,
   workflowDraftAutomationResolved,
   normalizeWorkflowAutomation,
+  sameWorkflowAutomation,
+  sameWorkflowDefinition,
   type WorkflowScope,
   type WorkflowEditorDraft,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -65,6 +67,7 @@ import {
   matchesWorkflowSave,
   applyWorkflowSaveReceipt,
   normalizeWorkflowDefinitionForSave,
+  workflowVmOffSave,
 } from "./workflowOperations";
 
 const isWorkflowAutomation = Schema.is(WorkflowAutomation);
@@ -78,6 +81,7 @@ type WorkflowBuilderProps = {
   projectsUnavailable?: boolean | undefined;
   vmAuthoring?: WorkflowCatalog["vmAuthoring"];
   vmExecutionAvailable?: boolean;
+  vmAutomationAvailable?: boolean;
   codexRefreshVersion?: number;
   canConfigure: boolean;
   call: ReturnType<typeof useWorkflowClient>;
@@ -118,6 +122,7 @@ function WorkflowBuilderEditor({
   projects,
   projectsUnavailable,
   vmAuthoring,
+  vmAutomationAvailable = false,
   vmExecutionAvailable = false,
   codexRefreshVersion = 0,
   canConfigure,
@@ -302,9 +307,9 @@ function WorkflowBuilderEditor({
   const issue = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
   const edit = (update: (draft: WorkflowEditorDraft) => WorkflowEditorDraft) =>
     editWorkflowDraft(scope, draft.workflowId, update);
-  const save = async () => {
+  const save = async (turnOffOnly = false) => {
     if (pending) return;
-    if (!draft.operation) {
+    if (!draft.operation && !turnOffOnly) {
       const problem = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
       if (problem) {
         edit((draft) => ({
@@ -338,6 +343,7 @@ function WorkflowBuilderEditor({
       undefined,
       {
         automationSupported,
+        turnOffOnly,
         read: () =>
           call((client, token) =>
             client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
@@ -618,6 +624,7 @@ function WorkflowBuilderEditor({
       projects={projects}
       projectsUnavailable={projectsUnavailable}
       vmAuthoring={vmAuthoring}
+      vmAutomationAvailable={vmAutomationAvailable}
       codexNotice={checkCodex ? codexNotice : null}
       pending={pending}
       archived={archived}
@@ -659,6 +666,7 @@ function WorkflowBuilderWorkspace({
   projects,
   projectsUnavailable,
   vmAuthoring,
+  vmAutomationAvailable,
   codexNotice,
   pending,
   archived,
@@ -685,6 +693,7 @@ function WorkflowBuilderWorkspace({
   projects: ReadonlyArray<RelayOrganizationProject>;
   projectsUnavailable: boolean | undefined;
   vmAuthoring: WorkflowCatalog["vmAuthoring"];
+  vmAutomationAvailable: boolean;
   codexNotice: string | null;
   pending: boolean;
   archived: boolean;
@@ -700,7 +709,7 @@ function WorkflowBuilderWorkspace({
     anchor: WorkflowInsertion,
     kind: WorkflowStep["kind"] | "open_pull_request",
   ) => string | null;
-  save: () => Promise<void>;
+  save: (turnOffOnly?: boolean) => Promise<void>;
   reload: () => Promise<void>;
   reconcile: () => Promise<void>;
   discard: () => Promise<void>;
@@ -741,6 +750,16 @@ function WorkflowBuilderWorkspace({
   const panelOpen = triggerOpen || settingsOpen || !!selected;
   const machine = draft.definition.target.kind === "machine" ? draft.definition.target : null;
   const automation = workflowDraftAutomation(draft);
+  const offSave =
+    automationSupported && !archived && !draft.operation ? workflowVmOffSave(draft) : null;
+  const hasOtherEdits =
+    !!offSave &&
+    (!sameWorkflowDefinition(
+      normalizeWorkflowDefinitionForSave(draft.definition),
+      offSave.definition,
+    ) ||
+      !sameWorkflowAutomation({ ...automation, enabled: false }, offSave.automation));
+  const vmTriggerUnavailable = !!vm && draft.targetConfirmed && !vmAutomationAvailable;
   const target = projects.find(
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
@@ -897,6 +916,10 @@ function WorkflowBuilderWorkspace({
       await save();
       return;
     }
+    if (offSave && !hasOtherEdits && !automation.enabled) {
+      await save(true);
+      return;
+    }
     const problem = issue;
     if (problem) {
       edit((current) => ({ ...current, error: problem.message }));
@@ -913,11 +936,11 @@ function WorkflowBuilderWorkspace({
       }));
       return;
     }
-    if (vm && draft.targetConfirmed && automation.enabled) {
+    if (vmTriggerUnavailable && automation.enabled) {
       openTrigger();
       edit((current) => ({
         ...current,
-        error: "Turn off automatic triggering to save this workflow with a VM target.",
+        error: "Automatic VM runs are unavailable. Turn off automatic triggering before saving.",
       }));
       return;
     }
@@ -969,6 +992,11 @@ function WorkflowBuilderWorkspace({
       }}
       supported={automationSupported}
       vmTarget={!!vm && draft.targetConfirmed}
+      vmAutomationAvailable={vmAutomationAvailable}
+      onSaveOff={
+        offSave && (vmTriggerUnavailable || hasOtherEdits) ? () => void save(true) : undefined
+      }
+      hasOtherEdits={hasOtherEdits}
       resolved={workflowDraftAutomationResolved(draft)}
       registerField={registerField}
       disabled={pending || archived}
@@ -1001,7 +1029,8 @@ function WorkflowBuilderWorkspace({
                 onValueChange={(value) => {
                   if (value === "vm") {
                     edit((current) => {
-                      if (workflowDraftAutomation(current).enabled) return current;
+                      if (!vmAutomationAvailable && workflowDraftAutomation(current).enabled)
+                        return current;
                       const { lastVmTarget, ...draft } = current;
                       const target = draft.definition.target;
                       const savedTarget = draft.baseline?.definition.target;
@@ -1054,7 +1083,7 @@ function WorkflowBuilderWorkspace({
                   </SelectValue>
                 </SelectTrigger>
                 <SelectPopup>
-                  <SelectItem value="vm" disabled={automation.enabled}>
+                  <SelectItem value="vm" disabled={!vmAutomationAvailable && automation.enabled}>
                     VM
                   </SelectItem>
                   <SelectItem value="machine" disabled={!projects.length && !machine}>
@@ -1062,7 +1091,7 @@ function WorkflowBuilderWorkspace({
                   </SelectItem>
                 </SelectPopup>
               </Select>
-              {automation.enabled && !vm ? (
+              {automation.enabled && !vm && !vmAutomationAvailable ? (
                 <p className="text-xs text-muted-foreground">
                   Turn off automatic triggering before choosing VM.
                 </p>

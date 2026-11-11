@@ -9,6 +9,7 @@ import {
   type ThreadVmResourceKind,
 } from "./ThreadVmAllocationStore.ts";
 import type { relayThreadVmProvisions } from "../persistence/schema.ts";
+import type { WorkflowSourceBlocker } from "../workflowEvents/OriginalAuthority.ts";
 
 export class ThreadVmProvisionConflict extends Schema.TaggedError<ThreadVmProvisionConflict>()(
   "ThreadVmProvisionConflict",
@@ -158,7 +159,7 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
           yield* sql`UPDATE relay_thread_vm_allocations SET template_id = ${input.templateId}
             WHERE allocation_id = ${input.allocationId}`;
         yield* capacity.beginExecution(row.operationId);
-        yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating' WHERE allocation_id = ${input.allocationId}`;
+        yield* sql`UPDATE relay_thread_vm_provisions SET phase = 'creating',error_code=NULL WHERE allocation_id = ${input.allocationId}`;
         return {
           ...row,
           templateId: input.templateId,
@@ -195,7 +196,11 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
   )(function* (input: {
     allocationId: string;
     claimId: string;
-    errorCode: "workflow_disabled" | "workflow_codex_unavailable" | "workflow_template_unverified";
+    errorCode:
+      | "workflow_disabled"
+      | "workflow_codex_unavailable"
+      | "workflow_template_unverified"
+      | WorkflowSourceBlocker;
   }) {
     yield* sql.withTransaction(
       Effect.gen(function* () {

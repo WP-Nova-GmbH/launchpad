@@ -17,7 +17,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { summaries as automationSummaries } from "../workflowEvents/Summaries.ts";
-import { targetKey } from "../workflowEvents/Routing.ts";
+import { isAutomationOffOnly, targetKey } from "../workflowEvents/Routing.ts";
+import { vmAutomationAvailable } from "../workflowEvents/VmAutomation.ts";
 import { prepare as prepareAutomationSave } from "../workflowEvents/Preparation.ts";
 import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "../jobs/Workflows.ts";
@@ -28,7 +29,7 @@ import {
   vmWorkflowExecutionUnavailable,
   workflowRunTargetChanged,
 } from "../jobs/WorkflowTarget.ts";
-import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { resolveWorkflowVmGitHub } from "../jobs/WorkflowVmGithub.ts";
 import {
@@ -390,12 +391,14 @@ export const saveRepositoryWorkflow = Effect.fn("WorkflowsApi.save")(function* (
       isInvalid(cause) ? cause : new WorkflowPersistenceError({ cause }),
     ),
   );
+  const automationOffOnly =
+    previous?.repositoryId === repositoryId && isAutomationOffOnly(payload, previous);
   if (payload.definition.target.kind === "vm") {
     const lifecycleOnly =
       previous?.repositoryId === repositoryId &&
       previous.archived !== payload.archived &&
       sameDefinition(previous.definition, payload.definition);
-    if (!lifecycleOnly) {
+    if (!lifecycleOnly && !automationOffOnly && !("proof" in saveContext)) {
       const issue = vmWorkflowDefinitionIssue(
         payload.definition.target.baseBranch,
         payload.definition.steps,
@@ -404,6 +407,7 @@ export const saveRepositoryWorkflow = Effect.fn("WorkflowsApi.save")(function* (
       if (issue) return yield* new WorkflowInvalidError({ message: issue });
     }
   } else if (
+    !automationOffOnly &&
     !payload.archived &&
     !payload.automation?.enabled &&
     (!previous ||
@@ -599,7 +603,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
   handlers
     .handle("list", ({ params }) =>
       Effect.gen(function* () {
-        yield* authorizeWorkflowRepository(params.repositoryId);
+        const membership = yield* authorizeWorkflowRepository(params.repositoryId);
         return {
           workflows: yield* (yield* Workflows).list(params.repositoryId),
           automationSupported: true,
@@ -609,6 +613,9 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
           vmAuthoring: { models: yield* vmModels },
           vmExecutionAvailable:
             (yield* ThreadVmRuntimeConfiguration).settings?.workflowExecutionEnabled === true,
+          vmAutomationAvailable: yield* vmAutomationAvailable(
+            membership.organization.organizationId,
+          ),
         };
       }).pipe(errors),
     )
@@ -624,6 +631,7 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
             repositoryId: record.repositoryId,
             workflowId: record.workflowId,
             runtime: record.runtime,
+            targetKind: record.vmAdmission ? ("vm" as const) : (record.runtime?.kind ?? "machine"),
             instruction: record.instruction.slice(0, 280),
             status: record.status,
             detail: record.detail?.slice(0, 500) ?? null,

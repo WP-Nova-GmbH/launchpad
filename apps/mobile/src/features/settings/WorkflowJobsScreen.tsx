@@ -644,7 +644,7 @@ function WorkflowJobsContent(props: Props) {
               <Text className="text-xs text-foreground-muted">
                 Submitted {new Date(selectedJob.createdAt).toLocaleString()}
               </Text>
-              {selectedJob.status === "queued" ? (
+              {selectedJob.status === "queued" && !selectedJob.vmAdmission ? (
                 <Text className="text-foreground-muted">
                   Waiting for an execution target. No steps have started.
                 </Text>
@@ -1225,7 +1225,7 @@ function WorkflowJobsContent(props: Props) {
                   key={job.jobId}
                   icon="arrow.triangle.branch"
                   label={job.instruction}
-                  subtitle={`${job.originSummary?.workflowName ?? "Workflow run"}${job.originSummary?.kind === "automation" ? "\nStarted by workflow" : ""}\nSubmitted ${new Date(job.createdAt).toLocaleString()}`}
+                  subtitle={`${job.originSummary?.workflowName ?? "Workflow run"}${job.originSummary?.kind === "automation" ? "\nStarted by workflow" : ""}${(job.targetKind ?? job.runtime?.kind) === "vm" ? "\nWorkflow VM" : ""}\nSubmitted ${new Date(job.createdAt).toLocaleString()}`}
                   value={workflowStatusLabel(job.status)}
                   valuePosition="trailing"
                   disabled={busy}

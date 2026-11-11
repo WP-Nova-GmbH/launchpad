@@ -52,12 +52,15 @@ export function WorkflowTriggerInspector({
   unsaved = false,
   supported,
   vmTarget = false,
+  vmAutomationAvailable = false,
+  hasOtherEdits = false,
   resolved = true,
   disabled,
   retrySave = false,
   onChange,
   onClose,
   onSave,
+  onSaveOff,
   onChooseMachine,
   registerField,
 }: {
@@ -67,16 +70,20 @@ export function WorkflowTriggerInspector({
   unsaved?: boolean;
   supported: boolean;
   vmTarget?: boolean;
+  vmAutomationAvailable?: boolean;
+  hasOtherEdits?: boolean;
   resolved?: boolean;
   disabled: boolean;
   retrySave?: boolean;
   onChange: (automation: WorkflowAutomation) => void;
   onClose: () => void;
   onSave: () => void;
+  onSaveOff?: (() => void) | undefined;
   onChooseMachine: () => void;
   registerField?: RegisterField | undefined;
 }) {
   const value = automation ?? normalizeWorkflowAutomation();
+  const vmTriggerUnavailable = vmTarget && !vmAutomationAvailable;
   const trigger = value.trigger;
   const validAutomation = isWorkflowAutomation(value);
   const complete = !!trigger && validAutomation;
@@ -118,7 +125,7 @@ export function WorkflowTriggerInspector({
   ]);
   const readSelection = useCallback(
     (client: WorkflowSources.Client, token: string) =>
-      trigger?.teamId && connected && !vmTarget && supported && resolved
+      trigger?.teamId && connected && !vmTriggerUnavailable && supported && resolved
         ? client
             .selection(token, scope.repositoryId, {
               grantId: trigger.grantId,
@@ -130,7 +137,7 @@ export function WorkflowTriggerInspector({
             })
             .pipe(Effect.map((criteria) => ({ trigger, sourceKey, criteria })))
         : Effect.succeed({ trigger, sourceKey, criteria: null }),
-    [scope.repositoryId, trigger, connected, vmTarget, supported, resolved, sourceKey],
+    [scope.repositoryId, trigger, connected, vmTriggerUnavailable, supported, resolved, sourceKey],
   );
   const selected = useWorkflowSources<{
     trigger: WorkflowTrigger | null;
@@ -158,8 +165,13 @@ export function WorkflowTriggerInspector({
   const summary = trigger
     ? `When an issue ${trigger.event === "issue_created" ? "is created" : `enters ${criteria?.state?.name ?? (trigger.stateId || "a status you choose")}`} in ${criteria?.team?.name ?? (trigger.teamId || "a team you choose")}${trigger.labelIds.length ? ` with all labels: ${trigger.labelIds.map((id) => criteria?.labels.find((label) => label.id === id)?.name ?? id).join(", ")}` : ", with any labels"}.`
     : null;
-  const unavailable = !supported || !resolved || vmTarget;
+  const unavailable = !supported || !resolved || vmTriggerUnavailable;
   const editableRule = !unavailable && !!source && !connectionUnknown;
+  const saveOff = onSaveOff ? (
+    <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={onSaveOff}>
+      {hasOtherEdits ? "Save Off only" : "Turn off automatic runs"}
+    </Button>
+  ) : null;
   const retrySelection = (
     <Button
       type="button"
@@ -221,10 +233,10 @@ export function WorkflowTriggerInspector({
             selections are kept.
           </WorkflowAlert>
         </div>
-      ) : vmTarget ? (
+      ) : vmTriggerUnavailable ? (
         <div className={styles["workflow-trigger-section"]}>
           <WorkflowAlert
-            title="Automatic runs need a Machine target"
+            title="Automatic VM runs unavailable"
             variant="warning"
             actions={
               <>
@@ -237,7 +249,14 @@ export function WorkflowTriggerInspector({
                 >
                   Choose a Machine target
                 </Button>
-                {value.enabled ? (
+                {retrySave ? (
+                  <Button type="button" size="sm" disabled={disabled} onClick={onSave}>
+                    Retry save
+                  </Button>
+                ) : (
+                  saveOff
+                )}
+                {value.enabled && !onSaveOff && !retrySave ? (
                   <Button
                     type="button"
                     variant="outline"
@@ -251,8 +270,10 @@ export function WorkflowTriggerInspector({
               </>
             }
           >
-            This workflow uses a VM. Manual runs remain available. Choose a Machine target to
-            configure automatic runs.
+            Automatic runs for VM workflows are unavailable for this repository.
+            {hasOtherEdits && onSaveOff
+              ? " Save Off only to keep your other changes as a draft."
+              : ""}
           </WorkflowAlert>
         </div>
       ) : (
@@ -636,6 +657,11 @@ export function WorkflowTriggerInspector({
                 Enable automatic runs when saved
               </label>
             ) : null}
+            {vmTarget ? (
+              <p className="text-xs text-muted-foreground">
+                Automatic VM runs can use this repository’s workflow variables and secrets.
+              </p>
+            ) : null}
             <div className="space-y-1 text-xs" aria-live="polite">
               <p className="font-medium">
                 {connectionUnknown
@@ -683,7 +709,9 @@ export function WorkflowTriggerInspector({
             <p className="text-xs text-muted-foreground">
               {retrySave
                 ? "Retry saves the captured workflow change. Newer edits stay in your draft."
-                : "Save applies all pending workflow changes. Only future matching events will start runs."}
+                : hasOtherEdits && onSaveOff
+                  ? "Save Off only to keep your other changes as a draft."
+                  : "Save applies all pending workflow changes. Only future matching events will start runs."}
             </p>
             <div className="flex flex-wrap items-center justify-end gap-2">
               {triggerDirty ? (
@@ -699,6 +727,7 @@ export function WorkflowTriggerInspector({
                   </Button>
                 </div>
               ) : null}
+              {saveOff}
               <Button
                 type="button"
                 size="sm"

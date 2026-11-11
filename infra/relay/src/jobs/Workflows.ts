@@ -515,7 +515,13 @@ export const make = Effect.gen(function* () {
         AND ${jobs.summary}#>>'{queueReason,code}' IS DISTINCT FROM 'vm_waiting_capacity')`;
       const rows = yield* persist(
         db
-          .select({ summary: jobs.summary, needsAttention })
+          .select({
+            summary: jobs.summary,
+            needsAttention,
+            targetKind: sql<"machine" | "vm">`CASE
+              WHEN ${jobs.record}#>>'{vmAdmission,codexConnectionId}' IS NOT NULL
+                OR ${jobs.record}#>>'{runtime,kind}'='vm' THEN 'vm' ELSE 'machine' END`,
+          })
           .from(jobs)
           .where(
             and(
@@ -537,9 +543,10 @@ export const make = Effect.gen(function* () {
           )
           .limit(limit + 1),
       );
-      const page = rows.slice(0, limit).map(({ summary, needsAttention }) => ({
+      const page = rows.slice(0, limit).map(({ summary, needsAttention, targetKind }) => ({
         ...summary,
         needsAttention,
+        targetKind,
       }));
       const last = page.at(-1);
       return {

@@ -15,6 +15,7 @@ import * as Sources from "../workflowSources/Sources.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";
 import * as Routing from "./Routing.ts";
+import { checkVmAutomationTarget, vmAutomationAvailable } from "./VmAutomation.ts";
 const decodeProof = Schema.decodeUnknownOption(Routing.EnableProof);
 const isSourceError = Schema.is(WorkflowSourceError);
 
@@ -30,7 +31,8 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
   );
   if (!next.enabled || input.archived) return { userId: user };
   const target = input.definition.target;
-  if (target.kind === "vm") return yield* vmWorkflowAutomationUnavailable();
+  if (target.kind === "vm" && !(yield* vmAutomationAvailable(org)))
+    return yield* vmWorkflowAutomationUnavailable();
   const config = yield* Fence.configuration;
   if (!config?.admissionEnabled || config.organizationId !== org || !next.trigger)
     return yield* new WorkflowInvalidError({
@@ -55,7 +57,15 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
     return yield* new WorkflowInvalidError({
       message: "Issue creation and status-entry delivery must be verified for this Linear team.",
     });
-  const canonicalKey = yield* validateWorkflowTarget(org, repo, input.definition);
+  const canonicalKey =
+    target.kind === "vm"
+      ? yield* checkVmAutomationTarget(
+          sql,
+          { organizationId: org, repositoryId: repo },
+          target,
+          input.definition.steps,
+        )
+      : yield* validateWorkflowTarget(org, repo, input.definition);
   const proof = {
     epoch: bound.connection.authorization_epoch,
     connectionId: trigger.connectionId,
@@ -84,7 +94,7 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
         (error) => new WorkflowInvalidError({ message: error.message }),
       ),
     );
-  if (sameTarget) return { userId: user, proof };
+  if (target.kind === "vm" || sameTarget) return { userId: user, proof };
   const connector = yield* EnvironmentConnector;
   const probeId = yield* (yield* Crypto.Crypto).randomUUIDv4.pipe(
     Effect.mapError(

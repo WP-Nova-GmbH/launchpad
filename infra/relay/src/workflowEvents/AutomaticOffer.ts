@@ -3,9 +3,9 @@ import * as Layer from "effect/Layer";
 import {
   WORKFLOW_PROTOCOL,
   RepositoryWorkflow,
-  WorkflowQueueReason,
+  WorkflowVmDispatchBinding,
 } from "@t3tools/contracts/workflows";
-import { RelayJobId, WorkflowSourceError } from "@t3tools/contracts/relay";
+import { RelayJobId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { RelayDb } from "../db.ts";
@@ -13,61 +13,17 @@ import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { Workflows, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { validateWorkflowTarget, lockWorkflowTarget } from "../jobs/WorkflowTarget.ts";
 import * as Store from "../workflowSources/Store.ts";
-import * as Issue from "../workflowSources/IssueContext.ts";
+import { readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
+import {
+  blocked,
+  originalAuthority,
+  lockOriginalAuthority,
+  readAdmittedIssue,
+} from "./OriginalAuthority.ts";
+export { WorkflowQueued } from "./OriginalAuthority.ts";
 import * as Fence from "./Fence.ts";
 
-export class WorkflowQueued extends Schema.TaggedError<WorkflowQueued>()(
-  "WorkflowQueued",
-  WorkflowQueueReason.fields,
-) {}
-const blocked = (code: WorkflowQueueReason["code"], retryAt: number | null = null) =>
-  new WorkflowQueued({ code, retryAt });
-const isSourceError = Schema.is(WorkflowSourceError);
 const decodeWorkflow = Schema.decodeUnknownEffect(RepositoryWorkflow);
-
-/** This reads no provider data and holds authority only for its calling transaction. */
-const authority = Effect.fn("workflowEvents.originalAuthority")(function* (row: WorkflowJobRecord) {
-  const origin = row.record.origin;
-  if (origin?.kind !== "automation" || !row.record.event)
-    return yield* blocked("issue_context_invalid");
-  const sql = (yield* RelayDb).$client;
-  const [admission] = yield* sql<{
-    grant_generation: number;
-    connection_id: string;
-    grant_id: string;
-  }>`SELECT grant_generation,connection_id,grant_id FROM relay_workflow_admissions WHERE job_id=${row.jobId} AND occurrence_id=${origin.occurrenceId} AND workflow_id=${row.record.workflowId} AND organization_id=${row.organizationId} AND repository_id=${row.repositoryId}`;
-  if (
-    !admission ||
-    admission.connection_id !== origin.source.connectionId ||
-    admission.grant_id !== origin.source.grantId
-  )
-    return yield* blocked("source_withdrawn");
-  const bound = yield* Store.authority(row.repositoryId, origin.source.grantId).pipe(
-    Effect.catchIf(isSourceError, (error) =>
-      Effect.fail(
-        blocked(
-          error.code === "reconnect_required"
-            ? "source_reconnect"
-            : error.code === "service_configuration" || error.code === "not_configured"
-              ? "source_configuration"
-              : error.code === "refresh_in_progress"
-                ? "source_unavailable"
-                : "source_withdrawn",
-          error.retryAt ?? null,
-        ),
-      ),
-    ),
-  );
-  if (
-    bound.connection.connection_id !== origin.source.connectionId ||
-    bound.connection.organization_id !== row.organizationId ||
-    bound.connection.application_id !== origin.source.applicationId ||
-    bound.connection.workspace_id !== origin.source.workspaceId ||
-    bound.grant.generation !== admission.grant_generation
-  )
-    return yield* blocked("source_withdrawn");
-  return bound;
-});
 
 export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticOffer")(function* (
   row: WorkflowJobRecord,
@@ -75,7 +31,7 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
 ) {
   const store = yield* Workflows;
   const sql = (yield* RelayDb).$client;
-  const bound = yield* sql.withTransaction(authority(row));
+  const bound = yield* sql.withTransaction(originalAuthority(row));
   const retryAt = bound.connection.health.retryAt;
   if (retryAt && retryAt > (yield* Store.now))
     return yield* blocked(
@@ -122,32 +78,11 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
     return yield* blocked("environment_update");
   if (capability.progress !== null || capability.outcome !== "missing")
     return yield* blocked("target_invalid");
-  const context = yield* Issue.readIssue(bound.connection, row.record.event!.issueId).pipe(
-    Effect.catchTag("IssueContextError", (error) => Effect.fail(blocked(error.code))),
-    Effect.catchIf(isSourceError, (error) =>
-      Effect.fail(
-        blocked(
-          error.code === "reconnect_required"
-            ? "source_reconnect"
-            : error.code === "service_configuration"
-              ? "source_configuration"
-              : error.code === "rate_limited"
-                ? "source_rate_limited"
-                : error.code === "forbidden" || error.code === "not_found"
-                  ? "issue_unavailable"
-                  : error.code === "invalid_input"
-                    ? "issue_context_invalid"
-                    : "source_unavailable",
-          error.retryAt ?? null,
-        ),
-      ),
-    ),
-  );
+  const context = yield* readAdmittedIssue(bound.connection, row.record.event!.issueId);
   return yield* sql.withTransaction(
     Effect.gen(function* () {
       if (origin.kind !== "automation") return yield* blocked("issue_context_invalid");
-      yield* Fence.lock(origin.source.applicationId, origin.source.workspaceId);
-      const current = yield* authority(row);
+      const current = yield* lockOriginalAuthority(row);
       if (current.connection.authorization_epoch !== context.snapshot.authorizationEpoch)
         return yield* blocked("source_unavailable");
       const [saved] = yield* sql<{
@@ -236,8 +171,7 @@ const beginStart = Effect.fn("workflowEvents.beginStart")(function* (
   const store = yield* Workflows;
   return yield* sql.withTransaction(
     Effect.gen(function* () {
-      yield* Fence.lock(origin.source.applicationId, origin.source.workspaceId);
-      const current = yield* authority(row);
+      const current = yield* lockOriginalAuthority(row);
       if (
         current.connection.authorization_epoch !== offerAuthority.authorizationEpoch ||
         current.connection.authorization_epoch !== issueSnapshot.authorizationEpoch ||
@@ -267,6 +201,76 @@ const beginStart = Effect.fn("workflowEvents.beginStart")(function* (
   );
 });
 
+const beginVmStart = Effect.fn("workflowEvents.beginVmStart")(function* (
+  row: WorkflowJobRecord,
+  leaseUntil: string,
+  binding: WorkflowVmDispatchBinding,
+  executionEnabled: boolean,
+) {
+  const { event, workflow, runtime, vmAdmission } = row.record;
+  if (!executionEnabled) return yield* blocked("vm_execution_disabled");
+  if (!event || !vmAdmission || workflow?.definition.target.kind !== "vm" || runtime?.kind !== "vm")
+    return yield* blocked("target_invalid");
+  const sql = (yield* RelayDb).$client;
+  const store = yield* Workflows;
+  const checkCodex = Effect.fnUntraced(function* (lock: boolean) {
+    const codex = yield* store.getWorkflowVmCodexConnection(row.organizationId, lock);
+    if (codex && codex.connectionId !== vmAdmission.codexConnectionId)
+      return yield* blocked("vm_codex_replaced");
+    if (codex?.status !== "connected") return yield* blocked("vm_waiting_codex");
+  });
+  yield* checkCodex(false);
+  const bound = yield* sql.withTransaction(originalAuthority(row));
+  const context = yield* readAdmittedIssue(bound.connection, event.issueId);
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const current = yield* lockOriginalAuthority(row);
+      if (current.connection.authorization_epoch !== context.snapshot.authorizationEpoch)
+        return yield* blocked("source_unavailable");
+      const [saved] = yield* sql<{ record: unknown }>`SELECT record FROM relay_repository_workflows
+        WHERE workflow_id=${workflow.workflowId} AND repository_id=${row.repositoryId} FOR SHARE`;
+      if (!saved || (yield* decodeWorkflow(saved.record)).archived)
+        return yield* blocked("workflow_unavailable");
+      const [job] = yield* sql`SELECT job_id FROM relay_workflow_jobs
+        WHERE job_id=${row.jobId} AND revision=${row.revision} AND lease_until=${leaseUntil}
+          AND lease_until::timestamptz>clock_timestamp() AND status='preparing' AND pending_control IS NULL
+          AND record->>'startAttempted'='false' AND record->'progress'='null'::jsonb
+          FOR NO KEY UPDATE`;
+      if (!job) return yield* blocked("source_unavailable");
+      const vm = yield* readWorkflowVmBinding(sql, binding, "active", true).pipe(
+        Effect.catchTag("RelayTenancyNotFoundError", () =>
+          Effect.fail(blocked("environment_offline")),
+        ),
+      );
+      if (
+        !Schema.toEquivalence(WorkflowVmDispatchBinding)(vm.binding, binding) ||
+        vm.snapshot.canonicalKey !== row.repositoryCanonicalKey
+      )
+        return yield* blocked("target_invalid");
+      yield* checkCodex(true);
+      return yield* store.updateJob(
+        row,
+        {
+          ...row.record,
+          issueSnapshot: context.snapshot,
+          instruction: context.instruction,
+          offerAuthority: {
+            authorizationEpoch: current.connection.authorization_epoch,
+            grantGeneration: current.grant.generation,
+          },
+          startAttempted: true,
+          queueReason: null,
+          detail: "Starting the workflow in its VM.",
+          updatedAt: yield* Fence.timestamp,
+        },
+        null,
+        false,
+        leaseUntil,
+      );
+    }),
+  );
+});
+
 export class AutomaticOffers extends Context.Service<
   AutomaticOffers,
   {
@@ -279,6 +283,12 @@ export class AutomaticOffers extends Context.Service<
       leaseUntil: string,
       updatedAt: string,
     ) => Effect.Effect<WorkflowJobRecord, Effect.Error<ReturnType<typeof beginStart>>>;
+    readonly beginVmStart: (
+      row: WorkflowJobRecord,
+      leaseUntil: string,
+      binding: WorkflowVmDispatchBinding,
+      executionEnabled: boolean,
+    ) => Effect.Effect<WorkflowJobRecord, Effect.Error<ReturnType<typeof beginVmStart>>>;
   }
 >()("launchpad-relay/workflowEvents/AutomaticOffer/AutomaticOffers") {}
 export const layer = Layer.effect(
@@ -290,6 +300,8 @@ export const layer = Layer.effect(
       prepare: (row, lease) => prepareAutomaticOffer(row, lease).pipe(Effect.provide(context)),
       beginStart: (row, lease, updatedAt) =>
         beginStart(row, lease, updatedAt).pipe(Effect.provide(context)),
+      beginVmStart: (row, lease, binding, enabled) =>
+        beginVmStart(row, lease, binding, enabled).pipe(Effect.provide(context)),
     });
   }),
 );

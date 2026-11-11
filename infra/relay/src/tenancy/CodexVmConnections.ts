@@ -4,6 +4,8 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
+export const CODEX_VM_REFRESH_CLAIM_TIMEOUT_SECONDS = 6;
+
 export interface CodexVmConnection {
   readonly organizationId: string;
   readonly connectionId: string;
@@ -452,7 +454,7 @@ export function makeCodexVmConnections(sql: PgClient) {
         }>`SELECT
         ${current.expiresAt}::timestamptz > ${timestamp}::timestamptz + (${input.minimumValidityMs ?? 60000} * interval '1 millisecond') AS valid,
         ${current.expiresAt}::timestamptz <= ${timestamp}::timestamptz AS expired,
-        ${current.refreshStartedAt}::timestamptz <= ${timestamp}::timestamptz - interval '6 seconds' AS abandoned,
+        ${current.refreshStartedAt}::timestamptz <= ${timestamp}::timestamptz - (${CODEX_VM_REFRESH_CLAIM_TIMEOUT_SECONDS}::int * interval '1 second') AS abandoned,
         ${current.earliestRefreshAt}::timestamptz > ${timestamp}::timestamptz AS "tooEarly"`;
         if (current.refreshAttemptId) {
           if (timing!.abandoned) {

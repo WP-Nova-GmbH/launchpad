@@ -44,6 +44,7 @@ export const readWorkflowVmBinding = Effect.fnUntraced(function* (
   sql: PgClient,
   expected: WorkflowVmIdentity,
   stage: "active" | "enrolled" = "active",
+  lock = false,
 ) {
   const [row] = yield* sql<{
     threadId: string;
@@ -113,7 +114,7 @@ export const readWorkflowVmBinding = Effect.fnUntraced(function* (
           AND x.acknowledged_connection_id=x.connection_id)
       `
       }
-    LIMIT 1`;
+    LIMIT 1 ${lock ? sql`FOR SHARE OF t,a,p,b,e,c` : sql``}`;
   if (!row) return yield* tenancyNotFound("thread_not_found");
   const binding = {
     jobId: row.jobId,

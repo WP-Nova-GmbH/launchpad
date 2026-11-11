@@ -4,6 +4,7 @@ import { ThreadId } from "@t3tools/contracts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { SandboxInfo } from "e2b";
 import * as Effect from "effect/Effect";
+import type { LinearWorkflowConfiguration } from "../Config.ts";
 import type {
   ThreadVmComputeError,
   makeE2BThreadVmCompute,
@@ -52,12 +53,15 @@ export function makeThreadVmResumeWorker(
   guest: ResumeGuest,
   hostId: string,
   workflowEnabled?: boolean,
+  linearWorkflow?: LinearWorkflowConfiguration,
 ) {
   const store = makeThreadVmResumeStore(sql);
   const runOne = Effect.fn("relay.thread_vm.resume.run_one")(function* () {
     yield* makeThreadVmCapacityStore(sql).admitNext(
       hostId,
-      workflowEnabled === undefined ? "personal" : { workflowEnabled },
+      workflowEnabled === undefined
+        ? "personal"
+        : { workflowEnabled, ...(linearWorkflow ? { linearWorkflow } : {}) },
     );
     const claim = yield* store.claim(hostId);
     if (!claim) return false;

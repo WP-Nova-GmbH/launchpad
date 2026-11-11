@@ -6,6 +6,7 @@ import {
   WorkflowManualControl,
   isTerminalWorkflowJob,
   type WorkflowControl,
+  type WorkflowControlResult,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
 import * as DateTime from "effect/DateTime";
@@ -16,7 +17,9 @@ import { RelayDb } from "../db.ts";
 import { readWorkflowVmBinding, workflowVmHasSecrets } from "./WorkflowVmBinding.ts";
 import { WorkflowVmPreparation } from "./WorkflowVmPreparation.ts";
 import * as Semaphore from "effect/Semaphore";
-import { AutomaticOffers, WorkflowQueued } from "../workflowEvents/AutomaticOffer.ts";
+import { AutomaticOffers } from "../workflowEvents/AutomaticOffer.ts";
+import { blocked, originalAuthority, WorkflowQueued } from "../workflowEvents/OriginalAuthority.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
 import { queueReasonText } from "../workflowSources/IssueContext.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
@@ -112,6 +115,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
   const refresh = Effect.gen(function* () {
     const now = DateTime.formatIso(yield* DateTime.now);
     let job = row!.record;
+    const automaticVm = !!job.vmAdmission && job.origin?.kind === "automation";
+    const vmExecutionEnabled = automaticVm
+      ? Option.getOrUndefined(yield* Effect.serviceOption(ThreadVmRuntimeConfiguration))?.settings
+          ?.workflowExecutionEnabled === true
+      : false;
     const preparation = job.vmAdmission
       ? yield* Effect.serviceOption(WorkflowVmPreparation)
       : Option.none();
@@ -120,6 +128,15 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       if (row!.pendingControl?.response.operation === "cancel")
         return (yield* store.settleQueuedVmCancellation(row!, leaseUntil)).record;
       if (job.status !== "queued") return job;
+      if (automaticVm) {
+        if ((job.queueReason?.retryAt ?? 0) > Date.parse(now)) return job;
+        if (!vmExecutionEnabled) return yield* blocked("vm_execution_disabled");
+        const db = yield* Effect.serviceOption(RelayDb);
+        if (Option.isNone(db)) return yield* blocked("source_unavailable");
+        yield* db.value.$client.withTransaction(
+          originalAuthority(row!).pipe(Effect.provideService(RelayDb, db.value)),
+        );
+      }
       const code = yield* queuedWorkflowVmReason(row!, job.vmAdmission.codexConnectionId);
       if (
         code === "vm_waiting_capacity" &&
@@ -146,6 +163,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     let vm: Effect.Success<ReturnType<typeof readWorkflowVmBinding>> | null = null;
     const db = vmRuntime ? yield* Effect.serviceOption(RelayDb) : Option.none();
     if (vmRuntime) {
+      if (job.status === "cancelling" && job.vmCancellationConfirmed === true)
+        return Option.isSome(preparation)
+          ? yield* preparation.value.advance(row!, leaseUntil)
+          : job;
       if (Option.isSome(db)) {
         vm = yield* readWorkflowVmBinding(db.value.$client, {
           jobId,
@@ -161,6 +182,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         if (!isTerminalWorkflowJob(job.status) && Option.isSome(preparation))
           return yield* preparation.value.advance(row!, leaseUntil);
         return job;
+      }
+      if (automaticVm && job.startAttempted === false && !row!.pendingControl) {
+        if ((job.queueReason?.retryAt ?? 0) > Date.parse(now)) return job;
+        if (!vmExecutionEnabled) return yield* blocked("vm_execution_disabled");
       }
     }
     const connector = yield* EnvironmentConnector;
@@ -451,6 +476,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       }
     }
     const mayRetireOffer = !vm && job.startAttempted === false;
+    const firstVmStart = vm !== null && automaticVm && job.startAttempted === false;
+    let knownStart: WorkflowControlResult | undefined;
     if (origin.kind === "automation" && control.operation === "start") {
       const capability = yield* dispatch({ ...binding, operation: "status" });
       if (
@@ -479,6 +506,13 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           message: "Update this environment to reconcile this automatic workflow.",
         });
       }
+      if (
+        vm &&
+        !firstVmStart &&
+        (capability.workflowResult.progress || capability.workflowResult.outcome === "cancelled")
+      )
+        knownStart = capability.workflowResult;
+      if (automaticVm && !firstVmStart && !vmExecutionEnabled && !knownStart) return job;
       const supported = capability.workflowResult.actions ?? [];
       if (
         workflow.definition.steps.some(
@@ -489,11 +523,13 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           message: "This environment does not support the workflow's publishing steps.",
         });
       // Persist before sending: a crash or timeout leaves every later delivery frozen.
-      if (mayRetireOffer) {
+      if (mayRetireOffer || firstVmStart) {
         const automatic = yield* Effect.serviceOption(AutomaticOffers);
         if (automatic._tag === "None")
           return yield* new WorkflowQueued({ code: "source_unavailable", retryAt: null });
-        row = yield* automatic.value.beginStart(row!, leaseUntil, now);
+        row = firstVmStart
+          ? yield* automatic.value.beginVmStart(row!, leaseUntil, vm!.binding, vmExecutionEnabled)
+          : yield* automatic.value.beginStart(row!, leaseUntil, now);
         job = row.record;
       }
     }
@@ -501,8 +537,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
       job = row.record;
     }
-    const response = yield* dispatch(control);
-    const outcome = response.workflowResult;
+    const outcome = knownStart ?? (yield* dispatch(control)).workflowResult;
     if (!outcome)
       return yield* new WorkflowInvalidError({
         message: "This environment did not answer with the workflow protocol.",
@@ -537,8 +572,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       if (vm && Option.isSome(preparation)) {
         row = yield* update(row!, {
           ...job,
+          status: "cancelling",
           startAttempted: false,
           vmCancellationConfirmed: true,
+          queueReason: null,
           detail: "Workflow never started. Cleaning up the VM.",
           updatedAt: now,
         });
@@ -566,6 +603,23 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         false,
       );
       return row.record;
+    }
+    if (
+      control.operation === "start" &&
+      firstVmStart &&
+      ["busy", "unavailable", "missing"].includes(outcome.outcome)
+    ) {
+      const code = outcome.outcome === "busy" ? "environment_busy" : "target_invalid";
+      return (yield* update(row!, {
+        ...job,
+        startAttempted: false,
+        issueSnapshot: undefined,
+        offerAuthority: undefined,
+        instruction: job.event ? `${job.event.identifier}: ${job.event.title}` : job.instruction,
+        queueReason: { code, retryAt: Date.parse(now) + 30_000 },
+        detail: outcome.detail ?? queueReasonText[code],
+        updatedAt: now,
+      })).record;
     }
     if (
       control.operation === "start" &&
@@ -620,6 +674,22 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           latest.leaseUntil !== leaseUntil
         )
           return latest?.record ?? null;
+        if (
+          latest.record.vmAdmission &&
+          latest.record.origin?.kind === "automation" &&
+          isWorkflowQueued(error)
+        ) {
+          const timestamp = yield* DateTime.now;
+          return (yield* update(latest, {
+            ...latest.record,
+            queueReason: {
+              code: error.code,
+              retryAt: error.retryAt ?? timestamp.epochMilliseconds + 30_000,
+            },
+            detail: queueReasonText[error.code],
+            updatedAt: DateTime.formatIso(timestamp),
+          })).record;
+        }
         if (
           !latest.record.vmAdmission &&
           latest.record.origin?.kind === "automation" &&

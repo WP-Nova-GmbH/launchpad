@@ -12,6 +12,7 @@ import { relayWorkflowJobs, relayWorkflowAdmissions } from "../persistence/schem
 import * as Sources from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";
 import { FRESHNESS_MS, WebhookError, matches, type NormalizedEvent } from "./Linear.ts";
+import { establishedWorkflowVmCodex, vmAutomationAvailable } from "./VmAutomation.ts";
 
 const decodeWorkflow = Schema.decodeUnknownEffect(RepositoryWorkflow);
 const decodeJob = Schema.decodeUnknownEffect(RepositoryWorkflowJob);
@@ -159,10 +160,13 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
         }
         const jobs: Array<typeof relayWorkflowJobs.$inferInsert> = [];
         const admissions: Array<typeof relayWorkflowAdmissions.$inferInsert> = [];
+        const allowVm = yield* vmAutomationAvailable(organizationId);
+        let vmCodex: Effect.Success<ReturnType<typeof establishedWorkflowVmCodex>> | undefined;
         for (const row of current) {
           const flow = yield* decodeWorkflow(row.record);
           const automation = flow.automation;
           const trigger = automation?.trigger;
+          const vm = flow.definition.target.kind === "vm";
           if (
             !config.admissionEnabled ||
             !automation?.enabled ||
@@ -170,7 +174,7 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
             flow.archived ||
             flow.organizationId !== organizationId ||
             flow.repositoryId !== row.repository_id ||
-            flow.definition.target.kind !== "machine" ||
+            (vm && !allowVm) ||
             !matches(trigger, event)
           )
             continue;
@@ -196,6 +200,14 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
               )
           )
             continue;
+          if (vm && vmCodex === undefined)
+            vmCodex = yield* establishedWorkflowVmCodex(sql, organizationId, true);
+          if (vm && !vmCodex) continue;
+          const vmAdmission =
+            vm && vmCodex
+              ? { codexConnectionId: vmCodex.connectionId, hasSecrets: true }
+              : undefined;
+          const waitingForCodex = vmAdmission && vmCodex?.status !== "connected";
           const jobId = yield* (yield* Crypto.Crypto).randomUUIDv4.pipe(
             Effect.mapError(() => new WebhookError({ status: 500, code: "identity_failed" })),
           );
@@ -219,11 +231,16 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
               occurrenceId,
             },
             event: event.facts,
+            ...(vmAdmission ? { vmAdmission } : {}),
             requiredProtocol: WORKFLOW_PROTOCOL,
             instruction: `${event.facts.identifier}: ${event.facts.title}\nAwaiting issue context before starting.`,
             status: "queued",
-            detail: "Waiting for the selected environment to start this workflow.",
-            queueReason: null,
+            detail: waitingForCodex
+              ? "Waiting for the organization Codex connection."
+              : vm
+                ? "Waiting to prepare the workflow VM."
+                : "Waiting for the selected environment to start this workflow.",
+            queueReason: waitingForCodex ? { code: "vm_waiting_codex", retryAt: null } : null,
             workflow: null,
             progress: null,
             createdAt: stamp,

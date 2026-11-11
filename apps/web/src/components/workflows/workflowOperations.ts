@@ -59,6 +59,7 @@ function definitiveRejection(cause: unknown) {
 type SaveOptions = {
   readonly automationSupported: boolean;
   readonly read: () => Promise<WorkflowCatalog>;
+  readonly turnOffOnly?: boolean;
 };
 type SaveOperation = NonNullable<WorkflowEditorDraft["operation"]>;
 const sameWorkflowTarget = Schema.toEquivalence(WorkflowTarget);
@@ -72,6 +73,21 @@ export function normalizeWorkflowDefinitionForSave(
   return baseBranch === target.baseBranch
     ? definition
     : { ...definition, target: { ...target, baseBranch } };
+}
+
+export function workflowVmOffSave(draft: WorkflowEditorDraft) {
+  const baseline = draft.baseline;
+  if (
+    !baseline ||
+    baseline.archived ||
+    baseline.definition.target.kind !== "vm" ||
+    !baseline.automation?.enabled
+  )
+    return null;
+  return {
+    definition: baseline.definition,
+    automation: { ...baseline.automation, enabled: false },
+  };
 }
 
 export function assertWorkflowSaveSupport(operation: SaveOperation, catalog?: WorkflowCatalog) {
@@ -137,6 +153,9 @@ export async function saveWorkflowDraft(
   const draft = appAtomRegistry.get(workflowDraftAtom).editors[key];
   if (!draft || draft.operation?.state === "pending") return null;
   const automationSupported = options?.automationSupported === true;
+  const previous = draft.operation;
+  const offOnly = !previous && options?.turnOffOnly === true ? workflowVmOffSave(draft) : null;
+  if (!previous && options?.turnOffOnly && (!offOnly || !automationSupported)) return null;
   if (!draft.operation && automationSupported && !workflowDraftAutomationResolved(draft)) {
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
       ...state,
@@ -152,10 +171,9 @@ export async function saveWorkflowDraft(
     return null;
   }
   const nextArchived = archived ?? draft.baseline?.archived ?? false;
-  const automation = { ...workflowDraftAutomation(draft) };
+  const automation = offOnly?.automation ?? { ...workflowDraftAutomation(draft) };
   // Both archive and restore deliberately stay Off, before capturing the expected receipt.
   if (archived !== undefined || nextArchived) automation.enabled = false;
-  const previous = draft.operation;
   const operation = previous
     ? {
         ...previous,
@@ -164,7 +182,7 @@ export async function saveWorkflowDraft(
     : {
         requestId: randomUUID(),
         state: "pending" as const,
-        definition: normalizeWorkflowDefinitionForSave(draft.definition),
+        definition: offOnly?.definition ?? normalizeWorkflowDefinitionForSave(draft.definition),
         automation,
         includesAutomation: automationSupported,
         archived: nextArchived,
@@ -176,10 +194,12 @@ export async function saveWorkflowDraft(
       ...state.editors,
       [key]: {
         ...draft,
-        ...(!previous ? { definition: operation.definition } : {}),
-        ...(archived !== undefined
-          ? { automation: normalizeWorkflowAutomation(operation.automation) }
-          : {}),
+        ...(!previous && !offOnly ? { definition: operation.definition } : {}),
+        ...(offOnly
+          ? { automation: { ...workflowDraftAutomation(draft), enabled: false } }
+          : archived !== undefined
+            ? { automation: normalizeWorkflowAutomation(operation.automation) }
+            : {}),
         operation,
         error: null,
       },

@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import { and, eq } from "drizzle-orm";
 import {
   WorkflowConflictError,
+  WorkflowDefinition,
   WorkflowInvalidError,
   type RepositoryWorkflow,
   type SaveRepositoryWorkflow,
@@ -14,6 +15,7 @@ import { relayRepositoryWorkflows } from "../persistence/schema.ts";
 import * as Sources from "../workflowSources/Store.ts";
 import * as Fence from "./Fence.ts";
 import { lockWorkflowTarget, vmWorkflowAutomationUnavailable } from "../jobs/WorkflowTarget.ts";
+import { checkVmAutomationTarget, vmAutomationAvailable } from "./VmAutomation.ts";
 
 export const automation = (value: RepositoryWorkflow["automation"] | null | undefined) => ({
   enabled: value?.enabled ?? false,
@@ -22,6 +24,21 @@ export const automation = (value: RepositoryWorkflow["automation"] | null | unde
     : null,
 });
 export const triggerKey = (trigger: WorkflowTrigger | null) => stableStringify(trigger);
+const sameDefinition = Schema.toEquivalence(WorkflowDefinition);
+const sameTarget = Schema.toEquivalence(WorkflowDefinition.fields.target);
+export function isAutomationOffOnly(
+  input: typeof SaveRepositoryWorkflow.Type,
+  previous: RepositoryWorkflow | null,
+) {
+  return (
+    previous?.automation?.enabled === true &&
+    input.automation?.enabled === false &&
+    input.archived === previous.archived &&
+    sameDefinition(input.definition, previous.definition) &&
+    triggerKey(automation(input.automation).trigger) ===
+      triggerKey(automation(previous.automation).trigger)
+  );
+}
 export const targetKey = (definition: RepositoryWorkflow["definition"]) =>
   stableStringify({
     ...(definition.target.kind === "machine"
@@ -75,8 +92,13 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
   if (!context) return yield* invalid("An authenticated repository maintainer is required.");
   const config = yield* Fence.configuration;
   const next = automation(record.automation);
+  const target = record.definition.target;
   if (record.archived) next.enabled = false;
-  if (next.enabled && record.definition.target.kind === "vm")
+  if (
+    next.enabled &&
+    target.kind === "vm" &&
+    !(yield* vmAutomationAvailable(record.organizationId))
+  )
     return yield* vmWorkflowAutomationUnavailable();
   if (
     next.enabled &&
@@ -152,11 +174,14 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
             "Source authority, delivery coverage or target validation changed. Refresh before enabling.",
           );
         if (next.enabled) {
-          const canonicalKey = yield* lockWorkflowTarget(
-            record.organizationId,
-            record.repositoryId,
-            record.definition,
-          );
+          const canonicalKey =
+            target.kind === "vm"
+              ? yield* checkVmAutomationTarget(sql, record, target, record.definition.steps, true)
+              : yield* lockWorkflowTarget(
+                  record.organizationId,
+                  record.repositoryId,
+                  record.definition,
+                );
           if (canonicalKey !== proof?.canonicalKey)
             return yield* invalid(
               "The target repository binding changed. Refresh before enabling.",
@@ -164,9 +189,21 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
         }
         const old = automation(current?.record.automation);
         const changed =
-          next.enabled && (!old.enabled || triggerKey(old.trigger) !== triggerKey(next.trigger));
+          next.enabled &&
+          (!old.enabled ||
+            triggerKey(old.trigger) !== triggerKey(next.trigger) ||
+            !current ||
+            !sameTarget(current.record.definition.target, target));
         const stamp = yield* Fence.timestamp;
-        const saved = { ...record, automation: next, updatedAt: stamp };
+        const saved =
+          current && isAutomationOffOnly(input, current.record)
+            ? {
+                ...current.record,
+                revision: record.revision,
+                automation: { ...old, enabled: false },
+                updatedAt: stamp,
+              }
+            : { ...record, automation: next, updatedAt: stamp };
         const projection = {
           revision: saved.revision,
           record: saved,

@@ -13,12 +13,18 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
+import { RelayConfiguration } from "../Config.ts";
 import { RelayDb } from "../db.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { makeThreadVmCapacityStore } from "../threads/ThreadVmCapacityStore.ts";
-import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
 import { queueReasonText } from "../workflowSources/IssueContext.ts";
+import {
+  lockOriginalAuthority,
+  blocked,
+  isWorkflowSourceBlocker,
+} from "../workflowEvents/OriginalAuthority.ts";
 import {
   withFrozenWorkflowRunConfiguration,
   WorkflowRunConfigurationError,
@@ -80,7 +86,9 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
       !checkoutFailed &&
       !createRejected &&
       !createRejectedAfterCancel &&
-      ((job.startAttempted === false && operation === "cancel") || cancelPaused)
+      ((job.startAttempted === false &&
+        (operation === "cancel" || job.vmCancellationConfirmed === true)) ||
+        cancelPaused)
     ) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
@@ -261,8 +269,33 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
       const status = "preparing";
       let detail = "Preparing the workflow VM.";
       let code: WorkflowQueueReason["code"] | null = null;
+      const awaitingAutomaticStart =
+        job.origin?.kind === "automation" && job.startAttempted === false;
+      const codex =
+        awaitingAutomaticStart && !checkoutFailed
+          ? yield* store.getWorkflowVmCodexConnection(row.organizationId)
+          : null;
       if (checkoutFailed) {
         detail = "Repository checkout failed. Cleaning up the workflow VM.";
+      } else if (
+        preparation.capacityState === "waiting" &&
+        isWorkflowSourceBlocker(preparation.blocker)
+      ) {
+        code = preparation.blocker;
+        detail = queueReasonText[code];
+      } else if (awaitingAutomaticStart && settings?.workflowExecutionEnabled !== true) {
+        code = "vm_execution_disabled";
+        detail = queueReasonText[code];
+      } else if (
+        awaitingAutomaticStart &&
+        codex &&
+        codex.connectionId !== admission.codexConnectionId
+      ) {
+        code = "vm_codex_replaced";
+        detail = queueReasonText[code];
+      } else if (awaitingAutomaticStart && codex?.status !== "connected") {
+        code = "vm_waiting_codex";
+        detail = queueReasonText[code];
       } else if (preparation.capacityState === "waiting") {
         if (preparation.blocker === "workflow_codex_unavailable") {
           code = "vm_waiting_codex";
@@ -270,7 +303,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
         } else if (preparation.blocker === "workflow_template_unverified") {
           code = "target_invalid";
           detail = "The saved workflow VM build could not be verified. Waiting to retry.";
-        } else if (preparation.blocker === "workflow_disabled") {
+        } else if (preparation.blocker === "workflow_disabled" && !awaitingAutomaticStart) {
           code = "target_invalid";
           detail = "Workflow VM starts are disabled. This preparation will wait.";
         } else {
@@ -315,6 +348,9 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
       )).record;
     }
     if (!settings || job.status !== "queued") return job;
+    const automatic = job.origin?.kind === "automation";
+    if (automatic && settings.workflowExecutionEnabled !== true)
+      return yield* blocked("vm_execution_disabled");
     const operationId = job.jobId;
     const threadId = ThreadId.make(`workflow:${job.jobId}`);
     const identity = {
@@ -402,7 +438,10 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
 
     const catalog = settings.workflowModelCatalog;
     const box = yield* RelaySecretBox;
-    const freeze = yield* withFrozenWorkflowRunConfiguration(
+    const linearWorkflow = Option.getOrUndefined(
+      yield* Effect.serviceOption(RelayConfiguration),
+    )?.linearWorkflow;
+    const freezeConfiguration = withFrozenWorkflowRunConfiguration(
       sql,
       box,
       identity,
@@ -414,6 +453,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
         const reserved = yield* capacity.admitNext(settings.hostId, {
           workflowEnabled: true,
           workflowOperationId: operationId,
+          ...(linearWorkflow ? { linearWorkflow } : {}),
         });
         if (!reserved) return yield* unavailable();
         yield* recheckWorkflowVmGitHub(sql, identity, git);
@@ -456,8 +496,14 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           expectedLease,
         );
       }),
+    );
+    const freeze = yield* (
+      automatic
+        ? sql.withTransaction(lockOriginalAuthority(row).pipe(Effect.andThen(freezeConfiguration)))
+        : freezeConfiguration
     ).pipe(Effect.result);
     if (freeze._tag === "Success") return (yield* store.getJob(job.jobId))?.record ?? job;
+    if (freeze.failure._tag !== "WorkflowRunConfigurationError") return yield* freeze.failure;
     if (freeze.failure.reason === "not_allowed") return yield* block(freeze.failure.message);
     if (freeze.failure.reason === "storage")
       return yield* new WorkflowPersistenceError({ cause: freeze.failure });

@@ -4,11 +4,14 @@ import * as Schema from "effect/Schema";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Redacted from "effect/Redacted";
 import { CurrentTransformer } from "effect/unstable/sql/Statement";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { RelayConfiguration } from "../Config.ts";
 import { RelayDb } from "../db.ts";
 import * as Workflows from "../jobs/Workflows.ts";
+import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import {
@@ -83,6 +86,97 @@ const ordered = Effect.fn(function* <A, E, R, B, F, S>(
   return [yield* Fiber.join(writer), yield* Fiber.join(reader)] as const;
 });
 describe("verified event admission (PostgreSQL)", () => {
+  it.live("admits a VM only with execution enabled and pins the established Codex identity", () =>
+    testDb(
+      Effect.gen(function* () {
+        yield* seed;
+        yield* enableBeforeEvent("machine");
+        const vm = yield* enableBeforeEvent("vm");
+        const sql = (yield* RelayDb).$client;
+        yield* sql`UPDATE relay_repository_workflows SET record=${sql.json({
+          ...vm,
+          definition: { ...vm.definition, target: { kind: "vm", baseBranch: null } },
+        })} WHERE workflow_id='vm'`;
+        const fs = yield* FileSystem.FileSystem;
+        const migration = yield* fs.readFileString(
+          new URL(
+            "../../migrations/postgres/20261028130056_codex_vm_connections/migration.sql",
+            import.meta.url,
+          ).pathname,
+        );
+        for (const statement of migration.split("--> statement-breakpoint")) {
+          if (statement.trim()) yield* sql.unsafe(statement);
+        }
+        yield* sql`INSERT INTO relay_codex_vm_connections (organization_id,connection_id,status,updated_at)
+          VALUES ('org','first','disconnected','2026')`;
+        const now = yield* clock;
+        const vmReceive = (offset: number) =>
+          receive(issue(now + offset)).pipe(
+            Effect.provideService(ThreadVmRuntimeConfiguration, {
+              settings: {
+                compute: {
+                  apiUrl: "https://compute.test",
+                  sandboxUrl: "https://sandbox.test",
+                  apiKey: Redacted.make("fixture"),
+                  templateId: "runner:fixture",
+                  hostAddresses: ["192.0.2.10"],
+                  timeoutMs: 600_000,
+                },
+                templateBuildId: "fixture",
+                workflowExecutionEnabled: true,
+                workflowModelCatalog: { defaultModel: "fixture-model", models: [] },
+                hostId: "host",
+                maxRunningVms: 1,
+                publicRelayUrl: "https://relay.test",
+                autoPauseEnabled: false,
+                autoBackupEnabled: false,
+                autoDeleteEnabled: false,
+                replacementEnabled: false,
+                restoreEnabled: false,
+                resetEnabled: false,
+              },
+            }),
+          );
+        expect((yield* vmReceive(0)).status).toBe(200);
+        expect(yield* counts).toEqual({ occurrences: 1, admissions: 1, jobs: 1 });
+        yield* sql`UPDATE relay_codex_vm_connections SET issuer='issuer',subject='subject',client_id='client'`;
+        expect((yield* receive(issue(now + 1))).status).toBe(200);
+        expect(yield* counts).toEqual({ occurrences: 2, admissions: 2, jobs: 2 });
+        const [admitted] = yield* ordered(
+          vmReceive(2),
+          sql`UPDATE relay_codex_vm_connections SET connection_id='replacement', subject='new-subject',
+            status='connected', payload_sealed='fixture', expires_at='2099-01-01'`,
+        );
+        expect(admitted.status).toBe(200);
+        expect((yield* vmReceive(2)).status).toBe(200);
+        expect((yield* vmReceive(3)).status).toBe(200);
+        expect(yield* counts).toEqual({ occurrences: 4, admissions: 6, jobs: 6 });
+        const store = yield* Workflows.make;
+        const jobs = (yield* store.listJobs("repo")).filter((j) => j.record.workflowId === "vm");
+        expect(jobs).toHaveLength(2);
+        const active = yield* store.pageJobs("repo", { view: "active" });
+        expect(active.jobs.filter((j) => j.targetKind === "vm")).toHaveLength(2);
+        const first = jobs.find((j) => j.record.vmAdmission?.codexConnectionId === "first");
+        expect(first).toMatchObject({
+          submitterUserId: null,
+          record: {
+            runtime: null,
+            workflow: null,
+            status: "queued",
+            queueReason: { code: "vm_waiting_codex", retryAt: null },
+            origin: {
+              kind: "automation",
+              source: { grantId: "grant", connectionId: "connection" },
+            },
+          },
+        });
+        expect(
+          jobs.find((j) => j.record.vmAdmission?.codexConnectionId === "replacement")?.record
+            .queueReason,
+        ).toBeNull();
+      }),
+    ),
+  );
   it.live(
     "atomically admits every workflow once across concurrent copies and stale authenticated retries",
     () =>

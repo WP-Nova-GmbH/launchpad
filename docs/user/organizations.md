@@ -223,10 +223,12 @@ When automatic triggering is available on your relay, open **Trigger settings** 
 Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected
 status. Optional labels must all match. Organization admins can connect Linear and grant
 repository access from the editor without leaving the draft. Enabling requires verified event
-delivery for that team and a valid Machine target.
+delivery for that team. A VM target also requires the organization's GitHub App and Codex account.
+Automatic VM runs use the repository's workflow variables and secrets and wait for an organization VM slot.
 
 **Save** applies the rule and its On/Off setting to future events. The catalog shows the saved
 state and any source or target problem. Turning Off preserves existing jobs and manual Run.
+Use **Save Off only** in a VM workflow to turn off its trigger while keeping other edits in the draft.
 Archiving disables automation, and restoring leaves it Off.
 
 Before an automatic job is handed to its environment, Launchpad reads the issue’s current title,
@@ -235,7 +237,7 @@ if the issue changes later; open **Issue details** on the run to inspect what it
 status or label changes do not cancel a job already created by an event. Offline or busy environments
 leave jobs queued. If issue context exceeds 32,000 characters including its metadata, shorten the
 description and refresh the run; Launchpad does not start with truncated requirements. Source or
-issue access problems keep the job queued with recovery guidance. Disconnecting a source prevents
+issue access problems hold the run and show recovery guidance. Disconnecting a source prevents
 new handoffs; work already marked Starting may continue. Use Cancel run to stop existing work.
 
 **Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use

@@ -243,6 +243,7 @@ export const WorkflowQueueReason = Schema.Struct({
     "issue_context_too_large",
     "vm_waiting_capacity",
     "vm_limit_disabled",
+    "vm_execution_disabled",
     "vm_waiting_codex",
     "vm_codex_replaced",
     "vm_target_changed",
@@ -437,6 +438,7 @@ export type RepositoryWorkflowJob = typeof RepositoryWorkflowJob.Type;
 export const RepositoryWorkflowJobSummary = Schema.Struct({
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
   originSummary: Schema.optional(WorkflowOriginSummary),
+  targetKind: Schema.optional(Schema.Literals(["machine", "vm"])),
   jobId: RepositoryWorkflowJob.fields.jobId,
   repositoryId: RepositoryWorkflowJob.fields.repositoryId,
   workflowId: RepositoryWorkflowJob.fields.workflowId,
@@ -638,6 +640,7 @@ export const WorkflowCatalog = Schema.Struct({
   workflows: Schema.Array(RepositoryWorkflow),
   automationSupported: Schema.optional(Schema.Boolean),
   vmExecutionAvailable: Schema.optional(Schema.Boolean),
+  vmAutomationAvailable: Schema.optional(Schema.Boolean),
   automationSummaries: Schema.optional(Schema.Array(WorkflowAutomationSummary)),
   vmAuthoring: Schema.optional(Schema.Struct({ models: Schema.NullOr(WorkflowVmModelCatalog) })),
 });

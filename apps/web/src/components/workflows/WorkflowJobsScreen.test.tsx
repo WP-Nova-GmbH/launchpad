@@ -412,15 +412,59 @@ effectIt.layer(
     expect(content()).not.toContain("Approve result");
   });
 
-  screenTest("cancels a queued VM run when the viewer has permission", async () => {
+  const queuedAutomaticVm = {
+    ...vmReview,
+    workflow: null,
+    runtime: null,
+    progress: null,
+    status: "queued",
+    detail: "Waiting for a VM slot.",
+    vmAdmission: { codexConnectionId: "codex", hasSecrets: true },
+    origin: {
+      kind: "automation",
+      organizationId: "organization",
+      repositoryId: "A",
+      workflowId: "workflow",
+      source: {
+        provider: "linear",
+        applicationId: "app",
+        workspaceId: "workspace",
+        connectionId: "source",
+        grantId: "grant",
+      },
+      occurrenceId: "event",
+    },
+  } satisfies RepositoryWorkflowJob;
+
+  screenTest("labels a queued automatic VM and respects denied cancellation", async () => {
+    fixture.list.mockResolvedValue([
+      {
+        ...summary(queuedAutomaticVm.jobId),
+        status: "queued",
+        runtime: null,
+        targetKind: "vm",
+        originSummary: { kind: "automation", workflowName: "Linear VM workflow" },
+      },
+    ]);
+    fixture.job.mockReturnValue({
+      ...queuedAutomaticVm,
+      viewerControls: { canCancel: false, canApprove: false, canRespond: false },
+    });
+    await mount({ repositoryId: "A" });
+    expect(content()).toContain("Linear VM workflow");
+    expect(content()).toContain("Workflow VM");
+    await press(queuedAutomaticVm.jobId);
+    expect(content()).toContain("Workflow VM");
+    expect(content()).toContain("Started by workflow");
+    expect(content()).toContain("Waiting for a VM slot.");
+    expect(content()).not.toContain("Cancel job");
+  });
+
+  screenTest("cancels a queued automatic VM run when the viewer has permission", async () => {
     const queued = {
-      ...vmReview,
-      runtime: null,
-      progress: null,
-      status: "queued",
-      vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
+      ...queuedAutomaticVm,
       viewerControls: { canCancel: true, canApprove: false, canRespond: false },
-    } satisfies RepositoryWorkflowJob;
+    };
     fixture.job.mockReturnValue(queued);
     fixture.respond.mockImplementation(() => {
       const cancelled = { ...queued, status: "cancelled" as const };

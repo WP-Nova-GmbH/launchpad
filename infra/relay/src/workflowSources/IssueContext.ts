@@ -112,6 +112,7 @@ export const queueReasonText: Record<WorkflowQueueReason["code"], string> = {
   target_invalid: "Choose a valid checkout in the workflow, then refresh this job.",
   vm_waiting_capacity: "Waiting for a workflow VM slot.",
   vm_limit_disabled: "Ask an organization admin to raise the Workflow VMs limit to start this run.",
+  vm_execution_disabled: "Workflow VM execution is disabled on this relay. The run will wait.",
   vm_waiting_codex: "Reconnect the organization's Codex account to start this run.",
   vm_codex_replaced:
     "The original Codex connection was replaced. Cancel this run and start a new one.",

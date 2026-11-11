@@ -30,20 +30,34 @@ import { makeThreadVmPolicyStore } from "./ThreadVmPolicy.ts";
 import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
 import { RelayDb } from "../db.ts";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
-import { advanceWorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
-import type { WorkflowResultSaving } from "@t3tools/contracts/workflows";
-import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
+import {
+  advanceWorkflowVmPreparation,
+  workflowVmPreparationLayer,
+} from "../jobs/WorkflowVmPreparation.ts";
+import type {
+  RepositoryWorkflowJob,
+  WorkflowResultSaving,
+  WorkflowVmDispatchBinding,
+} from "@t3tools/contracts/workflows";
+import {
+  EnvironmentConnector,
+  EnvironmentMintRequestTimedOut,
+} from "../environments/EnvironmentConnector.ts";
+import { HttpClient, HttpClientResponse } from "effect/unstable/http";
+import { RelayConfiguration } from "../Config.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Repositories } from "../tenancy/Repositories.ts";
 import { Machines } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
 import { WorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
-import { deliverPendingWorkflowJobs } from "../jobs/WorkflowDispatcher.ts";
+import { deliverPendingWorkflowJobs, refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
 import { WorkflowWake } from "../jobs/WorkflowWake.ts";
 import { refreshWorkflowJobForClient, respondToWorkflowJob } from "../http/WorkflowsApi.ts";
 import { Workflows, type WorkflowDispatchScope, layer as workflows } from "../jobs/Workflows.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { ThreadVmRuntimeConfiguration } from "./ThreadVmRuntime.ts";
+import * as AutomaticOffers from "../workflowEvents/AutomaticOffer.ts";
+import { config as relayConfig } from "../workflowSources/test-fixture.ts";
 import {
   admitPortableThreadWork,
   completePortableThreadWork,
@@ -76,6 +90,7 @@ const seed = Effect.fnUntraced(function* (input: {
   organizationId?: string;
   personal?: boolean;
   automatic?: boolean;
+  stableWorkflowIdentity?: boolean;
   kind?: "create" | "resume";
 }) {
   const sql = yield* PgClient.PgClient;
@@ -83,8 +98,8 @@ const seed = Effect.fnUntraced(function* (input: {
   const repositoryId = NodeCrypto.randomUUID();
   const workflowJobId = NodeCrypto.randomUUID();
   const threadId = input.personal ? NodeCrypto.randomUUID() : `workflow:${workflowJobId}`;
-  const allocationId = NodeCrypto.randomUUID();
-  const operationId = NodeCrypto.randomUUID();
+  const allocationId = input.stableWorkflowIdentity ? workflowJobId : NodeCrypto.randomUUID();
+  const operationId = input.stableWorkflowIdentity ? workflowJobId : NodeCrypto.randomUUID();
   const ownerUserId = NodeCrypto.randomUUID();
   const placements = makeThreadPlacementStore(sql);
   const capacity = makeThreadVmCapacityStore(sql);
@@ -135,10 +150,10 @@ const seed = Effect.fnUntraced(function* (input: {
             occurrenceId: NodeCrypto.randomUUID(),
             source: {
               provider: "linear",
-              applicationId: "app",
+              applicationId: input.stableWorkflowIdentity ? `app:${organizationId}` : "app",
               workspaceId: "workspace",
               connectionId: NodeCrypto.randomUUID(),
-              grantId: "grant",
+              grantId: input.stableWorkflowIdentity ? NodeCrypto.randomUUID() : "grant",
             },
           }
         : { kind: "manual", userId: ownerUserId },
@@ -187,8 +202,11 @@ const seed = Effect.fnUntraced(function* (input: {
   };
 });
 
-const activeWorkflow = Effect.fnUntraced(function* (automatic = false) {
-  const f = yield* seed({ hostId: NodeCrypto.randomUUID(), automatic });
+const activeWorkflow = Effect.fnUntraced(function* (
+  automatic = false,
+  stableWorkflowIdentity = false,
+) {
+  const f = yield* seed({ hostId: NodeCrypto.randomUUID(), automatic, stableWorkflowIdentity });
   const environmentId = NodeCrypto.randomUUID();
   const credentialId = NodeCrypto.randomUUID();
   const connectionId = NodeCrypto.randomUUID();
@@ -238,6 +256,61 @@ const activeWorkflow = Effect.fnUntraced(function* (automatic = false) {
   return { ...f, principal, owner };
 });
 
+const installLinearAdmission = Effect.fnUntraced(function* (
+  f: Effect.Success<ReturnType<typeof seed>>,
+) {
+  const { sql, workflowJobId, organizationId, repositoryId } = f;
+  const [job] = yield* sql<{
+    record: RepositoryWorkflowJob;
+  }>`SELECT record FROM relay_workflow_jobs WHERE job_id=${workflowJobId}`;
+  const record = job!.record;
+  const origin = record.origin!;
+  if (origin.kind !== "automation") return yield* Effect.die("Expected an automatic workflow");
+  const source = origin.source;
+  const linearWorkflow = { clientId: source.applicationId, organizationId };
+  const codexConnectionId = record.vmAdmission?.codexConnectionId ?? NodeCrypto.randomUUID();
+  const event = {
+    issueId: "issue",
+    teamId: "team",
+    stateId: "ready",
+    labelIds: [],
+    identifier: "ENG-1",
+    title: "Original title",
+    url: "https://linear.app/test/issue/ENG-1",
+    occurredAt: "2026-01-01T00:00:00.000Z",
+    issueUpdatedAt: "2026-01-01T00:00:00.000Z",
+  };
+  yield* sql`INSERT INTO relay_organizations VALUES (${organizationId},'Organization','2026','2026')`;
+  yield* sql`INSERT INTO relay_repositories (repository_id,organization_id,name,created_at,updated_at)
+    VALUES (${repositoryId},${organizationId},'Repository','2026','2026') ON CONFLICT DO NOTHING`;
+  yield* sql`INSERT INTO relay_repository_workflows (workflow_id,repository_id,revision,record)
+    VALUES (${record.workflowId},${repositoryId},1,${sql.json(record.workflow!)})`;
+  yield* sql`INSERT INTO relay_codex_vm_connections
+    (organization_id,connection_id,issuer,subject,client_id,status,payload_sealed,expires_at,updated_at)
+    VALUES (${organizationId},${codexConnectionId},'issuer','subject','client','connected','sealed','2099-01-01','2026')`;
+  yield* sql`INSERT INTO relay_workflow_authorizations (organization_id,application_id,connection_id,status)
+    VALUES (${organizationId},${source.applicationId},${source.connectionId},'connected')`;
+  yield* sql`INSERT INTO relay_workflow_connections
+    (connection_id,organization_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health)
+    VALUES (${source.connectionId},${organizationId},${source.applicationId},${source.workspaceId},'Workspace',
+      'Linear App','connected','2026','sealed','{"code":"healthy","retryAt":null}')`;
+  yield* sql`INSERT INTO relay_workflow_repository_grants (grant_id,connection_id,organization_id,repository_id,generation,created_at)
+    VALUES (${source.grantId},${source.connectionId},${organizationId},${repositoryId},1,'2026')`;
+  yield* sql`INSERT INTO relay_workflow_admissions
+    VALUES (${origin.occurrenceId},${record.workflowId},${workflowJobId},${organizationId},${repositoryId},
+      ${source.connectionId},${source.grantId},1,1,1,1)`;
+  yield* sql`UPDATE relay_workflow_jobs SET status='preparing',repository_canonical_key='github.com/acme/example',record=${sql.json(
+    {
+      ...record,
+      event,
+      status: "preparing",
+      startAttempted: false,
+      vmAdmission: { codexConnectionId, hasSecrets: true },
+    },
+  )} WHERE job_id=${workflowJobId}`;
+  return { linearWorkflow, source, codexConnectionId, event };
+});
+
 const services = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
   Layer.provideMerge(database),
   Layer.provideMerge(NodeEffectCrypto.layer),
@@ -248,6 +321,91 @@ const services = Layer.effect(RelayDb, PgDrizzle.makeWithDefaults()).pipe(
     }),
   ),
 );
+
+const refreshAutomaticVm = (
+  f: Effect.Success<ReturnType<typeof seed>>,
+  linearWorkflow: NonNullable<RelayConfiguration["Service"]["linearWorkflow"]>,
+  issueResponse: Effect.Effect<Response>,
+  dispatchJob: EnvironmentConnector["Service"]["dispatchJob"],
+  workflowExecutionEnabled = true,
+) =>
+  refreshWorkflowJob(f.workflowJobId).pipe(
+    Effect.provide(
+      Layer.merge(AutomaticOffers.layer, workflowVmPreparationLayer).pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            Layer.mock(EnvironmentConnector)({ dispatchJob }),
+            Layer.mock(Organizations)({}),
+            Layer.mock(Repositories)({}),
+            Layer.mock(Machines)({}),
+            Layer.mock(OrganizationProjectCatalog)({}),
+            Layer.mock(GithubApp)({}),
+            Layer.succeed(
+              HttpClient.HttpClient,
+              HttpClient.make((req) =>
+                issueResponse.pipe(
+                  Effect.map((response) => HttpClientResponse.fromWeb(req, response)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+    Effect.provideService(RelaySecretBox, {
+      seal: () => Effect.die("Issue reads should not seal credentials"),
+      open: () =>
+        Effect.succeed(
+          JSON.stringify({
+            accessToken: "fixture",
+            refreshToken: "fixture",
+            expiresAt: 4_102_444_800_000,
+          }),
+        ),
+    }),
+    Effect.provideService(RelayConfiguration, { ...relayConfig, linearWorkflow }),
+    Effect.provideService(ThreadVmRuntimeConfiguration, {
+      settings: {
+        workflowExecutionEnabled,
+        hostId: f.hostId,
+        maxRunningVms: 1,
+        templateBuildId: "build",
+        publicRelayUrl: "https://relay.test",
+        compute: {
+          apiUrl: "https://compute.test",
+          sandboxUrl: "https://sandbox.test",
+          apiKey: Redacted.make("fixture"),
+          templateId: "template:tag",
+          hostAddresses: ["192.0.2.10"],
+          timeoutMs: 600_000,
+        },
+        autoPauseEnabled: false,
+        autoBackupEnabled: false,
+        autoDeleteEnabled: false,
+        replacementEnabled: false,
+        restoreEnabled: false,
+        resetEnabled: false,
+      },
+    }),
+  );
+
+const issueResponse = (title: string) =>
+  Response.json({
+    data: {
+      organization: { id: "workspace" },
+      issue: {
+        id: "issue",
+        identifier: "ENG-1",
+        title,
+        url: "https://linear.app/test/issue/ENG-1",
+        description: "Current requirements",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        team: { id: "team", name: "Team" },
+        state: { id: "done", name: "Done" },
+        labels: { nodes: [], pageInfo: { hasNextPage: false } },
+      },
+    },
+  });
 
 const pausedSandbox = (
   computeRef: string,
@@ -1138,6 +1296,301 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
         }),
     );
+
+    it.effect(
+      "parks a first Create during Linear reconnect and restores the same reservation",
+      () =>
+        Effect.gen(function* () {
+          const hostId = NodeCrypto.randomUUID();
+          const f = yield* seed({ hostId, automatic: true, stableWorkflowIdentity: true });
+          const { linearWorkflow, source } = yield* installLinearAdmission(f);
+          const personal = yield* seed({ hostId, personal: true });
+          const sql = f.sql;
+          const snapshot = {
+            canonicalKey: "github.com/acme/example",
+            installationId: "1",
+            branch: "main",
+            commitSha: "a".repeat(40),
+            templateBuildId: "frozen-build",
+          };
+          yield* sql`INSERT INTO relay_thread_vm_provisions
+          (allocation_id,operation_id,generation,workflow_snapshot)
+          VALUES (${f.allocationId},${f.operationId},1,${sql.json(snapshot)})`;
+          yield* f.capacity.configure(hostId, 1);
+          expect(
+            (yield* f.capacity.admitNext(hostId, { workflowEnabled: true, linearWorkflow }))
+              ?.operationId,
+          ).toBe(f.operationId);
+          let reconnect = true;
+          let creates = 0;
+          let reconciliations = 0;
+          const worker = makeThreadVmProvisionWorker(
+            sql,
+            {
+              create: (input) =>
+                Effect.gen(function* () {
+                  expect(input.operationId).toBe(f.operationId);
+                  creates++;
+                  return yield* new ThreadVmComputeError({
+                    operation: "create",
+                    message: "Lost reply",
+                  });
+                }),
+              recoverIngress: () => Effect.die("No sandbox was found"),
+              findOperation: (operationId) =>
+                Effect.sync(() => {
+                  expect(operationId).toBe(f.operationId);
+                  reconciliations++;
+                  return [];
+                }),
+            },
+            "template",
+            hostId,
+            Effect.void,
+            {
+              enabled: true,
+              buildId: snapshot.templateBuildId,
+              linearWorkflow,
+              verifyTemplate: () =>
+                Effect.gen(function* () {
+                  if (reconnect)
+                    yield* sql`UPDATE relay_workflow_authorizations
+                  SET exchange_lease_until='2099-01-01T00:00:00.000Z'
+                  WHERE organization_id=${f.organizationId}`;
+                }).pipe(Effect.orDie),
+            },
+          );
+          const run = worker
+            .runOne()
+            .pipe(Effect.provideService(RelayConfiguration, { ...relayConfig, linearWorkflow }));
+          expect(yield* run).toBe(true);
+          expect(creates).toBe(0);
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("waiting");
+          expect(
+            yield* makeThreadVmProvisionStore(sql).get(f.allocationId, "organization_workflow"),
+          ).toMatchObject({ errorCode: "source_unavailable", workflowSnapshot: snapshot });
+
+          yield* sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
+          expect(
+            (yield* f.capacity.admitNext(hostId, { workflowEnabled: true, linearWorkflow }))
+              ?.operationId,
+          ).toBe(personal.operationId);
+          yield* personal.capacity.cancelUnstarted(personal.operationId);
+          reconnect = false;
+          yield* sql`UPDATE relay_workflow_authorizations SET exchange_lease_until=NULL WHERE organization_id=${f.organizationId}`;
+          expect(yield* run).toBe(true);
+          expect(creates).toBe(1);
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+          yield* sql`UPDATE relay_workflow_repository_grants SET revoked=true WHERE grant_id=${source.grantId}`;
+          yield* sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.allocationId}`;
+          expect(yield* run).toBe(true);
+          expect(creates).toBe(1);
+          expect(reconciliations).toBe(1);
+        }),
+    );
+
+    for (const change of ["disconnect-codex", "replace-codex", "withdraw-linear"] as const) {
+      it.effect(`blocks first automatic VM Start when ${change} wins during the issue read`, () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow(true, true);
+          const { linearWorkflow, source } = yield* installLinearAdmission(f);
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const issue = Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.map(() => issueResponse("Current title")),
+          );
+          const dispatched: string[] = [];
+          const refresh = refreshAutomaticVm(f, linearWorkflow, issue, (input) =>
+            Effect.sync(() => {
+              dispatched.push(input.workflowControl!.operation);
+              return {
+                accepted: false,
+                workflowResult: { protocol: 9, outcome: "missing", detail: null, progress: null },
+              };
+            }),
+          );
+          const fiber = yield* refresh.pipe(Effect.forkChild);
+          yield* Deferred.await(entered);
+          if (change === "disconnect-codex")
+            yield* f.sql`UPDATE relay_codex_vm_connections SET status='disconnected',payload_sealed=NULL,
+              expires_at=NULL WHERE organization_id=${f.organizationId}`;
+          if (change === "replace-codex")
+            yield* f.sql`UPDATE relay_codex_vm_connections SET connection_id=${NodeCrypto.randomUUID()}
+              WHERE organization_id=${f.organizationId}`;
+          if (change === "withdraw-linear")
+            yield* f.sql`UPDATE relay_workflow_repository_grants SET revoked=true WHERE grant_id=${source.grantId}`;
+          yield* Deferred.succeed(release, undefined);
+          const blocked = yield* Fiber.join(fiber);
+          expect(blocked).toMatchObject({
+            status: "preparing",
+            startAttempted: false,
+            runtime: { kind: "vm", threadId: f.threadId },
+            queueReason: {
+              code:
+                change === "disconnect-codex"
+                  ? "vm_waiting_codex"
+                  : change === "replace-codex"
+                    ? "vm_codex_replaced"
+                    : "source_withdrawn",
+            },
+          });
+          expect(blocked?.issueSnapshot).toBeUndefined();
+          expect(dispatched).toEqual(["status"]);
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+        }).pipe(Effect.provide(workflows)),
+      );
+    }
+
+    it.effect(
+      "rechecks a refused automatic VM Start and retains an ambiguous Start when disabled",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow(true, true);
+          const { linearWorkflow, source } = yield* installLinearAdmission(f);
+          const store = yield* Workflows;
+          const requests: Array<{ instruction: string; binding: WorkflowVmDispatchBinding }> = [];
+          let reads = 0;
+          let statusConfirmed = false;
+          const issue = Effect.sync(() => issueResponse(`Issue read ${++reads}`));
+          const dispatch: EnvironmentConnector["Service"]["dispatchJob"] = (input) =>
+            Effect.gen(function* () {
+              if (input.workflowControl?.operation === "start") {
+                const saved = (yield* store.getJob(f.workflowJobId).pipe(Effect.orDie))!.record;
+                expect(saved.startAttempted).toBe(true);
+                expect(saved.instruction).toBe(input.instruction);
+                expect(saved.issueSnapshot?.description).toBe("Current requirements");
+                requests.push({
+                  instruction: input.instruction,
+                  binding: input.workflowVmBinding!,
+                });
+                if (requests.length === 2)
+                  return yield* new EnvironmentMintRequestTimedOut({
+                    environmentId: input.environmentId,
+                    operation: "dispatch-job",
+                    timeoutMs: 5000,
+                  });
+                return {
+                  accepted: false,
+                  workflowResult: { protocol: 9, outcome: "busy", detail: null, progress: null },
+                } as const;
+              }
+              return statusConfirmed
+                ? ({
+                    accepted: true,
+                    workflowResult: {
+                      protocol: 9,
+                      outcome: "accepted",
+                      detail: null,
+                      progress: {
+                        revision: 1,
+                        status: "preparing",
+                        threadId: ThreadId.make(f.threadId),
+                        detail: null,
+                        checkpoint: null,
+                      },
+                    },
+                  } as const)
+                : ({
+                    accepted: false,
+                    workflowResult: {
+                      protocol: 9,
+                      outcome: "missing",
+                      detail: null,
+                      progress: null,
+                    },
+                  } as const);
+            });
+          const refresh = (enabled = true) =>
+            refreshAutomaticVm(f, linearWorkflow, issue, dispatch, enabled);
+          const retryDue = f.sql`UPDATE relay_workflow_jobs SET record=record #- '{queueReason}'
+          WHERE job_id=${f.workflowJobId}`;
+          expect(yield* refresh(false)).toMatchObject({
+            queueReason: { code: "vm_execution_disabled" },
+            startAttempted: false,
+          });
+          expect(reads).toBe(0);
+          expect(requests).toEqual([]);
+
+          yield* retryDue;
+          const refused = yield* refresh();
+          expect(refused).toMatchObject({
+            startAttempted: false,
+            queueReason: { code: "environment_busy" },
+            runtime: { kind: "vm", threadId: f.threadId },
+          });
+          expect(refused?.issueSnapshot).toBeUndefined();
+
+          yield* retryDue;
+          const uncertain = yield* refresh();
+          expect(uncertain?.startAttempted).toBe(true);
+          expect(uncertain?.issueSnapshot?.title).toBe("Issue read 2");
+          yield* f.sql`UPDATE relay_workflow_repository_grants SET revoked=true WHERE grant_id=${source.grantId}`;
+          const retry = yield* refresh(false);
+          expect(retry?.issueSnapshot).toEqual(uncertain?.issueSnapshot);
+          expect(requests).toHaveLength(2);
+          expect((yield* refresh())?.issueSnapshot).toEqual(uncertain?.issueSnapshot);
+          expect(requests).toHaveLength(3);
+          expect(requests[2]).toEqual(requests[1]);
+          expect(requests[1]?.binding).toEqual(requests[0]?.binding);
+          expect(reads).toBe(2);
+
+          statusConfirmed = true;
+          expect((yield* refresh(false))?.progress?.threadId).toBe(f.threadId);
+          expect(requests).toHaveLength(3);
+        }).pipe(Effect.provide(workflows)),
+    );
+
+    for (const afterRestart of [false, true]) {
+      it.effect(
+        `cleans up a VM after a signed cancellation tombstone without a pending requester (restart: ${afterRestart})`,
+        () =>
+          Effect.gen(function* () {
+            const f = yield* activeWorkflow(true, true);
+            const { linearWorkflow } = yield* installLinearAdmission(f);
+            if (afterRestart) {
+              yield* f.sql`UPDATE relay_workflow_jobs SET status='cancelling',
+              record=record||'{"status":"cancelling","startAttempted":false,"vmCancellationConfirmed":true}'::jsonb
+              WHERE job_id=${f.workflowJobId}`;
+            } else {
+              yield* f.sql`UPDATE relay_workflow_jobs SET record=jsonb_set(record,'{startAttempted}','true')
+              WHERE job_id=${f.workflowJobId}`;
+            }
+            const refresh = refreshAutomaticVm(
+              f,
+              linearWorkflow,
+              Effect.die("A confirmed cancellation must not read Linear"),
+              (input) =>
+                Effect.sync(() => {
+                  expect(afterRestart).toBe(false);
+                  expect(input.workflowControl?.operation).toBe("status");
+                  return {
+                    accepted: true,
+                    workflowResult: {
+                      protocol: 9,
+                      outcome: "cancelled",
+                      detail: null,
+                      progress: null,
+                    },
+                  };
+                }),
+              false,
+            );
+            expect(yield* refresh).toMatchObject({
+              status: "cancelling",
+              vmCancellationConfirmed: true,
+              startAttempted: false,
+            });
+            expect((yield* makeThreadVmAllocationStore(f.sql).getAny(f.allocationId))?.state).toBe(
+              "deleting",
+            );
+            yield* f.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at=clock_timestamp()
+          WHERE allocation_id=${f.allocationId}`;
+            yield* f.sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE operation_id=${f.operationId}`;
+            expect((yield* refresh)?.status).toBe("cancelled");
+          }).pipe(Effect.provide(workflows)),
+      );
+    }
 
     for (const nativeState of ["paused", "deleted"] as const) {
       it.effect(`renews a workflow VM lease and releases capacity when it is ${nativeState}`, () =>

@@ -203,6 +203,9 @@ export function WorkflowJobs({
                       {job.originSummary?.kind === "automation" ? (
                         <span className="text-xs text-muted-foreground">Started by workflow</span>
                       ) : null}
+                      {(job.targetKind ?? job.runtime?.kind) === "vm" ? (
+                        <span className="text-xs text-muted-foreground">Workflow VM</span>
+                      ) : null}
                     </div>
                     <p className="line-clamp-2 text-xs wrap-anywhere text-muted-foreground">
                       {job.instruction}

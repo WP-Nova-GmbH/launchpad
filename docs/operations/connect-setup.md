@@ -202,10 +202,13 @@ preserves repository grants and starts delivery verification again. An API read 
 alone does not verify webhook delivery.
 
 Keep `LINEAR_WORKFLOW_ADMISSION_ENABLED` absent or `false` in production until the isolated live
-provider and Machine workflow checks pass. Verify install, reconnect, token rotation, signed team
+provider and workflow checks pass. Verify install, reconnect, token rotation, signed team
 delivery, revocation ordering and actual provider retries. Then verify one new matching event
-starts one Machine job, including when Linear redelivers the event. VM trigger enablement is a
-separate capability.
+starts one job for each matching workflow, including when Linear redelivers the event. Automatic VM
+runs also require `RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true` and a verified workflow VM runner.
+Turning off Linear admission stops new event jobs. Turning off VM execution also holds first VM
+creation and first guest Start for automatic runs. Existing attempts can still reconcile or be
+cancelled.
 
 Unknown occurrences require a signed `webhookTimestamp` within 60 seconds. Authenticated retries
 of committed occurrences acknowledge without creating new jobs. If Linear preserves an old signing

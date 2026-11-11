@@ -50,6 +50,7 @@ const fixture = vi.hoisted(() => ({
   supported: false,
   vmAuthoring: undefined as WorkflowCatalog["vmAuthoring"],
   vmExecutionAvailable: false,
+  vmAutomationAvailable: false,
   projectsUnavailable: false,
   projects: [] as ReadonlyArray<RelayOrganizationProject>,
   repositoryError: null as string | null,
@@ -241,6 +242,7 @@ const client = {
           workflows,
           vmAuthoring: fixture.vmAuthoring,
           vmExecutionAvailable: fixture.vmExecutionAvailable,
+          vmAutomationAvailable: fixture.vmAutomationAvailable,
           ...(fixture.supported
             ? {
                 automationSupported: true,
@@ -376,6 +378,7 @@ beforeEach(() => {
   fixture.supported = false;
   fixture.vmAuthoring = undefined;
   fixture.vmExecutionAvailable = false;
+  fixture.vmAutomationAvailable = false;
   fixture.projectsUnavailable = false;
   fixture.projects = [];
   fixture.repositoryError = null;
@@ -1030,54 +1033,101 @@ it.effect(
       });
     }),
 );
-it.effect("opens an Off draft without saving or discarding other workflow edits", () =>
+it.effect.each(["machine", "vm"] as const)(
+  "opens an Off %s draft without saving or discarding other workflow edits",
+  (kind) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.supported = true;
+        const trigger = {
+          provider: "linear",
+          connectionId: "connection",
+          grantId: "grant",
+          teamId: "team",
+          event: "issue_created",
+          labelIds: ["label"],
+        } as const;
+        const current: RepositoryWorkflow = {
+          ...workflow,
+          definition:
+            kind === "vm"
+              ? { ...workflow.definition, target: { kind: "vm", baseBranch: null } }
+              : workflow.definition,
+          automation: { enabled: true, trigger },
+        };
+        const scope = { accountId: "account", organizationId: "organization", repositoryId };
+        const key = workflowSessionKey(scope, workflow.workflowId);
+        fixture.definitions.mockResolvedValue([current]);
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          editors: {
+            ...state.editors,
+            [key]: {
+              workflowId: workflow.workflowId,
+              baseline: current,
+              definition: { ...current.definition, name: "Unsaved name" },
+              automation: { enabled: true, trigger },
+              automationResolved: true,
+              selectedStepId: "",
+              targetConfirmed: true,
+              operation: null,
+              error: null,
+            },
+          },
+        }));
+        await mountCatalog();
+        await press(`More actions for ${workflow.definition.name}`);
+        await press("Turn off automatic triggering");
+        expect(fixture.save).not.toHaveBeenCalled();
+        expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
+          definition: { name: "Unsaved name" },
+          triggerSetup: true,
+          automation: { enabled: false, trigger },
+          baseline: { automation: { enabled: true, trigger } },
+        });
+        expect(fixture.navigate).toHaveBeenCalledWith(
+          expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
+        );
+      });
+    }),
+);
+
+it.effect("opens an enabled VM trigger draft when VM automation is available", () =>
   Effect.gen(function* () {
     yield* serve;
     yield* Effect.promise(async () => {
       fixture.tab = "workflows";
       fixture.supported = true;
+      fixture.vmAutomationAvailable = true;
+      fixture.vmAuthoring = { models: null };
       const trigger = {
         provider: "linear",
         connectionId: "connection",
         grantId: "grant",
         teamId: "team",
         event: "issue_created",
-        labelIds: ["label"],
+        labelIds: [],
       } as const;
-      const current: RepositoryWorkflow = { ...workflow, automation: { enabled: true, trigger } };
-      const scope = { accountId: "account", organizationId: "organization", repositoryId };
-      const key = workflowSessionKey(scope, workflow.workflowId);
-      fixture.definitions.mockResolvedValue([current]);
-      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
-        ...state,
-        editors: {
-          ...state.editors,
-          [key]: {
-            workflowId: workflow.workflowId,
-            baseline: current,
-            definition: { ...workflow.definition, name: "Unsaved name" },
-            automation: { enabled: true, trigger },
-            automationResolved: true,
-            selectedStepId: "",
-            targetConfirmed: true,
-            operation: null,
-            error: null,
-          },
-        },
-      }));
+      const saved: RepositoryWorkflow = {
+        ...workflow,
+        definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+        automation: { enabled: false, trigger },
+      };
+      fixture.definitions.mockResolvedValue([saved]);
       await mountCatalog();
       await press(`More actions for ${workflow.definition.name}`);
-      await press("Turn off automatic triggering");
-      expect(fixture.save).not.toHaveBeenCalled();
-      expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
-        definition: { name: "Unsaved name" },
+      await press("Turn on automatic triggering");
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      expect(
+        appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, saved.workflowId)],
+      ).toMatchObject({
         triggerSetup: true,
-        automation: { enabled: false, trigger },
-        baseline: { automation: { enabled: true, trigger } },
+        automation: { enabled: true, trigger },
+        baseline: saved,
       });
-      expect(fixture.navigate).toHaveBeenCalledWith(
-        expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
-      );
+      expect(fixture.save).not.toHaveBeenCalled();
     });
   }),
 );

@@ -43,9 +43,10 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 
-const { navigate, confirmation } = vi.hoisted(() => ({
+const { navigate, confirmation, modelIssues } = vi.hoisted(() => ({
   navigate: vi.fn(),
   confirmation: vi.fn<() => Promise<boolean>>(),
+  modelIssues: vi.fn<() => ReadonlyArray<{ stepId: string }>>(),
 }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => navigate }));
 vi.mock("../../lib/runtime", () => ({ runtime: {} }));
@@ -58,7 +59,7 @@ vi.mock("./WorkflowCanvas", async () => ({
 vi.mock("./WorkflowStepEditor", () => ({
   WorkflowStepEditor: (props: Record<string, unknown>) =>
     createElement("div", { ...props, "data-testid": "step-fixture" }),
-  useWorkflowEditorModels: () => ({ issues: [] }),
+  useWorkflowEditorModels: () => ({ issues: modelIssues() }),
 }));
 vi.mock("../ui/sheet", () => ({
   Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) => (open ? children : null),
@@ -144,13 +145,17 @@ function deferred<A>() {
 const editor = (id: string) =>
   appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, id)]!;
 const newId = () => appAtomRegistry.get(workflowDraftAtom).newWorkflowIds[slot]!;
-const saved = (id: string, revision = 1): RepositoryWorkflow => ({
+const saved = (
+  id: string,
+  revision = 1,
+  definition = editor(id).definition,
+): RepositoryWorkflow => ({
   workflowId: id,
   repositoryId: scope.repositoryId,
   organizationId: scope.organizationId,
   archived: false,
   revision,
-  definition: editor(id).definition,
+  definition,
   createdAt: "now",
   updatedAt: "now",
 });
@@ -218,6 +223,7 @@ beforeEach(() => {
   navigate.mockReset();
   confirmation.mockReset().mockResolvedValue(true);
   read.mockReset();
+  modelIssues.mockReset().mockReturnValue([]);
   refresh.mockReset();
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
@@ -775,7 +781,7 @@ describe("workflow templates and copies", () => {
       createdAt: "now",
       updatedAt: "now",
       definition: { ...draft.definition, target: { kind: "vm", baseBranch: "release/1.x" } },
-      automation: { enabled: false, trigger: recoveryAuto.trigger },
+      automation: recoveryAuto,
       archived: false,
     };
     expect(copiedWorkflowDraft(source, [], true, true)).toMatchObject({
@@ -1165,6 +1171,110 @@ describe("VM authoring", () => {
       automation: { enabled: false, trigger: recoveryTrigger },
       definition: { target: { kind: "vm", baseBranch: null } },
     });
+  });
+
+  it("allows choosing VM without turning off a Linear rule when VM automation is available", async () => {
+    const workflow = {
+      ...saved("saved-machine", 1, newWorkflowDraft([project])!.definition),
+      automation: recoveryAuto,
+    };
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      vmAuthoring: { models: null },
+      automationSupported: true,
+      vmAutomationAvailable: true,
+    });
+    const root = renderer!.root;
+    await act(() => root.findByProps({ "aria-label": "Workflow settings" }).props.onClick());
+    expect(
+      root.findByProps({ "data-workflow-select-item": true, value: "vm" }).props.disabled,
+    ).toBe(false);
+    read.mockResolvedValueOnce({ status: "connected" });
+    await act(() =>
+      root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange("vm"),
+    );
+    expect(editor(workflow.workflowId)).toMatchObject({
+      definition: { target: { kind: "vm" } },
+      automation: recoveryAuto,
+    });
+  });
+
+  it("saves Off against the saved revision during a VM outage and retains unrelated draft edits", async () => {
+    const original = saved("saved-vm", 4, newWorkflowDraft([], "review", true)!.definition);
+    const workflow: RepositoryWorkflow = {
+      ...original,
+      definition: { ...original.definition, target: { kind: "vm", baseBranch: "main" } },
+      automation: recoveryAuto,
+    };
+    modelIssues.mockReturnValue([{ stepId: "agent" }]);
+    read.mockResolvedValueOnce({ status: "connected" });
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      vmAuthoring: { models: null },
+      automationSupported: true,
+      vmAutomationAvailable: false,
+    });
+    await rename("");
+    const editedTrigger = { ...recoveryTrigger, labelIds: ["draft-label"] };
+    await act(() =>
+      editWorkflowDraft(scope, workflow.workflowId, (current) => ({
+        ...current,
+        automation: { enabled: true, trigger: editedTrigger },
+      })),
+    );
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Trigger settings" }).props.onClick(),
+    );
+    const off = { enabled: false, trigger: recoveryTrigger };
+    const receipt = { ...workflow, revision: workflow.revision + 1, automation: off };
+    read.mockImplementationOnce(async () => {
+      expect(editor(workflow.workflowId).operation).toMatchObject({
+        expectedRevision: workflow.revision,
+        definition: workflow.definition,
+        automation: off,
+      });
+      return receipt;
+    });
+    await click("Save Off only");
+    expect(editor(workflow.workflowId)).toMatchObject({
+      baseline: receipt,
+      definition: { name: "" },
+      automation: { enabled: false, trigger: editedTrigger },
+      operation: null,
+    });
+  });
+
+  it("saves the clean trigger switch Off when the saved model is unavailable", async () => {
+    const workflow = {
+      ...saved("saved-vm", 5, newWorkflowDraft([], "review", true)!.definition),
+      automation: recoveryAuto,
+    };
+    modelIssues.mockReturnValue([{ stepId: "agent" }]);
+    read.mockResolvedValueOnce({ status: "connected" });
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      vmAuthoring: { models: null },
+      automationSupported: true,
+      vmAutomationAvailable: true,
+    });
+    const root = renderer!.root;
+    await act(() => root.findByProps({ "aria-label": "Trigger settings" }).props.onClick());
+    await act(() => root.findByProps({ role: "checkbox" }).props.onClick());
+    const receipt = {
+      ...workflow,
+      revision: 6,
+      automation: { enabled: false, trigger: recoveryTrigger },
+    };
+    read.mockResolvedValueOnce(receipt);
+    await click("Save workflow");
+    expect(editor(workflow.workflowId).baseline).toEqual(receipt);
+    expect(workflowEditorDirty(editor(workflow.workflowId))).toBe(false);
   });
 });
 

@@ -349,6 +349,7 @@ function WorkflowRepositoryView({
   const drafts = useWorkflowDrafts();
   const catalogRevision = useAtomValue(workflowCatalogRevisionAtom);
   const [automationSupported, setAutomationSupported] = useState(false);
+  const [vmAutomationAvailable, setVmAutomationAvailable] = useState(false);
   const [vmAuthoring, setVmAuthoring] = useState<WorkflowCatalog["vmAuthoring"] | null>(null);
   const [vmExecutionAvailable, setVmExecutionAvailable] = useState(false);
   const [summaries, setSummaries] = useState<ReadonlyArray<WorkflowAutomationSummary>>([]);
@@ -474,6 +475,7 @@ function WorkflowRepositoryView({
       setVmAuthoring(result.vmAuthoring);
       setVmExecutionAvailable(result.vmExecutionAvailable === true);
       setAutomationSupported(result.automationSupported === true);
+      setVmAutomationAvailable(result.vmAutomationAvailable === true);
       setSummaries(result.automationSummaries ?? []);
       setLoaded(true);
       setError(null);
@@ -567,15 +569,17 @@ function WorkflowRepositoryView({
     )
       refresh();
   };
+  const canEnableTarget = (
+    workflow: RepositoryWorkflow,
+    draft?: RepositoryWorkflow["definition"],
+  ) =>
+    vmAutomationAvailable ||
+    (workflow.definition.target.kind === "machine" && draft?.target.kind !== "vm");
   const setupTrigger = (workflow: RepositoryWorkflow, enabled?: boolean) => {
     const key = workflowSessionKey(scope, workflow.workflowId);
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const draft = state.editors[key] ?? savedWorkflowDraft(workflow, automationSupported);
-      if (
-        draft.operation ||
-        draft.definition.target.kind === "vm" ||
-        workflow.definition.target.kind === "vm"
-      )
+      if (draft.operation || (enabled !== false && !canEnableTarget(workflow, draft.definition)))
         return { ...state, editors: { ...state.editors, [key]: { ...draft, triggerSetup: true } } };
       const automation = normalizeWorkflowAutomation(
         workflowDraftAutomationResolved(draft) ? draft.automation : workflow.automation,
@@ -606,20 +610,14 @@ function WorkflowRepositoryView({
     });
   };
   const toggleAutomation = (workflow: RepositoryWorkflow) => {
-    if (
-      !automationSupported ||
-      error ||
-      workflow.archived ||
-      workflow.definition.target.kind === "vm"
-    )
-      return;
+    if (!automationSupported || error || workflow.archived) return;
     const current =
       appAtomRegistry.get(workflowDraftAtom).editors[
         workflowSessionKey(scope, workflow.workflowId)
       ];
     if (
       current?.operation?.state === "pending" ||
-      current?.definition.target.kind === "vm" ||
+      (!workflow.automation?.enabled && !canEnableTarget(workflow, current?.definition)) ||
       (current?.baseline && current.baseline.revision > workflow.revision)
     )
       return;
@@ -690,8 +688,7 @@ function WorkflowRepositoryView({
               canConfigure &&
               automationSupported &&
               !archived &&
-              target.kind === "machine" &&
-              local?.definition.target.kind !== "vm";
+              (!!workflow.automation?.enabled || canEnableTarget(workflow, local?.definition));
             const canCopy =
               copyRepositories.length > 0 && (target.kind === "machine" || !!vmAuthoring);
 
@@ -986,6 +983,7 @@ function WorkflowRepositoryView({
           <WorkflowBuilder
             scope={scope}
             automationSupported={automationSupported}
+            vmAutomationAvailable={vmAutomationAvailable}
             automationReason={
               summaries.find(
                 (item) =>

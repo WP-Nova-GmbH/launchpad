@@ -1,5 +1,4 @@
 import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
-import type { WorkflowVmModelCatalog } from "@t3tools/contracts/workflows";
 import * as Option from "effect/Option";
 import { ManagedEndpointProvider } from "../environments/ManagedEndpointProvider.ts";
 import { threadVmEndpointOwner } from "./threadVmEndpointOwner.ts";
@@ -24,18 +23,13 @@ import { makeThreadVmMoveCleanupWorker } from "./ThreadVmMoveCleanupWorker.ts";
 import { Template } from "e2b";
 import { parse as parseDomain } from "tldts";
 import * as Config from "effect/Config";
-import * as Context from "effect/Context";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { RelayConfiguration } from "../Config.ts";
 import { RelayDb } from "../db.ts";
-import {
-  makeE2BThreadVmCompute,
-  ThreadVmComputeError,
-  type E2BThreadVmSettings,
-} from "../machines/E2BThreadVmCompute.ts";
+import { makeE2BThreadVmCompute, ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import { makeE2BThreadVmEnrollment } from "../machines/E2BThreadVmEnrollment.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmRestoreWorker } from "./ThreadVmRestoreWorker.ts";
@@ -63,36 +57,16 @@ import {
   verifiedWorkflowVmModelProof,
   WORKFLOW_VM_ISOLATION_VERSION,
 } from "./ThreadVmWorkflowModelProof.ts";
+import type { ThreadVmRuntimeSettings } from "./ThreadVmRuntimeConfiguration.ts";
+export {
+  ThreadVmRuntimeConfiguration,
+  type ThreadVmRuntimeSettings,
+} from "./ThreadVmRuntimeConfiguration.ts";
 
 export class ThreadVmRuntimeConfigurationError extends Schema.TaggedError<ThreadVmRuntimeConfigurationError>()(
   "ThreadVmRuntimeConfigurationError",
   { message: Schema.String },
 ) {}
-export interface ThreadVmRuntimeSettings {
-  readonly compute: E2BThreadVmSettings;
-  readonly templateBuildId: string;
-  readonly workflowModelCatalog?: WorkflowVmModelCatalog;
-  readonly workflowExecutionEnabled?: boolean;
-  readonly hostId: string;
-  readonly maxRunningVms: number;
-  readonly publicRelayUrl: string;
-  readonly autoPauseEnabled: boolean;
-  readonly autoBackupEnabled: boolean;
-  readonly autoDeleteEnabled: boolean;
-  readonly replacementEnabled: boolean;
-  readonly restoreEnabled: boolean;
-  readonly resetEnabled: boolean;
-  readonly permanentDeleteEnabled?: boolean;
-  readonly previewBaseUrl?: string;
-}
-
-export class ThreadVmRuntimeConfiguration extends Context.Service<
-  ThreadVmRuntimeConfiguration,
-  {
-    readonly settings: ThreadVmRuntimeSettings | undefined;
-  }
->()("launchpad-relay/threads/ThreadVmRuntime/ThreadVmRuntimeConfiguration") {}
-
 /** Cookie isolation follows the public suffix list, including hosted application domains. */
 function cookieDomain(origin: string) {
   try {
@@ -350,12 +324,14 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
       AND retry_at<=clock_timestamp() LIMIT 1`;
   if (restoring.length) {
     const objects = yield* ThreadArtifactObjectStorage;
+    const relay = yield* RelayConfiguration;
     yield* makeThreadVmRestoreWorker(
       sql,
       objects,
       compute.restore,
       settings.hostId,
       settings.workflowExecutionEnabled === true,
+      relay.linearWorkflow,
     ).runOne();
   }
   yield* makeThreadVmRestoreServingWorker(
@@ -439,7 +415,12 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
     settings.compute.templateId,
     settings.hostId,
     verifyTemplate(settings.compute.templateId, settings.templateBuildId),
-    { enabled: workflowEnabled, buildId: settings.templateBuildId, verifyTemplate },
+    {
+      enabled: workflowEnabled,
+      buildId: settings.templateBuildId,
+      verifyTemplate,
+      ...(relay.linearWorkflow ? { linearWorkflow: relay.linearWorkflow } : {}),
+    },
   );
   const enrollment = makeThreadVmEnrollmentWorker(
     sql,
@@ -519,12 +500,14 @@ export const reconcileThreadVmResumes = Effect.fn("relay.thread_vm.reconcile_res
 ) {
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
+  const relay = yield* RelayConfiguration;
   const worker = makeThreadVmResumeWorker(
     sql,
     makeE2BThreadVmCompute(settings.compute),
     makeE2BThreadVmPause(settings.compute),
     settings.hostId,
     settings.workflowExecutionEnabled === true,
+    relay.linearWorkflow,
   );
   for (let index = 0; index < 4; index++) if (!(yield* worker.runOne())) return;
 });

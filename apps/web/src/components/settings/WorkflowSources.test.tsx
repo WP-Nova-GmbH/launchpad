@@ -1027,9 +1027,11 @@ const saveTrigger = vi.fn<(automation: WorkflowAutomation) => void>();
 function TriggerEditor({
   initial = triggerInitial,
   vmTarget = false,
+  vmAutomationAvailable = false,
 }: {
   initial?: WorkflowAutomation;
   vmTarget?: boolean;
+  vmAutomationAvailable?: boolean;
 }) {
   const [automation, setAutomation] = useState(initial);
   return (
@@ -1042,6 +1044,7 @@ function TriggerEditor({
         resolved
         disabled={false}
         vmTarget={vmTarget}
+        vmAutomationAvailable={vmAutomationAvailable}
         onChange={setAutomation}
         onClose={() => {}}
         onChooseMachine={() => {}}
@@ -1051,7 +1054,11 @@ function TriggerEditor({
     </>
   );
 }
-async function mountTrigger(initial = triggerInitial, vmTarget = false) {
+async function mountTrigger(
+  initial = triggerInitial,
+  vmTarget = false,
+  vmAutomationAvailable = false,
+) {
   fixture.repo = {
     ...fixture.repo,
     eligible: [],
@@ -1070,7 +1077,13 @@ async function mountTrigger(initial = triggerInitial, vmTarget = false) {
     ],
   };
   await act(() => {
-    renderer = create(<TriggerEditor initial={initial} vmTarget={vmTarget} />);
+    renderer = create(
+      <TriggerEditor
+        initial={initial}
+        vmTarget={vmTarget}
+        vmAutomationAvailable={vmAutomationAvailable}
+      />,
+    );
   });
   await drain();
 }
@@ -1410,13 +1423,32 @@ it.effect("replaces unusable VM trigger fields with target recovery", () =>
     yield* serveRequests;
     yield* Effect.promise(async () => {
       await mountTrigger(triggerInitial, true);
-      expect(words()).toContain("Automatic runs need a Machine target");
+      expect(words()).toContain("Automatic VM runs unavailable");
       expect(words()).toContain("Choose a Machine target");
       expect(renderer.root.findAllByProps({ "data-picker": true })).toHaveLength(0);
       expect(fixture.metadataReads).toHaveLength(0);
       expect(saveTrigger).not.toHaveBeenCalled();
     });
   }),
+);
+
+it.effect(
+  "enables a VM trigger with the existing Linear rule and discloses repository secrets",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountTrigger(triggerInitial, true, true);
+        expect(words()).toContain(
+          "Automatic VM runs can use this repository’s workflow variables and secrets.",
+        );
+        expect(enableControl().props.disabled).toBe(false);
+        await act(() => enableControl().props.onClick());
+        await drain();
+        await click("Save workflow");
+        expect(saveTrigger).toHaveBeenCalledWith({ ...triggerInitial, enabled: true });
+      });
+    }),
 );
 
 it.effect(

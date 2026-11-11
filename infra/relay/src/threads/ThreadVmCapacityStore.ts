@@ -2,6 +2,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import { DEFAULT_WORKFLOW_VM_LIMIT } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import type { LinearWorkflowConfiguration } from "../Config.ts";
 import { lockWorkflowVmOrganization } from "./WorkflowVmPolicyLock.ts";
 
 export class ThreadVmCapacityConflict extends Schema.TaggedError<ThreadVmCapacityConflict>()(
@@ -19,6 +20,7 @@ interface CapacityRequest {
 interface OrderedCapacityAdmission {
   readonly workflowEnabled: boolean;
   readonly workflowOperationId?: string;
+  readonly linearWorkflow?: Pick<LinearWorkflowConfiguration, "clientId" | "organizationId">;
 }
 const conflict = (message: string) => new ThreadVmCapacityConflict({ message });
 
@@ -105,6 +107,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
   ) {
     const ordered = typeof scope === "object" ? scope : null;
     const workflowOperationId = ordered?.workflowOperationId;
+    const linear = ordered?.linearWorkflow;
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         // Serializes admission and limit edits across relay instances. No expiring
@@ -148,6 +151,31 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
                 AND (x.refresh_started_at IS NULL OR x.refresh_started_at::timestamptz > clock_timestamp() - interval '6 seconds')
               LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
               WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND t.operation_id=c.operation_id
+                AND (c.kind<>'create' OR (j.record#>>'{origin,kind}') IS DISTINCT FROM 'automation' OR ${
+                  linear
+                    ? sql`EXISTS (
+                      SELECT 1 FROM relay_workflow_admissions admitted
+                      JOIN relay_workflow_repository_grants grant_row ON grant_row.grant_id=admitted.grant_id
+                        AND grant_row.repository_id=admitted.repository_id AND grant_row.organization_id=admitted.organization_id
+                        AND grant_row.connection_id=admitted.connection_id AND grant_row.generation=admitted.grant_generation
+                        AND NOT grant_row.revoked
+                      JOIN relay_workflow_connections source ON source.connection_id=admitted.connection_id
+                        AND source.organization_id=admitted.organization_id AND source.status='connected'
+                        AND source.payload_sealed IS NOT NULL
+                      JOIN relay_workflow_authorizations auth ON auth.organization_id=source.organization_id
+                        AND auth.application_id=source.application_id AND auth.exchange_lease_until IS NULL
+                      WHERE admitted.job_id=j.job_id AND admitted.workflow_id=j.record->>'workflowId'
+                        AND admitted.repository_id=j.repository_id AND admitted.organization_id=j.organization_id
+                        AND admitted.occurrence_id=j.record#>>'{origin,occurrenceId}'
+                        AND source.organization_id=${linear.organizationId}
+                        AND source.application_id=${linear.clientId}
+                        AND source.application_id=j.record#>>'{origin,source,applicationId}'
+                        AND source.workspace_id=j.record#>>'{origin,source,workspaceId}'
+                        AND source.connection_id=j.record#>>'{origin,source,connectionId}'
+                        AND grant_row.grant_id=j.record#>>'{origin,source,grantId}'
+                    )`
+                    : sql`false`
+                })
                 AND j.pending_control IS NULL AND ((j.status='queued' AND p.allocation_id IS NULL
                   AND j.record#>>'{queueReason,code}'='vm_waiting_capacity') OR
                   (j.status='preparing' AND p.phase='pending' AND p.workflow_snapshot IS NOT NULL

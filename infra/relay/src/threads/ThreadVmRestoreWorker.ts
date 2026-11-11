@@ -1,5 +1,6 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
+import type { LinearWorkflowConfiguration } from "../Config.ts";
 import type { makeE2BRestoreClient } from "../machines/E2BRestoreClient.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
@@ -12,12 +13,15 @@ export function makeThreadVmRestoreWorker(
   compute: Pick<ReturnType<typeof makeE2BRestoreClient>, "resolveSource">,
   hostId: string,
   workflowEnabled?: boolean,
+  linearWorkflow?: LinearWorkflowConfiguration,
 ) {
   const store = makeThreadVmRestoreStore(sql, objects);
   const runOne = Effect.fn("relay.thread_vm.restore.prepare_one")(function* () {
     yield* makeThreadVmCapacityStore(sql).admitNext(
       hostId,
-      workflowEnabled === undefined ? "personal" : { workflowEnabled },
+      workflowEnabled === undefined
+        ? "personal"
+        : { workflowEnabled, ...(linearWorkflow ? { linearWorkflow } : {}) },
     );
     const claim = yield* store.claim(hostId);
     if (!claim) return false;

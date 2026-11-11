@@ -15,6 +15,13 @@ import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 import { withPreparingWorkflowVm } from "./ThreadVmWorkflowAccess.ts";
 import type { RelayInternalError, RelayTenancyNotFoundError } from "@t3tools/contracts/relay";
 import type { RelayDb } from "../db.ts";
+import type { LinearWorkflowConfiguration } from "../Config.ts";
+import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import { tenancyNotFound } from "../http/tenancyErrors.ts";
+import {
+  isWorkflowSourceBlocker,
+  lockOriginalAuthority,
+} from "../workflowEvents/OriginalAuthority.ts";
 
 interface ProvisionCompute {
   readonly create: (
@@ -43,6 +50,7 @@ export function makeThreadVmProvisionWorker(
   workflow?: {
     readonly enabled: boolean;
     readonly buildId: string;
+    readonly linearWorkflow?: LinearWorkflowConfiguration;
     readonly verifyTemplate: (
       templateId: string,
       buildId: string,
@@ -58,7 +66,12 @@ export function makeThreadVmProvisionWorker(
     const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
     yield* makeThreadVmCapacityStore(sql).admitNext(
       hostId,
-      workflow ? { workflowEnabled: workflow.enabled } : "personal",
+      workflow
+        ? {
+            workflowEnabled: workflow.enabled,
+            ...(workflow.linearWorkflow ? { linearWorkflow: workflow.linearWorkflow } : {}),
+          }
+        : "personal",
     );
     const row = yield* store.claim(claimId, hostId, workflow !== undefined, verifiedWorkflowBuild);
     if (!row) return false;
@@ -191,21 +204,62 @@ export function makeThreadVmProvisionWorker(
         } else yield* verifyTemplate;
         const selectedTemplate = snapshot ? row.templateId : templateId;
         const begin = snapshot
-          ? withPreparingWorkflowVm(sql, row, (scope) =>
+          ? sql.withTransaction(
               Effect.gen(function* () {
-                const [codex] = yield* sql`SELECT connection_id FROM relay_codex_vm_connections
-                WHERE organization_id=${scope.organizationId} AND connection_id=${scope.codexConnectionId}
-                  AND status='connected' AND (refresh_started_at IS NULL
-                    OR refresh_started_at::timestamptz > clock_timestamp()-interval '6 seconds') FOR SHARE`;
-                if (!codex) {
-                  yield* store.returnWorkflowReservation({
-                    ...claim,
-                    errorCode: "workflow_codex_unavailable",
-                  });
-                  return false;
-                }
-                yield* store.beginCreate({ ...claim, templateId: selectedTemplate });
-                return true;
+                const [hint] = yield* sql<{
+                  jobId: string;
+                  organizationId: string;
+                  repositoryId: string;
+                  record: RepositoryWorkflowJob;
+                }>`SELECT j.job_id AS "jobId",j.organization_id AS "organizationId",
+                  j.repository_id AS "repositoryId",j.record
+                FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+                  AND j.organization_id=t.organization_id AND j.repository_id=t.repository_id
+                WHERE t.thread_id=${row.threadId} AND t.operation_id=${row.operationId}`;
+                if (!hint) return yield* tenancyNotFound("thread_not_found");
+                const sourceBlocker =
+                  hint.record.origin?.kind === "automation"
+                    ? yield* lockOriginalAuthority(hint).pipe(
+                        Effect.as(null),
+                        Effect.catchTag("WorkflowQueued", (reason) =>
+                          Effect.succeed(
+                            isWorkflowSourceBlocker(reason.code)
+                              ? reason.code
+                              : ("source_unavailable" as const),
+                          ),
+                        ),
+                      )
+                    : null;
+                return yield* withPreparingWorkflowVm(sql, row, (scope) =>
+                  Effect.gen(function* () {
+                    if (
+                      scope.workflowJobId !== hint.jobId ||
+                      scope.organizationId !== hint.organizationId ||
+                      scope.repositoryId !== hint.repositoryId
+                    )
+                      return yield* tenancyNotFound("thread_not_found");
+                    if (sourceBlocker) {
+                      yield* store.returnWorkflowReservation({
+                        ...claim,
+                        errorCode: sourceBlocker,
+                      });
+                      return false;
+                    }
+                    const [codex] = yield* sql`SELECT connection_id FROM relay_codex_vm_connections
+                      WHERE organization_id=${scope.organizationId} AND connection_id=${scope.codexConnectionId}
+                        AND status='connected' AND (refresh_started_at IS NULL
+                          OR refresh_started_at::timestamptz > clock_timestamp()-interval '6 seconds') FOR SHARE`;
+                    if (!codex) {
+                      yield* store.returnWorkflowReservation({
+                        ...claim,
+                        errorCode: "workflow_codex_unavailable",
+                      });
+                      return false;
+                    }
+                    yield* store.beginCreate({ ...claim, templateId: selectedTemplate });
+                    return true;
+                  }),
+                );
               }),
             )
           : ownerAccess(store.beginCreate({ ...claim, templateId: selectedTemplate })).pipe(
