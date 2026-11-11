@@ -12,7 +12,7 @@ import * as Effect from "effect/Effect";
 import { useCallback, useId, useLayoutEffect, useRef, useState } from "react";
 import { resolveRelayClerkTokenOptions } from "../../cloud/publicConfig";
 import { runtime } from "../../lib/runtime";
-import { Badge } from "../ui/badge";
+import { GitForkIcon, InfoIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -46,14 +46,12 @@ type Request = (
   update?: RelayUpdateRepositoryWorkflowConfiguration,
 ) => Promise<RelayRepositoryWorkflowConfiguration>;
 
-type Draft =
-  | {
-      readonly kind: "variable" | "secret";
-      readonly name: string;
-      readonly value: string;
-      readonly editing: boolean;
-    }
-  | { readonly kind: "delete"; readonly name: string };
+type Draft = {
+  readonly kind: "variable" | "secret";
+  readonly name: string;
+  readonly value: string;
+  readonly mode: "add" | "edit" | "delete";
+};
 
 export function WorkflowEnvironmentButton(scope: Scope) {
   const { getToken, userId } = useAuth();
@@ -140,10 +138,13 @@ function ScopedWorkflowEnvironmentButton({
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetPopup>
           <SheetHeader>
-            <SheetTitle>Workflow environment</SheetTitle>
+            <div className="pe-8">
+              <SheetTitle>Workflow environment</SheetTitle>
+            </div>
             <SheetDescription>
-              Variables and secrets for {repositoryName}’s workflow VMs. Runs that have started
-              preparing keep their current values.
+              <GitForkIcon aria-hidden className="me-1.5 inline size-3.5 align-[-2px]" />
+              <span className="wrap-anywhere">{repositoryName}</span>
+              <span className="ms-2 border-s ps-2">Workflow VMs</span>
             </SheetDescription>
           </SheetHeader>
           {open ? <WorkflowEnvironmentEditor request={request} /> : null}
@@ -160,9 +161,13 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
   const [pending, setPending] = useState<"load" | "save" | null>("load");
   const [error, setError] = useState<keyof typeof editorErrorMessages | "changed" | null>(null);
   const [needsReload, setNeedsReload] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [kind, setKind] = useState<"variable" | "secret">("variable");
+  const [savedName, setSavedName] = useState<string | null>(null);
+  const addButton = useRef<HTMLButtonElement | null>(null);
+  const returnFocus = useRef<HTMLButtonElement | null>(null);
   const active = useRef<AbortController | null>(null);
   const recoveryRef = useRef<HTMLDivElement | null>(null);
+  const reloadButton = useRef<HTMLButtonElement | null>(null);
   const focusDraft = useCallback((node: HTMLDivElement | null) => {
     node?.focus();
   }, []);
@@ -174,7 +179,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
       active.current = operation;
       setPending(update ? "save" : "load");
       setError(null);
-      setSaved(false);
+      setSavedName(null);
       try {
         const result = await request(operation.signal, update);
         if (operation.signal.aborted) return;
@@ -182,9 +187,9 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
         setNeedsReload(false);
         if (update) {
           setDraft(null);
-          setSaved(true);
+          setSavedName(update.mutation.name);
         } else {
-          setDraft((current) => (current?.kind === "delete" ? null : current));
+          setDraft((current) => (current?.mode === "delete" ? null : current));
         }
       } catch (cause) {
         if (operation.signal.aborted) return;
@@ -236,219 +241,314 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
     if (error) recoveryRef.current?.scrollIntoView({ block: "nearest" });
   }, [error]);
 
+  useLayoutEffect(() => {
+    if (draft || pending || !returnFocus.current) return;
+    if (needsReload) {
+      reloadButton.current?.focus();
+      return;
+    }
+    const trigger = returnFocus.current;
+    returnFocus.current = null;
+    if (trigger.isConnected && !trigger.disabled) trigger.focus();
+    else addButton.current?.focus();
+  }, [draft, needsReload, pending]);
+
   const disabled = pending !== null || needsReload;
   const existing = draft && record?.entries.find((entry) => entry.name === draft.name);
-  const kindConflict = draft && draft.kind !== "delete" && existing && existing.kind !== draft.kind;
+  const kindConflict = draft && draft.mode !== "delete" && existing && existing.kind !== draft.kind;
   const validName = draft !== null && /^[A-Za-z_][A-Za-z0-9_]*$/u.test(draft.name);
   const submit = (mutation: RelayUpdateRepositoryWorkflowConfiguration["mutation"]) => {
     if (record && !disabled) void run({ expectedRevision: record.revision, mutation });
   };
 
+  const editingEntry =
+    draft && draft.mode !== "add" && existing?.kind === kind ? existing : undefined;
+  const beginDraft = (next: Draft, trigger: HTMLButtonElement) => {
+    returnFocus.current = trigger;
+    setSavedName(null);
+    setError(null);
+    setDraft(next);
+  };
+
+  const recovery =
+    error || needsReload ? (
+      <div ref={recoveryRef} className="min-w-0">
+        <WorkflowAlert
+          title={
+            error === "changed"
+              ? "Workflow environment changed"
+              : "Could not update workflow environment"
+          }
+          actions={
+            needsReload ? (
+              <Button
+                ref={reloadButton}
+                variant="outline"
+                size="sm"
+                disabled={pending !== null}
+                onClick={() => void run()}
+              >
+                Reload settings
+              </Button>
+            ) : undefined
+          }
+        >
+          {error === "changed"
+            ? draft?.mode === "delete"
+              ? "Reload the latest settings before confirming the deletion again."
+              : draft
+                ? "Reload the latest settings before trying again. Your draft will stay."
+                : "Reload the latest settings before trying again."
+            : error
+              ? editorErrorMessages[error]
+              : null}
+        </WorkflowAlert>
+      </div>
+    ) : null;
+  const savedNotice = savedName ? (
+    <p role="status" className="text-sm text-muted-foreground">
+      Workflow environment updated.
+    </p>
+  ) : null;
+  const draftForm = draft ? (
+    <>
+      <div
+        key={draft.mode}
+        ref={focusDraft}
+        role="group"
+        aria-labelledby={`${fieldId}-draft-title`}
+        tabIndex={-1}
+        className="space-y-3 rounded-lg border bg-muted/25 p-3"
+      >
+        {draft.mode === "delete" ? (
+          <p id={`${fieldId}-draft-title`} className="wrap-anywhere text-sm">
+            Delete {draft.name} from future runs?
+          </p>
+        ) : (
+          <>
+            <p
+              id={`${fieldId}-draft-title`}
+              className={editingEntry ? "sr-only" : "wrap-anywhere text-sm font-medium"}
+            >
+              {draft.mode === "edit"
+                ? `${draft.kind === "secret" ? "Replace" : "Edit"} ${draft.name}`
+                : `Add ${draft.kind}`}
+            </p>
+            {draft.mode === "add" ? (
+              <div className="grid gap-1.5">
+                <Label htmlFor={`${fieldId}-name`}>Name</Label>
+                <Input
+                  id={`${fieldId}-name`}
+                  nativeInput
+                  size="sm"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="API_KEY"
+                  maxLength={RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH}
+                  disabled={pending !== null}
+                  aria-describedby={`${fieldId}-name-hint`}
+                  aria-invalid={(draft.name.length > 0 && !validName) || undefined}
+                  value={draft.name}
+                  onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })}
+                />
+                <p
+                  id={`${fieldId}-name-hint`}
+                  className={
+                    draft.name && !validName
+                      ? "text-xs text-destructive"
+                      : "text-xs text-muted-foreground"
+                  }
+                >
+                  Start with a letter or underscore. Use only letters, numbers, and underscores.
+                </p>
+              </div>
+            ) : null}
+            <div className="grid gap-1.5">
+              <Label htmlFor={`${fieldId}-value`}>
+                {draft.kind === "secret" ? "Secret value" : "Variable value"}
+              </Label>
+              {draft.kind === "secret" ? (
+                <SecretDraft
+                  id={`${fieldId}-value`}
+                  value={draft.value}
+                  disabled={pending !== null}
+                  onChange={(value) => setDraft({ ...draft, value })}
+                />
+              ) : (
+                <Textarea
+                  id={`${fieldId}-value`}
+                  size="sm"
+                  autoComplete="off"
+                  spellCheck={false}
+                  disabled={pending !== null}
+                  value={draft.value}
+                  onChange={(event) => setDraft({ ...draft, value: event.currentTarget.value })}
+                />
+              )}
+            </div>
+            {kindConflict ? (
+              <WorkflowAlert title="Environment name already in use" variant="warning">
+                A {existing.kind} already uses this name. Choose a different name before saving.
+              </WorkflowAlert>
+            ) : null}
+          </>
+        )}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          {draft.mode === "edit" && editingEntry ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost-destructive"
+              disabled={disabled}
+              aria-label={`Delete ${draft.name}`}
+              onClick={() => setDraft({ ...draft, mode: "delete" })}
+            >
+              Delete
+            </Button>
+          ) : null}
+          <div className="ms-auto flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={pending === "save"}
+              onClick={() => setDraft(draft.mode === "delete" ? { ...draft, mode: "edit" } : null)}
+            >
+              {draft.mode === "delete" ? "Cancel deletion" : "Cancel"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={draft.mode === "delete" ? "destructive" : "default"}
+              disabled={
+                disabled ||
+                !!kindConflict ||
+                !validName ||
+                (draft.mode !== "delete" && draft.kind === "secret" && draft.value.length === 0)
+              }
+              onClick={() =>
+                submit(
+                  draft.mode === "delete"
+                    ? { kind: "delete", name: draft.name }
+                    : {
+                        kind: draft.kind === "secret" ? "setSecret" : "setVariable",
+                        name: draft.name,
+                        value: draft.value,
+                      },
+                )
+              }
+            >
+              {pending === "save"
+                ? "Saving…"
+                : draft.mode === "delete"
+                  ? "Confirm delete"
+                  : existing?.kind === draft.kind &&
+                      (draft.kind === "secret" || draft.mode === "add")
+                    ? `Replace ${draft.kind}`
+                    : `Save ${draft.kind}`}
+            </Button>
+          </div>
+        </div>
+      </div>
+      {recovery}
+    </>
+  ) : null;
+
+  const entries = record?.entries.filter((entry) => entry.kind === kind) ?? [];
+
   return (
     <>
       {record ? (
-        <div className="flex shrink-0 flex-wrap gap-2 px-6 pb-2">
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={disabled || draft !== null}
-            onClick={() => setDraft({ kind: "variable", name: "", value: "", editing: false })}
-          >
-            Add variable
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={disabled || draft !== null}
-            onClick={() => setDraft({ kind: "secret", name: "", value: "", editing: false })}
-          >
-            Add secret
-          </Button>
+        <div
+          role="group"
+          aria-label="Environment entry type"
+          className="flex shrink-0 gap-4 border-b px-6"
+        >
+          {(["variable", "secret"] as const).map((choice) => (
+            <button
+              key={choice}
+              type="button"
+              aria-pressed={choice === kind}
+              disabled={draft !== null && choice !== kind}
+              onClick={() => {
+                setKind(choice);
+                setSavedName(null);
+              }}
+              className="min-h-9 border-b-2 border-transparent px-0.5 text-sm text-muted-foreground aria-pressed:border-primary aria-pressed:font-medium aria-pressed:text-foreground disabled:opacity-50 pointer-coarse:min-h-11"
+            >
+              {choice === "variable" ? "Variables" : "Secrets"}
+            </button>
+          ))}
         </div>
       ) : null}
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 py-3">
         {record ? (
           <>
-            {record.entries.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No variables or secrets yet.</p>
-            ) : (
-              <ul className="divide-y rounded-md border">
-                {record.entries.map((entry) => (
-                  <li
-                    key={entry.name}
-                    className="flex flex-wrap items-start justify-between gap-2 p-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <code className="break-all text-xs">{entry.name}</code>
-                        {entry.kind === "secret" ? <Badge variant="outline">Secret</Badge> : null}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm text-muted-foreground">
+                {kind === "variable"
+                  ? "Plain text values for workflow runs."
+                  : "Saved secret values can’t be viewed."}
+              </p>
+              <Button
+                ref={addButton}
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={disabled || draft !== null}
+                onClick={(event) =>
+                  beginDraft({ kind, name: "", value: "", mode: "add" }, event.currentTarget)
+                }
+              >
+                {kind === "variable" ? "Add variable" : "Add secret"}
+              </Button>
+            </div>
+            {draft && draft.mode === "add" ? draftForm : null}
+            {entries.length > 0 ? (
+              <ul className="divide-y border-t">
+                {entries.map((entry) => (
+                  <li key={entry.name} className="space-y-2 py-2">
+                    <div className="flex min-h-8 items-center gap-2">
+                      <div className="min-w-0 flex-1">
+                        <code className="wrap-anywhere text-xs">{entry.name}</code>
+                        {entry.kind === "variable" && entry !== editingEntry ? (
+                          <p className="truncate text-sm text-muted-foreground">{entry.value}</p>
+                        ) : null}
                       </div>
-                      {entry.kind === "variable" ? (
-                        <p className="truncate text-sm text-muted-foreground">{entry.value}</p>
-                      ) : null}
+                      <div hidden={entry === editingEntry}>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          aria-label={`${entry.kind === "secret" ? "Replace" : "Edit"} ${entry.name}`}
+                          disabled={disabled || draft !== null}
+                          onClick={(event) =>
+                            beginDraft(
+                              {
+                                kind: entry.kind,
+                                name: entry.name,
+                                value: entry.kind === "variable" ? entry.value : "",
+                                mode: "edit",
+                              },
+                              event.currentTarget,
+                            )
+                          }
+                        >
+                          {entry.kind === "secret" ? "Replace" : "Edit"}
+                        </Button>
+                      </div>
                     </div>
-                    <div className="flex gap-1">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label={`${entry.kind === "secret" ? "Replace" : "Edit"} ${entry.name}`}
-                        disabled={disabled || draft !== null}
-                        onClick={() =>
-                          setDraft({
-                            kind: entry.kind,
-                            name: entry.name,
-                            value: entry.kind === "variable" ? entry.value : "",
-                            editing: true,
-                          })
-                        }
-                      >
-                        {entry.kind === "secret" ? "Replace" : "Edit"}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label={`Delete ${entry.name}`}
-                        disabled={disabled || draft !== null}
-                        onClick={() => setDraft({ kind: "delete", name: entry.name })}
-                      >
-                        Delete
-                      </Button>
-                    </div>
+                    {entry === editingEntry ? draftForm : null}
+                    {savedName === entry.name ? savedNotice : null}
                   </li>
                 ))}
               </ul>
-            )}
-            {draft ? (
-              <div
-                ref={focusDraft}
-                role="group"
-                aria-labelledby={`${fieldId}-draft-title`}
-                tabIndex={-1}
-                className="space-y-2 rounded-md border p-3"
-              >
-                {draft.kind === "delete" ? (
-                  <p id={`${fieldId}-draft-title`} className="break-words text-sm">
-                    Delete {draft.name} from future runs?
-                  </p>
-                ) : (
-                  <>
-                    <p id={`${fieldId}-draft-title`} className="text-sm font-medium">
-                      {draft.kind === "secret"
-                        ? existing?.kind === "secret" || draft.editing
-                          ? "Replace secret"
-                          : "Add secret"
-                        : draft.editing
-                          ? "Edit variable"
-                          : "Add variable"}
-                    </p>
-                    <div className="grid gap-1.5">
-                      <Label htmlFor={`${fieldId}-name`}>Name</Label>
-                      <Input
-                        id={`${fieldId}-name`}
-                        nativeInput
-                        size="sm"
-                        autoComplete="off"
-                        spellCheck={false}
-                        placeholder="API_KEY"
-                        maxLength={RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH}
-                        disabled={pending !== null}
-                        readOnly={draft.editing}
-                        aria-describedby={draft.editing ? undefined : `${fieldId}-name-hint`}
-                        aria-invalid={
-                          (!draft.editing && draft.name.length > 0 && !validName) || undefined
-                        }
-                        value={draft.name}
-                        onChange={(event) =>
-                          setDraft({ ...draft, name: event.currentTarget.value })
-                        }
-                      />
-                      {draft.editing ? null : (
-                        <p
-                          id={`${fieldId}-name-hint`}
-                          className={
-                            draft.name && !validName
-                              ? "text-xs text-destructive"
-                              : "text-xs text-muted-foreground"
-                          }
-                        >
-                          Start with a letter or underscore. Use only letters, numbers, and
-                          underscores.
-                        </p>
-                      )}
-                    </div>
-                    <div className="grid gap-1.5">
-                      <Label htmlFor={`${fieldId}-value`}>
-                        {draft.kind === "secret" ? "Secret value" : "Variable value"}
-                      </Label>
-                      {draft.kind === "secret" ? (
-                        <SecretDraft
-                          id={`${fieldId}-value`}
-                          value={draft.value}
-                          disabled={pending !== null}
-                          onChange={(value) => setDraft({ ...draft, value })}
-                        />
-                      ) : (
-                        <Textarea
-                          id={`${fieldId}-value`}
-                          autoComplete="off"
-                          spellCheck={false}
-                          disabled={pending !== null}
-                          value={draft.value}
-                          onChange={(event) =>
-                            setDraft({ ...draft, value: event.currentTarget.value })
-                          }
-                        />
-                      )}
-                    </div>
-                    {kindConflict ? (
-                      <WorkflowAlert title="Environment name already in use" variant="warning">
-                        A {existing.kind} already uses this name. Choose a different name before
-                        saving.
-                      </WorkflowAlert>
-                    ) : null}
-                  </>
-                )}
-                <div className="flex gap-2">
-                  <Button
-                    size="sm"
-                    variant={draft.kind === "delete" ? "destructive" : "default"}
-                    disabled={
-                      disabled ||
-                      !!kindConflict ||
-                      !validName ||
-                      (draft.kind === "secret" && draft.value.length === 0)
-                    }
-                    onClick={() =>
-                      submit(
-                        draft.kind === "delete"
-                          ? { kind: "delete", name: draft.name }
-                          : {
-                              kind: draft.kind === "secret" ? "setSecret" : "setVariable",
-                              name: draft.name,
-                              value: draft.value,
-                            },
-                      )
-                    }
-                  >
-                    {pending === "save"
-                      ? "Saving…"
-                      : draft.kind === "delete"
-                        ? "Confirm delete"
-                        : existing
-                          ? "Replace value"
-                          : "Save value"}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={pending === "save"}
-                    onClick={() => setDraft(null)}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              </div>
+            ) : !draft ? (
+              <p className="border-t py-3 text-sm text-muted-foreground">
+                {kind === "variable" ? "No variables yet." : "No secrets yet."}
+              </p>
             ) : null}
+            {draft && draft.mode !== "add" && !editingEntry ? draftForm : null}
           </>
         ) : null}
         {pending === "load" ? (
@@ -456,49 +556,12 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
             Loading workflow environment…
           </p>
         ) : null}
-        {error || needsReload ? (
-          <div ref={recoveryRef} className="min-w-0">
-            <WorkflowAlert
-              title={
-                error === "changed"
-                  ? "Workflow environment changed"
-                  : "Could not update workflow environment"
-              }
-              actions={
-                needsReload ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={pending !== null}
-                    onClick={() => void run()}
-                  >
-                    Reload settings
-                  </Button>
-                ) : undefined
-              }
-            >
-              {error === "changed" ? (
-                <div className="space-y-1">
-                  <p className="font-medium">Settings changed</p>
-                  <p className="text-muted-foreground">
-                    {draft?.kind === "delete"
-                      ? "Reload the latest settings before confirming the deletion again."
-                      : draft
-                        ? "Reload the latest settings before trying again. Your draft will stay."
-                        : "Reload the latest settings before trying again."}
-                  </p>
-                </div>
-              ) : error ? (
-                <p>{editorErrorMessages[error]}</p>
-              ) : null}
-            </WorkflowAlert>
-          </div>
-        ) : null}
-        {saved ? (
-          <p role="status" className="text-sm text-muted-foreground">
-            Workflow environment updated.
-          </p>
-        ) : null}
+        {!draft ? recovery : null}
+        {savedName && !entries.some((entry) => entry.name === savedName) ? savedNotice : null}
+      </div>
+      <div className="flex shrink-0 items-start gap-2 border-t px-6 py-3 text-xs text-muted-foreground">
+        <InfoIcon aria-hidden className="size-3.5 shrink-0" />
+        <p>Changes apply to runs that haven’t started preparing.</p>
       </div>
     </>
   );

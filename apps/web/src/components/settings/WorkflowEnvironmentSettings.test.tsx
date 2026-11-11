@@ -94,9 +94,6 @@ vi.mock("../ui/input", () => ({
     ...props
   }: ComponentProps<"input"> & { nativeInput?: boolean }) => <input {...props} />,
 }));
-vi.mock("../ui/badge", () => ({
-  Badge: ({ children }: { children: ReactNode }) => <span>{children}</span>,
-}));
 vi.mock("../ui/textarea", () => ({
   Textarea: (props: ComponentProps<"textarea">) => <textarea {...props} />,
 }));
@@ -185,15 +182,16 @@ const visibleText = (node: ReactTestInstance): string =>
     .join(" ")
     .replace(/\s+/gu, " ")
     .trim();
-const open = async () => {
+const open = async (options?: Parameters<typeof create>[1]) => {
   await act(() => {
-    renderer = create(editor());
+    renderer = create(editor(), options);
   });
   await click("Workflow environment");
 };
 const click = async (name: string) => {
   await act(async () => {
-    button(name).props.onClick();
+    const target = button(name);
+    target.props.onClick({ currentTarget: target.instance });
   });
   await act(async () => {
     await Promise.allSettled(fixture.pending.splice(0));
@@ -238,13 +236,17 @@ describe("workflow environment settings", () => {
       await click("Edit APP_MODE");
       expect(focus).toHaveBeenCalledTimes(1);
       await click("Cancel");
+      await click("Secrets");
       await click("Replace PACKAGE_TOKEN");
       expect(focus).toHaveBeenCalledTimes(2);
       await changeSecret("draft value");
       expect(focus).toHaveBeenCalledTimes(2);
-      await click("Cancel");
       await click("Delete PACKAGE_TOKEN");
       expect(focus).toHaveBeenCalledTimes(3);
+      expect(button("Confirm delete")).toBeDefined();
+      await click("Cancel deletion");
+      expect(field("Secret value").props.value).toBe("draft value");
+      expect(focus).toHaveBeenCalledTimes(4);
     }),
   );
 
@@ -261,16 +263,18 @@ describe("workflow environment settings", () => {
         );
         mockRelay(() => initial, write);
         await open();
-        expect(button("Replace PACKAGE_TOKEN")).toBeDefined();
+        expect(button("Replace PACKAGE_TOKEN")).toBeUndefined();
         expect(JSON.stringify(renderer.toJSON())).toContain("test");
         await click("Edit APP_MODE");
-        expect(field("Name").props.value).toBe("APP_MODE");
         expect(field("Variable value", "textarea").props.value).toBe(variableValue);
+        expect(button("Secrets").props.disabled).toBe(true);
         await click("Cancel");
+        await click("Secrets");
+        expect(button("Edit APP_MODE")).toBeUndefined();
         await click("Replace PACKAGE_TOKEN");
         expect(field("Secret value").props.type).toBe("password");
         expect(field("Secret value").props.value).toBe("");
-        expect(button("Replace value").props.disabled).toBe(true);
+        expect(button("Replace secret").props.disabled).toBe(true);
 
         const secret = "test-only secret\nsecond line";
         await act(() => {
@@ -280,12 +284,13 @@ describe("workflow environment settings", () => {
           });
         });
         expect(field("Secret value").props.value).not.toContain(secret);
-        await click("Replace value");
+        await click("Replace secret");
         expect(write.mock.calls[0]?.[0]).toEqual({
           expectedRevision: 1,
           mutation: { kind: "setSecret", name: "PACKAGE_TOKEN", value: secret },
         });
         expect(JSON.stringify(renderer.toJSON())).not.toContain("test-only secret");
+        await click("Replace PACKAGE_TOKEN");
         await click("Delete PACKAGE_TOKEN");
         await click("Confirm delete");
         expect(write.mock.calls[1]?.[0]).toEqual({
@@ -308,10 +313,10 @@ describe("workflow environment settings", () => {
       mockRelay(() => initial, write);
       await open();
       expect(button("Add variable").props.disabled).toBe(false);
-      expect(button("Add secret").props.disabled).toBe(false);
+      expect(button("Add secret")).toBeUndefined();
       await click("Add variable");
       expect(button("Add variable").props.disabled).toBe(true);
-      expect(button("Add secret").props.disabled).toBe(true);
+      expect(button("Secrets").props.disabled).toBe(true);
 
       const changeName = (value: string) =>
         act(() => field("Name").props.onChange({ currentTarget: { value } }));
@@ -322,19 +327,19 @@ describe("workflow environment settings", () => {
       expect(visibleText(hint)).toBe(
         "Start with a letter or underscore. Use only letters, numbers, and underscores.",
       );
-      expect(button("Save value").props.disabled).toBe(true);
+      expect(button("Save variable").props.disabled).toBe(true);
 
       await changeName("PACKAGE_TOKEN");
       expect(visibleText(renderer.root.findByProps({ role: "alert" }))).toContain(
         "A secret already uses this name.",
       );
-      expect(button("Replace value").props.disabled).toBe(true);
+      expect(button("Save variable").props.disabled).toBe(true);
       expect(write).not.toHaveBeenCalled();
 
       await changeName("API_KEY");
       expect(field("Name").props["aria-invalid"]).not.toBe(true);
-      expect(button("Save value").props.disabled).toBe(false);
-      await click("Save value");
+      expect(button("Save variable").props.disabled).toBe(false);
+      await click("Save variable");
       expect(write.mock.calls[0]?.[0]).toEqual({
         expectedRevision: 1,
         mutation: { kind: "setVariable", name: "API_KEY", value: "" },
@@ -343,7 +348,7 @@ describe("workflow environment settings", () => {
     }),
   );
 
-  for (const mode of ["conflict", "unconfirmed"] as const)
+  for (const mode of ["conflict", "unconfirmed", "removed"] as const)
     it.effect(
       `keeps the secret draft after a ${mode} save and waits for reload and an explicit retry`,
       () =>
@@ -351,26 +356,30 @@ describe("workflow environment settings", () => {
           let record = initial;
           const write = vi.fn(async (update: RelayUpdateRepositoryWorkflowConfiguration) => {
             if (update.expectedRevision === 1) {
-              record = { ...initial, revision: 2 };
-              return mode === "conflict"
-                ? changedRevisionResponse()
-                : new Response("test-only secret", { status: 500 });
+              record = {
+                ...initial,
+                revision: 2,
+                entries: mode === "removed" ? initial.entries.slice(0, 1) : initial.entries,
+              };
+              return mode === "unconfirmed"
+                ? new Response("test-only secret", { status: 500 })
+                : changedRevisionResponse();
             }
             return Response.json({ ...record, revision: 3 });
           });
           mockRelay(() => record, write);
           await open();
+          await click("Secrets");
           await click("Replace PACKAGE_TOKEN");
           await changeSecret("test-only secret");
-          await click("Replace value");
+          await click("Replace secret");
           expect(field("Secret value").props.value).toBe("test-only secret");
           const alert = renderer.root.findByProps({ role: "alert" });
-          const draft = renderer.root.findByProps({ role: "group" });
+          const draft = renderer.root.findByProps({ role: "group", tabIndex: -1 });
           let recovery = alert;
           while (recovery.parent && recovery.parent !== draft.parent) recovery = recovery.parent;
           expect(visibleText(alert)).not.toContain("test-only secret");
           if (mode === "conflict") {
-            expect(visibleText(alert)).toContain("Settings changed");
             expect(visibleText(alert)).toContain(
               "Reload the latest settings before trying again. Your draft will stay.",
             );
@@ -380,12 +389,17 @@ describe("workflow environment settings", () => {
           expect(recovery.parent!.children.indexOf(recovery)).toBe(
             recovery.parent!.children.indexOf(draft) + 1,
           );
-          expect(button("Replace value").props.disabled).toBe(true);
+          expect(button("Replace secret").props.disabled).toBe(true);
           expect(button("Add secret").props.disabled).toBe(true);
           await click("Reload settings");
           expect(write).toHaveBeenCalledTimes(1);
           expect(field("Secret value").props.value).toBe("test-only secret");
-          await click("Replace value");
+          if (mode === "removed") {
+            expect(
+              visibleText(renderer.root.findByProps({ role: "group", tabIndex: -1 })),
+            ).toContain("Replace PACKAGE_TOKEN");
+          }
+          await click(mode === "removed" ? "Save secret" : "Replace secret");
           expect(write.mock.calls[1]?.[0]).toEqual({
             expectedRevision: 2,
             mutation: { kind: "setSecret", name: "PACKAGE_TOKEN", value: "test-only secret" },
@@ -412,6 +426,8 @@ describe("workflow environment settings", () => {
         });
         mockRelay(() => record, write);
         await open();
+        await click("Secrets");
+        await click("Replace PACKAGE_TOKEN");
         await click("Delete PACKAGE_TOKEN");
         await click("Confirm delete");
         expect(button("Confirm delete").props.disabled).toBe(true);
@@ -425,8 +441,9 @@ describe("workflow environment settings", () => {
         expect(write).toHaveBeenCalledTimes(1);
         expect(button("Confirm delete")).toBeUndefined();
         if (target === "absent") {
-          expect(button("Delete PACKAGE_TOKEN")).toBeUndefined();
+          expect(button("Replace PACKAGE_TOKEN")).toBeUndefined();
         } else {
+          await click("Replace PACKAGE_TOKEN");
           await click("Delete PACKAGE_TOKEN");
           expect(write).toHaveBeenCalledTimes(1);
           await click("Confirm delete");
@@ -446,19 +463,35 @@ describe("workflow environment settings", () => {
         return changedRevisionResponse();
       });
       mockRelay(() => record, write);
-      await open();
+      const focusReload = vi.fn();
+      const focusReplace = vi.fn();
+      await open({
+        createNodeMock: (element) => {
+          if (element.type !== "button") return null;
+          const props = element.props as ComponentProps<"button">;
+          if (props.children === "Reload settings") return { focus: focusReload };
+          if (props["aria-label"] === "Replace PACKAGE_TOKEN") {
+            return { focus: focusReplace, isConnected: true };
+          }
+          return null;
+        },
+      });
+      await click("Secrets");
       await click("Replace PACKAGE_TOKEN");
       await changeSecret("discard this draft");
-      await click("Replace value");
+      await click("Replace secret");
       await click("Cancel");
       expect(renderer.root.findAllByType("input")).toHaveLength(0);
       const alert = visibleText(renderer.root.findByProps({ role: "alert" }));
       expect(alert).toContain("Reload the latest settings before trying again.");
       expect(alert).not.toContain("Your draft will stay.");
       expect(button("Reload settings").props.disabled).toBe(false);
-      expect(button("Delete PACKAGE_TOKEN").props.disabled).toBe(true);
+      expect(focusReload).toHaveBeenCalledTimes(1);
+      expect(focusReplace).not.toHaveBeenCalled();
+      expect(button("Replace PACKAGE_TOKEN").props.disabled).toBe(true);
       expect(button("Add secret").props.disabled).toBe(true);
       await click("Reload settings");
+      expect(focusReplace).toHaveBeenCalledTimes(1);
       expect(write).toHaveBeenCalledTimes(1);
       expect(button("Add secret").props.disabled).toBe(false);
       await click("Replace PACKAGE_TOKEN");
@@ -486,15 +519,17 @@ describe("workflow environment settings", () => {
           },
         );
         await open();
+        await click("Secrets");
         await click("Replace PACKAGE_TOKEN");
         await changeSecret("discard on close");
         await click("Close");
         await click("Workflow environment");
+        await click("Secrets");
         await click("Replace PACKAGE_TOKEN");
         expect(field("Secret value").props.value).toBe("");
         await changeSecret("first account only");
         await act(async () => {
-          button("Replace value").props.onClick();
+          button("Replace secret").props.onClick();
           await started;
         });
         expect(button("Add secret").props.disabled).toBe(true);
@@ -508,6 +543,7 @@ describe("workflow environment settings", () => {
           finishSave(Response.json({ ...initial, revision: 2, entries: [] }));
           await Promise.allSettled(oldRequest);
         });
+        await click("Secrets");
         await click("Replace PACKAGE_TOKEN");
         expect(field("Secret value").props.value).toBe("");
         expect(JSON.stringify(renderer.toJSON())).not.toContain("first account only");
@@ -530,9 +566,10 @@ describe("workflow environment settings", () => {
           ),
       );
       await open();
+      await click("Secrets");
       await click("Replace PACKAGE_TOKEN");
       await changeSecret("discard after permission loss");
-      await click("Replace value");
+      await click("Replace secret");
       expect(renderer.root.findAllByType("input")).toHaveLength(0);
       expect(visibleText(renderer.root.findByProps({ role: "alert" }))).toContain(
         "no longer have access",
@@ -545,10 +582,11 @@ describe("workflow environment settings", () => {
       const write = vi.fn(async () => Response.json({ ...initial, revision: 2 }));
       mockRelay(() => initial, write);
       await open();
+      await click("Secrets");
       await click("Replace PACKAGE_TOKEN");
       await changeSecret("first account only");
       fixture.tokenAccountId = "user-b";
-      await click("Replace value");
+      await click("Replace secret");
       expect(write).not.toHaveBeenCalled();
       expect(renderer.root.findAllByType("input")).toHaveLength(0);
     }),
