@@ -1,6 +1,10 @@
 import { WorkflowAlert } from "./WorkflowAlert";
 import * as Schema from "effect/Schema";
-import { WorkflowAutomation } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_MAX_STEPS,
+  WorkflowAutomation,
+  workflowPublishingPrerequisites,
+} from "@t3tools/contracts/workflows";
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
 import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import { RepositorySourcesButton } from "./WorkflowSources";
@@ -564,7 +568,11 @@ function WorkflowBuilderEditor({
     )
       refresh();
   };
-  const insert = (anchor: WorkflowInsertion, kind: WorkflowStep["kind"] | "open_pull_request") => {
+  const insert = (
+    anchor: WorkflowInsertion,
+    kind: WorkflowStep["kind"] | "open_pull_request",
+    repairOpenPrId?: string,
+  ) => {
     const stepId = randomUUID();
     const step: WorkflowStep =
       kind === "action" || kind === "open_pull_request"
@@ -593,24 +601,34 @@ function WorkflowBuilderEditor({
             : { id: stepId, kind, title: "Review changes", role: "maintainer" };
     let inserted = false;
     edit((draft) => {
-      const index = workflowInsertionIndex(draft.definition.steps, anchor);
+      const steps = draft.definition.steps;
+      const index = workflowInsertionIndex(steps, anchor);
       if (
         index === null ||
-        draft.definition.steps.length >= 32 ||
+        steps.length >= WORKFLOW_MAX_STEPS ||
         (draft.definition.target.kind === "vm" && step.kind === "action")
       )
         return draft;
+      if (repairOpenPrId) {
+        const openPr = steps[index];
+        if (
+          !draft.targetConfirmed ||
+          draft.selectedStepId !== repairOpenPrId ||
+          openPr?.id !== repairOpenPrId ||
+          openPr.kind !== "action" ||
+          openPr.action !== "open_pull_request"
+        )
+          return draft;
+        const { agent, push } = workflowPublishingPrerequisites(steps, index);
+        if (!agent || push) return draft;
+      }
       inserted = true;
       return {
         ...draft,
-        selectedStepId: stepId,
+        selectedStepId: repairOpenPrId ?? stepId,
         definition: {
           ...draft.definition,
-          steps: [
-            ...draft.definition.steps.slice(0, index),
-            step,
-            ...draft.definition.steps.slice(index),
-          ],
+          steps: [...steps.slice(0, index), step, ...steps.slice(index)],
         },
       };
     });
@@ -723,6 +741,7 @@ function WorkflowBuilderWorkspace({
   insert: (
     anchor: WorkflowInsertion,
     kind: WorkflowStep["kind"] | "open_pull_request",
+    repairOpenPrId?: string,
   ) => string | null;
   save: (turnOffOnly?: boolean) => Promise<void>;
   reload: () => Promise<void>;
@@ -761,10 +780,22 @@ function WorkflowBuilderWorkspace({
   const workspace = useRef<HTMLFormElement>(null);
   const settingsId = useId();
   const executionTargetControl = useRef<HTMLButtonElement>(null);
+  const saveControl = useRef<HTMLButtonElement>(null);
   const fields = useRef(new Map<string, HTMLElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
   const panelOpen = triggerOpen || settingsOpen || !!selected;
+  const publishingIssueInInspector =
+    issue?.publishing === true &&
+    !triggerOpen &&
+    !settingsOpen &&
+    selected?.kind === "action" &&
+    (issue.stepId === selected.id || !!vm);
+  const editorIssue = publishingIssueInInspector ? null : issue;
+  const editorError =
+    publishingIssueInInspector && !draft.operation && draft.error === issue?.message
+      ? null
+      : draft.error;
   const machine = draft.definition.target.kind === "machine" ? draft.definition.target : null;
   const automation = workflowDraftAutomation(draft);
   const offSave =
@@ -834,10 +865,18 @@ function WorkflowBuilderWorkspace({
       return false;
     }
     const key = request.stepId ? `${request.stepId}:${request.field}` : request.field;
-    const node = fields.current.get(key);
+    const focusableField = (key: string) => {
+      const node = fields.current.get(key);
+      return node?.isConnected && !node.matches(':disabled, [aria-disabled="true"]')
+        ? node
+        : undefined;
+    };
+    const node =
+      focusableField(key) ??
+      (request.field === "repair" ? focusableField(`${request.stepId}:repair-warning`) : undefined);
     focusRequest.current = null;
-    if (!node?.isConnected || node.matches(':disabled, [aria-disabled="true"]')) return false;
-    node.focus({ preventScroll: true });
+    if (!node) return false;
+    node.focus({ preventScroll: request.field !== "repair" && request.field !== "repair-warning" });
     if (
       request.selection &&
       (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)
@@ -943,6 +982,50 @@ function WorkflowBuilderWorkspace({
     select("");
     setSettingsOpen(true);
   };
+  const openMachineSettings = () => {
+    openSettings();
+    setFocusRequest({
+      field: showCheckout
+        ? "checkout"
+        : vmAuthoring && projects.length
+          ? "target:machine"
+          : projectsUnavailable
+            ? "refresh-checkouts"
+            : "close-settings",
+      stepId: null,
+    });
+  };
+  const focusIssue = (problem: NonNullable<typeof issue>) => {
+    setFocusRequest({
+      field: problem.publishing ? "repair" : problem.field,
+      stepId: problem.stepId,
+    });
+  };
+  const reviewIssueAction = editorIssue ? (
+    <Button
+      type="button"
+      size="sm"
+      variant="outline"
+      disabled={pending}
+      onClick={() => {
+        if (!editorIssue.stepId && editorIssue.field !== "name") openSettings();
+        else {
+          choose(editorIssue.stepId ?? "");
+          if (editorIssue.publishing) returnFocus.current = saveControl.current;
+        }
+        focusIssue(editorIssue);
+      }}
+    >
+      {editorIssue.publishing ? "Review publishing step" : "Review settings"}
+    </Button>
+  ) : null;
+  const insertPushBranch = () => {
+    if (selected?.kind !== "action" || selected.action !== "open_pull_request") return;
+    const preceding = draft.definition.steps[draft.definition.steps.indexOf(selected) - 1];
+    if (preceding && insert({ after: preceding }, "action", selected.id)) {
+      setFocusRequest({ field: "title", stepId: selected.id });
+    }
+  };
   const openTrigger = (opener?: HTMLElement | null) => {
     setFocusRequest(null);
     setSettingsOpen(false);
@@ -963,10 +1046,12 @@ function WorkflowBuilderWorkspace({
     }
     const problem = issue;
     if (problem) {
+      if (problem.publishing) returnFocus.current = submitter ?? saveControl.current;
       edit((current) => ({ ...current, error: problem.message }));
       setSettingsOpen(false);
+      setTriggerOpen(false);
       select(problem.stepId ?? "");
-      setFocusRequest({ field: problem.field, stepId: problem.stepId });
+      focusIssue(problem);
       return;
     }
     if (automationSupported && !workflowDraftAutomationResolved(draft)) {
@@ -1037,18 +1122,7 @@ function WorkflowBuilderWorkspace({
       unsaved={workflowEditorDirty(draft)}
       retrySave={draft.operation?.state === "uncertain"}
       onSave={() => void submit()}
-      onChooseMachine={() => {
-        openSettings();
-        setFocusRequest({
-          field:
-            vmAuthoring && projects.length
-              ? "target:machine"
-              : showCheckout
-                ? "checkout"
-                : "close-settings",
-          stepId: null,
-        });
-      }}
+      onChooseMachine={openMachineSettings}
       supported={automationSupported}
       vmTarget={!!vm && draft.targetConfirmed}
       vmAutomationAvailable={vmAutomationAvailable}
@@ -1264,7 +1338,13 @@ function WorkflowBuilderWorkspace({
               {!vmAuthoring ? (
                 <p className="text-xs text-warning-foreground">{machineDescription}</p>
               ) : null}
-              <Button type="button" variant="outline" size="sm" onClick={refreshProjects}>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                ref={(node) => registerField("refresh-checkouts", node)}
+                onClick={refreshProjects}
+              >
                 Retry loading checkouts
               </Button>
             </div>
@@ -1332,8 +1412,12 @@ function WorkflowBuilderWorkspace({
       selectedId={selected.id}
       models={models}
       vmModels={vmAuthoring?.models}
+      targetConfirmed={draft.targetConfirmed}
+      machineCheckoutAvailable={!!target}
       disabled={pending}
       close={close}
+      openWorkflowSettings={openMachineSettings}
+      insertPushBranch={insertPushBranch}
       registerField={(field, node) => registerField(`${selected.id}:${field}`, node)}
       select={(id) => {
         select(id);
@@ -1459,7 +1543,7 @@ function WorkflowBuilderWorkspace({
                     ? "Unsaved changes"
                     : "Saved"}
             </span>
-            <Button type="submit" disabled={pending}>
+            <Button type="submit" disabled={pending} ref={saveControl}>
               {draft.operation?.state === "uncertain" ? "Retry save" : "Save"}
             </Button>
           </div>
@@ -1467,10 +1551,10 @@ function WorkflowBuilderWorkspace({
       </div>
       {vmRunUnavailable ||
       codexNotice ||
-      draft.error ||
+      editorError ||
       draft.operation?.state === "uncertain" ||
       notice ||
-      issue ||
+      editorIssue ||
       models.issues.length ? (
         <div className={styles["workflow-editor-notices"]}>
           {vmRunUnavailable ? (
@@ -1507,17 +1591,22 @@ function WorkflowBuilderWorkspace({
               {codexNotice}
             </WorkflowAlert>
           ) : null}
-          {draft.error || draft.operation?.state === "uncertain" ? (
+          {editorError || draft.operation?.state === "uncertain" ? (
             <WorkflowAlert
               title={
                 draft.operation?.state === "uncertain"
                   ? "Save not confirmed"
-                  : issue?.message === draft.error
+                  : editorIssue?.message === editorError
                     ? "Check workflow settings"
                     : "Could not save workflow"
               }
               actions={
                 <>
+                  {!draft.operation &&
+                  editorIssue?.publishing &&
+                  editorIssue.message === editorError
+                    ? reviewIssueAction
+                    : null}
                   {!draft.operation ? (
                     <Button
                       type="button"
@@ -1552,7 +1641,7 @@ function WorkflowBuilderWorkspace({
                 </>
               }
             >
-              {draft.error ??
+              {editorError ??
                 "Save could not be confirmed. Check the saved version before retrying."}{" "}
               Your edits are kept.
             </WorkflowAlert>
@@ -1562,27 +1651,13 @@ function WorkflowBuilderWorkspace({
               {notice}
             </p>
           ) : null}
-          {issue && issue.message !== draft.error ? (
+          {editorIssue && editorIssue.message !== editorError ? (
             <WorkflowAlert
               title="Check workflow settings"
               variant="warning"
-              actions={
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={pending}
-                  onClick={() => {
-                    if (!issue.stepId && issue.field !== "name") openSettings();
-                    else choose(issue.stepId ?? "");
-                    setFocusRequest({ field: issue.field, stepId: issue.stepId });
-                  }}
-                >
-                  Review settings
-                </Button>
-              }
+              actions={reviewIssueAction}
             >
-              {issue.message}
+              {editorIssue.message}
             </WorkflowAlert>
           ) : null}
           {models.issues.length ? (

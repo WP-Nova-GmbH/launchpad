@@ -14,6 +14,7 @@ import {
   WorkflowAutomation as WorkflowAutomationSchema,
   WorkflowStep as WorkflowStepSchema,
   workflowDefinitionError,
+  workflowPublishingPrerequisites,
 } from "@t3tools/contracts/workflows";
 import * as Schema from "effect/Schema";
 import * as Exit from "effect/Exit";
@@ -496,6 +497,7 @@ export function workflowDraftIssue(definition: WorkflowDefinition) {
         "Publishing requires a Machine target. Remove Push branch and Open PR steps to use VM.",
       stepId: publishing.id,
       field: "title",
+      publishing: true,
     };
   if (Exit.isSuccess(decodeWorkflowDefinition(definition))) return null;
   if (!definition.name.trim())
@@ -518,17 +520,27 @@ export function workflowDraftIssue(definition: WorkflowDefinition) {
   }
   const structural = workflowDefinitionError(definition.steps);
   if (structural) {
-    const index = definition.steps.findIndex(
-      (step, index) =>
+    const step = definition.steps.find((step, index) => {
+      if (step.kind === "action") {
+        const { agent, push } = workflowPublishingPrerequisites(definition.steps, index);
+        return !agent || (step.action === "open_pull_request" && !push);
+      }
+      return (
         step.kind === "review" &&
         !definition.steps
           .slice(0, index)
           .some(
             (earlier) =>
               earlier.kind === "agent" && (!step.reworkStepId || earlier.id === step.reworkStepId),
-          ),
-    );
-    return { message: structural, stepId: definition.steps[index]?.id ?? null, field: "rework" };
+          )
+      );
+    });
+    return {
+      message: structural,
+      stepId: step?.id ?? null,
+      field: step?.kind === "action" ? "title" : "rework",
+      ...(step?.kind === "action" ? { publishing: true } : {}),
+    };
   }
   return {
     message: "Check the workflow name, execution target and the limit of 32 steps.",

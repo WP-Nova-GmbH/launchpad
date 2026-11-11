@@ -78,10 +78,12 @@ function Harness({
   initial = original,
   selection = "implement",
   vmModels = null,
+  machineCheckoutAvailable = true,
 }: {
   initial?: WorkflowDefinition;
   selection?: string;
   vmModels?: WorkflowVmModelCatalog | null;
+  machineCheckoutAvailable?: boolean;
 }) {
   const [steps, change] = useState<ReadonlyArray<WorkflowStep>>(initial.steps);
   const [selected, select] = useState(selection);
@@ -100,8 +102,12 @@ function Harness({
       move={change}
       models={models}
       vmModels={vmModels}
+      targetConfirmed
+      machineCheckoutAvailable={machineCheckoutAvailable}
       disabled={false}
       close={() => select("")}
+      openWorkflowSettings={() => {}}
+      insertPushBranch={() => {}}
       registerField={() => {}}
     />
   );
@@ -126,6 +132,87 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 describe("Workflow step editing", () => {
+  it("updates Open PR readiness when a Push branch follows its latest Agent", async () => {
+    await mount({
+      initial: {
+        ...original,
+        steps: [
+          original.steps[0]!,
+          { id: "push", kind: "action", title: "Push the release", action: "push" },
+          original.steps[1]!,
+          {
+            id: "open-pr",
+            kind: "action",
+            title: "Publish the changes",
+            action: "open_pull_request",
+          },
+        ],
+      },
+      selection: "open-pr",
+    });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Push branch step required");
+    expect(
+      renderer!.root.findAllByType("p").some((node) => node.props.children === "Open PR"),
+    ).toBe(true);
+
+    await click("Move up");
+
+    expect(selectedId).toBe("open-pr");
+    expect(definition.steps.map((step) => step.id)).toEqual([
+      "plan",
+      "push",
+      "open-pr",
+      "implement",
+    ]);
+    const updated = JSON.stringify(renderer!.toJSON());
+    expect(updated).toContain("Ready");
+    expect(updated).toContain("Push the release");
+    expect(updated).not.toContain("Push branch step required");
+  });
+
+  it("provides a checkout recovery before showing a renamed Push branch as ready", async () => {
+    const fixture = {
+      initial: {
+        ...original,
+        steps: [
+          original.steps[0]!,
+          { id: "push", kind: "action", title: "Publish the release", action: "push" },
+        ],
+      },
+      selection: "push",
+    } satisfies Parameters<typeof Harness>[0];
+    await mount({ ...fixture, machineCheckoutAvailable: false });
+    expect(
+      renderer!.root.findAllByType("p").some((node) => node.props.children === "Push branch"),
+    ).toBe(true);
+    const warning = renderer!.root.findByProps({
+      role: "group",
+      "aria-label": "Machine checkout unavailable",
+    });
+    expect(warning.props.tabIndex).toBe(-1);
+    const descriptionId = warning.props["aria-describedby"];
+    expect(warning.findByProps({ id: descriptionId }).props.children).toBe(
+      "Choose an available Machine checkout to publish.",
+    );
+    expect(
+      warning
+        .findAllByType("button")
+        .some(
+          (button) =>
+            !button.props.disabled &&
+            button.props["aria-describedby"] === descriptionId &&
+            button.children.includes("Open workflow settings"),
+        ),
+    ).toBe(true);
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain("Ready");
+
+    await act(() => renderer!.update(<Harness {...fixture} machineCheckoutAvailable />));
+
+    expect(selectedId).toBe("push");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Ready");
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain("Machine checkout unavailable");
+  });
+
   it("keeps an unavailable VM model visible and allows returning to the managed default", async () => {
     const current = original.steps[1]!;
     if (current.kind !== "agent") throw new Error("Expected the Agent step fixture.");

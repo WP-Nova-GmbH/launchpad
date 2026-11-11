@@ -536,6 +536,29 @@ describe("whole workflow validation and presentation", () => {
       }),
     ).toMatchObject({ stepId: "agent", field: "title" });
   });
+  it("points Save validation to Open PR when the latest Agent has no Push branch", () => {
+    const agent = definition.steps[0]!;
+    const push = { id: "push", kind: "action", title: "Push branch", action: "push" } as const;
+    const laterAgent = { ...agent, id: "later-agent" };
+    const openPr = {
+      id: "open-pr",
+      kind: "action",
+      title: "Open PR",
+      action: "open_pull_request",
+    } as const;
+    expect(workflowDraftIssue({ ...definition, steps: [agent, push, laterAgent, openPr] })).toEqual(
+      {
+        message: "Open PR needs a Push branch step after the latest Agent.",
+        stepId: openPr.id,
+        field: "title",
+        publishing: true,
+      },
+    );
+    expect(
+      workflowDraftIssue({ ...definition, steps: [agent, laterAgent, push, openPr] }),
+    ).toBeNull();
+  });
+
   it("enforces the schema limit and leaves an invalid rework target visible", () => {
     expect(
       workflowDraftIssue({

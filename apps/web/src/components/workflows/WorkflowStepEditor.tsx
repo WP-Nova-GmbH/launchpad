@@ -1,5 +1,6 @@
 import { useId, useRef } from "react";
 import { WorkflowAlert } from "./WorkflowAlert";
+import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { useEnvironment } from "../../state/environments";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useProject } from "../../state/entities";
@@ -7,15 +8,20 @@ import styles from "./workflowEditor.module.css";
 import {
   UploadIcon,
   BotIcon,
+  CircleCheckIcon,
   EllipsisIcon,
   MessageSquareIcon,
+  PlusIcon,
+  Settings2Icon,
   UserRoundCheckIcon,
   XIcon,
 } from "lucide-react";
-import type {
-  WorkflowStep,
-  WorkflowDefinition,
-  WorkflowVmModelCatalog,
+import {
+  WORKFLOW_MAX_STEPS,
+  workflowPublishingPrerequisites,
+  type WorkflowStep,
+  type WorkflowDefinition,
+  type WorkflowVmModelCatalog,
 } from "@t3tools/contracts/workflows";
 import {
   workflowModelState,
@@ -28,6 +34,135 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 
+function PublishingStepSettings({
+  definition,
+  index,
+  step,
+  targetConfirmed,
+  machineCheckoutAvailable,
+  openWorkflowSettings,
+  insertPushBranch,
+  registerField,
+}: {
+  definition: WorkflowDefinition;
+  index: number;
+  step: Extract<WorkflowStep, { kind: "action" }>;
+  targetConfirmed: boolean;
+  machineCheckoutAvailable: boolean;
+  openWorkflowSettings: () => void;
+  insertPushBranch: () => void;
+  registerField: (field: string, node: HTMLElement | null) => void;
+}) {
+  const descriptionId = useId();
+  const warning = (
+    title: string,
+    description: string,
+    repair?: {
+      label: string;
+      icon: typeof Settings2Icon;
+      onClick: () => void;
+      disabled?: boolean;
+    },
+  ) => {
+    const RepairIcon = repair?.icon;
+    return (
+      <div
+        role="group"
+        aria-label={title}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        className="rounded-lg focus-visible:outline-2 focus-visible:outline-ring"
+        ref={(node) => registerField("repair-warning", node)}
+      >
+        <WorkflowAlert
+          title={title}
+          variant="warning"
+          actions={
+            repair && RepairIcon ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                aria-describedby={descriptionId}
+                disabled={repair.disabled}
+                ref={repair.disabled ? undefined : (node) => registerField("repair", node)}
+                onClick={repair.onClick}
+              >
+                <RepairIcon aria-hidden />
+                {repair.label}
+              </Button>
+            ) : undefined
+          }
+        >
+          <span id={descriptionId}>{description}</span>
+        </WorkflowAlert>
+      </div>
+    );
+  };
+
+  const vm = definition.target.kind === "vm";
+  if (vm || !targetConfirmed || !machineCheckoutAvailable) {
+    const checkoutUnavailable = !vm && targetConfirmed;
+    return warning(
+      checkoutUnavailable ? "Machine checkout unavailable" : "Machine target required",
+      vm
+        ? "This workflow uses a VM. Choose a Machine checkout to publish."
+        : checkoutUnavailable
+          ? "Choose an available Machine checkout to publish."
+          : "Choose a Machine checkout to publish.",
+      {
+        label: "Open workflow settings",
+        icon: Settings2Icon,
+        onClick: openWorkflowSettings,
+      },
+    );
+  }
+
+  const { agent, push } = workflowPublishingPrerequisites(definition.steps, index);
+  if (!agent)
+    return warning("Agent step required", "Add or move an Agent step before this publishing step.");
+
+  const opensPullRequest = step.action === "open_pull_request";
+  if (opensPullRequest && !push) {
+    const atLimit = definition.steps.length >= WORKFLOW_MAX_STEPS;
+    return warning(
+      "Push branch step required",
+      atLimit
+        ? "Remove a step to make room for Push branch, then add it before Open PR."
+        : "Add Push branch after the latest Agent step and before Open PR.",
+      { label: "Add Push branch", icon: PlusIcon, onClick: insertPushBranch, disabled: atLimit },
+    );
+  }
+
+  return (
+    <div className="space-y-2 text-sm">
+      <p className="flex items-center gap-2 font-medium text-success-foreground">
+        <CircleCheckIcon size={15} aria-hidden />
+        Ready
+      </p>
+      <p className="text-muted-foreground">
+        {opensPullRequest
+          ? "Opens or reuses a pull request for the run branch."
+          : "Commits the saved result and pushes the run branch."}
+      </p>
+      <dl className="space-y-2 border-t border-border pt-3">
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="shrink-0 text-xs text-muted-foreground">Execution target</dt>
+          <dd>Machine</dd>
+        </div>
+        <div className="flex items-baseline justify-between gap-3">
+          <dt className="shrink-0 text-xs text-muted-foreground">
+            {opensPullRequest ? "Publishes after" : "Saved result"}
+          </dt>
+          <dd className="min-w-0 text-right wrap-anywhere">
+            {opensPullRequest ? push?.title : agent.title}
+          </dd>
+        </div>
+      </dl>
+    </div>
+  );
+}
+
 export function WorkflowStepEditor({
   definition,
   selectedId,
@@ -36,8 +171,12 @@ export function WorkflowStepEditor({
   move: moveSteps,
   models,
   vmModels,
+  targetConfirmed,
+  machineCheckoutAvailable,
   disabled,
   close,
+  openWorkflowSettings,
+  insertPushBranch,
   registerField,
 }: {
   definition: WorkflowDefinition;
@@ -47,8 +186,12 @@ export function WorkflowStepEditor({
   move: (steps: ReadonlyArray<WorkflowStep>) => void;
   models: ReturnType<typeof workflowModelState>;
   vmModels?: WorkflowVmModelCatalog | null | undefined;
+  targetConfirmed: boolean;
+  machineCheckoutAvailable: boolean;
   disabled: boolean;
   close: () => void;
+  openWorkflowSettings: () => void;
+  insertPushBranch: () => void;
   registerField: (field: string, node: HTMLElement | null) => void;
 }) {
   const id = useId();
@@ -56,6 +199,8 @@ export function WorkflowStepEditor({
   const { entries, modelOptions } = models;
   const index = definition.steps.findIndex((step) => step.id === selectedId);
   const step = definition.steps[index];
+  const operationLabel =
+    step?.kind === "action" ? (step.action === "push" ? "Push branch" : "Open PR") : null;
   const patch = (update: WorkflowStep) => {
     if (disabled) return;
     change(definition.steps.map((entry) => (entry.id === update.id ? update : entry)));
@@ -90,7 +235,11 @@ export function WorkflowStepEditor({
           <header className={styles["workflow-inspector-header"]}>
             <span className={styles["workflow-node-icon"]} data-kind={step.kind}>
               {step.kind === "action" ? (
-                <UploadIcon />
+                step.action === "push" ? (
+                  <UploadIcon aria-hidden />
+                ) : (
+                  <PullRequestGlyph.pullRequest aria-hidden />
+                )
               ) : step.kind === "agent" ? (
                 <BotIcon />
               ) : step.kind === "input" ? (
@@ -116,10 +265,10 @@ export function WorkflowStepEditor({
                   ? "Agent"
                   : step.kind === "input"
                     ? "Human input"
-                    : step.kind === "action"
-                      ? step.action === "push"
-                        ? "Push branch"
-                        : "Open PR"
+                    : operationLabel
+                      ? step.title === operationLabel
+                        ? "Publishing"
+                        : operationLabel
                       : "Review"}
               </p>
             </div>
@@ -313,11 +462,16 @@ export function WorkflowStepEditor({
                 ) : null}
               </div>
             ) : step.kind === "action" ? (
-              <p className="text-sm text-muted-foreground">
-                {step.action === "push"
-                  ? "Commits the saved result and pushes the job branch. Retries reuse the prepared commit."
-                  : "Opens or reuses this job's pull request."}
-              </p>
+              <PublishingStepSettings
+                definition={definition}
+                index={index}
+                step={step}
+                targetConfirmed={targetConfirmed}
+                machineCheckoutAvailable={machineCheckoutAvailable}
+                openWorkflowSettings={openWorkflowSettings}
+                insertPushBranch={insertPushBranch}
+                registerField={registerField}
+              />
             ) : (
               <div className="space-y-1">
                 <p id={`${id}-role`} className="text-sm">

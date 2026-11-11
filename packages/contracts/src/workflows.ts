@@ -9,6 +9,7 @@ const Instruction = TrimmedNonEmptyString.check(Schema.isMaxLength(32_000));
 const Revision = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 
 export const WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT = 500;
+export const WORKFLOW_MAX_STEPS = 32;
 export const WORKFLOW_VM_DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
 export const WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT = "high";
 
@@ -48,6 +49,20 @@ export const WorkflowStep = Schema.Union([
 ]);
 export type WorkflowStep = typeof WorkflowStep.Type;
 
+export function workflowPublishingPrerequisites(steps: ReadonlyArray<WorkflowStep>, index: number) {
+  const preceding = steps.slice(0, index);
+  const agentIndex = preceding.findLastIndex((step) => step.kind === "agent");
+  return {
+    agent: preceding[agentIndex],
+    push:
+      agentIndex < 0
+        ? undefined
+        : preceding
+            .slice(agentIndex + 1)
+            .findLast((step) => step.kind === "action" && step.action === "push"),
+  };
+}
+
 /** Sequential workflows use stable IDs; reviews can send work to an earlier Agent. */
 export function workflowDefinitionError(steps: ReadonlyArray<WorkflowStep>): string | null {
   if (!steps.some((step) => step.kind === "agent")) return "A workflow needs an Agent step.";
@@ -56,15 +71,9 @@ export function workflowDefinitionError(steps: ReadonlyArray<WorkflowStep>): str
     if (ids.has(step.id)) return "Each workflow step needs a unique ID.";
     ids.add(step.id);
     if (step.kind === "action") {
-      const earlier = steps.slice(0, index);
-      const lastAgent = earlier.findLastIndex((entry) => entry.kind === "agent");
-      if (lastAgent < 0) return "Publishing must follow an Agent step.";
-      if (
-        step.action === "open_pull_request" &&
-        !earlier
-          .slice(lastAgent + 1)
-          .some((entry) => entry.kind === "action" && entry.action === "push")
-      )
+      const { agent, push } = workflowPublishingPrerequisites(steps, index);
+      if (!agent) return "Publishing must follow an Agent step.";
+      if (step.action === "open_pull_request" && !push)
         return "Open PR needs a Push branch step after the latest Agent.";
     }
     if (step.kind !== "review") continue;
@@ -170,7 +179,10 @@ export type WorkflowResultSaving = typeof WorkflowResultSaving.Type;
 export const WorkflowDefinition = Schema.Struct({
   name: Label,
   target: WorkflowTarget,
-  steps: Schema.Array(WorkflowStep).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+  steps: Schema.Array(WorkflowStep).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(WORKFLOW_MAX_STEPS),
+  ),
 }).check(Schema.makeFilter((definition) => workflowDefinitionError(definition.steps) ?? true));
 export type WorkflowDefinition = typeof WorkflowDefinition.Type;
 

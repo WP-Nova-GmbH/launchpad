@@ -11,6 +11,7 @@ import {
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import { WORKFLOW_MAX_STEPS, workflowPublishingPrerequisites } from "@t3tools/contracts/workflows";
 import {
   RelayMachineId,
   RelayRepositoryId,
@@ -97,6 +98,32 @@ vi.mock("./WorkflowStepEditor", () => ({
   WorkflowStepEditor: (props: StepProps) => {
     const step = props.definition.steps.find((entry) => entry.id === props.selectedId)!;
     const field = step.kind === "agent" ? "instruction" : "question";
+    const { agent, push } = workflowPublishingPrerequisites(
+      props.definition.steps,
+      props.definition.steps.indexOf(step),
+    );
+    const needsMachine =
+      props.definition.target.kind === "vm" ||
+      !props.targetConfirmed ||
+      !props.machineCheckoutAvailable;
+    const needsPush =
+      step.kind === "action" && step.action === "open_pull_request" && agent && !push;
+    const blocked = step.kind === "action" && (needsMachine || !agent || needsPush);
+    const repair =
+      blocked && (needsMachine || needsPush)
+        ? createElement(
+            "button",
+            {
+              "data-focus-key": `${step.id}:repair`,
+              disabled:
+                props.disabled ||
+                (!needsMachine && props.definition.steps.length >= WORKFLOW_MAX_STEPS),
+              ref: (node: HTMLElement | null) => props.registerField("repair", node),
+              onClick: needsMachine ? props.openWorkflowSettings : props.insertPushBranch,
+            },
+            needsMachine ? "Open workflow settings" : "Add Push branch",
+          )
+        : null;
     return createElement(
       "div",
       null,
@@ -120,6 +147,17 @@ vi.mock("./WorkflowStepEditor", () => ({
                 ),
               ),
           }),
+      blocked
+        ? createElement(
+            "div",
+            {
+              tabIndex: -1,
+              "data-focus-key": `${step.id}:repair-warning`,
+              ref: (node: HTMLElement | null) => props.registerField("repair-warning", node),
+            },
+            repair,
+          )
+        : null,
       createElement("button", { "aria-label": "Close settings", onClick: props.close }),
       createElement("button", {
         "aria-label": "Remove only step",
@@ -217,6 +255,12 @@ const project: RelayOrganizationProject = {
   updatedAt: "now",
   catalogUpdatedAt: "now",
 };
+const openPrStep = {
+  id: "open-pr",
+  kind: "action",
+  title: "Open PR",
+  action: "open_pull_request",
+} as const;
 let renderer: ReactTestRenderer | undefined;
 const id = () =>
   appAtomRegistry.get(workflowDraftAtom).newWorkflowIds[workflowSessionKey(scope, "new")]!;
@@ -224,6 +268,10 @@ const draft = () =>
   appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, id())]!;
 const canvas = () => renderer!.root.findByProps({ "data-testid": "canvas" });
 const field = (key: string) => nodes.get(key)! as TextField;
+const reviewPublishingStep = () =>
+  renderer!.root
+    .findAllByType("button")
+    .find((button) => button.children.includes("Review publishing step"))!;
 async function mount(
   vm = false,
   {
@@ -424,6 +472,140 @@ describe("Inspector presentation focus", () => {
 
       expect(draft().triggerSetup).toBe(false);
       expect(focusDocument.activeElement).toBe(triggerButton);
+    },
+  );
+
+  it("repairs a stale Push branch immediately before Open PR and keeps its inspector focused", async () => {
+    await mount();
+    await act(() =>
+      editWorkflowDraft(scope, id(), (current) => {
+        const agent = current.definition.steps[0]!;
+        return {
+          ...current,
+          definition: {
+            ...current.definition,
+            steps: [
+              agent,
+              { id: "early-push", kind: "action", title: "Push branch", action: "push" },
+              { ...agent, id: "later-agent", title: "Finish change" },
+              openPrStep,
+            ],
+          },
+        };
+      }),
+    );
+
+    expect(renderer!.root.findAllByProps({ title: "Check workflow settings" })).toHaveLength(1);
+    await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+    expect(draft().error).toContain("Push branch");
+    expect(draft().selectedStepId).toBe(openPrStep.id);
+    expect(renderer!.root.findAllByProps({ title: "Check workflow settings" })).toHaveLength(0);
+    expect(focusDocument.activeElement).toBe(field("open-pr:repair"));
+
+    await act(() => renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick());
+    expect(draft().selectedStepId).toBe("");
+    expect(focusDocument.activeElement).toBe(field("save"));
+    await act(() => reviewPublishingStep().props.onClick());
+    expect(draft().selectedStepId).toBe(openPrStep.id);
+    expect(focusDocument.activeElement).toBe(field("open-pr:repair"));
+
+    await act(() => renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick());
+    expect(focusDocument.activeElement).toBe(field("save"));
+    await act(() => reviewPublishingStep().props.onClick());
+
+    const repair = renderer!.root.findByProps({ "data-focus-key": "open-pr:repair" });
+    await act(() => repair.props.onClick());
+
+    const steps = draft().definition.steps;
+    expect(steps.slice(0, 3).map((step) => step.id)).toEqual([
+      "agent",
+      "early-push",
+      "later-agent",
+    ]);
+    expect(steps.slice(3)).toEqual([
+      expect.objectContaining({ kind: "action", action: "push", title: "Push branch" }),
+      openPrStep,
+    ]);
+    expect(draft().error).toBeNull();
+    expect(draft().selectedStepId).toBe(openPrStep.id);
+    expect(focusDocument.activeElement).toBe(field("open-pr:title"));
+  });
+
+  it.each(["step limit", "no earlier Agent"] as const)(
+    "focuses the publishing warning when recovery is unavailable at %s",
+    async (blocker) => {
+      await mount();
+      await act(() =>
+        editWorkflowDraft(scope, id(), (current) => {
+          const agent = current.definition.steps[0]!;
+          const steps =
+            blocker === "step limit"
+              ? [
+                  ...Array.from({ length: WORKFLOW_MAX_STEPS - 1 }, (_, index) => ({
+                    ...agent,
+                    id: `agent-${index}`,
+                  })),
+                  openPrStep,
+                ]
+              : [openPrStep, agent];
+          return { ...current, definition: { ...current.definition, steps } };
+        }),
+      );
+
+      await act(() => reviewPublishingStep().props.onClick());
+      expect(focusDocument.activeElement).toBe(field("open-pr:repair-warning"));
+      if (blocker === "step limit") expect(field("open-pr:repair").disabled).toBe(true);
+      else expect(nodes.has("open-pr:repair")).toBe(false);
+
+      await act(() =>
+        renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick(),
+      );
+      await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+      expect(draft().selectedStepId).toBe(openPrStep.id);
+      expect(focusDocument.activeElement).toBe(field("open-pr:repair-warning"));
+    },
+  );
+
+  it.each([
+    ["VM", { kind: "vm", baseBranch: null }, "target:machine"],
+    [
+      "unavailable Machine",
+      {
+        kind: "machine",
+        environmentId: EnvironmentId.make("missing-environment"),
+        projectId: ProjectId.make("missing-project"),
+      },
+      "checkout",
+    ],
+  ] as const)(
+    "focuses the target recovery control in Workflow settings for %s",
+    async (_label, target, recoveryField) => {
+      await mount(true, { projects: [project] });
+      await act(() =>
+        editWorkflowDraft(scope, id(), (current) => ({
+          ...current,
+          targetConfirmed: true,
+          definition: {
+            ...current.definition,
+            target,
+            steps: [
+              ...current.definition.steps,
+              { id: "push", kind: "action", title: "Push branch", action: "push" },
+              openPrStep,
+            ],
+          },
+        })),
+      );
+      await act(() => canvas().props.onSelect(openPrStep.id));
+
+      await act(() =>
+        renderer!.root.findByProps({ "data-focus-key": "open-pr:repair" }).props.onClick(),
+      );
+
+      expect(draft().selectedStepId).toBe("");
+      expect(draft().definition.target).toEqual(target);
+      expect(draft().definition.steps.at(-1)).toEqual(openPrStep);
+      expect(focusDocument.activeElement).toBe(field(recoveryField));
     },
   );
 
