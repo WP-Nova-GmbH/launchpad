@@ -20,6 +20,7 @@ import {
 const decodeAutomation = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const fixture = vi.hoisted(() => ({
   account: "owner",
+  navigate: vi.fn(),
   getToken: vi.fn(async () => "fixture-token"),
   fetch: vi.fn<typeof fetch>(),
   deliveries: [] as Array<Promise<void>>,
@@ -48,6 +49,7 @@ const fixture = vi.hoisted(() => ({
 vi.mock("@clerk/react", () => ({
   useAuth: () => ({ userId: fixture.account, isLoaded: true, getToken: fixture.getToken }),
 }));
+vi.mock("@tanstack/react-router", () => ({ useNavigate: () => fixture.navigate }));
 vi.mock("../../cloud/publicConfig", () => ({ resolveRelayClerkTokenOptions: () => ({}) }));
 vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: () => Promise.resolve(true) }));
 vi.mock("../ui/button", () => ({
@@ -205,7 +207,8 @@ const { WorkflowSourceHealth } = await vi.importActual<{
   WorkflowSourceHealth: ComponentType<{ repositoryId: RelayRepositoryId; focused: boolean }>;
 }>("../../../../mobile/src/features/settings/WorkflowSourceHealth");
 import { WorkflowSourcesSettings } from "./WorkflowSources";
-import { RepositorySources } from "../workflows/WorkflowSources";
+import { RepositorySources, RepositorySourcesButton } from "../workflows/WorkflowSources";
+import { OwnerSources } from "../workflows/WorkflowOwnerSources";
 const source: WorkflowSource = {
   connectionId: "connection",
   organizationId: "org",
@@ -221,7 +224,18 @@ const source: WorkflowSource = {
 let renderer: ReactTestRenderer;
 const words = () => JSON.stringify(renderer.toJSON());
 const button = (text: string) =>
-  renderer.root.findAllByType("button").find((b) => b.children.join("") === text)!;
+  renderer.root.findAllByType("button").find(
+    (b) =>
+      b.props["aria-label"] === text ||
+      b.children
+        .filter((child) => typeof child === "string")
+        .join("")
+        .trim() === text,
+  )!;
+const checkConnectionInDisclosure = () =>
+  renderer.root
+    .findAllByType("details")
+    .some((disclosure) => disclosure.findAllByType("button").includes(button("Check connection")));
 const drain = async () => {
   do {
     await act(async () => {
@@ -500,7 +514,8 @@ it.effect("shows service recovery for a granted organization connection", () =>
       await mount();
       expect(words()).toContain("Engineering workspace");
       expect(words()).toContain("Service configuration needs attention");
-      expect(button("Retry connection")).toBeDefined();
+      expect(button("Check connection").props.disabled).toBe(false);
+      expect(checkConnectionInDisclosure()).toBe(false);
       expect(button("Allow repository")).toBeUndefined();
     });
   }),
@@ -515,13 +530,13 @@ it.effect("disables repository credential retry while exchange is in progress", 
       fixture.repo = { ...fixture.repo, exchangeInProgress: true };
       await click("Refresh sources");
 
-      expect(button("Retry connection").props.disabled).toBe(true);
+      expect(button("Check connection").props.disabled).toBe(true);
       expect(button("Withdraw access").props.disabled).toBe(false);
       expect(button("Refresh sources").props.disabled).toBe(false);
 
       fixture.repo = { ...fixture.repo, exchangeInProgress: false };
       await click("Refresh sources");
-      expect(button("Retry connection").props.disabled).toBe(false);
+      expect(button("Check connection").props.disabled).toBe(false);
     });
   }),
 );
@@ -582,6 +597,156 @@ const click = async (label: string) => {
   });
   await drain();
 };
+it.effect("keeps repository access visible and routes admins to reconnect Linear", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.repo = {
+        ...fixture.repo,
+        canAllow: false,
+        eligible: [],
+        sources: [
+          {
+            source: { ...source, status: "reconnect_required" },
+            grant: {
+              grantId: "grant",
+              connectionId: "connection",
+              repositoryId: "repo",
+              organizationId: "org",
+              generation: 1,
+              revoked: false,
+            },
+          },
+        ],
+      };
+      await act(async () => {
+        renderer = create(
+          <RepositorySourcesButton repositoryId="repo" repositoryName="launchpad" />,
+        );
+      });
+      await click("Workflow sources");
+      expect(words()).toContain("Allowed");
+      expect(words()).toContain("Reconnect required");
+      expect(words()).toContain("Ask an organization admin to reconnect Linear.");
+      expect(button("Reconnect Linear")).toBeUndefined();
+
+      fixture.repo = { ...fixture.repo, canAllow: true };
+      await click("Refresh sources");
+      await click("Reconnect Linear");
+      expect(fixture.navigate).toHaveBeenCalledWith({
+        to: "/settings/organization",
+        hash: "workflow-sources",
+      });
+      expect(words()).not.toContain("Reconnect required");
+    });
+  }),
+);
+
+it.effect("reconnects from the editor source sheet and refreshes access on return", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      const unavailable = { ...source, health: { code: "unavailable" as const, retryAt: null } };
+      const disconnected = { ...source, status: "reconnect_required" as const };
+      fixture.repo = {
+        ...fixture.repo,
+        eligible: [],
+        sources: [
+          {
+            source: unavailable,
+            grant: {
+              grantId: "grant",
+              connectionId: source.connectionId,
+              repositoryId: "repo",
+              organizationId: "org",
+              generation: 1,
+              revoked: false,
+            },
+          },
+        ],
+      };
+      await act(async () => {
+        renderer = create(
+          <RepositorySourcesButton
+            repositoryId="repo"
+            repositoryName="launchpad"
+            connectionSettings={
+              <OwnerSources accountId="owner" organizationId={RelayOrganizationId.make("org")} />
+            }
+          />,
+        );
+      });
+
+      await click("Workflow sources");
+      fixture.fetch.mockImplementationOnce(async (input, init) => {
+        const request = new Request(input, init);
+        expect(request.method).toBe("POST");
+        expect(new URL(request.url).pathname).toBe(
+          "/v1/repositories/repo/workflow-sources/refresh",
+        );
+        expect(await request.json()).toEqual({ grantId: "grant" });
+        fixture.repo = {
+          ...fixture.repo,
+          sources: fixture.repo.sources.map((entry) => ({ ...entry, source: disconnected })),
+        };
+        fixture.owner = { ...fixture.owner, connections: [disconnected] };
+        return Response.json(
+          { _tag: "WorkflowSourceError", code: "reconnect_required", message: "Reconnect Linear." },
+          { status: 400 },
+        );
+      });
+      await click("Check connection");
+      expect(words()).toContain("Reconnect required");
+      expect(button("Reconnect Linear").props.disabled).toBe(false);
+      await click("Reconnect Linear");
+      expect(button("Back to repository access")).toBeDefined();
+      await click("Reconnect Linear");
+      expect(fixture.begins.map((request) => request.connectionId)).toEqual([source.connectionId]);
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      fixture.repo = {
+        ...fixture.repo,
+        sources: fixture.repo.sources.map((entry) => ({ ...entry, source })),
+      };
+      await click("Back to repository access");
+      expect(words()).toContain("Allowed");
+      expect(words()).toContain("Connected");
+      expect(button("Reconnect Linear")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect("lets admins check an unavailable connection directly in Organization settings", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [{ ...source, health: { code: "unavailable", retryAt: null } }],
+      };
+      await mountOwner();
+      expect(words()).toContain("Linear unavailable");
+      expect(button("Check connection").props.disabled).toBe(false);
+      expect(checkConnectionInDisclosure()).toBe(false);
+
+      fixture.fetch.mockImplementationOnce(async (input, init) => {
+        const request = new Request(input, init);
+        expect(request.method).toBe("POST");
+        expect(new URL(request.url).pathname).toBe(
+          "/v1/organizations/org/workflow-sources/refresh",
+        );
+        expect(await request.json()).toEqual({ connectionId: source.connectionId });
+        fixture.owner = { ...fixture.owner, connections: [source] };
+        return Response.json(fixture.owner);
+      });
+      await click("Check connection");
+      expect(words()).toContain("Connected");
+      expect(words()).not.toContain("Linear unavailable");
+      expect(checkConnectionInDisclosure()).toBe(true);
+    });
+  }),
+);
+
 const pendingB = () => {
   fixture.owner = {
     ...fixture.owner,
@@ -782,8 +947,8 @@ it.effect("keeps the selected repository while a cancelled exchange is still in 
       };
       await refreshOwner();
       expect(button("Allow repository").props.disabled).toBe(true);
-      expect(button("Reconnect").props.disabled).toBe(true);
-      expect(button("Retry connection").props.disabled).toBe(true);
+      expect(button("Reconnect Linear").props.disabled).toBe(true);
+      expect(button("Check connection").props.disabled).toBe(true);
       expect(button("Disconnect").props.disabled).toBe(false);
       await click("Cancel authorization");
       expect(words()).toContain("Finishing Linear authorization");
@@ -1179,9 +1344,17 @@ it.effect("refreshes repository access when returning from Linear setup", () =>
       });
       await drain();
       await click("Connect Linear");
-      fixture.repo = { ...fixture.repo, eligible: [{ source, previousGrantId: null }] };
+      const unavailable = { ...source, health: { code: "unavailable" as const, retryAt: null } };
+      fixture.owner = { ...fixture.owner, connections: [unavailable] };
+      fixture.repo = {
+        ...fixture.repo,
+        eligible: [{ source: unavailable, previousGrantId: null }],
+      };
       await click("Continue to repository access");
       expect(button("Allow repository").props.disabled).toBe(false);
+      await click("Manage Linear connection");
+      expect(button("Check connection").props.disabled).toBe(false);
+      expect(fixture.allowCount).toBe(0);
     });
   }),
 );

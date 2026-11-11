@@ -790,8 +790,13 @@ export function WorkflowTriggerInspector({
               </>
             ) : connectionSheet === "access" ? (
               <>
-                <RepositorySourcesPanel repositoryId={scope.repositoryId} state={sources} />
-                {canAllow ? (
+                <RepositorySourcesPanel
+                  repositoryId={scope.repositoryId}
+                  state={sources}
+                  onManageConnection={() => openConnections("connect")}
+                />
+                {canAllow &&
+                sources.snapshot?.sources.some(({ source }) => source.status === "connected") ? (
                   <Button
                     type="button"
                     variant="ghost"

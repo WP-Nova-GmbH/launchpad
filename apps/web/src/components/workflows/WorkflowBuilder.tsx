@@ -4,11 +4,12 @@ import { WorkflowAutomation } from "@t3tools/contracts/workflows";
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
 import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import { RepositorySourcesButton } from "./WorkflowSources";
+import { OwnerSources } from "./WorkflowOwnerSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import styles from "./workflowEditor.module.css";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
+import { RelayOrganizationId, type RelayOrganizationProject } from "@t3tools/contracts/relay";
 import type {
   RepositoryWorkflow,
   WorkflowCatalog,
@@ -75,6 +76,7 @@ const isWorkflowAutomation = Schema.is(WorkflowAutomation);
 
 type WorkflowBuilderProps = {
   scope: WorkflowScope;
+  repositoryName: string;
   workflow: RepositoryWorkflow | undefined;
   workflowId?: string | undefined;
   isNew: boolean;
@@ -119,6 +121,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
 
 function WorkflowBuilderEditor({
   scope,
+  repositoryName,
   workflow,
   isNew,
   projects,
@@ -620,6 +623,7 @@ function WorkflowBuilderEditor({
     ((archived || vmRunUnavailable) && runDraft?.operation?.state === "uncertain");
   return (
     <WorkflowBuilderWorkspace
+      repositoryName={repositoryName}
       automationSupported={automationSupported}
       automationReason={automationReason}
       onDepart={onDepart}
@@ -664,6 +668,7 @@ type WorkflowFieldFocus = {
 };
 
 function WorkflowBuilderWorkspace({
+  repositoryName,
   draft,
   automationSupported,
   automationReason,
@@ -693,6 +698,7 @@ function WorkflowBuilderWorkspace({
   archive,
   scope,
 }: {
+  repositoryName: string;
   draft: WorkflowEditorDraft;
   automationSupported: boolean;
   automationReason?: string | null | undefined;
@@ -1290,7 +1296,16 @@ function WorkflowBuilderWorkspace({
         </section>
         <section className={styles["workflow-settings-row"]} aria-label="Repository">
           <h3 className="text-sm font-medium">Repository</h3>
-          <RepositorySourcesButton repositoryId={scope.repositoryId} />
+          <RepositorySourcesButton
+            repositoryId={scope.repositoryId}
+            repositoryName={repositoryName}
+            connectionSettings={
+              <OwnerSources
+                accountId={scope.accountId}
+                organizationId={RelayOrganizationId.make(scope.organizationId)}
+              />
+            }
+          />
         </section>
         <footer className={styles["workflow-settings-row"]}>
           <Button type="button" variant="ghost" size="sm" onClick={() => void discard()}>

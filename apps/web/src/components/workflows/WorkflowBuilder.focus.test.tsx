@@ -236,6 +236,7 @@ async function mount(
       <AppAtomRegistryProvider>
         <WorkflowBuilder
           scope={scope}
+          repositoryName="Repository"
           projects={projects}
           vmAuthoring={vm ? { models: null } : undefined}
           automationSupported={automationSupported}

@@ -565,7 +565,12 @@ function RepositoryRow({
           </div>
         ) : null}
         <div className="flex flex-wrap gap-2 border-t pt-3">
-          {canConfigure ? <RepositorySourcesButton repositoryId={repositoryId} /> : null}
+          {canConfigure ? (
+            <RepositorySourcesButton
+              repositoryId={repositoryId}
+              repositoryName={entry.repository.name}
+            />
+          ) : null}
           {canConfigure && state.snapshot ? (
             <WorkflowEnvironmentButton
               accountId={state.snapshot.membership.userId}

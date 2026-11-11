@@ -13,7 +13,7 @@ import { useWorkflowSources } from "../../cloud/workflowSources";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
-import { SourceIdentity, confirmChange } from "./WorkflowSources";
+import { SourceFacts, SourceIdentity, confirmChange } from "./WorkflowSources";
 export function OwnerSources({
   accountId,
   organizationId,
@@ -62,7 +62,7 @@ export function OwnerSources({
   return (
     <section aria-label="Linear for workflows">
       <header className="flex items-center justify-between gap-2 px-4">
-        <h3 className="text-sm font-medium">Linear for workflows</h3>
+        <h3 className="text-sm font-medium">Linear connection</h3>
         <Button
           variant="ghost"
           size="icon-sm"
@@ -74,9 +74,6 @@ export function OwnerSources({
         </Button>
       </header>
       <div className="space-y-4 px-4 py-3">
-        <p className="text-sm text-muted-foreground">
-          Install the Linear app for your organization and choose which repositories can use it.
-        </p>
         {state.error ? (
           <WorkflowAlert
             title="Could not update Linear connections"
@@ -106,9 +103,14 @@ export function OwnerSources({
                 Ask your relay administrator to configure Linear for this organization.
               </WorkflowAlert>
             ) : !snapshot.connections.length && !exchangeInProgress ? (
-              <Button disabled={disabled} onClick={() => void connect(null)}>
-                Connect Linear workspace
-              </Button>
+              <div className="space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  Connect a Linear workspace to use it in automatic triggers.
+                </p>
+                <Button disabled={disabled} onClick={() => void connect(null)}>
+                  Connect Linear workspace
+                </Button>
+              </div>
             ) : null}
             {snapshot.attempt && ["pending", "exchanging"].includes(snapshot.attempt.status) ? (
               <div className="space-y-2">
@@ -200,9 +202,6 @@ export function OwnerSources({
                 />
               ))}
             </div>
-            {!snapshot.connections.length ? (
-              <p className="text-sm text-muted-foreground">No workflow sources connected.</p>
-            ) : null}
           </>
         )}
       </div>
@@ -231,55 +230,80 @@ function OwnerSourceRow({
     (r) => !current.some((g) => g.repositoryId === r.repositoryId && !g.revoked),
   );
   const authorizationBlocked = disabled || snapshot.exchangeInProgress;
+  const needsReconnect = source.status !== "connected";
+  const canReconnect = snapshot.configured && source.health.code !== "service_configuration";
+  const grants = snapshot.withdrawableGrants.filter((g) => g.connectionId === source.connectionId);
+  const connectedToCurrentApp =
+    !needsReconnect && snapshot.configured && source.applicationId === snapshot.applicationId;
+  const showCheckInline = source.health.code !== "healthy";
+  const checkConnection = connectedToCurrentApp ? (
+    <Button
+      size="sm"
+      variant={showCheckInline ? "outline" : "ghost"}
+      disabled={authorizationBlocked}
+      onClick={() => void mutate((c, t) => c.refreshOwner(t, organizationId, source.connectionId))}
+    >
+      Check connection
+    </Button>
+  ) : null;
   return (
-    <div className="space-y-3 py-3">
-      <div className="flex flex-wrap items-start gap-2">
+    <div className="space-y-4">
+      <div className="space-y-3">
         <SourceIdentity source={source} />
-        <div className="flex flex-wrap gap-2">
-          {snapshot.configured && source.health.code !== "service_configuration" ? (
-            <Button size="sm" variant="outline" disabled={authorizationBlocked} onClick={reconnect}>
-              Reconnect
-            </Button>
-          ) : null}
-          {source.status === "connected" ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={authorizationBlocked}
-              onClick={() =>
-                void mutate((c, t) => c.refreshOwner(t, organizationId, source.connectionId))
-              }
-            >
-              Retry connection
-            </Button>
-          ) : null}
-          {source.status !== "disconnected" ? (
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={disabled}
-              onClick={async () => {
-                if (
-                  await confirmChange(
-                    "Disconnect this Linear source? Future events and queued starts will be blocked. Starting and running work may continue; use Cancel run to stop it.",
+        <SourceFacts source={source} showDelivery />
+        {showCheckInline ? checkConnection : null}
+        {needsReconnect && canReconnect ? (
+          <Button size="sm" disabled={authorizationBlocked} onClick={reconnect}>
+            Reconnect Linear
+          </Button>
+        ) : null}
+        {source.status !== "disconnected" ? (
+          <details>
+            <summary className="cursor-pointer py-1 text-sm text-muted-foreground">
+              Connection actions
+            </summary>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {!needsReconnect && canReconnect ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={authorizationBlocked}
+                  onClick={reconnect}
+                >
+                  Reconnect Linear
+                </Button>
+              ) : null}
+              {showCheckInline ? null : checkConnection}
+              <Button
+                size="sm"
+                variant="ghost-destructive"
+                disabled={disabled}
+                onClick={async () => {
+                  if (
+                    await confirmChange(
+                      "Disconnect this Linear source? Future events and queued starts will be blocked. Starting and running work may continue; use Cancel run to stop it.",
+                    )
                   )
-                )
-                  await mutate((c, t) =>
-                    c.disconnect(t, organizationId, {
-                      connectionId: source.connectionId,
-                      expectedEpoch: source.authorizationEpoch,
-                    }),
-                  );
-              }}
-            >
-              Disconnect
-            </Button>
-          ) : null}
-        </div>
+                    await mutate((c, t) =>
+                      c.disconnect(t, organizationId, {
+                        connectionId: source.connectionId,
+                        expectedEpoch: source.authorizationEpoch,
+                      }),
+                    );
+                }}
+              >
+                Disconnect
+              </Button>
+            </div>
+          </details>
+        ) : null}
       </div>
-      {snapshot.withdrawableGrants
-        .filter((g) => g.connectionId === source.connectionId)
-        .map((g) => (
+      <section className="space-y-2 border-t pt-3" aria-label="Repository access">
+        <h4 className="text-sm font-medium">Repository access</h4>
+        {!grants.length ? (
+          <p className="text-sm text-muted-foreground">No repositories have access.</p>
+        ) : null}
+        {grants.map((g) => (
           <div key={g.grantId} className="flex flex-wrap items-center gap-2 text-sm">
             <span className="min-w-0 flex-1 break-words">
               {g.repositoryName ?? "Repository no longer visible"}
@@ -306,49 +330,47 @@ function OwnerSourceRow({
             </Button>
           </div>
         ))}
-      {source.status === "connected" &&
-      snapshot.configured &&
-      source.applicationId === snapshot.applicationId &&
-      eligible.length ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="min-w-0 flex-1">
-            <Select value={repo} onValueChange={setRepo} disabled={authorizationBlocked}>
-              <SelectTrigger aria-label={`Repository allowed to use ${source.workspaceName}`}>
-                <SelectValue placeholder="Choose repository">
-                  {eligible.find((r) => r.repositoryId === repo)?.name}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectPopup>
-                {eligible.map((r) => (
-                  <SelectItem key={r.repositoryId} value={r.repositoryId}>
-                    {r.name}
-                  </SelectItem>
-                ))}
-              </SelectPopup>
-            </Select>
+        {connectedToCurrentApp && eligible.length ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="min-w-0 flex-1">
+              <Select value={repo} onValueChange={setRepo} disabled={authorizationBlocked}>
+                <SelectTrigger aria-label={`Repository allowed to use ${source.workspaceName}`}>
+                  <SelectValue placeholder="Choose repository">
+                    {eligible.find((r) => r.repositoryId === repo)?.name}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup>
+                  {eligible.map((r) => (
+                    <SelectItem key={r.repositoryId} value={r.repositoryId}>
+                      {r.name}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={
+                authorizationBlocked || !repo || !eligible.some((r) => r.repositoryId === repo)
+              }
+              onClick={() => {
+                if (repo)
+                  void mutate((c, t) =>
+                    c.allow(t, RelayRepositoryId.make(repo), {
+                      connectionId: source.connectionId,
+                      grantId: randomUUID(),
+                      previousGrantId:
+                        current.findLast((g) => g.repositoryId === repo)?.grantId ?? null,
+                    }),
+                  );
+              }}
+            >
+              Allow repository
+            </Button>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={
-              authorizationBlocked || !repo || !eligible.some((r) => r.repositoryId === repo)
-            }
-            onClick={() => {
-              if (repo)
-                void mutate((c, t) =>
-                  c.allow(t, RelayRepositoryId.make(repo), {
-                    connectionId: source.connectionId,
-                    grantId: randomUUID(),
-                    previousGrantId:
-                      current.findLast((g) => g.repositoryId === repo)?.grantId ?? null,
-                  }),
-                );
-            }}
-          >
-            Allow repository
-          </Button>
-        </div>
-      ) : null}
+        ) : null}
+      </section>
     </div>
   );
 }

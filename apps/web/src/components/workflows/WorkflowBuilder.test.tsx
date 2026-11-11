@@ -136,6 +136,7 @@ const call: Props["call"] = async <A,>() => (await read()) as A;
 const refresh = vi.fn();
 const base: Props = {
   scope,
+  repositoryName: "Repository",
   isNew: true,
   workflow: undefined,
   projects: [project],

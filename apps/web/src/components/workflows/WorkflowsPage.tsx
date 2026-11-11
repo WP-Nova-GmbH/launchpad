@@ -982,6 +982,7 @@ function WorkflowRepositoryView({
         ) : (
           <WorkflowBuilder
             scope={scope}
+            repositoryName={entry.repository.name}
             automationSupported={automationSupported}
             vmAutomationAvailable={vmAutomationAvailable}
             automationReason={
@@ -1224,7 +1225,10 @@ function WorkflowRepositoryView({
                 </div>
                 {canConfigure && tab === "workflows" ? (
                   <div className="flex flex-wrap gap-2">
-                    <RepositorySourcesButton repositoryId={scope.repositoryId} />
+                    <RepositorySourcesButton
+                      repositoryId={scope.repositoryId}
+                      repositoryName={entry.repository.name}
+                    />
                     <Menu>
                       <MenuTrigger
                         render={<Button variant="outline" disabled={vmAuthoring === null} />}
