@@ -5,6 +5,7 @@ import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import {
   ArrowLeftIcon,
   CopyIcon,
+  EllipsisIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   FolderGit2Icon,
@@ -624,226 +625,284 @@ function WorkflowRepositoryView({
       return;
     setupTrigger(workflow, !workflow.automation?.enabled);
   };
-  const rows = (archived: boolean) =>
-    workflows
-      .filter((workflow) => workflow.archived === archived)
-      .map((workflow) => {
-        const key = workflowSessionKey(scope, workflow.workflowId);
-        const local = drafts.editors[key];
-        const editorDirty = !!local && workflowEditorDirty(local);
-        const runDraft = drafts.runs[key];
-        const target = workflow.definition.target;
-        const machineProject =
-          target.kind === "machine"
-            ? projects.find(
-                (project) =>
-                  project.environmentId === target.environmentId &&
-                  project.projectId === target.projectId,
-              )
-            : undefined;
-        const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
-        const canStartRun = !archived && !vmUnavailable;
-        const hasRunSubmission =
-          runDraft?.operation?.targetKind === "vm" ||
-          (!canStartRun && runDraft?.operation?.state === "uncertain");
-        const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
-        const summary = summaries.find(
-          (item) => item.workflowId === workflow.workflowId && item.revision === workflow.revision,
-        );
-        return (
-          <div
-            key={workflow.workflowId}
-            className="flex flex-wrap items-center justify-between gap-3 border-b py-4 last:border-b-0"
-          >
-            <div className="min-w-0 flex-1 basis-64 space-y-1 wrap-anywhere">
-              <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                <p className="font-medium">{workflow.definition.name}</p>
-                {editorDirty ? <span className="text-xs font-medium">Unsaved changes</span> : null}
-              </div>
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>{workflow.definition.steps.length} steps</span>
-                {workflow.definition.target.kind === "vm" ? (
-                  <>
-                    <span className="inline-flex items-center gap-1.5">
-                      <CloudIcon aria-hidden className="size-3.5 shrink-0" />
-                      VM
-                    </span>
-                    <span className="inline-flex min-w-0 items-center gap-1.5">
-                      <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-                      <span>
-                        <span className="sr-only">Base branch: </span>
-                        {workflow.definition.target.baseBranch ?? "Repository default"}
-                      </span>
-                    </span>
-                  </>
-                ) : machineProject ? (
-                  <>
-                    <span className="inline-flex items-center gap-1.5">
-                      <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
-                      {machineProject.machineLabel}
-                    </span>
-                    <span>{machineProject.title}</span>
-                  </>
-                ) : (
-                  <span>
-                    {projectsUnavailable
-                      ? "Machine target not verified"
-                      : "Machine target unavailable"}
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>{workflowTriggerLabel(workflow.automation?.trigger)}</span>
-                {canConfigure ? <span>Trigger changes apply after Save.</span> : null}
-                <span>
-                  {automationSupported
-                    ? `Automatic triggering ${summary?.state === "on" ? "On" : summary?.state === "off" ? "Off" : summary?.state === "needs_attention" ? "needs attention" : "state unavailable"}`
-                    : "Automation state unavailable on this relay"}
-                </span>
-              </div>
-              {summary?.reason || local?.error ? (
-                <div className="mt-2">
-                  <WorkflowAlert
-                    title={
-                      local?.error
-                        ? "Workflow change not confirmed"
-                        : "Automatic triggering needs attention"
-                    }
-                    variant={local?.error ? "error" : "warning"}
-                    actions={
-                      canConfigure ? (
-                        <Button variant="outline" size="sm" onClick={() => setupTrigger(workflow)}>
-                          Review workflow settings
-                        </Button>
-                      ) : undefined
-                    }
-                  >
-                    {local?.error ?? summary?.reason}
-                  </WorkflowAlert>
-                </div>
-              ) : null}
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {canConfigure &&
+  const rows = (archived: boolean) => {
+    const entries = workflows.filter((workflow) => workflow.archived === archived);
+    if (!entries.length) return null;
+
+    return (
+      <div className="grid gap-x-4 @min-[34rem]/workflow-catalog:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_12rem]">
+        <div
+          aria-hidden
+          className="col-span-full hidden grid-cols-subgrid border-b pb-2 text-xs text-muted-foreground @min-[34rem]/workflow-catalog:grid"
+        >
+          <span>Workflow</span>
+          <span>Trigger</span>
+        </div>
+        <ul
+          role="list"
+          aria-label={archived ? "Archived workflows" : "Workflows"}
+          className="col-span-full grid grid-cols-subgrid"
+        >
+          {entries.map((workflow) => {
+            const key = workflowSessionKey(scope, workflow.workflowId);
+            const local = drafts.editors[key];
+            const editorDirty = !!local && workflowEditorDirty(local);
+            const runDraft = drafts.runs[key];
+            const { name, steps, target } = workflow.definition;
+            const machineProject =
+              target.kind === "machine"
+                ? projects.find(
+                    (project) =>
+                      project.environmentId === target.environmentId &&
+                      project.projectId === target.projectId,
+                  )
+                : undefined;
+            const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
+            const canStartRun = !archived && !vmUnavailable;
+            const hasRunSubmission =
+              runDraft?.operation?.targetKind === "vm" ||
+              (!canStartRun && runDraft?.operation?.state === "uncertain");
+            const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
+            const runLabel = hasRunSubmission
+              ? "View run submission"
+              : hasRetainedInstructions
+                ? "View retained instructions"
+                : "Run";
+            const summary = summaries.find(
+              (item) =>
+                item.workflowId === workflow.workflowId && item.revision === workflow.revision,
+            );
+            const trigger = workflow.automation?.trigger;
+            const triggerState = automationSupported ? summary?.state : undefined;
+            const triggerLabel = !automationSupported
+              ? "Automation state unavailable on this relay"
+              : triggerState === "on"
+                ? "Automatic"
+                : triggerState === "off"
+                  ? trigger
+                    ? "Automatic triggering off"
+                    : "Manual run"
+                  : triggerState === "needs_attention"
+                    ? "Needs attention"
+                    : "Automation state unavailable";
+            const triggerIssue = local?.error ?? summary?.reason;
+            const canToggle =
+              canConfigure &&
               automationSupported &&
               !archived &&
-              workflow.definition.target.kind === "machine" &&
-              local?.definition.target.kind !== "vm" ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  aria-label={`Turn automatic triggering ${workflow.automation?.enabled ? "off" : "on"} for ${workflow.definition.name}`}
-                  disabled={
-                    !!error ||
-                    !summary ||
-                    local?.operation?.state === "pending" ||
-                    (!!local?.baseline && local.baseline.revision > workflow.revision)
-                  }
-                  onClick={() => void toggleAutomation(workflow)}
-                >
-                  {local?.operation?.state === "pending"
-                    ? "Saving…"
-                    : local?.operation
-                      ? "Retry"
-                      : workflow.automation?.enabled
-                        ? "Turn Off"
-                        : "Turn On"}
-                </Button>
-              ) : null}
-              {canConfigure &&
-              automationSupported &&
-              (summary?.state === "needs_attention" || local?.error) ? (
-                <Button variant="ghost" size="sm" onClick={() => setupTrigger(workflow)}>
-                  Trigger settings
-                </Button>
-              ) : null}
-              {copyRepositories.length &&
-              (workflow.definition.target.kind === "machine" || vmAuthoring) ? (
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    setCopyDestination(
-                      copyRepositories.some(
-                        (entry) => entry.repository.repositoryId === scope.repositoryId,
-                      )
-                        ? scope.repositoryId
-                        : copyRepositories[0]!.repository.repositoryId,
-                    );
-                    setCopyError(null);
-                    setCopy(workflow);
-                  }}
-                >
-                  <CopyIcon /> Copy
-                </Button>
-              ) : null}
-              {canConfigure ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
+              target.kind === "machine" &&
+              local?.definition.target.kind !== "vm";
+            const canCopy =
+              copyRepositories.length > 0 && (target.kind === "machine" || !!vmAuthoring);
+
+            return (
+              <li
+                key={workflow.workflowId}
+                className="col-span-full grid grid-cols-subgrid items-start gap-y-3 border-b py-3 last:border-b-0"
+              >
+                <div className="min-w-0 space-y-1 wrap-anywhere">
+                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                    <p className="text-sm font-medium">{name}</p>
+                    {editorDirty ? (
+                      <span className="text-xs text-muted-foreground">Unsaved changes</span>
+                    ) : null}
+                  </div>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    <span>
+                      {steps.length} {steps.length === 1 ? "step" : "steps"}
+                    </span>
+                    {target.kind === "vm" ? (
+                      <>
+                        <span className="inline-flex items-center gap-1.5">
+                          <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+                          VM
+                        </span>
+                        <span className="inline-flex min-w-0 items-center gap-1.5">
+                          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+                          <span>
+                            <span className="sr-only">Base branch: </span>
+                            {target.baseBranch ?? "Repository default"}
+                          </span>
+                        </span>
+                      </>
+                    ) : machineProject ? (
+                      <span className="inline-flex min-w-0 items-center gap-1.5">
+                        <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                        <span>
+                          {machineProject.machineLabel} / {machineProject.title}
+                        </span>
+                      </span>
+                    ) : (
+                      <span>
+                        {projectsUnavailable
+                          ? "Machine target not verified"
+                          : "Machine target unavailable"}
+                      </span>
+                    )}
+                  </div>
+                  {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
+                    <p className="text-xs text-muted-foreground">VM execution unavailable</p>
+                  ) : null}
+                </div>
+                <div className="min-w-0 space-y-1 wrap-anywhere">
+                  <div role="status" aria-atomic="true" className="space-y-1">
+                    <p
+                      className={
+                        triggerState === "needs_attention"
+                          ? "text-sm font-medium text-warning-foreground"
+                          : "text-sm"
+                      }
+                    >
+                      <span className="sr-only">{name}: </span>
+                      {triggerLabel}
+                    </p>
+                    {trigger ? (
+                      <p className="text-xs text-muted-foreground">
+                        {workflowTriggerLabel(trigger)}
+                      </p>
+                    ) : null}
+                    {triggerIssue && !local?.error ? (
+                      <p className="text-xs text-muted-foreground">{triggerIssue}</p>
+                    ) : null}
+                  </div>
+                  {local?.error ? (
+                    <div role="alert" className="text-xs">
+                      <p className="font-medium text-error-foreground">
+                        Workflow change not confirmed
+                      </p>
+                      <p className="text-muted-foreground">{local.error}</p>
+                    </div>
+                  ) : null}
+                  {canConfigure && (triggerIssue || triggerState === "needs_attention") ? (
+                    <div className="pt-1">
                       <Button
-                        variant="ghost"
-                        size={editorDirty ? "default" : "icon"}
-                        aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${workflow.definition.name}`}
-                        onClick={() =>
-                          navigate({
-                            to: "/workflows/$repositoryId/$workflowId/edit",
-                            params: {
-                              repositoryId: scope.repositoryId,
-                              workflowId: workflow.workflowId,
-                            },
-                          })
+                        variant="outline"
+                        size="compact"
+                        aria-label={`Trigger settings for ${name}`}
+                        onClick={() => setupTrigger(workflow)}
+                      >
+                        Trigger settings
+                      </Button>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="flex min-w-0 flex-wrap items-center gap-1 pointer-coarse:gap-4 @min-[34rem]/workflow-catalog:justify-end">
+                  {canConfigure ? (
+                    <Button
+                      variant="ghost"
+                      size="compact"
+                      aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
+                      onClick={() =>
+                        navigate({
+                          to: "/workflows/$repositoryId/$workflowId/edit",
+                          params: {
+                            repositoryId: scope.repositoryId,
+                            workflowId: workflow.workflowId,
+                          },
+                        })
+                      }
+                    >
+                      <PencilIcon aria-hidden />
+                      {editorDirty ? "Resume editing" : "Edit"}
+                    </Button>
+                  ) : null}
+                  {archived && canConfigure ? (
+                    <Button
+                      variant="outline"
+                      size="compact"
+                      disabled={local?.operation?.state === "pending"}
+                      onClick={() => void archive(workflow)}
+                    >
+                      {local?.operation ? "Retry save" : "Restore"}
+                    </Button>
+                  ) : null}
+                  {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
+                    <Button
+                      variant="outline"
+                      size="compact"
+                      aria-label={`${runLabel} for ${name}`}
+                      onClick={() =>
+                        navigate({
+                          to: "/workflows/$repositoryId/$workflowId/run",
+                          params: {
+                            repositoryId: scope.repositoryId,
+                            workflowId: workflow.workflowId,
+                          },
+                        })
+                      }
+                    >
+                      {runLabel === "Run" ? (
+                        <PlayIcon aria-hidden />
+                      ) : (
+                        <ChevronRightIcon aria-hidden />
+                      )}
+                      {runLabel}
+                    </Button>
+                  ) : null}
+                  {canCopy || canToggle ? (
+                    <Menu>
+                      <MenuTrigger
+                        render={
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            aria-label={`More actions for ${name}`}
+                          />
                         }
-                      />
-                    }
-                  >
-                    <PencilIcon aria-hidden />
-                    {editorDirty ? "Resume editing" : null}
-                  </TooltipTrigger>
-                  <TooltipPopup>{editorDirty ? "Resume editing" : "Edit workflow"}</TooltipPopup>
-                </Tooltip>
-              ) : null}
-              {archived ? (
-                canConfigure ? (
-                  <Button
-                    variant="outline"
-                    disabled={local?.operation?.state === "pending"}
-                    onClick={() => void archive(workflow)}
-                  >
-                    {local?.operation ? "Retry save" : "Restore"}
-                  </Button>
-                ) : null
-              ) : null}
-              {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
-                <span className="self-center text-xs text-muted-foreground">
-                  VM execution unavailable
-                </span>
-              ) : null}
-              {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    navigate({
-                      to: "/workflows/$repositoryId/$workflowId/run",
-                      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
-                    })
-                  }
-                >
-                  {hasRunSubmission || hasRetainedInstructions ? (
-                    <ChevronRightIcon aria-hidden />
-                  ) : (
-                    <PlayIcon aria-hidden />
-                  )}
-                  {hasRunSubmission
-                    ? "View run submission"
-                    : hasRetainedInstructions
-                      ? "View retained instructions"
-                      : "Run"}
-                </Button>
-              ) : null}
-            </div>
-          </div>
-        );
-      });
+                      >
+                        <EllipsisIcon aria-hidden />
+                      </MenuTrigger>
+                      <MenuPopup align="end">
+                        {canCopy ? (
+                          <MenuItem
+                            onClick={() => {
+                              setCopyDestination(
+                                copyRepositories.some(
+                                  (entry) => entry.repository.repositoryId === scope.repositoryId,
+                                )
+                                  ? scope.repositoryId
+                                  : copyRepositories[0]!.repository.repositoryId,
+                              );
+                              setCopyError(null);
+                              setCopy(workflow);
+                            }}
+                          >
+                            <CopyIcon aria-hidden />
+                            Copy workflow
+                          </MenuItem>
+                        ) : null}
+                        {canToggle ? (
+                          <MenuItem
+                            disabled={
+                              !!error ||
+                              !summary ||
+                              local?.operation?.state === "pending" ||
+                              (!!local?.baseline && local.baseline.revision > workflow.revision)
+                            }
+                            onClick={() => toggleAutomation(workflow)}
+                          >
+                            {local?.operation?.state === "pending"
+                              ? "Saving…"
+                              : local?.operation
+                                ? "Retry trigger change"
+                                : workflow.automation?.enabled
+                                  ? "Turn off automatic triggering"
+                                  : trigger
+                                    ? "Turn on automatic triggering"
+                                    : "Set up automatic triggering"}
+                          </MenuItem>
+                        ) : null}
+                      </MenuPopup>
+                    </Menu>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    );
+  };
   if (view === "builder")
     return (
       <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
@@ -1212,7 +1271,7 @@ function WorkflowRepositoryView({
                 ) : null}
               </div>
               {tab === "workflows" ? (
-                <div>
+                <div className="@container/workflow-catalog">
                   {rows(false)}
                   {!workflows.some((workflow) => !workflow.archived) ? (
                     <p className="py-6 text-sm text-muted-foreground">No workflows yet.</p>

@@ -1,8 +1,10 @@
 import {
   act,
   cloneElement,
+  createContext,
   createElement,
   useCallback,
+  useContext,
   useState,
   type PropsWithChildren,
   type ReactElement,
@@ -142,6 +144,45 @@ vi.mock("../ui/tooltip", () => ({
     cloneElement(render, {}, children),
   TooltipPopup: () => null,
 }));
+vi.mock("../ui/menu", () => {
+  const MenuState = createContext<[boolean, (open: boolean) => void]>([false, () => {}]);
+  return {
+    Menu: ({ children }: PropsWithChildren) => {
+      const state = useState(false);
+      return <MenuState.Provider value={state}>{children}</MenuState.Provider>;
+    },
+    MenuTrigger: ({
+      render,
+      children,
+    }: PropsWithChildren<{ render: ReactElement<{ onClick: () => void }> }>) => {
+      const [open, setOpen] = useContext(MenuState);
+      return cloneElement(render, { onClick: () => setOpen(!open) }, children);
+    },
+    MenuPopup: ({ children }: PropsWithChildren) => (useContext(MenuState)[0] ? children : null),
+    MenuItem: ({
+      children,
+      onClick,
+      disabled,
+    }: PropsWithChildren<{
+      onClick: () => void;
+      disabled?: boolean;
+    }>) => {
+      const [, setOpen] = useContext(MenuState);
+      return (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            setOpen(false);
+            onClick();
+          }}
+        >
+          {children}
+        </button>
+      );
+    },
+  };
+});
 vi.mock("../ui/select", () => {
   const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
@@ -720,16 +761,8 @@ it.effect("copies using the checkout catalog refreshed while the source read is 
       const refreshed = deferred<void>();
       fixture.refreshCatalog.mockReturnValueOnce(refreshed.promise);
       await press("Refresh workflows");
-      const copy = renderer!.root
-        .findAllByType("button")
-        .find(
-          (node) =>
-            Array.isArray(node.props.children) &&
-            node.props.children.some(
-              (child: unknown) => typeof child === "string" && child.trim() === "Copy",
-            ),
-        )!;
-      await act(() => copy.props.onClick());
+      await press(`More actions for ${workflow.definition.name}`);
+      await press("Copy workflow");
 
       const source = deferred<ReadonlyArray<RepositoryWorkflow>>();
       fixture.definitions.mockReturnValueOnce(source.promise);
@@ -912,7 +945,8 @@ for (const savedVm of [false, true])
             },
           }));
           await mountCatalog();
-          expect(button("Turn On")).toBeUndefined();
+          await press(`More actions for ${workflow.definition.name}`);
+          expect(button("Set up automatic triggering")).toBeUndefined();
           await press("Trigger settings");
           expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
             triggerSetup: true,
@@ -926,7 +960,7 @@ for (const savedVm of [false, true])
 
 for (const retained of [false, true])
   it.effect(
-    `opens trigger setup for On without a trigger while preserving saved Off (retained unknown draft: ${retained})`,
+    `opens trigger setup while preserving saved Off (retained unknown draft: ${retained})`,
     () =>
       Effect.gen(function* () {
         yield* serve;
@@ -956,7 +990,8 @@ for (const retained of [false, true])
             }));
           }
           await mountCatalog();
-          await press("Turn On");
+          await press(`More actions for ${workflow.definition.name}`);
+          await press("Set up automatic triggering");
           expect(fixture.navigate).toHaveBeenCalledWith(
             expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
           );
@@ -988,8 +1023,9 @@ it.effect(
         ]);
         await mountCatalog();
         expect(content()).toContain("Automation state unavailable on this relay");
-        expect(content()).not.toContain("Automatic triggering Off");
-        expect(button("Turn Off")).toBeUndefined();
+        expect(content()).not.toContain("Manual run");
+        await press(`More actions for ${workflow.definition.name}`);
+        expect(button("Turn off automatic triggering")).toBeUndefined();
         expect(button("Run")).toBeDefined();
       });
     }),
@@ -1030,7 +1066,8 @@ it.effect("opens an Off draft without saving or discarding other workflow edits"
         },
       }));
       await mountCatalog();
-      await press("Turn Off");
+      await press(`More actions for ${workflow.definition.name}`);
+      await press("Turn off automatic triggering");
       expect(fixture.save).not.toHaveBeenCalled();
       expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
         definition: { name: "Unsaved name" },
