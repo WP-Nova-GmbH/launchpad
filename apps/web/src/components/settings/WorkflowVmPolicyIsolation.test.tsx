@@ -1,5 +1,5 @@
 import { act, type ComponentProps, type ReactNode } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, vi } from "vite-plus/test";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -50,6 +50,7 @@ vi.mock("../../lib/runtime", async () => {
           });
         if (path === "/v1/organization/workflow-vm-policy") {
           requests.workflowReads++;
+          if (requests.workflowReads === 1) throw new Error("Fixture transport failure");
           return Response.json(
             {
               _tag: "RelayInternalError",
@@ -119,6 +120,9 @@ vi.mock("../ui/button", () => ({
 }));
 vi.mock("../ui/input", () => ({ Input: (props: ComponentProps<"input">) => <input {...props} /> }));
 
+const visibleText = (node: ReactTestInstance): string =>
+  node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join(" ");
+
 let renderer: ReactTestRenderer | undefined;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -148,12 +152,15 @@ it.effect("keeps personal policy edits intact when the workflow policy read and 
         await Promise.allSettled(requests.pending);
       });
       const view = renderer!;
+      const initialAlert = visibleText(view.root.findByProps({ role: "alert" }));
+      expect(initialAlert).toContain("Check your connection and try again.");
+      expect(initialAlert).not.toContain("Could not read the workflow VM limit");
       const personal = () => view.root.findByProps({ "aria-label": "VMs per user" });
       expect(personal().props.value).toBe("3");
       await act(() => personal().props.onChange({ target: { value: "7" } }));
       const retry = view.root
         .findAllByType("button")
-        .find((entry) => entry.props.children === "Reload limit")!;
+        .find((entry) => visibleText(entry).trim() === "Retry")!;
       await act(async () => {
         retry.props.onClick();
       });
@@ -167,11 +174,10 @@ it.effect("keeps personal policy edits intact when the workflow policy read and 
         view.root.findAllByType("button").find((entry) => entry.props.children === "Save policy")!
           .props.disabled,
       ).toBe(false);
-      expect(
-        view.root
-          .findAllByProps({ role: "alert" })
-          .some((entry) => String(entry.props.children).includes("workflow VM limit")),
-      ).toBe(true);
+      const retryAlert = visibleText(view.root.findByProps({ role: "alert" }));
+      expect(retryAlert).toContain("Couldn’t load the VM limit");
+      expect(retryAlert).toContain("Relay encountered an internal error");
+      expect(retryAlert).not.toContain("Check your connection and try again.");
     });
   }),
 );

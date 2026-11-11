@@ -1,11 +1,18 @@
 import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
-import { RelayOrganizationId, type RelayOrganizationMembership } from "@t3tools/contracts/relay";
+import {
+  RelayAuthInvalidError,
+  RelayOrganizationId,
+  type RelayOrganizationMembership,
+} from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import { HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
+import { ManagedRelayRequestFailedError } from "./managedRelay.ts";
 import {
   makeWorkflowVmPolicyController,
   readWorkflowVmPolicy,
   saveWorkflowVmPolicy,
+  WorkflowVmPolicyScopeError,
 } from "./workflowVmPolicy.ts";
 
 const record = { organizationId: "org", revision: 1, maxRunningVms: 10 };
@@ -82,17 +89,76 @@ describe("workflow VM settings state", () => {
   });
   it("ignores a save reply after scope disposal and preserves the draft on read failure", async () => {
     const response = Promise.withResolvers<typeof record>();
-    const read = vi.fn().mockResolvedValueOnce(loaded).mockRejectedValueOnce(new Error("offline"));
-    const controller = makeWorkflowVmPolicyController({ read, save: () => response.promise });
+    const read = vi
+      .fn(async () => loaded)
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValueOnce(new Error("offline"));
+    const save = vi.fn(() => response.promise);
+    const controller = makeWorkflowVmPolicyController({ read, save });
     await controller.load();
     controller.edit("2");
     await controller.load();
-    expect(controller.getSnapshot()).toMatchObject({ draft: "2", readError: "offline" });
+    expect(controller.getSnapshot()).toMatchObject({
+      draft: "2",
+      recoveryDraft: "2",
+      readError: "offline",
+    });
+    await controller.save();
+    expect(save).not.toHaveBeenCalled();
+    await controller.load();
+    expect(controller.getSnapshot()).toMatchObject({
+      draft: "10",
+      recoveryDraft: null,
+      readError: null,
+    });
+    controller.edit("2");
     const pending = controller.save();
+    expect(save).toHaveBeenCalledWith({ ...record, maxRunningVms: 2 });
     controller.dispose();
     response.resolve({ ...record, revision: 2, maxRunningVms: 2 });
     await pending;
     expect(controller.getSnapshot()).toMatchObject({ record, saved: false, draft: "2" });
+  });
+  const request = HttpClientRequest.get(
+    "https://relay.example.test/v1/organization/workflow-vm-policy",
+  );
+  it.each([
+    new WorkflowVmPolicyScopeError({ message: "Your organization changed." }),
+    new ManagedRelayRequestFailedError({
+      action: "read workflow VM limit",
+      cause: undefined,
+      relayError: new RelayAuthInvalidError({
+        code: "auth_invalid",
+        reason: "invalid_bearer",
+        traceId: "trace",
+      }),
+    }),
+    new ManagedRelayRequestFailedError({
+      action: "read workflow VM limit",
+      cause: new HttpClientError.HttpClientError({
+        reason: new HttpClientError.StatusCodeError({
+          request,
+          response: HttpClientResponse.fromWeb(request, new Response("Forbidden", { status: 403 })),
+        }),
+      }),
+    }),
+  ])("clears the draft after an access failure ($_tag)", async (error) => {
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValueOnce(error)
+      .mockRejectedValueOnce(new Error("offline"));
+    const controller = makeWorkflowVmPolicyController({ read, save: vi.fn() });
+    await controller.load();
+    controller.edit("2");
+    await controller.load();
+    expect(controller.getSnapshot()).toMatchObject({
+      record: null,
+      draft: "",
+      recoveryDraft: null,
+    });
+    await controller.load();
+    expect(controller.getSnapshot()).toMatchObject({ readError: "offline", recoveryDraft: null });
   });
 });
 

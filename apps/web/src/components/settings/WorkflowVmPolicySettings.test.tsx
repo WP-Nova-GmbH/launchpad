@@ -66,12 +66,18 @@ describe("workflow VM settings block", () => {
     );
     const input = view.root.findByType("input");
     expect(input.props.value).toBe("10");
+    const saveButton = () =>
+      view.root.findAllByType("button").find((entry) => entry.props.children === "Save limit")!;
+    expect(saveButton().props.disabled).toBe(true);
+    await act(() => input.props.onChange({ target: { value: "010" } }));
+    expect(saveButton().props.disabled).toBe(true);
+    await act(() => input.props.onChange({ target: { value: "1.5" } }));
+    expect(saveButton().props.disabled).toBe(true);
+    expect(visibleText(view.root)).toContain("Enter a whole number");
     await act(() => input.props.onChange({ target: { value: "0" } }));
-    const button = view.root
-      .findAllByType("button")
-      .find((entry) => entry.props.children === "Save limit")!;
+    expect(saveButton().props.disabled).toBe(false);
     await act(async () => {
-      button.props.onClick();
+      saveButton().props.onClick();
     });
     expect(save).toHaveBeenCalledWith({ ...record, maxRunningVms: 0 });
     expect(view.root.findByType("input").props.value).toBe("0");
@@ -86,21 +92,58 @@ describe("workflow VM settings block", () => {
         .some((entry) => entry.props.children === "VM workflow execution is not available yet."),
     ).toBe(true);
   });
-  it("shows members a static value without editable or save controls", async () => {
+  it.each([0, 10])("shows members a read-only limit of %i", async (maxRunningVms) => {
     const save = vi.fn();
     const view = await render(
       WorkflowVmPolicy.makeWorkflowVmPolicyController({
-        read: async () => ({ record, capabilities, canEdit: false }),
+        read: async () => ({ record: { ...record, maxRunningVms }, capabilities, canEdit: false }),
         save,
       }),
     );
     expect(view.root.findAllByType("input")).toHaveLength(0);
     expect(view.root.findAllByType("button")).toHaveLength(0);
-    expect(view.root.findAllByType("span").some((entry) => entry.props.children === 10)).toBe(true);
+    const text = visibleText(view.root).replace(/\s+/gu, " ");
+    expect(text).toContain(`${maxRunningVms} VMs`);
+    expect(text).toContain("An organization admin can change this limit.");
+    expect(text.includes("Workflow VMs can’t start or resume while the limit is 0.")).toBe(
+      maxRunningVms === 0,
+    );
     expect(save).not.toHaveBeenCalled();
   });
-  it("keeps failed save edits and reloads only after explicit action", async () => {
-    const read = vi.fn(async () => ({ record, capabilities, canEdit: true }));
+  it("shows loading until the relay reports unsupported configuration", async () => {
+    type Unsupported = { record: null; capabilities: typeof capabilities; canEdit: boolean };
+    let resolve!: (value: Unsupported) => void;
+    const result = new Promise<Unsupported>((accept) => {
+      resolve = accept;
+    });
+    const view = await render(
+      WorkflowVmPolicy.makeWorkflowVmPolicyController({
+        read: () => result,
+        save: vi.fn(),
+      }),
+    );
+    expect(visibleText(view.root)).toContain("Loading workflow VM limit…");
+    expect(visibleText(view.root)).not.toContain("unavailable");
+    await act(async () => {
+      resolve({
+        record: null,
+        capabilities: { ...capabilities, configuration: false },
+        canEdit: false,
+      });
+    });
+    expect(visibleText(view.root)).toContain("Workflow VM settings unavailable");
+    expect(view.root.findAllByType("button")).toHaveLength(0);
+  });
+  it("shows the unsaved limit when conflict recovery fails and loads the fresh limit on retry", async () => {
+    const read = vi
+      .fn(async () => ({ record, capabilities, canEdit: true }))
+      .mockResolvedValueOnce({ record, capabilities, canEdit: true })
+      .mockRejectedValueOnce(new Error("Offline"))
+      .mockResolvedValueOnce({
+        record: { ...record, revision: 2, maxRunningVms: 12 },
+        capabilities,
+        canEdit: true,
+      });
     const view = await render(
       WorkflowVmPolicy.makeWorkflowVmPolicyController({
         read,
@@ -109,14 +152,14 @@ describe("workflow VM settings block", () => {
         },
       }),
     );
-    await act(() => view.root.findByType("input").props.onChange({ target: { value: "4" } }));
+    await act(() => view.root.findByType("input").props.onChange({ target: { value: "0" } }));
     await act(async () => {
       view.root
         .findAllByType("button")
         .find((entry) => entry.props.children === "Save limit")!
         .props.onClick();
     });
-    expect(view.root.findByType("input").props.value).toBe("4");
+    expect(view.root.findByType("input").props.value).toBe("0");
     expect(visibleText(view.root.findByProps({ role: "alert" }))).toContain("Policy changed");
     expect(read).toHaveBeenCalledTimes(1);
     await act(async () => {
@@ -125,7 +168,15 @@ describe("workflow VM settings block", () => {
         .find((entry) => entry.props.children === "Reload limit")!
         .props.onClick();
     });
-    expect(view.root.findByType("input").props.value).toBe("10");
+    const failure = visibleText(view.root.findByProps({ role: "alert" }));
+    expect(failure).toContain("Offline");
+    expect(failure).toMatch(/Unsaved limit:\s+0/u);
+    expect(view.root.findAllByType("input")).toHaveLength(0);
+    const [retry] = view.root.findAllByType("button");
+    expect(visibleText(retry!).trim()).toBe("Retry");
+    expect(view.root.findAllByType("button")).toHaveLength(1);
+    await act(async () => retry!.props.onClick());
+    expect(view.root.findByType("input").props.value).toBe("12");
     expect(view.root.findAllByProps({ role: "alert" })).toHaveLength(0);
   });
   it("ignores the old controller when the organization scope changes", async () => {

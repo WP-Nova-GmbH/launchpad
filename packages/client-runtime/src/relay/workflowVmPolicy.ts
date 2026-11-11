@@ -1,8 +1,15 @@
 import type { WorkflowVmCapabilities, WorkflowVmPolicyRecord } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { HttpClientError } from "effect/unstable/http";
+import { relayProtectedErrorMessage } from "./errorPresentation.ts";
+import { ManagedRelayRequestFailedError } from "./managedRelay.ts";
 import type { ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
-import { parseWorkflowVmLimit, WORKFLOW_VM_LIMIT_INPUT_ERROR } from "./threadVmPolicyForm.ts";
+import {
+  parseWorkflowVmLimit,
+  workflowVmLimitDraftStatus,
+  WORKFLOW_VM_LIMIT_INPUT_ERROR,
+} from "./threadVmPolicyForm.ts";
 
 type Client = Pick<
   ManagedRelayTenancyClient["Service"],
@@ -78,6 +85,7 @@ export interface WorkflowVmPolicyState {
   readonly loading: boolean;
   readonly saving: boolean;
   readonly readError: string | null;
+  readonly recoveryDraft: string | null;
   readonly saveError: string | null;
   readonly saved: boolean;
 }
@@ -92,9 +100,10 @@ export function makeWorkflowVmPolicyController(dependencies: {
     capabilities: null,
     canEdit: false,
     draft: "",
-    loading: false,
+    loading: true,
     saving: false,
     readError: null,
+    recoveryDraft: null,
     saveError: null,
     saved: false,
   };
@@ -105,7 +114,7 @@ export function makeWorkflowVmPolicyController(dependencies: {
     listeners.forEach((listener) => listener());
   };
   const message = (error: unknown, fallback: string) =>
-    error instanceof Error ? error.message : fallback;
+    error instanceof Error && error.message ? error.message : fallback;
   return {
     getSnapshot: () => state,
     subscribe: (listener: () => void) => {
@@ -118,7 +127,7 @@ export function makeWorkflowVmPolicyController(dependencies: {
       epoch++;
     },
     edit: (draft: string) => {
-      if (!state.canEdit || state.loading || state.saving) return;
+      if (!state.canEdit || state.loading || state.saving || state.readError) return;
       epoch++;
       update({ draft, saveError: null, saved: false });
     },
@@ -132,11 +141,53 @@ export function makeWorkflowVmPolicyController(dependencies: {
         update({
           ...next,
           draft: next.record ? String(next.record.maxRunningVms) : "",
+          recoveryDraft: null,
           saveError: null,
         });
       } catch (error) {
-        if (request === epoch)
-          update({ readError: message(error, "Could not read the workflow VM limit.") });
+        if (request !== epoch) return;
+        const relayFailure = error instanceof ManagedRelayRequestFailedError;
+        const relayError = relayFailure ? error.relayError : undefined;
+        const httpAccessDenied =
+          relayFailure &&
+          HttpClientError.isHttpClientError(error.cause) &&
+          [401, 403, 404].includes(error.cause.response?.status ?? 0);
+        const retryHint = "Check your connection and try again.";
+        const readError = relayError
+          ? relayProtectedErrorMessage(relayError)
+          : httpAccessDenied
+            ? "Check that you’re signed in and have access, then try again."
+            : relayFailure
+              ? retryHint
+              : message(error, retryHint);
+        const lostAccess =
+          httpAccessDenied ||
+          error instanceof WorkflowVmPolicyScopeError ||
+          relayError?._tag === "RelayAuthInvalidError" ||
+          relayError?._tag === "RelayTenancyForbiddenError" ||
+          relayError?._tag === "RelayTenancyNotFoundError";
+        if (lostAccess) {
+          update({
+            readError,
+            record: null,
+            capabilities: null,
+            canEdit: false,
+            draft: "",
+            recoveryDraft: null,
+            saveError: null,
+          });
+        } else {
+          const { record, draft, canEdit } = state;
+          update({
+            readError,
+            recoveryDraft:
+              canEdit &&
+              record &&
+              workflowVmLimitDraftStatus(draft, record.maxRunningVms) === "changed"
+                ? draft
+                : null,
+          });
+        }
       } finally {
         if (request === epoch) update({ loading: false });
       }
@@ -147,6 +198,7 @@ export function makeWorkflowVmPolicyController(dependencies: {
         !state.canEdit ||
         state.saving ||
         state.loading ||
+        state.readError ||
         !state.capabilities?.configuration
       )
         return;
