@@ -815,17 +815,20 @@ it.effect("refreshes open editor dependencies and ignores a late Codex status fa
           target: { value: "release/1.x" },
         }),
       );
-      const findMachine = () =>
-        renderer!.root.findByProps({ "data-workflow-select-item": true, value: "machine" });
+      const findMachine = () => renderer!.root.findByProps({ type: "radio", value: "machine" });
       expect(findMachine().props.disabled).toBe(true);
       expect(content()).toContain("Machine checkouts could not be loaded.");
 
-      const earlierStatus = deferred<"connected">();
-      fixture.codexStatus.mockReturnValueOnce(earlierStatus.promise);
       fixture.refreshCatalog.mockImplementationOnce(() => {
         fixture.projectsUnavailable = false;
         fixture.projects = [checkout];
       });
+      await press("Retry loading checkouts");
+      expect(findMachine().props.disabled).toBe(false);
+      expect(button("Retry loading checkouts")).toBeUndefined();
+
+      const earlierStatus = deferred<"connected">();
+      fixture.codexStatus.mockReturnValueOnce(earlierStatus.promise);
       const firstRetry = deliveries.length;
       await press("Refresh workflows", false);
       const firstRetryReceipts = deliveries.slice(firstRetry);
@@ -841,10 +844,20 @@ it.effect("refreshes open editor dependencies and ignores a late Codex status fa
       expect(renderer!.root.findByProps({ placeholder: "Repository default" }).props.value).toBe(
         "release/1.x",
       );
+      const targetGroup = renderer!.root
+        .findAllByType("div")
+        .find((node) => node.props.role === "radiogroup")!;
+      const machineRadio = Object.assign(new HTMLElement(), {
+        getAttribute: (name: string) => (name === "role" ? "radio" : null),
+        click: () => findMachine().props.onChange({ nativeEvent: {} }),
+      });
       await act(() =>
-        renderer!.root
-          .findByProps({ "data-workflow-select": true, value: "vm" })
-          .props.onValueChange("machine"),
+        targetGroup.props.onKeyDownCapture({
+          key: " ",
+          target: machineRadio,
+          preventDefault() {},
+          stopPropagation() {},
+        }),
       );
       expect(content()).toContain("Build machine · Workflow checkout");
     });

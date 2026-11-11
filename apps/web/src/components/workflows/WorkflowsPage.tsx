@@ -995,6 +995,7 @@ function WorkflowRepositoryView({
             isNew={!workflowId}
             projects={projects}
             projectsUnavailable={projectsUnavailable}
+            refreshProjects={refreshOrganizationCatalog}
             vmAuthoring={vmAuthoring ?? undefined}
             vmExecutionAvailable={vmExecutionAvailable}
             codexRefreshVersion={codexRefreshVersion}

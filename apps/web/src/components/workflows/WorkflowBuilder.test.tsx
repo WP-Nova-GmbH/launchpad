@@ -98,6 +98,12 @@ vi.mock("../ui/select", () => {
       createElement("div", { ...props, "data-workflow-select-item": true }, children),
   };
 });
+vi.mock("../ui/radio-group", () => ({
+  RadioGroup: ({ children, ...props }: PropsWithChildren) =>
+    createElement("div", { ...props, "data-workflow-target": true }, children),
+  RadioGroupItem: (props: Record<string, unknown>) =>
+    createElement("span", { ...props, "data-workflow-target-option": true }),
+}));
 
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import {
@@ -136,6 +142,7 @@ const base: Props = {
   canConfigure: true,
   call,
   refresh,
+  refreshProjects: () => {},
 };
 const slot = workflowSessionKey(scope, "new");
 let renderer: ReactTestRenderer | undefined;
@@ -894,7 +901,7 @@ describe("VM authoring", () => {
     act(() => renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick());
   const chooseExecutionTarget = (kind: "machine" | "vm") =>
     act(() =>
-      renderer!.root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange(kind),
+      renderer!.root.findByProps({ "data-workflow-target": true }).props.onValueChange(kind),
     );
   const changeBaseBranch = (value: string) =>
     act(() =>
@@ -902,6 +909,45 @@ describe("VM authoring", () => {
         target: { value },
       }),
     );
+
+  it.each([true, false])(
+    "keeps the saved Machine target and accounts for VM execution availability (%s)",
+    async (vmExecutionAvailable) => {
+      const workflow = saved("saved-machine", 1, newWorkflowDraft([project])!.definition);
+      read.mockResolvedValue({ status: "connected" });
+      await mount({
+        ...base,
+        workflow,
+        isNew: false,
+        projects: [],
+        vmAuthoring: { models: null },
+        vmExecutionAvailable,
+      });
+      await openExecutionSettings();
+
+      const root = renderer!.root;
+      expect(root.findByProps({ "data-workflow-target": true }).props.value).toBe("machine");
+      expect(
+        root.findByProps({ "data-workflow-target-option": true, value: "machine" }).props.disabled,
+      ).toBe(true);
+      expect(root.findAllByProps({ "data-workflow-select": true })).toHaveLength(0);
+      expect(editor(workflow.workflowId).definition.target).toEqual(workflow.definition.target);
+
+      const content = JSON.stringify(renderer!.toJSON());
+      if (vmExecutionAvailable) {
+        expect(content).toContain("Choose VM or enroll a checkout to run this workflow.");
+      } else {
+        expect(content).toContain("VM runs are unavailable.");
+        expect(content).not.toContain("Choose VM or enroll a checkout to run this workflow.");
+      }
+
+      await chooseExecutionTarget("vm");
+      expect(editor(workflow.workflowId).definition.target).toEqual({
+        kind: "vm",
+        baseBranch: null,
+      });
+    },
+  );
 
   it.each([
     { name: "the saved override", edit: undefined, expected: "release/1.x" },
@@ -1042,7 +1088,7 @@ describe("VM authoring", () => {
         renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
       );
       await act(() =>
-        renderer!.root.findByProps({ "data-workflow-select": true }).props.onValueChange("machine"),
+        renderer!.root.findByProps({ "data-workflow-target": true }).props.onValueChange("machine"),
       );
       expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
       const run = renderer!.root
@@ -1141,9 +1187,9 @@ describe("VM authoring", () => {
     const toggle = () =>
       root.findAllByType("button").find((node) => node.props.role === "checkbox")!;
     const selectVm = () =>
-      root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange("vm");
+      root.findByProps({ "data-workflow-target": true }).props.onValueChange("vm");
     await act(openSettings);
-    const vmChoice = root.findByProps({ "data-workflow-select-item": true, value: "vm" });
+    const vmChoice = root.findByProps({ "data-workflow-target-option": true, value: "vm" });
     expect(vmChoice.props.disabled).toBe(true);
     await act(selectVm);
     expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
@@ -1199,12 +1245,10 @@ describe("VM authoring", () => {
     const root = renderer!.root;
     await act(() => root.findByProps({ "aria-label": "Workflow settings" }).props.onClick());
     expect(
-      root.findByProps({ "data-workflow-select-item": true, value: "vm" }).props.disabled,
+      root.findByProps({ "data-workflow-target-option": true, value: "vm" }).props.disabled,
     ).toBe(false);
     read.mockResolvedValueOnce({ status: "connected" });
-    await act(() =>
-      root.findAllByProps({ "data-workflow-select": true })[0]!.props.onValueChange("vm"),
-    );
+    await act(() => root.findByProps({ "data-workflow-target": true }).props.onValueChange("vm"));
     expect(editor(workflow.workflowId)).toMatchObject({
       definition: { target: { kind: "vm" } },
       automation: recoveryAuto,

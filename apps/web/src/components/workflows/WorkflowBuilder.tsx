@@ -6,7 +6,7 @@ import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTrigge
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import styles from "./workflowEditor.module.css";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import type {
@@ -34,6 +34,7 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 import { WorkflowStepEditor, useWorkflowEditorModels } from "./WorkflowStepEditor";
 import { WorkflowCanvas, workflowInsertionIndex, type WorkflowInsertion } from "./WorkflowCanvas";
@@ -79,6 +80,7 @@ type WorkflowBuilderProps = {
   isNew: boolean;
   projects: ReadonlyArray<RelayOrganizationProject>;
   projectsUnavailable?: boolean | undefined;
+  refreshProjects: () => void;
   vmAuthoring?: WorkflowCatalog["vmAuthoring"];
   vmExecutionAvailable?: boolean;
   vmAutomationAvailable?: boolean;
@@ -121,6 +123,7 @@ function WorkflowBuilderEditor({
   isNew,
   projects,
   projectsUnavailable,
+  refreshProjects,
   vmAuthoring,
   vmAutomationAvailable = false,
   vmExecutionAvailable = false,
@@ -623,7 +626,9 @@ function WorkflowBuilderEditor({
       draft={draft}
       projects={projects}
       projectsUnavailable={projectsUnavailable}
+      refreshProjects={refreshProjects}
       vmAuthoring={vmAuthoring}
+      vmExecutionAvailable={vmExecutionAvailable}
       vmAutomationAvailable={vmAutomationAvailable}
       codexNotice={checkCodex ? codexNotice : null}
       pending={pending}
@@ -665,7 +670,9 @@ function WorkflowBuilderWorkspace({
   onDepart,
   projects,
   projectsUnavailable,
+  refreshProjects,
   vmAuthoring,
+  vmExecutionAvailable,
   vmAutomationAvailable,
   codexNotice,
   pending,
@@ -692,6 +699,8 @@ function WorkflowBuilderWorkspace({
   onDepart: () => void;
   projects: ReadonlyArray<RelayOrganizationProject>;
   projectsUnavailable: boolean | undefined;
+  refreshProjects: () => void;
+  vmExecutionAvailable: boolean;
   vmAuthoring: WorkflowCatalog["vmAuthoring"];
   vmAutomationAvailable: boolean;
   codexNotice: string | null;
@@ -744,6 +753,7 @@ function WorkflowBuilderWorkspace({
   const sheetReady = useRef(false);
   const mounted = useRef(true);
   const workspace = useRef<HTMLFormElement>(null);
+  const settingsId = useId();
   const executionTargetControl = useRef<HTMLButtonElement>(null);
   const fields = useRef(new Map<string, HTMLElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
@@ -772,6 +782,21 @@ function WorkflowBuilderWorkspace({
         ? `${target.machineLabel} · ${target.title}`
         : "Saved execution target is unavailable"
     : "Choose an execution target";
+  const canChooseVm = !!vmAuthoring && (vmAutomationAvailable || !automation.enabled);
+  const showCheckout = (!vmAuthoring || !!machine) && projects.length > 0;
+  const hasPublishingSteps = draft.definition.steps.some((step) => step.kind === "action");
+  const machineDescription = projects.length
+    ? "Use an enrolled repository checkout."
+    : projectsUnavailable
+      ? "Machine checkouts could not be loaded."
+      : "No enrolled checkout for this repository.";
+  const vmDescription = !canChooseVm
+    ? "Turn off automatic triggering before choosing VM."
+    : hasPublishingSteps
+      ? "Publishing requires Machine. Remove publishing steps to use VM."
+      : !vmExecutionAvailable
+        ? "VM runs are unavailable."
+        : "Run in a managed workspace.";
   const registerField = useCallback((field: string, node: HTMLElement | null) => {
     if (node) fields.current.set(field, node);
     else fields.current.delete(field);
@@ -805,7 +830,7 @@ function WorkflowBuilderWorkspace({
     const key = request.stepId ? `${request.stepId}:${request.field}` : request.field;
     const node = fields.current.get(key);
     focusRequest.current = null;
-    if (!node?.isConnected || node.matches(":disabled")) return false;
+    if (!node?.isConnected || node.matches(':disabled, [aria-disabled="true"]')) return false;
     node.focus({ preventScroll: true });
     if (
       request.selection &&
@@ -975,7 +1000,16 @@ function WorkflowBuilderWorkspace({
             ? "Update the relay to save a VM workflow."
             : "Choose an available execution target before saving.",
       }));
-      setFocusRequest({ field: vmAuthoring && machine ? "checkout" : "target", stepId: null });
+      setFocusRequest({
+        field: showCheckout
+          ? "checkout"
+          : vmAuthoring && projects.length
+            ? "target:machine"
+            : canChooseVm
+              ? "target:vm"
+              : "close-settings",
+        stepId: null,
+      });
       return;
     }
     const modelIssue = vm ? models.issues[0] : undefined;
@@ -999,7 +1033,15 @@ function WorkflowBuilderWorkspace({
       onSave={() => void submit()}
       onChooseMachine={() => {
         openSettings();
-        setFocusRequest({ field: "target", stepId: null });
+        setFocusRequest({
+          field:
+            vmAuthoring && projects.length
+              ? "target:machine"
+              : showCheckout
+                ? "checkout"
+                : "close-settings",
+          stepId: null,
+        });
       }}
       supported={automationSupported}
       vmTarget={!!vm && draft.targetConfirmed}
@@ -1016,27 +1058,49 @@ function WorkflowBuilderWorkspace({
     />
   ) : settingsOpen ? (
     <div>
-      <header className={styles["workflow-inspector-header"]}>
-        <Settings2Icon size={20} />
+      <header className={styles["workflow-settings-header"]}>
+        <Settings2Icon size={18} aria-hidden />
         <h2 className="min-w-0 flex-1 text-sm font-medium">Workflow settings</h2>
         <Button
           type="button"
           variant="ghost"
-          size="icon"
+          size="icon-sm"
           aria-label="Close settings"
+          ref={(node) => registerField("close-settings", node)}
           onClick={close}
         >
           <XIcon />
         </Button>
       </header>
-      <fieldset disabled={pending} className={styles["workflow-inspector-fields"]}>
-        <div className="space-y-2">
-          <RepositorySourcesButton repositoryId={scope.repositoryId} />
-          <p className="text-sm">Execution target</p>
+      <fieldset disabled={pending} className="min-w-0">
+        <section className={styles["workflow-settings-execution"]}>
+          <h3 id={`${settingsId}-target`} className="text-sm font-medium">
+            Execution target
+          </h3>
           {vmAuthoring ? (
             <>
-              <Select
+              {!machine && !draft.targetConfirmed ? (
+                <p className="text-xs text-muted-foreground">Choose a target</p>
+              ) : null}
+              <RadioGroup
+                aria-labelledby={`${settingsId}-target`}
+                disabled={pending}
                 value={machine ? "machine" : draft.targetConfirmed ? "vm" : null}
+                onKeyDownCapture={(event) => {
+                  const radio = event.target;
+                  if (
+                    event.key !== " " ||
+                    !(radio instanceof HTMLElement) ||
+                    radio.getAttribute("role") !== "radio" ||
+                    radio.getAttribute("aria-disabled") === "true"
+                  )
+                    return;
+
+                  // Base UI's non-native radio cancels Space before its click handler can select it.
+                  event.preventDefault();
+                  event.stopPropagation();
+                  radio.click();
+                }}
                 onValueChange={(value) => {
                   if (value === "vm") {
                     edit((current) => {
@@ -1085,85 +1149,129 @@ function WorkflowBuilderWorkspace({
                     });
                 }}
               >
+                <label
+                  htmlFor={`${settingsId}-machine`}
+                  className={styles["workflow-settings-option"]}
+                >
+                  <RadioGroupItem
+                    id={`${settingsId}-machine`}
+                    value="machine"
+                    disabled={!projects.length}
+                    aria-labelledby={`${settingsId}-machine-label`}
+                    aria-describedby={`${settingsId}-machine-description`}
+                    ref={(node) => registerField("target:machine", node)}
+                  />
+                  <MonitorIcon size={15} aria-hidden />
+                  <span className="min-w-0">
+                    <span id={`${settingsId}-machine-label`} className="font-medium">
+                      Machine
+                    </span>
+                    <small id={`${settingsId}-machine-description`}>{machineDescription}</small>
+                  </span>
+                </label>
+                <label htmlFor={`${settingsId}-vm`} className={styles["workflow-settings-option"]}>
+                  <RadioGroupItem
+                    id={`${settingsId}-vm`}
+                    value="vm"
+                    disabled={!canChooseVm}
+                    aria-labelledby={`${settingsId}-vm-label`}
+                    aria-describedby={`${settingsId}-vm-description`}
+                    ref={(node) => registerField("target:vm", node)}
+                  />
+                  <CloudIcon size={15} aria-hidden />
+                  <span className="min-w-0">
+                    <span id={`${settingsId}-vm-label`} className="font-medium">
+                      VM
+                    </span>
+                    <small id={`${settingsId}-vm-description`}>{vmDescription}</small>
+                  </span>
+                </label>
+              </RadioGroup>
+            </>
+          ) : vm ? (
+            <p className="text-xs text-warning-foreground">
+              Update the relay to save a VM workflow.
+            </p>
+          ) : null}
+          {showCheckout ? (
+            <div className={styles["workflow-settings-field"]}>
+              <label htmlFor={`${settingsId}-checkout`}>Checkout</label>
+              {draft.targetConfirmed && machine && !target ? (
+                <p className="text-warning-foreground" id={`${settingsId}-checkout-warning`}>
+                  Saved checkout unavailable. Choose another checkout.
+                </p>
+              ) : null}
+              <Select
+                disabled={pending}
+                value={
+                  draft.targetConfirmed && target
+                    ? `${target.environmentId}:${target.projectId}`
+                    : null
+                }
+                onValueChange={(value) => {
+                  const next = projects.find(
+                    (entry) => `${entry.environmentId}:${entry.projectId}` === value,
+                  );
+                  if (next)
+                    edit((current) => ({
+                      ...current,
+                      targetConfirmed: true,
+                      definition: {
+                        ...current.definition,
+                        target: {
+                          kind: "machine",
+                          environmentId: next.environmentId,
+                          projectId: next.projectId,
+                        },
+                      },
+                    }));
+                }}
+              >
                 <SelectTrigger
-                  aria-label="Execution target"
-                  ref={(node) => registerField("target", node)}
+                  id={`${settingsId}-checkout`}
+                  aria-describedby={
+                    draft.targetConfirmed && machine && !target
+                      ? `${settingsId}-checkout-warning`
+                      : undefined
+                  }
+                  ref={(node) => registerField("checkout", node)}
                 >
                   <SelectValue>
-                    {machine ? "Machine" : draft.targetConfirmed ? "VM" : "Choose a target"}
+                    {draft.targetConfirmed && target ? targetLabel : "Choose a checkout"}
                   </SelectValue>
                 </SelectTrigger>
                 <SelectPopup>
-                  <SelectItem value="vm" disabled={!vmAutomationAvailable && automation.enabled}>
-                    VM
-                  </SelectItem>
-                  <SelectItem value="machine" disabled={!projects.length && !machine}>
-                    Machine
-                  </SelectItem>
+                  {projects.map((project) => (
+                    <SelectItem
+                      key={`${project.environmentId}:${project.projectId}`}
+                      value={`${project.environmentId}:${project.projectId}`}
+                    >
+                      {project.machineLabel} · {project.title}
+                    </SelectItem>
+                  ))}
                 </SelectPopup>
               </Select>
-              {automation.enabled && !vm && !vmAutomationAvailable ? (
-                <p className="text-xs text-muted-foreground">
-                  Turn off automatic triggering before choosing VM.
-                </p>
-              ) : null}
-              {!projects.length ? (
-                <p className="text-xs text-muted-foreground">
-                  {projectsUnavailable
-                    ? "Machine checkouts could not be loaded."
-                    : "Machine requires an enrolled checkout of this repository."}
-                </p>
-              ) : null}
-            </>
+            </div>
           ) : null}
-          {!vmAuthoring || machine ? (
-            <Select
-              value={
-                draft.targetConfirmed && draft.definition.target.kind === "machine"
-                  ? `${draft.definition.target.environmentId}:${draft.definition.target.projectId}`
-                  : null
-              }
-              onValueChange={(value) => {
-                const next = projects.find(
-                  (entry) => `${entry.environmentId}:${entry.projectId}` === value,
-                );
-                if (next)
-                  edit((current) => ({
-                    ...current,
-                    targetConfirmed: true,
-                    definition: {
-                      ...current.definition,
-                      target: {
-                        kind: "machine",
-                        environmentId: next.environmentId,
-                        projectId: next.projectId,
-                      },
-                    },
-                  }));
-              }}
-            >
-              <SelectTrigger
-                aria-label={vmAuthoring ? "Checkout" : "Execution target"}
-                ref={(node) => registerField(vmAuthoring ? "checkout" : "target", node)}
-              >
-                <SelectValue>
-                  {vmAuthoring && !draft.targetConfirmed ? "Choose a checkout" : targetLabel}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectPopup>
-                {projects.map((project) => (
-                  <SelectItem
-                    key={`${project.environmentId}:${project.projectId}`}
-                    value={`${project.environmentId}:${project.projectId}`}
-                  >
-                    {project.machineLabel} · {project.title}
-                  </SelectItem>
-                ))}
-              </SelectPopup>
-            </Select>
+          {!projects.length && projectsUnavailable ? (
+            <div className="space-y-2">
+              {!vmAuthoring ? (
+                <p className="text-xs text-warning-foreground">{machineDescription}</p>
+              ) : null}
+              <Button type="button" variant="outline" size="sm" onClick={refreshProjects}>
+                Retry loading checkouts
+              </Button>
+            </div>
+          ) : !projects.length && (machine || (!vmAuthoring && !vm)) ? (
+            <p className="text-xs text-muted-foreground">
+              {!vmAuthoring ? `${machineDescription} ` : null}
+              {canChooseVm && vmExecutionAvailable && !hasPublishingSteps
+                ? "Choose VM or enroll a checkout to run this workflow."
+                : "Enroll a checkout to run this workflow."}
+            </p>
           ) : null}
           {vm && draft.targetConfirmed ? (
-            <label className="block space-y-1 text-sm">
+            <label className={styles["workflow-settings-field"]}>
               <span>Base branch</span>
               <Input
                 ref={(node) => registerField("baseBranch", node)}
@@ -1179,20 +1287,27 @@ function WorkflowBuilderWorkspace({
               />
             </label>
           ) : null}
-        </div>
-        <Button type="button" variant="outline" onClick={() => void discard()}>
-          Discard changes
-        </Button>
-        {draft.baseline ? (
-          <Button
-            type="button"
-            variant="ghost"
-            disabled={!!draft.operation}
-            onClick={() => void archive()}
-          >
-            {draft.baseline.archived ? "Restore workflow" : "Archive workflow"}
+        </section>
+        <section className={styles["workflow-settings-row"]} aria-label="Repository">
+          <h3 className="text-sm font-medium">Repository</h3>
+          <RepositorySourcesButton repositoryId={scope.repositoryId} />
+        </section>
+        <footer className={styles["workflow-settings-row"]}>
+          <Button type="button" variant="ghost" size="sm" onClick={() => void discard()}>
+            Discard changes
           </Button>
-        ) : null}
+          {draft.baseline ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={!!draft.operation}
+              onClick={() => void archive()}
+            >
+              {draft.baseline.archived ? "Restore workflow" : "Archive workflow"}
+            </Button>
+          ) : null}
+        </footer>
       </fieldset>
     </div>
   ) : selected ? (

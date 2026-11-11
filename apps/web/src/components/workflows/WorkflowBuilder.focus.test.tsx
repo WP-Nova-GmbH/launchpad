@@ -66,7 +66,9 @@ let initialSheetFocus: (() => boolean | HTMLElement | null | void) | undefined;
 function runInitialFocus(callback: NonNullable<typeof initialSheetFocus>) {
   const target = callback();
   if (target === true)
-    nodes.get(draft().selectedStepId ? `${draft().selectedStepId}:title` : "target")?.focus();
+    nodes
+      .get(draft().selectedStepId ? `${draft().selectedStepId}:title` : "close-settings")
+      ?.focus();
   else if (target && typeof target !== "boolean") target.focus();
 }
 
@@ -188,9 +190,14 @@ vi.mock("../ui/select", () => {
     SelectPopup: component,
     SelectItem: component,
     SelectTrigger: (props: Record<string, unknown>) =>
-      createElement("button", { ...props, "data-focus-key": "target" }),
+      createElement("button", { ...props, "data-focus-key": "checkout" }),
   };
 });
+vi.mock("../ui/radio-group", () => ({
+  RadioGroup: ({ children }: PropsWithChildren) => children,
+  RadioGroupItem: ({ value, ...props }: Record<string, unknown>) =>
+    createElement("span", { ...props, "data-focus-key": `target:${value}` }),
+}));
 
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import { editWorkflowDraft } from "./workflowState";
@@ -239,6 +246,7 @@ async function mount(
             throw new Error("Unexpected write");
           }}
           refresh={() => {}}
+          refreshProjects={() => {}}
         />
       </AppAtomRegistryProvider>,
       {
@@ -258,11 +266,13 @@ async function mount(
                 : typeof props["aria-label"] === "string" &&
                     props["aria-label"].startsWith("Execution target: ")
                   ? "header-target"
-                  : props.type === "submit"
-                    ? "save"
-                    : props.placeholder === "Repository default"
-                      ? "baseBranch"
-                      : null;
+                  : props["aria-label"] === "Close settings"
+                    ? "close-settings"
+                    : props.type === "submit"
+                      ? "save"
+                      : props.placeholder === "Repository default"
+                        ? "baseBranch"
+                        : null;
           if (!key) return null;
           const cacheKey = `${presentation}:${key}`;
           let node = cache.get(cacheKey);
@@ -449,16 +459,22 @@ describe("Inspector presentation focus", () => {
     expect(focusDocument.activeElement).toBe(field("header-target"));
   });
 
-  it("preserves ordinary workflow-target control focus and explicit dismissal", async () => {
-    await mount();
+  it.each([
+    { vm: false, key: "checkout" },
+    { vm: true, key: "target:machine" },
+  ])("preserves $key focus and explicit dismissal", async ({ vm, key }) => {
+    await mount(vm, { projects: [project] });
     const opener = new FocusNode();
     opener.focus();
     await act(() =>
-      renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+      renderer!.root
+        .findAllByType("button")
+        .find((button) => button.props["aria-label"] === "Workflow settings")!
+        .props.onClick(),
     );
-    field("target").focus();
+    field(key).focus();
     await changeWidth(800);
-    expect(focusDocument.activeElement === field("target")).toBe(true);
+    expect(focusDocument.activeElement === field(key)).toBe(true);
     await act(() => dismissSheet!(false));
     expect(draft().selectedStepId).toBe("");
     expect(focusDocument.activeElement === opener).toBe(true);
