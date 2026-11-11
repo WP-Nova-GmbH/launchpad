@@ -22,7 +22,14 @@ import {
   ChevronDownIcon,
   AlertCircleIcon,
 } from "lucide-react";
-import { useCallback, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type Ref,
+} from "react";
 import {
   workflowZones,
   type WorkflowDefinition,
@@ -47,6 +54,7 @@ export function workflowInsertionIndex(
 
 export function WorkflowCanvas({
   definition,
+  addStepRef,
   triggerLabel = "Manual run",
   triggerSelected = false,
   triggerIssue,
@@ -63,6 +71,7 @@ export function WorkflowCanvas({
   movementVersion = 0,
 }: {
   definition: WorkflowDefinition;
+  addStepRef?: Ref<HTMLButtonElement> | undefined;
   triggerLabel?: string;
   triggerSelected?: boolean;
   triggerIssue?: string | null | undefined;
@@ -133,6 +142,7 @@ export function WorkflowCanvas({
           disabled={pending || atLimit}
           onInsert={onInsert}
           label={selected ? `Add a step after ${selected.title}` : "Add a step at the end"}
+          triggerRef={addStepRef}
           toolbar
         />
         {atLimit ? <span className="text-xs text-muted-foreground">Maximum 32 steps</span> : null}
@@ -424,6 +434,7 @@ function InsertMenu({
   disabled,
   onInsert,
   label,
+  triggerRef,
   toolbar = false,
 }: {
   definition: WorkflowDefinition;
@@ -431,6 +442,7 @@ function InsertMenu({
   disabled: boolean;
   onInsert: (anchor: WorkflowInsertion, kind: WorkflowStep["kind"] | "open_pull_request") => void;
   label: string;
+  triggerRef?: Ref<HTMLButtonElement> | undefined;
   toolbar?: boolean;
 }) {
   const [captured, setCaptured] = useState<WorkflowInsertion | null>(null);
@@ -447,6 +459,7 @@ function InsertMenu({
       }}
     >
       <MenuTrigger
+        ref={triggerRef}
         render={
           toolbar ? (
             <Button type="button" variant="outline" size="sm" />

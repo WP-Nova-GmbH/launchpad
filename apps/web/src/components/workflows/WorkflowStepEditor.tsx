@@ -1,9 +1,17 @@
+import { useId, useRef } from "react";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { useEnvironment } from "../../state/environments";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useProject } from "../../state/entities";
 import styles from "./workflowEditor.module.css";
-import { UploadIcon, BotIcon, MessageSquareIcon, UserRoundCheckIcon, XIcon } from "lucide-react";
+import {
+  UploadIcon,
+  BotIcon,
+  EllipsisIcon,
+  MessageSquareIcon,
+  UserRoundCheckIcon,
+  XIcon,
+} from "lucide-react";
 import type {
   WorkflowStep,
   WorkflowDefinition,
@@ -16,6 +24,7 @@ import {
 } from "../settings/workflowModels";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { Button } from "../ui/button";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 
@@ -42,18 +51,35 @@ export function WorkflowStepEditor({
   close: () => void;
   registerField: (field: string, node: HTMLElement | null) => void;
 }) {
+  const id = useId();
+  const removingStep = useRef(false);
   const { entries, modelOptions } = models;
   const index = definition.steps.findIndex((step) => step.id === selectedId);
   const step = definition.steps[index];
-  const patch = (update: WorkflowStep) =>
+  const patch = (update: WorkflowStep) => {
+    if (disabled) return;
     change(definition.steps.map((entry) => (entry.id === update.id ? update : entry)));
+  };
   const move = (offset: number) => {
     const steps = [...definition.steps];
     const target = index + offset;
-    if (target < 0 || target >= steps.length) return;
+    if (disabled || !step || target < 0 || target >= steps.length) return;
     [steps[index], steps[target]] = [steps[target]!, steps[index]!];
     moveSteps(steps);
   };
+  const remove = () => {
+    if (disabled || !step) return;
+    removingStep.current = true;
+    change(definition.steps.filter((entry) => entry.id !== step.id));
+    select(definition.steps[index + 1]?.id ?? definition.steps[index - 1]?.id ?? "");
+  };
+  const earlierAgents =
+    step?.kind === "review"
+      ? definition.steps.slice(0, index).filter((entry) => entry.kind === "agent")
+      : [];
+  const invalidRework =
+    step?.kind === "review" &&
+    !earlierAgents.some((entry) => !step.reworkStepId || entry.id === step.reworkStepId);
   const triggerLabel = step?.kind === "agent" ? models.triggerLabel(step) : undefined;
   const vm = definition.target.kind === "vm";
   const vmModelIssue = vm ? models.issues.find((issue) => issue.stepId === step?.id) : undefined;
@@ -85,42 +111,74 @@ export function WorkflowStepEditor({
                 value={step.title}
                 onChange={(event) => patch({ ...step, title: event.target.value })}
               />
-              <p className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span>
-                  {step.kind === "agent"
-                    ? "Agent"
-                    : step.kind === "input"
-                      ? "Human input"
-                      : step.kind === "action"
-                        ? step.action === "push"
-                          ? "Push branch"
-                          : "Open PR"
-                        : "Human review"}
-                </span>
-                <span>Step {index + 1}</span>
+              <p className="text-xs text-muted-foreground">
+                {step.kind === "agent"
+                  ? "Agent"
+                  : step.kind === "input"
+                    ? "Human input"
+                    : step.kind === "action"
+                      ? step.action === "push"
+                        ? "Push branch"
+                        : "Open PR"
+                      : "Review"}
               </p>
             </div>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              aria-label="Close settings"
-              ref={(node) => registerField("close", node)}
-              onClick={close}
-            >
-              <XIcon />
-            </Button>
+            <div className="flex items-center gap-1">
+              <Menu
+                onOpenChange={(open) => {
+                  if (open) removingStep.current = false;
+                }}
+              >
+                <MenuTrigger
+                  disabled={disabled}
+                  ref={(node) => registerField("actions", node)}
+                  render={
+                    <Button type="button" variant="ghost" size="icon" aria-label="Step actions" />
+                  }
+                >
+                  <EllipsisIcon aria-hidden />
+                </MenuTrigger>
+                <MenuPopup align="end" finalFocus={() => !removingStep.current}>
+                  <MenuItem disabled={disabled || index === 0} onClick={() => move(-1)}>
+                    Move up
+                  </MenuItem>
+                  <MenuItem
+                    disabled={disabled || index === definition.steps.length - 1}
+                    onClick={() => move(1)}
+                  >
+                    Move down
+                  </MenuItem>
+                  <MenuItem disabled={disabled} variant="destructive" onClick={remove}>
+                    Remove step
+                  </MenuItem>
+                </MenuPopup>
+              </Menu>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Close settings"
+                ref={(node) => registerField("close", node)}
+                onClick={close}
+              >
+                <XIcon />
+              </Button>
+            </div>
           </header>
           <fieldset disabled={disabled} className={styles["workflow-inspector-fields"]}>
-            {step.kind === "input" || step.kind === "review" ? (
-              <p className={styles["workflow-checkpoint-note"]} data-kind={step.kind}>
-                {step.kind === "input"
-                  ? "The workflow waits here until someone answers."
-                  : "The workflow waits here until someone approves or requests changes."}
+            {step.kind === "input" ? (
+              <p className={styles["workflow-checkpoint-note"]}>
+                The workflow waits here until someone answers.
               </p>
             ) : null}
             {step.kind === "agent" || step.kind === "input" ? (
-              <label className="block space-y-1 text-sm">
+              <label
+                className={
+                  step.kind === "agent"
+                    ? `block space-y-1 text-sm ${styles["workflow-agent-instructions"]}`
+                    : "block space-y-1 text-sm"
+                }
+              >
                 <span>{step.kind === "agent" ? "Agent instructions" : "Required question"}</span>
                 <Textarea
                   ref={(node) =>
@@ -143,10 +201,7 @@ export function WorkflowStepEditor({
             ) : null}
             {step.kind === "agent" ? (
               <div className="space-y-2">
-                <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                  <p className="text-sm">Model</p>
-                  <span className="text-xs text-muted-foreground">Approvals required</span>
-                </div>
+                <p className="text-sm">Model</p>
                 {vm ? (
                   <>
                     <Select
@@ -172,6 +227,7 @@ export function WorkflowStepEditor({
                     >
                       <SelectTrigger
                         aria-label="Managed Codex model"
+                        aria-describedby={`${id}-approvals`}
                         ref={(node) => registerField("model", node)}
                       >
                         <SelectValue>{triggerLabel}</SelectValue>
@@ -210,6 +266,8 @@ export function WorkflowStepEditor({
                   </>
                 ) : entries[0] ? (
                   <ProviderModelPicker
+                    disabled={disabled}
+                    triggerClassName="w-full max-w-none sm:max-w-none"
                     activeInstanceId={
                       models.effectiveSelection(step)?.instanceId ?? entries[0].instanceId
                     }
@@ -240,6 +298,9 @@ export function WorkflowStepEditor({
                     Connect to this environment to choose or verify a model.
                   </p>
                 )}
+                <p id={`${id}-approvals`} className="text-xs text-muted-foreground">
+                  Approvals required
+                </p>
                 {step.modelSelection && !vmModelIssue ? (
                   <Button
                     type="button"
@@ -259,7 +320,9 @@ export function WorkflowStepEditor({
               </p>
             ) : (
               <div className="space-y-1">
-                <p className="text-sm">Who can respond?</p>
+                <p id={`${id}-role`} className="text-sm">
+                  {step.kind === "review" ? "Who can review?" : "Who can respond?"}
+                </p>
                 <Select
                   value={step.role}
                   onValueChange={(role) => {
@@ -267,12 +330,12 @@ export function WorkflowStepEditor({
                   }}
                 >
                   <SelectTrigger
-                    aria-label="Checkpoint role"
+                    aria-labelledby={`${id}-role`}
                     data-workflow-field="role"
                     ref={(node) => registerField("role", node)}
                   >
                     <SelectValue>
-                      {step.role === "member" ? "Repository members" : "Maintainers"}
+                      {step.role === "member" ? "Any repository member" : "Repository maintainers"}
                     </SelectValue>
                   </SelectTrigger>
                   <SelectPopup>
@@ -284,7 +347,9 @@ export function WorkflowStepEditor({
             )}
             {step.kind === "review" ? (
               <div className="space-y-1">
-                <p className="text-sm">Request changes returns to</p>
+                <p id={`${id}-rework`} className="text-sm">
+                  Send requested changes back to
+                </p>
                 <Select
                   value={step.reworkStepId ? `agent:${step.reworkStepId}` : "nearest"}
                   onValueChange={(value) =>
@@ -295,7 +360,9 @@ export function WorkflowStepEditor({
                   }
                 >
                   <SelectTrigger
-                    aria-label="Rework target"
+                    aria-labelledby={`${id}-rework`}
+                    aria-invalid={invalidRework || undefined}
+                    aria-describedby={invalidRework ? `${id}-rework-issue` : undefined}
                     data-workflow-field="rework"
                     ref={(node) => registerField("rework", node)}
                   >
@@ -308,49 +375,22 @@ export function WorkflowStepEditor({
                   </SelectTrigger>
                   <SelectPopup>
                     <SelectItem value="nearest">Previous Agent step</SelectItem>
-                    {definition.steps
-                      .slice(0, index)
-                      .filter((entry) => entry.kind === "agent")
-                      .map((entry) => (
-                        <SelectItem key={entry.id} value={`agent:${entry.id}`}>
-                          {entry.title}
-                        </SelectItem>
-                      ))}
+                    {earlierAgents.map((entry) => (
+                      <SelectItem key={entry.id} value={`agent:${entry.id}`}>
+                        {entry.title}
+                      </SelectItem>
+                    ))}
                   </SelectPopup>
                 </Select>
+                {invalidRework ? (
+                  <p id={`${id}-rework-issue`} className="text-xs text-destructive-foreground">
+                    {earlierAgents.length
+                      ? "Choose an earlier Agent step."
+                      : "Add an Agent step before Review."}
+                  </p>
+                ) : null}
               </div>
             ) : null}
-            <div className="flex flex-wrap gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={index === 0}
-                onClick={() => move(-1)}
-              >
-                Move up
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={index === definition.steps.length - 1}
-                onClick={() => move(1)}
-              >
-                Move down
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  change(definition.steps.filter((entry) => entry.id !== step.id));
-                  select(definition.steps[index + 1]?.id ?? definition.steps[index - 1]?.id ?? "");
-                }}
-              >
-                Remove step
-              </Button>
-            </div>
           </fieldset>
         </div>
       ) : null}

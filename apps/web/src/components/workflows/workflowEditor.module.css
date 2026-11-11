@@ -502,15 +502,16 @@
   font-size: 12px;
   line-height: 1.5;
 }
+.workflow-agent-instructions textarea {
+  min-height: 9rem;
+  resize: vertical;
+}
 .workflow-checkpoint-note {
   padding: 10px 12px;
   border-radius: 8px;
   font-size: 12px;
-  background: color-mix(in srgb, var(--primary) 7%, transparent);
-  color: var(--muted-foreground);
-}
-.workflow-checkpoint-note[data-kind="input"] {
   background: var(--warning-surface);
+  color: var(--muted-foreground);
 }
 @container workflow-canvas (max-width:640px) {
   .workflow-canvas-scroll {

@@ -15,6 +15,7 @@ import {
   setWorkflowSessionAccount,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
+import type { WorkflowCanvas } from "./WorkflowCanvas";
 import type { WorkflowStepEditor } from "./WorkflowStepEditor";
 
 type StepProps = Parameters<typeof WorkflowStepEditor>[0];
@@ -66,8 +67,15 @@ vi.mock("../../lib/runtime", () => ({ runtime: {} }));
 vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: () => Promise.resolve(false) }));
 vi.mock("./WorkflowCanvas", async () => ({
   ...(await vi.importActual("./WorkflowCanvas")),
-  WorkflowCanvas: (props: Record<string, unknown>) =>
-    createElement("div", { ...props, "data-testid": "canvas" }),
+  WorkflowCanvas: (props: Parameters<typeof WorkflowCanvas>[0]) =>
+    createElement(
+      "div",
+      { ...props, "data-testid": "canvas" },
+      createElement("button", {
+        "data-focus-key": "add-step",
+        ref: props.addStepRef,
+      }),
+    ),
 }));
 vi.mock("./WorkflowStepEditor", () => ({
   useWorkflowEditorModels: () => ({ issues: [] }),
@@ -98,6 +106,13 @@ vi.mock("./WorkflowStepEditor", () => ({
               ),
           }),
       createElement("button", { "aria-label": "Close settings", onClick: props.close }),
+      createElement("button", {
+        "aria-label": "Remove only step",
+        onClick: () => {
+          props.change([]);
+          props.select("");
+        },
+      }),
     );
   },
 }));
@@ -280,6 +295,21 @@ afterEach(async () => {
 });
 
 describe("Inspector presentation focus", () => {
+  it.each([1200, 600])(
+    "focuses Add a step after removing the only step at width %i",
+    async (editorWidth) => {
+      width = editorWidth;
+      await mount();
+      await inspect();
+      field("agent:title").focus();
+      await act(() =>
+        renderer!.root.findByProps({ "aria-label": "Remove only step" }).props.onClick(),
+      );
+      expect(draft().definition.steps).toEqual([]);
+      expect(focusDocument.activeElement).toBe(field("add-step"));
+    },
+  );
+
   it("keeps instructions, selection and textarea scroll through both presentation changes", async () => {
     await mount();
     await inspect();

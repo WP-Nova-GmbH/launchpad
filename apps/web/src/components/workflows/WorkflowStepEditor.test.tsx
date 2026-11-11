@@ -16,6 +16,12 @@ vi.mock("../ui/button", () => ({
 vi.mock("../ui/textarea", () => ({
   Textarea: (props: Record<string, unknown>) => createElement("textarea", props),
 }));
+vi.mock("../ui/menu", () => ({
+  Menu: ({ children }: PropsWithChildren) => children,
+  MenuTrigger: ({ render }: { render: React.ReactElement }) => render,
+  MenuPopup: ({ children }: PropsWithChildren) => children,
+  MenuItem: (props: Record<string, unknown>) => createElement("button", props),
+}));
 vi.mock("../ui/select", () => {
   const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
@@ -187,6 +193,8 @@ describe("Workflow step editing", () => {
     expect(definition.steps.map((step) => step.id)).toEqual(["plan", "review"]);
     expect(definition.steps[1]).toMatchObject({ reworkStepId: "implement" });
     expect(workflowDraftIssue(definition)).toMatchObject({ stepId: "review", field: "rework" });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Unavailable Agent step");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Choose an earlier Agent step.");
   });
   it("removing the last step leaves an explicit empty, invalid draft", async () => {
     await mount({ initial: { ...original, steps: [original.steps[0]!] }, selection: "plan" });

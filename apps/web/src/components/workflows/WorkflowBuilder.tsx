@@ -770,11 +770,14 @@ function WorkflowBuilderWorkspace({
   const focusPending = useCallback(() => {
     const request = focusRequest.current;
     if (!mounted.current || !request) return false;
-    const expectedPanel = request.stepId
-      ? `step:${request.stepId}`
-      : request.field.startsWith("trigger:")
-        ? "trigger"
-        : "workflow";
+    const expectedPanel =
+      request.field === "add-step"
+        ? null
+        : request.stepId
+          ? `step:${request.stepId}`
+          : request.field.startsWith("trigger:")
+            ? "trigger"
+            : "workflow";
     if (request.field !== "name" && panelIdentity.current !== expectedPanel) {
       focusRequest.current = null;
       return false;
@@ -1164,7 +1167,12 @@ function WorkflowBuilderWorkspace({
       registerField={(field, node) => registerField(`${selected.id}:${field}`, node)}
       select={(id) => {
         select(id);
-        setFocusRequest(id ? { field: "title", stepId: id } : null);
+        if (id) {
+          setFocusRequest({ field: "title", stepId: id });
+        } else {
+          returnFocus.current = fields.current.get("add-step") ?? null;
+          setFocusRequest({ field: "add-step", stepId: null });
+        }
       }}
       change={(steps) => {
         reorder(steps);
@@ -1452,6 +1460,7 @@ function WorkflowBuilderWorkspace({
       ) : null}
       <div className={styles["workflow-editor-body"]}>
         <WorkflowCanvas
+          addStepRef={(node) => registerField("add-step", node)}
           triggerLabel={workflowTriggerLabel(workflowDraftAutomation(draft).trigger)}
           triggerSelected={triggerOpen}
           triggerIssue={automationReason}
