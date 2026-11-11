@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Alert, Pressable, ScrollView, View } from "react-native";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
+import { Alert, AppState, Platform, Pressable, ScrollView, View } from "react-native";
 import * as Effect from "effect/Effect";
 import { useAtomValue } from "@effect/atom-react";
 import { threadVmControls } from "../../state/threads";
@@ -9,6 +17,7 @@ import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay
 import {
   makeWorkflowSavedResultReader,
   currentWorkflowSavedResult,
+  isCurrentWorkflowReviewResult,
   savedWorkflowThreadState,
   canDeleteSavedWorkflowThread,
   type SavedWorkflowResultRead,
@@ -18,9 +27,14 @@ import {
   beginWorkflowReview,
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
+  workflowJobReadAtom,
+  workflowSessionKey,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
-import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
+import {
+  sameWorkflowResultCheckpoint,
+  workflowResultCheckpoint,
+} from "@t3tools/client-runtime/relay/workflow-result";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { AppText as Text } from "../../components/AppText";
 import { ErrorBanner } from "../../components/ErrorBanner";
@@ -50,12 +64,21 @@ type Call = <A>(
   ) => Effect.Effect<A, ManagedRelay.ManagedRelayClientError>,
 ) => Promise<A>;
 const EMPTY: ReadonlyArray<string> = [];
+const SAVED_DIFF_VIEWPORT_HEIGHT = 420;
+type SavedResultView = "changes" | "conversation";
+type ReviewViewport = {
+  scroll: RefObject<ScrollView | null>;
+  check: RefObject<(() => void) | null>;
+};
+
 function SavedChanges({
   read,
+  viewport,
   onVisible,
 }: {
   read: SavedWorkflowResultRead;
-  onVisible: () => void;
+  viewport: ReviewViewport;
+  onVisible?: () => boolean;
 }) {
   const parsed = useMemo(
     () =>
@@ -71,6 +94,18 @@ function SavedChanges({
   const NativeView = resolveNativeReviewDiffView();
   const { themeAppearance } = useAppearancePreferences();
   const { nativeReviewDiffStyle } = useAppearanceCodeSurface();
+  const { fileHeaderHeight, rowHeight } = nativeReviewDiffStyle;
+  const minimumContentHeight = useMemo(() => {
+    if (parsed.kind === "empty") return null;
+    const collapsedFiles = new Set(collapsed);
+    let height = 0;
+    for (const row of data.rows) {
+      if (row.kind === "file") height += fileHeaderHeight;
+      else if (!row.fileId || !collapsedFiles.has(row.fileId)) height += rowHeight;
+      if (height >= SAVED_DIFF_VIEWPORT_HEIGHT) return SAVED_DIFF_VIEWPORT_HEIGHT;
+    }
+    return height;
+  }, [collapsed, data.rows, fileHeaderHeight, parsed.kind, rowHeight]);
   const bridge = useNativeReviewDiffBridge({
     threadKey: read.result.resultId,
     sectionId: read.result.resultId,
@@ -81,11 +116,70 @@ function SavedChanges({
     selectedRowIds: EMPTY,
     canHighlight: true,
   });
+  const diffRef = useRef<View>(null);
+  const drawn = useRef(false);
   useLayoutEffect(() => {
-    if (parsed.kind === "empty") onVisible();
-  }, [parsed.kind, onVisible]);
+    if (!onVisible) return;
+    let active = true;
+    let measuring = false;
+    let recheck = false;
+    let recorded = false;
+    const check = () => {
+      if (!active || !drawn.current || recorded || AppState.currentState !== "active") return;
+      if (measuring) {
+        recheck = true;
+        return;
+      }
+      const scroll = viewport.scroll.current?.getNativeScrollRef();
+      const diff = diffRef.current;
+      if (!scroll || !diff) return;
+      measuring = true;
+      scroll.measureInWindow((x, y, width, height) => {
+        if (!active) return;
+        diff.measureInWindow((diffX, diffY, diffWidth, diffHeight) => {
+          measuring = false;
+          if (!active || AppState.currentState !== "active") return;
+          if (recheck) {
+            recheck = false;
+            check();
+            return;
+          }
+          // Native draw events describe the diff's own viewport, which may be scrolled offscreen.
+          // Use unwrapped row heights to exclude blank space below a short diff.
+          const contentHeight = Math.min(diffHeight, minimumContentHeight ?? diffHeight);
+          const overlap = Math.min(y + height, diffY + contentHeight) - Math.max(y, diffY);
+          if (
+            width > 0 &&
+            diffWidth > 0 &&
+            contentHeight > 0 &&
+            diffX < x + width &&
+            x < diffX + diffWidth &&
+            overlap >= Math.min(24, contentHeight)
+          ) {
+            recorded = onVisible();
+          }
+        });
+      });
+    };
+    viewport.check.current = check;
+    check();
+    return () => {
+      active = false;
+      if (viewport.check.current === check) viewport.check.current = null;
+    };
+  }, [minimumContentHeight, onVisible, viewport]);
+  const markDrawn = () => {
+    drawn.current = true;
+    viewport.check.current?.();
+  };
   if (parsed.kind === "empty")
-    return <Text className="p-4 text-sm text-foreground-muted">No file changes.</Text>;
+    return (
+      <View className="p-4">
+        <View ref={diffRef} collapsable={false} onLayout={markDrawn}>
+          <Text className="text-sm text-foreground-muted">No file changes.</Text>
+        </View>
+      </View>
+    );
   if (!NativeView)
     return (
       <ErrorBanner
@@ -94,7 +188,12 @@ function SavedChanges({
       />
     );
   return (
-    <View style={{ height: 420 }}>
+    <View
+      ref={diffRef}
+      collapsable={false}
+      onLayout={() => viewport.check.current?.()}
+      style={{ height: SAVED_DIFF_VIEWPORT_HEIGHT }}
+    >
       <NativeView
         style={{ flex: 1 }}
         appearanceScheme={themeAppearance}
@@ -109,8 +208,17 @@ function SavedChanges({
         collapsedFileIdsJson={bridge.collapsedFileIdsJson}
         onDebug={(event) => {
           bridge.onDebug(event);
-          if (parsed.kind === "files" && isNativeReviewDiffDrawEvent(event.nativeEvent))
-            onVisible();
+          const metrics = event.nativeEvent;
+          if (
+            !drawn.current &&
+            parsed.kind === "files" &&
+            (Platform.OS === "ios"
+              ? metrics.message === "draw-metrics" &&
+                typeof metrics.drawnRows === "number" &&
+                metrics.drawnRows > 0
+              : isNativeReviewDiffDrawEvent(metrics))
+          )
+            markDrawn();
         }}
         onToggleFile={(event) => {
           const id = event.nativeEvent.fileId;
@@ -130,6 +238,10 @@ export function SavedWorkflowResults({
   call,
   refresh,
   canConfigure,
+  collapsed = false,
+  openReviewKey = null,
+  reviewViewport,
+  focused,
   onReviewTargetChange,
 }: {
   scope: WorkflowScope;
@@ -137,6 +249,10 @@ export function SavedWorkflowResults({
   call: Call;
   refresh: () => Promise<void>;
   canConfigure: boolean;
+  collapsed?: boolean;
+  openReviewKey?: string | null;
+  reviewViewport: ReviewViewport;
+  focused: boolean;
   onReviewTargetChange?: (current: boolean) => void;
 }) {
   const [index, setIndex] = useState<{
@@ -146,11 +262,17 @@ export function SavedWorkflowResults({
     threadId: ThreadId;
     generation: number;
   } | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selection, setSelection] = useState<{
+    resultId: string | null;
+    reviewKey: string | null;
+  }>({ resultId: null, reviewKey: null });
   const [browsingHistory, setBrowsingHistory] = useState(false);
   const selectedRef = useRef<string | null>(null);
-  selectedRef.current = selected;
-  const [view, setView] = useState<"changes" | "conversation">("changes");
+  selectedRef.current = selection.resultId;
+  const [tab, setTab] = useState<{ view: SavedResultView; reviewKey: string | null }>({
+    view: "changes",
+    reviewKey: null,
+  });
   const [loaded, setLoaded] = useState<SavedWorkflowResultRead | null>(null);
   const [conversation, setConversation] = useState<{
     resultId: string;
@@ -223,7 +345,11 @@ export function SavedWorkflowResults({
                 : data.results,
           }));
           setError(null);
-          setSelected((id) => id ?? data.results[0]?.resultId ?? null);
+          setSelection((previous) =>
+            previous.resultId || !data.results[0]
+              ? previous
+              : { ...previous, resultId: data.results[0].resultId },
+          );
         }
       })
       .catch(() => {
@@ -250,21 +376,29 @@ export function SavedWorkflowResults({
     deleted,
     waitingForThread,
   ]);
-  const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
   const currentResult = currentWorkflowSavedResult(job, index?.results ?? []);
+  // A new inspection starts on the exact diff, including when its index entry arrives later.
+  const followingReview = openReviewKey !== null && selection.reviewKey !== openReviewKey;
+  const result = followingReview
+    ? currentResult
+    : (index?.results.find((entry) => entry.resultId === selection.resultId) ?? null);
+  const view = openReviewKey !== null && tab.reviewKey !== openReviewKey ? "changes" : tab.view;
   const reviewingCurrent = !!result && result.resultId === currentResult?.resultId;
   useLayoutEffect(() => {
     onReviewTargetChange?.(reviewingCurrent);
   }, [onReviewTargetChange, reviewingCurrent]);
-  const selectResult = (id: string | null) => {
+  const selectResult = (resultId: string) => {
     setBrowsingHistory(true);
-    setSelected(id);
+    setSelection({ resultId, reviewKey: openReviewKey });
   };
   const returnToCurrent = () => {
-    setView("changes");
+    setTab({ view: "changes", reviewKey: openReviewKey });
     setBrowsingHistory(false);
-    if (currentResult) setSelected(currentResult.resultId);
-    else setRetry((n) => n + 1);
+    if (currentResult) setSelection({ resultId: currentResult.resultId, reviewKey: null });
+    else {
+      if (openReviewKey !== null) setSelection((previous) => ({ ...previous, reviewKey: null }));
+      setRetry((n) => n + 1);
+    }
   };
   const resultLabel = reviewingCurrent
     ? job.status === "awaiting_review"
@@ -277,7 +411,10 @@ export function SavedWorkflowResults({
     const id = ++request.current;
     setLoaded(null);
     setConversation(null);
-    if (!result) return;
+    if (!result) {
+      setBusy(false);
+      return;
+    }
     setBusy(true);
     setError(null);
     void reader
@@ -307,17 +444,30 @@ export function SavedWorkflowResults({
   const recorded = useRef<string | null>(null);
   const visible = useCallback(() => {
     const checkpoint = workflowResultCheckpoint(job.progress?.checkpoint);
-    if (!loaded || !checkpoint || job.status !== "awaiting_review") return;
-    const key = `${checkpoint.checkpointId}:${loaded.result.resultId}`;
-    if (recorded.current === key) return;
-    recorded.current = key;
+    const current =
+      appAtomRegistry.get(workflowJobReadAtom).jobs[workflowSessionKey(scope, job.jobId)]?.job;
+    const currentCheckpoint = workflowResultCheckpoint(current?.progress?.checkpoint);
+    if (
+      !loaded ||
+      !checkpoint ||
+      !currentCheckpoint ||
+      current?.status !== "awaiting_review" ||
+      !sameWorkflowResultCheckpoint(checkpoint, currentCheckpoint) ||
+      !isCurrentWorkflowReviewResult(current, loaded.result)
+    )
+      return false;
+    const key = JSON.stringify([checkpoint, loaded.result.resultId]);
+    if (recorded.current === key) return true;
     const visit = uuidv4();
     beginWorkflowReview(appAtomRegistry, scope, job.jobId, visit, checkpoint);
     if (recordSavedWorkflowReviewDiff(appAtomRegistry, scope, job.jobId, visit, loaded.result)) {
+      recorded.current = key;
       requireFreshWorkflowReviewRead(appAtomRegistry, scope, job.jobId);
       void refresh();
+      return true;
     }
-  }, [loaded, job.progress?.checkpoint, job.status, job.jobId, scope, refresh]);
+    return false;
+  }, [loaded, job.progress?.checkpoint, job.jobId, scope, refresh]);
   const history = useCallback(
     async (more = false) => {
       if (!result || job.runtime?.kind !== "vm") return;
@@ -472,6 +622,7 @@ export function SavedWorkflowResults({
       }
     }
   };
+  if (collapsed) return null;
   if (deleted)
     return (
       <Text className="p-4 text-sm text-foreground-muted">
@@ -535,7 +686,7 @@ export function SavedWorkflowResults({
           <Pressable
             key={entry.resultId}
             accessibilityRole="button"
-            accessibilityState={{ selected: entry.resultId === selected }}
+            accessibilityState={{ selected: entry.resultId === result?.resultId }}
             className="mr-2 min-h-11 justify-center rounded-lg bg-card px-3"
             onPress={() => selectResult(entry.resultId)}
           >
@@ -567,14 +718,25 @@ export function SavedWorkflowResults({
           { value: "conversation", label: "Conversation" },
         ]}
         selected={view}
-        onSelect={setView}
+        onSelect={(view) => setTab({ view, reviewKey: openReviewKey })}
       />
       {!waitingForThread && (!index || busy) && !error ? (
         <Text accessibilityRole="text" className="text-sm text-foreground-muted">
           Loading saved {view}…
         </Text>
       ) : null}
-      {(waitingForThread || index) && !result ? (
+      {followingReview && index && !result && !error ? (
+        <View className="gap-1">
+          <Text className="text-sm text-foreground-muted">
+            The current saved diff hasn’t loaded.
+          </Text>
+          <SettingsActionRow
+            icon="arrow.clockwise"
+            label="Refresh results"
+            onPress={() => setRetry((n) => n + 1)}
+          />
+        </View>
+      ) : (waitingForThread || index) && !result ? (
         <Text className="text-sm text-foreground-muted">
           {job.status === "failed" || job.status === "cancelled"
             ? "No safely captured Agent result is available."
@@ -582,7 +744,14 @@ export function SavedWorkflowResults({
         </Text>
       ) : null}
       {view === "changes" && loaded && loaded.result.resultId === result?.resultId ? (
-        <SavedChanges read={loaded} onVisible={visible} />
+        <SavedChanges
+          key={JSON.stringify([openReviewKey, loaded.result.resultId, loaded.result.patch.sha256])}
+          read={loaded}
+          viewport={reviewViewport}
+          onVisible={
+            focused && job.status === "awaiting_review" && reviewingCurrent ? visible : undefined
+          }
+        />
       ) : null}
       {view === "conversation" && conversation && conversation.resultId === result?.resultId ? (
         <View>
