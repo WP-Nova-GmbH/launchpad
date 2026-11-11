@@ -13,7 +13,6 @@ import { RelayConfiguration } from "../Config.ts";
 import { RelayDb } from "../db.ts";
 import { RelaySecretBox } from "../auth/SecretBox.ts";
 import * as Store from "./Store.ts";
-import { UserDirectory } from "../tenancy/UserDirectory.ts";
 import * as Linear from "./Linear.ts";
 import * as EventFence from "../workflowEvents/Fence.ts";
 import type { WorkflowTrigger } from "@t3tools/contracts/workflows";
@@ -29,71 +28,129 @@ const uuid = Crypto.Crypto.pipe(
 export const configuredApp = RelayConfiguration.pipe(
   Effect.map((c) => c.linearWorkflow?.clientId.trim() || null),
 );
-export const owner = Effect.fn("workflowSources.owner")(function* (user: string) {
-  return yield* Store.ownerSnapshot(user, yield* configuredApp);
+const configuration = Effect.fn("workflowSources.organizationConfiguration")(function* (
+  org: string,
+) {
+  const config = yield* Linear.configuration;
+  if (config.organizationId !== org || (yield* Store.configuredFor(org)) !== config.clientId)
+    return yield* Store.fail(
+      "service_configuration",
+      "Linear workflow authorization is unavailable for this organization.",
+    );
+  return config;
 });
-export const repository = Effect.fn("workflowSources.repository")(function* (
-  repo: string,
+
+// Keep the claim until its worker settles, even when the admin cancels the attempt.
+// An abandoned claim can only be replaced by a fresh authorization, never a token refresh.
+const exchangeLeaseMs = 30_000;
+const finishFailedExchange = Effect.fn("workflowSources.finishFailedExchange")(function* (
+  a: Store.Attempt,
+  uncertain: boolean,
+  error: WorkflowSourceError["code"],
+) {
+  const sql = (yield* RelayDb).$client;
+  if (uncertain && a.connection_id && a.expected_epoch !== null) {
+    yield* sql`UPDATE relay_workflow_connections SET status='reconnect_required',authorization_epoch=authorization_epoch+1,
+      credential_version=credential_version+1,payload_sealed=NULL,delivery_evidence=NULL,
+      health=${Store.json({ code: "reconnect_required", retryAt: null })}::jsonb
+      WHERE organization_id=${a.organization_id} AND application_id=${a.application_id} AND connection_id=${a.connection_id}
+        AND authorization_epoch=${a.expected_epoch} AND status='connected'`;
+  }
+  yield* sql`UPDATE relay_workflow_authorizations SET exchange_lease_until=NULL,version=version+1,pending_sealed=NULL,
+    status=CASE WHEN status='exchanging' THEN 'failed' ELSE status END,
+    error=CASE WHEN status='exchanging' OR (status='cancelled' AND ${uncertain}) THEN ${uncertain ? "reconnect_required" : error} ELSE error END
+    WHERE organization_id=${a.organization_id} AND application_id=${a.application_id} AND attempt_id=${a.attempt_id}`;
+});
+
+const recoverAbandonedExchange = Effect.fn("workflowSources.recoverAbandonedExchange")(function* (
+  org: string,
+  app: string,
   user: string,
 ) {
-  const app = yield* configuredApp;
-  const snapshot = yield* Store.repositorySnapshot(repo, user, app);
-  const directory = yield* UserDirectory;
-  const profiles = yield* directory
-    .lookup({ userIds: snapshot.sources.map((s) => s.source.ownerUserId) })
-    .pipe(Effect.timeoutOption("2 seconds"));
-  const current = yield* Store.repositorySnapshot(repo, user, app);
-  return {
-    ...current,
-    sources: current.sources.map((entry) => ({
-      ...entry,
-      source: {
-        ...entry.source,
-        ownerLabel:
-          profiles._tag === "Some"
-            ? (profiles.value.get(entry.source.ownerUserId)?.displayName ??
-              entry.source.ownerUserId)
-            : entry.source.ownerUserId,
-      },
-    })),
-  };
+  const sql = (yield* RelayDb).$client;
+  const hint = yield* Store.attempt(org, app);
+  if (!hint?.exchange_lease_until || Date.parse(hint.exchange_lease_until) > (yield* Store.now))
+    return;
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* Store.organizationAdmin(org, user);
+      const a = yield* Store.attempt(org, app, true);
+      if (a?.exchange_lease_until && Date.parse(a.exchange_lease_until) <= (yield* Store.now))
+        yield* finishFailedExchange(a, true, "reconnect_required");
+    }),
+  );
 });
-const owned = Effect.fn("workflowSources.owned")(function* (id: string, user: string) {
-  const c = yield* Store.connection(id);
-  if (!c || c.owner_user_id !== user)
-    return yield* Store.fail("not_found", "Owned source not found.");
+export const owner = Effect.fn("workflowSources.owner")(function* (org: string, user: string) {
+  const app = yield* Store.configuredFor(org);
+  if (app) yield* recoverAbandonedExchange(org, app, user);
+  return yield* Store.ownerSnapshot(org, user);
+});
+export const repository = Store.repositorySnapshot;
+
+const organizationConnection = Effect.fn("workflowSources.organizationConnection")(function* (
+  org: string,
+  app: string,
+  id: string,
+  lock = false,
+) {
+  const c = yield* Store.installed(org, app, lock);
+  if (!c || c.connection_id !== id)
+    return yield* Store.fail("not_found", "Organization source not found.");
   return c;
 });
+
 export const begin = Effect.fn("workflowSources.begin")(function* (
+  org: string,
   user: string,
   input: typeof BeginWorkflowSource.Type,
 ) {
-  const config = yield* Linear.configuration;
+  const config = yield* configuration(org);
+  // Resolve a crashed exchange before comparing the caller's version.
+  yield* recoverAbandonedExchange(org, config.clientId, user);
   const box = yield* RelaySecretBox;
-  const pending = { state: (yield* uuid) + (yield* uuid), verifier: (yield* uuid) + (yield* uuid) };
-  const sealed = yield* box.seal(Store.json(pending));
-  const stateHash = yield* Linear.hash(pending.state);
-  const time = yield* Store.now;
+  const state = (yield* uuid) + (yield* uuid);
+  const verifier = (yield* uuid) + (yield* uuid);
+  const stateHash = yield* Linear.hash(state);
   const sql = (yield* RelayDb).$client;
   const saved = yield* sql.withTransaction(
     Effect.gen(function* () {
-      yield* sql`INSERT INTO relay_workflow_authorizations (owner_user_id,application_id) VALUES (${user},${config.clientId}) ON CONFLICT DO NOTHING`;
-      const a = (yield* Store.attempt(user, config.clientId, true))!;
-      if (a.attempt_id === input.attemptId) return a;
+      yield* Store.organizationAdmin(org, user);
+      yield* sql`INSERT INTO relay_workflow_authorizations (organization_id,application_id) VALUES (${org},${config.clientId}) ON CONFLICT DO NOTHING`;
+      const a = yield* Store.attempt(org, config.clientId, true);
+      if (!a)
+        return yield* Store.fail(
+          "service_configuration",
+          "The Linear app is bound to another organization.",
+        );
+      if (a.exchange_lease_until) return yield* Store.exchangeInProgress(a.exchange_lease_until);
+      if (a.attempt_id === input.attemptId) {
+        if (a.initiating_user_id !== user || a.connection_id !== input.connectionId)
+          return yield* Store.fail(
+            "conflict",
+            "This authorization attempt belongs to another request.",
+          );
+        return a;
+      }
       if (a.version !== input.expectedVersion)
         return yield* Store.fail(
           "conflict",
           "Authorization changed. Refresh before starting again.",
         );
-      const c = input.connectionId ? yield* owned(input.connectionId, user) : null;
-      if (c && c.application_id !== config.clientId)
+      const c = yield* Store.installed(org, config.clientId, true);
+      if ((c?.connection_id ?? null) !== input.connectionId)
         return yield* Store.fail(
-          "service_configuration",
-          "This connection belongs to a different Linear application.",
+          "conflict",
+          "Reconnect the organization's existing Linear workspace.",
         );
-      const startedAt = yield* EventFence.timestamp;
+      const sealed = yield* box.seal(
+        Store.json({ state, verifier, reconnect: !!c || a.error === "reconnect_required" }),
+      );
+      const time = yield* Store.now;
       const [updated] =
-        yield* sql<Store.Attempt>`UPDATE relay_workflow_authorizations SET started_at=${startedAt},version=version+1,attempt_id=${input.attemptId},connection_id=${input.connectionId},expected_epoch=${c?.authorization_epoch ?? null},state_hash=${stateHash},pending_sealed=${sealed},expires_at=${Store.iso(time + 600_000)},status='pending',error=NULL WHERE owner_user_id=${user} AND application_id=${config.clientId} RETURNING *`;
+        yield* sql<Store.Attempt>`UPDATE relay_workflow_authorizations SET started_at=NULL,version=version+1,
+      attempt_id=${input.attemptId},initiating_user_id=${user},connection_id=${input.connectionId},expected_epoch=${c?.authorization_epoch ?? null},
+      state_hash=${stateHash},pending_sealed=${sealed},expires_at=${Store.iso(time + 600_000)},status='pending',error=NULL
+      WHERE organization_id=${org} AND application_id=${config.clientId} RETURNING *`;
       return updated!;
     }),
   );
@@ -110,38 +167,52 @@ export const begin = Effect.fn("workflowSources.begin")(function* (
             .pipe(Effect.flatMap(decodePending), Effect.flatMap(Linear.authorizationUrl)),
         }
       : null;
-  // The snapshot may already contain a newer attempt; it never identifies this link.
-  return { authorization, owner: yield* owner(user) };
+  return { authorization, owner: yield* Store.ownerSnapshot(org, user) };
 });
-export const cancel = Effect.fn("workflowSources.cancel")(function* (user: string, id: string) {
+export const cancel = Effect.fn("workflowSources.cancel")(function* (
+  org: string,
+  user: string,
+  id: string,
+) {
+  const config = yield* configuration(org);
   const sql = (yield* RelayDb).$client;
-  yield* sql`UPDATE relay_workflow_authorizations SET version=version+1,status='cancelled',state_hash=NULL,pending_sealed=NULL,error=NULL WHERE owner_user_id=${user} AND attempt_id=${id} AND status IN ('pending','exchanging')`;
-  return yield* owner(user);
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* Store.organizationAdmin(org, user);
+      yield* sql`UPDATE relay_workflow_authorizations SET version=version+1,status='cancelled',state_hash=NULL,pending_sealed=NULL,error=NULL
+      WHERE organization_id=${org} AND application_id=${config.clientId} AND attempt_id=${id} AND status IN ('pending','exchanging')`;
+    }),
+  );
+  return yield* owner(org, user);
 });
 export const disconnect = Effect.fn("workflowSources.disconnect")(function* (
+  org: string,
   user: string,
   id: string,
   epoch: number,
 ) {
-  const c = yield* owned(id, user);
   const sql = (yield* RelayDb).$client;
   yield* sql.withTransaction(
     Effect.gen(function* () {
-      // OAuth finalization uses this same attempt -> connection order.
-      yield* Store.attempt(user, c.application_id, true);
-      const [current] =
-        yield* sql<Store.Connection>`SELECT * FROM relay_workflow_connections WHERE connection_id=${id} AND owner_user_id=${user} FOR UPDATE`;
-      if (current?.status === "disconnected") return;
-      if (!current || current.authorization_epoch !== epoch)
+      yield* Store.organizationAdmin(org, user);
+      const hint = yield* Store.connection(id);
+      if (!hint || hint.organization_id !== org)
+        return yield* Store.fail("not_found", "Organization source not found.");
+      yield* Store.attempt(org, hint.application_id, true);
+      const current = yield* organizationConnection(org, hint.application_id, id, true);
+      if (current.status === "disconnected") return;
+      if (current.authorization_epoch !== epoch)
         return yield* Store.fail(
           "conflict",
           "The connection changed. Refresh before disconnecting.",
         );
-      yield* sql`UPDATE relay_workflow_authorizations SET version=version+1,status='cancelled',state_hash=NULL,pending_sealed=NULL,error=NULL WHERE owner_user_id=${user} AND application_id=${c.application_id} AND (connection_id=${id} OR connection_id IS NULL) AND status IN ('pending','exchanging')`;
-      yield* sql`UPDATE relay_workflow_connections SET status='disconnected',authorization_epoch=authorization_epoch+1,credential_version=credential_version+1,payload_sealed=NULL,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL,health=${Store.json(Store.healthy)}::jsonb WHERE connection_id=${id}`;
+      yield* sql`UPDATE relay_workflow_authorizations SET version=version+1,status='cancelled',state_hash=NULL,pending_sealed=NULL,error=NULL
+      WHERE organization_id=${org} AND application_id=${hint.application_id} AND status IN ('pending','exchanging')`;
+      yield* sql`UPDATE relay_workflow_connections SET status='disconnected',authorization_epoch=authorization_epoch+1,credential_version=credential_version+1,
+      payload_sealed=NULL,delivery_evidence=NULL,health=${Store.json(Store.healthy)}::jsonb WHERE connection_id=${id}`;
     }),
   );
-  return yield* owner(user);
+  return yield* owner(org, user);
 });
 export const callback = Effect.fn("workflowSources.callback")(function* (
   state: string,
@@ -151,90 +222,180 @@ export const callback = Effect.fn("workflowSources.callback")(function* (
   if (!state || state.length > 256 || (code && code.length > 16_384))
     return yield* Store.fail("invalid_input", "Invalid authorization callback.");
   const sql = (yield* RelayDb).$client;
-  const time = yield* Store.now;
+  const config = yield* Linear.configuration;
+  const org = config.organizationId;
+  const app = config.clientId;
   const digest = yield* Linear.hash(state);
-  const [claimed] =
-    yield* sql<Store.Attempt>`UPDATE relay_workflow_authorizations SET status='exchanging',version=version+1,state_hash=NULL WHERE state_hash=${digest} AND status='pending' AND expires_at>${Store.iso(time)} RETURNING *`;
-  if (!claimed?.attempt_id || !claimed.pending_sealed)
+  const [hint] =
+    yield* sql<Store.Attempt>`SELECT * FROM relay_workflow_authorizations WHERE organization_id=${org} AND application_id=${app} AND state_hash=${digest}`;
+  if (!hint?.attempt_id || !hint.initiating_user_id)
     return yield* Store.fail(
       "conflict",
-      "This authorization expired or has already been handled. Refresh Connections.",
+      "This authorization expired or has already been handled. Refresh Organization settings.",
     );
-  const attemptId = claimed.attempt_id;
-  const complete = Effect.gen(function* () {
+  const initiator = hint.initiating_user_id;
+  const attemptId = hint.attempt_id;
+  const claimed = yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* Store.organizationAdmin(org, initiator);
+      yield* configuration(org);
+      const a = yield* Store.attempt(org, app, true);
+      const now = yield* Store.now;
+      if (
+        !a ||
+        a.attempt_id !== attemptId ||
+        a.initiating_user_id !== initiator ||
+        a.status !== "pending" ||
+        a.state_hash !== digest ||
+        !a.pending_sealed ||
+        !a.expires_at ||
+        Date.parse(a.expires_at) <= now
+      )
+        return yield* Store.fail(
+          "conflict",
+          "This authorization expired or has already been handled. Refresh Organization settings.",
+        );
+      if (a.exchange_lease_until) return yield* Store.exchangeInProgress(a.exchange_lease_until);
+      const c = yield* Store.installed(org, app, true);
+      if (
+        (c?.connection_id ?? null) !== a.connection_id ||
+        (c?.authorization_epoch ?? null) !== a.expected_epoch
+      )
+        return yield* Store.fail("conflict", "The source changed during authorization.");
+      if (!denied && code && c?.lease_until && Date.parse(c.lease_until) > now)
+        return yield* Store.fail(
+          "refresh_in_progress",
+          "Linear credentials are refreshing. Reload this callback shortly.",
+          Date.parse(c.lease_until),
+        );
+      // Revocations older than this exchange belong to the previous authorization.
+      const exchangeStartedAt = yield* EventFence.timestamp;
+      const [claimed] =
+        yield* sql<Store.Attempt>`UPDATE relay_workflow_authorizations SET status='exchanging',version=version+1,
+      state_hash=NULL,started_at=${exchangeStartedAt},exchange_lease_until=${Store.iso(now + exchangeLeaseMs)}
+      WHERE organization_id=${org} AND application_id=${app} RETURNING *`;
+      return { attempt: claimed!, connection: c };
+    }),
+  );
+
+  let mayHaveRotated = false;
+  let committed = false;
+  let errorCode: WorkflowSourceError["code"] = "unavailable";
+  return yield* Effect.gen(function* () {
     if (denied || !code)
       return yield* Store.fail("invalid_input", "Linear authorization was cancelled.");
-    const config = yield* Linear.configuration;
-    if (config.clientId !== claimed.application_id)
-      return yield* Store.fail(
-        "service_configuration",
-        "Linear application configuration changed.",
-      );
     const box = yield* RelaySecretBox;
-    const pending = yield* box.open(claimed.pending_sealed!).pipe(Effect.flatMap(decodePending));
-    const tokens = yield* Linear.exchange({ code, verifier: pending.verifier });
+    const pending = yield* box
+      .open(claimed.attempt.pending_sealed!)
+      .pipe(Effect.flatMap(decodePending));
+    mayHaveRotated = true;
+    let grantIssued = false;
+    const tokens = yield* Linear.exchange({ code, verifier: pending.verifier }, () => {
+      grantIssued = true;
+    }).pipe(
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          // These explicit rejections occur before the provider issues credentials.
+          if (
+            !grantIssued &&
+            ["service_configuration", "rate_limited", "forbidden", "invalid_input"].includes(
+              error.code,
+            )
+          )
+            mayHaveRotated = false;
+        }),
+      ),
+    );
     const identity = yield* Linear.identity(tokens.accessToken);
+    if (claimed.connection && claimed.connection.workspace_id !== identity.organization.id) {
+      mayHaveRotated = false;
+      return yield* Store.fail(
+        "workspace_mismatch",
+        "Reconnect must use the organization's existing Linear workspace.",
+      );
+    }
+    if (identity.viewer.app !== true)
+      return yield* Store.fail(
+        "invalid_input",
+        "Linear did not authorize the app. Start the workspace installation again.",
+      );
     const sealed = yield* box.seal(Store.json(tokens));
-    const id = yield* uuid;
-    return yield* sql.withTransaction(
+    const id = claimed.connection?.connection_id ?? (yield* uuid);
+    const connectionId = yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* EventFence.lock(claimed.application_id, identity.organization.id);
-        const cutoff = yield* EventFence.revocationCutoff(
-          claimed.application_id,
-          identity.organization.id,
-        );
-        const current = yield* Store.attempt(claimed.owner_user_id, claimed.application_id, true);
+        yield* EventFence.lock(app, identity.organization.id);
+        yield* Store.organizationAdmin(org, initiator);
+        yield* configuration(org);
+        const cutoff = yield* EventFence.revocationCutoff(app, identity.organization.id);
+        const current = yield* Store.attempt(org, app, true);
+        const now = yield* Store.now;
         if (
-          cutoff &&
-          (!current?.started_at || Date.parse(current.started_at) <= Date.parse(cutoff))
+          !current ||
+          current.attempt_id !== attemptId ||
+          current.initiating_user_id !== initiator ||
+          current.status !== "exchanging" ||
+          current.exchange_lease_until !== claimed.attempt.exchange_lease_until ||
+          !current.exchange_lease_until ||
+          !current.started_at ||
+          Date.parse(current.exchange_lease_until) <= now ||
+          !current.expires_at ||
+          Date.parse(current.expires_at) <= now
         )
+          return yield* Store.fail("conflict", "Authorization changed. Start connecting again.");
+        if (cutoff && Date.parse(current.started_at) <= Date.parse(cutoff))
           return yield* Store.fail(
             "conflict",
             "Linear was revoked during this authorization. Start connecting again.",
           );
-        const stamp = yield* EventFence.timestamp;
+        const target = yield* Store.installed(org, app, true);
         if (
-          current?.attempt_id !== attemptId ||
-          current.status !== "exchanging" ||
-          Date.parse(current.expires_at!) <= (yield* Store.now)
-        )
-          return yield* Store.fail("conflict", "Authorization changed. Start connecting again.");
-        const [target] = current.connection_id
-          ? yield* sql<Store.Connection>`SELECT * FROM relay_workflow_connections WHERE connection_id=${current.connection_id} AND owner_user_id=${claimed.owner_user_id} FOR UPDATE`
-          : yield* sql<Store.Connection>`SELECT * FROM relay_workflow_connections WHERE owner_user_id=${claimed.owner_user_id} AND application_id=${claimed.application_id} AND workspace_id=${identity.organization.id} FOR UPDATE`;
-        if (
-          current.connection_id &&
-          (!target || target.authorization_epoch !== current.expected_epoch)
+          (target?.connection_id ?? null) !== current.connection_id ||
+          (target?.authorization_epoch ?? null) !== current.expected_epoch
         )
           return yield* Store.fail("conflict", "The source changed during authorization.");
-        if (target && target.workspace_id !== identity.organization.id)
-          return yield* Store.fail(
-            "workspace_mismatch",
-            "Reconnect must use the same Linear workspace. Use Connect for a different workspace.",
-          );
-        const connectionId = target?.connection_id ?? id;
-        if (target)
-          yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=NULL,authorization_started_at=${current?.started_at ?? null},payload_sealed=${sealed},status='connected',workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},authorization_epoch=authorization_epoch+1,credential_version=credential_version+1,activated_at=${stamp},health=${Store.json(Store.healthy)}::jsonb,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL WHERE connection_id=${connectionId}`;
-        else
-          yield* sql`INSERT INTO relay_workflow_connections (authorization_started_at,connection_id,owner_user_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES (${current?.started_at ?? null},${id},${claimed.owner_user_id},${claimed.application_id},${identity.organization.id},${identity.organization.name},${identity.viewer.name},'connected',${stamp},${sealed},${Store.json(Store.healthy)}::jsonb)`;
-        yield* sql`UPDATE relay_workflow_authorizations SET status='connected',version=version+1,connection_id=${connectionId},pending_sealed=NULL,error=NULL WHERE owner_user_id=${claimed.owner_user_id} AND application_id=${claimed.application_id}`;
-        return connectionId;
+        const stamp = yield* EventFence.timestamp;
+        if (target) {
+          yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=NULL,authorization_started_at=${current.started_at},payload_sealed=${sealed},status='connected',
+          workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},authorization_epoch=authorization_epoch+1,credential_version=credential_version+1,
+          activated_at=${stamp},health=${Store.json(Store.healthy)}::jsonb,lease_id=NULL,lease_until=NULL,refresh_started_at=NULL WHERE connection_id=${id}`;
+        } else {
+          yield* sql`INSERT INTO relay_workflow_connections (authorization_started_at,connection_id,organization_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health)
+          VALUES (${current.started_at},${id},${org},${app},${identity.organization.id},${identity.organization.name},${identity.viewer.name},'connected',${stamp},${sealed},${Store.json(Store.healthy)}::jsonb)`;
+        }
+        yield* sql`UPDATE relay_workflow_authorizations SET status='connected',version=version+1,connection_id=${id},exchange_lease_until=NULL,pending_sealed=NULL,error=NULL
+        WHERE organization_id=${org} AND application_id=${app}`;
+        return id;
       }),
     );
+    committed = true;
+    return connectionId;
   }).pipe(
     Effect.timeoutOrElse({
       duration: "8 seconds",
       orElse: () =>
-        Effect.fail(
-          Store.fail("unavailable", "Authorization was interrupted. Start connecting again."),
-        ),
+        Effect.fail(Store.fail("unavailable", "Authorization was interrupted. Reconnect Linear.")),
     }),
-  );
-  return yield* complete.pipe(
     Effect.tapError((error) =>
-      sql`UPDATE relay_workflow_authorizations SET status='failed',version=version+1,pending_sealed=NULL,error=${isSourceError(error) ? error.code : "unavailable"} WHERE owner_user_id=${claimed.owner_user_id} AND application_id=${claimed.application_id} AND attempt_id=${attemptId} AND status='exchanging'`.pipe(
-        Effect.ignore,
-      ),
+      Effect.sync(() => {
+        errorCode = isSourceError(error) ? error.code : "unavailable";
+      }),
+    ),
+    Effect.ensuring(
+      Effect.gen(function* () {
+        if (committed) return;
+        yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              const current = yield* Store.attempt(org, app, true);
+              if (
+                current?.attempt_id === attemptId &&
+                current.exchange_lease_until === claimed.attempt.exchange_lease_until
+              )
+                yield* finishFailedExchange(current, mayHaveRotated, errorCode);
+            }),
+          )
+          .pipe(Effect.ignore);
+      }),
     ),
   );
 });
@@ -270,20 +431,43 @@ const recordFailure = Effect.fn("workflowSources.recordFailure")(function* (
     refresh_started_at=CASE WHEN ${leaseId}::text IS NOT NULL AND ${c.refresh_started_at}::text IS NULL AND ${error.code !== "unavailable"} THEN NULL ELSE refresh_started_at END
     WHERE connection_id=${c.connection_id} AND status='connected'
       AND authorization_epoch=${c.authorization_epoch} AND credential_version=${c.credential_version}
+      AND NOT EXISTS (SELECT 1 FROM relay_workflow_authorizations a WHERE a.organization_id=${c.organization_id}
+        AND a.application_id=${c.application_id} AND a.exchange_lease_until IS NOT NULL)
       AND (${leaseId}::text IS NULL OR lease_id=${leaseId})`;
 });
 export const credentials = Effect.fn("workflowSources.credentials")(function* (
-  c: Store.Connection,
+  input: Store.Connection,
   force = false,
 ) {
-  const config = yield* Linear.configuration;
-  if (c.application_id !== config.clientId)
+  const config = yield* configuration(input.organization_id);
+  if (input.application_id !== config.clientId)
     return yield* Store.fail(
       "service_configuration",
       "This source belongs to a different Linear application.",
     );
-  if (c.status !== "connected" || !c.payload_sealed)
-    return yield* Store.fail("reconnect_required", "The source owner must reconnect Linear.");
+  const sql = (yield* RelayDb).$client;
+  const c = yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const a = yield* Store.attempt(input.organization_id, config.clientId);
+      if (a?.exchange_lease_until) return yield* Store.exchangeInProgress(a.exchange_lease_until);
+      const current = yield* organizationConnection(
+        input.organization_id,
+        config.clientId,
+        input.connection_id,
+      );
+      if (current.authorization_epoch !== input.authorization_epoch)
+        return yield* Store.fail(
+          "conflict",
+          "The Linear authorization changed. Refresh its status.",
+        );
+      if (!a || current.status !== "connected" || !current.payload_sealed)
+        return yield* Store.fail(
+          "reconnect_required",
+          "An organization admin must reconnect Linear.",
+        );
+      return { ...current, payload_sealed: current.payload_sealed };
+    }),
+  );
   const time = yield* Store.now;
   if (c.health.retryAt && c.health.retryAt > time)
     return yield* Store.fail(
@@ -295,10 +479,13 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
   const payload = yield* box.open(c.payload_sealed).pipe(Effect.flatMap(decodeCredentials));
   if (!force && c.health.code !== "service_configuration" && payload.expiresAt > time + 60_000)
     return { credentials: payload, connection: c };
-  const sql = (yield* RelayDb).$client;
   const lease = yield* uuid;
   // Capture pre-lease recovery state atomically; the caller may hold an older snapshot.
-  const [claimed] = yield* sql<Store.Connection & { prior_refresh_started_at: string | null }>`
+  const claimed = yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const a = yield* Store.attempt(c.organization_id, c.application_id);
+      if (a?.exchange_lease_until) return yield* Store.exchangeInProgress(a.exchange_lease_until);
+      const [row] = yield* sql<Store.Connection & { prior_refresh_started_at: string | null }>`
     WITH previous AS (
       SELECT connection_id,refresh_started_at FROM relay_workflow_connections
       WHERE connection_id=${c.connection_id} AND status='connected'
@@ -311,6 +498,9 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
       refresh_started_at=COALESCE(previous.refresh_started_at,${Store.iso(time)})
     FROM previous WHERE c.connection_id=previous.connection_id
     RETURNING c.*,previous.refresh_started_at AS prior_refresh_started_at`;
+      return row;
+    }),
+  );
   if (!claimed)
     return yield* Store.fail(
       "refresh_in_progress",
@@ -324,7 +514,7 @@ export const credentials = Effect.fn("workflowSources.credentials")(function* (
     )
       return yield* Store.fail(
         "reconnect_required",
-        "Credential recovery expired. The source owner must reconnect Linear.",
+        "Credential recovery expired. An organization admin must reconnect Linear.",
       );
     const tokens = yield* Linear.exchange({ refreshToken: payload.refreshToken });
     const sealed = yield* box.seal(Store.json(tokens));
@@ -383,11 +573,20 @@ export const refresh = Effect.fn("workflowSources.refresh")(function* (c: Store.
   yield* sql`UPDATE relay_workflow_connections SET workspace_name=${identity.organization.name},viewer_name=${identity.viewer.name},health=${Store.json(Store.healthy)}::jsonb WHERE connection_id=${c.connection_id} AND status='connected' AND authorization_epoch=${c.authorization_epoch} AND health->>'code'<>'service_configuration' AND ((health->>'retryAt')::double precision IS NULL OR (health->>'retryAt')::double precision<=${yield* Store.now})`;
 });
 export const refreshOwner = Effect.fn("workflowSources.refreshOwner")(function* (
+  org: string,
   user: string,
   id: string,
 ) {
-  yield* refresh(yield* owned(id, user));
-  return yield* owner(user);
+  const config = yield* configuration(org);
+  const sql = (yield* RelayDb).$client;
+  const c = yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* Store.organizationAdmin(org, user);
+      return yield* organizationConnection(org, config.clientId, id);
+    }),
+  );
+  yield* refresh(c);
+  return yield* owner(org, user);
 });
 
 const Cursor = Schema.Struct({

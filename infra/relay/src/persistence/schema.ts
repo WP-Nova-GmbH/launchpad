@@ -39,6 +39,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   varchar,
 } from "drizzle-orm/pg-core";
@@ -2659,7 +2660,7 @@ export const relayWorkflowConnections = pgTable(
   "relay_workflow_connections",
   {
     connectionId: text("connection_id").primaryKey(),
-    ownerUserId: text("owner_user_id").notNull(),
+    organizationId: text("organization_id").notNull(),
     applicationId: text("application_id").notNull(),
     workspaceId: text("workspace_id").notNull(),
     workspaceName: text("workspace_name").notNull(),
@@ -2677,18 +2678,17 @@ export const relayWorkflowConnections = pgTable(
     refreshStartedAt: text("refresh_started_at"),
   },
   (t) => [
-    uniqueIndex("workflow_connection_owner_workspace").on(
-      t.ownerUserId,
-      t.applicationId,
-      t.workspaceId,
-    ),
+    uniqueIndex("workflow_connection_organization").on(t.organizationId),
+    uniqueIndex("workflow_connection_application").on(t.applicationId),
+    unique("workflow_connection_id_organization").on(t.connectionId, t.organizationId),
   ],
 );
 export const relayWorkflowAuthorizations = pgTable(
   "relay_workflow_authorizations",
   {
-    ownerUserId: text("owner_user_id").notNull(),
+    organizationId: text("organization_id").notNull(),
     applicationId: text("application_id").notNull(),
+    initiatingUserId: text("initiating_user_id"),
     version: integer("version").notNull().default(0),
     attemptId: text("attempt_id"),
     startedAt: text("started_at"),
@@ -2697,11 +2697,14 @@ export const relayWorkflowAuthorizations = pgTable(
     stateHash: text("state_hash"),
     pendingSealed: text("pending_sealed"),
     expiresAt: text("expires_at"),
+    exchangeLeaseUntil: text("exchange_lease_until"),
     status: text("status"),
     error: text("error"),
   },
   (t) => [
-    primaryKey({ columns: [t.ownerUserId, t.applicationId] }),
+    primaryKey({ columns: [t.organizationId, t.applicationId] }),
+    uniqueIndex("workflow_authorization_application").on(t.applicationId),
+    uniqueIndex("workflow_authorization_organization").on(t.organizationId),
     uniqueIndex("workflow_authorization_state").on(t.stateHash),
   ],
 );
@@ -2712,7 +2715,6 @@ export const relayWorkflowRepositoryGrants = pgTable(
     connectionId: text("connection_id").notNull(),
     organizationId: text("organization_id").notNull(),
     repositoryId: text("repository_id").notNull(),
-    ownerUserId: text("owner_user_id").notNull(),
     generation: integer("generation").notNull(),
     revoked: boolean("revoked").notNull().default(false),
     createdAt: text("created_at").notNull(),
@@ -2724,7 +2726,15 @@ export const relayWorkflowRepositoryGrants = pgTable(
       .on(t.repositoryId, t.connectionId)
       .where(sql`NOT ${t.revoked}`),
     uniqueIndex("workflow_grant_generation").on(t.repositoryId, t.connectionId, t.generation),
-    index("workflow_grant_owner_org").on(t.ownerUserId, t.organizationId),
+    index("workflow_grant_organization").on(t.organizationId),
+    foreignKey({
+      name: "workflow_grant_connection_organization_fk",
+      columns: [t.connectionId, t.organizationId],
+      foreignColumns: [
+        relayWorkflowConnections.connectionId,
+        relayWorkflowConnections.organizationId,
+      ],
+    }),
   ],
 );
 

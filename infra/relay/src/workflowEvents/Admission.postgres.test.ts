@@ -12,11 +12,11 @@ import * as Workflows from "../jobs/Workflows.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import {
-  createConnection,
   databaseUrl,
   withDatabase,
   tokenReply,
   identityReply,
+  transport,
 } from "../workflowSources/test-fixture.ts";
 import * as Fence from "./Fence.ts";
 import * as Routing from "./Routing.ts";
@@ -35,6 +35,7 @@ import {
   enableBeforeEvent,
   receive,
   counts,
+  sign,
 } from "./test-fixture.ts";
 if (!databaseUrl)
   throw new Error(
@@ -42,6 +43,24 @@ if (!databaseUrl)
   );
 const decodeProof = Schema.decodeUnknownEffect(Routing.EnableProof);
 const testDb = <A, E, R>(effect: Effect.Effect<A, E, R>) => withDatabase(configured(effect));
+const gateExchange = Effect.fn(function* (state: string) {
+  const entered = yield* Deferred.make<void>();
+  const release = yield* Deferred.make<void>();
+  const callback = Sources.callback(state, "code").pipe(
+    Effect.provideService(
+      HttpClient.HttpClient,
+      HttpClient.make((req) =>
+        req.url.endsWith("/oauth/token")
+          ? Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(HttpClientResponse.fromWeb(req, Response.json(tokenReply))),
+            )
+          : Effect.succeed(HttpClientResponse.fromWeb(req, Response.json(identityReply))),
+      ),
+    ),
+  );
+  return { entered, release, callback };
+});
 // Hold the actual production transaction's locks after its writes, then start the contender.
 const ordered = Effect.fn(function* <A, E, R, B, F, S>(
   first: Effect.Effect<A, E, R>,
@@ -188,7 +207,7 @@ describe("verified event admission (PostgreSQL)", () => {
     "edit",
     "withdraw",
     "disconnect",
-    "member",
+    "installer-departure",
     "repository",
     "organization",
   ] as const) {
@@ -204,6 +223,8 @@ describe("verified event admission (PostgreSQL)", () => {
               const payload = issue(yield* clock);
               const event = yield* normalize(payload, "native-app");
               const store = yield* Workflows.make;
+              if (mutation === "installer-departure")
+                yield* sql`UPDATE relay_workflow_authorizations SET initiating_user_id='admin'`;
               const change =
                 mutation === "disable"
                   ? save("flow", trigger, false)
@@ -219,9 +240,9 @@ describe("verified event admission (PostgreSQL)", () => {
                       : mutation === "withdraw"
                         ? Store.withdraw("maintainer", "grant", "repo")
                         : mutation === "disconnect"
-                          ? Sources.disconnect("owner", "connection", 1)
-                          : mutation === "member"
-                            ? sql`DELETE FROM relay_organization_members WHERE user_id='owner'`
+                          ? Sources.disconnect("org", "admin", "connection", 1)
+                          : mutation === "installer-departure"
+                            ? sql`DELETE FROM relay_organization_members WHERE user_id='admin'`
                             : mutation === "repository"
                               ? sql`DELETE FROM relay_repositories WHERE repository_id='repo'`
                               : sql`DELETE FROM relay_organizations WHERE organization_id='org'`;
@@ -239,10 +260,15 @@ describe("verified event admission (PostgreSQL)", () => {
                   }),
                   admit(event),
                 );
-              expect((yield* counts).jobs).toBe(admissionFirst ? 1 : 0);
-              expect((yield* counts).occurrences).toBe(1);
+              const expected = admissionFirst || mutation === "installer-departure" ? 1 : 0;
+              expect((yield* counts).jobs).toBe(expected);
+              expect((yield* counts).occurrences).toBe(
+                !admissionFirst && (mutation === "disconnect" || mutation === "organization")
+                  ? 0
+                  : 1,
+              );
               expect((yield* receive(payload)).status).toBe(200);
-              expect((yield* counts).jobs).toBe(admissionFirst ? 1 : 0);
+              expect((yield* counts).jobs).toBe(expected);
             }),
           ),
       );
@@ -278,14 +304,14 @@ describe("verified event admission (PostgreSQL)", () => {
         yield* seed;
         yield* Store.allow(
           "repo-2",
-          "owner",
+          "admin",
           { grantId: "grant-2", connectionId: "connection", previousGrantId: null },
           "native-app",
         );
         yield* enableBeforeEvent("valid");
         const sql = (yield* RelayDb).$client;
         yield* sql`INSERT INTO relay_repository_workflows SELECT 'invalid','repo-2',revision,jsonb_set(jsonb_set(jsonb_set(record,'{workflowId}','"invalid"'),'{repositoryId}','"repo-2"'),'{automation,trigger,grantId}','"grant-2"'),automation_enabled,source_application_id,source_workspace_id,trigger_team_id,trigger_event,'grant-2',routing_generation,effective_after,target_capability FROM relay_repository_workflows WHERE workflow_id='valid'`;
-        yield* Store.withdraw("owner", "grant-2");
+        yield* Store.withdraw("admin", "grant-2");
         expect((yield* receive(issue(yield* clock))).status).toBe(200);
         expect((yield* counts).jobs).toBe(1);
       }),
@@ -308,6 +334,11 @@ describe("verified event admission (PostgreSQL)", () => {
           };
           const start = issue(yield* clock);
           yield* receive(start).pipe(Effect.provideService(RelayConfiguration, off));
+          expect(
+            (yield* receive({ ...start, webhookTimestamp: start.webhookTimestamp - 3600000 }).pipe(
+              Effect.provideService(RelayConfiguration, off),
+            )).status,
+          ).toBe(200);
           expect(Fence.covers((yield* Store.connection("connection"))!, "coverage-1", "team")).toBe(
             false,
           );
@@ -323,10 +354,9 @@ describe("verified event admission (PostgreSQL)", () => {
           expect(Fence.covers({ ...c, authorization_epoch: 2 }, "coverage-1", "team")).toBe(false);
           expect(Fence.covers(c, "coverage-1", "other-team")).toBe(false);
           expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources[0]?.source
-              .delivery,
+            (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.source.delivery,
           ).toBe("verified");
-          expect((yield* counts).jobs).toBe(0);
+          expect(yield* counts).toEqual({ occurrences: 2, admissions: 0, jobs: 0 });
         }),
       ),
   );
@@ -336,21 +366,29 @@ describe("verified event admission (PostgreSQL)", () => {
       testDb(
         Effect.gen(function* () {
           const sql = (yield* RelayDb).$client;
-          const pending = yield* Sources.begin("owner", {
+          const pending = yield* Sources.begin("org", "admin", {
             attemptId: "before-revocation",
             expectedVersion: 0,
             connectionId: null,
           });
-          const state = new URL(pending.authorization!.url).searchParams.get("state")!;
-          const attempt = yield* Store.attempt("owner", "native-app");
-          const stamp = Date.parse(attempt!.started_at!) + 1;
+          const gate = yield* gateExchange(
+            new URL(pending.authorization!.url).searchParams.get("state")!,
+          );
+          const callback = yield* gate.callback.pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(gate.entered);
+          const attempt = (yield* Store.attempt("org", "native-app"))!;
+          const stamp = Date.parse(attempt.started_at!);
           expect((yield* receive(revocation(stamp))).status).toBe(200);
-          expect(yield* Sources.callback(state, "code").pipe(Effect.flip)).toMatchObject({
+          expect(
+            yield* sql`SELECT facts FROM relay_workflow_occurrences WHERE event_type='revocation'`,
+          ).toEqual([{ facts: {} }]);
+          yield* Deferred.succeed(gate.release, undefined);
+          expect(yield* Fiber.join(callback)).toMatchObject({
             code: "conflict",
           });
           expect(yield* sql`SELECT * FROM relay_workflow_connections`).toHaveLength(0);
-          const current = yield* Store.attempt("owner", "native-app");
-          const later = yield* Sources.begin("owner", {
+          const current = yield* Store.attempt("org", "native-app");
+          const later = yield* Sources.begin("org", "admin", {
             attemptId: "later",
             expectedVersion: current!.version,
             connectionId: null,
@@ -426,40 +464,91 @@ describe("verified event admission (PostgreSQL)", () => {
         ),
     );
   it.live(
-    "revokes multiple owners only within the configured application/workspace and retains grants",
+    "isolates app revocation and issue deliveries from the old signing secret and unrelated workspaces",
     () =>
       testDb(
         Effect.gen(function* () {
           yield* seed;
           yield* enableBeforeEvent("one");
-          yield* createConnection("second", "maintainer");
-          yield* Store.allow(
-            "repo",
-            "maintainer",
-            { connectionId: "second", grantId: "second-grant", previousGrantId: null },
-            "native-app",
-          );
           const sql = (yield* RelayDb).$client;
-          const past = Store.iso((yield* clock) - 10000);
-          yield* sql`UPDATE relay_workflow_connections SET activated_at=${past},authorization_started_at=${past} WHERE connection_id='second'`;
-          yield* createConnection("other-workspace", "owner", false, "other-workspace");
-          yield* createConnection("other-app", "owner", false, "third-workspace");
-          yield* sql`UPDATE relay_workflow_connections SET application_id='another-app',workspace_id='workspace' WHERE connection_id='other-app'`;
-          expect((yield* receive(revocation(yield* clock))).status).toBe(200);
-          for (const id of ["connection", "second"])
-            expect((yield* Store.connection(id))?.status).toBe("reconnect_required");
-          for (const id of ["other-workspace", "other-app"])
-            expect((yield* Store.connection(id))?.status).toBe("connected");
+          const now = yield* clock;
+          for (const legacy of [{ ...revocation(now), oauthClientId: "legacy-app" }, issue(now)]) {
+            const signature = yield* sign(Store.json(legacy), "legacy-webhook-test-secret");
+            expect((yield* receive(legacy, { "linear-signature": signature })).status).toBe(401);
+          }
+          const reconnect = yield* Sources.begin("org", "admin", {
+            attemptId: "unrelated-workspace",
+            expectedVersion: 0,
+            connectionId: "connection",
+          });
+          expect(
+            yield* Sources.callback(
+              new URL(reconnect.authorization!.url).searchParams.get("state")!,
+              "wrong-workspace-code",
+            ).pipe(
+              Effect.provide(
+                transport((req) =>
+                  Response.json(
+                    req.url.endsWith("/oauth/token")
+                      ? tokenReply
+                      : {
+                          data: {
+                            ...identityReply.data,
+                            organization: { id: "other-workspace", name: "Unrelated" },
+                          },
+                        },
+                  ),
+                ),
+              ),
+              Effect.flip,
+            ),
+          ).toMatchObject({ code: "workspace_mismatch" });
+          const connection = yield* Store.connection("connection");
+          expect((yield* receive(issue(now, { organizationId: "other-workspace" }))).status).toBe(
+            200,
+          );
+          expect(yield* counts).toEqual({ occurrences: 0, jobs: 0, admissions: 0 });
+          expect(yield* Store.connection("connection")).toEqual(connection);
+          expect(
+            (yield* receive({ ...revocation(now), organizationId: "other-workspace" })).status,
+          ).toBe(200);
+          expect((yield* Store.connection("connection"))?.status).toBe("connected");
+          expect((yield* receive(revocation(now))).status).toBe(200);
+          expect((yield* Store.connection("connection"))?.status).toBe("reconnect_required");
           expect(
             yield* sql`SELECT grant_id FROM relay_workflow_repository_grants WHERE NOT revoked`,
-          ).toHaveLength(2);
+          ).toHaveLength(1);
           expect((yield* receive(issue((yield* clock) + 1))).status).toBe(200);
           expect((yield* counts).jobs).toBe(0);
         }),
       ),
   );
+  it.live("rejects intake if relay configuration tries to reassign the bound app", () =>
+    testDb(
+      Effect.gen(function* () {
+        yield* seed;
+        const mismatched = {
+          ...webhookConfig,
+          linearWorkflow: { ...webhookConfig.linearWorkflow!, organizationId: "other-org" },
+          linearWorkflowWebhook: {
+            ...webhookConfig.linearWorkflowWebhook,
+            organizationId: "other-org",
+          },
+        };
+        const payload = revocation(yield* clock);
+        expect(
+          (yield* receive(payload).pipe(Effect.provideService(RelayConfiguration, mismatched)))
+            .status,
+        ).toBe(503);
+        expect((yield* counts).occurrences).toBe(0);
+        expect((yield* Store.connection("connection"))?.status).toBe("connected");
+        expect((yield* receive(payload)).status).toBe(200);
+        expect((yield* Store.connection("connection"))?.status).toBe("reconnect_required");
+      }),
+    ),
+  );
   it.live(
-    "rejects stale/future unknown deliveries without making them known and records irrelevant no-match safely",
+    "rejects stale or future deliveries and ignores fresh issues without an installed connection",
     () =>
       testDb(
         Effect.gen(function* () {
@@ -475,7 +564,7 @@ describe("verified event admission (PostgreSQL)", () => {
           );
           expect((yield* counts).occurrences).toBe(0);
           expect((yield* receive(issue(time))).status).toBe(200);
-          expect((yield* counts).occurrences).toBe(1);
+          expect((yield* counts).occurrences).toBe(0);
         }),
       ),
   );
@@ -530,61 +619,71 @@ describe("verified event admission (PostgreSQL)", () => {
       ),
   );
 
-  it.live.each([false, true])(
-    "preserves a newer reconnect across delayed revocation (exchanging: %s)",
-    (exchanging) =>
+  it.live.each(["before exchange", "during exchange", "after commit"] as const)(
+    "preserves a newer reconnect when an old revocation arrives %s",
+    (arrival) =>
       testDb(
         Effect.gen(function* () {
           yield* seed;
-          const pending = yield* Sources.begin("owner", {
+          const sql = (yield* RelayDb).$client;
+          const pending = yield* Sources.begin("org", "admin", {
             attemptId: "later-reconnect",
             connectionId: "connection",
             expectedVersion: 0,
           });
-          const state = new URL(pending.authorization!.url).searchParams.get("state")!;
-          const attempt = (yield* Store.attempt("owner", "native-app"))!;
-          const revokedAt = Date.parse(attempt.started_at!) - 1;
-          const entered = yield* Deferred.make<void>();
-          const release = yield* Deferred.make<void>();
-          const callback = Sources.callback(state, "code").pipe(
-            Effect.provideService(
-              HttpClient.HttpClient,
-              HttpClient.make((req) =>
-                req.url.endsWith("/oauth/token")
-                  ? Deferred.succeed(entered, undefined).pipe(
-                      Effect.andThen(Deferred.await(release)),
-                      Effect.as(HttpClientResponse.fromWeb(req, Response.json(tokenReply))),
-                    )
-                  : Effect.succeed(HttpClientResponse.fromWeb(req, Response.json(identityReply))),
+          expect((yield* Store.attempt("org", "native-app"))?.started_at).toBeNull();
+          // The event occurred with consent open. Set the later exchange and activation
+          // timestamps explicitly so this ordering never depends on the clock advancing.
+          const revokedAt = yield* clock;
+          let stamp = revokedAt;
+          const gate = yield* gateExchange(
+            new URL(pending.authorization!.url).searchParams.get("state")!,
+          );
+          const callback = gate.callback.pipe(
+            Effect.provideService(CurrentTransformer, (statement) =>
+              Effect.succeed(
+                statement.compile()[0].includes("to_char(clock_timestamp()")
+                  ? sql`SELECT ${Store.iso(++stamp)}::text AS stamp`
+                  : statement,
               ),
             ),
           );
-          const fiber = exchanging ? yield* callback.pipe(Effect.forkChild) : null;
-          if (fiber) yield* Deferred.await(entered);
+          let fiber = arrival === "before exchange" ? null : yield* callback.pipe(Effect.forkChild);
+          if (fiber) yield* Deferred.await(gate.entered);
+          if (arrival === "after commit") {
+            yield* Deferred.succeed(gate.release, undefined);
+            expect(yield* Fiber.join(fiber!)).toBe("connection");
+          }
           expect((yield* receive(revocation(revokedAt))).status).toBe(200);
-          expect(yield* Store.connection("connection")).toMatchObject({
-            status: "reconnect_required",
-            payload_sealed: null,
-            delivery_evidence: null,
-            authorization_epoch: 2,
-          });
-          expect((yield* Store.attempt("owner", "native-app"))?.expected_epoch).toBe(2);
-          yield* Deferred.succeed(release, undefined);
-          expect(fiber ? yield* Fiber.join(fiber) : yield* callback).toBe("connection");
+          if (arrival !== "after commit") {
+            expect(yield* Store.connection("connection")).toMatchObject({
+              status: "reconnect_required",
+              payload_sealed: null,
+              delivery_evidence: null,
+              authorization_epoch: 2,
+            });
+            expect((yield* Store.attempt("org", "native-app"))?.expected_epoch).toBe(2);
+            fiber ??= yield* callback.pipe(Effect.forkChild);
+            yield* Deferred.succeed(gate.release, undefined);
+            expect(yield* Fiber.join(fiber)).toBe("connection");
+          }
           const connected = (yield* Store.connection("connection"))!;
           expect(connected).toMatchObject({
             status: "connected",
-            authorization_epoch: 3,
+            authorization_epoch: arrival === "after commit" ? 2 : 3,
+            authorization_started_at: Store.iso(revokedAt + 1),
+            activated_at: Store.iso(revokedAt + 2),
             delivery_evidence: null,
           });
           expect(connected.payload_sealed).not.toBeNull();
           expect((yield* receive(revocation(revokedAt))).status).toBe(200);
           expect((yield* receive(revocation(revokedAt - 1))).status).toBe(200);
-          expect((yield* Store.connection("connection"))?.authorization_epoch).toBe(3);
-          const sql = (yield* RelayDb).$client;
+          expect(yield* Store.connection("connection")).toEqual(connected);
           expect(
             yield* sql`SELECT grant_id FROM relay_workflow_repository_grants WHERE grant_id='grant' AND NOT revoked`,
           ).toHaveLength(1);
+          expect((yield* receive(revocation(revokedAt + 1))).status).toBe(200);
+          expect((yield* Store.connection("connection"))?.status).toBe("reconnect_required");
         }),
       ),
   );
@@ -593,36 +692,20 @@ describe("verified event admission (PostgreSQL)", () => {
     testDb(
       Effect.gen(function* () {
         yield* seed;
-        const pending = yield* Sources.begin("owner", {
+        const pending = yield* Sources.begin("org", "admin", {
           attemptId: "later-disconnect",
           connectionId: "connection",
           expectedVersion: 0,
         });
-        const attempt = (yield* Store.attempt("owner", "native-app"))!;
-        const entered = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const callback = yield* Sources.callback(
+        const gate = yield* gateExchange(
           new URL(pending.authorization!.url).searchParams.get("state")!,
-          "code",
-        ).pipe(
-          Effect.provideService(
-            HttpClient.HttpClient,
-            HttpClient.make((req) =>
-              req.url.endsWith("/oauth/token")
-                ? Deferred.succeed(entered, undefined).pipe(
-                    Effect.andThen(Deferred.await(release)),
-                    Effect.as(HttpClientResponse.fromWeb(req, Response.json(tokenReply))),
-                  )
-                : Effect.succeed(HttpClientResponse.fromWeb(req, Response.json(identityReply))),
-            ),
-          ),
-          Effect.flip,
-          Effect.forkChild,
         );
-        yield* Deferred.await(entered);
+        const callback = yield* gate.callback.pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(gate.entered);
+        const attempt = (yield* Store.attempt("org", "native-app"))!;
         expect((yield* receive(revocation(Date.parse(attempt.started_at!) - 1))).status).toBe(200);
-        yield* Sources.disconnect("owner", "connection", 2);
-        yield* Deferred.succeed(release, undefined);
+        yield* Sources.disconnect("org", "admin", "connection", 2);
+        yield* Deferred.succeed(gate.release, undefined);
         expect(yield* Fiber.join(callback)).toMatchObject({ code: "conflict" });
         expect(yield* Store.connection("connection")).toMatchObject({
           status: "disconnected",
@@ -631,81 +714,74 @@ describe("verified event admission (PostgreSQL)", () => {
       }),
     ),
   );
-  it.live.each(["before", "tie", "null", "expired"])(
-    "does not forward a %s reconnect attempt",
-    (kind) =>
+  it.live.each([0, 1])(
+    "blocks reconnect when the revocation occurs %d ms after exchange starts",
+    (offset) =>
       testDb(
         Effect.gen(function* () {
           yield* seed;
-          const pending = yield* Sources.begin("owner", {
+          const pending = yield* Sources.begin("org", "admin", {
             attemptId: "blocked",
             expectedVersion: 0,
             connectionId: "connection",
           });
-          const stamp = yield* clock;
-          const sql = (yield* RelayDb).$client;
-          const start =
-            kind === "null"
-              ? null
-              : Store.iso(stamp + (kind === "expired" ? 1 : kind === "before" ? -1 : 0));
-          yield* sql`UPDATE relay_workflow_authorizations SET started_at=${start},expires_at=${Store.iso(stamp + (kind === "expired" ? -1 : 600000))}`;
-          expect((yield* receive(revocation(stamp))).status).toBe(200);
-          expect((yield* Store.attempt("owner", "native-app"))?.expected_epoch).toBe(1);
-          expect(
-            yield* Sources.callback(
-              new URL(pending.authorization!.url).searchParams.get("state")!,
-              "code",
-            ).pipe(Effect.flip),
-          ).toMatchObject({ code: "conflict" });
+          const gate = yield* gateExchange(
+            new URL(pending.authorization!.url).searchParams.get("state")!,
+          );
+          const callback = yield* gate.callback.pipe(Effect.flip, Effect.forkChild);
+          yield* Deferred.await(gate.entered);
+          const attempt = (yield* Store.attempt("org", "native-app"))!;
+          const boundary = Date.parse(attempt.started_at!);
+          expect((yield* receive(revocation(boundary + offset))).status).toBe(200);
+          expect((yield* Store.attempt("org", "native-app"))?.expected_epoch).toBe(1);
+          yield* Deferred.succeed(gate.release, undefined);
+          expect(yield* Fiber.join(callback)).toMatchObject({ code: "conflict" });
           expect((yield* Store.connection("connection"))?.payload_sealed).toBeNull();
         }),
       ),
   );
 
-  it.live(
-    "preserves a completed newer reconnect when the older notification arrives afterward",
-    () =>
-      testDb(
-        Effect.gen(function* () {
-          yield* seed;
-          const pending = yield* Sources.begin("owner", {
-            attemptId: "completed",
-            expectedVersion: 0,
-            connectionId: "connection",
-          });
-          const attempt = (yield* Store.attempt("owner", "native-app"))!;
+  it.live("does not forward an expired pending reconnect attempt", () =>
+    testDb(
+      Effect.gen(function* () {
+        yield* seed;
+        const pending = yield* Sources.begin("org", "admin", {
+          attemptId: "expired",
+          expectedVersion: 0,
+          connectionId: "connection",
+        });
+        const sql = (yield* RelayDb).$client;
+        const stamp = yield* clock;
+        const expiredAt = Store.iso(Date.parse(yield* Fence.timestamp) - 1);
+        yield* sql`UPDATE relay_workflow_authorizations SET expires_at=${expiredAt}`;
+        expect((yield* receive(revocation(stamp))).status).toBe(200);
+        expect((yield* Store.attempt("org", "native-app"))?.expected_epoch).toBe(1);
+        expect(
           yield* Sources.callback(
             new URL(pending.authorization!.url).searchParams.get("state")!,
             "code",
-          );
-          const installed = yield* Store.connection("connection");
-          expect((yield* receive(revocation(Date.parse(attempt.started_at!) - 1))).status).toBe(
-            200,
-          );
-          expect(yield* Store.connection("connection")).toEqual(installed);
-        }),
-      ),
+          ).pipe(Effect.flip),
+        ).toMatchObject({ code: "conflict" });
+      }),
+    ),
   );
 
   it.live("serializes a concurrent Begin before forwarding the later reconnect", () =>
     testDb(
       Effect.gen(function* () {
         yield* seed;
-        const entered = yield* Deferred.make<number>();
+        const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const attemptingRevocation = yield* Deferred.make<void>();
-        const begin = yield* Sources.begin("owner", {
+        const begin = yield* Sources.begin("org", "admin", {
           attemptId: "concurrent",
           expectedVersion: 0,
           connectionId: "connection",
         }).pipe(
           Effect.provideService(CurrentTransformer, (statement) =>
             Effect.gen(function* () {
-              if (statement.compile()[0].includes("SET started_at=")) {
-                const startedAt = statement.compile()[1][0];
-                if (typeof startedAt !== "string")
-                  throw new Error("Expected database authorization start");
-                yield* Deferred.succeed(entered, Date.parse(startedAt) - 1);
+              if (statement.compile()[0].includes("SET started_at=NULL")) {
+                yield* Deferred.succeed(entered, undefined);
                 yield* Deferred.await(release);
               }
               return statement;
@@ -713,11 +789,16 @@ describe("verified event admission (PostgreSQL)", () => {
           ),
           Effect.forkChild,
         );
-        const revokedAt = yield* Deferred.await(entered);
+        yield* Deferred.await(entered);
+        const revokedAt = (yield* clock) - 1;
         const revoking = yield* receive(revocation(revokedAt)).pipe(
           Effect.provideService(CurrentTransformer, (statement) =>
             Effect.gen(function* () {
-              if (statement.compile()[0].includes("INSERT INTO relay_workflow_authorizations"))
+              const query = statement.compile()[0];
+              if (
+                query.includes("FROM relay_workflow_authorizations") &&
+                query.includes("FOR UPDATE")
+              )
                 yield* Deferred.succeed(attemptingRevocation, undefined);
               return statement;
             }),
@@ -728,7 +809,7 @@ describe("verified event admission (PostgreSQL)", () => {
         yield* Deferred.succeed(release, undefined);
         const pending = yield* Fiber.join(begin);
         expect((yield* Fiber.join(revoking)).status).toBe(200);
-        expect((yield* Store.attempt("owner", "native-app"))?.expected_epoch).toBe(2);
+        expect((yield* Store.attempt("org", "native-app"))?.expected_epoch).toBe(2);
         expect(
           yield* Sources.callback(
             new URL(pending.authorization!.url).searchParams.get("state")!,
@@ -744,41 +825,38 @@ describe("verified event admission (PostgreSQL)", () => {
       Effect.gen(function* () {
         yield* seed;
         const sql = (yield* RelayDb).$client;
-        const pending = yield* Sources.begin("owner", {
+        const pending = yield* Sources.begin("org", "admin", {
           attemptId: "stale-epoch",
           expectedVersion: 0,
           connectionId: "connection",
         });
-        const attempt = (yield* Store.attempt("owner", "native-app"))!;
         // A different authority mutation cannot inherit the exception for provider revocation.
         yield* sql`UPDATE relay_workflow_connections SET authorization_epoch=authorization_epoch+1 WHERE connection_id='connection'`;
-        expect((yield* receive(revocation(Date.parse(attempt.started_at!) - 1))).status).toBe(200);
-        expect((yield* Store.attempt("owner", "native-app"))?.expected_epoch).toBe(1);
+        expect((yield* receive(revocation((yield* clock) - 1000))).status).toBe(200);
+        expect((yield* Store.attempt("org", "native-app"))?.expected_epoch).toBe(1);
         expect(
           yield* Sources.callback(
             new URL(pending.authorization!.url).searchParams.get("state")!,
             "code",
           ).pipe(Effect.flip),
         ).toMatchObject({ code: "conflict" });
-        const owner = yield* Sources.owner("owner");
-        const next = yield* Sources.begin("owner", {
+        const owner = yield* Sources.owner("org", "admin");
+        const next = yield* Sources.begin("org", "admin", {
           attemptId: "stale-time",
           expectedVersion: owner.version,
           connectionId: "connection",
         });
-        const nextAttempt = (yield* Store.attempt("owner", "native-app"))!;
-        expect((yield* receive(revocation(Date.parse(nextAttempt.started_at!) + 1))).status).toBe(
-          200,
+        const gate = yield* gateExchange(
+          new URL(next.authorization!.url).searchParams.get("state")!,
         );
-        expect((yield* receive(revocation(Date.parse(nextAttempt.started_at!) - 1))).status).toBe(
-          200,
-        );
-        expect(
-          yield* Sources.callback(
-            new URL(next.authorization!.url).searchParams.get("state")!,
-            "code",
-          ).pipe(Effect.flip),
-        ).toMatchObject({ code: "conflict" });
+        const callback = yield* gate.callback.pipe(Effect.flip, Effect.forkChild);
+        yield* Deferred.await(gate.entered);
+        const nextAttempt = (yield* Store.attempt("org", "native-app"))!;
+        const boundary = Date.parse(nextAttempt.started_at!);
+        expect((yield* receive(revocation(boundary + 1))).status).toBe(200);
+        expect((yield* receive(revocation(boundary - 1))).status).toBe(200);
+        yield* Deferred.succeed(gate.release, undefined);
+        expect(yield* Fiber.join(callback)).toMatchObject({ code: "conflict" });
       }),
     ),
   );

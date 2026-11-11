@@ -40,7 +40,7 @@ export function RepositorySourcesButton({ repositoryId }: { repositoryId: string
           <SheetHeader>
             <SheetTitle>Workflow sources</SheetTitle>
             <SheetDescription>
-              Allow this repository to use a connected Linear workspace.
+              Manage this repository's access to the organization's Linear connection.
             </SheetDescription>
           </SheetHeader>
           <div className="overflow-y-auto p-4">
@@ -69,6 +69,16 @@ export function RepositorySources({
     [repositoryId],
   );
   const state = useWorkflowSources<WorkflowRepositorySources>(accountId, read);
+  return <RepositorySourcesPanel repositoryId={repositoryId} state={state} />;
+}
+
+export function RepositorySourcesPanel({
+  repositoryId,
+  state,
+}: {
+  repositoryId: RelayRepositoryId;
+  state: ReturnType<typeof useWorkflowSources<WorkflowRepositorySources>>;
+}) {
   const snapshot = state.snapshot,
     disabled = state.busy || state.loading || state.unverified;
   return (
@@ -117,43 +127,44 @@ export function RepositorySources({
           {snapshot.sources.map(({ source, grant }) => (
             <div key={grant.grantId} className="space-y-2 border-b pb-3">
               <SourceIdentity source={source} />
-              <p className="break-words text-xs text-muted-foreground">
-                {source.ownerUserId === accountId
-                  ? "Owned by you"
-                  : `Owner: ${source.ownerLabel ?? source.ownerUserId}`}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={disabled}
-                  onClick={() =>
-                    void state.mutate((c, t) => c.refreshRepository(t, repositoryId, grant.grantId))
-                  }
-                >
-                  Retry connection
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={disabled}
-                  onClick={async () => {
-                    if (
-                      await confirmChange(
-                        "Withdraw this repository's source access? Future events and queued starts will be blocked. Starting and running work may continue.",
+              {snapshot.canManage ? (
+                <div className="flex flex-wrap gap-2">
+                  {source.status === "connected" ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={disabled}
+                      onClick={() =>
+                        void state.mutate((c, t) =>
+                          c.refreshRepository(t, repositoryId, grant.grantId),
+                        )
+                      }
+                    >
+                      Retry connection
+                    </Button>
+                  ) : null}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={disabled}
+                    onClick={async () => {
+                      if (
+                        await confirmChange(
+                          "Withdraw this repository's source access? Future events and queued starts will be blocked. Starting and running work may continue.",
+                        )
                       )
-                    )
-                      await state.mutate((c, t) => c.withdraw(t, repositoryId, grant.grantId));
-                  }}
-                >
-                  Withdraw access
-                </Button>
-              </div>
-              {source.status === "reconnect_required" ? (
+                        await state.mutate((c, t) => c.withdraw(t, repositoryId, grant.grantId));
+                    }}
+                  >
+                    Withdraw access
+                  </Button>
+                </div>
+              ) : null}
+              {source.status !== "connected" ? (
                 <WorkflowAlert title="Linear source needs reconnection" variant="warning">
-                  {source.ownerUserId === accountId
-                    ? "Reconnect this workspace in Account connections."
-                    : "Ask the connection owner to reconnect this workspace."}
+                  {snapshot.canAllow
+                    ? "Reconnect Linear in Organization settings."
+                    : "Ask an organization admin to reconnect Linear."}
                 </WorkflowAlert>
               ) : null}
             </div>
@@ -161,31 +172,35 @@ export function RepositorySources({
           {!snapshot.sources.length ? (
             <p className="text-sm text-muted-foreground">No sources allowed for this repository.</p>
           ) : null}
-          {snapshot.eligible.map(({ source, previousGrantId }) => (
-            <div key={source.connectionId} className="flex flex-wrap items-start gap-2">
-              <SourceIdentity source={source} />
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={disabled || !snapshot.configured}
-                onClick={async () => {
-                  await state.mutate((c, t) =>
-                    c.allow(t, repositoryId, {
-                      connectionId: source.connectionId,
-                      grantId: randomUUID(),
-                      previousGrantId,
-                    }),
-                  );
-                }}
-              >
-                Allow repository
-              </Button>
-            </div>
-          ))}
-          <p className="text-sm text-muted-foreground">
-            Use Connect Linear in trigger settings, or Account connections, to manage your
-            workspaces. Only an owner can allow new repository use.
-          </p>
+          {snapshot.canAllow &&
+            snapshot.eligible.map(({ source, previousGrantId }) => (
+              <div key={source.connectionId} className="flex flex-wrap items-start gap-2">
+                <SourceIdentity source={source} />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={disabled || !!state.error || !snapshot.configured}
+                  onClick={async () => {
+                    await state.mutate((c, t) =>
+                      c.allow(t, repositoryId, {
+                        connectionId: source.connectionId,
+                        grantId: randomUUID(),
+                        previousGrantId,
+                      }),
+                    );
+                  }}
+                >
+                  Allow repository
+                </Button>
+              </div>
+            ))}
+          {snapshot.configured && !snapshot.sources.length ? (
+            <p className="text-sm text-muted-foreground">
+              {snapshot.canAllow
+                ? "Manage the Linear connection in Organization settings."
+                : "Ask an organization admin to allow this repository to use Linear."}
+            </p>
+          ) : null}
         </>
       )}
     </div>

@@ -22,10 +22,14 @@ export const Credentials = Schema.Struct({
   refreshToken: Text,
   expiresAt: Schema.Number,
 });
-export const Pending = Schema.Struct({ state: Text, verifier: Text });
+export const Pending = Schema.Struct({
+  state: Text,
+  verifier: Text,
+  reconnect: Schema.optional(Schema.Boolean),
+});
 export const Identity = Schema.Struct({
   organization: Schema.Struct({ id: Text, name: Text }),
-  viewer: Schema.Struct({ id: Text, name: Text }),
+  viewer: Schema.Struct({ id: Text, name: Text, app: Schema.optional(Schema.Boolean) }),
 });
 const ErrorBody = Schema.Struct({
   error: Schema.optional(Schema.String),
@@ -44,7 +48,7 @@ const decodeTokens = Schema.decodeUnknownEffect(Tokens);
 const decodeIdentity = Schema.decodeUnknownEffect(Schema.Struct({ data: Identity }));
 export const configuration = Effect.gen(function* () {
   const c = yield* RelayConfiguration;
-  if (!c.linearWorkflow?.clientId.trim())
+  if (!c.linearWorkflow?.clientId.trim() || !c.linearWorkflow.organizationId.trim())
     return yield* fail("not_configured", "Native Linear workflow connections are not configured.");
   return {
     ...c.linearWorkflow,
@@ -79,7 +83,8 @@ export const authorizationUrl = Effect.fn("workflowSources.linear.authorizationU
     redirect_uri: config.callbackUrl,
     response_type: "code",
     scope: "read",
-    actor: "user",
+    actor: "app",
+    ...(pending.reconnect ? { update_scopes_on_existing_token: "true" } : {}),
     prompt: "consent",
     state: pending.state,
     code_challenge: challenge,
@@ -134,7 +139,9 @@ export const request = Effect.fn("workflowSources.linear.request")(
         "Linear service configuration needs attention. Retry after it is restored.",
       );
     if (stage === "refresh" && error.error === "invalid_grant")
-      return yield* fail("reconnect_required", "The source owner must reconnect Linear.");
+      return yield* fail("reconnect_required", "An organization admin must reconnect Linear.");
+    if (stage === "code" && response.status === 400 && error.error === "invalid_grant")
+      return yield* fail("invalid_input", "Linear rejected this authorization code. Start again.");
     if (
       response.status === 429 ||
       error.errors?.some((e) => e.extensions?.code === "RATELIMITED")
@@ -194,6 +201,7 @@ export const request = Effect.fn("workflowSources.linear.request")(
 );
 export const exchange = Effect.fn("workflowSources.linear.exchange")(function* (
   input: { code: string; verifier: string } | { refreshToken: string },
+  onGrant?: () => void,
 ) {
   const config = yield* configuration;
   const refresh = "refreshToken" in input;
@@ -215,6 +223,7 @@ export const exchange = Effect.fn("workflowSources.linear.exchange")(function* (
     ),
     refresh ? "refresh" : "code",
   );
+  onGrant?.();
   const tokens = yield* decodeTokens(result).pipe(
     Effect.mapError(() => fail("unavailable", "Linear returned invalid credentials.")),
   );
@@ -259,7 +268,7 @@ export const graphql = Effect.fn("workflowSources.linear.graphql")(function* <A>
 export const identity = (token: string) =>
   graphql(
     token,
-    "query WorkflowSourceIdentity { organization { id name } viewer { id name } }",
+    "query WorkflowSourceIdentity { organization { id name } viewer { id name app } }",
     {},
     decodeIdentity,
   );

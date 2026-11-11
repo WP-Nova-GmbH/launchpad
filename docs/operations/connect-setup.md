@@ -177,58 +177,44 @@ supported by these connections.
 
 ## Native Linear workflow connections
 
-Native workflow authorization is independent of personal MCP issue-tracker connections. Configure
-`LINEAR_WORKFLOW_CLIENT_ID` and, if the application uses one, `LINEAR_WORKFLOW_CLIENT_SECRET` on
-the relay only. Both the Worker and Node development relay use these names. Register the exact
-callback `<relay issuer>/oauth/workflow-sources/linear/callback`; the client never chooses its
-origin. The flow requests only `read`, with a user actor and PKCE S256. A missing client ID leaves
-source connection setup unavailable without preventing relay startup. No application secret belongs
-in public client configuration.
+Register a new Linear OAuth app for workflow automation. Use a new client ID and webhook signing
+secret when replacing the old person-owned workflow integration. Configure these on the relay:
 
-Keep production native OAuth configuration absent until an authorized development application has
-proven workspace identity, repeated consent, rotating refresh recovery, and independent authorization
-for multiple owners, including two Launchpad accounts using the same Linear identity. Fixture tests
-prove implementation behavior, not provider credential independence. If that evidence is unavailable
-or fails, native connection release remains blocked; do not silently share provider credentials.
+- `LINEAR_WORKFLOW_CLIENT_ID` and, if the app uses one, `LINEAR_WORKFLOW_CLIENT_SECRET`.
+- `LINEAR_WORKFLOW_ORGANIZATION_ID`, the Launchpad organization allowed to install and manage the
+  app. This is Launchpad's organization ID, not the Linear workspace ID.
+- `LINEAR_WORKFLOW_WEBHOOK_SECRET` and `LINEAR_WORKFLOW_WEBHOOK_GENERATION` for event intake. Change
+  the generation when the signing secret or app subscription coverage changes.
 
-Event delivery has a separate release gate. The receiver is `POST
-/webhooks/workflow-sources/linear` on the relay origin. In addition to the native client ID,
-configure `LINEAR_WORKFLOW_WEBHOOK_SECRET` and `LINEAR_WORKFLOW_WEBHOOK_GENERATION` on the
-relay only. Missing or partial configuration returns 503; native source management still works.
-Rotate the generation whenever the signing secret or app subscription coverage changes. Both
-relay entry points use these settings; keep the secret out of client bundles and diagnostics.
+Both the Worker and Node development relay use these settings. Register the exact callback
+`<relay issuer>/oauth/workflow-sources/linear/callback` in Linear. Configure Issue webhooks on the
+OAuth app with the HTTPS destination `<relay issuer>/webhooks/workflow-sources/linear`. The install
+uses the read-only app actor with PKCE. Keep the client and signing secrets on the relay.
 
-Keep `LINEAR_WORKFLOW_ADMISSION_ENABLED` absent or `false` in production. Before activation,
-prove native authorization independence as above, then verify signed Issue create and status-entry
-coverage for selected teams, including private teams and pre-existing authorizations, duplicate
-subscriptions, actual retry timestamp behavior, and the exact app/workspace scope and timestamp
-ordering of OAuth revocation. Do not activate production subscriptions to discover these facts.
-Use an explicitly authorized development application. Fixture success cannot replace this evidence.
+An admin of the configured Launchpad organization opens **Settings → Organization → Workflow
+sources** and installs the app in one Linear workspace. The app binding persists once setup
+starts. Changing the configured organization does not transfer that binding. For a fresh setup,
+grant repository access again and re-enable affected triggers with the new connection.
 
-The receiver tracks observed create AND true status-entry delivery per team, current authorization
-epoch and webhook generation. An existing connection can gain this evidence from new verified
-post-activation deliveries; an API read or token exchange alone cannot establish it. Unsupported
-teams remain blocked. Reauthorization clears old evidence while preserving source and grant identity;
-repair must not revoke an installation used by other owners. The existing source label describes
-observed teams and does not assert complete workspace coverage or enabled automatic execution.
+The webhook receiver can verify delivery while job admission is off. It records observed Issue
+create and status-entry delivery for each team, authorization and webhook generation. Reconnecting
+preserves repository grants and starts delivery verification again. An API read or OAuth success
+alone does not verify webhook delivery.
 
-Unknown occurrences require a signed body `webhookTimestamp` within 60 seconds. Authenticated
-retries of a committed occurrence acknowledge without additional jobs even when stale. Linear
-retry intervals exceed that window: verify that actual retries refresh their signed timestamp before
-activation; otherwise revisit this policy before release. A 400 indicates invalid routing facts,
-401 invalid signature/freshness, 413 a body over 1 MiB, and 500 an uncommitted admission failure.
-Diagnostics must retain only the bounded failure code, never the body or signing/OAuth material.
+Keep `LINEAR_WORKFLOW_ADMISSION_ENABLED` absent or `false` in production until the isolated live
+provider and Machine workflow checks pass. Verify install, reconnect, token rotation, signed team
+delivery, revocation ordering and actual provider retries. Then verify one new matching event
+starts one Machine job, including when Linear redelivers the event. VM trigger enablement is a
+separate capability.
 
-Events commit all matching queued jobs or none. Successful and unmatched occurrences retain a
-duplicate fence; reconfiguration never rematches them. After admission, automatic starts read issue context through the original connection and grant,
-then persist their authorized offer before delivery. Background wakeups accelerate the existing
-periodic retry worker; a lost wakeup does not lose a job. The production release gates above still
-apply even when fixture-based execution succeeds. Do not present
-this receiver as production automatic execution or enable the admission flag before those slices
-and the provider proof are complete.
+Unknown occurrences require a signed `webhookTimestamp` within 60 seconds. Authenticated retries
+of committed occurrences acknowledge without creating new jobs. If Linear preserves an old signing
+timestamp on a retry of an uncommitted event, that retry is rejected. Verify this behavior before
+enabling admission. Missing webhook configuration returns 503, invalid routing facts return 400,
+invalid signature or freshness returns 401, oversized payloads return 413, and persistence failures
+return 500. Keep callback queries, webhook payloads and OAuth credentials out of diagnostics.
 
-An `invalid_client` or `unauthorized_client` error during token exchange/refresh is a service
-configuration fault. Repair the application's configured credentials and retry the failed operation;
-existing credentials and repository consent are retained. A confirmed invalid refresh grant instead
-requires the connection owner to reconnect. Rotating application credentials does not require removing
-repository grants. Keep callback query strings and token payloads out of diagnostics.
+If an app configuration error prevents exchange or refresh, repair the relay configuration and
+try again. If credentials may have changed during a reconnect that Launchpad could not complete,
+an organization admin reconnects the same workspace. Reconnect does not require granting the same
+repositories again.

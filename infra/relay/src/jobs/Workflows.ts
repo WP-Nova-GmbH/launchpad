@@ -146,8 +146,8 @@ export const make = Effect.gen(function* () {
       return connection ?? null;
     },
   );
-  const requireVisibleVmRepository = Effect.fnUntraced(function* (
-    scope: Pick<WorkflowVmSubmissionScope, "organizationId" | "repositoryId">,
+  const requireVisibleWorkflowRepository = Effect.fnUntraced(function* (
+    scope: Pick<WorkflowJobRecord, "organizationId" | "repositoryId">,
     userId: string | null,
     lock: boolean,
   ) {
@@ -189,7 +189,7 @@ export const make = Effect.gen(function* () {
   const canSettleVmCancellation = Effect.fnUntraced(function* (row: WorkflowJobRecord) {
     const requester = row.pendingControl?.userId;
     if (!requester || !row.record.vmAdmission) return false;
-    const canManage = yield* requireVisibleVmRepository(row, requester, true).pipe(
+    const canManage = yield* requireVisibleWorkflowRepository(row, requester, true).pipe(
       Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
     );
     if (canManage === null || canManage || requester !== row.submitterUserId)
@@ -388,7 +388,7 @@ export const make = Effect.gen(function* () {
       return yield* db.$client
         .withTransaction(
           Effect.gen(function* () {
-            yield* requireVisibleVmRepository(input, input.submitterUserId, true);
+            yield* requireVisibleWorkflowRepository(input, input.submitterUserId, true);
             return yield* findVmSubmission(input);
           }),
         )
@@ -399,7 +399,7 @@ export const make = Effect.gen(function* () {
     requireWorkflowVmLimit,
     checkWorkflowVmSubmissionAccess: Effect.fn("Workflows.checkWorkflowVmSubmissionAccess")(
       function* (scope: WorkflowVmSubmissionScope) {
-        const canUseSecrets = yield* requireVisibleVmRepository(
+        const canUseSecrets = yield* requireVisibleWorkflowRepository(
           scope,
           scope.submitterUserId,
           false,
@@ -430,7 +430,7 @@ export const make = Effect.gen(function* () {
             const sql = db.$client;
             let hasSecrets = false;
             if (vm) {
-              const canUseSecrets = yield* requireVisibleVmRepository(
+              const canUseSecrets = yield* requireVisibleWorkflowRepository(
                 row,
                 row.submitterUserId,
                 true,
@@ -624,6 +624,37 @@ export const make = Effect.gen(function* () {
       return row;
     }),
     updateJob,
+    settlePreparedMachineCancellation: Effect.fn("Workflows.settlePreparedMachineCancellation")(
+      function* (previous: WorkflowJobRecord, expectedLease: string) {
+        const request = previous.pendingControl;
+        if (request?.response.operation !== "cancel") return previous;
+        return yield* db.$client
+          .withTransaction(
+            Effect.gen(function* () {
+              const authorized = yield* requireVisibleWorkflowRepository(
+                previous,
+                request.userId,
+                true,
+              ).pipe(Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(false)));
+              return yield* updateJob(
+                previous,
+                {
+                  ...previous.record,
+                  status: authorized ? "cancelled" : "dispatching",
+                  detail: authorized
+                    ? "Cancelled before acceptance."
+                    : "Cancellation was withdrawn because the requester no longer has permission.",
+                  updatedAt: yield* now,
+                },
+                null,
+                false,
+                expectedLease,
+              );
+            }),
+          )
+          .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+      },
+    ),
     canSettleVmCancellation,
     settleQueuedVmCancellation: Effect.fn("Workflows.settleQueuedVmCancellation")(function* (
       previous: WorkflowJobRecord,

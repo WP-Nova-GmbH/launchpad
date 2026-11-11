@@ -8,6 +8,7 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ThreadId } from "@t3tools/contracts";
+import { RelayClientPrincipal } from "@t3tools/contracts/relay";
 import {
   EnvironmentConnector,
   EnvironmentMintRequestTimedOut,
@@ -17,13 +18,22 @@ import { layer as repositories } from "../tenancy/Repositories.ts";
 import { layer as catalog } from "../projects/OrganizationProjectCatalog.ts";
 import { Workflows, make as makeWorkflows } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
-import { refreshWorkflowJobForClient } from "../http/WorkflowsApi.ts";
+import { refreshWorkflowJobForClient, respondToWorkflowJob } from "../http/WorkflowsApi.ts";
 import { RelayDb } from "../db.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import * as Issue from "../workflowSources/IssueContext.ts";
 import { databaseUrl, withDatabase, transport } from "../workflowSources/test-fixture.ts";
-import { configured, seed, enableBeforeEvent, receive, clock, issue } from "./test-fixture.ts";
+import {
+  configured,
+  seed,
+  enableBeforeEvent,
+  receive,
+  clock,
+  issue,
+  save,
+  trigger,
+} from "./test-fixture.ts";
 import * as Automatic from "./AutomaticOffer.ts";
 if (!databaseUrl)
   throw new Error("Automatic offer tests require disposable WORKFLOW_SOURCES_TEST_DATABASE_URL.");
@@ -53,9 +63,19 @@ const harness = Effect.gen(function* () {
   const [job] = yield* store.listJobs("repo");
   const mode = yield* Ref.make<"accepted" | "busy" | "lost">("accepted");
   const starts = yield* Ref.make<string[]>([]);
+  const beforePreparedStart = yield* Ref.make(Effect.void);
+  const probes = yield* Ref.make(0);
+  const cancellations = yield* Ref.make(0);
   const connector = Layer.mock(EnvironmentConnector)({
     dispatchJob: (input) =>
       Effect.gen(function* () {
+        if (input.workflowControl?.operation === "cancel")
+          yield* Ref.update(cancellations, (count) => count + 1);
+        if (
+          input.workflowControl?.operation === "status" &&
+          (yield* Ref.updateAndGet(probes, (count) => count + 1)) === 2
+        )
+          yield* yield* Ref.get(beforePreparedStart);
         if (input.workflowControl?.operation === "start") {
           yield* Ref.update(starts, (values) => [...values, input.instruction]);
           const current = yield* Ref.get(mode);
@@ -112,6 +132,8 @@ const harness = Effect.gen(function* () {
     jobId: job!.jobId,
     mode,
     starts,
+    cancellations,
+    beforePreparedStart,
     base,
     runtime,
     refresh: refreshWorkflowJob(job!.jobId).pipe(Effect.provide(runtime)),
@@ -162,7 +184,7 @@ describe("automatic offers (PostgreSQL)", () => {
           yield* h.refresh.pipe(Effect.provide(transport(() => Response.json(reply()))));
           const offered = (yield* h.row)!.record;
           expect(offered.startAttempted).toBe(true);
-          yield* Store.withdraw("owner", "grant");
+          yield* Store.withdraw("maintainer", "grant", "repo");
           yield* Ref.set(h.mode, "busy");
           yield* h.refresh.pipe(
             Effect.provide(
@@ -185,9 +207,9 @@ describe("automatic offers (PostgreSQL)", () => {
         }),
       ),
   );
-  it.live(
-    "clears a first-attempt busy refusal and rehydrates only after a new authorized offer",
-    () =>
+  it.live.each([false, true])(
+    "clears a first-attempt busy refusal and rechecks the original grant (withdrawn: %s)",
+    (withdrawn) =>
       testDb(
         Effect.gen(function* () {
           const h = yield* harness;
@@ -199,6 +221,7 @@ describe("automatic offers (PostgreSQL)", () => {
           expect(queued.repositoryCanonicalKey).toBeNull();
           expect(queued.record.instruction).not.toContain("Exact requirements");
           yield* h.store.updateJob(queued, { ...queued.record, queueReason: null });
+          if (withdrawn) yield* Store.withdraw("maintainer", "grant", "repo");
           yield* Ref.set(h.mode, "accepted");
           yield* h.refresh.pipe(
             Effect.provide(
@@ -207,11 +230,17 @@ describe("automatic offers (PostgreSQL)", () => {
               ),
             ),
           );
-          expect((yield* h.row)!.record.instruction).toContain("New requirements");
+          const current = (yield* h.row)!.record;
+          if (withdrawn) {
+            expect(current.queueReason?.code).toBe("source_withdrawn");
+            expect(yield* Ref.get(h.starts)).toHaveLength(1);
+          } else {
+            expect(current.instruction).toContain("New requirements");
+          }
         }),
       ),
   );
-  for (const operation of ["withdraw", "disconnect", "cancel", "owner-removal"] as const)
+  for (const operation of ["withdraw", "disconnect", "cancel"] as const)
     it.live(`does not offer when ${operation} wins during a gated issue read`, () =>
       testDb(
         Effect.gen(function* () {
@@ -230,11 +259,9 @@ describe("automatic offers (PostgreSQL)", () => {
             Effect.forkChild,
           );
           yield* Deferred.await(ready);
-          const sql = (yield* RelayDb).$client;
-          if (operation === "withdraw") yield* Store.withdraw("owner", "grant");
-          if (operation === "disconnect") yield* Sources.disconnect("owner", "connection", 1);
-          if (operation === "owner-removal")
-            yield* sql`DELETE FROM relay_organization_members WHERE user_id='owner'`;
+          if (operation === "withdraw") yield* Store.withdraw("maintainer", "grant", "repo");
+          if (operation === "disconnect")
+            yield* Sources.disconnect("org", "admin", "connection", 1);
           if (operation === "cancel") {
             const row = (yield* h.row)!;
             yield* h.store.updateJob(row, { ...row.record, status: "cancelled" }, null);
@@ -247,6 +274,134 @@ describe("automatic offers (PostgreSQL)", () => {
         }),
       ),
     );
+  for (const [change, reason] of [
+    ["withdraw", "source_withdrawn"],
+    ["disconnect", "source_reconnect"],
+    ["cutover", "source_withdrawn"],
+    ["off", null],
+    ["criteria", null],
+    ["archive", "workflow_unavailable"],
+    ["target", "target_invalid"],
+  ] as const)
+    it.live(`rechecks the prepared offer after the executor probe when ${change} wins`, () =>
+      testDb(
+        Effect.gen(function* () {
+          const h = yield* harness;
+          const ready = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          yield* Ref.set(
+            h.beforePreparedStart,
+            Deferred.succeed(ready, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          );
+          const refresh = yield* h.refresh.pipe(
+            Effect.provide(transport(() => Response.json(reply()))),
+            Effect.forkChild,
+          );
+          yield* Deferred.await(ready);
+          expect((yield* h.row)!.record).toMatchObject({
+            status: "dispatching",
+            startAttempted: false,
+          });
+          if (change === "withdraw") yield* Store.withdraw("maintainer", "grant", "repo");
+          if (change === "disconnect") yield* Sources.disconnect("org", "admin", "connection", 1);
+          if (change === "cutover") {
+            const sql = (yield* RelayDb).$client;
+            yield* sql`DELETE FROM relay_workflow_repository_grants WHERE grant_id='grant'`;
+          }
+          if (change === "archive") {
+            const workflow = (yield* h.store.get("flow"))!;
+            yield* h.store.save(
+              "org",
+              "repo",
+              {
+                workflowId: workflow.workflowId,
+                expectedRevision: workflow.revision,
+                definition: workflow.definition,
+                archived: true,
+              },
+              { userId: "maintainer" },
+            );
+          }
+          if (change === "target")
+            yield* (yield* RelayDb)
+              .$client`DELETE FROM relay_organization_projects WHERE project_id='project'`;
+          if (change === "off") yield* save("flow", trigger, false);
+          if (change === "criteria") yield* save("flow", { ...trigger, labelIds: ["unmatched"] });
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(refresh);
+          const row = (yield* h.row)!;
+          if (reason === null) {
+            expect(row.record.status).toBe("preparing");
+            expect(yield* Ref.get(h.starts)).toHaveLength(1);
+          } else {
+            expect(yield* Ref.get(h.starts)).toEqual([]);
+            expect(row.record).toMatchObject({ status: "queued", workflow: null });
+            expect(row.record.queueReason?.code).toBe(reason);
+            yield* h.store.updateJob(
+              row,
+              { ...row.record, status: "cancelling" },
+              {
+                userId: "maintainer",
+                response: { operation: "cancel" },
+              },
+            );
+            expect((yield* h.refresh)?.status).toBe("cancelled");
+          }
+        }),
+      ),
+    );
+  it.live(
+    "settles a prepared cancellation only while its requester can maintain the repository",
+    () =>
+      testDb(
+        Effect.gen(function* () {
+          const h = yield* harness;
+          const ready = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          yield* Ref.set(
+            h.beforePreparedStart,
+            Deferred.succeed(ready, undefined).pipe(Effect.andThen(Deferred.await(release))),
+          );
+          const refresh = yield* h.refresh.pipe(
+            Effect.provide(transport(() => Response.json(reply()))),
+            Effect.forkChild,
+          );
+          yield* Deferred.await(ready);
+          const frozen = (yield* h.row)!.record;
+          expect(frozen).toMatchObject({ status: "dispatching", startAttempted: false });
+          const cancel = (userId: string) =>
+            respondToWorkflowJob(
+              { repositoryId: "repo", jobId: h.jobId },
+              { operation: "cancel" },
+            ).pipe(
+              Effect.provide(h.base),
+              Effect.provideService(RelayClientPrincipal, { userId, token: "fixture" }),
+            );
+          expect((yield* cancel("maintainer")).status).toBe("cancelling");
+          yield* (yield* RelayDb)
+            .$client`UPDATE relay_repository_access SET role='developer' WHERE organization_id='org' AND repository_id='repo' AND user_id='maintainer'`;
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(refresh);
+
+          const restored = yield* h.refresh;
+          expect(restored).toMatchObject({
+            status: "dispatching",
+            startAttempted: false,
+            workflow: frozen.workflow,
+            issueSnapshot: frozen.issueSnapshot,
+          });
+          expect(restored?.detail).toContain("no longer has permission");
+          expect((yield* h.row)?.pendingControl).toBeNull();
+          expect(yield* Ref.get(h.starts)).toEqual([]);
+          expect(yield* Ref.get(h.cancellations)).toBe(0);
+
+          expect((yield* cancel("owner")).status).toBe("cancelling");
+          expect((yield* h.refresh)?.status).toBe("cancelled");
+          expect(yield* Ref.get(h.starts)).toEqual([]);
+          expect(yield* Ref.get(h.cancellations)).toBe(0);
+        }),
+      ),
+  );
   for (const change of ["team", "status", "labels", "identifier"] as const)
     it.live(`does not rematch after an issue ${change} change`, () =>
       testDb(

@@ -1,4 +1,5 @@
 import { RepositorySourcesButton } from "../workflows/WorkflowSources";
+import { WorkflowSourcesSettings } from "./WorkflowSources";
 import {
   BuildingIcon,
   CopyIcon,
@@ -1639,6 +1640,12 @@ function ConfiguredOrganizationSettings() {
           <OrganizationSection state={state} />
           <MembersSection state={state} />
           <GithubSection state={state} />
+          {state.snapshot && state.snapshot.membership.userId === userId ? (
+            <WorkflowSourcesSettings
+              organizationId={state.snapshot.membership.organization.organizationId}
+              isAdmin={state.snapshot.membership.role === "admin"}
+            />
+          ) : null}
           {state.snapshot && state.snapshot.membership.userId === userId ? (
             <CodexVmConnectionSettings
               key={state.snapshot.membership.organization.organizationId}

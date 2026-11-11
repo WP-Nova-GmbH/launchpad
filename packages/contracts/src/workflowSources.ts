@@ -38,12 +38,11 @@ export const WorkflowSourceHealth = Schema.Struct({
 export type WorkflowSourceHealth = typeof WorkflowSourceHealth.Type;
 export const WorkflowSource = Schema.Struct({
   connectionId: Id,
-  ownerUserId: Id,
+  organizationId: Id,
   applicationId: Id,
   workspaceId: Id,
   workspaceName: Schema.String,
   viewerName: Schema.String,
-  ownerLabel: Schema.optional(Schema.String),
   authorizationEpoch: Revision,
   status: Schema.Literals(["connected", "reconnect_required", "disconnected"]),
   health: WorkflowSourceHealth,
@@ -55,7 +54,6 @@ export const WorkflowSourceGrant = Schema.Struct({
   connectionId: Id,
   organizationId: Id,
   repositoryId: Id,
-  ownerUserId: Id,
   generation: Revision,
   revoked: Schema.Boolean,
 });
@@ -65,12 +63,14 @@ export const WorkflowSourceAttempt = Schema.Struct({
   connectionId: Schema.NullOr(Id),
   expiresAt: Schema.Number,
   status: Schema.Literals(["pending", "exchanging", "connected", "cancelled", "failed"]),
+  canResume: Schema.Boolean,
   error: Schema.NullOr(WorkflowSourceErrorCode),
 });
 export const WorkflowSourceOwner = Schema.Struct({
   configured: Schema.Boolean,
   applicationId: Schema.NullOr(Id),
   version: Revision,
+  exchangeInProgress: Schema.Boolean,
   attempt: Schema.NullOr(WorkflowSourceAttempt),
   connections: Schema.Array(WorkflowSource),
   repositories: Schema.Array(
@@ -84,6 +84,7 @@ export const WorkflowSourceOwner = Schema.Struct({
 export type WorkflowSourceOwner = typeof WorkflowSourceOwner.Type;
 export const WorkflowRepositorySources = Schema.Struct({
   configured: Schema.Boolean,
+  canAllow: Schema.Boolean,
   canManage: Schema.Boolean,
   sources: Schema.Array(Schema.Struct({ source: WorkflowSource, grant: WorkflowSourceGrant })),
   eligible: Schema.Array(
@@ -131,7 +132,6 @@ export const WorkflowSourceHealthList = Schema.Struct({
     Schema.Struct({
       connectionId: Id,
       workspaceName: Schema.String,
-      ownerUserId: Id,
       status: WorkflowSource.fields.status,
       health: WorkflowSourceHealth,
       delivery: Schema.Literals(["unverified", "verified"]),

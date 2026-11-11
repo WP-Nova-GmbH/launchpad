@@ -11,6 +11,7 @@ import {
   RelayClientAuth,
   RelayClientPrincipal,
   RelayRepositoryId,
+  RelayOrganizationId,
 } from "@t3tools/contracts/relay";
 import { RelayDb } from "../db.ts";
 import { RelayConfiguration } from "../Config.ts";
@@ -20,6 +21,7 @@ import { workflowSourcesApi } from "./WorkflowSourcesApi.ts";
 import { databaseUrl, withDatabase, createConnection } from "../workflowSources/test-fixture.ts";
 import * as Store from "../workflowSources/Store.ts";
 const api = HttpApi.make("RelayApi").add(RelayApi.groups.workflowSources);
+const organization = { organizationId: RelayOrganizationId.make("org") };
 const clientFor = Effect.fn("workflowSources.test.client")(function* (userId: string) {
   const deps = Layer.succeedContext(
     yield* Effect.context<
@@ -45,17 +47,17 @@ const clientFor = Effect.fn("workflowSources.test.client")(function* (userId: st
   return yield* HttpApiTest.groups(api, ["workflowSources"]).pipe(Effect.provide(layer));
 });
 describe.skipIf(!databaseUrl)("workflow source HTTP authorization", () => {
-  it.effect("separates owner, maintainer and read-only projections through the typed API", () =>
+  it.effect("separates admin, maintainer and read-only projections through the typed API", () =>
     withDatabase(
       Effect.gen(function* () {
         yield* createConnection();
-        const owner = (yield* clientFor("owner")).workflowSources;
+        const admin = (yield* clientFor("admin")).workflowSources;
         const headers = { authorization: "Bearer owner-token" };
         const params = { repositoryId: RelayRepositoryId.make("repo") };
-        const initial = yield* owner.owner({ headers });
+        const initial = yield* admin.owner({ headers, params: organization });
         expect(initial.configured).toBe(true);
         expect(initial.connections[0]).not.toHaveProperty("payload_sealed");
-        const allowed = yield* owner.allow({
+        const allowed = yield* admin.allow({
           headers,
           params,
           payload: { connectionId: "connection", grantId: "grant", previousGrantId: null },
@@ -78,89 +80,70 @@ describe.skipIf(!databaseUrl)("workflow source HTTP authorization", () => {
               payload: { connectionId: "connection", grantId: "borrowed", previousGrantId: null },
             })
             .pipe(Effect.flip),
-        ).toMatchObject({ code: "not_found" });
+        ).toMatchObject({ code: "forbidden" });
         expect(
           yield* maintainer
-            .disconnect({ headers, payload: { connectionId: "connection", expectedEpoch: 1 } })
+            .disconnect({
+              headers,
+              params: organization,
+              payload: { connectionId: "connection", expectedEpoch: 1 },
+            })
             .pipe(Effect.flip),
-        ).toMatchObject({ code: "not_found" });
+        ).toMatchObject({ code: "forbidden" });
         yield* maintainer.withdraw({ headers, params, payload: { grantId: "grant" } });
         expect((yield* reader.health({ headers, params })).sources).toHaveLength(0);
         expect((yield* Store.connection("connection"))?.status).toBe("connected");
       }),
     ),
   );
-  it.effect(
-    "lists hidden owner consent safely and withdraws only that exact grant through HTTP",
-    () =>
-      withDatabase(
-        Effect.gen(function* () {
-          yield* createConnection();
-          const sql = (yield* RelayDb).$client;
-          const owner = (yield* clientFor("owner")).workflowSources;
-          const maintainer = (yield* clientFor("maintainer")).workflowSources;
-          const headers = { authorization: "Bearer test-token" };
-          for (const repositoryId of ["repo", "repo-2"])
-            yield* owner.allow({
+  it.effect("keeps installation and new grants inside the configured organization", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        yield* createConnection();
+        const admin = (yield* clientFor("admin")).workflowSources;
+        const otherAdmin = (yield* clientFor("admin-2")).workflowSources;
+        const outsider = (yield* clientFor("outsider")).workflowSources;
+        const maintainer = (yield* clientFor("maintainer")).workflowSources;
+        const headers = { authorization: "Bearer test-token" };
+        const params = { repositoryId: RelayRepositoryId.make("repo") };
+        expect(yield* maintainer.repository({ headers, params })).toMatchObject({
+          canManage: true,
+          canAllow: false,
+          eligible: [],
+          sources: [],
+        });
+        expect(yield* admin.repository({ headers, params })).toMatchObject({
+          canManage: true,
+          canAllow: true,
+          eligible: [{ source: { organizationId: "org" } }],
+        });
+        expect(
+          yield* outsider.owner({ headers, params: organization }).pipe(Effect.flip),
+        ).toMatchObject({ code: "forbidden" });
+        expect(
+          yield* outsider
+            .begin({
               headers,
-              params: { repositoryId: RelayRepositoryId.make(repositoryId) },
-              payload: {
-                connectionId: "connection",
-                grantId: "grant-" + repositoryId,
-                previousGrantId: null,
-              },
-            });
-          yield* sql`DELETE FROM relay_repository_access WHERE repository_id='repo' AND user_id='owner'`;
-          const hidden = yield* owner.owner({ headers });
-          expect(hidden).toHaveProperty("withdrawableGrants", [
-            { grantId: "grant-repo", connectionId: "connection", repositoryName: null },
-            { grantId: "grant-repo-2", connectionId: "connection", repositoryName: "Second" },
-          ]);
-          expect(hidden.grants.map((g) => g.repositoryId)).toEqual(["repo-2"]);
-          expect(hidden.repositories.map((r) => r.repositoryId)).toEqual(["repo-2"]);
-          const params = { repositoryId: RelayRepositoryId.make("repo") };
-          expect((yield* maintainer.repository({ headers, params })).sources).toHaveLength(1);
-          const other = (yield* clientFor("outsider")).workflowSources;
-          expect(yield* other.owner({ headers })).toHaveProperty("withdrawableGrants", []);
-          expect(
-            yield* other
-              .withdrawOwner({ headers, payload: { grantId: "grant-repo" } })
-              .pipe(Effect.flip),
-          ).toMatchObject({ code: "not_found" });
-          yield* owner.withdrawOwner({ headers, payload: { grantId: "grant-repo" } });
-          expect((yield* maintainer.repository({ headers, params })).sources).toHaveLength(0);
-          expect(yield* owner.owner({ headers })).toHaveProperty("withdrawableGrants", [
-            { grantId: "grant-repo-2", connectionId: "connection", repositoryName: "Second" },
-          ]);
-          yield* sql`INSERT INTO relay_repository_access(repository_id,user_id,organization_id,role) VALUES ('repo','owner','org','developer')`;
-          expect(yield* owner.owner({ headers })).toHaveProperty("withdrawableGrants", [
-            { grantId: "grant-repo-2", connectionId: "connection", repositoryName: "Second" },
-          ]);
-          expect(
-            yield* owner
-              .allow({
-                headers,
-                params,
-                payload: {
-                  connectionId: "connection",
-                  grantId: "new",
-                  previousGrantId: "grant-repo",
-                },
-              })
-              .pipe(Effect.flip),
-          ).toMatchObject({ code: "forbidden" });
-          yield* sql`UPDATE relay_repository_access SET role='developer' WHERE repository_id='repo-2' AND user_id='owner'`;
-          const readOnly = yield* owner.owner({ headers });
-          expect(readOnly.repositories).toHaveLength(0);
-          expect(readOnly).toHaveProperty("withdrawableGrants", [
-            { grantId: "grant-repo-2", connectionId: "connection", repositoryName: "Second" },
-          ]);
-          yield* owner.withdrawOwner({ headers, payload: { grantId: "grant-repo-2" } });
-          expect(yield* owner.owner({ headers })).toHaveProperty("withdrawableGrants", []);
-        }),
-      ),
+              params: { organizationId: RelayOrganizationId.make("other-org") },
+              payload: { attemptId: "outside", expectedVersion: 0, connectionId: null },
+            })
+            .pipe(Effect.flip),
+        ).toMatchObject({ code: "service_configuration" });
+        yield* admin.allow({
+          headers,
+          params,
+          payload: { grantId: "grant", connectionId: "connection", previousGrantId: null },
+        });
+        yield* otherAdmin.withdrawOwner({
+          headers,
+          params: organization,
+          payload: { grantId: "grant" },
+        });
+        expect((yield* maintainer.repository({ headers, params })).sources).toHaveLength(0);
+        expect((yield* Store.connection("connection"))?.status).toBe("connected");
+      }),
+    ),
   );
-
   it.effect(
     "keeps Begin A's link identity when its refreshed owner snapshot already contains B",
     () =>
@@ -178,21 +161,23 @@ describe.skipIf(!databaseUrl)("workflow source HTTP authorization", () => {
                 return yield* box.open(sealed);
               }),
           });
-          const aClient = (yield* clientFor("owner").pipe(
+          const aClient = (yield* clientFor("admin").pipe(
             Effect.provideService(RelaySecretBox, gated),
           )).workflowSources;
-          const bClient = (yield* clientFor("owner")).workflowSources;
+          const bClient = (yield* clientFor("admin")).workflowSources;
           const headers = { authorization: "Bearer owner-token" };
           const first = yield* aClient
             .begin({
               headers,
+              params: organization,
               payload: { attemptId: "attempt-A", expectedVersion: 0, connectionId: null },
             })
             .pipe(Effect.forkScoped);
           yield* Deferred.await(entered);
-          const savedA = (yield* Store.attempt("owner", "native-app"))!;
+          const savedA = (yield* Store.attempt("org", "native-app"))!;
           const second = yield* bClient.begin({
             headers,
+            params: organization,
             payload: {
               attemptId: "attempt-B",
               expectedVersion: savedA.version,
@@ -214,6 +199,7 @@ describe.skipIf(!databaseUrl)("workflow source HTTP authorization", () => {
           expect(returnedA.authorization?.url).not.toBe(second.authorization?.url);
           const resumed = yield* bClient.begin({
             headers,
+            params: organization,
             payload: {
               attemptId: "attempt-B",
               expectedVersion: savedA.version,
@@ -223,19 +209,25 @@ describe.skipIf(!databaseUrl)("workflow source HTTP authorization", () => {
           expect(resumed.authorization).toEqual(second.authorization);
           const sql = (yield* RelayDb).$client;
           for (const status of ["exchanging", "connected", "failed"] as const) {
-            yield* sql`UPDATE relay_workflow_authorizations SET status=${status} WHERE owner_user_id='owner'`;
+            yield* sql`UPDATE relay_workflow_authorizations SET status=${status} WHERE organization_id='org'`;
             expect(
               (yield* bClient.begin({
                 headers,
+                params: organization,
                 payload: { attemptId: "attempt-B", expectedVersion: 0, connectionId: null },
               })).authorization,
             ).toBeNull();
           }
-          yield* sql`UPDATE relay_workflow_authorizations SET status='pending' WHERE owner_user_id='owner'`;
-          yield* bClient.cancel({ headers, payload: { attemptId: "attempt-B" } });
+          yield* sql`UPDATE relay_workflow_authorizations SET status='pending' WHERE organization_id='org'`;
+          yield* bClient.cancel({
+            headers,
+            params: organization,
+            payload: { attemptId: "attempt-B" },
+          });
           expect(
             (yield* bClient.begin({
               headers,
+              params: organization,
               payload: { attemptId: "attempt-B", expectedVersion: 0, connectionId: null },
             })).authorization,
           ).toBeNull();

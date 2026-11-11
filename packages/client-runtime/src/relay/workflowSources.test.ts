@@ -1,11 +1,15 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { RelayRepositoryId, WorkflowSourceError } from "@t3tools/contracts/relay";
+import {
+  RelayOrganizationId,
+  RelayRepositoryId,
+  WorkflowSourceError,
+} from "@t3tools/contracts/relay";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as Tenancy from "./managedRelayTenancy.ts";
 import * as Sources from "./workflowSources.ts";
-const snapshot = { configured: true, canManage: true, sources: [], eligible: [] };
+const snapshot = { configured: true, canAllow: true, canManage: true, sources: [], eligible: [] };
 function layer(fetchFn: typeof fetch) {
   const http = remoteHttpClientLayer(fetchFn);
   return Tenancy.layer({ relayUrl: "https://relay.test" }).pipe(Layer.provideMerge(http));
@@ -67,7 +71,7 @@ describe("workflow source client", () => {
   it.effect("decodes a Begin link independently of a newer owner snapshot", () =>
     Effect.gen(function* () {
       const client = yield* Sources.client;
-      const result = yield* client.begin("token", {
+      const result = yield* client.begin("token", RelayOrganizationId.make("org"), {
         attemptId: "A",
         expectedVersion: 0,
         connectionId: null,
@@ -83,8 +87,12 @@ describe("workflow source client", () => {
       ]);
     }).pipe(
       Effect.provide(
-        layer(async () =>
-          Response.json({
+        layer(async (input, init) => {
+          const req = new Request(input, init);
+          expect(req.url).toBe(
+            "https://relay.test/v1/organizations/org/workflow-sources/linear/begin",
+          );
+          return Response.json({
             authorization: {
               applicationId: "app",
               attemptId: "A",
@@ -94,11 +102,13 @@ describe("workflow source client", () => {
               configured: true,
               applicationId: "app",
               version: 2,
+              exchangeInProgress: false,
               attempt: {
                 attemptId: "B",
                 connectionId: null,
                 expiresAt: 600000,
                 status: "pending",
+                canResume: true,
                 error: null,
               },
               connections: [],
@@ -108,8 +118,8 @@ describe("workflow source client", () => {
                 { grantId: "hidden", connectionId: "owned", repositoryName: null },
               ],
             },
-          }),
-        ),
+          });
+        }),
       ),
     ),
   );

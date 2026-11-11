@@ -168,20 +168,22 @@ _is_ registered requires a role on that repository.
 
 ## Workflow sources
 
-When Linear workflow connections are available on your relay, open **Settings → Connections →
-Workflow sources** to connect your workspace. This is separate from your personal issue-tracker
-connection in the composer. Only the connection owner can allow new repository use, and only for
-repositories they maintain or administer. Other repository maintainers can inspect granted sources
-and withdraw their repository's use. **Workflow sources** in the repository workflow view opens
-that repository's access management, including when it has no saved workflows.
+An organization admin opens **Settings → Organization → Workflow sources**, then uses
+**Connect Linear workspace** to install the app in Linear. Use **Allow repository** to make the
+connection available to a repository. This workflow connection is separate from the personal
+issue-tracker connection in the composer.
 
-Reconnect uses the same Linear workspace and preserves existing repository consent. Connect a
-separate source for a different workspace. Withdrawing access requires fresh owner consent before
-it can be used again. Disconnect removes Launchpad's stored authorization; it does not cancel
-Starting or running work. Use the run's Cancel action to stop that work.
+Repository maintainers choose an allowed connection in **Trigger settings**. The **Workflow
+sources** button in the repository workflow view shows access and lets maintainers withdraw it.
+An organization admin must grant access again after withdrawal.
 
-Automatic Linear triggers require relay support and verified event delivery for the selected team. Rollout of automatic execution depends on the relay’s available integration. Mobile shows source health; configure sources and triggers in the web or desktop app. If the service configuration needs attention,
-retry after the relay operator repairs it rather than reconnecting your account.
+An organization admin can reconnect the same Linear workspace and keep the repository grants.
+Disconnect removes Launchpad's authorization and blocks new starts. Work already Starting or
+running can continue. Use **Cancel run** to stop it. If the relay needs configuration, ask the
+relay operator to check it.
+
+Automatic Linear triggers require verified event delivery for the selected team. Manage
+connections and triggers in the web or desktop app. Mobile shows source health.
 
 ## Repository workflows
 
@@ -217,7 +219,15 @@ worktree and one shared agent conversation. Inspect the saved result and diff be
 Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
 history, and response drafts remain available while waiting for the machine to acknowledge them. Leaving an editor with unsaved changes asks whether to keep editing or discard and leave. Discard removes local edits; a Save already submitted may still complete. Save errors retain edits; Retry checks the saved version before submitting again. Reloading or restarting the app does not restore unsaved drafts.
 
-When automatic triggering is available on your relay, open **Trigger settings** in the editor. Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected status. Optional labels must all match. You can connect Linear and allow repository use from the editor without leaving your draft. Enabling requires verified event delivery for that exact team and a validated execution target. Save applies the rule and its On/Off setting; changed rules apply only to events after Save. The catalog shows the saved state and any source or target problem. The catalog’s On/Off actions open trigger settings and keep other unsaved edits. Save applies the change; turning Off stops new event admissions and preserves existing jobs and manual Run. Archive disables automation, and restore leaves it Off. Automatic execution depends on your relay’s available integration and rollout; configuring a trigger alone does not confirm that a job has started.
+When automatic triggering is available on your relay, open **Trigger settings** in the editor.
+Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected
+status. Optional labels must all match. Organization admins can connect Linear and grant
+repository access from the editor without leaving the draft. Enabling requires verified event
+delivery for that team and a valid Machine target.
+
+**Save** applies the rule and its On/Off setting to future events. The catalog shows the saved
+state and any source or target problem. Turning Off preserves existing jobs and manual Run.
+Archiving disables automation, and restoring leaves it Off.
 
 Before an automatic job is handed to its environment, Launchpad reads the issue’s current title,
 description, status and labels. Comments and images are excluded. The run keeps those details even

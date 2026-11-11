@@ -2,6 +2,7 @@ import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowSources } from "@t3tools/client-runtime/relay";
 import {
   RelayRepositoryId,
+  type RelayOrganizationId,
   type WorkflowSource,
   type WorkflowSourceOwner,
   type WorkflowSourceAuthorization,
@@ -13,16 +14,24 @@ import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 import { SourceIdentity, confirmChange } from "./WorkflowSources";
-export function OwnerSources({ accountId }: { accountId: string }) {
+export function OwnerSources({
+  accountId,
+  organizationId,
+}: {
+  accountId: string;
+  organizationId: RelayOrganizationId;
+}) {
   const read = useCallback(
-    (client: WorkflowSources.Client, token: string) => client.owner(token),
-    [],
+    (client: WorkflowSources.Client, token: string) => client.owner(token, organizationId),
+    [organizationId],
   );
   const state = useWorkflowSources<WorkflowSourceOwner>(accountId, read);
   const [authorization, setAuthorization] =
     useState<WorkflowSourceAuthorization["authorization"]>(null);
   const snapshot = state.snapshot,
     disabled = state.busy || state.loading || state.unverified;
+  const exchangeInProgress = snapshot?.exchangeInProgress === true;
+  const authorizationBlocked = disabled || exchangeInProgress;
   const matches = (
     link: WorkflowSourceAuthorization["authorization"],
     current: WorkflowSourceOwner,
@@ -30,13 +39,14 @@ export function OwnerSources({ accountId }: { accountId: string }) {
     link !== null &&
     current.applicationId === link.applicationId &&
     current.attempt?.attemptId === link.attemptId &&
-    current.attempt.status === "pending";
+    current.attempt.status === "pending" &&
+    current.attempt.canResume;
   const activeAuthorization =
-    !disabled && snapshot && matches(authorization, snapshot) ? authorization : null;
+    !authorizationBlocked && snapshot && matches(authorization, snapshot) ? authorization : null;
   const connect = async (connectionId: string | null, resumeId?: string) => {
     if (!snapshot) return;
     const result = await state.mutate((client, token) =>
-      client.begin(token, {
+      client.begin(token, organizationId, {
         attemptId: resumeId ?? randomUUID(),
         expectedVersion: snapshot.version,
         connectionId,
@@ -50,9 +60,9 @@ export function OwnerSources({ accountId }: { accountId: string }) {
     }
   };
   return (
-    <section aria-label="Your Linear connections">
+    <section aria-label="Linear for workflows">
       <header className="flex items-center justify-between gap-2 px-4">
-        <h3 className="text-sm font-medium">Your Linear connections</h3>
+        <h3 className="text-sm font-medium">Linear for workflows</h3>
         <Button
           variant="ghost"
           size="icon-sm"
@@ -65,8 +75,7 @@ export function OwnerSources({ accountId }: { accountId: string }) {
       </header>
       <div className="space-y-4 px-4 py-3">
         <p className="text-sm text-muted-foreground">
-          Connect a Linear workspace and allow repositories to use it for workflows. Read access
-          only.
+          Install the Linear app for your organization and choose which repositories can use it.
         </p>
         {state.error ? (
           <WorkflowAlert
@@ -94,18 +103,17 @@ export function OwnerSources({ accountId }: { accountId: string }) {
           <>
             {!snapshot.configured ? (
               <WorkflowAlert title="Linear workflow connections unavailable" variant="info">
-                Linear workflow connections are not available on this relay yet. Ask your
-                environment administrator to enable them, then refresh connections.
+                Ask your relay administrator to configure Linear for this organization.
               </WorkflowAlert>
-            ) : (
+            ) : !snapshot.connections.length && !exchangeInProgress ? (
               <Button disabled={disabled} onClick={() => void connect(null)}>
                 Connect Linear workspace
               </Button>
-            )}
+            ) : null}
             {snapshot.attempt && ["pending", "exchanging"].includes(snapshot.attempt.status) ? (
               <div className="space-y-2">
                 <p className="text-sm">
-                  {snapshot.attempt.status === "exchanging"
+                  {exchangeInProgress
                     ? "Finishing Linear authorization…"
                     : "Waiting for Linear authorization."}
                 </p>
@@ -114,17 +122,25 @@ export function OwnerSources({ accountId }: { accountId: string }) {
                   disabled={disabled}
                   onClick={() => {
                     setAuthorization(null);
-                    void state.mutate((c, t) => c.cancel(t, snapshot.attempt!.attemptId));
+                    void state.mutate((c, t) =>
+                      c.cancel(t, organizationId, snapshot.attempt!.attemptId),
+                    );
                   }}
                 >
                   Cancel authorization
                 </Button>
               </div>
+            ) : exchangeInProgress ? (
+              <p role="status" className="text-sm">
+                Finishing Linear authorization…
+              </p>
             ) : null}
-            {snapshot.attempt?.status === "pending" && !activeAuthorization ? (
+            {snapshot.attempt?.status === "pending" &&
+            snapshot.attempt.canResume &&
+            !activeAuthorization ? (
               <Button
                 variant="outline"
-                disabled={disabled}
+                disabled={authorizationBlocked}
                 onClick={() =>
                   void connect(snapshot.attempt!.connectionId, snapshot.attempt!.attemptId)
                 }
@@ -140,7 +156,10 @@ export function OwnerSources({ accountId }: { accountId: string }) {
                   <Button
                     variant="outline"
                     size="sm"
-                    disabled={disabled}
+                    disabled={
+                      disabled ||
+                      (exchangeInProgress && snapshot.attempt!.error !== "service_configuration")
+                    }
                     onClick={() =>
                       snapshot.attempt!.error === "service_configuration"
                         ? void state.refresh()
@@ -155,7 +174,7 @@ export function OwnerSources({ accountId }: { accountId: string }) {
               >
                 {snapshot.attempt.error === "service_configuration"
                   ? "Linear service configuration needs attention. Retry after it is restored."
-                  : "Authorization did not complete. Your existing sources were preserved."}
+                  : "Authorization did not complete. Check the connection and try again."}
               </WorkflowAlert>
             ) : null}
             {activeAuthorization ? (
@@ -172,6 +191,7 @@ export function OwnerSources({ accountId }: { accountId: string }) {
               {snapshot.connections.map((source) => (
                 <OwnerSourceRow
                   key={source.connectionId}
+                  organizationId={organizationId}
                   source={source}
                   snapshot={snapshot}
                   disabled={disabled}
@@ -191,12 +211,14 @@ export function OwnerSources({ accountId }: { accountId: string }) {
 }
 type OwnerState = ReturnType<typeof useWorkflowSources<WorkflowSourceOwner>>;
 function OwnerSourceRow({
+  organizationId,
   source,
   snapshot,
   disabled,
   reconnect,
   mutate,
 }: {
+  organizationId: RelayOrganizationId;
   source: WorkflowSource;
   snapshot: WorkflowSourceOwner;
   disabled: boolean;
@@ -208,13 +230,14 @@ function OwnerSourceRow({
   const eligible = snapshot.repositories.filter(
     (r) => !current.some((g) => g.repositoryId === r.repositoryId && !g.revoked),
   );
+  const authorizationBlocked = disabled || snapshot.exchangeInProgress;
   return (
     <div className="space-y-3 py-3">
       <div className="flex flex-wrap items-start gap-2">
         <SourceIdentity source={source} />
         <div className="flex flex-wrap gap-2">
           {snapshot.configured && source.health.code !== "service_configuration" ? (
-            <Button size="sm" variant="outline" disabled={disabled} onClick={reconnect}>
+            <Button size="sm" variant="outline" disabled={authorizationBlocked} onClick={reconnect}>
               Reconnect
             </Button>
           ) : null}
@@ -222,8 +245,10 @@ function OwnerSourceRow({
             <Button
               size="sm"
               variant="ghost"
-              disabled={disabled}
-              onClick={() => void mutate((c, t) => c.refreshOwner(t, source.connectionId))}
+              disabled={authorizationBlocked}
+              onClick={() =>
+                void mutate((c, t) => c.refreshOwner(t, organizationId, source.connectionId))
+              }
             >
               Retry connection
             </Button>
@@ -240,7 +265,7 @@ function OwnerSourceRow({
                   )
                 )
                   await mutate((c, t) =>
-                    c.disconnect(t, {
+                    c.disconnect(t, organizationId, {
                       connectionId: source.connectionId,
                       expectedEpoch: source.authorizationEpoch,
                     }),
@@ -274,7 +299,7 @@ function OwnerSourceRow({
                     "Withdraw this repository's source access? Starting and running work may continue.",
                   )
                 )
-                  await mutate((c, t) => c.withdrawOwner(t, g.grantId));
+                  await mutate((c, t) => c.withdrawOwner(t, organizationId, g.grantId));
               }}
             >
               Withdraw access
@@ -287,7 +312,7 @@ function OwnerSourceRow({
       eligible.length ? (
         <div className="flex flex-wrap items-center gap-2">
           <div className="min-w-0 flex-1">
-            <Select value={repo} onValueChange={setRepo}>
+            <Select value={repo} onValueChange={setRepo} disabled={authorizationBlocked}>
               <SelectTrigger aria-label={`Repository allowed to use ${source.workspaceName}`}>
                 <SelectValue placeholder="Choose repository">
                   {eligible.find((r) => r.repositoryId === repo)?.name}
@@ -305,7 +330,9 @@ function OwnerSourceRow({
           <Button
             size="sm"
             variant="outline"
-            disabled={disabled || !repo || !eligible.some((r) => r.repositoryId === repo)}
+            disabled={
+              authorizationBlocked || !repo || !eligible.some((r) => r.repositoryId === repo)
+            }
             onClick={() => {
               if (repo)
                 void mutate((c, t) =>

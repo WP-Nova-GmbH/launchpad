@@ -16,11 +16,11 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
     target_capability: unknown;
     connection: Connection | null;
     grant: Grant | null;
-    owner_present: boolean;
+    reconnecting: boolean;
     target_bound: boolean;
   }>`SELECT w.record,w.target_capability,
     to_jsonb(c) AS connection,to_jsonb(g) AS grant,
-    EXISTS(SELECT 1 FROM relay_organization_members om WHERE om.organization_id=r.organization_id AND om.user_id=g.owner_user_id) AS owner_present,
+    a.exchange_lease_until IS NOT NULL AS reconnecting,
     EXISTS(SELECT 1 FROM relay_machines m
       JOIN relay_organization_project_catalogs pc ON pc.machine_id=m.machine_id AND pc.environment_id=m.environment_id AND pc.organization_id=r.organization_id
       JOIN relay_organization_projects p ON p.machine_id=m.machine_id AND p.environment_id=pc.environment_id AND p.organization_id=r.organization_id
@@ -31,7 +31,8 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
     FROM relay_repository_workflows w
     JOIN relay_repositories r ON r.repository_id=w.repository_id
     LEFT JOIN relay_workflow_repository_grants g ON g.grant_id=w.record->'automation'->'trigger'->>'grantId' AND g.repository_id=w.repository_id AND g.organization_id=r.organization_id
-    LEFT JOIN relay_workflow_connections c ON c.connection_id=g.connection_id AND c.owner_user_id=g.owner_user_id
+    LEFT JOIN relay_workflow_connections c ON c.connection_id=g.connection_id AND c.organization_id=g.organization_id
+    LEFT JOIN relay_workflow_authorizations a ON a.organization_id=c.organization_id AND a.application_id=c.application_id
     WHERE w.repository_id=${repo}`;
   return rows.map((row): WorkflowAutomationSummary => {
     const saved = automation(row.record.automation);
@@ -43,22 +44,17 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
     if (saved.enabled) {
       if (!config?.admissionEnabled)
         reason = "Automatic event admission is unavailable on this relay.";
-      else if (
-        !trigger ||
-        !g ||
-        g.revoked ||
-        !row.owner_present ||
-        !c ||
-        c.connection_id !== trigger.connectionId
-      )
+      else if (!trigger || !g || g.revoked || !c || c.connection_id !== trigger.connectionId)
         reason = "Repository source permission needs attention.";
       else if (
+        c.organization_id !== config.organizationId ||
         c.application_id !== config.applicationId ||
         c.health.code === "service_configuration"
       )
         reason = "Linear service configuration needs attention.";
+      else if (row.reconnecting) reason = "Linear reconnection has not finished.";
       else if (c.status !== "connected" || !c.payload_sealed)
-        reason = "The source owner must reconnect Linear.";
+        reason = "An organization admin must reconnect Linear.";
       else if (c.health.code !== "healthy")
         reason =
           c.health.code === "rate_limited"

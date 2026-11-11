@@ -48,6 +48,12 @@ export interface GithubAppCredentials {
   readonly privateKey: Redacted.Redacted<string>;
 }
 
+export interface LinearWorkflowConfiguration {
+  readonly clientId: string;
+  readonly organizationId: string;
+  readonly clientSecret?: Redacted.Redacted<string>;
+}
+
 export class RelayConfiguration extends Context.Service<
   RelayConfiguration,
   {
@@ -62,14 +68,12 @@ export class RelayConfiguration extends Context.Service<
     readonly cloudMintPublicKey: string;
     /** Absent until a deployment configures a GitHub App; the surface hides itself. */
     readonly github?: GithubAppCredentials | undefined;
-    /** Configure only after native owner/credential isolation has been proven. */
-    readonly linearWorkflow?:
-      | { readonly clientId: string; readonly clientSecret?: Redacted.Redacted<string> }
-      | undefined;
+    readonly linearWorkflow?: LinearWorkflowConfiguration | undefined;
     /** Intake may observe delivery while admission stays disabled until release verification. */
     readonly linearWorkflowWebhook?:
       | {
           readonly applicationId: string;
+          readonly organizationId: string;
           readonly signingSecret: Redacted.Redacted<string>;
           readonly generation: string;
           readonly admissionEnabled: boolean;
@@ -98,18 +102,31 @@ export const make = (configuration: RelayConfiguration["Service"]) =>
 export const layer = (configuration: RelayConfiguration["Service"]) =>
   Layer.succeed(RelayConfiguration, make(configuration));
 
+export function workflowLinearConfiguration(
+  clientId: string | undefined,
+  organizationId: string | undefined,
+  clientSecret?: Redacted.Redacted<string>,
+): LinearWorkflowConfiguration | undefined {
+  const app = clientId?.trim();
+  const org = organizationId?.trim();
+  if (!app || !org) return undefined;
+  return {
+    clientId: app,
+    organizationId: org,
+    ...(clientSecret && Redacted.value(clientSecret).trim() ? { clientSecret } : {}),
+  };
+}
+
 export function workflowWebhookConfiguration(
-  applicationId: string | undefined,
+  linear: LinearWorkflowConfiguration | undefined,
   signingSecret: Redacted.Redacted<string> | undefined,
   generation: string | undefined,
   admissionEnabled = false,
 ) {
-  return applicationId?.trim() &&
-    signingSecret &&
-    Redacted.value(signingSecret).trim() &&
-    generation?.trim()
+  return linear && signingSecret && Redacted.value(signingSecret).trim() && generation?.trim()
     ? {
-        applicationId: applicationId.trim(),
+        applicationId: linear.clientId,
+        organizationId: linear.organizationId,
         signingSecret,
         generation: generation.trim(),
         admissionEnabled,

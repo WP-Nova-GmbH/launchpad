@@ -119,13 +119,13 @@ export const queueReasonText: Record<WorkflowQueueReason["code"], string> = {
     "The workflow no longer targets a VM. Switch it back to VM or cancel this run.",
   source_unavailable: "Linear is temporarily unavailable. The job will retry automatically.",
   source_rate_limited: "Linear is rate limited. The job will retry after its waiting period.",
-  source_reconnect: "The source owner must reconnect Linear before this job can start.",
+  source_reconnect: "An organization admin must reconnect Linear before this job can start.",
   source_configuration:
     "Linear service configuration needs attention. Retry after the relay operator repairs it.",
   source_withdrawn:
     "The original repository source permission was withdrawn. Cancel this job; a different grant cannot replace it.",
   source_owner_ineligible:
-    "The source owner is no longer in this organization. Restore access or cancel this job.",
+    "The original source is no longer authorized. Update access or cancel this job.",
   issue_unavailable:
     "The original Linear connection cannot read this issue. Restore issue access or cancel the job.",
   issue_context_invalid:

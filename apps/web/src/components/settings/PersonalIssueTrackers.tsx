@@ -1,4 +1,3 @@
-import { WorkflowSourcesSettings } from "./WorkflowSources";
 import { useAuth } from "@clerk/react";
 import { useIssueTrackers } from "../../cloud/issueTrackers";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
@@ -33,10 +32,5 @@ function ConfiguredConnections() {
 }
 
 export function PersonalIssueTrackers() {
-  return hasCloudPublicConfig() ? (
-    <>
-      <ConfiguredConnections />
-      <WorkflowSourcesSettings />
-    </>
-  ) : null;
+  return hasCloudPublicConfig() ? <ConfiguredConnections /> : null;
 }

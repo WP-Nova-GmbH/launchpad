@@ -13,7 +13,7 @@ type Operation<A> = (
   client: WorkflowSources.Client,
   token: string,
 ) => Effect.Effect<A, WorkflowSourceError | ManagedRelay.ManagedRelayClientError>;
-/** Mount under an account/repository key; reads and writes share one response owner. */
+/** Mount under the current account and resource key. */
 export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
   const { getToken, userId } = useAuth();
   const identity = useRef(userId);
@@ -30,7 +30,7 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
   const [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(false),
     [unverified, setUnverified] = useState(false);
-  useEffect(() => {
+  useLayoutEffect(() => {
     live.current = true;
     return () => {
       live.current = false;

@@ -13,7 +13,6 @@ import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { Workflows, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { validateWorkflowTarget, lockWorkflowTarget } from "../jobs/WorkflowTarget.ts";
 import * as Store from "../workflowSources/Store.ts";
-import * as Sources from "../workflowSources/Sources.ts";
 import * as Issue from "../workflowSources/IssueContext.ts";
 import * as Fence from "./Fence.ts";
 
@@ -43,24 +42,28 @@ const authority = Effect.fn("workflowEvents.originalAuthority")(function* (row: 
     admission.grant_id !== origin.source.grantId
   )
     return yield* blocked("source_withdrawn");
-  const hint = yield* Store.connection(origin.source.connectionId);
-  if (!hint) return yield* blocked("source_withdrawn");
-  const [member] =
-    yield* sql`SELECT user_id FROM relay_organization_members WHERE organization_id=${row.organizationId} AND user_id=${hint.owner_user_id} FOR SHARE`;
-  if (!member) return yield* blocked("source_owner_ineligible");
   const bound = yield* Store.authority(row.repositoryId, origin.source.grantId).pipe(
     Effect.catchIf(isSourceError, (error) =>
       Effect.fail(
-        blocked(error.code === "reconnect_required" ? "source_reconnect" : "source_withdrawn"),
+        blocked(
+          error.code === "reconnect_required"
+            ? "source_reconnect"
+            : error.code === "service_configuration" || error.code === "not_configured"
+              ? "source_configuration"
+              : error.code === "refresh_in_progress"
+                ? "source_unavailable"
+                : "source_withdrawn",
+          error.retryAt ?? null,
+        ),
       ),
     ),
   );
   if (
     bound.connection.connection_id !== origin.source.connectionId ||
+    bound.connection.organization_id !== row.organizationId ||
     bound.connection.application_id !== origin.source.applicationId ||
     bound.connection.workspace_id !== origin.source.workspaceId ||
-    bound.grant.generation !== admission.grant_generation ||
-    (yield* Sources.configuredApp) !== origin.source.applicationId
+    bound.grant.generation !== admission.grant_generation
   )
     return yield* blocked("source_withdrawn");
   return bound;
@@ -205,6 +208,65 @@ export const prepareAutomaticOffer = Effect.fn("workflowEvents.prepareAutomaticO
   );
 });
 
+const beginStart = Effect.fn("workflowEvents.beginStart")(function* (
+  row: WorkflowJobRecord,
+  leaseUntil: string,
+  updatedAt: string,
+) {
+  const { origin, workflow, runtime, offerAuthority, issueSnapshot } = row.record;
+  if (
+    origin?.kind !== "automation" ||
+    row.record.status !== "dispatching" ||
+    row.record.startAttempted !== false ||
+    row.record.progress ||
+    row.pendingControl ||
+    !offerAuthority ||
+    !issueSnapshot
+  )
+    return yield* blocked("source_withdrawn");
+  if (
+    !workflow ||
+    workflow.definition.target.kind !== "machine" ||
+    runtime?.kind !== "machine" ||
+    workflow.definition.target.environmentId !== runtime.environmentId ||
+    workflow.definition.target.projectId !== runtime.projectId
+  )
+    return yield* blocked("target_invalid");
+  const sql = (yield* RelayDb).$client;
+  const store = yield* Workflows;
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* Fence.lock(origin.source.applicationId, origin.source.workspaceId);
+      const current = yield* authority(row);
+      if (
+        current.connection.authorization_epoch !== offerAuthority.authorizationEpoch ||
+        current.connection.authorization_epoch !== issueSnapshot.authorizationEpoch ||
+        current.grant.generation !== offerAuthority.grantGeneration
+      )
+        return yield* blocked("source_unavailable");
+      const [saved] = yield* sql<{ record: unknown }>`SELECT record FROM relay_repository_workflows
+        WHERE workflow_id=${workflow.workflowId} AND repository_id=${row.repositoryId} FOR SHARE`;
+      if (!saved || (yield* decodeWorkflow(saved.record)).archived)
+        return yield* blocked("workflow_unavailable");
+      const target = yield* lockWorkflowTarget(
+        row.organizationId,
+        row.repositoryId,
+        workflow.definition,
+      ).pipe(Effect.mapError(() => blocked("target_invalid")));
+      if (target !== row.repositoryCanonicalKey) return yield* blocked("target_invalid");
+      // An Off or criteria-only Save changes future admission, not this offer's source.
+      // The job revision and active lease also fence a cancellation recorded during the probe.
+      return yield* store.updateJob(
+        row,
+        { ...row.record, startAttempted: true, updatedAt },
+        row.pendingControl,
+        false,
+        leaseUntil,
+      );
+    }),
+  );
+});
+
 export class AutomaticOffers extends Context.Service<
   AutomaticOffers,
   {
@@ -212,6 +274,11 @@ export class AutomaticOffers extends Context.Service<
       row: WorkflowJobRecord,
       leaseUntil: string,
     ) => Effect.Effect<WorkflowJobRecord, Effect.Error<ReturnType<typeof prepareAutomaticOffer>>>;
+    readonly beginStart: (
+      row: WorkflowJobRecord,
+      leaseUntil: string,
+      updatedAt: string,
+    ) => Effect.Effect<WorkflowJobRecord, Effect.Error<ReturnType<typeof beginStart>>>;
   }
 >()("launchpad-relay/workflowEvents/AutomaticOffer/AutomaticOffers") {}
 export const layer = Layer.effect(
@@ -221,6 +288,8 @@ export const layer = Layer.effect(
       yield* Effect.context<Effect.Services<ReturnType<typeof prepareAutomaticOffer>>>();
     return AutomaticOffers.of({
       prepare: (row, lease) => prepareAutomaticOffer(row, lease).pipe(Effect.provide(context)),
+      beginStart: (row, lease, updatedAt) =>
+        beginStart(row, lease, updatedAt).pipe(Effect.provide(context)),
     });
   }),
 );

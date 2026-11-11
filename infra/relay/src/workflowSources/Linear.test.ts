@@ -8,14 +8,14 @@ import { configLayer, transport, tokenReply } from "./test-fixture.ts";
 const isSourceError = Schema.is(WorkflowSourceError);
 
 describe("native Linear workflow adapter", () => {
-  it.effect("uses fixed native endpoints, read/user consent and PKCE S256", () =>
+  it.effect("uses fixed native endpoints, read-only app consent and PKCE S256", () =>
     Effect.gen(function* () {
       const url = new URL(
         yield* Linear.authorizationUrl({ state: "csrf-state", verifier: "private-verifier" }),
       );
       expect(url.origin + url.pathname).toBe("https://linear.app/oauth/authorize");
       expect(Object.fromEntries(url.searchParams)).toMatchObject({
-        actor: "user",
+        actor: "app",
         scope: "read",
         state: "csrf-state",
         prompt: "consent",
@@ -23,6 +23,15 @@ describe("native Linear workflow adapter", () => {
         redirect_uri: "https://relay.test/oauth/workflow-sources/linear/callback",
       });
       expect(url.searchParams.get("code_challenge")).toHaveLength(43);
+      expect(url.searchParams.has("update_scopes_on_existing_token")).toBe(false);
+      const reconnect = new URL(
+        yield* Linear.authorizationUrl({
+          state: "csrf-state",
+          verifier: "private-verifier",
+          reconnect: true,
+        }),
+      );
+      expect(reconnect.searchParams.get("update_scopes_on_existing_token")).toBe("true");
       const tokens = yield* Linear.exchange({ code: "code", verifier: "verifier" });
       expect(tokens).toMatchObject({ accessToken: "new-access", refreshToken: "new-refresh" });
     }).pipe(
@@ -48,6 +57,23 @@ describe("native Linear workflow adapter", () => {
         Effect.provide([
           configLayer,
           transport(() => Response.json({ error: code }, { status: 401 })),
+        ]),
+      ),
+    );
+  for (const [status, expected] of [
+    [400, "invalid_input"],
+    [503, "unavailable"],
+  ] as const)
+    it.effect(`classifies authorization-code invalid_grant with HTTP ${status}`, () =>
+      Effect.gen(function* () {
+        const error = yield* Linear.exchange({ code: "code", verifier: "verifier" }).pipe(
+          Effect.flip,
+        );
+        expect(error).toMatchObject({ code: expected });
+      }).pipe(
+        Effect.provide([
+          configLayer,
+          transport(() => Response.json({ error: "invalid_grant" }, { status })),
         ]),
       ),
     );

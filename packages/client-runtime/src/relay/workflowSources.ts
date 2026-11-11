@@ -1,6 +1,7 @@
 import {
   RelayApi,
   WorkflowSourceError,
+  type RelayOrganizationId,
   type RelayRepositoryId,
   type BeginWorkflowSource,
   type DisconnectWorkflowSource,
@@ -44,15 +45,37 @@ export const client = Effect.gen(function* () {
     return yield* new ManagedRelayUrlInvalidError({ relayUrl });
   const { workflowSources: api } = yield* HttpApiClient.make(RelayApi, { baseUrl: relayUrl });
   return {
-    owner: (token: string) => finish(api.owner({ headers: bearerHeaders(token) })),
-    begin: (token: string, payload: typeof BeginWorkflowSource.Type) =>
-      finish(api.begin({ headers: bearerHeaders(token), payload })),
-    cancel: (token: string, attemptId: string) =>
-      finish(api.cancel({ headers: bearerHeaders(token), payload: { attemptId } })),
-    disconnect: (token: string, payload: typeof DisconnectWorkflowSource.Type) =>
-      finish(api.disconnect({ headers: bearerHeaders(token), payload })),
-    refreshOwner: (token: string, connectionId: string) =>
-      finish(api.refreshOwner({ headers: bearerHeaders(token), payload: { connectionId } })),
+    owner: (token: string, organizationId: RelayOrganizationId) =>
+      finish(api.owner({ headers: bearerHeaders(token), params: { organizationId } })),
+    begin: (
+      token: string,
+      organizationId: RelayOrganizationId,
+      payload: typeof BeginWorkflowSource.Type,
+    ) => finish(api.begin({ headers: bearerHeaders(token), params: { organizationId }, payload })),
+    cancel: (token: string, organizationId: RelayOrganizationId, attemptId: string) =>
+      finish(
+        api.cancel({
+          headers: bearerHeaders(token),
+          params: { organizationId },
+          payload: { attemptId },
+        }),
+      ),
+    disconnect: (
+      token: string,
+      organizationId: RelayOrganizationId,
+      payload: typeof DisconnectWorkflowSource.Type,
+    ) =>
+      finish(
+        api.disconnect({ headers: bearerHeaders(token), params: { organizationId }, payload }),
+      ),
+    refreshOwner: (token: string, organizationId: RelayOrganizationId, connectionId: string) =>
+      finish(
+        api.refreshOwner({
+          headers: bearerHeaders(token),
+          params: { organizationId },
+          payload: { connectionId },
+        }),
+      ),
     repository: (token: string, repositoryId: RelayRepositoryId) =>
       finish(api.repository({ headers: bearerHeaders(token), params: { repositoryId } })),
     health: (token: string, repositoryId: RelayRepositoryId) =>
@@ -70,8 +93,14 @@ export const client = Effect.gen(function* () {
           payload: { grantId },
         }),
       ),
-    withdrawOwner: (token: string, grantId: string) =>
-      finish(api.withdrawOwner({ headers: bearerHeaders(token), payload: { grantId } })),
+    withdrawOwner: (token: string, organizationId: RelayOrganizationId, grantId: string) =>
+      finish(
+        api.withdrawOwner({
+          headers: bearerHeaders(token),
+          params: { organizationId },
+          payload: { grantId },
+        }),
+      ),
     refreshRepository: (token: string, repositoryId: RelayRepositoryId, grantId: string) =>
       finish(
         api.refreshRepository({
@@ -106,7 +135,7 @@ export const sourceHealthLabel = (source: { status: string; health: { code: stri
   source.status === "disconnected"
     ? "Disconnected"
     : source.status === "reconnect_required"
-      ? "Owner reconnect required"
+      ? "Reconnect required"
       : source.health.code === "service_configuration"
         ? "Service configuration needs attention"
         : source.health.code === "rate_limited"

@@ -18,7 +18,7 @@ vi.mock("../../cloud/workflowSources", () => ({
   useWorkflowSources: () => ({ snapshot: null, loading: false, refresh: vi.fn() }),
 }));
 vi.mock("./WorkflowSources", () => ({
-  RepositorySources: () => null,
+  RepositorySourcesPanel: () => null,
   RepositorySourcesButton: () => null,
 }));
 vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));

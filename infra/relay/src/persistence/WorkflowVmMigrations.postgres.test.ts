@@ -22,6 +22,7 @@ const stockVmHead = "c57df92d-b498-403e-9d19-d8453f1502dd";
 const runtimeMigration = "20261028221922_thread_vm_runtime_protocol";
 const foundationMigration = "20261102170843_workflow_execution_foundation";
 const configurationMigration = "20261103125456_workflow_run_configuration";
+const preLinearMigration = "20261110103102_workflow_saved_results";
 const prefix = "workflow_vm_merge_20261027_";
 type Snapshot = Awaited<ReturnType<typeof generateDrizzleJson>>;
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
@@ -163,6 +164,26 @@ const seed = (sql: PgClient.PgClient, names: ReadonlySet<string>) =>
       yield* sql`INSERT INTO relay_workflow_jobs(job_id,repository_id,organization_id,submitter_user_id,status,record,revision,created_at,checked_at) VALUES ('merge-uncertain-job','merge-repo','merge-org','merge-user','dispatching',${sql.json(uncertain)},0,'2026','2026')`;
       yield* sql`INSERT INTO relay_workflow_connections(connection_id,owner_user_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES ('merge-connection','merge-user','app','workspace','Workspace','Owner','connected','2026','sealed-fixture','{"code":"healthy","retryAt":null}')`;
       yield* sql`INSERT INTO relay_workflow_repository_grants(grant_id,connection_id,organization_id,repository_id,owner_user_id,generation,created_at) VALUES ('merge-grant','merge-connection','merge-org','merge-repo','merge-user',1,'2026')`;
+      yield* sql`INSERT INTO relay_workflow_authorizations(owner_user_id,application_id,status,pending_sealed) VALUES ('merge-user','app','pending','sealed-attempt')`;
+      if (names.has(preLinearMigration)) {
+        const active = {
+          ...flow,
+          workflowId: "linear-cutover-flow",
+          automation: {
+            enabled: true,
+            trigger: {
+              provider: "linear",
+              connectionId: "merge-connection",
+              grantId: "merge-grant",
+              teamId: "team",
+              event: "issue_created",
+              labelIds: [],
+            },
+          },
+        };
+        yield* sql`INSERT INTO relay_repository_workflows(workflow_id,repository_id,revision,record,automation_enabled,source_application_id,source_workspace_id,trigger_team_id,trigger_event,trigger_grant_id,routing_generation,effective_after,target_capability)
+          VALUES ('linear-cutover-flow','merge-repo',1,${sql.json(active)},true,'app','workspace','team','issue_created','merge-grant',1,'2026','{}')`;
+      }
     }
     if (names.has("20261023131714_thread_original_location")) {
       yield* sql`INSERT INTO relay_thread_placements(thread_id,organization_id,repository_id,owner_user_id,environment_id,project_id,original_environment_id,original_project_id) VALUES ('merge-thread','merge-org','merge-repo','merge-user','environment','project','original-environment','original-project')`;
@@ -270,6 +291,9 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
           configuration!.snapshot.prevIds.flatMap((id) => [...ancestors(id)]),
         );
         expect(beforeConfiguration.has(foundationMigration)).toBe(true);
+        const beforeLinear = ancestors(
+          entries.find((entry) => entry.name === preLinearMigration)!.snapshot.id,
+        );
         const generated = yield* Effect.promise(() => generateDrizzleJson(schema));
         expect(yield* Effect.promise(() => generateMigration(head, generated))).toEqual([]);
         const empty = yield* Effect.promise(() => generateDrizzleJson({}));
@@ -297,6 +321,7 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
           ["stock", stock],
           ["current", current],
           ["before-configuration", beforeConfiguration],
+          ["before-linear", beforeLinear],
         ] as const) {
           const baselineFolder = path.join(folder, label);
           yield* fs.makeDirectory(baselineFolder);
@@ -381,8 +406,44 @@ describe.skipIf(!url)("workflow and VM PostgreSQL migration convergence", () => 
                     expect(job.record).not.toHaveProperty("startAttempted");
                 }
               }
-              for (const [table, rows] of Object.entries(before))
+              const retired = [
+                "relay_workflow_authorizations",
+                "relay_workflow_connections",
+                "relay_workflow_repository_grants",
+              ];
+              for (const table of retired)
+                expect(after[table], label + ": " + table).toBeUndefined();
+              for (const [table, rows] of Object.entries(before)) {
+                if (retired.includes(table)) continue;
+                if (table === "relay_repository_workflows" && baseline.has(preLinearMigration)) {
+                  const previous = (rows as Array<{ row: Record<string, unknown> }>).find(
+                    ({ row }) => row.workflow_id === "linear-cutover-flow",
+                  )!.row;
+                  const [disabled] =
+                    yield* sql`SELECT * FROM relay_repository_workflows WHERE workflow_id='linear-cutover-flow'`;
+                  const record = previous.record as { automation: Record<string, unknown> };
+                  expect(disabled).toEqual({
+                    ...previous,
+                    revision: 2,
+                    automation_enabled: false,
+                    source_application_id: null,
+                    source_workspace_id: null,
+                    trigger_team_id: null,
+                    trigger_event: null,
+                    trigger_grant_id: null,
+                    routing_generation: 2,
+                    effective_after: null,
+                    target_capability: null,
+                    record: {
+                      ...record,
+                      revision: 2,
+                      automation: { ...record.automation, enabled: false },
+                    },
+                  });
+                  continue;
+                }
                 expect(after[table], label + ": " + table).toEqual(rows);
+              }
               expect(yield* catalog(sql), label + ": database schema").toEqual(expected);
               const applied = yield* ledger(sql);
               expect(applied.filter((entry) => baseline.has(entry.name))).toEqual(beforeLedger);

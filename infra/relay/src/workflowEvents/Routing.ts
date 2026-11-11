@@ -78,7 +78,10 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
   if (record.archived) next.enabled = false;
   if (next.enabled && record.definition.target.kind === "vm")
     return yield* vmWorkflowAutomationUnavailable();
-  if (next.enabled && (!next.trigger || !config?.admissionEnabled))
+  if (
+    next.enabled &&
+    (!next.trigger || !config?.admissionEnabled || config.organizationId !== record.organizationId)
+  )
     return yield* invalid("Automatic event admission is not enabled on this relay.");
   const db = yield* RelayDb;
   const sql = db.$client;
@@ -109,7 +112,7 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
             next.trigger.grantId,
             context.userId,
           );
-        else yield* Sources.repositoryAuthority(record.repositoryId, context.userId, null, true);
+        else yield* Sources.repositoryAuthority(record.repositoryId, context.userId, true);
         const current =
           (yield* sql<RoutingRow>`SELECT * FROM relay_repository_workflows WHERE workflow_id=${record.workflowId} FOR UPDATE`)[0] ??
           null;
@@ -123,6 +126,7 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
         if (
           next.trigger &&
           (!grantHint ||
+            grantHint.organization_id !== record.organizationId ||
             grantHint.repository_id !== record.repositoryId ||
             grantHint.connection_id !== next.trigger.connectionId) &&
           triggerKey(next.trigger) !== triggerKey(previous?.automation?.trigger ?? null)
@@ -134,6 +138,7 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
           bound &&
           (!config ||
             !proof ||
+            bound.connection.organization_id !== record.organizationId ||
             bound.connection.application_id !== config.applicationId ||
             bound.connection.connection_id !== next.trigger!.connectionId ||
             proof.epoch !== bound.connection.authorization_epoch ||

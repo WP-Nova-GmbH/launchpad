@@ -27,7 +27,7 @@ export const config = RelayConfiguration.of({
   cloudMintPublicKey: "public",
   managedEndpointBaseDomain: undefined,
   managedEndpointNamespace: undefined,
-  linearWorkflow: { clientId: "native-app" },
+  linearWorkflow: { clientId: "native-app", organizationId: "org" },
 });
 export const configLayer = Layer.succeed(RelayConfiguration, config);
 export const tokenReply = {
@@ -40,7 +40,7 @@ export const tokenReply = {
 export const identityReply = {
   data: {
     organization: { id: "workspace", name: "Workspace" },
-    viewer: { id: "linear-owner", name: "Linear Owner" },
+    viewer: { id: "linear-owner", name: "Linear Owner", app: true },
   },
 };
 export const transport = (reply: (req: HttpClientRequest) => Response) =>
@@ -110,6 +110,7 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
               "20261016074602_workflow_events",
               "20261019163246_workflow_automatic_starts",
               "20261102170843_workflow_execution_foundation",
+              "20261111101500_workflow_organization_linear",
             ].map(
               (name) =>
                 new URL(`../../migrations/postgres/${name}/migration.sql`, import.meta.url)
@@ -129,7 +130,7 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
             }
           }
           yield* sql`INSERT INTO relay_organizations(organization_id,name) VALUES ('org','Organization'),('other-org','Other')`;
-          yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role) VALUES ('org','owner','member'),('org','maintainer','member'),('org','reader','member'),('org','admin','admin'),('other-org','outsider','admin')`;
+          yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role) VALUES ('org','owner','member'),('org','maintainer','member'),('org','reader','member'),('org','admin','admin'),('org','admin-2','admin'),('other-org','outsider','admin')`;
           yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name) VALUES ('repo','org','Repository'),('repo-2','org','Second'),('foreign','other-org','Foreign')`;
           yield* sql`INSERT INTO relay_repository_access(repository_id,user_id,organization_id,role) VALUES ('repo','owner','org','maintainer'),('repo','maintainer','org','maintainer'),('repo','reader','org','developer'),('repo-2','owner','org','maintainer')`;
           return yield* program.pipe(Effect.provide(RelayTransactions.layer));
@@ -142,19 +143,20 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
   );
 export const createConnection = Effect.fn("workflowSources.test.createConnection")(function* (
   id = "connection",
-  owner = "owner",
+  organizationId = "org",
   expired = false,
   workspace = "workspace",
 ) {
   const box = yield* RelaySecretBox;
   const sealed = yield* box.seal(
     Store.json({
-      accessToken: "old-access-" + owner,
-      refreshToken: "old-refresh-" + owner,
+      accessToken: "old-access-" + organizationId,
+      refreshToken: "old-refresh-" + organizationId,
       expiresAt: (yield* Store.now) + (expired ? -1 : 86_400_000),
     }),
   );
   const sql = (yield* RelayDb).$client;
-  yield* sql`INSERT INTO relay_workflow_connections(connection_id,owner_user_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES (${id},${owner},'native-app',${workspace},'Workspace','Linear Owner','connected',${Store.iso(yield* Store.now)},${sealed},${Store.json(Store.healthy)}::jsonb)`;
+  yield* sql`INSERT INTO relay_workflow_authorizations(organization_id,application_id) VALUES (${organizationId},'native-app') ON CONFLICT DO NOTHING`;
+  yield* sql`INSERT INTO relay_workflow_connections(connection_id,organization_id,application_id,workspace_id,workspace_name,viewer_name,status,activated_at,payload_sealed,health) VALUES (${id},${organizationId},'native-app',${workspace},'Workspace','Linear App','connected',${Store.iso(yield* Store.now)},${sealed},${Store.json(Store.healthy)}::jsonb)`;
   return (yield* Store.connection(id))!;
 });

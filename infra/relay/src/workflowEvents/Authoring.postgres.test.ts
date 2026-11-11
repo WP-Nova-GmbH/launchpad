@@ -87,7 +87,11 @@ describe("workflow authoring reads (PostgreSQL)", () => {
       "UPDATE relay_workflow_repository_grants SET revoked=true",
       "permission",
     ],
-    ["removed owner", "DELETE FROM relay_organization_members WHERE user_id='owner'", "permission"],
+    [
+      "reconnection in progress",
+      "UPDATE relay_workflow_authorizations SET exchange_lease_until='2099-01-01T00:00:00.000Z'",
+      "reconnection",
+    ],
     [
       "disconnected source",
       "UPDATE relay_workflow_connections SET status='disconnected',payload_sealed=NULL",
@@ -190,7 +194,7 @@ describe("workflow authoring reads (PostgreSQL)", () => {
           Effect.forkChild,
         );
         yield* Deferred.await(entered);
-        yield* Sources.disconnect("owner", "connection", 1);
+        yield* Sources.disconnect("org", "admin", "connection", 1);
         yield* Deferred.succeed(release, undefined);
         expect((yield* Fiber.await(request))._tag).toBe("Failure");
       }),
@@ -422,10 +426,10 @@ it.live(
         yield* save();
         const original = yield* Routing.read("flow");
         const source = (yield* Store.connection("connection"))!;
-        yield* Sources.disconnect("owner", "connection", source.authorization_epoch);
+        yield* Sources.disconnect("org", "admin", "connection", source.authorization_epoch);
         expect((yield* summaries("repo"))[0]?.state).toBe("needs_attention");
-        const owner = yield* Store.attempt("owner", "native-app");
-        const begin = yield* Sources.begin("owner", {
+        const owner = yield* Store.attempt("org", "native-app");
+        const begin = yield* Sources.begin("org", "admin", {
           attemptId: "reconnect",
           expectedVersion: owner?.version ?? 0,
           connectionId: "connection",

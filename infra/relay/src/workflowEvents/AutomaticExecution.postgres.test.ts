@@ -108,7 +108,11 @@ it.live(
             const previous = (yield* store.get("flow"))!;
             const definition = {
               ...previous.definition,
-              projectId: PROJECT,
+              target: {
+                kind: "machine" as const,
+                environmentId: EnvironmentId.make("environment"),
+                projectId: PROJECT,
+              },
               steps: [
                 ...workflow.definition.steps,
                 { id: "push", kind: "action" as const, title: "Push", action: "push" as const },
@@ -274,7 +278,7 @@ it.live(
               expect(offered.instruction).toContain("Preserved requirements");
               yield* h.awaitPrompt;
               expect((yield* h.starts)[0]!.author).toBeUndefined();
-              yield* Store.withdraw("owner", "grant");
+              yield* Store.withdraw("maintainer", "grant", "repo");
               yield* h.complete;
               const review = (yield* refresh)!.progress!;
               expect(review.status, review.detail ?? "").toBe("awaiting_review");

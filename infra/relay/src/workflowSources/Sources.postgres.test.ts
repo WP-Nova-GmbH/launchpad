@@ -25,12 +25,12 @@ const allow = (
   id = "grant",
   repo = "repo",
   connectionId = "connection",
-  owner = "owner",
+  actor = "admin",
   previousGrantId: string | null = null,
-) => Store.allow(repo, owner, { grantId: id, connectionId, previousGrantId }, "native-app");
+) => Store.allow(repo, actor, { grantId: id, connectionId, previousGrantId }, "native-app");
 describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
   it.effect(
-    "migrates separate native credentials, enforces owner consent and supplies bounded reader health",
+    "stores organization credentials, enforces admin consent and supplies bounded reader health",
     () =>
       withDatabase(
         Effect.gen(function* () {
@@ -40,12 +40,12 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
           expect(c.payload_sealed).not.toContain("old-refresh");
           expect(
             yield* allow("borrowed", "repo", "connection", "maintainer").pipe(Effect.flip),
-          ).toMatchObject({ code: "not_found" });
-          const listed = yield* Store.repositorySnapshot("repo", "maintainer", "native-app");
-          expect(listed.sources.map((s) => s.grant.grantId)).toEqual(["grant"]);
-          expect(
-            yield* Store.repositorySnapshot("repo", "reader", "native-app").pipe(Effect.flip),
           ).toMatchObject({ code: "forbidden" });
+          const listed = yield* Store.repositorySnapshot("repo", "maintainer");
+          expect(listed.sources.map((s) => s.grant.grantId)).toEqual(["grant"]);
+          expect(yield* Store.repositorySnapshot("repo", "reader").pipe(Effect.flip)).toMatchObject(
+            { code: "forbidden" },
+          );
           const health = yield* Store.repositoryHealth("repo", "reader");
           expect(health.sources[0]).not.toHaveProperty("grantId");
           expect(health.sources[0]).not.toHaveProperty("workspaceId");
@@ -53,12 +53,8 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
             { code: "not_found" },
           );
           yield* Store.withdraw("maintainer", "grant", "repo");
-          expect(
-            (yield* Store.repositorySnapshot("repo-2", "owner", "native-app")).sources,
-          ).toHaveLength(1);
-          expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources,
-          ).toHaveLength(0);
+          expect((yield* Store.repositorySnapshot("repo-2", "owner")).sources).toHaveLength(1);
+          expect((yield* Store.repositorySnapshot("repo", "maintainer")).sources).toHaveLength(0);
         }),
       ),
   );
@@ -71,47 +67,49 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         yield* Store.withdraw("maintainer", "grant", "repo");
         expect((yield* allow()).revoked).toBe(true);
         expect(yield* allow("loser").pipe(Effect.flip)).toMatchObject({ code: "conflict" });
-        yield* allow("replacement", "repo", "connection", "owner", "grant");
+        yield* allow("replacement", "repo", "connection", "admin", "grant");
         yield* Store.withdraw("maintainer", "grant", "repo");
         expect(
-          (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources[0]?.grant
-            .grantId,
+          (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.grant.grantId,
         ).toBe("replacement");
       }),
     ),
   );
   it.effect(
-    "membership removal/re-add, reassignment and repository/organization deletion revoke at commit",
+    "installer departure preserves organization consent; repository and organization deletion revoke it",
     () =>
       withDatabase(
         Effect.gen(function* () {
           const sql = (yield* RelayDb).$client;
-          yield* createConnection();
-          yield* allow();
-          yield* allow("grant-2", "repo-2");
-          yield* sql`DELETE FROM relay_organization_members WHERE user_id='owner'`;
-          expect((yield* Sources.owner("owner")).withdrawableGrants).toHaveLength(0);
-          yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role) VALUES ('org','owner','member')`;
-          expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources,
-          ).toHaveLength(0);
-          yield* allow("again", "repo", "connection", "owner", "grant");
-          yield* sql`UPDATE relay_organization_members SET organization_id='other-org' WHERE user_id='owner'`;
-          expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources,
-          ).toHaveLength(0);
-          yield* sql`UPDATE relay_organization_members SET organization_id='org' WHERE user_id='owner'`;
-          yield* allow("repository-delete", "repo", "connection", "owner", "again");
+          const first = yield* Sources.begin("org", "admin", {
+            attemptId: "install",
+            expectedVersion: 0,
+            connectionId: null,
+          });
+          const connectionId = yield* Sources.callback(
+            new URL(first.authorization!.url).searchParams.get("state")!,
+            "code",
+          );
+          yield* allow("grant", "repo", connectionId);
+          yield* allow("grant-2", "repo-2", connectionId);
+          yield* sql`DELETE FROM relay_organization_members WHERE user_id='admin'`;
+          const retained = yield* Store.repositorySnapshot("repo", "maintainer");
+          expect(retained.sources[0]?.grant.grantId).toBe("grant");
+          expect(retained.canAllow).toBe(false);
+          expect(retained.canManage).toBe(true);
+          expect((yield* Sources.owner("org", "admin-2")).withdrawableGrants).toHaveLength(2);
+          expect(yield* Sources.owner("org", "admin").pipe(Effect.flip)).toMatchObject({
+            code: "forbidden",
+          });
           yield* sql`DELETE FROM relay_repositories WHERE repository_id='repo'`;
           expect(
-            (yield* sql<Store.Grant>`SELECT * FROM relay_workflow_repository_grants WHERE grant_id='repository-delete'`)[0]
+            (yield* sql<Store.Grant>`SELECT * FROM relay_workflow_repository_grants WHERE grant_id='grant'`)[0]
               ?.revoked,
           ).toBe(true);
-          yield* allow("org-delete", "repo-2", "connection", "owner", "grant-2");
           yield* sql`DELETE FROM relay_organizations WHERE organization_id='org'`;
-          expect((yield* Sources.owner("owner")).withdrawableGrants).toHaveLength(0);
+          expect((yield* Store.connection(connectionId))?.status).toBe("disconnected");
           expect(
-            (yield* sql<Store.Grant>`SELECT * FROM relay_workflow_repository_grants WHERE grant_id='org-delete'`)[0]
+            (yield* sql<Store.Grant>`SELECT * FROM relay_workflow_repository_grants WHERE grant_id='grant-2'`)[0]
               ?.revoked,
           ).toBe(true);
         }),
@@ -124,7 +122,7 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         Effect.gen(function* () {
           const c = yield* createConnection();
           yield* allow();
-          const first = yield* Sources.begin("owner", {
+          const first = yield* Sources.begin("org", "admin", {
             attemptId: "first",
             expectedVersion: 0,
             connectionId: c.connection_id,
@@ -133,9 +131,9 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
           expect(yield* Sources.callback("wrong-state", "code").pipe(Effect.flip)).toMatchObject({
             code: "conflict",
           });
-          const cancelled = yield* Sources.cancel("owner", "first");
+          const cancelled = yield* Sources.cancel("org", "admin", "first");
           expect((yield* Store.connection(c.connection_id))?.payload_sealed).toBe(c.payload_sealed);
-          const second = yield* Sources.begin("owner", {
+          const second = yield* Sources.begin("org", "admin", {
             attemptId: "second",
             expectedVersion: cancelled.version,
             connectionId: c.connection_id,
@@ -161,9 +159,9 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
             ),
           ).toMatchObject({ code: "workspace_mismatch" });
           expect((yield* Store.connection(c.connection_id))?.payload_sealed).toBe(c.payload_sealed);
-          const third = yield* Sources.begin("owner", {
+          const third = yield* Sources.begin("org", "admin", {
             attemptId: "third",
-            expectedVersion: (yield* Sources.owner("owner")).version,
+            expectedVersion: (yield* Sources.owner("org", "admin")).version,
             connectionId: c.connection_id,
           });
           const thirdState = new URL(third.authorization!.url).searchParams.get("state")!;
@@ -172,16 +170,104 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
             code: "conflict",
           });
           expect(
-            yield* Sources.disconnect("owner", c.connection_id, c.authorization_epoch).pipe(
+            yield* Sources.disconnect("org", "admin", c.connection_id, c.authorization_epoch).pipe(
               Effect.flip,
             ),
           ).toMatchObject({ code: "conflict" });
           expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources[0]?.grant
-              .grantId,
+            (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.grant.grantId,
           ).toBe("grant");
         }),
       ),
+  );
+  for (const app of [false, undefined]) {
+    it.effect(`does not install or replace credentials for a viewer with app=${app}`, () =>
+      withDatabase(
+        Effect.gen(function* () {
+          const wrongActor = transport((request) =>
+            Response.json(
+              request.url.endsWith("/oauth/token")
+                ? tokenReply
+                : {
+                    data: {
+                      ...identityReply.data,
+                      viewer: { ...identityReply.data.viewer, app },
+                    },
+                  },
+            ),
+          );
+          const attempt = (connectionId: string | null, attemptId: string) =>
+            Effect.gen(function* () {
+              const owner = yield* Sources.owner("org", "admin");
+              const begun = yield* Sources.begin("org", "admin", {
+                attemptId,
+                expectedVersion: owner.version,
+                connectionId,
+              });
+              return new URL(begun.authorization!.url).searchParams.get("state")!;
+            });
+          const rejected = yield* attempt(null, "wrong-actor");
+          expect(
+            yield* Sources.callback(rejected, "code").pipe(Effect.provide(wrongActor), Effect.flip),
+          ).toMatchObject({ code: "invalid_input" });
+          expect((yield* Sources.owner("org", "admin")).connections).toEqual([]);
+
+          const installed = yield* Sources.callback(yield* attempt(null, "install-app"), "code");
+          yield* allow("grant", "repo", installed);
+          const reconnect = yield* attempt(installed, "wrong-reconnect-actor");
+          expect(
+            yield* Sources.callback(reconnect, "code").pipe(
+              Effect.provide(wrongActor),
+              Effect.flip,
+            ),
+          ).toMatchObject({ code: "invalid_input" });
+          expect(yield* Store.connection(installed)).toMatchObject({
+            status: "reconnect_required",
+            payload_sealed: null,
+          });
+          expect((yield* Sources.owner("org", "admin")).grants[0]?.revoked).toBe(false);
+        }),
+      ),
+    );
+  }
+  it.effect("a definitively rejected reconnect code preserves the current credentials", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const c = yield* createConnection();
+        yield* allow();
+        const sql = (yield* RelayDb).$client;
+        const evidence = { generation: "coverage", epoch: c.authorization_epoch, teams: {} };
+        yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json(evidence)} WHERE connection_id=${c.connection_id}`;
+        const original = (yield* Store.connection(c.connection_id))!;
+        const priorCredentials = (yield* Sources.credentials(original)).credentials;
+        const begun = yield* Sources.begin("org", "admin", {
+          attemptId: "rejected-code",
+          expectedVersion: 0,
+          connectionId: c.connection_id,
+        });
+        expect(
+          yield* Sources.callback(
+            new URL(begun.authorization!.url).searchParams.get("state")!,
+            "expired-code",
+          ).pipe(
+            Effect.provide(
+              transport(() => Response.json({ error: "invalid_grant" }, { status: 400 })),
+            ),
+            Effect.flip,
+          ),
+        ).toMatchObject({ code: "invalid_input" });
+        expect(yield* Store.connection(c.connection_id)).toEqual(original);
+        expect((yield* Sources.credentials(original)).credentials).toEqual(priorCredentials);
+        expect(yield* Store.attempt("org", "native-app")).toMatchObject({
+          status: "failed",
+          error: "invalid_input",
+          exchange_lease_until: null,
+        });
+        expect(
+          (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.grant.grantId,
+        ).toBe("grant");
+      }),
+    ),
   );
   it.effect(
     "retries Begin idempotently, fences superseded callbacks, and expires pending consent",
@@ -190,49 +276,49 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         Effect.gen(function* () {
           const c = yield* createConnection();
           yield* allow();
-          const first = yield* Sources.begin("owner", {
+          const first = yield* Sources.begin("org", "admin", {
             attemptId: "first",
             expectedVersion: 0,
-            connectionId: null,
+            connectionId: c.connection_id,
           });
           expect(
-            (yield* Sources.begin("owner", {
+            (yield* Sources.begin("org", "admin", {
               attemptId: "first",
               expectedVersion: 0,
-              connectionId: null,
+              connectionId: c.connection_id,
             })).authorization?.url,
           ).toBe(first.authorization?.url);
-          const next = yield* Sources.begin("owner", {
+          const next = yield* Sources.begin("org", "admin", {
             attemptId: "next",
             expectedVersion: first.owner.version,
-            connectionId: null,
+            connectionId: c.connection_id,
           });
           expect(
-            yield* Sources.begin("owner", {
+            yield* Sources.begin("org", "admin", {
               attemptId: "first",
               expectedVersion: 0,
-              connectionId: null,
+              connectionId: c.connection_id,
             }).pipe(Effect.flip),
           ).toMatchObject({ code: "conflict" });
-          yield* Sources.cancel("owner", "first");
-          expect((yield* Sources.owner("owner")).attempt?.attemptId).toBe("next");
+          yield* Sources.cancel("org", "admin", "first");
+          expect((yield* Sources.owner("org", "admin")).attempt?.attemptId).toBe("next");
           expect(
             yield* Sources.callback(
               new URL(first.authorization!.url).searchParams.get("state")!,
               "code",
             ).pipe(Effect.flip),
           ).toMatchObject({ code: "conflict" });
-          yield* Sources.disconnect("owner", c.connection_id, c.authorization_epoch);
+          yield* Sources.disconnect("org", "admin", c.connection_id, c.authorization_epoch);
           expect(
             yield* Sources.callback(
               new URL(next.authorization!.url).searchParams.get("state")!,
               "code",
             ).pipe(Effect.flip),
           ).toMatchObject({ code: "conflict" });
-          const fresh = yield* Sources.begin("owner", {
+          const fresh = yield* Sources.begin("org", "admin", {
             attemptId: "expired",
-            expectedVersion: (yield* Sources.owner("owner")).version,
-            connectionId: null,
+            expectedVersion: (yield* Sources.owner("org", "admin")).version,
+            connectionId: c.connection_id,
           });
           yield* TestClock.adjust("11 minutes");
           expect(
@@ -241,19 +327,19 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
               "code",
             ).pipe(Effect.flip),
           ).toMatchObject({ code: "conflict" });
-          expect((yield* Sources.owner("owner")).attempt?.status).toBe("failed");
+          expect((yield* Sources.owner("org", "admin")).attempt?.status).toBe("failed");
           expect(
-            (yield* Sources.begin("owner", {
+            (yield* Sources.begin("org", "admin", {
               attemptId: "expired",
               expectedVersion: 0,
-              connectionId: null,
+              connectionId: c.connection_id,
             })).authorization,
           ).toBeNull();
           expect((yield* Store.connection(c.connection_id))?.status).toBe("disconnected");
         }),
       ),
   );
-  it.effect("a grant insertion waiting behind member removal cannot survive the removal", () =>
+  it.effect("a grant insertion waiting behind admin removal cannot survive the removal", () =>
     withDatabase(
       Effect.gen(function* () {
         yield* createConnection();
@@ -263,11 +349,10 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         const deletion = yield* sql
           .withTransaction(
             Effect.gen(function* () {
-              yield* sql`SELECT user_id FROM relay_organization_members WHERE user_id='owner' FOR UPDATE`;
+              yield* sql`SELECT user_id FROM relay_organization_members WHERE user_id='admin' FOR UPDATE`;
               yield* Deferred.succeed(locked, undefined);
               yield* Deferred.await(release);
-              yield* sql`DELETE FROM relay_organization_members WHERE user_id='owner'`;
-              expect((yield* Sources.owner("owner")).withdrawableGrants).toHaveLength(0);
+              yield* sql`DELETE FROM relay_organization_members WHERE user_id='admin'`;
             }),
           )
           .pipe(Effect.forkChild);
@@ -286,7 +371,7 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
     () =>
       withDatabase(
         Effect.gen(function* () {
-          const c = yield* createConnection("connection", "owner", true);
+          const c = yield* createConnection("connection", "org", true);
           yield* allow();
           const started = yield* Deferred.make<void>();
           const release = yield* Deferred.make<void>();
@@ -311,10 +396,21 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
               Effect.flip,
             ),
           ).toMatchObject({ code: "refresh_in_progress" });
+          const reconnect = yield* Sources.begin("org", "admin", {
+            attemptId: "wait-refresh",
+            expectedVersion: 0,
+            connectionId: c.connection_id,
+          });
+          expect(
+            yield* Sources.callback(
+              new URL(reconnect.authorization!.url).searchParams.get("state")!,
+              "code",
+            ).pipe(Effect.provideService(HttpClient.HttpClient, http), Effect.flip),
+          ).toMatchObject({ code: "refresh_in_progress" });
           const sql = (yield* RelayDb).$client;
           yield* sql.withTransaction(Store.authority("repo", "grant", "maintainer"));
           yield* Store.withdraw("maintainer", "grant", "repo");
-          yield* Sources.disconnect("owner", c.connection_id, c.authorization_epoch);
+          yield* Sources.disconnect("org", "admin", c.connection_id, c.authorization_epoch);
           yield* Deferred.succeed(release, undefined);
           const result = yield* Fiber.join(fiber);
           expect(Exit.isFailure(result)).toBe(true);
@@ -325,12 +421,120 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         }),
       ),
   );
+  for (const change of ["demotion", "cancel", "disconnect"] as const) {
+    it.effect(
+      `fences a completed exchange after ${change} without reviving stale credentials`,
+      () =>
+        withDatabase(
+          Effect.gen(function* () {
+            const c = yield* createConnection();
+            yield* allow();
+            const begun = yield* Sources.begin("org", "admin", {
+              attemptId: "reconnect",
+              expectedVersion: 0,
+              connectionId: c.connection_id,
+            });
+            const state = new URL(begun.authorization!.url).searchParams.get("state")!;
+            const entered = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const http = HttpClient.make((req) =>
+              Effect.gen(function* () {
+                if (!req.url.endsWith("/oauth/token"))
+                  return HttpClientResponse.fromWeb(req, Response.json(identityReply));
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+                return HttpClientResponse.fromWeb(req, Response.json(tokenReply));
+              }),
+            );
+            const callback = yield* Sources.callback(state, "code").pipe(
+              Effect.provideService(HttpClient.HttpClient, http),
+              Effect.exit,
+              Effect.forkChild,
+            );
+            yield* Deferred.await(entered);
+            expect((yield* Sources.owner("org", "admin-2")).exchangeInProgress).toBe(true);
+            const sql = (yield* RelayDb).$client;
+            expect(
+              yield* sql.withTransaction(Store.authority("repo", "grant")).pipe(Effect.flip),
+            ).toMatchObject({ code: "refresh_in_progress" });
+            expect(yield* Sources.credentials(c, true).pipe(Effect.flip)).toMatchObject({
+              code: "refresh_in_progress",
+            });
+            if (change === "demotion")
+              yield* sql`UPDATE relay_organization_members SET role='member' WHERE user_id='admin'`;
+            else if (change === "cancel") {
+              const cancelled = yield* Sources.cancel("org", "admin-2", "reconnect");
+              expect(cancelled.attempt?.status).toBe("cancelled");
+              expect(cancelled.exchangeInProgress).toBe(true);
+            } else
+              yield* Sources.disconnect("org", "admin-2", c.connection_id, c.authorization_epoch);
+            yield* Deferred.succeed(release, undefined);
+            expect(Exit.isFailure(yield* Fiber.join(callback))).toBe(true);
+            const failed = (yield* Store.connection(c.connection_id))!;
+            expect(failed.status).toBe(
+              change === "disconnect" ? "disconnected" : "reconnect_required",
+            );
+            expect(failed.payload_sealed).toBeNull();
+            expect((yield* Store.attempt("org", "native-app"))?.exchange_lease_until).toBeNull();
+            expect((yield* Sources.owner("org", "admin-2")).exchangeInProgress).toBe(false);
+            const recovered = yield* Sources.begin("org", "admin-2", {
+              attemptId: "recover",
+              expectedVersion: (yield* Sources.owner("org", "admin-2")).version,
+              connectionId: c.connection_id,
+            });
+            yield* Sources.callback(
+              new URL(recovered.authorization!.url).searchParams.get("state")!,
+              "code",
+            );
+            expect(
+              (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.grant.grantId,
+            ).toBe("grant");
+            expect((yield* Store.connection(c.connection_id))?.status).toBe("connected");
+          }),
+        ),
+    );
+  }
+  it.effect(
+    "treats a lost exchange reply as a reconnect and rejects a changed app before issuing consent",
+    () =>
+      withDatabase(
+        Effect.gen(function* () {
+          const c = yield* createConnection();
+          const begun = yield* Sources.begin("org", "admin", {
+            attemptId: "reconnect",
+            expectedVersion: 0,
+            connectionId: c.connection_id,
+          });
+          const state = new URL(begun.authorization!.url).searchParams.get("state")!;
+          expect(
+            yield* Sources.callback(state, "code").pipe(
+              Effect.provide(transport(() => new Response("lost reply", { status: 503 }))),
+              Effect.flip,
+            ),
+          ).toMatchObject({ code: "unavailable" });
+          expect((yield* Store.connection(c.connection_id))?.status).toBe("reconnect_required");
+          expect((yield* Store.connection(c.connection_id))?.payload_sealed).toBeNull();
+          const changedApp = {
+            ...config,
+            linearWorkflow: { organizationId: "org", clientId: "different-app" },
+          };
+          expect(
+            yield* Sources.begin("org", "admin", {
+              attemptId: "wrong-app",
+              expectedVersion: 0,
+              connectionId: null,
+            }).pipe(Effect.provideService(RelayConfiguration, changedApp), Effect.flip),
+          ).toMatchObject({ code: "service_configuration" });
+          expect((yield* Store.attempt("org", "native-app"))?.attempt_id).toBe("reconnect");
+        }),
+      ),
+  );
   it.effect(
     "service credential failure preserves consent and operator repair refreshes without reauthorization",
     () =>
       withDatabase(
         Effect.gen(function* () {
-          const c = yield* createConnection("connection", "owner");
+          const c = yield* createConnection("connection", "org");
           yield* allow();
           expect(
             yield* Sources.credentials(c, true).pipe(
@@ -352,9 +556,7 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
           expect(fixed.activated_at).toBe(c.activated_at);
           const box = yield* RelaySecretBox;
           expect(yield* box.open(fixed.payload_sealed!)).toContain("new-refresh");
-          expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources,
-          ).toHaveLength(1);
+          expect((yield* Store.repositorySnapshot("repo", "maintainer")).sources).toHaveLength(1);
           expect(
             yield* Sources.credentials(fixed, true).pipe(
               Effect.provide(
@@ -367,58 +569,52 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         }),
       ),
   );
-  it.effect(
-    "keeps independent owners' credentials separate and binds metadata pages to grant and epoch",
-    () =>
-      withDatabase(
-        Effect.gen(function* () {
-          const first = yield* createConnection();
-          const second = yield* createConnection("second", "maintainer");
-          yield* allow();
-          const pageHttp = transport(() =>
-            Response.json({
-              data: {
-                organization: { id: "workspace" },
-                page: {
-                  nodes: [{ id: "team", name: "Team", archivedAt: null }],
-                  pageInfo: { hasNextPage: true, endCursor: "next" },
-                },
+  it.effect("binds metadata pages to the grant and current authorization epoch", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const first = yield* createConnection();
+        yield* allow();
+        const pageHttp = transport(() =>
+          Response.json({
+            data: {
+              organization: { id: "workspace" },
+              page: {
+                nodes: [{ id: "team", name: "Team", archivedAt: null }],
+                pageInfo: { hasNextPage: true, endCursor: "next" },
               },
-            }),
-          );
-          const page = yield* Sources.metadata("repo", "maintainer", {
+            },
+          }),
+        );
+        const page = yield* Sources.metadata("repo", "maintainer", {
+          grantId: "grant",
+          kind: "teams",
+        }).pipe(Effect.provide(pageHttp));
+        expect(page.items).toEqual([{ id: "team", name: "Team" }]);
+        expect(page.nextCursor).toBeTruthy();
+        yield* Sources.credentials(first, true);
+        yield* Sources.metadata("repo", "maintainer", {
+          grantId: "grant",
+          kind: "teams",
+          cursor: page.nextCursor!,
+        }).pipe(Effect.provide(pageHttp));
+        expect(
+          yield* Sources.metadata("repo", "maintainer", {
             grantId: "grant",
-            kind: "teams",
-          }).pipe(Effect.provide(pageHttp));
-          expect(page.items).toEqual([{ id: "team", name: "Team" }]);
-          expect(page.nextCursor).toBeTruthy();
-          yield* Sources.credentials(first, true);
-          expect((yield* Store.connection(second.connection_id))?.payload_sealed).toBe(
-            second.payload_sealed,
-          );
+            kind: "labels",
+            teamId: "team",
+            cursor: page.nextCursor!,
+          }).pipe(Effect.provide(pageHttp), Effect.flip),
+        ).toMatchObject({ code: "invalid_input" });
+        yield* Store.withdraw("maintainer", "grant", "repo");
+        expect(
           yield* Sources.metadata("repo", "maintainer", {
             grantId: "grant",
             kind: "teams",
             cursor: page.nextCursor!,
-          }).pipe(Effect.provide(pageHttp));
-          expect(
-            yield* Sources.metadata("repo", "maintainer", {
-              grantId: "grant",
-              kind: "labels",
-              teamId: "team",
-              cursor: page.nextCursor!,
-            }).pipe(Effect.provide(pageHttp), Effect.flip),
-          ).toMatchObject({ code: "invalid_input" });
-          yield* Store.withdraw("maintainer", "grant", "repo");
-          expect(
-            yield* Sources.metadata("repo", "maintainer", {
-              grantId: "grant",
-              kind: "teams",
-              cursor: page.nextCursor!,
-            }).pipe(Effect.provide(pageHttp), Effect.flip),
-          ).toMatchObject({ code: "forbidden" });
-        }),
-      ),
+          }).pipe(Effect.provide(pageHttp), Effect.flip),
+        ).toMatchObject({ code: "forbidden" });
+      }),
+    ),
   );
   it.effect(
     "missing native configuration leaves setup unavailable and preserves manual/source records",
@@ -426,11 +622,19 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
       withDatabase(
         Effect.gen(function* () {
           yield* createConnection();
+          yield* allow();
           const { linearWorkflow: _, ...withoutNative } = config;
           yield* Effect.gen(function* () {
-            expect((yield* Sources.owner("owner")).configured).toBe(false);
+            expect((yield* Sources.owner("org", "admin")).configured).toBe(false);
+            expect((yield* Store.repositoryHealth("repo", "reader")).sources).toMatchObject([
+              { health: { code: "service_configuration" }, delivery: "unverified" },
+            ]);
             expect(
-              yield* Sources.begin("owner", {
+              (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.source.health
+                .code,
+            ).toBe("service_configuration");
+            expect(
+              yield* Sources.begin("org", "admin", {
                 attemptId: "blocked",
                 expectedVersion: 0,
                 connectionId: null,
@@ -444,28 +648,26 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
   it.effect("recovers a lost refresh reply only within the original rotation window", () =>
     withDatabase(
       Effect.gen(function* () {
-        const within = yield* createConnection("within", "owner", true);
-        const beyond = yield* createConnection("beyond", "maintainer", true);
+        const c = yield* createConnection("connection", "org", true);
         const unavailable = transport(() => new Response("lost reply", { status: 503 }));
-        for (const c of [within, beyond])
-          expect(
-            yield* Sources.credentials(c).pipe(Effect.provide(unavailable), Effect.flip),
-          ).toMatchObject({ code: "unavailable" });
-        const original = (yield* Store.connection("beyond"))!;
+        const failRefresh = () =>
+          Sources.credentials(c, true).pipe(Effect.provide(unavailable), Effect.flip);
+        expect(yield* failRefresh()).toMatchObject({ code: "unavailable" });
         yield* TestClock.adjust("5 seconds");
-        yield* Sources.credentials((yield* Store.connection("within"))!);
-        expect((yield* Store.connection("within"))?.refresh_started_at).toBeNull();
-        expect(
-          yield* Sources.credentials(original).pipe(Effect.provide(unavailable), Effect.flip),
-        ).toMatchObject({ code: "unavailable" });
-        expect((yield* Store.connection("beyond"))?.refresh_started_at).toBe(
+        yield* Sources.credentials((yield* Store.connection(c.connection_id))!);
+        expect((yield* Store.connection(c.connection_id))?.refresh_started_at).toBeNull();
+        expect(yield* failRefresh()).toMatchObject({ code: "unavailable" });
+        const original = (yield* Store.connection(c.connection_id))!;
+        yield* TestClock.adjust("5 seconds");
+        expect(yield* failRefresh()).toMatchObject({ code: "unavailable" });
+        expect((yield* Store.connection(c.connection_id))?.refresh_started_at).toBe(
           original.refresh_started_at,
         );
         yield* TestClock.adjust("30 minutes");
-        expect(
-          yield* Sources.credentials((yield* Store.connection("beyond"))!).pipe(Effect.flip),
-        ).toMatchObject({ code: "reconnect_required" });
-        expect((yield* Store.connection("beyond"))?.status).toBe("reconnect_required");
+        expect(yield* Sources.credentials(original, true).pipe(Effect.flip)).toMatchObject({
+          code: "reconnect_required",
+        });
+        expect((yield* Store.connection(c.connection_id))?.status).toBe("reconnect_required");
       }),
     ),
   );
@@ -586,9 +788,7 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
           expect(recovered.health.code).toBe("healthy");
           expect(recovered.authorization_epoch).toBe(current.authorization_epoch);
           expect(recovered.activated_at).toBe(current.activated_at);
-          expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources,
-          ).toHaveLength(1);
+          expect((yield* Store.repositorySnapshot("repo", "maintainer")).sources).toHaveLength(1);
         }),
       ),
     );
@@ -649,9 +849,7 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
           expect((yield* Store.connection(c.connection_id))?.authorization_epoch).toBe(
             c.authorization_epoch,
           );
-          expect(
-            (yield* Store.repositorySnapshot("repo", "maintainer", "native-app")).sources,
-          ).toHaveLength(1);
+          expect((yield* Store.repositorySnapshot("repo", "maintainer")).sources).toHaveLength(1);
         }),
       ),
   );

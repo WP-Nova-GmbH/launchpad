@@ -2,11 +2,12 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { useCallback, useState } from "react";
 import { WorkflowAutomation, type WorkflowTrigger } from "@t3tools/contracts/workflows";
-import type {
-  WorkflowRepositorySources,
-  WorkflowSourceMetadataPage,
-  WorkflowSourceSelection,
-  WorkflowSourceMetadataQuery,
+import {
+  RelayOrganizationId,
+  type WorkflowRepositorySources,
+  type WorkflowSourceMetadataPage,
+  type WorkflowSourceSelection,
+  type WorkflowSourceMetadataQuery,
 } from "@t3tools/contracts/relay";
 import { WorkflowSources } from "@t3tools/client-runtime/relay";
 import {
@@ -31,7 +32,7 @@ import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../
 import { Sheet, SheetPopup, SheetHeader, SheetTitle, SheetDescription } from "../ui/sheet";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { OwnerSources } from "./WorkflowOwnerSources";
-import { RepositorySources } from "./WorkflowSources";
+import { RepositorySourcesPanel } from "./WorkflowSources";
 import styles from "./workflowEditor.module.css";
 
 type RegisterField = (field: string, node: HTMLElement | null) => void;
@@ -81,7 +82,6 @@ export function WorkflowTriggerInspector({
   const complete = !!trigger && validAutomation;
   const triggerDirty = !sameWorkflowAutomation(value, savedAutomation);
   const [connectionsOpen, setConnectionsOpen] = useState<"connect" | "access" | null>(null);
-  const [changingSource, setChangingSource] = useState(false);
   const read = useCallback(
     (client: WorkflowSources.Client, token: string) => client.repository(token, scope.repositoryId),
     [scope.repositoryId],
@@ -89,6 +89,7 @@ export function WorkflowTriggerInspector({
   const sources = useWorkflowSources<WorkflowRepositorySources>(scope.accountId, read);
   const source = sources.snapshot?.sources.find(
     (entry) =>
+      entry.source.organizationId === scope.organizationId &&
       entry.grant.grantId === trigger?.grantId &&
       entry.source.connectionId === trigger?.connectionId,
   );
@@ -96,7 +97,25 @@ export function WorkflowTriggerInspector({
     sources.loading || !!sources.error || sources.unverified || !sources.snapshot;
   const sourceHealth = source ? WorkflowSources.sourceHealthLabel(source.source) : null;
   const connected = sourceHealth === "Connected";
-  const authorizationEpoch = source?.source.authorizationEpoch;
+  const canAllow = sources.snapshot?.canAllow === true;
+  const canManage = sources.snapshot?.canManage === true;
+  const connectionSheet =
+    (connectionsOpen === "connect" && !canAllow) || (connectionsOpen === "access" && !canManage)
+      ? null
+      : connectionsOpen;
+  const openConnections = (view: "connect" | "access") => {
+    setConnectionsOpen(view);
+    if (view === "access") void sources.refresh();
+  };
+  const sourceKey = JSON.stringify([
+    scope.accountId,
+    scope.organizationId,
+    scope.repositoryId,
+    source?.source.connectionId,
+    source?.grant.grantId,
+    source?.grant.generation,
+    source?.source.authorizationEpoch,
+  ]);
   const readSelection = useCallback(
     (client: WorkflowSources.Client, token: string) =>
       trigger?.teamId && connected && !vmTarget && supported && resolved
@@ -109,19 +128,20 @@ export function WorkflowTriggerInspector({
                 ? { stateId: trigger.stateId }
                 : {}),
             })
-            .pipe(Effect.map((criteria) => ({ trigger, authorizationEpoch, criteria })))
-        : Effect.succeed({ trigger, authorizationEpoch, criteria: null }),
-    [scope.repositoryId, trigger, connected, vmTarget, supported, resolved, authorizationEpoch],
+            .pipe(Effect.map((criteria) => ({ trigger, sourceKey, criteria })))
+        : Effect.succeed({ trigger, sourceKey, criteria: null }),
+    [scope.repositoryId, trigger, connected, vmTarget, supported, resolved, sourceKey],
   );
   const selected = useWorkflowSources<{
     trigger: WorkflowTrigger | null;
-    authorizationEpoch: number | undefined;
+    sourceKey: string;
     criteria: WorkflowSourceSelection | null;
   }>(scope.accountId, readSelection);
   // Keep the controls mounted while ensuring a previous rule cannot enable the new one.
   const criteria =
+    !connectionUnknown &&
     selected.snapshot?.trigger === trigger &&
-    selected.snapshot?.authorizationEpoch === authorizationEpoch
+    selected.snapshot?.sourceKey === sourceKey
       ? (selected.snapshot?.criteria ?? null)
       : null;
   const canEnable =
@@ -244,15 +264,6 @@ export function WorkflowTriggerInspector({
                 <div className="flex items-center gap-1">
                   <Button
                     type="button"
-                    size="xs"
-                    variant="ghost"
-                    disabled={disabled}
-                    onClick={() => setChangingSource(!changingSource)}
-                  >
-                    Change
-                  </Button>
-                  <Button
-                    type="button"
                     size="icon-sm"
                     variant="ghost"
                     aria-label="Refresh workspace access"
@@ -264,21 +275,10 @@ export function WorkflowTriggerInspector({
                 </div>
               ) : null}
             </div>
-            {source ? (
-              <>
-                <p className="text-sm font-medium">{source.source.workspaceName}</p>
-                <p className="text-xs text-muted-foreground">
-                  {source.source.ownerUserId === scope.accountId
-                    ? "Owned by you"
-                    : `Owner: ${source.source.ownerLabel ?? source.source.viewerName}`}
-                </p>
-              </>
-            ) : null}
-            {(!source || changingSource) &&
-            !connectionUnknown &&
-            sources.snapshot?.sources.length ? (
+            {source ? <p className="text-sm font-medium">{source.source.workspaceName}</p> : null}
+            {!source && !connectionUnknown && sources.snapshot?.sources.length ? (
               <Select
-                value={source?.grant.grantId ?? ""}
+                value=""
                 disabled={disabled}
                 onValueChange={(id) => {
                   const next = sources.snapshot?.sources.find(
@@ -293,7 +293,6 @@ export function WorkflowTriggerInspector({
                       event: "issue_created",
                       labelIds: [],
                     });
-                    setChangingSource(false);
                   }
                 }}
               >
@@ -301,17 +300,12 @@ export function WorkflowTriggerInspector({
                   aria-label="Linear workspace"
                   ref={(node) => registerField?.("trigger:source", node)}
                 >
-                  <SelectValue>
-                    {source
-                      ? `${source.source.workspaceName} · ${source.source.ownerLabel ?? source.source.viewerName}`
-                      : "Choose a workspace"}
-                  </SelectValue>
+                  <SelectValue>Choose a workspace</SelectValue>
                 </SelectTrigger>
                 <SelectPopup>
                   {sources.snapshot.sources.map((entry) => (
                     <SelectItem key={entry.grant.grantId} value={entry.grant.grantId}>
-                      {entry.source.workspaceName} ·{" "}
-                      {entry.source.ownerLabel ?? entry.source.viewerName}
+                      {entry.source.workspaceName}
                     </SelectItem>
                   ))}
                 </SelectPopup>
@@ -343,40 +337,45 @@ export function WorkflowTriggerInspector({
                 title="Repository source access unavailable"
                 variant="warning"
                 actions={
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={disabled}
-                    onClick={() => setConnectionsOpen("access")}
-                  >
-                    Manage source access
-                  </Button>
+                  canAllow ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={disabled}
+                      onClick={() => openConnections("access")}
+                    >
+                      Manage source access
+                    </Button>
+                  ) : null
                 }
               >
-                The saved repository grant is unavailable. Ask the connection owner to restore
-                repository access, or choose another workspace.
+                {canAllow
+                  ? "Allow this repository to use Linear again, then select the new grant."
+                  : "Ask an organization admin to restore this repository's Linear access."}
               </WorkflowAlert>
             ) : source && !connected ? (
               <WorkflowAlert
                 title="Linear source needs attention"
                 variant="warning"
                 actions={
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={disabled}
-                    onClick={() => setConnectionsOpen("connect")}
-                  >
-                    Review connection
-                  </Button>
+                  canAllow ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={disabled}
+                      onClick={() => openConnections("connect")}
+                    >
+                      Review connection
+                    </Button>
+                  ) : null
                 }
               >
                 {sourceHealth}.{" "}
-                {source.source.ownerUserId === scope.accountId
-                  ? "Reconnect this workspace in your Linear connections."
-                  : `Ask ${source.source.ownerLabel ?? source.source.viewerName} to reconnect this workspace.`}
+                {canAllow
+                  ? "Reconnect this workspace in Organization settings."
+                  : "Ask an organization admin to reconnect Linear."}
               </WorkflowAlert>
             ) : connected ? (
               <div className="grid gap-1 text-xs text-success-foreground">
@@ -395,13 +394,21 @@ export function WorkflowTriggerInspector({
                 {!source ? (
                   <p className="text-xs text-muted-foreground">
                     {sources.snapshot?.sources.length
-                      ? "Choose an allowed Linear workspace, or connect another workspace."
-                      : sources.snapshot?.eligible.length
-                        ? "A Linear workspace is connected. Allow this repository to use it, then choose the workspace. Only the connection owner can allow new repository use."
-                        : "Connect a Linear workspace, then allow this repository to use it."}
+                      ? "Choose the Linear workspace allowed for this repository."
+                      : canAllow && sources.snapshot?.eligible.length
+                        ? "Allow this repository to use the connected Linear workspace."
+                        : !sources.snapshot?.configured
+                          ? "Linear is unavailable for this organization."
+                          : canAllow
+                            ? "Connect a Linear workspace in Organization settings."
+                            : "Ask an organization admin to allow this repository to use Linear."}
                   </p>
                 ) : null}
-                {!source || changingSource ? (
+                {(!source &&
+                  canAllow &&
+                  sources.snapshot?.configured &&
+                  !sources.snapshot.sources.length) ||
+                (source && canManage) ? (
                   <div className="flex flex-wrap items-center gap-2">
                     <Button
                       type="button"
@@ -409,7 +416,7 @@ export function WorkflowTriggerInspector({
                       variant={source ? "ghost" : "outline"}
                       disabled={disabled}
                       onClick={() =>
-                        setConnectionsOpen(
+                        openConnections(
                           !source && !sources.snapshot?.eligible.length ? "connect" : "access",
                         )
                       }
@@ -511,7 +518,7 @@ export function WorkflowTriggerInspector({
                 </Select>
               </div>
               <MetadataPicker
-                key={trigger.grantId}
+                key={sourceKey}
                 scope={scope}
                 grantId={trigger.grantId}
                 kind="teams"
@@ -535,7 +542,7 @@ export function WorkflowTriggerInspector({
               />
               {trigger.teamId && trigger.event === "entered_status" ? (
                 <MetadataPicker
-                  key={`${trigger.grantId}:${trigger.teamId}:states`}
+                  key={`${sourceKey}:${trigger.teamId}:states`}
                   scope={scope}
                   grantId={trigger.grantId}
                   teamId={trigger.teamId}
@@ -589,7 +596,7 @@ export function WorkflowTriggerInspector({
                     </summary>
                     <div className="mt-3">
                       <MetadataPicker
-                        key={`${trigger.grantId}:${trigger.teamId}:labels`}
+                        key={`${sourceKey}:${trigger.teamId}:labels`}
                         scope={scope}
                         grantId={trigger.grantId}
                         teamId={trigger.teamId}
@@ -724,7 +731,7 @@ export function WorkflowTriggerInspector({
         </>
       )}
       <Sheet
-        open={connectionsOpen !== null}
+        open={connectionSheet !== null}
         onOpenChange={(open) => {
           if (!open) {
             setConnectionsOpen(null);
@@ -735,7 +742,7 @@ export function WorkflowTriggerInspector({
         <SheetPopup>
           <SheetHeader>
             <SheetTitle>
-              {connectionsOpen === "connect" ? "Connect Linear" : "Repository access"}
+              {connectionSheet === "connect" ? "Connect Linear" : "Repository access"}
             </SheetTitle>
             <SheetDescription>
               Connect a workspace, then allow this repository to use it. Connection and access
@@ -743,23 +750,30 @@ export function WorkflowTriggerInspector({
             </SheetDescription>
           </SheetHeader>
           <div className="min-h-0 space-y-6 overflow-y-auto p-4">
-            {connectionsOpen === "connect" ? (
+            {connectionSheet === "connect" ? (
               <>
-                <OwnerSources accountId={scope.accountId} />
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => setConnectionsOpen("access")}
-                >
+                <OwnerSources
+                  key={JSON.stringify([scope.accountId, scope.organizationId])}
+                  accountId={scope.accountId}
+                  organizationId={RelayOrganizationId.make(scope.organizationId)}
+                />
+                <Button type="button" variant="outline" onClick={() => openConnections("access")}>
                   Continue to repository access
                 </Button>
               </>
-            ) : connectionsOpen === "access" ? (
+            ) : connectionSheet === "access" ? (
               <>
-                <RepositorySources accountId={scope.accountId} repositoryId={scope.repositoryId} />
-                <Button type="button" variant="ghost" onClick={() => setConnectionsOpen("connect")}>
-                  Manage Linear connections
-                </Button>
+                <RepositorySourcesPanel repositoryId={scope.repositoryId} state={sources} />
+                {canAllow ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    disabled={sources.busy || connectionUnknown}
+                    onClick={() => openConnections("connect")}
+                  >
+                    Manage Linear connection
+                  </Button>
+                ) : null}
               </>
             ) : null}
           </div>

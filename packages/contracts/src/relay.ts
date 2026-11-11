@@ -4221,6 +4221,10 @@ const RelayOrganizationMemberParams = Schema.Struct({
 const RelayRepositoryParams = Schema.Struct({
   repositoryId: RelayRepositoryId,
 });
+const RelayWorkflowSourceOrganizationParams = Schema.Struct({
+  organizationId: RelayOrganizationId,
+});
+const workflowOrganizationSourcesPath = "/v1/organizations/:organizationId/workflow-sources";
 
 const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
   .add(
@@ -4230,31 +4234,36 @@ const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
       success: WorkflowSourceHealthList,
       error: [...RelayTenancyErrors, WorkflowSourceError],
     }),
-    HttpApiEndpoint.get("owner", "/v1/workflow-sources", {
+    HttpApiEndpoint.get("owner", workflowOrganizationSourcesPath, {
       headers: RelayBearerRequestHeaders,
+      params: RelayWorkflowSourceOrganizationParams,
       success: WorkflowSourceOwner,
       error: [...RelayTenancyErrors, WorkflowSourceError],
     }),
-    HttpApiEndpoint.post("begin", "/v1/workflow-sources/linear/begin", {
+    HttpApiEndpoint.post("begin", `${workflowOrganizationSourcesPath}/linear/begin`, {
       headers: RelayBearerRequestHeaders,
+      params: RelayWorkflowSourceOrganizationParams,
       payload: BeginWorkflowSource,
       success: WorkflowSourceAuthorization,
       error: [...RelayTenancyErrors, WorkflowSourceError],
     }),
-    HttpApiEndpoint.post("cancel", "/v1/workflow-sources/linear/cancel", {
+    HttpApiEndpoint.post("cancel", `${workflowOrganizationSourcesPath}/linear/cancel`, {
       headers: RelayBearerRequestHeaders,
+      params: RelayWorkflowSourceOrganizationParams,
       payload: Schema.Struct({ attemptId: TrimmedNonEmptyString }),
       success: WorkflowSourceOwner,
       error: [...RelayTenancyErrors, WorkflowSourceError],
     }),
-    HttpApiEndpoint.post("disconnect", "/v1/workflow-sources/disconnect", {
+    HttpApiEndpoint.post("disconnect", `${workflowOrganizationSourcesPath}/disconnect`, {
       headers: RelayBearerRequestHeaders,
+      params: RelayWorkflowSourceOrganizationParams,
       payload: DisconnectWorkflowSource,
       success: WorkflowSourceOwner,
       error: [...RelayTenancyErrors, WorkflowSourceError],
     }),
-    HttpApiEndpoint.post("refreshOwner", "/v1/workflow-sources/refresh", {
+    HttpApiEndpoint.post("refreshOwner", `${workflowOrganizationSourcesPath}/refresh`, {
       headers: RelayBearerRequestHeaders,
+      params: RelayWorkflowSourceOrganizationParams,
       payload: Schema.Struct({ connectionId: TrimmedNonEmptyString }),
       success: WorkflowSourceOwner,
       error: [...RelayTenancyErrors, WorkflowSourceError],
@@ -4279,8 +4288,9 @@ const RelayWorkflowSourcesGroup = HttpApiGroup.make("workflowSources")
       success: WorkflowRepositorySources,
       error: [...RelayTenancyErrors, WorkflowSourceError],
     }),
-    HttpApiEndpoint.post("withdrawOwner", "/v1/workflow-sources/withdraw", {
+    HttpApiEndpoint.post("withdrawOwner", `${workflowOrganizationSourcesPath}/withdraw`, {
       headers: RelayBearerRequestHeaders,
+      params: RelayWorkflowSourceOrganizationParams,
       payload: Schema.Struct({ grantId: TrimmedNonEmptyString }),
       success: WorkflowSourceOwner,
       error: [...RelayTenancyErrors, WorkflowSourceError],

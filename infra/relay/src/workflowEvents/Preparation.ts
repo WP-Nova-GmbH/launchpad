@@ -32,7 +32,7 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
   const target = input.definition.target;
   if (target.kind === "vm") return yield* vmWorkflowAutomationUnavailable();
   const config = yield* Fence.configuration;
-  if (!config?.admissionEnabled || !next.trigger)
+  if (!config?.admissionEnabled || config.organizationId !== org || !next.trigger)
     return yield* new WorkflowInvalidError({
       message: "Automatic event admission is not enabled on this relay.",
     });
@@ -48,6 +48,7 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
     );
   if (
     bound.connection.connection_id !== trigger.connectionId ||
+    bound.connection.organization_id !== org ||
     bound.connection.application_id !== config.applicationId ||
     !Fence.covers(bound.connection, config.generation, trigger.teamId)
   )

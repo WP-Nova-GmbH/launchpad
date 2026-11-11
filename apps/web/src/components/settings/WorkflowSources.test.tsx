@@ -10,6 +10,7 @@ import { it } from "@effect/vitest";
 import type { HttpClient } from "effect/unstable/http";
 import type { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
+  RelayOrganizationId,
   RelayRepositoryId,
   type WorkflowRepositorySources,
   type WorkflowSource,
@@ -26,6 +27,7 @@ const fixture = vi.hoisted(() => ({
   repo: null as unknown as WorkflowRepositorySources,
   failRead: false,
   metadataReads: [] as string[],
+  metadataReply: null as null | ((kind: string, cursor?: string) => Response | Promise<Response>),
   failSelection: false,
   deliveryReady: true,
   selectionReply: null as
@@ -83,6 +85,7 @@ vi.mock("../ui/combobox", () => {
       createElement("div", {
         ...props,
         "data-picker": true,
+        "data-options": items.map((item) => item.name),
         value: value?.id ?? "",
         onValueChange: (id: string) =>
           onValueChange(items.find((item) => item.id === id) ?? { id, name: id }),
@@ -205,11 +208,11 @@ import { WorkflowSourcesSettings } from "./WorkflowSources";
 import { RepositorySources } from "../workflows/WorkflowSources";
 const source: WorkflowSource = {
   connectionId: "connection",
-  ownerUserId: "owner",
+  organizationId: "org",
   applicationId: "app",
   workspaceId: "workspace",
   workspaceName: "Engineering workspace",
-  viewerName: "Linear Owner",
+  viewerName: "Launchpad",
   authorizationEpoch: 1,
   status: "connected",
   health: { code: "healthy", retryAt: null },
@@ -245,6 +248,7 @@ beforeEach(() => {
     configured: true,
     applicationId: "app",
     version: 0,
+    exchangeInProgress: false,
     attempt: null,
     connections: [],
     repositories: [],
@@ -253,6 +257,7 @@ beforeEach(() => {
   };
   fixture.failRead = false;
   fixture.metadataReads = [];
+  fixture.metadataReply = null;
   fixture.failSelection = false;
   fixture.deliveryReady = true;
   fixture.selectionReply = null;
@@ -263,6 +268,7 @@ beforeEach(() => {
   fixture.readCount = 0;
   fixture.repo = {
     configured: true,
+    canAllow: true,
     canManage: true,
     sources: [],
     eligible: [{ source, previousGrantId: null }],
@@ -290,7 +296,6 @@ beforeEach(() => {
             {
               connectionId: "connection",
               workspaceName: source.workspaceName,
-              ownerUserId: "owner",
               status: source.status,
               health: source.health,
               delivery: fixture.delivery,
@@ -298,12 +303,15 @@ beforeEach(() => {
           ],
         });
       return Response.json(
-        request.url.endsWith("/v1/workflow-sources") ? fixture.owner : fixture.repo,
+        new URL(request.url).pathname.startsWith("/v1/organizations/")
+          ? fixture.owner
+          : fixture.repo,
       );
     }
     if (request.url.endsWith("/metadata")) {
-      const body = (await request.json()) as { kind: string };
+      const body = (await request.json()) as { kind: string; cursor?: string };
       fixture.metadataReads.push(body.kind);
+      if (fixture.metadataReply) return fixture.metadataReply(body.kind, body.cursor);
       return Response.json({
         items: [{ id: "new-team", name: "Another page item" }],
         nextCursor: null,
@@ -318,7 +326,7 @@ beforeEach(() => {
       };
       if (fixture.selectionReply) return fixture.selectionReply(body);
       return Response.json({
-        authorizationEpoch: 1,
+        authorizationEpoch: fixture.repo.sources[0]?.source.authorizationEpoch ?? 1,
         team: { id: body.teamId, name: "Saved team" },
         state: body.stateId ? { id: body.stateId, name: "Saved status" } : null,
         labels: body.labelIds.map((id) => ({
@@ -341,6 +349,7 @@ beforeEach(() => {
           connectionId: body.connectionId,
           expiresAt: 600000,
           status: "pending",
+          canResume: true,
           error: null,
         },
       };
@@ -354,7 +363,7 @@ beforeEach(() => {
         owner: fixture.owner,
       });
     }
-    if (request.url.endsWith("/v1/workflow-sources/withdraw")) {
+    if (request.url.endsWith("/v1/organizations/org/workflow-sources/withdraw")) {
       const { grantId } = (await request.json()) as { grantId: string };
       fixture.owner = {
         ...fixture.owner,
@@ -367,7 +376,9 @@ beforeEach(() => {
       fixture.owner = {
         ...fixture.owner,
         version: fixture.owner.version + 1,
-        attempt: fixture.owner.attempt ? { ...fixture.owner.attempt, status: "cancelled" } : null,
+        attempt: fixture.owner.attempt
+          ? { ...fixture.owner.attempt, status: "cancelled", canResume: false }
+          : null,
       };
       return Response.json(fixture.owner);
     }
@@ -385,7 +396,6 @@ beforeEach(() => {
               connectionId: source.connectionId,
               organizationId: "org",
               repositoryId: "repo",
-              ownerUserId: "owner",
               generation: 1,
               revoked: false,
             },
@@ -462,7 +472,7 @@ it.effect("retains explicitly stale rows during an outage and clears them on los
     });
   }),
 );
-it.effect("shows the connection owner and service recovery independently of consent", () =>
+it.effect("shows service recovery for a granted organization connection", () =>
   Effect.gen(function* () {
     yield* serveRequests;
     yield* Effect.promise(async () => {
@@ -473,8 +483,6 @@ it.effect("shows the connection owner and service recovery independently of cons
           {
             source: {
               ...source,
-              ownerUserId: "other",
-              ownerLabel: "Riley",
               health: { code: "service_configuration", retryAt: null },
             },
             grant: {
@@ -482,7 +490,6 @@ it.effect("shows the connection owner and service recovery independently of cons
               connectionId: "connection",
               repositoryId: "repo",
               organizationId: "org",
-              ownerUserId: "other",
               generation: 1,
               revoked: false,
             },
@@ -490,7 +497,7 @@ it.effect("shows the connection owner and service recovery independently of cons
         ],
       };
       await mount();
-      expect(words()).toContain("Riley");
+      expect(words()).toContain("Engineering workspace");
       expect(words()).toContain("Service configuration needs attention");
       expect(button("Retry connection")).toBeDefined();
       expect(button("Allow repository")).toBeUndefined();
@@ -533,7 +540,9 @@ it.effect("mobile reads safe source health, refreshes stale status and clears re
 
 const mountOwner = async () => {
   await act(async () => {
-    renderer = create(<WorkflowSourcesSettings />);
+    renderer = create(
+      <WorkflowSourcesSettings organizationId={RelayOrganizationId.make("org")} isAdmin />,
+    );
   });
   await drain();
 };
@@ -561,13 +570,14 @@ const pendingB = () => {
       connectionId: null,
       expiresAt: 600000,
       status: "pending",
+      canResume: true,
       error: null,
     },
   };
 };
 const links = () => renderer.root.findAllByType("a");
 
-it.effect("lets owners withdraw a hidden repository's consent and reconciles a lost reply", () =>
+it.effect("lets admins withdraw a hidden repository's access and reconciles a lost reply", () =>
   Effect.gen(function* () {
     yield* serveRequests;
     yield* Effect.promise(async () => {
@@ -710,7 +720,10 @@ for (const status of ["exchanging", "connected", "failed", "cancelled"] as const
       yield* Effect.promise(async () => {
         await mountOwner();
         await click("Connect Linear workspace");
-        fixture.owner = { ...fixture.owner, attempt: { ...fixture.owner.attempt!, status } };
+        fixture.owner = {
+          ...fixture.owner,
+          attempt: { ...fixture.owner.attempt!, status, canResume: false },
+        };
         await refreshOwner();
         expect(links()).toHaveLength(0);
         expect(button("Continue authorization")).toBeUndefined();
@@ -719,48 +732,118 @@ for (const status of ["exchanging", "connected", "failed", "cancelled"] as const
     }),
   );
 }
-it.effect("drops a delayed Begin result after the authenticated account changes", () =>
+it.effect("keeps the selected repository while a cancelled exchange is still in progress", () =>
   Effect.gen(function* () {
     yield* serveRequests;
     yield* Effect.promise(async () => {
-      let enter!: () => void, release!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        enter = resolve;
-      });
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      fixture.beginReply = async (body) => {
-        const owner = fixture.owner;
-        enter();
-        await gate;
-        return Response.json({
-          authorization: {
-            applicationId: "app",
-            attemptId: body.attemptId,
-            url: "https://linear.app/oauth/authorize?state=old-account",
-          },
-          owner,
-        });
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        repositories: [{ repositoryId: "repo", organizationId: "org", name: "Repository" }],
       };
       await mountOwner();
-      await act(async () => {
-        button("Connect Linear workspace").props.onClick();
-        await entered;
-      });
-      fixture.account = "another-account";
-      fixture.owner = { ...fixture.owner, attempt: null, version: 0 };
-      await act(async () => {
-        renderer.update(<WorkflowSourcesSettings />);
-        release();
-      });
-      await drain();
-      expect(window.open).not.toHaveBeenCalled();
-      expect(links()).toHaveLength(0);
-      expect(button("Continue authorization")).toBeUndefined();
+      await act(() =>
+        renderer.root.findByProps({ "data-picker": true }).props.onValueChange("repo"),
+      );
+      expect(button("Allow repository").props.disabled).toBe(false);
+
+      fixture.owner = {
+        ...fixture.owner,
+        exchangeInProgress: true,
+        attempt: {
+          attemptId: "reconnect",
+          connectionId: source.connectionId,
+          expiresAt: 600000,
+          status: "exchanging",
+          canResume: false,
+          error: null,
+        },
+      };
+      await refreshOwner();
+      expect(button("Allow repository").props.disabled).toBe(true);
+      expect(button("Reconnect").props.disabled).toBe(true);
+      expect(button("Retry connection").props.disabled).toBe(true);
+      expect(button("Disconnect").props.disabled).toBe(false);
+      await click("Cancel authorization");
+      expect(words()).toContain("Finishing Linear authorization");
+      expect(button("Allow repository").props.disabled).toBe(true);
+
+      fixture.owner = { ...fixture.owner, exchangeInProgress: false };
+      await refreshOwner();
+      expect(renderer.root.findByProps({ "data-picker": true }).props.value).toBe("repo");
+      expect(button("Allow repository").props.disabled).toBe(false);
+      await click("Allow repository");
+      expect(fixture.allowCount).toBe(1);
     });
   }),
 );
+it.effect("lets an admin cancel another admin's pending authorization", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      pendingB();
+      fixture.owner = {
+        ...fixture.owner,
+        attempt: { ...fixture.owner.attempt!, canResume: false },
+      };
+      await mountOwner();
+      expect(button("Continue authorization")).toBeUndefined();
+      expect(button("Connect Linear workspace")).toBeDefined();
+      await click("Cancel authorization");
+      expect(words()).not.toContain("Waiting for Linear authorization.");
+    });
+  }),
+);
+for (const changed of ["account", "organization", "admin role"] as const)
+  it.effect(`drops a delayed Begin result after the ${changed} changes`, () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        let enter!: () => void, release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          enter = resolve;
+        });
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        fixture.beginReply = async (body) => {
+          const owner = fixture.owner;
+          enter();
+          await gate;
+          return Response.json({
+            authorization: {
+              applicationId: "app",
+              attemptId: body.attemptId,
+              url: "https://linear.app/oauth/authorize?state=old-account",
+            },
+            owner,
+          });
+        };
+        await mountOwner();
+        await act(async () => {
+          button("Connect Linear workspace").props.onClick();
+          await entered;
+        });
+        if (changed === "account") fixture.account = "another-account";
+        fixture.owner = { ...fixture.owner, attempt: null, version: 0 };
+        await act(async () => {
+          renderer.update(
+            <WorkflowSourcesSettings
+              organizationId={RelayOrganizationId.make(
+                changed === "organization" ? "other-org" : "org",
+              )}
+              isAdmin={changed !== "admin role"}
+            />,
+          );
+          release();
+        });
+        await drain();
+        expect(window.open).not.toHaveBeenCalled();
+        expect(links()).toHaveLength(0);
+        expect(button("Continue authorization")).toBeUndefined();
+      });
+    }),
+  );
 
 it.effect(
   "resolves saved selections beyond the current page and clears only incompatible team criteria",
@@ -779,7 +862,6 @@ it.effect(
                 connectionId: "connection",
                 organizationId: "org",
                 repositoryId: "repo",
-                ownerUserId: "owner",
                 generation: 1,
                 revoked: false,
               },
@@ -857,7 +939,6 @@ it.effect("keeps selected IDs and shows an error when selection metadata is unav
               connectionId: "connection",
               organizationId: "org",
               repositoryId: "repo",
-              ownerUserId: "owner",
               generation: 1,
               revoked: false,
             },
@@ -961,7 +1042,6 @@ async function mountTrigger(initial = triggerInitial, vmTarget = false) {
           connectionId: "connection",
           organizationId: "org",
           repositoryId: "repo",
-          ownerUserId: "owner",
           generation: 1,
           revoked: false,
         },
@@ -974,6 +1054,174 @@ async function mountTrigger(initial = triggerInitial, vmTarget = false) {
   await drain();
 }
 const enableControl = () => renderer.root.findByProps({ role: "checkbox" });
+
+it.effect("directs a maintainer without a grant to an organization admin", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.repo = { ...fixture.repo, canAllow: false, eligible: [] };
+      await act(() => {
+        renderer = create(<TriggerEditor initial={{ enabled: false, trigger: null }} />);
+      });
+      await drain();
+      expect(words()).toContain(
+        "Ask an organization admin to allow this repository to use Linear.",
+      );
+      expect(button("Connect Linear")).toBeUndefined();
+      expect(button("Allow this repository")).toBeUndefined();
+      expect(words()).not.toContain("Engineering workspace");
+    });
+  }),
+);
+
+it.effect("refreshes repository access when returning from Linear setup", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.repo = { ...fixture.repo, eligible: [] };
+      await act(() => {
+        renderer = create(<TriggerEditor initial={{ enabled: false, trigger: null }} />);
+      });
+      await drain();
+      await click("Connect Linear");
+      fixture.repo = { ...fixture.repo, eligible: [{ source, previousGrantId: null }] };
+      await click("Continue to repository access");
+      expect(button("Allow repository").props.disabled).toBe(false);
+    });
+  }),
+);
+
+it.effect("drops a late admin snapshot while the access sheet and trigger draft stay open", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mountTrigger();
+      const refreshOnFocus = vi
+        .mocked(window.addEventListener)
+        .mock.calls.find(([type]) => type === "focus")?.[1];
+      if (typeof refreshOnFocus !== "function") throw new Error("Missing source focus listener");
+      await act(() =>
+        renderer.root
+          .findAllByType("button")
+          .find((node) => node.props["aria-label"] === "Remove label Global label")!
+          .props.onClick(),
+      );
+      await drain();
+      await click("Manage access");
+      expect(button("Manage Linear connection")).toBeDefined();
+
+      let markStarted!: () => void;
+      let releaseOldRead!: () => void;
+      const started = new Promise<void>((resolve) => (markStarted = resolve));
+      const blocked = new Promise<void>((resolve) => (releaseOldRead = resolve));
+      const oldAdmin = {
+        ...fixture.repo,
+        sources: [],
+        eligible: [{ source, previousGrantId: "grant" }],
+      };
+      fixture.fetch.mockImplementationOnce(async () => {
+        markStarted();
+        await blocked;
+        return Response.json(oldAdmin);
+      });
+      await act(() => button("Refresh sources").props.onClick());
+      await started;
+      const oldReadReceipt = fixture.deliveries.splice(0);
+      try {
+        expect(button("Withdraw access")).toBeDefined();
+        fixture.repo = {
+          ...fixture.repo,
+          canAllow: false,
+          sources: fixture.repo.sources.map((entry) => ({
+            ...entry,
+            grant: { ...entry.grant, grantId: "new-grant", generation: 2 },
+          })),
+        };
+        await act(() => refreshOnFocus(new Event("focus")));
+        await drain();
+        expect(button("Manage Linear connection")).toBeUndefined();
+        expect(button("Withdraw access").props.disabled).toBe(false);
+      } finally {
+        releaseOldRead();
+        fixture.deliveries.push(...oldReadReceipt);
+        await drain();
+      }
+      expect(button("Allow repository")).toBeUndefined();
+      expect(button("Manage Linear connection")).toBeUndefined();
+      expect(button("Withdraw access").props.disabled).toBe(false);
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toMatchObject({
+        trigger: { labelIds: ["team-label"], teamId: "saved-team", grantId: "grant" },
+      });
+    });
+  }),
+);
+
+it.effect("discards pending metadata from before reconnect while preserving draft edits", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      let oldReadStarted!: () => void;
+      let releaseOldRead!: () => void;
+      const started = new Promise<void>((resolve) => (oldReadStarted = resolve));
+      const blocked = new Promise<void>((resolve) => (releaseOldRead = resolve));
+      fixture.metadataReply = async (kind, cursor) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        if (cursor === "old-page") {
+          oldReadStarted();
+          await blocked;
+          return Response.json({
+            items: [{ id: "old-team", name: "Team from before reconnect" }],
+            nextCursor: null,
+          });
+        }
+        return fixture.repo.sources[0]?.source.authorizationEpoch === 1
+          ? Response.json({ items: [], nextCursor: "old-page" })
+          : Response.json({
+              items: [{ id: "fresh-team", name: "Team after reconnect" }],
+              nextCursor: null,
+            });
+      };
+      await mountTrigger();
+      await act(() =>
+        renderer.root
+          .findAllByType("button")
+          .find((node) => node.props["aria-label"] === "Remove label Global label")!
+          .props.onClick(),
+      );
+      await drain();
+
+      await act(() => button("More teams").props.onClick());
+      await started;
+      const oldReadReceipt = fixture.deliveries.splice(0);
+      try {
+        fixture.repo = {
+          ...fixture.repo,
+          sources: fixture.repo.sources.map((entry) => ({
+            ...entry,
+            source: { ...entry.source, authorizationEpoch: 2 },
+          })),
+        };
+        await act(() =>
+          renderer.root
+            .findAllByType("button")
+            .find((node) => node.props["aria-label"] === "Refresh workspace access")!
+            .props.onClick(),
+        );
+        await drain();
+        expect(words()).toContain("Team after reconnect");
+      } finally {
+        releaseOldRead();
+        fixture.deliveries.push(...oldReadReceipt);
+        await drain();
+      }
+      expect(words()).toContain("Team after reconnect");
+      expect(words()).not.toContain("Team from before reconnect");
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toMatchObject({
+        trigger: { labelIds: ["team-label"], teamId: "saved-team", grantId: "grant" },
+      });
+    });
+  }),
+);
 
 for (const enabled of [false, true])
   it.effect(

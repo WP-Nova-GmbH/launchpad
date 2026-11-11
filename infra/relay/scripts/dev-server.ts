@@ -267,6 +267,14 @@ const cloudMintKeyPair = loadOrCreateDevCloudMintKeyPair(
     ),
 );
 
+const linearWorkflow = RelayConfiguration.workflowLinearConfiguration(
+  process.env.LINEAR_WORKFLOW_CLIENT_ID,
+  process.env.LINEAR_WORKFLOW_ORGANIZATION_ID,
+  process.env.LINEAR_WORKFLOW_CLIENT_SECRET?.trim()
+    ? Redacted.make(process.env.LINEAR_WORKFLOW_CLIENT_SECRET)
+    : undefined,
+);
+
 const relayConfigurationLayer = Layer.succeed(
   RelayConfiguration.RelayConfiguration,
   RelayConfiguration.RelayConfiguration.of({
@@ -294,21 +302,14 @@ const relayConfigurationLayer = Layer.succeed(
     cloudMintPrivateKey: Redacted.make(cloudMintKeyPair.privateKey),
     cloudMintPublicKey: cloudMintKeyPair.publicKey,
     linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
-      process.env.LINEAR_WORKFLOW_CLIENT_ID,
+      linearWorkflow,
       process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET?.trim()
         ? Redacted.make(process.env.LINEAR_WORKFLOW_WEBHOOK_SECRET)
         : undefined,
       process.env.LINEAR_WORKFLOW_WEBHOOK_GENERATION,
       process.env.LINEAR_WORKFLOW_ADMISSION_ENABLED === "true",
     ),
-    linearWorkflow: process.env.LINEAR_WORKFLOW_CLIENT_ID?.trim()
-      ? {
-          clientId: process.env.LINEAR_WORKFLOW_CLIENT_ID.trim(),
-          ...(process.env.LINEAR_WORKFLOW_CLIENT_SECRET?.trim()
-            ? { clientSecret: Redacted.make(process.env.LINEAR_WORKFLOW_CLIENT_SECRET.trim()) }
-            : {}),
-        }
-      : undefined,
+    linearWorkflow,
     github:
       process.env.GITHUB_APP_ID && process.env.GITHUB_APP_SLUG && process.env.GITHUB_APP_PRIVATE_KEY
         ? {

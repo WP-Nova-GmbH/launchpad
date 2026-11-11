@@ -5,7 +5,11 @@ import * as Layer from "effect/Layer";
 import { HttpRouter, HttpServerRequest } from "effect/unstable/http";
 import * as Store from "../workflowSources/Store.ts";
 import { RelayDb } from "../db.ts";
-import { RelayConfiguration, workflowWebhookConfiguration } from "../Config.ts";
+import {
+  RelayConfiguration,
+  workflowLinearConfiguration,
+  workflowWebhookConfiguration,
+} from "../Config.ts";
 import { config } from "../workflowSources/test-fixture.ts";
 import { receiveWorkflowEvent, workflowEventsRoute } from "./WorkflowEventsRoute.ts";
 import { configured, issue, clock, sign, webhookConfig } from "../workflowEvents/test-fixture.ts";
@@ -30,14 +34,24 @@ describe("Linear workflow HTTP receiver", () => {
         (yield* invoke(request("{}")).pipe(Effect.provideService(RelayConfiguration, config)))
           .status,
       ).toBe(503);
-      expect(workflowWebhookConfiguration("app", undefined, "v1")).toBeUndefined();
+      const linear = workflowLinearConfiguration(" app ", " org ");
+      expect(workflowLinearConfiguration("app", " ")).toBeUndefined();
+      expect(workflowWebhookConfiguration(undefined, undefined, "v1")).toBeUndefined();
+      expect(workflowWebhookConfiguration(linear, undefined, "v1")).toBeUndefined();
       expect(
-        workflowWebhookConfiguration("app", webhookConfig.linearWorkflowWebhook.signingSecret, " "),
+        workflowWebhookConfiguration(
+          linear,
+          webhookConfig.linearWorkflowWebhook.signingSecret,
+          " ",
+        ),
       ).toBeUndefined();
       expect(
-        workflowWebhookConfiguration("app", webhookConfig.linearWorkflowWebhook.signingSecret, "v1")
-          ?.admissionEnabled,
-      ).toBe(false);
+        workflowWebhookConfiguration(
+          linear,
+          webhookConfig.linearWorkflowWebhook.signingSecret,
+          "v1",
+        ),
+      ).toMatchObject({ applicationId: "app", organizationId: "org", admissionEnabled: false });
     }),
   );
   it.effect.each([undefined, "abc", "z".repeat(64), "0".repeat(64)])(

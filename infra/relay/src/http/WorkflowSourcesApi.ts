@@ -29,17 +29,24 @@ const safe = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
 export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSources", (handlers) =>
   Effect.succeed(
     handlers
-      .handle("owner", () =>
+      .handle("owner", (args) =>
         safe(
           Effect.gen(function* () {
-            return yield* Sources.owner((yield* RelayClientPrincipal).userId);
+            return yield* Sources.owner(
+              args.params.organizationId,
+              (yield* RelayClientPrincipal).userId,
+            );
           }),
         ),
       )
       .handle("begin", (args) =>
         safe(
           Effect.gen(function* () {
-            return yield* Sources.begin((yield* RelayClientPrincipal).userId, args.payload);
+            return yield* Sources.begin(
+              args.params.organizationId,
+              (yield* RelayClientPrincipal).userId,
+              args.payload,
+            );
           }),
         ),
       )
@@ -47,6 +54,7 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
         safe(
           Effect.gen(function* () {
             return yield* Sources.cancel(
+              args.params.organizationId,
               (yield* RelayClientPrincipal).userId,
               args.payload.attemptId,
             );
@@ -57,6 +65,7 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
         safe(
           Effect.gen(function* () {
             return yield* Sources.disconnect(
+              args.params.organizationId,
               (yield* RelayClientPrincipal).userId,
               args.payload.connectionId,
               args.payload.expectedEpoch,
@@ -68,6 +77,7 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
         safe(
           Effect.gen(function* () {
             const result = yield* Sources.refreshOwner(
+              args.params.organizationId,
               (yield* RelayClientPrincipal).userId,
               args.payload.connectionId,
             );
@@ -119,8 +129,13 @@ export const workflowSourcesApi = HttpApiBuilder.group(RelayApi, "workflowSource
         safe(
           Effect.gen(function* () {
             const user = (yield* RelayClientPrincipal).userId;
-            yield* Store.withdraw(user, args.payload.grantId);
-            return yield* Sources.owner(user);
+            yield* Store.withdraw(
+              user,
+              args.payload.grantId,
+              undefined,
+              args.params.organizationId,
+            );
+            return yield* Sources.owner(args.params.organizationId, user);
           }),
         ),
       )
@@ -183,7 +198,7 @@ export const workflowSourceCallbackRoute = HttpRouter.add(
     );
     if (outcome) yield* wakeWorkflows();
     return HttpServerResponse.text(
-      `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workflow source · Launchpad</title><body><h1>${outcome ? "Linear connected" : "Linear was not connected"}</h1><p>Return to Workflow sources in Launchpad and refresh the connection status. You can close this tab.</p></body></html>`,
+      `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workflow source · Launchpad</title><body><h1>${outcome ? "Linear connected" : "Linear was not connected"}</h1><p>Return to Organization settings in Launchpad and refresh the connection status. You can close this tab.</p></body></html>`,
       {
         status: outcome ? 200 : 400,
         contentType: "text/html; charset=utf-8",

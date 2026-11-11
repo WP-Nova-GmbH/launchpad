@@ -269,7 +269,15 @@ export const ApiLive = Api.make(
     const axiomTracesEndpoint = yield* observability.traces.otelTracesEndpoint;
 
     // Optional: a deployment without a GitHub App simply hides the surface.
-    const linearClientId = yield* Config.String("LINEAR_WORKFLOW_CLIENT_ID").pipe(Config.option);
+    const linearWorkflow = RelayConfiguration.workflowLinearConfiguration(
+      Option.getOrUndefined(yield* Config.String("LINEAR_WORKFLOW_CLIENT_ID").pipe(Config.option)),
+      Option.getOrUndefined(
+        yield* Config.String("LINEAR_WORKFLOW_ORGANIZATION_ID").pipe(Config.option),
+      ),
+      Option.getOrUndefined(
+        yield* Config.Redacted("LINEAR_WORKFLOW_CLIENT_SECRET").pipe(Config.option),
+      ),
+    );
     const linearWebhookSecret = yield* Config.Redacted("LINEAR_WORKFLOW_WEBHOOK_SECRET").pipe(
       Config.option,
     );
@@ -278,9 +286,6 @@ export const ApiLive = Api.make(
     );
     const linearAdmissionEnabled = yield* Config.Boolean("LINEAR_WORKFLOW_ADMISSION_ENABLED").pipe(
       Config.withDefault(false),
-    );
-    const linearClientSecret = yield* Config.Redacted("LINEAR_WORKFLOW_CLIENT_SECRET").pipe(
-      Config.option,
     );
     const githubAppId = yield* Config.String("GITHUB_APP_ID").pipe(Config.option);
     const githubAppSlug = yield* Config.String("GITHUB_APP_SLUG").pipe(Config.option);
@@ -335,21 +340,12 @@ export const ApiLive = Api.make(
         cloudMintPrivateKey: yield* cloudMintPrivateKey,
         cloudMintPublicKey: yield* cloudMintPublicKey,
         linearWorkflowWebhook: RelayConfiguration.workflowWebhookConfiguration(
-          Option.getOrUndefined(linearClientId),
+          linearWorkflow,
           Option.getOrUndefined(linearWebhookSecret),
           Option.getOrUndefined(linearWebhookGeneration),
           linearAdmissionEnabled,
         ),
-        linearWorkflow:
-          Option.isSome(linearClientId) && linearClientId.value.trim()
-            ? {
-                clientId: linearClientId.value.trim(),
-                ...(Option.isSome(linearClientSecret) &&
-                Redacted.value(linearClientSecret.value).trim()
-                  ? { clientSecret: linearClientSecret.value }
-                  : {}),
-              }
-            : undefined,
+        linearWorkflow,
         github:
           Option.isSome(githubAppId) &&
           Option.isSome(githubAppSlug) &&

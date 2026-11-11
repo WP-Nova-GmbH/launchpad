@@ -32,6 +32,17 @@ const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 const isWorkflowQueued = Schema.is(WorkflowQueued);
 
+const clearUnacceptedOffer = (job: RepositoryWorkflowJob): RepositoryWorkflowJob => ({
+  ...job,
+  workflow: null,
+  runtime: null,
+  issueSnapshot: undefined,
+  offerAuthority: undefined,
+  startAttempted: undefined,
+  instruction: job.event ? `${job.event.identifier}: ${job.event.title}` : job.instruction,
+  status: "queued",
+});
+
 const canDeliverControl = Effect.fnUntraced(function* (
   row: WorkflowJobRecord,
   userId: string,
@@ -174,10 +185,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       job = row.record;
     }
     let workflow = job.workflow;
-    // Queued jobs adopt the current definition. A dispatching offer stays frozen
-    // through timeout and retries until the executor answers authoritatively.
-    if (workflow === null) {
-      if (row!.pendingControl?.response.operation === "cancel") {
+    if (row!.pendingControl?.response.operation === "cancel") {
+      if (workflow === null) {
         row = yield* update(
           row!,
           { ...job, status: "cancelled", detail: "Cancelled before acceptance.", updatedAt: now },
@@ -186,6 +195,17 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         );
         return row.record;
       }
+      if (
+        origin.kind === "automation" &&
+        job.runtime?.kind === "machine" &&
+        job.startAttempted === false &&
+        job.progress === null
+      )
+        return (yield* store.settlePreparedMachineCancellation(row!, leaseUntil)).record;
+    }
+    // Queued jobs adopt the current definition. A dispatching offer stays frozen
+    // through timeout and retries until the executor answers authoritatively.
+    if (workflow === null) {
       if (origin.kind === "automation") {
         if (
           job.queueReason?.retryAt &&
@@ -446,17 +466,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           return (yield* update(
             { ...row!, repositoryCanonicalKey: null },
             {
-              ...job,
-              workflow: null,
-              runtime: null,
-              issueSnapshot: undefined,
-              offerAuthority: undefined,
-              startAttempted: undefined,
-              instruction: job.event
-                ? `${job.event.identifier}: ${job.event.title}`
-                : job.instruction,
+              ...clearUnacceptedOffer(job),
               queueReason: { code: "environment_update", retryAt: null },
-              status: "queued",
               requiredProtocol: WORKFLOW_PROTOCOL,
               detail: "Update this environment before running automatic workflows.",
               updatedAt: now,
@@ -478,8 +489,13 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           message: "This environment does not support the workflow's publishing steps.",
         });
       // Persist before sending: a crash or timeout leaves every later delivery frozen.
-      row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
-      job = row.record;
+      if (mayRetireOffer) {
+        const automatic = yield* Effect.serviceOption(AutomaticOffers);
+        if (automatic._tag === "None")
+          return yield* new WorkflowQueued({ code: "source_unavailable", retryAt: null });
+        row = yield* automatic.value.beginStart(row!, leaseUntil, now);
+        job = row.record;
+      }
     }
     if (control.operation === "start" && origin.kind === "manual") {
       row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
@@ -559,13 +575,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       row = yield* update(
         { ...row!, repositoryCanonicalKey: null },
         {
-          ...job,
-          workflow: null,
-          runtime: null,
-          issueSnapshot: undefined,
-          offerAuthority: undefined,
-          startAttempted: undefined,
-          instruction: job.event ? `${job.event.identifier}: ${job.event.title}` : job.instruction,
+          ...clearUnacceptedOffer(job),
           ...(origin.kind === "automation"
             ? {
                 queueReason: {
@@ -577,7 +587,6 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
                 },
               }
             : {}),
-          status: "queued",
           detail: outcome.detail ?? "Waiting for the selected environment.",
           updatedAt: now,
         },
@@ -614,7 +623,8 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         if (
           !latest.record.vmAdmission &&
           latest.record.origin?.kind === "automation" &&
-          latest.record.workflow === null
+          (latest.record.workflow === null ||
+            (latest.record.startAttempted === false && isWorkflowQueued(error)))
         ) {
           const reason = isWorkflowQueued(error)
             ? error
@@ -624,9 +634,9 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             retryAt: reason.retryAt ?? (yield* DateTime.now).epochMilliseconds + 30_000,
           };
           return (yield* update(
-            latest,
+            { ...latest, repositoryCanonicalKey: null },
             {
-              ...latest.record,
+              ...clearUnacceptedOffer(latest.record),
               queueReason,
               detail: queueReasonText[reason.code],
               updatedAt: DateTime.formatIso(yield* DateTime.now),

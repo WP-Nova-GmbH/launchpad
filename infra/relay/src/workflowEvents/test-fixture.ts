@@ -16,6 +16,7 @@ export const webhookConfig = {
   ...config,
   linearWorkflowWebhook: {
     applicationId: "native-app",
+    organizationId: "org",
     signingSecret: Redacted.make("webhook-test-secret"),
     generation: "coverage-1",
     admissionEnabled: true,
@@ -84,11 +85,11 @@ export const revocation = (time: number) => ({
   webhookTimestamp: time,
   webhookId: "subscription-1",
 });
-export const sign = (body: string) =>
+export const sign = (body: string, secret = "webhook-test-secret") =>
   Effect.promise(async () => {
     const key = await crypto.subtle.importKey(
       "raw",
-      new TextEncoder().encode("webhook-test-secret"),
+      new TextEncoder().encode(secret),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"],
@@ -122,7 +123,7 @@ export const seed = Effect.gen(function* () {
   yield* createConnection();
   yield* Store.allow(
     "repo",
-    "owner",
+    "admin",
     { grantId: "grant", connectionId: "connection", previousGrantId: null },
     "native-app",
   );

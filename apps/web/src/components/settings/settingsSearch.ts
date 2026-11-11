@@ -827,7 +827,7 @@ export const SETTINGS_SEARCH_ITEMS = [
   {
     id: "workflow-sources",
     title: "Workflow sources",
-    to: "/settings/connections",
+    to: "/settings/organization",
     cloudOnly: true,
     searchTerms: ["Linear workflow source repository consent connect reconnect disconnect"],
   },

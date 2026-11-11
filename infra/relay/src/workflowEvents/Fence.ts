@@ -9,8 +9,15 @@ import type { Connection } from "../workflowSources/Store.ts";
 // Webhook intake is optional; absence leaves existing source management usable.
 export const configuration = Effect.serviceOption(RelayConfiguration).pipe(
   Effect.map((service) => {
-    const config = Option.getOrUndefined(service)?.linearWorkflowWebhook;
-    return config?.applicationId.trim() && config.generation.trim() ? config : undefined;
+    const { linearWorkflow: oauth, linearWorkflowWebhook: config } =
+      Option.getOrUndefined(service) ?? {};
+    return config?.applicationId.trim() &&
+      config.generation.trim() &&
+      config.organizationId.trim() &&
+      oauth?.clientId === config.applicationId &&
+      oauth.organizationId === config.organizationId
+      ? config
+      : undefined;
   }),
 );
 export const lock = Effect.fn("workflowEvents.sourceFence")(function* (
