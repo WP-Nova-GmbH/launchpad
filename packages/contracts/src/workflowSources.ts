@@ -86,6 +86,7 @@ export const WorkflowRepositorySources = Schema.Struct({
   configured: Schema.Boolean,
   canAllow: Schema.Boolean,
   canManage: Schema.Boolean,
+  exchangeInProgress: Schema.Boolean,
   sources: Schema.Array(Schema.Struct({ source: WorkflowSource, grant: WorkflowSourceGrant })),
   eligible: Schema.Array(
     Schema.Struct({ source: WorkflowSource, previousGrantId: Schema.NullOr(Id) }),

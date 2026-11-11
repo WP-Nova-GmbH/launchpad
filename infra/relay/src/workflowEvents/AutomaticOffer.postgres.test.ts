@@ -23,7 +23,13 @@ import { RelayDb } from "../db.ts";
 import * as Store from "../workflowSources/Store.ts";
 import * as Sources from "../workflowSources/Sources.ts";
 import * as Issue from "../workflowSources/IssueContext.ts";
-import { databaseUrl, withDatabase, transport } from "../workflowSources/test-fixture.ts";
+import {
+  databaseUrl,
+  withDatabase,
+  transport,
+  tokenReply,
+  identityReply,
+} from "../workflowSources/test-fixture.ts";
 import {
   configured,
   seed,
@@ -31,6 +37,7 @@ import {
   receive,
   clock,
   issue,
+  counts,
   save,
   trigger,
 } from "./test-fixture.ts";
@@ -55,12 +62,7 @@ const rawIssue = {
 const reply = (value: unknown = rawIssue) => ({
   data: { organization: { id: "workspace" }, issue: value },
 });
-const harness = Effect.gen(function* () {
-  yield* seed;
-  yield* enableBeforeEvent("flow");
-  expect((yield* receive(issue(yield* clock))).status).toBe(200);
-  const store = yield* makeWorkflows;
-  const [job] = yield* store.listJobs("repo");
+const dispatcher = Effect.fnUntraced(function* (jobId: string, store: Workflows["Service"]) {
   const mode = yield* Ref.make<"accepted" | "busy" | "lost">("accepted");
   const starts = yield* Ref.make<string[]>([]);
   const beforePreparedStart = yield* Ref.make(Effect.void);
@@ -129,19 +131,131 @@ const harness = Effect.gen(function* () {
   const runtime = Automatic.layer.pipe(Layer.provideMerge(base));
   return {
     store,
-    jobId: job!.jobId,
+    jobId,
     mode,
     starts,
     cancellations,
     beforePreparedStart,
     base,
     runtime,
-    refresh: refreshWorkflowJob(job!.jobId).pipe(Effect.provide(runtime)),
-    row: store.getJob(job!.jobId),
+    refresh: refreshWorkflowJob(jobId).pipe(Effect.provide(runtime)),
+    row: store.getJob(jobId),
   };
+});
+const harness = Effect.gen(function* () {
+  yield* seed;
+  yield* enableBeforeEvent("flow");
+  expect((yield* receive(issue(yield* clock))).status).toBe(200);
+  const store = yield* makeWorkflows;
+  const [job] = yield* store.listJobs("repo");
+  return yield* dispatcher(job!.jobId, store);
+});
+const holdReconnect = Effect.fnUntraced(function* (accepted: boolean) {
+  const pending = yield* Sources.begin("org", "admin", {
+    attemptId: "reconnect",
+    expectedVersion: 0,
+    connectionId: "connection",
+  });
+  const state = new URL(pending.authorization!.url).searchParams.get("state")!;
+  const entered = yield* Deferred.make<void>();
+  const release = yield* Deferred.make<void>();
+  const http = HttpClient.make((req) => {
+    if (!req.url.endsWith("/oauth/token"))
+      return Effect.succeed(HttpClientResponse.fromWeb(req, Response.json(identityReply)));
+    const response = accepted
+      ? Response.json(tokenReply)
+      : Response.json({ error: "invalid_grant" }, { status: 400 });
+    return Deferred.succeed(entered, undefined).pipe(
+      Effect.andThen(Deferred.await(release)),
+      Effect.as(HttpClientResponse.fromWeb(req, response)),
+    );
+  });
+  const callback = yield* Sources.callback(state, "code").pipe(
+    Effect.provideService(HttpClient.HttpClient, http),
+    Effect.match({ onFailure: (error) => error, onSuccess: (id) => id }),
+    Effect.forkChild,
+  );
+  yield* Deferred.await(entered);
+  return { release, callback };
 });
 
 describe("automatic offers (PostgreSQL)", () => {
+  it.live.each(["rejected", "successful"] as const)(
+    "queues a Linear event once during a reconnect that is %s and then starts that job",
+    (outcome) =>
+      testDb(
+        Effect.gen(function* () {
+          yield* seed;
+          yield* enableBeforeEvent("flow");
+          const before = (yield* Store.connection("connection"))!;
+          const accepted = outcome === "successful";
+          const reconnect = yield* holdReconnect(accepted);
+          const payload = issue(yield* clock);
+          expect((yield* receive(payload)).status).toBe(200);
+          expect((yield* receive(payload)).status).toBe(200);
+          expect(yield* counts).toEqual({ occurrences: 1, admissions: 1, jobs: 1 });
+          expect((yield* Store.connection("connection"))?.delivery_evidence).toEqual(
+            before.delivery_evidence,
+          );
+
+          const sql = (yield* RelayDb).$client;
+          const [admission] = yield* sql<{ job_id: string }>`
+            SELECT job_id, authorization_epoch, grant_generation FROM relay_workflow_admissions
+          `;
+          expect(admission).toMatchObject({ authorization_epoch: 1, grant_generation: 1 });
+          const h = yield* dispatcher(admission!.job_id, yield* makeWorkflows);
+          const issueReads: Array<string | undefined> = [];
+          const issueTransport = transport((req) => {
+            issueReads.push(req.headers.authorization);
+            return Response.json(reply());
+          });
+          const blocked = yield* h.refresh.pipe(Effect.provide(issueTransport));
+          expect(blocked).toMatchObject({
+            status: "queued",
+            queueReason: { code: "source_unavailable" },
+          });
+          expect(issueReads).toEqual([]);
+          expect(yield* Ref.get(h.starts)).toEqual([]);
+
+          yield* Deferred.succeed(reconnect.release, undefined);
+          const result = yield* Fiber.join(reconnect.callback);
+          const current = (yield* Store.connection("connection"))!;
+          if (accepted) {
+            expect(result).toBe("connection");
+            expect(current).toMatchObject({ authorization_epoch: 2, delivery_evidence: null });
+          } else {
+            expect(result).toMatchObject({ code: "invalid_input" });
+            expect(current).toEqual(before);
+          }
+
+          const queued = (yield* h.row)!;
+          yield* h.store.updateJob(queued, {
+            ...queued.record,
+            queueReason: { code: "source_unavailable", retryAt: 1 },
+          });
+          const started = yield* h.refresh.pipe(Effect.provide(issueTransport));
+          expect(started).toMatchObject({
+            jobId: h.jobId,
+            status: "preparing",
+            issueSnapshot: { authorizationEpoch: accepted ? 2 : 1 },
+          });
+          expect(issueReads).toEqual([accepted ? "Bearer new-access" : "Bearer old-access-org"]);
+          expect(yield* Ref.get(h.starts)).toHaveLength(1);
+          expect((yield* receive(payload)).status).toBe(200);
+          expect(yield* counts).toEqual({ occurrences: 1, admissions: 1, jobs: 1 });
+
+          if (accepted) {
+            const nextEventAt = Math.max(yield* clock, Date.parse(current.activated_at) + 1);
+            expect((yield* receive(issue(nextEventAt))).status).toBe(200);
+            expect(yield* counts).toEqual({ occurrences: 2, admissions: 1, jobs: 1 });
+            expect((yield* Store.connection("connection"))?.delivery_evidence).toMatchObject({
+              epoch: 2,
+              teams: { team: { created: true, entered: false } },
+            });
+          }
+        }),
+      ),
+  );
   it.live(
     "reads the exact issue and commits a snapshot before delivering one concurrent start",
     () =>
@@ -277,6 +391,7 @@ describe("automatic offers (PostgreSQL)", () => {
   for (const [change, reason] of [
     ["withdraw", "source_withdrawn"],
     ["disconnect", "source_reconnect"],
+    ["reconnect", "source_unavailable"],
     ["cutover", "source_withdrawn"],
     ["off", null],
     ["criteria", null],
@@ -304,6 +419,7 @@ describe("automatic offers (PostgreSQL)", () => {
           });
           if (change === "withdraw") yield* Store.withdraw("maintainer", "grant", "repo");
           if (change === "disconnect") yield* Sources.disconnect("org", "admin", "connection", 1);
+          const reconnect = change === "reconnect" ? yield* holdReconnect(false) : null;
           if (change === "cutover") {
             const sql = (yield* RelayDb).$client;
             yield* sql`DELETE FROM relay_workflow_repository_grants WHERE grant_id='grant'`;
@@ -329,6 +445,10 @@ describe("automatic offers (PostgreSQL)", () => {
           if (change === "criteria") yield* save("flow", { ...trigger, labelIds: ["unmatched"] });
           yield* Deferred.succeed(release, undefined);
           yield* Fiber.join(refresh);
+          if (reconnect) {
+            yield* Deferred.succeed(reconnect.release, undefined);
+            expect(yield* Fiber.join(reconnect.callback)).toMatchObject({ code: "invalid_input" });
+          }
           const row = (yield* h.row)!;
           if (reason === null) {
             expect(row.record.status).toBe("preparing");

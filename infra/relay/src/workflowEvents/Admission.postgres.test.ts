@@ -360,6 +360,39 @@ describe("verified event admission (PostgreSQL)", () => {
         }),
       ),
   );
+  it.live("cannot complete a team's delivery coverage during a reconnect", () =>
+    testDb(
+      Effect.gen(function* () {
+        yield* seed;
+        yield* enableBeforeEvent("flow");
+        const sql = (yield* RelayDb).$client;
+        const incomplete = {
+          generation: "coverage-1",
+          epoch: 1,
+          teams: { team: { created: false, entered: true } },
+        };
+        yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json(incomplete)}`;
+        const pending = yield* Sources.begin("org", "admin", {
+          attemptId: "incomplete-coverage",
+          expectedVersion: 0,
+          connectionId: "connection",
+        });
+        const gate = yield* gateExchange(
+          new URL(pending.authorization!.url).searchParams.get("state")!,
+        );
+        const callback = yield* gate.callback.pipe(Effect.forkChild);
+        yield* Deferred.await(gate.entered);
+
+        expect((yield* receive(issue(yield* clock))).status).toBe(200);
+        expect(yield* counts).toEqual({ occurrences: 1, admissions: 0, jobs: 0 });
+        expect((yield* Store.connection("connection"))?.delivery_evidence).toEqual(incomplete);
+
+        yield* Deferred.succeed(gate.release, undefined);
+        expect(yield* Fiber.join(callback)).toBe("connection");
+        expect((yield* Store.connection("connection"))?.delivery_evidence).toBeNull();
+      }),
+    ),
+  );
   it.live(
     "fences first-connection late OAuth callbacks and retains a later authorization through old revocations",
     () =>

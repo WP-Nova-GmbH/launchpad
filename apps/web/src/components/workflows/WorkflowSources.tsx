@@ -133,7 +133,7 @@ export function RepositorySourcesPanel({
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={disabled}
+                      disabled={disabled || snapshot.exchangeInProgress}
                       onClick={() =>
                         void state.mutate((c, t) =>
                           c.refreshRepository(t, repositoryId, grant.grantId),

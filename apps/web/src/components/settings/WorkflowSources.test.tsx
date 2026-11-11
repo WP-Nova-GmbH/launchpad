@@ -270,6 +270,7 @@ beforeEach(() => {
     configured: true,
     canAllow: true,
     canManage: true,
+    exchangeInProgress: false,
     sources: [],
     eligible: [{ source, previousGrantId: null }],
   };
@@ -501,6 +502,26 @@ it.effect("shows service recovery for a granted organization connection", () =>
       expect(words()).toContain("Service configuration needs attention");
       expect(button("Retry connection")).toBeDefined();
       expect(button("Allow repository")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect("disables repository credential retry while exchange is in progress", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mount();
+      await click("Allow repository");
+      fixture.repo = { ...fixture.repo, exchangeInProgress: true };
+      await click("Refresh sources");
+
+      expect(button("Retry connection").props.disabled).toBe(true);
+      expect(button("Withdraw access").props.disabled).toBe(false);
+      expect(button("Refresh sources").props.disabled).toBe(false);
+
+      fixture.repo = { ...fixture.repo, exchangeInProgress: false };
+      await click("Refresh sources");
+      expect(button("Retry connection").props.disabled).toBe(false);
     });
   }),
 );
@@ -1070,6 +1091,67 @@ it.effect("directs a maintainer without a grant to an organization admin", () =>
       expect(button("Connect Linear")).toBeUndefined();
       expect(button("Allow this repository")).toBeUndefined();
       expect(words()).not.toContain("Engineering workspace");
+    });
+  }),
+);
+
+it.effect("lets a maintainer refresh a new workspace grant without losing the trigger draft", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.repo = { ...fixture.repo, canAllow: false, eligible: [] };
+      await act(() => {
+        renderer = create(<TriggerEditor />);
+      });
+      await drain();
+      const refresh = () =>
+        renderer.root
+          .findAllByType("button")
+          .find((node) => node.props["aria-label"] === "Refresh workspace access")!;
+      expect(refresh().props.disabled).toBe(false);
+      expect(words()).not.toContain("Engineering workspace");
+
+      let markStarted!: () => void;
+      let releaseRead!: () => void;
+      const started = new Promise<void>((resolve) => (markStarted = resolve));
+      const blocked = new Promise<void>((resolve) => (releaseRead = resolve));
+      fixture.fetch.mockImplementationOnce(async () => {
+        markStarted();
+        await blocked;
+        return Response.json(fixture.repo);
+      });
+      await act(() => refresh().props.onClick());
+      await started;
+      try {
+        expect(refresh().props.disabled).toBe(true);
+        expect(words()).toContain("Checking workspace access");
+        fixture.repo = {
+          ...fixture.repo,
+          sources: [
+            {
+              source,
+              grant: {
+                grantId: "new-grant",
+                connectionId: "connection",
+                organizationId: "org",
+                repositoryId: "repo",
+                generation: 2,
+                revoked: false,
+              },
+            },
+          ],
+        };
+      } finally {
+        releaseRead();
+        await drain();
+      }
+      expect(refresh().props.disabled).toBe(false);
+      expect(words()).toContain("Engineering workspace");
+      expect(button("Connect Linear")).toBeUndefined();
+      expect(button("Allow this repository")).toBeUndefined();
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toEqual(
+        triggerInitial,
+      );
     });
   }),
 );

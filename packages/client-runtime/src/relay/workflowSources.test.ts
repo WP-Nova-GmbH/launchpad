@@ -9,7 +9,14 @@ import {
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as Tenancy from "./managedRelayTenancy.ts";
 import * as Sources from "./workflowSources.ts";
-const snapshot = { configured: true, canAllow: true, canManage: true, sources: [], eligible: [] };
+const snapshot = {
+  configured: true,
+  canAllow: true,
+  canManage: true,
+  exchangeInProgress: false,
+  sources: [],
+  eligible: [],
+};
 function layer(fetchFn: typeof fetch) {
   const http = remoteHttpClientLayer(fetchFn);
   return Tenancy.layer({ relayUrl: "https://relay.test" }).pipe(Layer.provideMerge(http));

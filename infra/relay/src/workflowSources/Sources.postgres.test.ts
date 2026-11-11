@@ -453,6 +453,9 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
             );
             yield* Deferred.await(entered);
             expect((yield* Sources.owner("org", "admin-2")).exchangeInProgress).toBe(true);
+            expect((yield* Sources.repository("repo", "maintainer")).exchangeInProgress).toBe(true);
+            expect((yield* Sources.repository("repo-2", "admin-2")).exchangeInProgress).toBe(true);
+            expect((yield* Sources.repository("repo-2", "owner")).exchangeInProgress).toBe(false);
             const sql = (yield* RelayDb).$client;
             expect(
               yield* sql.withTransaction(Store.authority("repo", "grant")).pipe(Effect.flip),
@@ -466,6 +469,9 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
               const cancelled = yield* Sources.cancel("org", "admin-2", "reconnect");
               expect(cancelled.attempt?.status).toBe("cancelled");
               expect(cancelled.exchangeInProgress).toBe(true);
+              expect((yield* Sources.repository("repo", "maintainer")).exchangeInProgress).toBe(
+                true,
+              );
             } else
               yield* Sources.disconnect("org", "admin-2", c.connection_id, c.authorization_epoch);
             yield* Deferred.succeed(release, undefined);
@@ -477,6 +483,9 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
             expect(failed.payload_sealed).toBeNull();
             expect((yield* Store.attempt("org", "native-app"))?.exchange_lease_until).toBeNull();
             expect((yield* Sources.owner("org", "admin-2")).exchangeInProgress).toBe(false);
+            expect((yield* Sources.repository("repo", "maintainer")).exchangeInProgress).toBe(
+              false,
+            );
             const recovered = yield* Sources.begin("org", "admin-2", {
               attemptId: "recover",
               expectedVersion: (yield* Sources.owner("org", "admin-2")).version,
@@ -486,9 +495,9 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
               new URL(recovered.authorization!.url).searchParams.get("state")!,
               "code",
             );
-            expect(
-              (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.grant.grantId,
-            ).toBe("grant");
+            const snapshot = yield* Store.repositorySnapshot("repo", "maintainer");
+            expect(snapshot.sources[0]?.grant.grantId).toBe("grant");
+            expect(snapshot.exchangeInProgress).toBe(false);
             expect((yield* Store.connection(c.connection_id))?.status).toBe("connected");
           }),
         ),

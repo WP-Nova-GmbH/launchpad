@@ -124,11 +124,7 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
         )
           return { duplicate: false, jobs: 0 };
         yield* storeOccurrence;
-        if (
-          attempt.exchange_lease_until ||
-          !event.eligible ||
-          occurrenceTime <= Date.parse(connection.activated_at)
-        )
+        if (!event.eligible || occurrenceTime <= Date.parse(connection.activated_at))
           return { duplicate: false, jobs: 0 };
         const grants = grantIds.length
           ? yield* sql<
@@ -152,7 +148,11 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
           created: old.created || event.action === "create",
           entered: old.entered || event.entered,
         };
-        if (old.created !== next.created || old.entered !== next.entered) {
+        // A reconnect can queue against verified coverage, but it cannot establish coverage.
+        if (
+          !attempt.exchange_lease_until &&
+          (old.created !== next.created || old.entered !== next.entered)
+        ) {
           const evidence = { ...proof, teams: { ...proof.teams, [event.facts.teamId]: next } };
           yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json(evidence)} WHERE connection_id=${c.connection_id} AND authorization_epoch=${c.authorization_epoch}`;
           c.delivery_evidence = evidence;

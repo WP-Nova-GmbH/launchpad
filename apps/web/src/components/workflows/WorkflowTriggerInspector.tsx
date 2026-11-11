@@ -260,19 +260,17 @@ export function WorkflowTriggerInspector({
           <section className={styles["workflow-trigger-section"]} aria-label="Trigger connection">
             <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm font-medium">Connection</h3>
-              {source && !connectionUnknown ? (
-                <div className="flex items-center gap-1">
-                  <Button
-                    type="button"
-                    size="icon-sm"
-                    variant="ghost"
-                    aria-label="Refresh workspace access"
-                    disabled={disabled || sources.loading}
-                    onClick={() => void sources.refresh()}
-                  >
-                    <RefreshCwIcon />
-                  </Button>
-                </div>
+              {!sources.error ? (
+                <Button
+                  type="button"
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Refresh workspace access"
+                  disabled={disabled || sources.busy || sources.loading}
+                  onClick={() => void sources.refresh()}
+                >
+                  <RefreshCwIcon />
+                </Button>
               ) : null}
             </div>
             {source ? <p className="text-sm font-medium">{source.source.workspaceName}</p> : null}

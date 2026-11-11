@@ -383,6 +383,7 @@ export const repositorySnapshot = Effect.fn("workflowSources.repositorySnapshot"
       const org = repository.organization_id;
       const app = yield* configuredFor(org);
       const a = app ? yield* attempt(org, app) : null;
+      const exchangeInProgress = !!a?.exchange_lease_until;
       const grants =
         yield* sql<Grant>`SELECT * FROM relay_workflow_repository_grants WHERE repository_id=${repo} AND organization_id=${org} ORDER BY generation DESC`;
       const all =
@@ -395,14 +396,14 @@ export const repositorySnapshot = Effect.fn("workflowSources.repositorySnapshot"
           return c
             ? [
                 {
-                  source: source(c, app, eventConfig, !!a?.exchange_lease_until),
+                  source: source(c, app, eventConfig, exchangeInProgress),
                   grant: grant(g),
                 },
               ]
             : [];
         });
       const eligible =
-        canAllow && a && !a.exchange_lease_until
+        canAllow && a && !exchangeInProgress
           ? all
               .filter(
                 (c) =>
@@ -417,7 +418,14 @@ export const repositorySnapshot = Effect.fn("workflowSources.repositorySnapshot"
                   grants.find((g) => g.connection_id === c.connection_id)?.grant_id ?? null,
               }))
           : [];
-      return { configured: app !== null, canAllow, canManage, sources, eligible };
+      return {
+        configured: app !== null,
+        canAllow,
+        canManage,
+        exchangeInProgress: exchangeInProgress && (canAllow || sources.length > 0),
+        sources,
+        eligible,
+      };
     }),
   );
 });
