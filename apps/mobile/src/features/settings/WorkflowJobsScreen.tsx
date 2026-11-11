@@ -34,7 +34,12 @@ import {
 import { appAtomRegistry } from "../../state/atom-registry";
 import { useAuth } from "@clerk/expo";
 import { useNavigation, useIsFocused, type StaticScreenProps } from "@react-navigation/native";
-import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
+import {
+  ManagedRelay,
+  ManagedRelayTenancy,
+  matchesWorkflowRepository,
+  workflowRepositoryRemote,
+} from "@t3tools/client-runtime/relay";
 import {
   workflowManualControlState,
   workflowActionState,
@@ -57,8 +62,17 @@ import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
 import { useCallback, useEffect, useState, useMemo, useRef, useLayoutEffect } from "react";
-import { Linking, Alert, AppState, View, TextInput } from "react-native";
-import { AppText as Text } from "../../components/AppText";
+import {
+  AccessibilityInfo,
+  Linking,
+  Alert,
+  AppState,
+  Platform,
+  View,
+  TextInput,
+} from "react-native";
+import { AppText as Text, AppTextInput } from "../../components/AppText";
+import { ScreenScrollView } from "../../components/ScreenScrollView";
 import { runtime } from "../../lib/runtime";
 import { uuidv4 } from "../../lib/uuid";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -74,6 +88,7 @@ import { scopedThreadKey } from "../../lib/scopedEntities";
 import { setReviewSelectedSectionId } from "../review/reviewState";
 
 type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+const NO_REPOSITORY_MATCHES_MESSAGE = "No repositories match your search.";
 
 type Props = StaticScreenProps<
   | {
@@ -117,10 +132,22 @@ function ConfiguredWorkflowJobsScreen(props: Props) {
 
 function WorkflowJobsContent(props: Props) {
   const { getToken, isSignedIn, userId } = useAuth();
+  const latestGetToken = useRef(getToken);
+  useLayoutEffect(() => {
+    latestGetToken.current = getToken;
+  }, [getToken]);
   const navigation = useNavigation();
   const openPortableResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const focused = useIsFocused();
   const [repositories, setRepositories] = useState<ReadonlyArray<RelayRepositorySummary>>([]);
+  const [repositoryQuery, setRepositoryQuery] = useState("");
+  const matchingRepositories = useMemo(
+    () =>
+      repositories.filter(({ repository }) =>
+        matchesWorkflowRepository(repository, repositoryQuery),
+      ),
+    [repositories, repositoryQuery],
+  );
   const [membership, setMembership] = useState<RelayOrganizationMembership | null>(null);
   const [selectedRepository, setSelectedRepository] = useState<RelayRepositorySummary | null>(null);
   const [recent, setRecent] = useState(emptyWorkflowJobPageRead);
@@ -135,6 +162,7 @@ function WorkflowJobsContent(props: Props) {
     props.route.params?.jobId ?? null,
   );
   const drafts = useAtomValue(workflowDraftAtom);
+  const workflowAccountReady = !!userId && drafts.accountId === userId;
   const reads = useAtomValue(workflowJobReadAtom);
   const organizationId = selectedRepository?.repository.organizationId;
   const repositoryId = selectedRepository?.repository.repositoryId;
@@ -189,6 +217,27 @@ function WorkflowJobsContent(props: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [catalogRefresh, setCatalogRefresh] = useState(0);
+  const [catalogRead, setCatalogRead] = useState<
+    { status: "loading" | "loaded" } | { status: "error"; message: string }
+  >({ status: "loading" });
+  const noRepositoryMatches =
+    catalogRead.status === "loaded" && repositories.length > 0 && matchingRepositories.length === 0;
+  useEffect(() => {
+    if (
+      Platform.OS === "ios" &&
+      focused &&
+      isSignedIn &&
+      workflowAccountReady &&
+      !selectedRepository &&
+      noRepositoryMatches
+    )
+      AccessibilityInfo.announceForAccessibility(NO_REPOSITORY_MATCHES_MESSAGE);
+  }, [focused, isSignedIn, workflowAccountReady, noRepositoryMatches, selectedRepository]);
+  const refreshRepositories = () => {
+    setCatalogRead({ status: "loading" });
+    setCatalogRefresh((version) => version + 1);
+    setError(null);
+  };
   const call = useCallback(
     async <A,>(
       operation: (
@@ -196,7 +245,7 @@ function WorkflowJobsContent(props: Props) {
         clerkToken: string,
       ) => Effect.Effect<A, ManagedRelay.ManagedRelayClientError>,
     ) => {
-      const token = await getToken(resolveRelayClerkTokenOptions());
+      const token = await latestGetToken.current(resolveRelayClerkTokenOptions());
       if (!token || appAtomRegistry.get(workflowDraftAtom).accountId !== userId)
         throw new Error("Sign in to Launchpad to view repository jobs.");
       const result = await runtime.runPromiseExit(
@@ -207,7 +256,7 @@ function WorkflowJobsContent(props: Props) {
       if (Exit.isFailure(result)) throw Cause.squash(result.cause);
       return result.value;
     },
-    [getToken, userId],
+    [userId],
   );
   const perform = async (operation: () => Promise<void>) => {
     setBusy(true);
@@ -221,7 +270,7 @@ function WorkflowJobsContent(props: Props) {
     }
   };
   useEffect(() => {
-    if (!isSignedIn) return;
+    if (!isSignedIn || !workflowAccountReady) return;
     let disposed = false;
     void Promise.all([
       call((client, clerkToken) => client.listRepositories({ clerkToken })),
@@ -235,6 +284,7 @@ function WorkflowJobsContent(props: Props) {
           setRepositories(entries);
           setMembership(member);
           setProjects(organizationProjects);
+          setCatalogRead({ status: "loaded" });
           const requested = entries.find(
             (entry) => entry.repository.repositoryId === props.route.params?.repositoryId,
           );
@@ -245,14 +295,18 @@ function WorkflowJobsContent(props: Props) {
       },
       (cause) => {
         if (!disposed)
-          setError(cause instanceof Error ? cause.message : "Could not load repository jobs.");
+          setCatalogRead({
+            status: "error",
+            message:
+              cause instanceof Error ? cause.message : "Check your connection and try again.",
+          });
       },
     );
     return () => {
       disposed = true;
     };
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- An explicit recovery action increments catalogRefresh to retry this external read.
-  }, [isSignedIn, call, props.route.params?.repositoryId, catalogRefresh]);
+  }, [isSignedIn, workflowAccountReady, call, props.route.params?.repositoryId, catalogRefresh]);
   const loadJobs = useCallback(
     async (cursor: string | null = null, minimumCount = 0) => {
       if (!scope || !focused || listRequest.current?.key === listKey) return;
@@ -588,7 +642,7 @@ function WorkflowJobsContent(props: Props) {
                 setError(null);
                 if (selectedJobId && scope) void refreshJob();
                 else if (selectedRepository) void loadJobs();
-                else setCatalogRefresh((version) => version + 1);
+                else refreshRepositories();
               }}
             />
             <MaterialButton label="Dismiss" tone="text" onPress={() => setError(null)} />
@@ -1165,9 +1219,16 @@ function WorkflowJobsContent(props: Props) {
             focused={focused}
           />
           <SettingsSection title="Runs">
-            <Text className="px-4 pt-4 text-sm text-foreground-muted">
-              {selectedRepository.repository.name}
-            </Text>
+            <View className="gap-1 px-4 pt-4">
+              <Text className="text-sm font-t3-medium text-foreground">
+                {selectedRepository.repository.name}
+              </Text>
+              {selectedRepository.repository.canonicalKeys[0] ? (
+                <Text className="text-xs text-foreground-muted">
+                  {selectedRepository.repository.canonicalKeys[0]}
+                </Text>
+              ) : null}
+            </View>
             <View className="px-4 pt-3">
               <SegmentedControl
                 role="tab"
@@ -1249,24 +1310,83 @@ function WorkflowJobsContent(props: Props) {
           </SettingsSection>
         </>
       ) : (
-        <SettingsSection title="Repositories">
-          {repositories.length === 0 ? (
-            <Text className="p-4 text-foreground-muted">No repositories available.</Text>
-          ) : (
-            repositories.map((entry) => (
-              <SettingsRow
-                key={entry.repository.repositoryId}
-                icon="folder"
-                label={entry.repository.name}
-                disabled={busy}
-                onPress={() => {
-                  setSelectedJobId(null);
-                  setSelectedRepository(entry);
-                }}
-              />
-            ))
-          )}
-        </SettingsSection>
+        <ScreenScrollView
+          className="flex-1"
+          contentContainerClassName="px-5 pt-4 pb-6"
+          contentInsetAdjustmentBehavior="automatic"
+          keyboardDismissMode="on-drag"
+          keyboardShouldPersistTaps="handled"
+        >
+          <SettingsSection title="Choose a repository">
+            {!workflowAccountReady || catalogRead.status === "loading" ? (
+              <Text accessibilityLiveRegion="polite" className="p-4 text-foreground-muted">
+                Loading repositories…
+              </Text>
+            ) : catalogRead.status === "error" ? (
+              <View className="p-4">
+                <ErrorBanner title="Couldn’t load repositories" message={catalogRead.message}>
+                  <MaterialButton label="Retry" onPress={refreshRepositories} />
+                </ErrorBanner>
+              </View>
+            ) : repositories.length === 0 ? (
+              <View className="gap-2 p-4">
+                <Text className="font-t3-medium text-foreground">No repositories available</Text>
+                <Text className="text-sm text-foreground-muted">
+                  {membership?.role === "admin"
+                    ? "Add a repository in Organization settings on web or desktop."
+                    : "Ask an organization admin to give you access to a repository."}
+                </Text>
+                <MaterialButton
+                  label="Refresh repositories"
+                  tone="text"
+                  onPress={refreshRepositories}
+                />
+              </View>
+            ) : (
+              <>
+                <View className="p-4">
+                  <AppTextInput
+                    accessibilityLabel="Search repositories"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    clearButtonMode="while-editing"
+                    onChangeText={setRepositoryQuery}
+                    placeholder="Search repositories"
+                    returnKeyType="search"
+                    value={repositoryQuery}
+                  />
+                </View>
+                {noRepositoryMatches ? (
+                  <View className="gap-2 px-4 pb-4">
+                    <Text accessibilityLiveRegion="polite" className="text-foreground-muted">
+                      {NO_REPOSITORY_MATCHES_MESSAGE}
+                    </Text>
+                    <MaterialButton
+                      label="Clear search"
+                      tone="text"
+                      onPress={() => setRepositoryQuery("")}
+                    />
+                  </View>
+                ) : (
+                  matchingRepositories.map((entry) => (
+                    <SettingsRow
+                      key={entry.repository.repositoryId}
+                      icon="folder"
+                      label={entry.repository.name}
+                      subtitle={workflowRepositoryRemote(entry.repository, repositoryQuery)}
+                      disabled={busy}
+                      onPress={() => {
+                        setError(null);
+                        setSelectedJobId(null);
+                        setSelectedRepository(entry);
+                      }}
+                    />
+                  ))
+                )}
+              </>
+            )}
+          </SettingsSection>
+        </ScreenScrollView>
       )}
     </SettingsScreen>
   );

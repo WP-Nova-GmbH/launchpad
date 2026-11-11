@@ -8,7 +8,6 @@ import {
   EllipsisIcon,
   ChevronDownIcon,
   ChevronRightIcon,
-  FolderGit2Icon,
   PencilIcon,
   PlayIcon,
   RefreshCwIcon,
@@ -48,9 +47,9 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
+import { searchableSetting } from "../settings/settingsSearch";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
-import { DiscoveryList, DiscoveryListRow } from "../ui/discovery-list";
 import { Spinner } from "../ui/spinner";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
 import {
@@ -67,6 +66,7 @@ import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
 import { WorkflowJob } from "./WorkflowJob";
 import { WorkflowJobs } from "./WorkflowJobs";
+import { WorkflowRepositoryChooser, WorkflowRepositorySwitcher } from "./WorkflowRepositoryPicker";
 import {
   useWorkflowClient,
   useWorkflowDrafts,
@@ -169,9 +169,11 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
     userId && entryOrganizationId && entryRepositoryId
       ? { accountId: userId, organizationId: entryOrganizationId, repositoryId: entryRepositoryId }
       : null;
+  const emptyChooser = !repositoryId && catalog.data?.repositories.length === 0;
   if (
     !isLoaded ||
-    (isSignedIn && (catalog.accountId !== userId || (!catalog.data && catalog.isPending)))
+    (isSignedIn &&
+      (catalog.accountId !== userId || (catalog.isPending && (!catalog.data || emptyChooser))))
   )
     return (
       <div className="flex h-full min-h-0 min-w-0 flex-1 items-center justify-center">
@@ -187,7 +189,7 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
         actions={<Button onClick={() => openAuthPrompt()}>Sign in</Button>}
       />
     );
-  if (!catalog.data)
+  if (!catalog.data || (emptyChooser && catalog.error))
     return (
       <WorkflowNotice
         title={catalog.error ? "Could not load repositories" : "Organization required"}
@@ -225,39 +227,24 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
         </WorkspacePageHeader>
         <div className="min-h-0 flex-1 overflow-y-auto">
           <WorkspacePageContainer width="expanded">
-            <p className="text-sm text-muted-foreground">Choose a repository.</p>
-            {catalog.data.repositories.length ? (
-              <DiscoveryList>
-                {catalog.data.repositories.map(({ repository }) => (
-                  <DiscoveryListRow
-                    key={repository.repositoryId}
-                    icon={
-                      <FolderGit2Icon
-                        aria-hidden
-                        className="size-4 shrink-0 text-muted-foreground"
-                      />
-                    }
-                    title={repository.name}
-                    description={repository.canonicalKeys.join(" · ")}
-                    action={
-                      <ChevronRightIcon
-                        aria-hidden
-                        className="size-4 shrink-0 text-muted-foreground"
-                      />
-                    }
-                    onClick={() =>
-                      void navigate({
-                        to: "/workflows/$repositoryId",
-                        params: { repositoryId: repository.repositoryId },
-                        search: { tab: "workflows" },
-                      })
-                    }
-                  />
-                ))}
-              </DiscoveryList>
-            ) : (
-              <p>No repositories available. Add one in Organization settings.</p>
-            )}
+            <WorkflowRepositoryChooser
+              key={catalog.data.membership.organization.organizationId}
+              repositories={catalog.data.repositories}
+              canManageRepositories={catalog.data.membership.role === "admin"}
+              onManageRepositories={() => {
+                void navigate({
+                  to: "/settings/organization",
+                  hash: searchableSetting("organization-repositories").id,
+                });
+              }}
+              onSelect={(repositoryId) => {
+                void navigate({
+                  to: "/workflows/$repositoryId",
+                  params: { repositoryId },
+                  search: { tab: "workflows" },
+                });
+              }}
+            />
           </WorkspacePageContainer>
         </div>
       </div>
@@ -507,6 +494,13 @@ function WorkflowRepositoryView({
       params: { repositoryId: scope.repositoryId },
       search: { tab: view === "job" ? "runs" : "workflows" },
     });
+  const selectRepository = (repositoryId: RelayRepositoryId) => {
+    void navigate({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId },
+      search: { tab },
+    });
+  };
   const workflow =
     workflows.find((workflow) => workflow.workflowId === workflowId) ??
     (workflowId
@@ -915,31 +909,12 @@ function WorkflowRepositoryView({
               <ArrowLeftIcon />
             </Button>
             <div className="min-w-0 flex-1 max-w-64">
-              <Select
-                value={scope.repositoryId}
-                onValueChange={(id) => {
-                  if (id)
-                    void navigate({
-                      to: "/workflows/$repositoryId",
-                      params: { repositoryId: id },
-                      search: { tab },
-                    });
-                }}
-              >
-                <SelectTrigger aria-label="Workflow repository">
-                  <SelectValue>{entry.repository.name}</SelectValue>
-                </SelectTrigger>
-                <SelectPopup>
-                  {repositories.map((entry) => (
-                    <SelectItem
-                      key={entry.repository.repositoryId}
-                      value={entry.repository.repositoryId}
-                    >
-                      {entry.repository.name}
-                    </SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
+              <WorkflowRepositorySwitcher
+                compact
+                current={entry}
+                repositories={repositories}
+                onSelect={selectRepository}
+              />
             </div>
             <Tooltip>
               <TooltipTrigger
@@ -1092,32 +1067,12 @@ function WorkflowRepositoryView({
                     {view === "job" ? "← Back to runs" : "← Workflows"}
                   </Button>
                 ) : null}
-                <div className="w-64 max-w-full">
-                  <Select
-                    value={scope.repositoryId}
-                    onValueChange={(id) => {
-                      if (id)
-                        void navigate({
-                          to: "/workflows/$repositoryId",
-                          params: { repositoryId: id },
-                          search: { tab },
-                        });
-                    }}
-                  >
-                    <SelectTrigger aria-label="Workflow repository">
-                      <SelectValue>{entry.repository.name}</SelectValue>
-                    </SelectTrigger>
-                    <SelectPopup>
-                      {repositories.map((entry) => (
-                        <SelectItem
-                          key={entry.repository.repositoryId}
-                          value={entry.repository.repositoryId}
-                        >
-                          {entry.repository.name}
-                        </SelectItem>
-                      ))}
-                    </SelectPopup>
-                  </Select>
+                <div className="w-72 max-w-full">
+                  <WorkflowRepositorySwitcher
+                    current={entry}
+                    repositories={repositories}
+                    onSelect={selectRepository}
+                  />
                 </div>
               </div>
               {view !== "catalog" || tab !== "runs" ? (
