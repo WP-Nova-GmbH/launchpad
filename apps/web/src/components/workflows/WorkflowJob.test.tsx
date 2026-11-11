@@ -492,6 +492,112 @@ describe("workflow run presentation", () => {
     ).toBe(true);
     expect(appAtomRegistry.get(workflowDraftAtom).responses[key]?.checkpoint).toBe("First draft");
   });
+  it("shows capture progress and preserves focus when an automatic VM start is refused", async () => {
+    const preparing: RepositoryWorkflowJob = {
+      ...job,
+      status: "preparing",
+      runtime: { kind: "vm", threadId: ThreadId.make("workflow-vm") },
+      progress: null,
+      startAttempted: false,
+      origin: {
+        kind: "automation",
+        organizationId: "org",
+        repositoryId: "repo",
+        workflowId: "workflow",
+        source: {
+          provider: "linear",
+          applicationId: "app",
+          workspaceId: "workspace",
+          connectionId: "connection",
+          grantId: "grant",
+        },
+        occurrenceId: "event",
+      },
+      event: {
+        issueId: "issue",
+        teamId: "team",
+        stateId: "ready",
+        labelIds: [],
+        identifier: "ENG-284",
+        title: "Title from the trigger",
+        url: "https://linear.app/example/issue/ENG-284",
+        occurredAt: job.createdAt,
+        issueUpdatedAt: job.createdAt,
+      },
+    };
+    const body = {};
+    let focused = body;
+    const ownerDocument = {
+      body,
+      get activeElement() {
+        const content = text(renderer?.toJSON() ?? null);
+        return focused === disclosure && !content.includes("Saved issue details") ? body : focused;
+      },
+    };
+    const disclosure = { ownerDocument };
+    const heading = {
+      ownerDocument,
+      focus() {
+        focused = heading;
+      },
+    };
+    fixture.call.mockResolvedValue(preparing);
+    await mount(true, {
+      createNodeMock(element) {
+        if (element.type === "h2") return heading;
+        if (element.type === "summary") return disclosure;
+        return null;
+      },
+    });
+
+    const content = () => text(renderer!.toJSON());
+    const issueStatus = () =>
+      renderer!.root.findByProps({ "aria-label": "Linear issue" }).findByProps({ role: "status" });
+    const initialStatus = issueStatus();
+    expect(initialStatus.children).toEqual(["Waiting to capture Linear issue details"]);
+    expect(content()).toContain("Title from the trigger");
+    expect(content()).toContain("Waiting to capture");
+    expect(content()).not.toContain("Run instructions");
+
+    fixture.call.mockResolvedValue({
+      ...preparing,
+      startAttempted: true,
+      issueSnapshot: {
+        workspaceId: "workspace",
+        issueId: "issue",
+        identifier: "ENG-284",
+        title: "Title captured before execution",
+        url: "https://linear.app/example/issue/ENG-284",
+        description: "Saved requirements",
+        team: { id: "team", name: "Engineering" },
+        status: { id: "ready", name: "Ready" },
+        labels: [],
+        issueUpdatedAt: job.createdAt,
+        retrievedAt: "2026-10-27T13:32:00.000Z",
+        authorizationEpoch: 1,
+        credentialVersion: 1,
+      },
+    });
+    await press("Refresh run");
+
+    expect(issueStatus()).toBe(initialStatus);
+    expect(issueStatus().children).toEqual(["Linear issue snapshot saved"]);
+    expect(content()).toContain("Title captured before execution");
+    expect(content()).toContain("Saved for this run");
+    expect(content()).toContain("Saved issue details");
+    expect(content()).not.toContain("Waiting to capture");
+    expect(content()).not.toContain("Title from the trigger");
+
+    focused = disclosure;
+    fixture.call.mockResolvedValue(preparing);
+    await pollRun();
+
+    expect(content()).toContain("Waiting to capture");
+    expect(content()).not.toContain("Saved issue details");
+    expect(issueStatus().children).toEqual(["Waiting to capture Linear issue details"]);
+    expect(ownerDocument.activeElement).toBe(heading);
+  });
+
   it("keeps the generic waiting state and relay detail for other queue reasons", async () => {
     fixture.call.mockResolvedValue({
       ...job,

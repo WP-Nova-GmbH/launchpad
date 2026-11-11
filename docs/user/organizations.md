@@ -236,12 +236,13 @@ Archiving disables automation, and restoring leaves it Off.
 
 Before an automatic job is handed to its environment, Launchpad reads the issue’s current title,
 description, status and labels. Comments and images are excluded. The run keeps those details even
-if the issue changes later; open **Issue details** on the run to inspect what it used. Later team,
-status or label changes do not cancel a job already created by an event. Offline or busy environments
-leave jobs queued. If issue context exceeds 32,000 characters including its metadata, shorten the
-description and refresh the run; Launchpad does not start with truncated requirements. Source or
-issue access problems hold the run and show recovery guidance. Disconnecting a source prevents
-new handoffs; work already marked Starting may continue. Use Cancel run to stop existing work.
+if the issue changes later. Open the run and expand its saved issue details to see what the workflow
+used. Later team, status or label changes do not cancel a job already created by an event. Offline
+or busy environments leave jobs queued. If issue context exceeds 32,000 characters including its
+metadata, shorten the description and refresh the run. Launchpad does not start with truncated
+requirements. Source or issue access problems hold the run and show recovery guidance. Disconnecting
+a source prevents new handoffs. Work already marked Starting may continue. Use Cancel run to stop
+existing work.
 
 **Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
 **Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed
