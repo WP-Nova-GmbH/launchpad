@@ -361,6 +361,80 @@ describe.skipIf(!databaseUrl)("repository workflow environment HTTP (Postgres)",
         }).pipe(Effect.scoped),
     );
 
+    it.effect("imports entries atomically and requires explicit same-type replacements", () =>
+      Effect.gen(function* () {
+        const scope = yield* fixture();
+        const { repositoryId: repo, maintainer, developer } = scope;
+        const http = yield* buildHttp();
+        const sql = (yield* RelayDb).$client;
+        const box = yield* SecretBox.RelaySecretBox;
+        const write = (
+          expectedRevision: number,
+          entries: Extract<
+            RelayUpdateRepositoryWorkflowConfiguration["mutation"],
+            { kind: "import" }
+          >["entries"],
+        ) =>
+          call(http, repo, maintainer, { expectedRevision, mutation: { kind: "import", entries } });
+        const variable = {
+          name: "APP_MODE",
+          kind: "variable",
+          value: "production",
+          replace: false,
+        } as const;
+        const secret = {
+          name: "DEPLOY_TOKEN",
+          kind: "secret",
+          value: "imported-secret",
+          replace: false,
+        } as const;
+
+        expect(
+          (yield* call(http, repo, developer, {
+            expectedRevision: 0,
+            mutation: { kind: "import", entries: [variable, secret] },
+          })).status,
+        ).toBe(403);
+        expect((yield* write(0, [variable, { ...secret, name: "PATH" }])).status).toBe(422);
+        expect((yield* write(0, [variable, variable])).status).toBe(422);
+        expect((yield* call(http, repo, maintainer)).body).toMatchObject({
+          revision: 0,
+          entries: [],
+        });
+
+        const saved = yield* write(0, [variable, secret]);
+        expect(saved.status).toBe(200);
+        expect(saved.body).toMatchObject({
+          revision: 1,
+          entries: [
+            { name: "APP_MODE", value: "production" },
+            { name: "DEPLOY_TOKEN", kind: "secret" },
+          ],
+        });
+        expect(encode(saved.body)).not.toContain(secret.value);
+
+        const next = { ...variable, name: "APP_URL", value: "https://example.test" };
+        expect((yield* write(0, [next])).status).toBe(409);
+        expect((yield* write(1, [next, secret])).status).toBe(422);
+        expect(
+          (yield* write(1, [next, { ...secret, replace: true, kind: "variable" }])).status,
+        ).toBe(422);
+        expect((yield* call(http, repo, maintainer)).body).toEqual(saved.body);
+
+        expect(
+          (yield* write(1, [next, { ...secret, replace: true, value: "rotated-secret" }])).status,
+        ).toBe(200);
+        expect(yield* readWorkflowConfigurationForFreeze(sql, box, scope)).toMatchObject({
+          revision: 2,
+          values: [
+            { name: "APP_MODE", value: "production" },
+            { name: "APP_URL", value: "https://example.test" },
+            { name: "DEPLOY_TOKEN", kind: "secret", value: "rotated-secret" },
+          ],
+        });
+      }).pipe(Effect.scoped),
+    );
+
     it.effect("rechecks write authority after the initial membership read", () =>
       Effect.gen(function* () {
         const { organizationId, repositoryId, admin, maintainer } = yield* fixture();

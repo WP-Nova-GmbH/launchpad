@@ -1,9 +1,9 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import {
   RELAY_WORKFLOW_ENV_MAX_ENTRIES,
-  RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH,
   RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES,
   RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES,
+  isAllowedWorkflowEnvironmentName,
   RelayOrganizationId,
   RelayRepositoryId,
   type RelayRepositoryWorkflowConfiguration,
@@ -48,47 +48,6 @@ const utf8 = new TextEncoder();
 
 type RepositoryScope = { readonly organizationId: string; readonly repositoryId: string };
 
-// Workloads inherit these boundaries from the VM runtime, credential helper, and provider.
-const reservedNames = new Set([
-  "PATH",
-  "HOME",
-  "USER",
-  "LOGNAME",
-  "SHELL",
-  "PWD",
-  "OLDPWD",
-  "TMPDIR",
-  "ENV",
-  "BASH_ENV",
-  "NODE_OPTIONS",
-  "NODE_PATH",
-  "GITHUB_TOKEN",
-  "GH_TOKEN",
-  "OPENAI_API_KEY",
-  "OPENAI_BASE_URL",
-  "ANTHROPIC_API_KEY",
-  "ANTHROPIC_AUTH_TOKEN",
-  "ANTHROPIC_BASE_URL",
-]);
-const reservedPrefixes = [
-  "T3CODE_",
-  "LAUNCHPAD_",
-  "CODEX_",
-  "GIT_",
-  "LD_",
-  "DYLD_",
-  "XDG_",
-  "BASH_FUNC_",
-];
-const isAllowedName = (name: string): boolean => {
-  const key = name.toUpperCase();
-  return (
-    name.length <= RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH &&
-    /^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) &&
-    !reservedNames.has(key) &&
-    !reservedPrefixes.some((prefix) => key.startsWith(prefix))
-  );
-};
 const entryBytes = (entry: StoredEntry): number =>
   entry.kind === "secret" ? entry.bytes : utf8.encode(entry.value).byteLength;
 const validValue = (value: string): boolean =>
@@ -107,7 +66,7 @@ const readStored = Effect.fnUntraced(function* (sql: PgClient, scope: Repository
     new Set(entries.map((entry) => entry.name)).size !== entries.length ||
     entries.some(
       (entry) =>
-        !isAllowedName(entry.name) ||
+        !isAllowedWorkflowEnvironmentName(entry.name) ||
         entryBytes(entry) > RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES ||
         (entry.kind === "variable" && !validValue(entry.value)),
     ) ||
@@ -148,47 +107,76 @@ export const updateRepositoryWorkflowConfiguration = Effect.fnUntraced(function*
   scope: RepositoryScope,
   { expectedRevision, mutation }: RelayUpdateRepositoryWorkflowConfiguration,
 ) {
-  if (!isAllowedName(mutation.name)) return yield* failure("invalid");
   const { revision, entries } = yield* readStored(sql, scope);
   if (revision !== expectedRevision) return yield* failure("conflict");
   if (revision === 2_147_483_647) return yield* failure("limit");
-  const previous = entries.find((entry) => entry.name === mutation.name);
-  const next = entries.filter((entry) => entry.name !== mutation.name);
+
+  const nextByName = new Map(entries.map((entry) => [entry.name, entry]));
   if (mutation.kind === "delete") {
-    if (!previous) return yield* failure("invalid");
+    if (!nextByName.delete(mutation.name)) return yield* failure("invalid");
   } else {
-    const kind = mutation.kind === "setVariable" ? "variable" : "secret";
+    const incoming =
+      mutation.kind === "import"
+        ? mutation.entries
+        : [
+            {
+              kind: mutation.kind === "setVariable" ? ("variable" as const) : ("secret" as const),
+              name: mutation.name,
+              value: mutation.value,
+              replace: nextByName.has(mutation.name),
+            },
+          ];
     if (
-      (previous && previous.kind !== kind) ||
-      !validValue(mutation.value) ||
-      (kind === "secret" && mutation.value.length === 0)
+      incoming.length === 0 ||
+      new Set(incoming.map((entry) => entry.name)).size !== incoming.length
     )
       return yield* failure("invalid");
-    const bytes = utf8.encode(mutation.value).byteLength;
+    let totalBytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
+    let totalEntries = entries.length;
+    const prepared = [];
+    for (const entry of incoming) {
+      const { name, kind, value, replace } = entry;
+      const previous = nextByName.get(name);
+      if (
+        !isAllowedWorkflowEnvironmentName(name) ||
+        replace !== !!previous ||
+        (previous && previous.kind !== kind) ||
+        !validValue(value) ||
+        (kind === "secret" && value.length === 0)
+      )
+        return yield* failure("invalid");
+      const bytes = utf8.encode(value).byteLength;
+      if (bytes > RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES) return yield* failure("limit");
+      totalBytes += bytes - (previous ? entryBytes(previous) : 0);
+      if (!previous) totalEntries++;
+      prepared.push({ ...entry, bytes });
+    }
     if (
-      bytes > RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES ||
-      next.length >= RELAY_WORKFLOW_ENV_MAX_ENTRIES ||
-      next.reduce((total, entry) => total + entryBytes(entry), bytes) >
-        RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES
+      totalEntries > RELAY_WORKFLOW_ENV_MAX_ENTRIES ||
+      totalBytes > RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES
     )
       return yield* failure("limit");
-    if (kind === "variable") {
-      next.push({ kind, name: mutation.name, value: mutation.value });
-    } else {
-      const sealed = yield* encodeSecret({
-        purpose: "repository-workflow-environment",
-        organizationId: scope.organizationId,
-        repositoryId: scope.repositoryId,
-        name: mutation.name,
-        value: mutation.value,
-      }).pipe(
-        Effect.flatMap(box.seal),
-        Effect.mapError(() => failure("storage")),
-      );
-      next.push({ kind, name: mutation.name, sealed, bytes });
+
+    for (const { name, kind, value, bytes } of prepared) {
+      if (kind === "variable") {
+        nextByName.set(name, { kind, name, value });
+      } else {
+        const sealed = yield* encodeSecret({
+          purpose: "repository-workflow-environment",
+          organizationId: scope.organizationId,
+          repositoryId: scope.repositoryId,
+          name,
+          value,
+        }).pipe(
+          Effect.flatMap(box.seal),
+          Effect.mapError(() => failure("storage")),
+        );
+        nextByName.set(name, { kind, name, sealed, bytes });
+      }
     }
   }
-  next.sort((left, right) => left.name.localeCompare(right.name));
+
+  const next = [...nextByName.values()].sort((left, right) => left.name.localeCompare(right.name));
   const nextRevision = revision + 1;
   yield* sql`
     INSERT INTO relay_repository_workflow_configurations (repository_id,revision,entries)

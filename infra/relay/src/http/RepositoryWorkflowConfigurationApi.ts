@@ -1,5 +1,7 @@
 import {
-  RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES,
+  RELAY_WORKFLOW_ENV_MAX_ENTRIES,
+  RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH,
+  RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES,
   RelayClientPrincipal,
   RelayUpdateRepositoryWorkflowConfiguration,
 } from "@t3tools/contracts/relay";
@@ -18,8 +20,11 @@ import {
 } from "./TenancyApi.ts";
 import { tenancyConflict, tenancyInvalid } from "./tenancyErrors.ts";
 
-// A 4 KiB value can take six JSON bytes per byte when escaped.
-const maxRequestBytes = RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES * 6 + 1024;
+// Each byte of a value can take six JSON bytes when escaped. Allow room for entry metadata.
+const maxRequestBytes =
+  RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES * 6 +
+  RELAY_WORKFLOW_ENV_MAX_ENTRIES * (RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH + 96) +
+  1024;
 const decodeUpdate = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RelayUpdateRepositoryWorkflowConfiguration),
 );

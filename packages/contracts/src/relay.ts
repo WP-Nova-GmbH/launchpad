@@ -1528,6 +1528,48 @@ export const RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES = 4 * 1024;
 export const RELAY_WORKFLOW_ENV_MAX_ENTRIES = 64;
 export const RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES = 32 * 1024;
 
+// Workloads inherit these boundaries from the VM runtime, credential helper, and provider.
+const reservedWorkflowEnvironmentNames = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "PWD",
+  "OLDPWD",
+  "TMPDIR",
+  "ENV",
+  "BASH_ENV",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+]);
+const reservedWorkflowEnvironmentPrefixes = [
+  "T3CODE_",
+  "LAUNCHPAD_",
+  "CODEX_",
+  "GIT_",
+  "LD_",
+  "DYLD_",
+  "XDG_",
+  "BASH_FUNC_",
+];
+export const isAllowedWorkflowEnvironmentName = (name: string): boolean => {
+  const key = name.toUpperCase();
+  return (
+    name.length <= RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/u.test(name) &&
+    !reservedWorkflowEnvironmentNames.has(key) &&
+    !reservedWorkflowEnvironmentPrefixes.some((prefix) => key.startsWith(prefix))
+  );
+};
+
 const RelayWorkflowEnvironmentName = Schema.String.check(
   Schema.isMaxLength(RELAY_WORKFLOW_ENV_NAME_MAX_LENGTH),
   Schema.isPattern(/^[A-Za-z_][A-Za-z0-9_]*$/u),
@@ -1563,6 +1605,17 @@ export const RelayUpdateRepositoryWorkflowConfiguration = Schema.Struct({
       value: Schema.String,
     }),
     Schema.Struct({ kind: Schema.Literal("delete"), name: RelayWorkflowEnvironmentName }),
+    Schema.Struct({
+      kind: Schema.Literal("import"),
+      entries: Schema.Array(
+        Schema.Struct({
+          kind: Schema.Literals(["variable", "secret"]),
+          name: RelayWorkflowEnvironmentName,
+          value: Schema.String,
+          replace: Schema.Boolean,
+        }),
+      ).check(Schema.isMinLength(1), Schema.isMaxLength(RELAY_WORKFLOW_ENV_MAX_ENTRIES)),
+    }),
   ]),
 });
 export type RelayUpdateRepositoryWorkflowConfiguration =

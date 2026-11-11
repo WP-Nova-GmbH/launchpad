@@ -302,6 +302,10 @@ On web or desktop, repository maintainers and organization admins can open
 repository's workflow VMs. Use a variable for ordinary settings and a secret for credentials.
 Saved secret values are hidden and can be replaced or deleted.
 
+Use **Import .env** to paste several entries and review their types before saving. Names such as
+`DEPLOY_TOKEN` are suggested as secrets. Existing entries are skipped unless you choose
+**Replace**, which keeps the saved type. Import saves the selected entries together.
+
 A VM run keeps the settings it had when preparation began. If a run needs a new credential
 after rotation, update the repository setting and start a fresh run. These values are used
 once VM workflow execution is available.

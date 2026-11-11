@@ -18,6 +18,7 @@ import { Input } from "../ui/input";
 import { Label } from "../ui/label";
 import { Sheet, SheetDescription, SheetHeader, SheetPopup, SheetTitle } from "../ui/sheet";
 import { Textarea } from "../ui/textarea";
+import { WorkflowEnvironmentImport } from "./WorkflowEnvironmentImport";
 
 interface Scope {
   readonly accountId: string;
@@ -163,6 +164,8 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
   const [needsReload, setNeedsReload] = useState(false);
   const [kind, setKind] = useState<"variable" | "secret">("variable");
   const [savedName, setSavedName] = useState<string | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [importedCount, setImportedCount] = useState<number | null>(null);
   const addButton = useRef<HTMLButtonElement | null>(null);
   const returnFocus = useRef<HTMLButtonElement | null>(null);
   const active = useRef<AbortController | null>(null);
@@ -180,6 +183,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
       setPending(update ? "save" : "load");
       setError(null);
       setSavedName(null);
+      setImportedCount(null);
       try {
         const result = await request(operation.signal, update);
         if (operation.signal.aborted) return;
@@ -187,7 +191,12 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
         setNeedsReload(false);
         if (update) {
           setDraft(null);
-          setSavedName(update.mutation.name);
+          if (update.mutation.kind === "import") {
+            setImportOpen(false);
+            setImportedCount(update.mutation.entries.length);
+          } else {
+            setSavedName(update.mutation.name);
+          }
         } else {
           setDraft((current) => (current?.mode === "delete" ? null : current));
         }
@@ -198,6 +207,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
           case "access":
             setRecord(null);
             setDraft(null);
+            setImportOpen(false);
             setNeedsReload(false);
             setError(failure);
             break;
@@ -242,7 +252,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
   }, [error]);
 
   useLayoutEffect(() => {
-    if (draft || pending || !returnFocus.current) return;
+    if (draft || importOpen || pending || !returnFocus.current) return;
     if (needsReload) {
       reloadButton.current?.focus();
       return;
@@ -251,7 +261,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
     returnFocus.current = null;
     if (trigger.isConnected && !trigger.disabled) trigger.focus();
     else addButton.current?.focus();
-  }, [draft, needsReload, pending]);
+  }, [draft, importOpen, needsReload, pending]);
 
   const disabled = pending !== null || needsReload;
   const existing = draft && record?.entries.find((entry) => entry.name === draft.name);
@@ -266,6 +276,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
   const beginDraft = (next: Draft, trigger: HTMLButtonElement) => {
     returnFocus.current = trigger;
     setSavedName(null);
+    setImportedCount(null);
     setError(null);
     setDraft(next);
   };
@@ -458,7 +469,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
 
   return (
     <>
-      {record ? (
+      {record && !importOpen ? (
         <div
           role="group"
           aria-label="Environment entry type"
@@ -482,7 +493,23 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
         </div>
       ) : null}
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-6 py-3">
-        {record ? (
+        {importedCount !== null ? (
+          <p role="status" className="text-sm text-muted-foreground">
+            {`Imported ${importedCount} ${importedCount === 1 ? "entry" : "entries"}.`}
+          </p>
+        ) : null}
+        {record && importOpen ? (
+          <>
+            {recovery}
+            <WorkflowEnvironmentImport
+              record={record}
+              disabled={disabled}
+              saving={pending === "save"}
+              onCancel={() => setImportOpen(false)}
+              onImport={submit}
+            />
+          </>
+        ) : record ? (
           <>
             <div className="flex flex-wrap items-center justify-between gap-2">
               <p className="text-sm text-muted-foreground">
@@ -490,18 +517,35 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
                   ? "Plain text values for workflow runs."
                   : "Saved secret values can’t be viewed."}
               </p>
-              <Button
-                ref={addButton}
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={disabled || draft !== null}
-                onClick={(event) =>
-                  beginDraft({ kind, name: "", value: "", mode: "add" }, event.currentTarget)
-                }
-              >
-                {kind === "variable" ? "Add variable" : "Add secret"}
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  ref={addButton}
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={disabled || draft !== null}
+                  onClick={(event) =>
+                    beginDraft({ kind, name: "", value: "", mode: "add" }, event.currentTarget)
+                  }
+                >
+                  {kind === "variable" ? "Add variable" : "Add secret"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  disabled={disabled || draft !== null}
+                  onClick={(event) => {
+                    returnFocus.current = event.currentTarget;
+                    setError(null);
+                    setSavedName(null);
+                    setImportedCount(null);
+                    setImportOpen(true);
+                  }}
+                >
+                  Import .env
+                </Button>
+              </div>
             </div>
             {draft && draft.mode === "add" ? draftForm : null}
             {entries.length > 0 ? (
@@ -556,7 +600,7 @@ function WorkflowEnvironmentEditor({ request }: { readonly request: Request }) {
             Loading workflow environment…
           </p>
         ) : null}
-        {!draft ? recovery : null}
+        {!draft && !importOpen ? recovery : null}
         {savedName && !entries.some((entry) => entry.name === savedName) ? savedNotice : null}
       </div>
       <div className="flex shrink-0 items-start gap-2 border-t px-6 py-3 text-xs text-muted-foreground">

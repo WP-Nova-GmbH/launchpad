@@ -216,6 +216,117 @@ function withUi(test: () => Promise<void>) {
 }
 
 describe("workflow environment settings", () => {
+  it.effect("imports reviewed entries together, preserving the type of explicit replacements", () =>
+    withUi(async () => {
+      const write = vi.fn(async (update: RelayUpdateRepositoryWorkflowConfiguration) =>
+        Response.json({ ...initial, revision: update.expectedRevision + 1 }),
+      );
+      mockRelay(() => initial, write);
+      await open();
+      await click("Import .env");
+      await act(() =>
+        field("Paste .env contents", "textarea").props.onChange({
+          currentTarget: {
+            value:
+              "APP_MODE=prod\nPACKAGE_TOKEN=new-token\nAPP_URL=http://localhost\nDEPLOY_TOKEN=deploy-value",
+          },
+        }),
+      );
+      await click("Preview import");
+      const select = (label: string) =>
+        renderer.root.findAllByType("select").find((node) => node.props["aria-label"] === label)!;
+      expect(select("Action for APP_MODE").props.value).toBe("skip");
+      expect(select("Action for PACKAGE_TOKEN").props.value).toBe("skip");
+      expect(select("Type for APP_URL").props.value).toBe("variable");
+      expect(select("Type for DEPLOY_TOKEN").props.value).toBe("secret");
+      expect(JSON.stringify(renderer.toJSON())).not.toContain("deploy-value");
+      expect(write).not.toHaveBeenCalled();
+      await act(() => {
+        select("Action for PACKAGE_TOKEN").props.onChange({ currentTarget: { value: "replace" } });
+        select("Type for APP_URL").props.onChange({ currentTarget: { value: "secret" } });
+      });
+      await click("Edit pasted text");
+      const pastedText = field("Paste .env contents", "textarea");
+      await act(() =>
+        pastedText.props.onChange({
+          currentTarget: {
+            value: pastedText.props.value.replace(
+              "DEPLOY_TOKEN=deploy-value",
+              "DEPLOY_TOKEN=updated-deploy-value",
+            ),
+          },
+        }),
+      );
+      await click("Preview import");
+      expect(select("Type for APP_URL").props.value).toBe("secret");
+      expect(select("Action for PACKAGE_TOKEN").props.value).toBe("skip");
+      expect(write).not.toHaveBeenCalled();
+      await act(() =>
+        select("Action for PACKAGE_TOKEN").props.onChange({ currentTarget: { value: "replace" } }),
+      );
+      await click("Import 3 entries");
+      expect(write).toHaveBeenCalledExactlyOnceWith(
+        {
+          expectedRevision: 1,
+          mutation: {
+            kind: "import",
+            entries: [
+              { name: "PACKAGE_TOKEN", value: "new-token", kind: "secret", replace: true },
+              { name: "APP_URL", value: "http://localhost", kind: "secret", replace: false },
+              {
+                name: "DEPLOY_TOKEN",
+                value: "updated-deploy-value",
+                kind: "secret",
+                replace: false,
+              },
+            ],
+          },
+        },
+        expect.any(Request),
+      );
+      expect(visibleText(renderer.root)).toContain("Imported 3 entries.");
+    }),
+  );
+
+  it.effect("asks for a fresh preview after a conflicting import", () =>
+    withUi(async () => {
+      let record = initial;
+      const write = vi.fn(async () => {
+        record = {
+          ...initial,
+          revision: 2,
+          entries: [
+            ...initial.entries,
+            { name: "APP_URL", kind: "variable", value: "another-value" },
+          ],
+        };
+        return changedRevisionResponse();
+      });
+      mockRelay(() => record, write);
+      await open();
+      await click("Import .env");
+      await act(() =>
+        field("Paste .env contents", "textarea").props.onChange({
+          currentTarget: { value: "APP_URL=http://localhost\nCONNECTION_URL=opaque-credential" },
+        }),
+      );
+      await click("Preview import");
+      const choice = (label: string) => renderer.root.findByProps({ "aria-label": label });
+      await act(() =>
+        choice("Type for CONNECTION_URL").props.onChange({ currentTarget: { value: "secret" } }),
+      );
+      await click("Import 2 entries");
+      expect(button("Import 2 entries").props.disabled).toBe(true);
+      await click("Reload settings");
+      expect(button("Review again").props.disabled).toBe(false);
+      await click("Review again");
+      expect(choice("Action for APP_URL").props.value).toBe("skip");
+      expect(choice("Type for CONNECTION_URL").props.value).toBe("secret");
+      expect(button("Import 1 entry").props.disabled).toBe(false);
+      expect(write).toHaveBeenCalledTimes(1);
+    }),
+  );
+
   it.effect("focuses each draft when opened and leaves focus alone while editing", () =>
     withUi(async () => {
       mockRelay(
