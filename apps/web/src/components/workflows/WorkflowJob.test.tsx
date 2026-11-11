@@ -512,6 +512,171 @@ describe("workflow run presentation", () => {
   });
 });
 
+describe("workflow run outcomes", () => {
+  const workflow: NonNullable<RepositoryWorkflowJob["workflow"]> = {
+    workflowId: job.workflowId,
+    repositoryId: job.repositoryId,
+    organizationId: scope.organizationId,
+    archived: false,
+    revision: 1,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    definition: {
+      name: "Reviewed implementation",
+      target: {
+        kind: "machine",
+        environmentId: EnvironmentId.make("original"),
+        projectId: ProjectId.make("project"),
+      },
+      steps: [
+        {
+          id: "agent",
+          title: "Agent",
+          kind: "agent",
+          instruction: "Implement",
+          modelSelection: null,
+        },
+        { id: "push", title: "Push branch", kind: "action", action: "push" },
+      ],
+    },
+  };
+
+  const publishingFailure = (state: "failed" | "uncertain"): RepositoryWorkflowJob => ({
+    ...job,
+    workflow,
+    status: "paused",
+    detail: "The remote is unavailable.",
+    progress: {
+      ...job.progress!,
+      status: "paused",
+      checkpoint: null,
+      stepId: "push",
+      generation: 2,
+      actions: [
+        {
+          actionId: "push-attempt",
+          stepId: "push",
+          operation: "push",
+          generation: 2,
+          state,
+          detail: "The remote stopped responding.",
+          commitSha: null,
+          pullRequestUrl: null,
+          retryable: true,
+        },
+      ],
+    },
+  });
+
+  it("offers the failed step's conversation from the outcome", async () => {
+    fixture.call.mockResolvedValue({
+      ...job,
+      workflow,
+      status: "failed",
+      detail: "The provider connection closed.",
+      progress: {
+        ...job.progress!,
+        status: "failed",
+        checkpoint: null,
+        stepId: "agent",
+        hasThread: true,
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount(false);
+
+    const content = text(renderer!.toJSON());
+    expect(content).toContain("Agent failed");
+    expect(content).toContain("The provider connection closed.");
+    expect(content.match(/Back to runs/g)).toHaveLength(1);
+    await press("Open conversation");
+
+    expect(fixture.open).toHaveBeenCalledOnce();
+    expect(fixture.navigate.mock.calls[0]![0].state({}).workflowOrigin.jobId).toBe(job.jobId);
+  });
+
+  it.each([
+    ["failed", "Couldn’t push branch"],
+    ["uncertain", "Couldn’t confirm the branch push"],
+  ] as const)(
+    "retries the exact %s publishing action only for maintainers",
+    async (state, title) => {
+      const paused = publishingFailure(state);
+      fixture.call.mockResolvedValue(paused);
+      await mount(false);
+
+      expect(text(renderer!.toJSON())).toContain(title);
+      expect(text(renderer!.toJSON())).not.toContain("Retry publishing action");
+      await act(() => renderer!.update(view("job", true)));
+      expect(text(renderer!.toJSON())).toContain("The remote is unavailable.");
+      expect(text(renderer!.toJSON())).not.toContain("The remote stopped responding.");
+
+      const resumed: RepositoryWorkflowJob = {
+        ...paused,
+        status: "running",
+        progress: { ...paused.progress!, status: "running", revision: 4 },
+      };
+      const reply = deferred();
+      const retry = vi.fn().mockReturnValue(reply.promise);
+      fixture.call
+        .mockResolvedValue(resumed)
+        .mockImplementationOnce((request) => request({ respondToWorkflowJob: retry }, "token"));
+      await press("Retry publishing action");
+
+      expect(retry).toHaveBeenCalledExactlyOnceWith({
+        clerkToken: "token",
+        repositoryId: scope.repositoryId,
+        jobId: job.jobId,
+        payload: { operation: "retry_action", actionId: "push-attempt", expectedRevision: 3 },
+      });
+      expect(findButton("Retry publishing action").props.disabled).toBe(true);
+      await act(async () => {
+        reply.resolve(resumed);
+        await reply.promise;
+      });
+      expect(text(renderer!.toJSON())).not.toContain("Retry publishing action");
+    },
+  );
+
+  it("resumes a manual hold before retrying a failed publishing action", async () => {
+    const failed = publishingFailure("failed");
+    const paused: RepositoryWorkflowJob = {
+      ...failed,
+      progress: {
+        ...failed.progress!,
+        manualPauseSupported: true,
+        manualPause: { state: "paused" },
+      },
+    };
+    fixture.call.mockResolvedValue(paused);
+    await mount();
+
+    expect(text(renderer!.toJSON())).toContain("Couldn’t push branch");
+    expect(text(renderer!.toJSON())).not.toContain("Retry publishing action");
+
+    const resumed: RepositoryWorkflowJob = {
+      ...failed,
+      progress: { ...failed.progress!, revision: 4, manualPauseSupported: true },
+    };
+    const resume = vi.fn().mockResolvedValue(resumed);
+    fixture.call
+      .mockResolvedValue(resumed)
+      .mockImplementationOnce((request) => request({ respondToWorkflowJob: resume }, "token"));
+    await press("Resume workflow");
+
+    expect(resume).toHaveBeenCalledExactlyOnceWith({
+      clerkToken: "token",
+      repositoryId: scope.repositoryId,
+      jobId: job.jobId,
+      payload: {
+        operation: "resume",
+        controlId: expect.any(String),
+        expectedRevision: 3,
+      },
+    });
+    expect(text(renderer!.toJSON())).toContain("Retry publishing action");
+  });
+});
+
 describe("queued workflow recovery", () => {
   const queued = {
     ...job,

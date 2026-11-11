@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useId, useMemo, useRef, useState } from "react";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import { useAtomValue } from "@effect/atom-react";
 import { threadVmControls } from "../../state/threads";
 import { ThreadId, type ChatAttachment } from "@t3tools/contracts";
-import type { RepositoryWorkflowJob, WorkflowSavedResult } from "@t3tools/contracts/workflows";
+import { WorkflowSavedResult, type RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
 import {
   makeWorkflowSavedResultReader,
   currentWorkflowSavedResult,
@@ -19,7 +20,7 @@ import {
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
-import { Columns2Icon, Rows3Icon } from "lucide-react";
+import { Columns2Icon, FileDiffIcon, Rows3Icon } from "lucide-react";
 import { ToggleGroup, Toggle } from "../ui/toggle-group";
 import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
 import { useIsMobile } from "../../hooks/useMediaQuery";
@@ -31,7 +32,10 @@ import { SavedConversationMessage } from "../chat/SavedConversationMessage";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { WorkflowAlert } from "./WorkflowAlert";
+import { WorkflowOutcome } from "./WorkflowOutcome";
 import { useWorkflowClient, confirmWorkflow } from "./workflowState";
+
+const sameSavedResult = Schema.toEquivalence(WorkflowSavedResult);
 
 export function SavedWorkflowResults({
   scope,
@@ -61,6 +65,8 @@ export function SavedWorkflowResults({
   } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [browsingHistory, setBrowsingHistory] = useState(false);
+  // A run that ends while someone is reading keeps its result viewer open.
+  const [partialResultOpen, setPartialResultOpen] = useState(job.status !== "cancelled");
   const selectedRef = useRef<string | null>(null);
   selectedRef.current = selected;
   const [view, setView] = useState<"changes" | "conversation">("changes");
@@ -75,6 +81,9 @@ export function SavedWorkflowResults({
   const [retry, setRetry] = useState(0);
   const deleteIntent = useRef<string | null>(null);
   const [deletionRequested, setDeletionRequested] = useState(false);
+  const [deletionError, setDeletionError] = useState<string | null>(null);
+  const cancelled = job.status === "cancelled";
+  const cancellationDetail = cancelled && (job.detail ?? job.progress?.detail);
   const threadState = savedWorkflowThreadState(job);
   const deleted = deletionRequested || threadState === "deleted";
   const waitingForThread = threadState === "not_started";
@@ -121,18 +130,22 @@ export function SavedWorkflowResults({
     )
       .then((data) => {
         if (!current) return;
-        setIndex((previous) => ({
-          ...data,
-          results:
-            previous &&
-            selectedRef.current &&
-            !data.results.some((entry) => entry.resultId === selectedRef.current)
-              ? [
-                  ...data.results,
-                  ...previous.results.filter((entry) => entry.resultId === selectedRef.current),
-                ]
-              : data.results,
-        }));
+        setIndex((previous) => {
+          const previousResult = previous?.results.find(
+            (entry) => entry.resultId === selectedRef.current,
+          );
+          if (!previousResult) return data;
+          const freshResult = data.results.find(
+            (entry) => entry.resultId === previousResult.resultId,
+          );
+          if (!freshResult) return { ...data, results: [...data.results, previousResult] };
+          // Re-reading the index should not reload the open diff or conversation.
+          if (!sameSavedResult(previousResult, freshResult)) return data;
+          return {
+            ...data,
+            results: data.results.map((entry) => (entry === freshResult ? previousResult : entry)),
+          };
+        });
         setError(null);
         setSelected((id) => id ?? data.results[0]?.resultId ?? null);
       })
@@ -152,6 +165,7 @@ export function SavedWorkflowResults({
     call,
     scope.repositoryId,
     job.jobId,
+    cancelled,
     job.progress?.resultSaving?.publicationId,
     job.progress?.resultSaving?.state,
     job.progress?.checkpoint?.checkpointId,
@@ -162,6 +176,8 @@ export function SavedWorkflowResults({
   ]);
   const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
   const currentResult = currentWorkflowSavedResult(job, index?.results ?? []);
+  const partialResult = cancelled && currentResult?.outcome === "cancelled" ? currentResult : null;
+  const hasPartialChanges = !!partialResult && partialResult.patch.sizeBytes > 0;
   const reviewingCurrent = !!result && result.resultId === currentResult?.resultId;
   useLayoutEffect(() => {
     onReviewTargetChange?.(reviewingCurrent);
@@ -401,6 +417,7 @@ export function SavedWorkflowResults({
     )
       return;
     deleteIntent.current ??= randomUUID();
+    setDeletionError(null);
     const request = generation.current;
     setBusy(true);
     try {
@@ -427,21 +444,24 @@ export function SavedWorkflowResults({
       }
     } catch {
       if (active.current && request === generation.current) {
-        setError(
-          "Could not confirm thread deletion. Retry deleting to reconcile the same request.",
-        );
+        setDeletionError("Retry deleting to reconcile the same request.");
         setBusy(false);
       }
     }
   };
   if (deleted)
     return (
-      <p className="text-sm text-muted-foreground">
-        Thread deletion requested. Its saved results are no longer available.
-      </p>
+      <div className="space-y-3 text-sm text-muted-foreground">
+        {cancellationDetail ? <p>{cancellationDetail}</p> : null}
+        <p>Thread deletion requested. Its saved results are no longer available.</p>
+      </div>
     );
-  return (
-    <section aria-label="Saved workflow results" className="space-y-3">
+  const resultView = (
+    <div
+      id={`${tabId}-saved-results`}
+      className="space-y-3"
+      hidden={!!partialResult && !partialResultOpen}
+    >
       <div className="flex flex-wrap items-start justify-between gap-3">
         {result ? (
           <div className="min-w-0 space-y-1">
@@ -664,14 +684,54 @@ export function SavedWorkflowResults({
           </div>
         ) : null}
       </div>
+    </div>
+  );
+  return (
+    <section aria-label="Saved workflow results" className="space-y-3">
+      {partialResult ? (
+        <WorkflowOutcome
+          title={hasPartialChanges ? "Partial changes saved" : "Partial result saved"}
+          actions={
+            <Button
+              aria-controls={`${tabId}-saved-results`}
+              aria-expanded={partialResultOpen}
+              onClick={() => {
+                if (!partialResultOpen) {
+                  setSelected(partialResult.resultId);
+                  setView("changes");
+                  setBrowsingHistory(false);
+                }
+                setPartialResultOpen(!partialResultOpen);
+              }}
+            >
+              <FileDiffIcon aria-hidden />
+              {partialResultOpen
+                ? "Hide saved result"
+                : hasPartialChanges
+                  ? "View saved changes"
+                  : "View saved result"}
+            </Button>
+          }
+        >
+          <p>{cancellationDetail || "The run ended before the workflow completed."}</p>
+        </WorkflowOutcome>
+      ) : cancellationDetail ? (
+        <p className="text-sm text-muted-foreground">{cancellationDetail}</p>
+      ) : null}
+      {resultView}
       {canDelete ? (
         <details className="border-t pt-3">
           <summary className="cursor-pointer text-sm text-muted-foreground">More controls</summary>
-          <div className="mt-2">
+          <div className="mt-2 space-y-2">
+            {deletionError ? (
+              <WorkflowAlert title="Could not confirm thread deletion">
+                {deletionError}
+              </WorkflowAlert>
+            ) : null}
             <Button
               size="sm"
               variant="destructive-outline"
-              disabled={busy}
+              disabled={busy || !index}
               onClick={() => void deleteThread()}
             >
               Delete thread permanently

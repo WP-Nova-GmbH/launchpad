@@ -9,10 +9,12 @@ import {
   PauseIcon,
   PlayIcon,
   RefreshCwIcon,
+  RotateCwIcon,
 } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { WorkflowAlert } from "./WorkflowAlert";
+import { WorkflowOutcome } from "./WorkflowOutcome";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
@@ -125,6 +127,7 @@ export function WorkflowJob({
   const conversationButton = useRunActionFocus(key);
   const resumeButton = useRunActionFocus(key);
   const runHeading = useRef<HTMLHeadingElement>(null);
+  const retryPublishingButton = useRunActionFocus(key, runHeading);
   const queuedRecoveryLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
   const resultRequest = useRef<{ key: string } | null>(null);
   useLayoutEffect(
@@ -236,6 +239,11 @@ export function WorkflowJob({
     if (
       operation === "retry_saving" &&
       (!canConfigure || !selectedJob.progress?.resultSaving?.retryable)
+    )
+      return;
+    if (
+      operation === "retry_action" &&
+      (!canConfigure || !actionState.canRetry || currentRead.job !== selectedJob)
     )
       return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId, randomUUID());
@@ -449,9 +457,12 @@ export function WorkflowJob({
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
-  const checkpointStep = selectedJob.workflow?.definition.steps.find(
-    (step) => step.id === (checkpoint?.stepId ?? selectedJob.progress?.stepId),
-  );
+  const failed = selectedJob.status === "failed";
+  const cancelledVm = selectedJob.status === "cancelled" && selectedJob.runtime?.kind === "vm";
+  const stepId = failed
+    ? selectedJob.progress?.stepId
+    : (checkpoint?.stepId ?? selectedJob.progress?.stepId);
+  const checkpointStep = selectedJob.workflow?.definition.steps.find((step) => step.id === stepId);
   const stepRepeatsWorkflowName =
     !!checkpointStep && checkpointStep.title === selectedJob.workflow?.definition.name;
   const approval =
@@ -481,11 +492,28 @@ export function WorkflowJob({
   const running = selectedJob.status === "running";
   const needsInput = selectedJob.status === "awaiting_input";
   const paused = selectedJob.status === "paused";
+  const action = actionState.action;
+  const publishingFailure =
+    paused &&
+    action &&
+    (actionState.canRetry || action.state === "failed" || action.state === "uncertain")
+      ? action
+      : null;
+  const publishingStep = publishingFailure?.operation === "push" ? "Push branch" : "Open PR";
+  const publishingTitle =
+    publishingFailure?.operation === "push"
+      ? publishingFailure.state === "uncertain"
+        ? "Couldn’t confirm the branch push"
+        : "Couldn’t push branch"
+      : publishingFailure?.state === "uncertain"
+        ? "Couldn’t confirm the pull request"
+        : "Couldn’t open pull request";
+  const canRetryPublishing = canConfigure && actionState.canRetry;
   const StatusIcon = running
     ? ActivityIcon
     : needsInput
       ? MessageSquareIcon
-      : paused
+      : paused && !publishingFailure
         ? PauseIcon
         : null;
   const manualHold = paused && selectedJob.progress?.manualPause?.state === "paused";
@@ -533,7 +561,7 @@ export function WorkflowJob({
     ) : null;
   const conversationActions =
     !composingFeedback &&
-    selectedJob.runtime?.kind !== "vm" &&
+    selectedJob.runtime?.kind === "machine" &&
     selectedJob.progress &&
     selectedJob.progress.hasThread !== false ? (
       <div className="flex flex-wrap gap-2">
@@ -553,9 +581,10 @@ export function WorkflowJob({
         <Button
           ref={conversationButton}
           variant={
-            completed &&
-            !selectedJob.progress.pullRequestUrl &&
-            (!checkpoint || checkpoint.kind === "input")
+            failed ||
+            (completed &&
+              !selectedJob.progress.pullRequestUrl &&
+              (!checkpoint || checkpoint.kind === "input"))
               ? "default"
               : conversationInTask
                 ? "outline"
@@ -565,7 +594,7 @@ export function WorkflowJob({
           onClick={() => void inspect(false)}
         >
           Open conversation
-          {conversationInTask ? <ArrowUpRightIcon aria-hidden /> : null}
+          {conversationInTask || failed ? <ArrowUpRightIcon aria-hidden /> : null}
         </Button>
       </div>
     ) : null;
@@ -684,7 +713,40 @@ export function WorkflowJob({
               organizationAdmin={organizationAdmin}
               recoveryLinkRef={queuedRecoveryLink}
             />
-          ) : (
+          ) : failed ? (
+            <WorkflowOutcome
+              title={checkpointStep ? `${checkpointStep.title} failed` : "Run failed"}
+              tone="error"
+              actions={conversationActions}
+            >
+              <p>{detail ?? "This run stopped before completing."}</p>
+            </WorkflowOutcome>
+          ) : publishingFailure ? (
+            <WorkflowOutcome
+              title={publishingTitle}
+              tone="warning"
+              actions={
+                <>
+                  {canRetryPublishing ? (
+                    <Button
+                      ref={retryPublishingButton}
+                      disabled={busy}
+                      onClick={() => void respond("retry_action")}
+                    >
+                      <RotateCwIcon aria-hidden />
+                      Retry publishing action
+                    </Button>
+                  ) : (
+                    resumeAction
+                  )}
+                  {conversationActions}
+                </>
+              }
+            >
+              {detail ? <p>{detail}</p> : null}
+              {canRetryPublishing ? <p>Retry starts at {publishingStep}.</p> : null}
+            </WorkflowOutcome>
+          ) : cancelledVm ? null : (
             <div
               className={
                 StatusIcon
@@ -766,21 +828,12 @@ export function WorkflowJob({
               {manualState.message}
             </WorkflowAlert>
           ) : null}
-          {selectedJob.status === "failed" ? (
-            <WorkflowAlert
-              title="Run failed"
-              actions={
-                <Button variant="outline" size="sm" onClick={backToRuns}>
-                  Back to runs
-                </Button>
-              }
-            >
-              {detail ??
-                "This run stopped before completing. Open its conversation to review the result."}
-            </WorkflowAlert>
-          ) : !queuedTask &&
-            detail &&
-            !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
+          {!failed &&
+          !publishingFailure &&
+          !cancelledVm &&
+          !queuedTask &&
+          detail &&
+          !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
           {(reviewChanged && selectedJob.runtime?.kind !== "vm") ||
@@ -849,7 +902,7 @@ export function WorkflowJob({
                 "The next step starts after this result is saved. Cancel remains available."}
             </WorkflowAlert>
           ) : null}
-          {!conversationInTask ? conversationActions : null}
+          {!conversationInTask && !failed && !publishingFailure ? conversationActions : null}
           {resultError ? (
             <WorkflowAlert
               title="Could not open the result"
@@ -991,11 +1044,6 @@ export function WorkflowJob({
               ))}
             </ol>
           </details>
-        ) : null}
-        {canConfigure && actionState.canRetry ? (
-          <Button variant="outline" disabled={busy} onClick={() => void respond("retry_action")}>
-            Retry publishing action
-          </Button>
         ) : null}
         {!completed && selectedJob.progress?.pullRequestUrl ? (
           <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer">

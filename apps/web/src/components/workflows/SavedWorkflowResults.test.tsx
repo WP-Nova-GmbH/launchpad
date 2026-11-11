@@ -20,6 +20,7 @@ const fixture = vi.hoisted(() => ({
   confirm: vi.fn(),
   list: vi.fn(),
   read: vi.fn(),
+  history: vi.fn(),
   deletion: vi.fn(),
   refresh: vi.fn(),
   target: vi.fn(),
@@ -180,6 +181,7 @@ beforeEach(() => {
     relayUrl: "https://relay.invalid",
   });
   fixture.read.mockResolvedValue({ result, patch });
+  fixture.history.mockResolvedValue({ entries: [] });
   fixture.deletion.mockResolvedValue(undefined);
   fixture.confirm.mockResolvedValue(true);
   fixture.refresh.mockResolvedValue(undefined);
@@ -199,6 +201,7 @@ const withClient = async (test: () => Promise<void>) => {
     relayUrl: "https://relay.invalid",
     listSavedWorkflowResults: transport(fixture.list),
     readSavedWorkflowResult: transport(fixture.read),
+    getSavedWorkflowHistory: transport(fixture.history),
     permanentlyDeleteThread: transport(fixture.deletion),
   };
   fixture.call.mockImplementation(
@@ -363,6 +366,151 @@ it("keeps Input-first runs empty until an Agent creates results, rather than cal
     expect(fixture.list).toHaveBeenCalled();
     expect(renderer.root.findAllByType("pre")).toHaveLength(1);
   }));
+it.each([
+  [patch, "Partial changes saved", "View saved changes"],
+  ["", "Partial result saved", "View saved result"],
+])(
+  "discloses the confirmed partial result with the right action (%s)",
+  (savedPatch, title, label) =>
+    withClient(async () => {
+      const partial: WorkflowSavedResult = {
+        ...result,
+        outcome: "cancelled",
+        patch: { ...result.patch, sizeBytes: new TextEncoder().encode(savedPatch).length },
+      };
+      fixture.list.mockResolvedValue({
+        results: [partial],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+      });
+      fixture.read.mockResolvedValue({ result: partial, patch: savedPatch });
+      await mount({
+        ...job,
+        status: "cancelled",
+        detail: "Canceled before the Agent step completed.",
+        progress: { ...job.progress!, status: "cancelled", checkpoint: null },
+      });
+
+      const outcome = JSON.stringify(renderer.toJSON());
+      expect(outcome).toContain(title);
+      expect(outcome).toContain("Canceled before the Agent step completed.");
+      const disclosure = () =>
+        renderer.root
+          .findAllByType("button")
+          .find((button) => typeof button.props["aria-expanded"] === "boolean")!;
+      const savedResults = () =>
+        renderer.root.findByProps({ id: disclosure().props["aria-controls"] });
+      expect(disclosure().children).toContain(label);
+      expect(disclosure().props["aria-expanded"]).toBe(false);
+      expect(savedResults().props.hidden).toBe(true);
+      const cleanup = renderer.root
+        .findAllByType("button")
+        .find((button) => button.props.children === "Delete thread permanently")!;
+      for (let node: typeof cleanup | null = cleanup; node; node = node.parent) {
+        expect(node.props.hidden).not.toBe(true);
+      }
+      if (savedPatch) {
+        fixture.deletion.mockRejectedValueOnce(new Error("Reply lost"));
+        await press("Delete thread permanently");
+        const deletionError = renderer.root
+          .findAllByType("div")
+          .find((node) =>
+            node.children.some(
+              (child) =>
+                typeof child === "string" && /could not confirm thread deletion/i.test(child),
+            ),
+          )!;
+        for (let node: typeof deletionError | null = deletionError; node; node = node.parent) {
+          expect(node.props.hidden).not.toBe(true);
+        }
+        expect(deletionError).toBeDefined();
+        expect(savedResults().props.hidden).toBe(true);
+      }
+
+      await act(() => disclosure().props.onClick());
+      expect(disclosure().props["aria-expanded"]).toBe(true);
+      expect(savedResults().props.hidden).toBe(false);
+      if (savedPatch)
+        expect(savedResults().findByType("pre").props.items[0].id).toContain(partial.resultId);
+      else expect(JSON.stringify(renderer.toJSON())).toContain("No file changes.");
+      expect(fixture.refresh).not.toHaveBeenCalled();
+    }),
+);
+
+it("keeps an open saved conversation in place when a live run is canceled", () =>
+  withClient(async () => {
+    await mount({
+      ...job,
+      status: "running",
+      progress: { ...job.progress!, status: "running", checkpoint: null },
+    });
+    await press("Conversation");
+    const panel = renderer.root.findByProps({ role: "tabpanel" });
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+
+    const partial: WorkflowSavedResult = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      stepId: "Agent 2",
+      outcome: "cancelled",
+    };
+    let publish!: () => void;
+    const publication = new Promise<void>((resolve) => {
+      publish = resolve;
+    });
+    fixture.list.mockImplementation(async () => {
+      await publication;
+      return {
+        results: [partial, { ...result, patch: { ...result.patch } }],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+        relayUrl: "https://relay.invalid",
+      };
+    });
+    await act(() =>
+      renderer.update(
+        view({
+          ...job,
+          status: "cancelled",
+          progress: { ...job.progress!, status: "cancelled", checkpoint: null },
+        }),
+      ),
+    );
+    expect(renderer.root.findByProps({ role: "tabpanel" })).toBe(panel);
+
+    await act(async () => {
+      publish();
+      await publication;
+    });
+    const content = JSON.stringify(renderer.toJSON());
+    expect(content).toContain("Partial changes saved");
+    expect(content).toContain("No saved messages for this Agent result.");
+    expect(renderer.root.findByProps({ role: "tabpanel" })).toBe(panel);
+    expect(renderer.root.findByType("select").props.value).toBe(result.resultId);
+    expect(fixture.history).toHaveBeenCalledOnce();
+    const disclosure = renderer.root
+      .findAllByType("button")
+      .find((button) => typeof button.props["aria-expanded"] === "boolean")!;
+    expect(disclosure.props["aria-expanded"]).toBe(true);
+    expect(renderer.root.findByProps({ id: disclosure.props["aria-controls"] }).props.hidden).toBe(
+      false,
+    );
+  }));
+
+it("does not label an earlier completed result as partial when a run is canceled", () =>
+  withClient(async () => {
+    await mount({
+      ...job,
+      status: "cancelled",
+      progress: { ...job.progress!, status: "cancelled", checkpoint: null },
+    });
+    const content = JSON.stringify(renderer.toJSON());
+    expect(content).not.toMatch(/View saved (changes|result)/);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+  }));
+
 it("allows cleanup metadata for a cancellation before the first Agent without calling it deleted", () =>
   withClient(async () => {
     fixture.list.mockResolvedValue({
