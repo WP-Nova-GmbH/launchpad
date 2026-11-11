@@ -744,6 +744,7 @@ function WorkflowBuilderWorkspace({
   const sheetReady = useRef(false);
   const mounted = useRef(true);
   const workspace = useRef<HTMLFormElement>(null);
+  const executionTargetControl = useRef<HTMLButtonElement>(null);
   const fields = useRef(new Map<string, HTMLElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
@@ -886,7 +887,17 @@ function WorkflowBuilderWorkspace({
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     select(id);
   };
+  const canvasTrigger = () =>
+    workspace.current?.querySelector<HTMLButtonElement>(
+      '[aria-label="Configure workflow trigger"]',
+    );
+  const inspectorReturnTarget = () => {
+    if (returnFocus.current?.isConnected) return returnFocus.current;
+    if (triggerOpen) return canvasTrigger();
+    return settingsOpen ? executionTargetControl.current : null;
+  };
   const close = () => {
+    returnFocus.current = inspectorReturnTarget() ?? null;
     setFocusRequest(null);
     setSettingsOpen(false);
     setTriggerOpen(false);
@@ -901,15 +912,14 @@ function WorkflowBuilderWorkspace({
     select("");
     setSettingsOpen(true);
   };
-  const openTrigger = () => {
+  const openTrigger = (opener?: HTMLElement | null) => {
     setFocusRequest(null);
     setSettingsOpen(false);
     select("");
-    returnFocus.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    returnFocus.current = opener ?? canvasTrigger() ?? null;
     setTriggerOpen(true);
   };
-  const submit = async () => {
+  const submit = async (submitter?: HTMLElement) => {
     if (pending) return;
     if (draft.operation?.state === "uncertain") {
       setFocusRequest(null);
@@ -936,8 +946,9 @@ function WorkflowBuilderWorkspace({
       }));
       return;
     }
+    const triggerOpener = submitter ?? (triggerOpen ? returnFocus.current : null);
     if (vmTriggerUnavailable && automation.enabled) {
-      openTrigger();
+      openTrigger(triggerOpener);
       edit((current) => ({
         ...current,
         error: "Automatic VM runs are unavailable. Turn off automatic triggering before saving.",
@@ -948,7 +959,7 @@ function WorkflowBuilderWorkspace({
       automationSupported &&
       (!isWorkflowAutomation(automation) || (automation.enabled && !automation.trigger))
     ) {
-      openTrigger();
+      openTrigger(triggerOpener);
       edit((current) => ({
         ...current,
         error: "Complete the Linear trigger selections, or remove the trigger before saving.",
@@ -1218,7 +1229,8 @@ function WorkflowBuilderWorkspace({
       className={styles["workflow-editor"]}
       onSubmit={(event) => {
         event.preventDefault();
-        void submit();
+        const submitter = event.nativeEvent?.submitter;
+        void submit(submitter instanceof HTMLElement ? submitter : undefined);
       }}
     >
       <div className={styles["workflow-editor-header"]}>
@@ -1238,7 +1250,31 @@ function WorkflowBuilderWorkspace({
               }))
             }
           />
-          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    className={styles["workflow-target-summary"]}
+                    ref={executionTargetControl}
+                    aria-label={`Execution target: ${targetLabel}`}
+                    onClick={openSettings}
+                  />
+                }
+              >
+                {vm && draft.targetConfirmed ? <CloudIcon /> : <MonitorIcon />}
+                <span>{vm && draft.targetConfirmed ? "VM" : targetLabel}</span>
+                {vm && draft.targetConfirmed ? (
+                  <>
+                    <GitBranchIcon aria-hidden />
+                    <span>{vm.baseBranch ?? "Repository default"}</span>
+                  </>
+                ) : null}
+                <ChevronDownIcon aria-hidden />
+              </TooltipTrigger>
+              <TooltipPopup>{targetLabel}</TooltipPopup>
+            </Tooltip>
             <span>{draft.definition.steps.length} steps</span>
             {archived ? <span>Archived</span> : null}
             <span>
@@ -1253,36 +1289,12 @@ function WorkflowBuilderWorkspace({
           <Button
             type="button"
             variant="ghost"
-            size="sm"
-            aria-label="Trigger settings"
-            onClick={openTrigger}
+            size="icon"
+            aria-label="Workflow settings"
+            onClick={openSettings}
           >
-            Trigger settings
+            <Settings2Icon />
           </Button>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <button
-                  type="button"
-                  className={styles["workflow-target-summary"]}
-                  aria-label={`Execution target: ${targetLabel}`}
-                  onClick={openSettings}
-                />
-              }
-            >
-              {vm && draft.targetConfirmed ? <CloudIcon /> : <MonitorIcon />}
-              <span>{vm && draft.targetConfirmed ? "VM" : targetLabel}</span>
-              {vm && draft.targetConfirmed ? (
-                <>
-                  <GitBranchIcon aria-hidden />
-                  <span>{vm.baseBranch ?? "Repository default"}</span>
-                </>
-              ) : null}
-              <ChevronDownIcon aria-hidden />
-            </TooltipTrigger>
-            <TooltipPopup>{targetLabel}</TooltipPopup>
-          </Tooltip>
-
           <Button
             type="button"
             variant="outline"
@@ -1321,15 +1333,6 @@ function WorkflowBuilderWorkspace({
               {draft.operation?.state === "uncertain" ? "Retry save" : "Save"}
             </Button>
           </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="Workflow settings"
-            onClick={openSettings}
-          >
-            <Settings2Icon />
-          </Button>
         </div>
       </div>
       {vmRunUnavailable ||
@@ -1493,7 +1496,7 @@ function WorkflowBuilderWorkspace({
           triggerLabel={workflowTriggerLabel(workflowDraftAutomation(draft).trigger)}
           triggerSelected={triggerOpen}
           triggerIssue={automationReason}
-          onTrigger={openTrigger}
+          onTrigger={() => openTrigger()}
           definition={draft.definition}
           selectedStepId={draft.selectedStepId}
           invalidStepId={issue?.stepId}
@@ -1549,9 +1552,7 @@ function WorkflowBuilderWorkspace({
               }}
               finalFocus={() => {
                 if (!mounted.current || presentation.current !== false) return false;
-                return returnFocus.current?.isConnected
-                  ? returnFocus.current
-                  : (workspace.current?.querySelector('[aria-label="Trigger settings"]') ?? true);
+                return inspectorReturnTarget() ?? true;
               }}
             >
               <SheetTitle className="sr-only">

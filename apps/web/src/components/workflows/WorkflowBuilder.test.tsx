@@ -54,7 +54,14 @@ vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: confirmation }));
 vi.mock("./WorkflowCanvas", async () => ({
   ...(await vi.importActual("./WorkflowCanvas")),
   WorkflowCanvas: (props: Record<string, unknown>) =>
-    createElement("div", { ...props, "data-testid": "canvas-fixture" }),
+    createElement(
+      "div",
+      { ...props, "data-testid": "canvas-fixture" },
+      createElement("button", {
+        "aria-label": "Configure workflow trigger",
+        onClick: props.onTrigger,
+      }),
+    ),
 }));
 vi.mock("./WorkflowStepEditor", () => ({
   WorkflowStepEditor: (props: Record<string, unknown>) =>
@@ -165,7 +172,10 @@ async function mount(props: Props = base) {
       <AppAtomRegistryProvider>
         <WorkflowBuilder {...props} />
       </AppAtomRegistryProvider>,
-      { createNodeMock: (element) => (element.type === "form" ? {} : null) },
+      {
+        createNodeMock: (element) =>
+          element.type === "form" ? { querySelector: () => null } : null,
+      },
     );
   });
 }
@@ -1127,7 +1137,7 @@ describe("VM authoring", () => {
     const openSettings = () =>
       root.findByProps({ "aria-label": "Workflow settings" }).props.onClick();
     const openTrigger = () =>
-      root.findByProps({ "aria-label": "Trigger settings" }).props.onClick();
+      root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick();
     const toggle = () =>
       root.findAllByType("button").find((node) => node.props.role === "checkbox")!;
     const selectVm = () =>
@@ -1227,7 +1237,7 @@ describe("VM authoring", () => {
       })),
     );
     await act(() =>
-      renderer!.root.findByProps({ "aria-label": "Trigger settings" }).props.onClick(),
+      renderer!.root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick(),
     );
     const off = { enabled: false, trigger: recoveryTrigger };
     const receipt = { ...workflow, revision: workflow.revision + 1, automation: off };
@@ -1264,7 +1274,9 @@ describe("VM authoring", () => {
       vmAutomationAvailable: true,
     });
     const root = renderer!.root;
-    await act(() => root.findByProps({ "aria-label": "Trigger settings" }).props.onClick());
+    await act(() =>
+      root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick(),
+    );
     await act(() => root.findByProps({ role: "checkbox" }).props.onClick());
     const receipt = {
       ...workflow,
@@ -1544,7 +1556,9 @@ it("cancels only trigger changes while keeping other unsaved workflow edits", as
   };
   await mount({ ...base, workflow, isNew: false, automationSupported: true });
   await rename("Retained workflow name");
-  await act(() => renderer!.root.findByProps({ "aria-label": "Trigger settings" }).props.onClick());
+  await act(() =>
+    renderer!.root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick(),
+  );
   await act(() =>
     renderer!.root
       .findAllByType("button")

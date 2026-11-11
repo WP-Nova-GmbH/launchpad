@@ -1,6 +1,13 @@
 vi.mock("./WorkflowSources", () => ({ RepositorySourcesButton: () => null }));
 vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
-import { act, createElement, useLayoutEffect, type PropsWithChildren } from "react";
+import {
+  act,
+  cloneElement,
+  createElement,
+  useLayoutEffect,
+  type PropsWithChildren,
+  type ReactElement,
+} from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
@@ -48,6 +55,7 @@ class TextField extends FocusNode {
 const focusDocument: { activeElement: FocusNode | null } = { activeElement: null };
 const nodes = new Map<string, FocusNode>();
 const cache = new Map<string, FocusNode>();
+let triggerButton: FocusNode;
 let width = 1200;
 let presentation = 0;
 let resize: ((entries: Array<{ contentRect: { width: number } }>) => void) | undefined;
@@ -76,6 +84,11 @@ vi.mock("./WorkflowCanvas", async () => ({
         ref: props.addStepRef,
       }),
     ),
+}));
+vi.mock("./WorkflowTriggerInspector", async () => ({
+  ...(await vi.importActual("./WorkflowTriggerInspector")),
+  WorkflowTriggerInspector: ({ onClose }: { onClose: () => void }) =>
+    createElement("button", { "aria-label": "Close trigger settings", onClick: onClose }),
 }));
 vi.mock("./WorkflowStepEditor", () => ({
   useWorkflowEditorModels: () => ({ issues: [] }),
@@ -157,7 +170,8 @@ vi.mock("../ui/sheet", () => ({
 }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
-  TooltipTrigger: ({ children }: PropsWithChildren) => children,
+  TooltipTrigger: ({ render, children }: PropsWithChildren<{ render?: ReactElement }>) =>
+    render ? cloneElement(render, {}, children) : children,
   TooltipPopup: () => null,
 }));
 vi.mock("../ui/button", () => ({
@@ -203,14 +217,21 @@ const draft = () =>
   appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, id())]!;
 const canvas = () => renderer!.root.findByProps({ "data-testid": "canvas" });
 const field = (key: string) => nodes.get(key)! as TextField;
-async function mount(vm = false) {
+async function mount(
+  vm = false,
+  {
+    projects = vm ? [] : [project],
+    automationSupported = false,
+  }: { projects?: ReadonlyArray<RelayOrganizationProject>; automationSupported?: boolean } = {},
+) {
   await act(() => {
     renderer = create(
       <AppAtomRegistryProvider>
         <WorkflowBuilder
           scope={scope}
-          projects={vm ? [] : [project]}
+          projects={projects}
           vmAuthoring={vm ? { models: null } : undefined}
+          automationSupported={automationSupported}
           isNew
           workflow={undefined}
           canConfigure
@@ -222,16 +243,26 @@ async function mount(vm = false) {
       </AppAtomRegistryProvider>,
       {
         createNodeMock: (element) => {
-          if (element.type === "form") return { querySelector: () => null };
+          if (element.type === "form") {
+            return {
+              querySelector: (selector: string) =>
+                selector === '[aria-label="Configure workflow trigger"]' ? triggerButton : null,
+            };
+          }
           const props = element.props as Record<string, unknown>;
           const key =
             typeof props["data-focus-key"] === "string"
               ? props["data-focus-key"]
               : props["aria-label"] === "Workflow name"
                 ? "name"
-                : props.placeholder === "Repository default"
-                  ? "baseBranch"
-                  : null;
+                : typeof props["aria-label"] === "string" &&
+                    props["aria-label"].startsWith("Execution target: ")
+                  ? "header-target"
+                  : props.type === "submit"
+                    ? "save"
+                    : props.placeholder === "Repository default"
+                      ? "baseBranch"
+                      : null;
           if (!key) return null;
           const cacheKey = `${presentation}:${key}`;
           let node = cache.get(cacheKey);
@@ -280,6 +311,7 @@ beforeEach(() => {
   width = 1200;
   presentation = 0;
   focusDocument.activeElement = null;
+  triggerButton = new FocusNode();
   completeOpening = undefined;
   dismissSheet = undefined;
   initialSheetFocus = undefined;
@@ -362,6 +394,61 @@ describe("Inspector presentation focus", () => {
       1, 4,
     ]);
   });
+  it.each([1200, 600])(
+    "returns focus to the canvas trigger after dismissing trigger settings at width %i",
+    async (editorWidth) => {
+      width = editorWidth;
+      await mount();
+      await act(() =>
+        editWorkflowDraft(scope, id(), (current) => ({ ...current, triggerSetup: true })),
+      );
+
+      if (editorWidth < 920) {
+        await act(() => dismissSheet!(false));
+      } else {
+        await act(() =>
+          renderer!.root.findByProps({ "aria-label": "Close trigger settings" }).props.onClick(),
+        );
+      }
+
+      expect(draft().triggerSetup).toBe(false);
+      expect(focusDocument.activeElement).toBe(triggerButton);
+    },
+  );
+
+  it("returns focus to Save after dismissing trigger validation", async () => {
+    width = 600;
+    await mount(false, { automationSupported: true });
+    await act(() =>
+      editWorkflowDraft(scope, id(), (current) => ({
+        ...current,
+        automation: { enabled: true, trigger: null },
+      })),
+    );
+    const submitter = renderer!.root
+      .findAllByType("button")
+      .find((button) => button.props.type === "submit")!.instance;
+    await act(() =>
+      renderer!.root.findByType("form").props.onSubmit({
+        preventDefault() {},
+        nativeEvent: { submitter },
+      }),
+    );
+    expect(draft().triggerSetup).toBe(true);
+
+    await act(() => dismissSheet!(false));
+    expect(focusDocument.activeElement).toBe(submitter);
+  });
+
+  it("returns focus to the execution target after dismissing automatically opened settings", async () => {
+    width = 600;
+    await mount(true, { projects: [project] });
+    expect(draft().targetConfirmed).toBe(false);
+
+    await act(() => dismissSheet!(false));
+    expect(focusDocument.activeElement).toBe(field("header-target"));
+  });
+
   it("preserves ordinary workflow-target control focus and explicit dismissal", async () => {
     await mount();
     const opener = new FocusNode();
