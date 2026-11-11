@@ -326,10 +326,17 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
         yield* sql<Connection>`SELECT * FROM relay_workflow_connections WHERE organization_id=${org} ORDER BY workspace_name,connection_id`;
       const repositories = yield* sql<WorkflowSourceOwner["repositories"][number]>`
       SELECT repository_id AS "repositoryId",organization_id AS "organizationId",name FROM relay_repositories WHERE organization_id=${org} ORDER BY name,repository_id`;
-      const grants = yield* sql<Grant>`SELECT g.* FROM relay_workflow_repository_grants g
+      const grants = yield* sql<Grant & { repository_remote: string | null }>`
+      SELECT g.*, CASE WHEN NOT g.revoked THEN (
+        SELECT a.canonical_key FROM relay_repository_aliases a
+        WHERE a.repository_id=g.repository_id AND a.organization_id=g.organization_id
+        ORDER BY a.created_at,a.canonical_key LIMIT 1
+      ) END AS repository_remote
+      FROM relay_workflow_repository_grants g
       JOIN relay_repositories r ON r.repository_id=g.repository_id AND r.organization_id=g.organization_id
       JOIN relay_workflow_connections c ON c.connection_id=g.connection_id AND c.organization_id=g.organization_id
       WHERE g.organization_id=${org} ORDER BY g.generation`;
+      const repositoryNames = new Map(repositories.map((r) => [r.repositoryId, r.name]));
       const time = yield* now;
       return {
         configured: app !== null,
@@ -360,12 +367,17 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
         grants: grants.map(grant),
         withdrawableGrants: grants
           .filter((g) => !g.revoked)
-          .map((g) => ({
-            grantId: g.grant_id,
-            connectionId: g.connection_id,
-            repositoryName:
-              repositories.find((r) => r.repositoryId === g.repository_id)?.name ?? null,
-          })),
+          .map((g) => {
+            const repositoryName = repositoryNames.get(g.repository_id) ?? null;
+            return {
+              grantId: g.grant_id,
+              connectionId: g.connection_id,
+              repositoryName,
+              ...(repositoryName !== null && g.repository_remote !== null
+                ? { repositoryRemote: g.repository_remote }
+                : {}),
+            };
+          }),
       } satisfies WorkflowSourceOwner;
     }),
   );

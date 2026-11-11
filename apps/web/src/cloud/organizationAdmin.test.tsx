@@ -5,10 +5,16 @@ import { it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Queue from "effect/Queue";
 import * as Effect from "effect/Effect";
-import { ManagedRelayTenancy, setManagedRelaySession } from "@t3tools/client-runtime/relay";
+import {
+  ManagedRelay,
+  ManagedRelayTenancy,
+  setManagedRelaySession,
+} from "@t3tools/client-runtime/relay";
 import {
   RelayOrganizationId,
   RelayRepositoryId,
+  type RelayGithubConnection,
+  type RelayGithubInstallationCandidate,
   type RelayOrganizationMembership,
   type RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
@@ -118,29 +124,33 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+const runRelayRequests = Effect.gen(function* () {
+  const calls = yield* Queue.unbounded<Effect.Effect<void>>();
+  fixture.runPromise = <A, E>(
+    program: Effect.Effect<A, E, ManagedRelayTenancy.ManagedRelayTenancyClient>,
+  ) =>
+    new Promise<A>((resolve, reject) => {
+      Queue.offerUnsafe(
+        calls,
+        program.pipe(
+          Effect.provideService(ManagedRelayTenancy.ManagedRelayTenancyClient, fixture.client),
+          Effect.matchCause({
+            onFailure: (cause) => reject(Cause.squash(cause)),
+            onSuccess: resolve,
+          }),
+        ),
+      );
+    });
+  yield* Effect.forever(Queue.take(calls).pipe(Effect.flatMap((call) => call))).pipe(
+    Effect.forkScoped,
+  );
+});
+
 it.effect(
   "updates an already-mounted repository catalog after registration and removal in Settings",
   () =>
     Effect.gen(function* () {
-      const calls = yield* Queue.unbounded<Effect.Effect<void>>();
-      fixture.runPromise = <A, E>(
-        program: Effect.Effect<A, E, ManagedRelayTenancy.ManagedRelayTenancyClient>,
-      ) =>
-        new Promise<A>((resolve, reject) => {
-          Queue.offerUnsafe(
-            calls,
-            program.pipe(
-              Effect.provideService(ManagedRelayTenancy.ManagedRelayTenancyClient, fixture.client),
-              Effect.matchCause({
-                onFailure: (cause) => reject(Cause.squash(cause)),
-                onSuccess: resolve,
-              }),
-            ),
-          );
-        });
-      yield* Effect.forever(Queue.take(calls).pipe(Effect.flatMap((call) => call))).pipe(
-        Effect.forkScoped,
-      );
+      yield* runRelayRequests;
       yield* Effect.promise(async () => {
         await act(async () => {
           renderer = create(
@@ -171,4 +181,128 @@ it.effect(
         expect(catalog.data?.repositories).toEqual([]);
       });
     }),
+);
+
+async function mountAdmin() {
+  await act(async () => {
+    renderer = create(
+      <AppAtomRegistryProvider>
+        <Probe />
+      </AppAtomRegistryProvider>,
+    );
+  });
+  await act(async () => admin.refresh());
+}
+
+it.effect("retains GitHub data as unverified until its own reads recover", () =>
+  Effect.gen(function* () {
+    yield* runRelayRequests;
+    yield* Effect.promise(async () => {
+      const connection: RelayGithubConnection = {
+        installationId: "installation",
+        accountLogin: "acme",
+        accountType: "Organization",
+        connectedByUserId: "account",
+        connectedAt: "2026-10-20",
+      };
+      const mutationError = new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "register relay repository",
+        cause: "Registration failed",
+      });
+      const connectionError = new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "read relay GitHub connection",
+        cause: "Connection check failed",
+      });
+      const repositoriesError = new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "list relay GitHub repositories",
+        cause: "Installation token rejected",
+      });
+      let readFailure: "connection" | "repositories" | null = null;
+      let installationId = connection.installationId;
+      fixture.client = {
+        ...fixture.client,
+        getGithubConnection: () =>
+          readFailure === "connection"
+            ? Effect.fail(connectionError)
+            : Effect.succeed({
+                connection: { ...connection, installationId },
+                installUrl: "https://example.test/install",
+                appSlug: null,
+                setupCallbackUrl: null,
+              }),
+        listGithubRepositories: () =>
+          readFailure === "repositories" ? Effect.fail(repositoriesError) : Effect.succeed([]),
+        registerRepository: () => Effect.fail(mutationError),
+      };
+      await mountAdmin();
+      expect(admin.snapshot?.github.connection).toEqual(connection);
+      expect(admin.githubReadError).toBeNull();
+
+      await act(async () => {
+        await admin.registerRepository({
+          name: "Repository",
+          canonicalKey: "github.com/acme/repository",
+        });
+      });
+      expect(admin.error).toBe(mutationError.message);
+      expect(admin.githubReadError).toBeNull();
+
+      readFailure = "connection";
+      await act(async () => admin.refresh());
+      expect(admin.githubReadError).toBe(connectionError.message);
+      expect(admin.githubConnectionVerified).toBe(false);
+      expect(admin.snapshot?.github.connection).toEqual(connection);
+
+      readFailure = "repositories";
+      await act(async () => admin.refresh());
+      expect(admin.githubReadError).toBe(repositoriesError.message);
+      expect(admin.githubConnectionVerified).toBe(true);
+      expect(admin.snapshot?.github.connection).toEqual(connection);
+
+      installationId = "replacement";
+      await act(async () => admin.refresh());
+      expect(admin.githubReadError).toBe(repositoriesError.message);
+      expect(admin.githubConnectionVerified).toBe(false);
+      expect(admin.snapshot?.github.connection).toEqual(connection);
+
+      readFailure = null;
+      await act(async () => admin.refresh());
+      expect(admin.githubReadError).toBeNull();
+      expect(admin.error).toBeNull();
+      expect(admin.githubConnectionVerified).toBe(true);
+      expect(admin.snapshot?.github.connection).toEqual({ ...connection, installationId });
+    });
+  }),
+);
+
+it.effect("installation lookup can be retried without setting a global settings error", () =>
+  Effect.gen(function* () {
+    yield* runRelayRequests;
+    yield* Effect.promise(async () => {
+      const error = new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "list relay GitHub installations",
+        cause: "Upstream unavailable",
+      });
+      const installation: RelayGithubInstallationCandidate = {
+        installationId: "installation",
+        accountLogin: "acme",
+        accountType: "Organization",
+        createdAt: "2026-10-20",
+        connected: false,
+      };
+      const list = vi
+        .fn<ManagedRelayTenancy.ManagedRelayTenancyClient["Service"]["listGithubInstallations"]>()
+        .mockReturnValueOnce(Effect.fail(error))
+        .mockReturnValueOnce(Effect.succeed([installation]));
+      fixture.client = { ...fixture.client, listGithubInstallations: list };
+      await mountAdmin();
+
+      await expect(admin.listGithubInstallations()).rejects.toThrow(error.message);
+      expect(admin.error).toBeNull();
+      expect(admin.githubReadError).toBeNull();
+      await expect(admin.listGithubInstallations()).resolves.toEqual([installation]);
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(admin.error).toBeNull();
+    });
+  }),
 );

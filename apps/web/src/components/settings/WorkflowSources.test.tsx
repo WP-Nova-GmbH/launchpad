@@ -1,7 +1,15 @@
 import * as Schema from "effect/Schema";
 import type { WorkflowAutomation } from "@t3tools/contracts/workflows";
 import { WorkflowTriggerInspector } from "../workflows/WorkflowTriggerInspector";
-import { act, useState, createElement, type PropsWithChildren, type ComponentType } from "react";
+import {
+  act,
+  createElement,
+  useState,
+  type ComponentType,
+  type PropsWithChildren,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
@@ -45,13 +53,14 @@ const fixture = vi.hoisted(() => ({
     | null
     | ((body: typeof BeginWorkflowSource.Type) => Response | Promise<Response>),
   dropWithdraw: false,
+  confirm: vi.fn<(message: string) => Promise<boolean>>(),
 }));
 vi.mock("@clerk/react", () => ({
   useAuth: () => ({ userId: fixture.account, isLoaded: true, getToken: fixture.getToken }),
 }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => fixture.navigate }));
 vi.mock("../../cloud/publicConfig", () => ({ resolveRelayClerkTokenOptions: () => ({}) }));
-vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: () => Promise.resolve(true) }));
+vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: fixture.confirm }));
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
@@ -111,6 +120,46 @@ vi.mock("../ui/select", () => {
     SelectItem: part,
   };
 });
+vi.mock("../ui/menu", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../ui/menu")>();
+  const { cloneElement, createContext, useContext, useState } = await import("react");
+  const MenuOpen = createContext<[boolean, (open: boolean) => void]>([false, () => {}]);
+  return {
+    ...original,
+    Menu: ({ children }: PropsWithChildren) => {
+      const state = useState(false);
+      return <MenuOpen.Provider value={state}>{children}</MenuOpen.Provider>;
+    },
+    MenuTrigger: ({
+      render,
+      children,
+    }: PropsWithChildren<{ render: ReactElement<{ onClick: () => void }> }>) => {
+      const [open, setOpen] = useContext(MenuOpen);
+      return cloneElement(render, { onClick: () => setOpen(!open) }, children);
+    },
+    MenuPopup: ({ children }: PropsWithChildren) => (useContext(MenuOpen)[0] ? children : null),
+    MenuItem: ({
+      children,
+      onClick,
+      disabled,
+    }: PropsWithChildren<{ onClick: () => void; disabled?: boolean }>) => {
+      const [, setOpen] = useContext(MenuOpen);
+      return (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            setOpen(false);
+            onClick();
+          }}
+        >
+          {children}
+        </button>
+      );
+    },
+    MenuSeparator: () => null,
+  };
+});
 vi.mock("../ui/sheet", () => {
   const part = ({ children }: PropsWithChildren) => children;
   return {
@@ -122,11 +171,17 @@ vi.mock("../ui/sheet", () => {
   };
 });
 vi.mock("./settingsLayout", () => ({
-  SettingsSection: ({
-    children,
-    headerAction,
-  }: PropsWithChildren<{ headerAction?: React.ReactNode }>) =>
+  SettingsSection: ({ children, headerAction }: PropsWithChildren<{ headerAction?: ReactNode }>) =>
     createElement("section", null, headerAction, children),
+  SettingsRow: ({
+    title,
+    description,
+    control,
+  }: {
+    title: ReactNode;
+    description?: ReactNode;
+    control?: ReactNode;
+  }) => createElement("div", null, title, description, control),
 }));
 vi.mock("./settingsSearch", () => ({
   searchableSetting: (id: string) => ({ id, title: "Workflow sources" }),
@@ -258,6 +313,7 @@ beforeEach(() => {
   fixture.begins = [];
   fixture.beginReply = null;
   fixture.dropWithdraw = false;
+  fixture.confirm.mockReset().mockResolvedValue(true);
   fixture.owner = {
     configured: true,
     applicationId: "app",
@@ -582,14 +638,14 @@ const mountOwner = async () => {
   });
   await drain();
 };
+const openOwnerActions = () => click(`Linear connection actions for ${source.workspaceName}`);
 const refreshOwner = async () => {
-  await act(async () => {
-    renderer.root
-      .findAllByType("button")
-      .find((b) => b.props["aria-label"] === "Refresh workflow sources")!
-      .props.onClick();
-  });
-  await drain();
+  if (button("Retry connections")) await click("Retry connections");
+  else if (button("Refresh workflow sources")) await click("Refresh workflow sources");
+  else {
+    if (!button("Refresh status")) await openOwnerActions();
+    await click("Refresh status");
+  }
 };
 const click = async (label: string) => {
   await act(async () => {
@@ -742,7 +798,13 @@ it.effect("lets admins check an unavailable connection directly in Organization 
       await click("Check connection");
       expect(words()).toContain("Connected");
       expect(words()).not.toContain("Linear unavailable");
-      expect(checkConnectionInDisclosure()).toBe(true);
+      expect(button("Check connection")).toBeUndefined();
+      expect(button("Reconnect Linear")).toBeUndefined();
+      expect(button("Disconnect")).toBeUndefined();
+      await openOwnerActions();
+      expect(button("Check connection").props.disabled).toBe(false);
+      expect(button("Reconnect Linear").props.disabled).toBe(false);
+      expect(button("Disconnect").props.disabled).toBe(false);
     });
   }),
 );
@@ -763,30 +825,170 @@ const pendingB = () => {
 };
 const links = () => renderer.root.findAllByType("a");
 
-it.effect("lets admins withdraw a hidden repository's access and reconciles a lost reply", () =>
+it.effect("starts fresh authorization once first-time Linear configuration is restored", () =>
   Effect.gen(function* () {
     yield* serveRequests;
     yield* Effect.promise(async () => {
       fixture.owner = {
         ...fixture.owner,
-        connections: [source],
-        withdrawableGrants: [
-          { grantId: "hidden", connectionId: source.connectionId, repositoryName: null },
+        configured: false,
+        applicationId: null,
+      };
+      await mountOwner();
+      expect(button("Connect Linear workspace")).toBeUndefined();
+      expect(button("Retry authorization")).toBeUndefined();
+      await refreshOwner();
+      expect(fixture.begins).toHaveLength(0);
+
+      const failedAttemptId = "first-authorization";
+      fixture.owner = {
+        ...fixture.owner,
+        configured: true,
+        applicationId: "app",
+        version: 2,
+        attempt: {
+          attemptId: failedAttemptId,
+          connectionId: null,
+          expiresAt: 600000,
+          status: "failed",
+          canResume: false,
+          error: "service_configuration",
+        },
+      };
+      await refreshOwner();
+      expect(words()).toContain("Linear authorization did not finish");
+      expect(button("Connect Linear workspace")).toBeUndefined();
+      expect(button("Refresh connection status")).toBeUndefined();
+      await click("Retry authorization");
+      expect(fixture.begins).toHaveLength(1);
+      expect(fixture.begins[0]).toMatchObject({ connectionId: null, expectedVersion: 2 });
+      expect(fixture.begins[0]?.attemptId).not.toBe(failedAttemptId);
+      expect(window.open).toHaveBeenCalledExactlyOnceWith(
+        links()[0]!.props.href,
+        "_blank",
+        "noopener,noreferrer",
+      );
+    });
+  }),
+);
+
+it.effect(
+  "names the repository in withdrawal confirmations and keeps the hidden grant actionable",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        fixture.owner = {
+          ...fixture.owner,
+          connections: [source],
+          withdrawableGrants: [
+            { grantId: "hidden", connectionId: source.connectionId, repositoryName: null },
+            {
+              grantId: "visible",
+              connectionId: source.connectionId,
+              repositoryName: "Visible repository",
+            },
+          ],
+        };
+        await mountOwner();
+        expect(words()).toContain("Repository no longer visible");
+        expect(words()).toContain("You can still withdraw");
+        fixture.dropWithdraw = true;
+        await click("Withdraw access");
+        expect(fixture.confirm).toHaveBeenLastCalledWith(
+          "Withdraw this repository's source access? Starting and running work may continue.",
+        );
+        expect(words()).not.toContain("Repository no longer visible");
+        expect(words()).toContain("Visible repository");
+        expect(fixture.owner.withdrawableGrants.map((g) => g.grantId)).toEqual(["visible"]);
+
+        fixture.confirm.mockResolvedValueOnce(false);
+        await click("Withdraw access for Visible repository");
+        expect(fixture.confirm).toHaveBeenLastCalledWith(
+          "Withdraw source access for Visible repository? Starting and running work may continue.",
+        );
+        expect(fixture.owner.withdrawableGrants.map((g) => g.grantId)).toEqual(["visible"]);
+
+        fixture.dropWithdraw = false;
+        await click("Withdraw access for Visible repository");
+        expect(fixture.owner.withdrawableGrants).toHaveLength(0);
+      });
+    }),
+);
+it.effect("identifies same-named repositories before withdrawing a specific grant", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      const otherSource = {
+        ...source,
+        connectionId: "old-connection",
+        applicationId: "old-app",
+        workspaceId: "old-workspace",
+        workspaceName: "Old workspace",
+        status: "disconnected" as const,
+      };
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source, otherSource],
+        repositories: [
+          { repositoryId: "platform-repo", organizationId: source.organizationId, name: "API" },
+          { repositoryId: "services-repo", organizationId: source.organizationId, name: "api" },
+        ],
+        grants: [
           {
-            grantId: "visible",
+            grantId: "old-grant",
+            connectionId: otherSource.connectionId,
+            organizationId: source.organizationId,
+            repositoryId: "legacy-repo",
+            generation: 1,
+            revoked: false,
+          },
+        ],
+        withdrawableGrants: [
+          {
+            grantId: "platform-grant",
             connectionId: source.connectionId,
-            repositoryName: "Visible repository",
+            repositoryName: "API",
+            repositoryRemote: "github.com/platform/api",
+          },
+          {
+            grantId: "services-grant",
+            connectionId: source.connectionId,
+            repositoryName: "API",
+            repositoryRemote: "github.com/services/api",
+          },
+          {
+            grantId: "old-grant",
+            connectionId: otherSource.connectionId,
+            repositoryName: "API",
           },
         ],
       };
       await mountOwner();
-      expect(words()).toContain("Repository no longer visible");
-      expect(words()).toContain("You can still withdraw");
-      fixture.dropWithdraw = true;
-      await click("Withdraw access");
-      expect(words()).not.toContain("Repository no longer visible");
-      expect(words()).toContain("Visible repository");
-      expect(fixture.owner.withdrawableGrants.map((g) => g.grantId)).toEqual(["visible"]);
+      expect(words()).toContain('"github.com/platform/api"');
+      expect(words()).toContain('"github.com/services/api"');
+      expect(words()).toContain('"Repository ID legacy-repo"');
+      fixture.confirm.mockResolvedValueOnce(false);
+      await click("Withdraw access for API (github.com/services/api)");
+      expect(fixture.confirm).toHaveBeenLastCalledWith(
+        "Withdraw source access for API (github.com/services/api)? Starting and running work may continue.",
+      );
+      expect(fixture.owner.withdrawableGrants).toHaveLength(3);
+
+      await click("Withdraw access for API (github.com/services/api)");
+      expect(fixture.owner.withdrawableGrants.map(({ grantId }) => grantId)).toEqual([
+        "platform-grant",
+        "old-grant",
+      ]);
+      await click("Withdraw access for API (Repository ID legacy-repo)");
+      expect(fixture.confirm).toHaveBeenLastCalledWith(
+        "Withdraw source access for API (Repository ID legacy-repo)? Starting and running work may continue.",
+      );
+      expect(fixture.owner.withdrawableGrants.map(({ grantId }) => grantId)).toEqual([
+        "platform-grant",
+      ]);
+      expect(words()).toContain('"github.com/platform/api"');
+      expect(button("Withdraw access for API (github.com/platform/api)")).toBeDefined();
     });
   }),
 );
@@ -848,7 +1050,12 @@ it.effect(
     Effect.gen(function* () {
       yield* serveRequests;
       yield* Effect.promise(async () => {
-        await mountOwner();
+        await act(async () => {
+          renderer = create(
+            <OwnerSources accountId="owner" organizationId={RelayOrganizationId.make("org")} />,
+          );
+        });
+        await drain();
         await click("Connect Linear workspace");
         fixture.beginReply = () => {
           throw new Error("Begin reply lost after commit");
@@ -947,6 +1154,7 @@ it.effect("keeps the selected repository while a cancelled exchange is still in 
       };
       await refreshOwner();
       expect(button("Allow repository").props.disabled).toBe(true);
+      await openOwnerActions();
       expect(button("Reconnect Linear").props.disabled).toBe(true);
       expect(button("Check connection").props.disabled).toBe(true);
       expect(button("Disconnect").props.disabled).toBe(false);
@@ -974,9 +1182,10 @@ it.effect("lets an admin cancel another admin's pending authorization", () =>
       };
       await mountOwner();
       expect(button("Continue authorization")).toBeUndefined();
-      expect(button("Connect Linear workspace")).toBeDefined();
+      expect(button("Connect Linear workspace")).toBeUndefined();
       await click("Cancel authorization");
       expect(words()).not.toContain("Waiting for Linear authorization.");
+      expect(button("Connect Linear workspace")).toBeDefined();
     });
   }),
 );

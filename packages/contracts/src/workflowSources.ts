@@ -78,7 +78,12 @@ export const WorkflowSourceOwner = Schema.Struct({
   ),
   grants: Schema.Array(WorkflowSourceGrant),
   withdrawableGrants: Schema.Array(
-    Schema.Struct({ grantId: Id, connectionId: Id, repositoryName: Schema.NullOr(Schema.String) }),
+    Schema.Struct({
+      grantId: Id,
+      connectionId: Id,
+      repositoryName: Schema.NullOr(Schema.String),
+      repositoryRemote: Schema.optionalKey(Schema.String),
+    }),
   ),
 });
 export type WorkflowSourceOwner = typeof WorkflowSourceOwner.Type;

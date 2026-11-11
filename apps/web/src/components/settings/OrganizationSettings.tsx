@@ -3,6 +3,7 @@ import { WorkflowSourcesSettings } from "./WorkflowSources";
 import {
   BuildingIcon,
   CopyIcon,
+  EllipsisIcon,
   FolderGit2Icon,
   KeyRoundIcon,
   ServerIcon,
@@ -11,9 +12,18 @@ import {
   UploadIcon,
   UsersIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useAuth } from "@clerk/react";
 import type {
+  RelayGithubConnection,
   RelayGithubInstallationCandidate,
   RelayInvitation,
   RelayMachine,
@@ -41,10 +51,20 @@ import {
 } from "../../cloud/organizationAdmin";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
 import { Input } from "../ui/input";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Spinner } from "../ui/spinner";
 import { useAtomValue } from "@effect/atom-react";
@@ -1012,67 +1032,258 @@ function SkillsSection({ state }: { state: OrganizationAdminState }) {
   );
 }
 
+function GithubConnectionRow({
+  connection,
+  isAdmin,
+  disabled,
+  checking,
+  unverified,
+  connectionVerified,
+  onChangeRepositories,
+  onDisconnect,
+}: {
+  connection: RelayGithubConnection;
+  isAdmin: boolean;
+  disabled: boolean;
+  checking: boolean;
+  unverified: boolean;
+  connectionVerified: boolean;
+  onChangeRepositories: (() => void) | undefined;
+  onDisconnect: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const actionsTrigger = useRef<HTMLButtonElement>(null);
+  const connectedDate = connection.connectedAt.slice(0, 10);
+  const disconnectDisabled = disabled || (unverified && !connectionVerified);
+
+  return (
+    <>
+      <SettingsRow
+        title={<span className="wrap-anywhere">{connection.accountLogin}</span>}
+        description={
+          <>
+            Since <time dateTime={connectedDate}>{connectedDate}</time>
+          </>
+        }
+        control={
+          <div className="flex flex-wrap items-center gap-2">
+            <span role="status">
+              <Badge variant={checking || unverified ? "secondary" : "success"}>
+                {checking ? "Checking status…" : unverified ? "Connection unverified" : "Connected"}
+              </Badge>
+            </span>
+            {isAdmin ? (
+              <>
+                {onChangeRepositories ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={disabled}
+                    onClick={onChangeRepositories}
+                  >
+                    Change repositories
+                  </Button>
+                ) : null}
+                <Menu>
+                  <MenuTrigger
+                    ref={actionsTrigger}
+                    disabled={disconnectDisabled}
+                    render={
+                      <Button
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label="GitHub connection actions"
+                      />
+                    }
+                  >
+                    <EllipsisIcon />
+                  </MenuTrigger>
+                  <MenuPopup align="end">
+                    <MenuItem
+                      variant="destructive"
+                      disabled={disconnectDisabled}
+                      onClick={() => setConfirming(true)}
+                    >
+                      Disconnect…
+                    </MenuItem>
+                  </MenuPopup>
+                </Menu>
+              </>
+            ) : null}
+          </div>
+        }
+      />
+      <AlertDialog open={isAdmin && confirming} onOpenChange={setConfirming}>
+        <AlertDialogPopup finalFocus={actionsTrigger}>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Disconnect GitHub?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Launchpad and organization executors will lose access through this GitHub
+              installation.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+            <Button
+              variant="destructive"
+              disabled={!isAdmin || disconnectDisabled}
+              onClick={() => {
+                setConfirming(false);
+                onDisconnect();
+              }}
+            >
+              Disconnect
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </>
+  );
+}
+
+function GithubInstallationPicker({
+  list,
+  connect,
+  disabled,
+}: {
+  list: OrganizationAdminState["listGithubInstallations"];
+  connect: OrganizationAdminState["connectGithub"];
+  disabled: boolean;
+}) {
+  const [installations, setInstallations] = useState<
+    ReadonlyArray<RelayGithubInstallationCandidate>
+  >([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const pending = useRef<symbol | null>(null);
+
+  const load = useCallback(
+    async (supersede = false) => {
+      if (pending.current !== null && !supersede) return;
+      const request = Symbol();
+      pending.current = request;
+      setLoading(true);
+      try {
+        const candidates = await list();
+        if (pending.current === request) {
+          setInstallations(candidates);
+          setError(null);
+        }
+      } catch (cause) {
+        if (pending.current === request) {
+          setError(cause instanceof Error ? cause.message : "Could not list GitHub installations.");
+        }
+      } finally {
+        if (pending.current === request) {
+          pending.current = null;
+          setLoading(false);
+        }
+      }
+    },
+    [list],
+  );
+
+  useEffect(() => {
+    let active = true;
+    const onFocus = () => void load(true);
+    queueMicrotask(() => {
+      if (active) void load();
+    });
+    window.addEventListener("focus", onFocus);
+    return () => {
+      active = false;
+      pending.current = null;
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [load]);
+
+  if (!loading && !error && installations.length === 0) return null;
+
+  return (
+    <div className="space-y-1 px-3 py-3 sm:px-4">
+      <h3 className="text-xs font-medium text-muted-foreground">Existing installations</h3>
+      {error ? (
+        <div className="flex flex-wrap items-center justify-between gap-2 py-1.5">
+          <p role="alert" className="min-w-0 wrap-anywhere text-xs text-destructive">
+            {error}
+          </p>
+          <Button
+            size="xs"
+            variant="outline"
+            disabled={disabled || loading}
+            onClick={() => void load()}
+          >
+            Retry installations
+          </Button>
+        </div>
+      ) : loading && !installations.length ? (
+        <p role="status" className="text-xs text-muted-foreground">
+          Checking for installations…
+        </p>
+      ) : null}
+      {installations.length > 0 ? (
+        <ul className="divide-y divide-border/50">
+          {installations.map((installation) => (
+            <li
+              key={installation.installationId}
+              className="flex items-center justify-between gap-3 py-1.5"
+            >
+              <div className="min-w-0 wrap-anywhere text-xs">
+                <p className="font-medium">{installation.accountLogin}</p>
+                <p className="text-muted-foreground">{installation.accountType}</p>
+              </div>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={disabled || loading || Boolean(error)}
+                aria-label={`Connect ${installation.accountLogin}`}
+                onClick={() => void connect(installation.installationId)}
+              >
+                Connect
+              </Button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 function GithubSection({ state }: { state: OrganizationAdminState }) {
   const snapshot = state.snapshot;
   const isAdmin = snapshot?.membership.role === "admin";
   const connection = snapshot?.github.connection ?? null;
   const installUrl = snapshot?.github.installUrl ?? null;
-  const [installations, setInstallations] =
-    useState<ReadonlyArray<RelayGithubInstallationCandidate> | null>(null);
-
-  // An App installed straight from GitHub — by this organization or by a
-  // customer's — never comes back through the relay's callback, so GitHub is
-  // asked which installations exist and the admin picks theirs.
-  const listInstallations = state.listGithubInstallations;
-  const canPickInstallation = isAdmin && installUrl !== null && connection === null;
-  useEffect(() => {
-    if (!canPickInstallation) {
-      setInstallations(null);
-      return;
-    }
-    void listInstallations().then(setInstallations);
-  }, [canPickInstallation, listInstallations]);
-
-  // The GitHub steps finish in a browser tab, and the relay has the result by
-  // the time the admin comes back — so regaining focus is the moment to look.
+  const disabled = state.busy || state.loading;
+  const unverified = Boolean(state.githubReadError);
   const refresh = state.refresh;
+
   useEffect(() => {
     if (!isAdmin) return;
-    const onFocus = () => {
-      void refresh();
-      if (canPickInstallation) void listInstallations().then(setInstallations);
-    };
+    const onFocus = () => void refresh();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [canPickInstallation, isAdmin, listInstallations, refresh]);
+  }, [isAdmin, refresh]);
 
   // GitHub sends the id in the query string on its way back from the install.
-  useEffect(() => {
-    if (!isAdmin || connection) return;
-    const params = new URLSearchParams(window.location.search);
-    const installationId = params.get("installation_id");
-    if (!installationId) return;
-    void state.connectGithub(installationId).then(() => {
+  const finishInstallation = useEffectEvent((installationId: string) =>
+    state.connectGithub(installationId).then(() => {
       stripQueryParams(["installation_id", "setup_action"]);
-    });
-  }, [connection, isAdmin, state]);
+    }),
+  );
+  useEffect(() => {
+    if (!isAdmin || connection !== null) return;
+    const installationId = new URLSearchParams(window.location.search).get("installation_id");
+    if (installationId) void finishInstallation(installationId);
+  }, [connection, isAdmin]);
 
   if (!snapshot) return null;
-  if (!installUrl && !connection) {
-    // No GitHub App on this relay: nothing an organization can do about it here.
-    return (
-      <SettingsSection
-        id={searchableSetting("organization-github").id}
-        title={searchableSetting("organization-github").title}
-        icon={<GitHubIcon className="size-4 text-muted-foreground" />}
-      >
-        <SectionNote>
-          GitHub is not set up on this Launchpad yet. Its operator configures the Launchpad GitHub
-          app on the relay; connecting becomes one click here afterwards.
-        </SectionNote>
-      </SettingsSection>
-    );
-  }
+
+  const startInstallation = () => {
+    void state.startGithubInstall().then((install) => {
+      if (install) openGithubJourney(install.installUrl);
+    });
+  };
 
   return (
     <SettingsSection
@@ -1080,123 +1291,100 @@ function GithubSection({ state }: { state: OrganizationAdminState }) {
       title={searchableSetting("organization-github").title}
       icon={<GitHubIcon className="size-4 text-muted-foreground" />}
     >
-      <SectionNote>
-        Connecting installs an app on GitHub, which lets this organization see those repositories
-        and register them without typing their addresses. The access belongs to the organization, so
-        members share it and nobody needs their own GitHub token.
-      </SectionNote>
       {connection ? (
+        <GithubConnectionRow
+          key={connection.installationId}
+          connection={connection}
+          isAdmin={isAdmin}
+          disabled={disabled}
+          checking={state.loading}
+          unverified={unverified}
+          connectionVerified={state.githubConnectionVerified}
+          onChangeRepositories={installUrl ? startInstallation : undefined}
+          onDisconnect={() => void state.disconnectGithub()}
+        />
+      ) : unverified ? null : installUrl ? (
         <SettingsRow
-          title={connection.accountLogin}
-          description={`Connected ${connection.connectedAt.slice(0, 10)}. Every member of this organization reaches these repositories; nobody needs their own GitHub token.`}
+          title="No GitHub connection"
+          description={
+            isAdmin
+              ? "Connect an installation to discover and register its repositories."
+              : "Ask an organization admin to connect GitHub."
+          }
           control={
             isAdmin ? (
-              <div className="flex items-center gap-2">
-                {installUrl ? (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={state.busy}
-                    onClick={() =>
-                      void state.startGithubInstall().then((install) => {
-                        if (install) openGithubJourney(install.installUrl);
-                      })
-                    }
-                  >
-                    Change repositories
-                  </Button>
-                ) : null}
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={state.busy}
-                  onClick={() => void state.disconnectGithub()}
-                >
-                  Disconnect
-                </Button>
-              </div>
+              <Button size="sm" disabled={disabled} onClick={startInstallation}>
+                Connect GitHub
+              </Button>
             ) : null
           }
         />
       ) : (
         <SettingsRow
-          title="Connect GitHub"
-          description="Install the app on a GitHub organization, or on just the repositories you choose. Access belongs to this organization afterwards, not to you."
-          control={
-            isAdmin && installUrl ? (
-              <Button
-                size="sm"
-                disabled={state.busy}
-                onClick={() =>
-                  void state.startGithubInstall().then((install) => {
-                    if (install) openGithubJourney(install.installUrl);
-                  })
-                }
-              >
-                Connect GitHub
-              </Button>
-            ) : (
-              <span className="text-xs text-muted-foreground">Ask an admin to connect it.</span>
-            )
-          }
+          title="GitHub unavailable"
+          description="Ask your Launchpad operator to configure the GitHub app."
         />
       )}
-      {canPickInstallation && installations && installations.length > 0 ? (
-        <div className="space-y-1 px-3 pt-1 sm:px-4">
-          <p className="text-xs font-medium text-muted-foreground">
-            Already installed on GitHub — pick this organization&apos;s installation
-          </p>
-          {installations.map((installation) => (
-            <div
-              key={installation.installationId}
-              className="flex items-center justify-between gap-3 py-1"
-            >
-              <span className="min-w-0 truncate text-xs">
-                <span className="font-medium">{installation.accountLogin}</span>
-                <span className="text-muted-foreground"> · {installation.accountType}</span>
-              </span>
-              <Button
-                size="sm"
-                variant="outline"
-                className="shrink-0"
-                disabled={state.busy}
-                onClick={() => void state.connectGithub(installation.installationId)}
-              >
-                Connect
-              </Button>
-            </div>
-          ))}
-        </div>
+      {unverified ? (
+        <SettingsRow
+          title="GitHub status could not be checked"
+          description={connection ? "Showing the last available repository list." : undefined}
+          control={
+            <Button size="sm" variant="outline" disabled={disabled} onClick={() => void refresh()}>
+              Retry GitHub status
+            </Button>
+          }
+        />
+      ) : null}
+      {isAdmin && installUrl && !connection && !unverified ? (
+        <GithubInstallationPicker
+          list={state.listGithubInstallations}
+          connect={state.connectGithub}
+          disabled={disabled}
+        />
       ) : null}
 
-      {connection && snapshot.githubRepositories.length > 0 ? (
-        <div className="space-y-1 px-3 pt-1 sm:px-4">
-          <p className="text-xs font-medium text-muted-foreground">
-            Repositories this installation can see
-          </p>
-          {snapshot.githubRepositories.map((repository) => (
-            <div key={repository.fullName} className="flex items-center justify-between gap-3 py-1">
-              <span className="min-w-0 truncate font-mono text-xs">{repository.fullName}</span>
-              {repository.registered ? (
-                <Badge variant="secondary">Registered</Badge>
-              ) : isAdmin ? (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  disabled={state.busy}
-                  onClick={() =>
-                    void state.registerRepository({
-                      name: repository.name,
-                      canonicalKey: repository.canonicalKey,
-                    })
-                  }
+      {connection ? (
+        <div className="space-y-1 px-3 py-3 sm:px-4">
+          <h3 className="text-xs font-medium text-muted-foreground">Available repositories</h3>
+          {snapshot.githubRepositories.length > 0 ? (
+            <ul className="divide-y divide-border/50">
+              {snapshot.githubRepositories.map((repository) => (
+                <li
+                  key={repository.fullName}
+                  className="flex min-h-10 items-center justify-between gap-3 py-1.5 sm:min-h-9"
                 >
-                  Register
-                </Button>
-              ) : null}
-            </div>
-          ))}
+                  <span className="min-w-0 wrap-anywhere font-mono text-xs">
+                    {repository.fullName}
+                  </span>
+                  {repository.registered ? (
+                    <Badge variant="secondary">Registered</Badge>
+                  ) : isAdmin ? (
+                    <Button
+                      size="xs"
+                      variant="outline"
+                      disabled={disabled || unverified}
+                      aria-label={`Register ${repository.fullName}`}
+                      onClick={() =>
+                        void state.registerRepository({
+                          name: repository.name,
+                          canonicalKey: repository.canonicalKey,
+                        })
+                      }
+                    >
+                      Register
+                    </Button>
+                  ) : (
+                    <Badge variant="outline">Unregistered</Badge>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              No repositories are available to this installation.
+            </p>
+          )}
         </div>
       ) : null}
     </SettingsSection>
@@ -1644,7 +1832,12 @@ function ConfiguredOrganizationSettings() {
         <>
           <OrganizationSection state={state} />
           <MembersSection state={state} />
-          <GithubSection state={state} />
+          {state.snapshot && state.snapshot.membership.userId === userId ? (
+            <GithubSection
+              key={`${userId}:${state.snapshot.membership.organization.organizationId}:${state.snapshot.membership.role}`}
+              state={state}
+            />
+          ) : null}
           {state.snapshot && state.snapshot.membership.userId === userId ? (
             <WorkflowSourcesSettings
               organizationId={state.snapshot.membership.organization.organizationId}

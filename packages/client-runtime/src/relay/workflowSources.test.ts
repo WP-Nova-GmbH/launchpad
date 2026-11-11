@@ -75,6 +75,42 @@ describe("workflow source client", () => {
       ),
     ),
   );
+  it.effect(
+    "decodes owner withdrawal targets from relays with and without repository remotes",
+    () => {
+      const withdrawableGrants = [
+        { grantId: "legacy", connectionId: "owned", repositoryName: "API" },
+        {
+          grantId: "visible",
+          connectionId: "owned",
+          repositoryName: "API",
+          repositoryRemote: "github.com/northstar/api",
+        },
+        { grantId: "hidden", connectionId: "owned", repositoryName: null },
+      ];
+      return Effect.gen(function* () {
+        const client = yield* Sources.client;
+        const owner = yield* client.owner("token", RelayOrganizationId.make("org"));
+        expect(owner.withdrawableGrants).toStrictEqual(withdrawableGrants);
+      }).pipe(
+        Effect.provide(
+          layer(async () =>
+            Response.json({
+              configured: true,
+              applicationId: "app",
+              version: 2,
+              exchangeInProgress: false,
+              attempt: null,
+              connections: [],
+              repositories: [],
+              grants: [],
+              withdrawableGrants,
+            }),
+          ),
+        ),
+      );
+    },
+  );
   it.effect("decodes a Begin link independently of a newer owner snapshot", () =>
     Effect.gen(function* () {
       const client = yield* Sources.client;

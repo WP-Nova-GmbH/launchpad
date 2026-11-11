@@ -58,6 +58,45 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         }),
       ),
   );
+  it.effect("identifies same-named withdrawal grants with the earliest organization alias", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = (yield* RelayDb).$client;
+        yield* sql`UPDATE relay_repositories SET name='API' WHERE repository_id IN ('repo','repo-2')`;
+        yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name) VALUES ('repo-3','org','Without alias')`;
+        yield* sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES
+          ('github.com/northstar-mirror/api','repo','org','2026-10-03'),
+          ('github.com/northstar-z/api','repo','org','2026-10-02'),
+          ('github.com/northstar-a/api','repo','org','2026-10-02'),
+          ('github.com/northstar-labs/api','repo-2','org','2026-10-01'),
+          ('github.com/other/api','repo','other-org','2026-10-01'),
+          ('github.com/other/hidden','repo-3','other-org','2026-10-01')`;
+        yield* createConnection();
+        yield* allow();
+        yield* allow("grant-2", "repo-2");
+        yield* allow("grant-3", "repo-3");
+
+        const snapshot = yield* Sources.owner("org", "admin");
+        expect(
+          snapshot.withdrawableGrants.toSorted((a, b) => a.grantId.localeCompare(b.grantId)),
+        ).toStrictEqual([
+          {
+            grantId: "grant",
+            connectionId: "connection",
+            repositoryName: "API",
+            repositoryRemote: "github.com/northstar-a/api",
+          },
+          {
+            grantId: "grant-2",
+            connectionId: "connection",
+            repositoryName: "API",
+            repositoryRemote: "github.com/northstar-labs/api",
+          },
+          { grantId: "grant-3", connectionId: "connection", repositoryName: "Without alias" },
+        ]);
+      }),
+    ),
+  );
   it.effect("never resurrects withdrawn consent through old Allow/Withdraw retries", () =>
     withDatabase(
       Effect.gen(function* () {
