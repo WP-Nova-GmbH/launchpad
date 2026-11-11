@@ -314,22 +314,31 @@ export const metadata = Effect.fn("workflowSources.linear.metadata")(function* (
       ? "teams(first:$first,after:$after)"
       : kind === "states"
         ? "team(id:$team) { id page: states(first:$first,after:$after)"
-        : "issueLabels(first:$first,after:$after,filter:{isGroup:{eq:false},or:[{team:{id:{eq:$team}}},{team:{null:true}}]})";
+        : "issueLabels(first:$first,after:$after,filter:{isGroup:{eq:false},or:[{team:{id:{eq:$teamFilterId}}},{team:{null:true}}]})";
   const pageFields = "{ nodes { id name archivedAt } pageInfo { hasNextPage endCursor } }";
   const query =
     kind === "states"
       ? `query WorkflowSourceStates($first:Int!,$after:String,$team:String!) { organization {id} page: ${connection} ${pageFields} } }`
-      : `query WorkflowSourceMetadata($first:Int!,$after:String${kind === "labels" ? ",$team:String!" : ""}) { organization {id} ${kind === "labels" ? "team(id:$team){id}" : ""} page: ${connection} ${pageFields} }`;
+      : `query WorkflowSourceMetadata($first:Int!,$after:String${kind === "labels" ? ",$team:String!,$teamFilterId:ID!" : ""}) { organization {id} ${kind === "labels" ? "team(id:$team){id}" : ""} page: ${connection} ${pageFields} }`;
   const result = yield* graphql<
     | Effect.Success<ReturnType<typeof decodeTeams>>["data"]
     | Effect.Success<ReturnType<typeof decodeStates>>["data"]
     | Effect.Success<ReturnType<typeof decodeLabels>>["data"]
-  >(token, query, { first, after, ...(teamId ? { team: teamId } : {}) }, (value) =>
-    kind === "states"
-      ? decodeStates(value)
-      : kind === "labels"
-        ? decodeLabels(value)
-        : decodeTeams(value),
+  >(
+    token,
+    query,
+    {
+      first,
+      after,
+      ...(teamId ? { team: teamId } : {}),
+      ...(kind === "labels" ? { teamFilterId: teamId } : {}),
+    },
+    (value) =>
+      kind === "states"
+        ? decodeStates(value)
+        : kind === "labels"
+          ? decodeLabels(value)
+          : decodeTeams(value),
   );
   if (result.organization.id !== workspace)
     return yield* fail("workspace_mismatch", "Linear returned a different workspace.");

@@ -1,5 +1,6 @@
 import { ProviderDriverKind, defaultInstanceIdForDriver } from "@t3tools/contracts";
 import {
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
   WorkflowInvalidError,
   type WorkflowDefinition,
   type WorkflowVmModelCatalog,
@@ -55,7 +56,12 @@ export function vmWorkflowDefinitionIssue(
 ): string | null {
   if (baseBranch !== null && !validBranchName(baseBranch)) return "Enter a valid Git branch name.";
   for (const step of steps) {
-    if (step.kind !== "agent" || !step.modelSelection) continue;
+    if (step.kind !== "agent") continue;
+    if (!step.modelSelection) {
+      if (catalog && !catalog.models.some(({ slug }) => slug === WORKFLOW_VM_DEFAULT_CODEX_MODEL))
+        return "The workflow VM build does not support the managed default Codex model.";
+      continue;
+    }
     const { instanceId, model, options } = step.modelSelection;
     if (instanceId !== codexInstanceId) return "Choose a managed Codex model for this VM workflow.";
     if (!catalog)

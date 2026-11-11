@@ -9,6 +9,8 @@ const Instruction = TrimmedNonEmptyString.check(Schema.isMaxLength(32_000));
 const Revision = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
 
 export const WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT = 500;
+export const WORKFLOW_VM_DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
+export const WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT = "high";
 
 export const WorkflowAgentStep = Schema.Struct({
   id: Label,

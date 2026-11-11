@@ -7,6 +7,7 @@ import {
   codexSessionAppServerArgs,
   managedCodexEnvironment,
   managedCodexModelIssue,
+  managedCodexModelProbePolicy,
   codexExecLaunchArgs,
   resolveCodexLaunchArgs,
 } from "./codexLaunchArgs.ts";
@@ -79,6 +80,14 @@ describe("organization-managed Codex launch", () => {
         configs.findLast((value) => value.startsWith("model_provider=")),
         'model_provider="launchpad_vm"',
       );
+      NodeAssert.equal(
+        configs.findLast((value) => value.startsWith("model=")),
+        'model="gpt-6.1-sol"',
+      );
+      NodeAssert.equal(
+        configs.findLast((value) => value.startsWith("model_reasoning_effort=")),
+        'model_reasoning_effort="high"',
+      );
       const provider = configs.at(-1)!;
       NodeAssert.ok(provider.startsWith("model_providers.launchpad_vm={"));
       NodeAssert.ok(provider.includes('base_url="https://api.openai.com/v1"'));
@@ -90,6 +99,12 @@ describe("organization-managed Codex launch", () => {
       NodeAssert.ok(!provider.includes("env_key"));
       NodeAssert.ok(!provider.includes("experimental_bearer_token"));
     }
+  });
+
+  it("advertises Sol as the default while retaining Astra as a choice", () => {
+    const policy = managedCodexModelProbePolicy();
+    NodeAssert.equal(policy.defaultModel, "gpt-6.1-sol");
+    NodeAssert.ok(policy.modelSlugs.includes("gpt-6-astra"));
   });
 
   it("does not inherit personal credentials or an overriding Launchpad argument variable", () => {

@@ -94,7 +94,8 @@ const harnessCommand = Effect.fn("VmWorkload.owned_harness")(function* (
     .run({
       command: "/opt/launchpad/bin/launchpad-workload",
       args,
-      timeout: "10 seconds",
+      // The identity helper hashes the pinned Codex executable on cold VM storage.
+      timeout: action === "provider-identity" ? "30 seconds" : "10 seconds",
       maxOutputBytes: 4096,
     })
     .pipe(

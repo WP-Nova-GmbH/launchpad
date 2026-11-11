@@ -124,7 +124,12 @@ describe("verified event admission (PostgreSQL)", () => {
                 },
                 templateBuildId: "fixture",
                 workflowExecutionEnabled: true,
-                workflowModelCatalog: { defaultModel: "fixture-model", models: [] },
+                workflowModelCatalog: {
+                  defaultModel: "gpt-6.1-sol",
+                  models: [
+                    { slug: "gpt-6.1-sol", name: "Sol", isCustom: false, capabilities: null },
+                  ],
+                },
                 hostId: "host",
                 maxRunningVms: 1,
                 publicRelayUrl: "https://relay.test",

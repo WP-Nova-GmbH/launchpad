@@ -149,12 +149,18 @@ describe("native Linear workflow adapter", () => {
             expect(request.body._tag).toBe("Uint8Array");
             if (request.body._tag === "Uint8Array") {
               const body = JSON.parse(new TextDecoder().decode(request.body.body));
-              expect(body.variables).toEqual({ first: 25, after: "previous", team: "team" });
+              expect(body.variables).toEqual({
+                first: 25,
+                after: "previous",
+                team: "team",
+                ...(kind === "labels" ? { teamFilterId: "team" } : {}),
+              });
               expect(body.query).toContain(
                 kind === "states" ? "states(first:$first,after:$after)" : "isGroup:{eq:false}",
               );
               if (kind === "labels") {
-                expect(body.query).toContain("{team:{id:{eq:$team}}}");
+                expect(body.query).toContain("$teamFilterId:ID!");
+                expect(body.query).toContain("{team:{id:{eq:$teamFilterId}}}");
                 expect(body.query).toContain("{team:{null:true}}");
               }
             }

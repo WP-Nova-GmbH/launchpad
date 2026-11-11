@@ -741,6 +741,34 @@ it.effect("retains the verification command's exit and decoding failure", () =>
   }),
 );
 
+it.effect("accepts a valid provider identity after the usual control deadline", () =>
+  Effect.gen(function* () {
+    const identity = {
+      bootId,
+      groupId: group.id,
+      pid: 123,
+      startTicks: "98765",
+      executableSha256: "b".repeat(64),
+    };
+    const spawned = yield* Deferred.make<void>();
+    const receipt = yield* Deferred.make<void>();
+    const raw = ChildProcessSpawner.make((command) =>
+      Deferred.succeed(spawned, undefined).pipe(
+        Effect.andThen(Deferred.await(receipt)),
+        Effect.andThen(respond(json(identity)).spawn(command)),
+      ),
+    );
+    const pending = yield* readVmHarnessIdentity(group.id, 123).pipe(
+      Effect.provideService(VmControlSpawner, raw),
+      Effect.forkChild,
+    );
+    yield* Deferred.await(spawned);
+    yield* TestClock.adjust("15 seconds");
+    yield* Deferred.succeed(receipt, undefined);
+    expect(yield* Fiber.join(pending)).toEqual(identity);
+  }),
+);
+
 it.effect("retains the underlying timeout instead of disguising it as a decode error", () =>
   Effect.gen(function* () {
     const spawned = yield* Deferred.make<void>();
@@ -753,11 +781,11 @@ it.effect("retains the underlying timeout instead of disguising it as a decode e
       Effect.forkChild,
     );
     yield* Deferred.await(spawned);
-    yield* TestClock.adjust("10 seconds");
+    yield* TestClock.adjust("30 seconds");
     expect(yield* Fiber.join(pending)).toMatchObject({
       reason: "timeout",
       action: "provider-identity",
-      cause: { _tag: "ProcessTimeoutError", timeoutMs: 10_000 },
+      cause: { _tag: "ProcessTimeoutError", timeoutMs: 30_000 },
     });
   }),
 );

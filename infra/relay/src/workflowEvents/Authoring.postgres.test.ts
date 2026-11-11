@@ -248,7 +248,10 @@ const vmSettings = {
   workflowExecutionEnabled: true,
   workflowModelCatalog: {
     defaultModel: "fixture-model",
-    models: [{ slug: "fixture-model", name: "Fixture", isCustom: false, capabilities: null }],
+    models: [
+      { slug: "fixture-model", name: "Fixture", isCustom: false, capabilities: null },
+      { slug: "gpt-6.1-sol", name: "Sol", isCustom: false, capabilities: null },
+    ],
   },
   hostId: "host",
   maxRunningVms: 1,

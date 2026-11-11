@@ -195,4 +195,16 @@ describe("VM workflow definition checks", () => {
       ),
     ).toMatch(/options supported/);
   });
+
+  it("requires a verified catalog to offer Sol for steps using the managed default", () => {
+    const astra = { slug: "gpt-6-astra", name: "Astra", isCustom: false, capabilities: null };
+    const sol = { slug: "gpt-6.1-sol", name: "Sol", isCustom: false, capabilities: null };
+    const catalog = { defaultModel: astra.slug, models: [astra] };
+    expect(vmWorkflowDefinitionIssue(null, definition.steps, catalog)).toMatch(
+      /does not support the managed default Codex model/,
+    );
+    expect(
+      vmWorkflowDefinitionIssue(null, definition.steps, { ...catalog, models: [astra, sol] }),
+    ).toBeNull();
+  });
 });

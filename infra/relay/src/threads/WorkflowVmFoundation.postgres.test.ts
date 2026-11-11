@@ -491,6 +491,13 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
                   instruction: "Implement",
                   modelSelection: null,
                 },
+                {
+                  kind: "agent",
+                  id: "explicit",
+                  title: "Check",
+                  instruction: "Check",
+                  modelSelection: { instanceId: "codex", model: "gpt-6-astra" },
+                },
               ],
             },
           };
@@ -537,7 +544,13 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
                 hostId,
                 maxRunningVms: 1,
                 workflowExecutionEnabled: true,
-                workflowModelCatalog: { defaultModel: "default-model", models: [] },
+                workflowModelCatalog: {
+                  defaultModel: "gpt-6-astra",
+                  models: [
+                    { slug: "gpt-6-astra", name: "Astra", isCustom: false, capabilities: null },
+                    { slug: "gpt-6.1-sol", name: "Sol", isCustom: false, capabilities: null },
+                  ],
+                },
                 templateBuildId: "pinned-build",
                 publicRelayUrl: "https://relay.test",
                 compute: {
@@ -581,10 +594,27 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           ).toBe(first.operationId);
           yield* first.capacity.cancelUnstarted(first.operationId);
 
+          const managedDefault = {
+            instanceId: "codex",
+            model: "gpt-6.1-sol",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          };
           expect(yield* advance).toMatchObject({
             status: "preparing",
             runtime: { kind: "vm", threadId },
+            workflow: {
+              definition: {
+                steps: [
+                  { id: "agent", modelSelection: managedDefault },
+                  { id: "explicit", modelSelection: { instanceId: "codex", model: "gpt-6-astra" } },
+                ],
+              },
+            },
           });
+          expect(
+            yield* sql`SELECT initial_state::jsonb->'modelSelection' AS model_selection
+            FROM relay_thread_vm_setups WHERE allocation_id=${jobId}`,
+          ).toEqual([{ model_selection: managedDefault }]);
           expect(yield* first.capacity.get(jobId)).toMatchObject({ state: "reserved" });
           expect(
             yield* makeThreadVmProvisionStore(sql).get(jobId, "organization_workflow"),

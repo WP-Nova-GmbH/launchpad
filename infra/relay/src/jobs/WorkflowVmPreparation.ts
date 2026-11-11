@@ -1,6 +1,8 @@
 import { ProviderDriverKind, ThreadId, defaultInstanceIdForDriver } from "@t3tools/contracts";
 import { RelayThreadVmInitialThread } from "@t3tools/contracts/relay";
 import {
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+  WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT,
   isTerminalWorkflowJob,
   type RepositoryWorkflow,
   type WorkflowQueueReason,
@@ -424,6 +426,26 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
     );
     if (!settings.workflowModelCatalog || modelIssue)
       return yield* block(modelIssue ?? "Verify the workflow VM build before starting this run.");
+    const firstAgent = definition.definition.steps.find((step) => step.kind === "agent");
+    const managedDefault = {
+      instanceId: defaultInstanceIdForDriver(ProviderDriverKind.make("codex")),
+      model: WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+      options: [{ id: "reasoningEffort", value: WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT }],
+    };
+    const initialModel = firstAgent?.modelSelection ?? managedDefault;
+    // Generic project creation leaves its default model unset. Freeze each Agent's
+    // effective model here so the guest can start with the admitted selection.
+    const workflow: RepositoryWorkflow = {
+      ...definition,
+      definition: {
+        ...definition.definition,
+        steps: definition.definition.steps.map((step) =>
+          step.kind === "agent" && step.modelSelection === null
+            ? { ...step, modelSelection: managedDefault }
+            : step,
+        ),
+      },
+    };
     if (!(yield* capacity.hasWorkflowSlot(settings.hostId, row.organizationId))) return job;
     const app = yield* Effect.serviceOption(GithubApp);
     if (Option.isNone(app)) return yield* block("Configure the organization's GitHub App.");
@@ -436,7 +458,6 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
     );
     if ("jobId" in git) return git;
 
-    const catalog = settings.workflowModelCatalog;
     const box = yield* RelaySecretBox;
     const linearWorkflow = Option.getOrUndefined(
       yield* Effect.serviceOption(RelayConfiguration),
@@ -466,16 +487,10 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           (allocation_id,operation_id,generation,workflow_snapshot)
           VALUES (${job.jobId},${operationId},1,${sql.json({ ...git, templateBuildId: settings.templateBuildId })})`;
         const timestamp = DateTime.formatIso(yield* DateTime.now);
-        const model = definition.definition.steps.find(
-          (step) => step.kind === "agent",
-        )?.modelSelection;
         const initialState = yield* encodeInitialThread({
           title: definition.definition.name,
           createdAt: timestamp,
-          modelSelection: model ?? {
-            instanceId: defaultInstanceIdForDriver(ProviderDriverKind.make("codex")),
-            model: catalog.defaultModel,
-          },
+          modelSelection: initialModel,
         });
         yield* sql`INSERT INTO relay_thread_vm_setups (allocation_id,canonical_key,branch,revision,initial_state)
           VALUES (${job.jobId},${git.canonicalKey},${jobBranchName(job.jobId)},${git.commitSha},${initialState})`;
@@ -483,7 +498,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           { ...row, repositoryCanonicalKey: git.canonicalKey },
           {
             ...job,
-            workflow: definition,
+            workflow,
             status: "preparing",
             runtime: { kind: "vm", threadId },
             startAttempted: false,

@@ -1,11 +1,14 @@
+import {
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+  WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT,
+} from "@t3tools/contracts/workflows";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 
 const T3CODE_CODEX_LAUNCH_ARGS_ENV = "T3CODE_CODEX_LAUNCH_ARGS";
 export const MANAGED_CODEX_MODEL_PROVIDER = "launchpad_vm";
-const MANAGED_CODEX_DEFAULT_MODEL = "gpt-6-astra";
 export const MANAGED_CODEX_MODELS = new Set([
-  "gpt-6.1-sol",
-  MANAGED_CODEX_DEFAULT_MODEL,
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+  "gpt-6-astra",
   "gpt-6-sol",
   "gpt-6-luna",
   "gpt-5.6-sol",
@@ -27,7 +30,9 @@ const managedCodexProviderArgs = (
   "-c",
   `model_provider="${MANAGED_CODEX_MODEL_PROVIDER}"`,
   "-c",
-  `model="${MANAGED_CODEX_DEFAULT_MODEL}"`,
+  `model="${WORKFLOW_VM_DEFAULT_CODEX_MODEL}"`,
+  "-c",
+  `model_reasoning_effort="${WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT}"`,
   "-c",
   `model_providers.${MANAGED_CODEX_MODEL_PROVIDER}={name="Organization Codex",base_url=${JSON.stringify(baseUrl)},wire_api="responses",requires_openai_auth=false,supports_websockets=false,auth={command=${JSON.stringify(authCommand)},args=${JSON.stringify(authArgs)},timeout_ms=10000,refresh_interval_ms=300000}}`,
 ];
@@ -50,7 +55,7 @@ export const workflowCodexSandboxPolicy = () => ({
 /** This policy is emitted by the packaged guest for the offline runner smoke probe. */
 export const managedCodexModelProbePolicy = () => ({
   schemaVersion: 1 as const,
-  defaultModel: MANAGED_CODEX_DEFAULT_MODEL,
+  defaultModel: WORKFLOW_VM_DEFAULT_CODEX_MODEL,
   modelSlugs: [...MANAGED_CODEX_MODELS],
   workflowSandboxPolicy: workflowCodexSandboxPolicy(),
   probeArgs: [
