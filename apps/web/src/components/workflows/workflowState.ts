@@ -146,13 +146,15 @@ export const savedWorkflowDraft = (
   error: null,
 });
 
-function workflowTemplateNeedsCheckout(template: "review" | "publish", vmAuthoring: boolean) {
+export type WorkflowTemplate = "review" | "publish";
+
+export function workflowTemplateNeedsCheckout(template: WorkflowTemplate, vmAuthoring: boolean) {
   return template === "publish" || !vmAuthoring;
 }
 
 export function newWorkflowDraft(
   projects: ReadonlyArray<RelayOrganizationProject>,
-  template: "review" | "publish" = "review",
+  template: WorkflowTemplate = "review",
   vmAuthoring = false,
 ): WorkflowEditorDraft | null {
   const project = projects[0];
@@ -274,7 +276,11 @@ export async function openNewWorkflowDraft(
     throw new Error(
       "Enroll an organization machine with a checkout in the destination repository first.",
     );
-  return replaceNewWorkflowDraft(appAtomRegistry, scope, previous, draft) ? draft.workflowId : null;
+  if (!replaceNewWorkflowDraft(appAtomRegistry, scope, previous, draft))
+    throw new Error(
+      "The retained draft changed while you were confirming. Review it before trying again.",
+    );
+  return draft.workflowId;
 }
 
 export function useActiveWorkflowView() {

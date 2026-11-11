@@ -877,8 +877,9 @@ describe("workflow templates and copies", () => {
     confirmation.mockReturnValueOnce(confirm.promise);
     const pending = openNewWorkflowDraft(scope, () => newWorkflowDraft([project], "publish"));
     await rename("Changed during confirmation");
+    const rejected = expect(pending).rejects.toThrow("The retained draft changed");
     confirm.resolve(true);
-    expect(await pending).toBeNull();
+    await rejected;
     expect(newId()).toBe(id);
     editWorkflowDraft(scope, id, (draft) => ({
       ...draft,

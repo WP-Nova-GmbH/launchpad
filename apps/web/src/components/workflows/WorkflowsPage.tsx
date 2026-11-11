@@ -6,7 +6,6 @@ import {
   ArrowLeftIcon,
   CopyIcon,
   EllipsisIcon,
-  ChevronDownIcon,
   ChevronRightIcon,
   PencilIcon,
   PlayIcon,
@@ -37,7 +36,6 @@ import {
   workflowEditorDirty,
   workflowDraftAutomationResolved,
   clearWorkflowScope,
-  startNewWorkflowDraft,
   replaceNewWorkflowDraft,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -54,6 +52,7 @@ import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { Spinner } from "../ui/spinner";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
 import { WorkflowCopyDialog } from "./WorkflowCopyDialog";
+import { WorkflowCatalogEmpty, WorkflowTemplateDialog } from "./WorkflowTemplateDialog";
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
 import { WorkflowJob } from "./WorkflowJob";
@@ -67,6 +66,8 @@ import {
   newWorkflowDraft,
   copiedWorkflowDraft,
   workflowCopyNeedsCheckout,
+  workflowTemplateNeedsCheckout,
+  type WorkflowTemplate,
   openNewWorkflowDraft,
   useActiveWorkflowView,
   confirmWorkflow,
@@ -361,6 +362,34 @@ function WorkflowRepositoryView({
   const [loaded, setLoaded] = useState(false);
   const [codexRefreshVersion, setCodexRefreshVersion] = useState(0);
   const active = useActiveWorkflowView();
+  const canChooseTemplate = canConfigure && view === "catalog" && tab === "workflows";
+  const [templateOpen, setTemplateOpen] = useState(false);
+  const [templateBusy, setTemplateBusy] = useState(false);
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  const templateRequest = useRef<object | null>(null);
+  const closeTemplates = useCallback(() => {
+    templateRequest.current = null;
+    setTemplateOpen(false);
+    setTemplateBusy(false);
+    setTemplateError(null);
+  }, []);
+  const templateCatalog = useRef({ canChooseTemplate, projects, projectsUnavailable, vmAuthoring });
+  useLayoutEffect(() => {
+    templateCatalog.current = { canChooseTemplate, projects, projectsUnavailable, vmAuthoring };
+    // oxlint-disable-next-line react/set-state-in-effect -- Cancel pending confirmation when its catalog view loses ownership.
+    if (!canChooseTemplate && templateOpen) closeTemplates();
+  }, [canChooseTemplate, projects, projectsUnavailable, vmAuthoring, templateOpen, closeTemplates]);
+  const newWorkflowSlot = workflowSessionKey(scope, "new");
+  const newWorkflowId = drafts.newWorkflowIds[newWorkflowSlot];
+  const newWorkflow = newWorkflowId
+    ? drafts.editors[workflowSessionKey(scope, newWorkflowId)]
+    : undefined;
+  const retainedDraft = newWorkflow?.baseline ? undefined : newWorkflow;
+  const retainedDraftRecovery =
+    canConfigure && retainedDraft && vmAuthoring === null
+      ? "Your draft is kept. Retry to load workflow settings before resuming it."
+      : null;
+  const firstWorkflow = loaded && !error && workflows.length === 0;
   const [copy, setCopy] = useState<RepositoryWorkflow | null>(null);
   const listedCopySource =
     copy && workflows.find((workflow) => workflow.workflowId === copy.workflowId);
@@ -405,6 +434,7 @@ function WorkflowRepositoryView({
   useLayoutEffect(
     () => () => {
       copyRequest.current = null;
+      templateRequest.current = null;
     },
     [],
   );
@@ -477,21 +507,76 @@ function WorkflowRepositoryView({
       }
     }
   };
-  const useTemplate = async (template: "review" | "publish") => {
-    if (vmAuthoring === null) return;
+  const openDraft = () =>
+    void navigate({
+      to: "/workflows/$repositoryId/new",
+      params: { repositoryId: scope.repositoryId },
+    });
+  const resumeDraft = () => {
+    const state = appAtomRegistry.get(workflowDraftAtom);
+    const currentId = state.newWorkflowIds[newWorkflowSlot];
+    const current = currentId ? state.editors[workflowSessionKey(scope, currentId)] : undefined;
+    if (
+      templateCatalog.current.canChooseTemplate &&
+      templateCatalog.current.vmAuthoring !== null &&
+      state.accountId === scope.accountId &&
+      current === retainedDraft &&
+      current &&
+      !current.baseline
+    )
+      openDraft();
+  };
+  const openTemplates = () => {
+    setTemplateError(null);
+    setTemplateOpen(true);
+  };
+  const useTemplate = async (template: WorkflowTemplate) => {
+    if (!canChooseTemplate || vmAuthoring === null || templateRequest.current) return;
+    const request = {};
+    templateRequest.current = request;
+    setTemplateBusy(true);
+    setTemplateError(null);
+    const owns = () => active.current && templateRequest.current === request;
     try {
-      const id = await openNewWorkflowDraft(scope, () =>
-        active.current ? newWorkflowDraft(projects, template, !!vmAuthoring) : null,
-      );
-      if (active.current && id)
-        void navigate({
-          to: "/workflows/$repositoryId/new",
-          params: { repositoryId: scope.repositoryId },
-        });
+      const id = await openNewWorkflowDraft(scope, () => {
+        const current = templateCatalog.current;
+        if (!owns() || !current.canChooseTemplate || current.vmAuthoring === null) return null;
+        if (
+          workflowTemplateNeedsCheckout(template, !!current.vmAuthoring) &&
+          !current.projects.length
+        )
+          throw new Error(
+            current.projectsUnavailable
+              ? "Machine checkouts could not be loaded. Retry loading checkouts."
+              : "This template requires a Machine checkout in this repository.",
+          );
+        return newWorkflowDraft(current.projects, template, !!current.vmAuthoring);
+      });
+      if (!owns() || !templateCatalog.current.canChooseTemplate || !id) return;
+      closeTemplates();
+      openDraft();
     } catch (cause) {
-      if (active.current) setError(workflowError(cause));
+      if (owns() && templateCatalog.current.canChooseTemplate)
+        setTemplateError(workflowError(cause));
+    } finally {
+      if (owns()) {
+        templateRequest.current = null;
+        setTemplateBusy(false);
+      }
     }
   };
+  const creationActions = canChooseTemplate ? (
+    <div className="flex flex-wrap gap-2">
+      {retainedDraft && !retainedDraft.operation ? (
+        <Button variant="outline" disabled={vmAuthoring === null} onClick={openTemplates}>
+          Start another workflow
+        </Button>
+      ) : null}
+      <Button disabled={vmAuthoring === null} onClick={retainedDraft ? resumeDraft : openTemplates}>
+        {retainedDraft ? "Resume new workflow" : "Create workflow"}
+      </Button>
+    </div>
+  ) : null;
   const loadGeneration = useRef(0);
   const refresh = useCallback(async () => {
     const generation = ++loadGeneration.current;
@@ -986,17 +1071,17 @@ function WorkflowRepositoryView({
                 </Button>
               }
             >
-              {error} Showing the last available data. Your edits are kept.
+              {error}{" "}
+              {workflowId || vmAuthoring !== null
+                ? "Showing the last available data. Your edits are kept."
+                : (retainedDraftRecovery ??
+                  "Retry to load workflow settings before creating a workflow.")}
             </WorkflowAlert>
           </div>
         ) : null}
         {!loaded ? (
           <Spinner />
-        ) : !workflowId && vmAuthoring === null ? (
-          <p className="px-4 py-2 text-sm text-muted-foreground">
-            Refresh the workflow catalog before creating a workflow.
-          </p>
-        ) : (
+        ) : !workflowId && vmAuthoring === null ? null : (
           <WorkflowBuilder
             scope={scope}
             repositoryName={entry.repository.name}
@@ -1044,6 +1129,33 @@ function WorkflowRepositoryView({
           }}
           onClose={closeCopy}
           onCopy={() => void copySaved()}
+        />
+      ) : null}
+      {templateOpen && canChooseTemplate && vmAuthoring !== null ? (
+        <WorkflowTemplateDialog
+          repositoryName={entry.repository.name}
+          vmAuthoring={!!vmAuthoring}
+          hasMachineCheckout={projects.length > 0}
+          projectsUnavailable={projectsUnavailable}
+          busy={templateBusy}
+          error={templateError}
+          onRefreshCheckouts={() => {
+            setTemplateError(null);
+            refreshOrganizationCatalog();
+          }}
+          onOpenMachines={
+            organizationAdmin
+              ? () => {
+                  closeTemplates();
+                  void navigate({
+                    to: "/settings/organization",
+                    hash: searchableSetting("organization-machines").id,
+                  });
+                }
+              : undefined
+          }
+          onCreate={(template) => void useTemplate(template)}
+          onClose={closeTemplates}
         />
       ) : null}
       <WorkspacePageHeader electron={isElectron}>
@@ -1095,7 +1207,8 @@ function WorkflowRepositoryView({
                 </Button>
               }
             >
-              {error} Showing the last available data.
+              {error}{" "}
+              {(canChooseTemplate && retainedDraftRecovery) || "Showing the last available data."}
             </WorkflowAlert>
           ) : null}
           {!loaded ? (
@@ -1177,58 +1290,24 @@ function WorkflowRepositoryView({
                       repositoryId={scope.repositoryId}
                       repositoryName={entry.repository.name}
                     />
-                    <Menu>
-                      <MenuTrigger
-                        render={<Button variant="outline" disabled={vmAuthoring === null} />}
-                      >
-                        Use template <ChevronDownIcon />
-                      </MenuTrigger>
-                      <MenuPopup>
-                        <MenuItem onClick={() => void useTemplate("review")}>
-                          Agent → Review
-                        </MenuItem>
-                        <MenuItem
-                          disabled={!projects.length}
-                          onClick={() => void useTemplate("publish")}
-                        >
-                          Reviewed implementation → PR (Machine)
-                        </MenuItem>
-                      </MenuPopup>
-                    </Menu>
-                    <Button
-                      disabled={vmAuthoring === null}
-                      onClick={() => {
-                        if (vmAuthoring === null) return;
-                        startNewWorkflowDraft(
-                          appAtomRegistry,
-                          scope,
-                          () => newWorkflowDraft(projects, "review", !!vmAuthoring),
-                          true,
-                        );
-                        navigate({
-                          to: "/workflows/$repositoryId/new",
-                          params: { repositoryId: scope.repositoryId },
-                        });
-                      }}
-                    >
-                      {drafts.newWorkflowIds[workflowSessionKey(scope, "new")] &&
-                      !drafts.editors[
-                        workflowSessionKey(
-                          scope,
-                          drafts.newWorkflowIds[workflowSessionKey(scope, "new")]!,
-                        )
-                      ]?.baseline
-                        ? "Resume new workflow"
-                        : "Create workflow"}
-                    </Button>
+                    {firstWorkflow ? null : creationActions}
                   </div>
                 ) : null}
               </div>
               {tab === "workflows" ? (
                 <div className="@container/workflow-catalog">
                   {rows(false)}
-                  {!workflows.some((workflow) => !workflow.archived) ? (
-                    <p className="py-6 text-sm text-muted-foreground">No workflows yet.</p>
+                  {firstWorkflow ? (
+                    <WorkflowCatalogEmpty
+                      actions={creationActions}
+                      draftName={
+                        canChooseTemplate && retainedDraft
+                          ? retainedDraft.definition.name || "New workflow"
+                          : undefined
+                      }
+                    />
+                  ) : workflows.length > 0 && workflows.every((workflow) => workflow.archived) ? (
+                    <p className="py-6 text-sm text-muted-foreground">No active workflows.</p>
                   ) : null}
                   {workflows.some((workflow) => workflow.archived) ? (
                     <details className="mt-6">

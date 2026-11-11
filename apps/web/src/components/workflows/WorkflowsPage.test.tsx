@@ -34,12 +34,18 @@ import type {
 import type { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
   setWorkflowSessionAccount,
+  startNewWorkflowDraft,
   workflowDraftAtom,
   workflowSessionKey,
   updateWorkflowDrafts,
   type WorkflowEditorDraft,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
+import {
+  readConfirmDialogState,
+  registerConfirmDialogHost,
+  respondToConfirmDialog,
+} from "../../confirmDialog";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { workflowVmCodexInstanceId } from "../settings/workflowModels";
 
@@ -245,7 +251,7 @@ vi.mock("../ui/select", () => {
 });
 
 import { WorkflowsPage } from "./WorkflowsPage";
-import { newWorkflowDraft, type useWorkflowClient } from "./workflowState";
+import { editWorkflowDraft, newWorkflowDraft, type useWorkflowClient } from "./workflowState";
 
 const repositoryId = RelayRepositoryId.make("repository");
 const canonicalKey = "github.com/launchpad/example";
@@ -402,6 +408,21 @@ async function press(label: string, waitForReads = true) {
       await Promise.all(deliveries.slice(before));
     });
 }
+const starterScope = { accountId: "account", organizationId: "organization", repositoryId };
+const newWorkflowRoute = {
+  to: "/workflows/$repositoryId/new",
+  params: { repositoryId },
+};
+function retainedStarter() {
+  const state = appAtomRegistry.get(workflowDraftAtom);
+  const id = state.newWorkflowIds[workflowSessionKey(starterScope, "new")];
+  return id ? state.editors[workflowSessionKey(starterScope, id)] : undefined;
+}
+function starterOption(value: "review" | "publish") {
+  return renderer!.root
+    .findAllByType("input")
+    .find((input) => input.props.type === "radio" && input.props.value === value)!;
+}
 function deferred<A>() {
   let resolve!: (value: A) => void;
   let reject!: (cause: unknown) => void;
@@ -520,6 +541,7 @@ it.effect(
         expect(content()).toContain("VM execution unavailable");
         expect(button("Run")).toBeUndefined();
         await press("Create workflow");
+        await press("Create draft");
         const state = appAtomRegistry.get(workflowDraftAtom);
         const id = state.newWorkflowIds[slot]!;
         expect(state.editors[workflowSessionKey(scope, id)]).toMatchObject({
@@ -783,7 +805,7 @@ it.effect("uses catalog Refresh to recover Machine choices and reload workflow d
       fixture.vmAuthoring = { models: null };
       fixture.definitions.mockResolvedValueOnce([]).mockResolvedValueOnce([workflow]);
       await mountCatalog();
-      expect(content()).toContain("No workflows yet.");
+      expect(content()).toContain("Create your first workflow");
       fixture.refreshCatalog.mockImplementationOnce(() => {
         fixture.projectsUnavailable = false;
         fixture.projects = [checkout];
@@ -791,10 +813,213 @@ it.effect("uses catalog Refresh to recover Machine choices and reload workflow d
       await press("Refresh workflows");
       expect(content()).toContain(workflow.definition.name);
       await press("Create workflow");
-      const scope = { accountId: "account", organizationId: "organization", repositoryId };
-      const state = appAtomRegistry.get(workflowDraftAtom);
-      const id = state.newWorkflowIds[workflowSessionKey(scope, "new")]!;
-      expect(state.editors[workflowSessionKey(scope, id)]?.targetConfirmed).toBe(false);
+      await press("Create draft");
+      expect(retainedStarter()?.targetConfirmed).toBe(false);
+    });
+  }),
+);
+
+it.effect("offers one first-workflow action and explains the unavailable publishing starter", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+      await mountCatalog();
+
+      expect(content()).toContain("Create your first workflow");
+      const createActions = renderer!.root
+        .findAllByType("button")
+        .filter(
+          (action) =>
+            action.children.filter((child) => typeof child === "string").join("") ===
+            "Create workflow",
+        );
+      expect(createActions).toHaveLength(1);
+      expect(button("Use template")).toBeUndefined();
+      await press("Create workflow");
+
+      expect(content()).toContain("Agent and review");
+      expect(content()).toContain("Review and open a pull request");
+      expect(content()).toContain("Requires a Machine checkout");
+      expect(starterOption("publish").props.disabled).toBe(true);
+      expect(starterOption("review").props.disabled).toBeFalsy();
+      expect(retainedStarter()).toBeUndefined();
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Create draft");
+      expect(retainedStarter()).toMatchObject({
+        baseline: null,
+        automation: { enabled: false, trigger: null },
+        definition: { target: { kind: "vm", baseBranch: null } },
+      });
+      expect(retainedStarter()?.definition.steps.map((step) => step.kind)).toEqual([
+        "agent",
+        "review",
+      ]);
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("does not reopen the template picker when returning from Runs", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+      fixture.page.mockResolvedValue({ jobs: [], nextCursor: null });
+      await mountCatalog();
+      await press("Create workflow");
+      expect(button("Create draft")).toBeDefined();
+
+      const renderPage = () =>
+        renderer!.update(
+          <AppAtomRegistryProvider>
+            <WorkflowsPage view="catalog" />
+          </AppAtomRegistryProvider>,
+        );
+      fixture.tab = "runs";
+      await act(renderPage);
+      expect(button("Create draft")).toBeUndefined();
+
+      fixture.tab = "workflows";
+      await act(renderPage);
+      expect(button("Create workflow")).toBeDefined();
+      expect(button("Create draft")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect("retries unavailable Machine checkouts and creates a publishing draft", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.projectsUnavailable = true;
+      fixture.definitions.mockResolvedValue([]);
+      await mountCatalog();
+      await press("Create workflow");
+
+      expect(content()).toContain("Could not load Machine checkouts");
+      expect(content()).not.toContain("Requires a Machine checkout");
+      expect(starterOption("publish").props.disabled).toBe(true);
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projectsUnavailable = false;
+        fixture.projects = [checkout];
+      });
+      await press("Retry loading checkouts");
+      expect(content()).not.toContain("Could not load Machine checkouts");
+      expect(starterOption("publish").props.disabled).toBeFalsy();
+
+      await act(() => starterOption("publish").props.onChange());
+      await press("Create draft");
+      const draft = retainedStarter();
+      expect(draft?.definition.target).toEqual({
+        kind: "machine",
+        environmentId: checkout.environmentId,
+        projectId: checkout.projectId,
+      });
+      expect(draft?.definition.steps.map((step) => step.title)).toEqual([
+        "Agent",
+        "Review changes",
+        "Push branch",
+        "Open PR",
+      ]);
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("resumes a retained workflow draft after retrying the catalog", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions
+        .mockRejectedValueOnce(new Error("Metadata offline"))
+        .mockResolvedValue([]);
+      const starter = newWorkflowDraft([], "review", true)!;
+      const draft = {
+        ...starter,
+        definition: { ...starter.definition, name: "Review the release" },
+      };
+      startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
+      await mountCatalog();
+
+      expect(content()).toContain(
+        "Your draft is kept. Retry to load workflow settings before resuming it.",
+      );
+      expect(button("Resume new workflow").props.disabled).toBe(true);
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Retry");
+      expect(button("Resume new workflow").props.disabled).toBe(false);
+      expect(button("Start another workflow").props.disabled).toBe(false);
+      await press("Resume new workflow");
+
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(retainedStarter()).toBe(draft);
+      expect(button("Create draft")).toBeUndefined();
+
+      await act(() => renderer!.unmount());
+      fixture.definitions.mockRejectedValueOnce(new Error("Metadata offline in editor"));
+      await mountCatalog("builder");
+      expect(content()).toContain(
+        "Your draft is kept. Retry to load workflow settings before resuming it.",
+      );
+      expect(button("Save")).toBeUndefined();
+
+      await press("Retry");
+      const name = renderer!.root.findByProps({ "aria-label": "Workflow name" });
+      expect(name.props.value).toBe(draft.definition.name);
+      expect(retainedStarter()).toBe(draft);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("explains when a retained draft changes during replacement confirmation", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+      const draft = newWorkflowDraft([], "review", true)!;
+      startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
+      const unregister = registerConfirmDialogHost();
+      try {
+        await mountCatalog();
+        await press("Start another workflow");
+        await press("Create draft");
+        expect(readConfirmDialogState().status).toBe("confirming");
+
+        await act(() =>
+          editWorkflowDraft(starterScope, draft.workflowId, (current) => ({
+            ...current,
+            definition: { ...current.definition, name: "Changed during confirmation" },
+          })),
+        );
+        await act(async () => respondToConfirmDialog(true));
+
+        expect(content()).toContain(
+          "The retained draft changed while you were confirming. Review it before trying again.",
+        );
+        expect(retainedStarter()).toMatchObject({
+          workflowId: draft.workflowId,
+          definition: { name: "Changed during confirmation" },
+        });
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      } finally {
+        unregister();
+      }
     });
   }),
 );

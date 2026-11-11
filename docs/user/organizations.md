@@ -209,7 +209,10 @@ in a job must use compatible providers of the same kind so they can share the co
 Model changes are available when that provider supports them. If its configuration becomes
 incompatible during a job, cancel the job and run it again after correcting the workflow.
 
-Start with **Agent → Review** or **Reviewed implementation → PR** from **Use template**, or build your own sequence. **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy. A VM workflow copied to another repository starts from the destination's default branch. Copies start with automatic triggering Off and no trigger.
+Choose **Create workflow** and pick a template to open an unsaved draft. **Review and open a pull request**
+requires a Machine checkout of the repository. You can change the steps in the editor.
+
+**Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy. A VM workflow copied to another repository starts from the destination's default branch. Copies start with automatic triggering Off and no trigger.
 
 **Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch. **Open PR** opens a PR against the base selected when the job was accepted; it requires a Push after the latest Agent step. Add Review before publishing when human approval is wanted. Workflows without publishing steps keep changes local. Publishing requires an updated Linux or macOS executor; PR publishing currently supports GitHub. Other forges are rejected before the run starts.
 
