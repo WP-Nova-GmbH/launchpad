@@ -249,6 +249,11 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
         </div>
       </div>
     );
+  const { membership } = catalog.data;
+  const organizationAdmin =
+    membership.userId === scope.accountId &&
+    membership.organization.organizationId === scope.organizationId &&
+    membership.role === "admin";
   return (
     <WorkflowRepositoryView
       key={workflowSessionKey(scope, "repository")}
@@ -268,6 +273,7 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
           entry.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
       )}
       canConfigure={catalog.data.membership.role === "admin" || entry.role === "maintainer"}
+      organizationAdmin={organizationAdmin}
       view={view}
     />
   );
@@ -313,6 +319,7 @@ function WorkflowRepositoryView({
   projectsUnavailable,
   refreshOrganizationCatalog,
   canConfigure,
+  organizationAdmin,
   view,
 }: {
   scope: WorkflowScope;
@@ -324,6 +331,7 @@ function WorkflowRepositoryView({
   projectsUnavailable: boolean;
   refreshOrganizationCatalog: () => void;
   canConfigure: boolean;
+  organizationAdmin: boolean;
   view: WorkflowView;
 }) {
   const navigate = useNavigate();
@@ -1143,6 +1151,7 @@ function WorkflowRepositoryView({
               jobId={jobId}
               projects={projects}
               canConfigure={canConfigure}
+              organizationAdmin={organizationAdmin}
               refreshCatalog={refreshView}
             />
           ) : (

@@ -879,6 +879,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "workflow-vms",
+    title: "Workflow VMs",
+    to: "/settings/organization",
+    cloudOnly: true,
+    searchTerms: ["automation VM concurrency organization limit"],
+  },
+  {
     id: "organization-machines",
     title: "Machines",
     to: "/settings/organization",

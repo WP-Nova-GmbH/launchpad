@@ -14,8 +14,9 @@ import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
+import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
-import { useCallback, useEffect, useState, useRef, useLayoutEffect } from "react";
+import { useCallback, useEffect, useState, useRef, useLayoutEffect, type RefObject } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openPortableThreadChat } from "../../state/threads";
@@ -67,33 +68,35 @@ import {
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
 
-/** A run update can move an action between the task card and the secondary controls. */
-function useRunActionFocus(runKey: string) {
-  const button = useRef<HTMLButtonElement | null>(null);
+/** Keep focus in the run when an update moves or removes the focused action. */
+function useRunActionFocus<
+  Action extends HTMLButtonElement | HTMLAnchorElement = HTMLButtonElement,
+>(runKey: string, fallback?: RefObject<HTMLElement | null>) {
+  const action = useRef<Action | null>(null);
   const focusedRun = useRef<string | null>(null);
-  const registerButton = useCallback(
-    (node: HTMLButtonElement | null) => {
-      const previous = button.current;
+  const registerAction = useCallback(
+    (node: Action | null) => {
+      const previous = action.current;
       if (!node && previous && previous.ownerDocument.activeElement === previous) {
         focusedRun.current = runKey;
       }
-      button.current = node;
+      action.current = node;
     },
     [runKey],
   );
   useLayoutEffect(() => {
-    const node = button.current;
+    const target = action.current ?? fallback?.current;
     if (
       focusedRun.current === runKey &&
-      node &&
-      !node.disabled &&
-      node.ownerDocument.activeElement === node.ownerDocument.body
+      target &&
+      !("disabled" in target && target.disabled) &&
+      target.ownerDocument.activeElement === target.ownerDocument.body
     ) {
-      node.focus();
+      target.focus();
     }
     focusedRun.current = null;
   });
-  return registerButton;
+  return registerAction;
 }
 
 export function WorkflowJob({
@@ -101,12 +104,14 @@ export function WorkflowJob({
   jobId,
   projects,
   canConfigure,
+  organizationAdmin,
   refreshCatalog,
 }: {
   scope: WorkflowScope;
   jobId: string;
   projects: ReadonlyArray<RelayOrganizationProject>;
   canConfigure: boolean;
+  organizationAdmin: boolean;
   refreshCatalog: () => void;
 }) {
   const navigate = useNavigate();
@@ -119,6 +124,8 @@ export function WorkflowJob({
   const key = workflowSessionKey(scope, jobId);
   const conversationButton = useRunActionFocus(key);
   const resumeButton = useRunActionFocus(key);
+  const runHeading = useRef<HTMLHeadingElement>(null);
+  const queuedRecoveryLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
   const resultRequest = useRef<{ key: string } | null>(null);
   useLayoutEffect(
     () => () => {
@@ -485,6 +492,18 @@ export function WorkflowJob({
   const pausedBeforeStep = manualHold && manualState.status === "waiting_capacity" && !checkpoint;
   const showPauseDetail = manualHold && !confirmationPending;
   const statusLabel = workflowStatusLabel(selectedJob.status);
+  const queueReason = selectedJob.queueReason?.code;
+  const queueReasonTask =
+    queueReason &&
+    (selectedJob.status === "queued" ||
+      (selectedJob.status === "preparing" && queueReason === "source_reconnect"))
+      ? workflowQueuedTasks[queueReason]
+      : undefined;
+  // The dispatcher can update the detail after a failed retry while retaining the queue reason.
+  const queuedTask =
+    queueReasonTask && (!detail || queueReasonTask.relayDetails.includes(detail))
+      ? queueReasonTask
+      : undefined;
   const taskTitle = composingFeedback
     ? "Request changes"
     : terminal
@@ -606,10 +625,10 @@ export function WorkflowJob({
       {runNavigation}
       <header>
         <span role="status" className="sr-only">
-          {statusLabel}
+          {queuedTask ? `${statusLabel}. ${queuedTask.title}` : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
-          <h1 className="text-xl font-semibold">
+          <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
             {selectedJob.workflow?.definition.name ?? "Workflow run"}
           </h1>
           {!StatusIcon ? (
@@ -659,74 +678,82 @@ export function WorkflowJob({
       ) : null}
       <div className="min-w-0 space-y-5">
         <section className="space-y-4" aria-label="Current workflow task">
-          <div
-            className={
-              StatusIcon
-                ? "space-y-3 rounded-lg border bg-card p-4 text-card-foreground"
-                : "space-y-3 border-t pt-5"
-            }
-          >
-            {StatusIcon || (!terminal && stepIndex >= 0) ? (
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                {StatusIcon ? (
-                  <span
-                    aria-hidden
-                    className={cn(
-                      "inline-flex items-center gap-2 text-sm font-medium",
-                      needsInput && "text-warning-foreground",
-                      running && "text-info-foreground",
-                    )}
-                  >
-                    <StatusIcon aria-hidden className="size-4" />
-                    {statusLabel}
-                  </span>
-                ) : null}
-                {!terminal && stepIndex >= 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    {pausedBeforeStep ? "Next step" : "Step"} {stepIndex + 1} of{" "}
-                    {selectedJob.workflow!.definition.steps.length}
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
-            {composingFeedback && checkpointStep && !stepRepeatsWorkflowName ? (
-              <p className="text-sm text-muted-foreground">{checkpointStep.title}</p>
-            ) : null}
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0 space-y-1">
-                {taskTitle ? (
-                  <h2 className={StatusIcon ? "text-base font-semibold" : "text-sm font-medium"}>
-                    {taskTitle}
-                  </h2>
-                ) : null}
-                {conversationInTask && nextStep ? (
-                  <p className="text-xs text-muted-foreground">Up next is {nextStep.title}.</p>
-                ) : null}
-                {showPauseDetail ? (
-                  <p className="text-xs text-muted-foreground">
-                    Setup and previews remain running.
-                  </p>
-                ) : null}
-              </div>
-              {composingFeedback ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    feedbackFocus.current = "button";
-                    setFeedbackView({ key: feedbackKey, open: false });
-                  }}
-                >
-                  Back to review
-                </Button>
+          {queuedTask ? (
+            <WorkflowQueuedTask
+              task={queuedTask}
+              organizationAdmin={organizationAdmin}
+              recoveryLinkRef={queuedRecoveryLink}
+            />
+          ) : (
+            <div
+              className={
+                StatusIcon
+                  ? "space-y-3 rounded-lg border bg-card p-4 text-card-foreground"
+                  : "space-y-3 border-t pt-5"
+              }
+            >
+              {StatusIcon || (!terminal && stepIndex >= 0) ? (
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  {StatusIcon ? (
+                    <span
+                      aria-hidden
+                      className={cn(
+                        "inline-flex items-center gap-2 text-sm font-medium",
+                        needsInput && "text-warning-foreground",
+                        running && "text-info-foreground",
+                      )}
+                    >
+                      <StatusIcon aria-hidden className="size-4" />
+                      {statusLabel}
+                    </span>
+                  ) : null}
+                  {!terminal && stepIndex >= 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      {pausedBeforeStep ? "Next step" : "Step"} {stepIndex + 1} of{" "}
+                      {selectedJob.workflow!.definition.steps.length}
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
-              {conversationInTask ? conversationActions : null}
-              {paused ? resumeAction : null}
+              {composingFeedback && checkpointStep && !stepRepeatsWorkflowName ? (
+                <p className="text-sm text-muted-foreground">{checkpointStep.title}</p>
+              ) : null}
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0 space-y-1">
+                  {taskTitle ? (
+                    <h2 className={StatusIcon ? "text-base font-semibold" : "text-sm font-medium"}>
+                      {taskTitle}
+                    </h2>
+                  ) : null}
+                  {conversationInTask && nextStep ? (
+                    <p className="text-xs text-muted-foreground">Up next is {nextStep.title}.</p>
+                  ) : null}
+                  {showPauseDetail ? (
+                    <p className="text-xs text-muted-foreground">
+                      Setup and previews remain running.
+                    </p>
+                  ) : null}
+                </div>
+                {composingFeedback ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      feedbackFocus.current = "button";
+                      setFeedbackView({ key: feedbackKey, open: false });
+                    }}
+                  >
+                    Back to review
+                  </Button>
+                ) : null}
+                {conversationInTask ? conversationActions : null}
+                {paused ? resumeAction : null}
+              </div>
+              {inputInTask ? checkpointResponse : null}
             </div>
-            {inputInTask ? checkpointResponse : null}
-          </div>
-          {selectedJob.status === "queued" ? (
+          )}
+          {selectedJob.status === "queued" && !queuedTask ? (
             <p className="text-sm text-muted-foreground">
               Waiting for an execution target. No steps have started.
             </p>
@@ -751,7 +778,9 @@ export function WorkflowJob({
               {detail ??
                 "This run stopped before completing. Open its conversation to review the result."}
             </WorkflowAlert>
-          ) : detail && !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
+          ) : !queuedTask &&
+            detail &&
+            !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
           {(reviewChanged && selectedJob.runtime?.kind !== "vm") ||

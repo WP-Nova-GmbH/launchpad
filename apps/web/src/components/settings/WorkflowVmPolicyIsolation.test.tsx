@@ -91,9 +91,10 @@ vi.mock("../../lib/runtime", async () => {
   };
 });
 vi.mock("./settingsSearch", () => ({
-  searchableSetting: () => ({ id: "organization-thread-vms" }),
+  searchableSetting: (id: string) => ({ id }),
 }));
 vi.mock("./settingsLayout", () => ({
+  SettingsSearchTarget: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   SettingsSection: ({ children }: { children: ReactNode }) => <section>{children}</section>,
   SettingsRow: ({
     title,
@@ -126,12 +127,14 @@ const visibleText = (node: ReactTestInstance): string =>
 let renderer: ReactTestRenderer | undefined;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "fixture");
   requests.pending = [];
   requests.workflowReads = 0;
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
+  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
 
@@ -152,7 +155,9 @@ it.effect("keeps personal policy edits intact when the workflow policy read and 
         await Promise.allSettled(requests.pending);
       });
       const view = renderer!;
-      const initialAlert = visibleText(view.root.findByProps({ role: "alert" }));
+      const workflowAlert = () =>
+        view.root.findAllByType("div").find((element) => element.props.role === "alert")!;
+      const initialAlert = visibleText(workflowAlert());
       expect(initialAlert).toContain("Check your connection and try again.");
       expect(initialAlert).not.toContain("Could not read the workflow VM limit");
       const personal = () => view.root.findByProps({ "aria-label": "VMs per user" });
@@ -174,7 +179,7 @@ it.effect("keeps personal policy edits intact when the workflow policy read and 
         view.root.findAllByType("button").find((entry) => entry.props.children === "Save policy")!
           .props.disabled,
       ).toBe(false);
-      const retryAlert = visibleText(view.root.findByProps({ role: "alert" }));
+      const retryAlert = visibleText(workflowAlert());
       expect(retryAlert).toContain("Couldn’t load the VM limit");
       expect(retryAlert).toContain("Relay encountered an internal error");
       expect(retryAlert).not.toContain("Check your connection and try again.");

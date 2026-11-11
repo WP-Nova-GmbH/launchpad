@@ -1,4 +1,11 @@
-import { act, cloneElement, type PropsWithChildren, type ReactElement, createElement } from "react";
+import {
+  act,
+  cloneElement,
+  type PropsWithChildren,
+  type ReactElement,
+  type Ref,
+  createElement,
+} from "react";
 import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
@@ -24,8 +31,19 @@ const fixture = vi.hoisted(() => ({
   navigate: vi.fn(),
   select: vi.fn(),
   panel: vi.fn(),
+  confirm: vi.fn(),
 }));
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => fixture.navigate }));
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => fixture.navigate,
+  Link: ({
+    to,
+    hash,
+    children,
+    ref,
+  }: PropsWithChildren<{ to: string; hash?: string; ref?: Ref<HTMLAnchorElement> }>) =>
+    createElement("a", { href: hash ? `${to}#${hash}` : to, ref }, children),
+}));
+vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: fixture.confirm }));
 vi.mock("../../state/threads", () => ({ openPortableThreadChat: "open" }));
 vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => fixture.open }));
 vi.mock("../../diffPanelStore", () => ({
@@ -50,7 +68,11 @@ vi.mock("../ui/tooltip", () => ({
   TooltipPopup: () => null,
 }));
 vi.mock("../ui/button", () => ({
-  Button: (props: PropsWithChildren<Record<string, unknown>>) => createElement("button", props),
+  Button: ({
+    render,
+    ...props
+  }: PropsWithChildren<Record<string, unknown> & { render?: ReactElement }>) =>
+    render ? cloneElement(render, props) : createElement("button", props),
 }));
 vi.mock("../ui/textarea", () => ({ Textarea: "textarea" }));
 import { WorkflowJob } from "./WorkflowJob";
@@ -95,20 +117,25 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
   if (typeof node === "string") return node;
   return Array.isArray(node) ? node.map(text).join(" ") : (node.children ?? []).map(text).join(" ");
 }
-const view = (jobId = "job", canConfigure = true) => (
+const view = (jobId = "job", canConfigure = true, organizationAdmin = false) => (
   <AppAtomRegistryProvider>
     <WorkflowJob
       scope={scope}
       jobId={jobId}
       projects={[]}
       canConfigure={canConfigure}
+      organizationAdmin={organizationAdmin}
       refreshCatalog={fixture.refreshCatalog}
     />
   </AppAtomRegistryProvider>
 );
-async function mount(canConfigure = true, options?: Parameters<typeof create>[1]) {
+async function mount(
+  canConfigure = true,
+  options?: Parameters<typeof create>[1],
+  organizationAdmin = false,
+) {
   await act(async () => {
-    renderer = create(view("job", canConfigure), options);
+    renderer = create(view("job", canConfigure, organizationAdmin), options);
   });
 }
 function deferred() {
@@ -131,6 +158,11 @@ async function press(label: string) {
   await act(async () => {
     findButton(label).props.onClick();
   });
+}
+async function pollRun() {
+  const poll = vi.mocked(window.setInterval).mock.lastCall?.[0];
+  if (typeof poll !== "function") throw new Error("Expected a live run poll");
+  await act(() => poll());
 }
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -157,6 +189,7 @@ beforeEach(() => {
   fixture.navigate.mockReset();
   fixture.select.mockReset();
   fixture.panel.mockReset();
+  fixture.confirm.mockReset().mockResolvedValue(true);
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -459,14 +492,236 @@ describe("workflow run presentation", () => {
     ).toBe(true);
     expect(appAtomRegistry.get(workflowDraftAtom).responses[key]?.checkpoint).toBe("First draft");
   });
-  it("explains an accepted queued run without displaying a speculative step plan", async () => {
-    fixture.call.mockResolvedValue({ ...job, status: "queued", progress: null, workflow: null });
+  it("keeps the generic waiting state and relay detail for other queue reasons", async () => {
+    fixture.call.mockResolvedValue({
+      ...job,
+      status: "queued",
+      progress: null,
+      workflow: null,
+      detail: "The machine is offline.",
+      queueReason: { code: "environment_offline", retryAt: null },
+    });
     await mount();
-    expect(text(renderer!.toJSON())).toContain("Waiting for execution");
-    expect(text(renderer!.toJSON())).toContain("No steps have started");
+    const content = text(renderer!.toJSON());
+    expect(content).toContain("Waiting for execution");
+    expect(content).toContain("No steps have started");
+    expect(content).toContain("The machine is offline.");
     expect(
       renderer!.root.findAll((node) => node.props["aria-label"] === "Run progress"),
     ).toHaveLength(0);
+  });
+});
+
+describe("queued workflow recovery", () => {
+  const queued = {
+    ...job,
+    runtime: null,
+    progress: null,
+    workflow: null,
+    status: "queued",
+    detail: null,
+    viewerControls: { canApprove: false, canRespond: false, canCancel: true },
+  } satisfies RepositoryWorkflowJob;
+
+  it("explains an initially queued VM run and keeps cancellation usable", async () => {
+    fixture.call.mockResolvedValue({
+      ...queued,
+      vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
+      detail: "Waiting for a VM slot.",
+      queueReason: { code: "vm_waiting_capacity", retryAt: null },
+    });
+    await mount(false);
+
+    const content = text(renderer!.toJSON());
+    expect(content).toContain("Waiting for a VM slot");
+    expect(content).not.toContain("Waiting for execution");
+    expect(content).not.toContain("Waiting for an execution target");
+    expect(content).toContain("This run will start automatically when a slot becomes available.");
+    expect(content).not.toContain("Waiting for a VM slot.");
+    expect(content).toContain("More controls");
+    expect(findButton("Cancel run").props.disabled).toBe(false);
+
+    const cancelled = { ...queued, status: "cancelled", detail: null };
+    const cancel = vi.fn().mockResolvedValue(cancelled);
+    fixture.call
+      .mockResolvedValue(cancelled)
+      .mockImplementationOnce((request) => request({ respondToWorkflowJob: cancel }, "token"));
+    await press("Cancel run");
+
+    expect(fixture.confirm).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledWith({
+      clerkToken: "token",
+      repositoryId: scope.repositoryId,
+      jobId: job.jobId,
+      payload: { operation: "cancel" },
+    });
+  });
+
+  const linearReconnect = {
+    code: "source_reconnect",
+    title: "Linear needs reconnecting",
+    detail: "An organization admin must reconnect Linear before this job can start.",
+    hash: "workflow-sources",
+    label: "Open Workflow sources",
+  } as const;
+
+  it.each([
+    {
+      status: "queued",
+      code: "vm_limit_disabled",
+      title: "Workflow VMs disabled",
+      detail: "Ask an organization admin to raise the Workflow VMs limit to start this run.",
+      hash: "workflow-vms",
+      label: "Open Workflow VMs settings",
+    },
+    { ...linearReconnect, status: "queued" },
+    { ...linearReconnect, status: "preparing" },
+  ] as const)(
+    "shows organization recovery for $code on $status runs only to admins",
+    async ({ code, status, title, detail, hash, label }) => {
+      fixture.call.mockResolvedValue({
+        ...queued,
+        status,
+        runtime: status === "preparing" ? { kind: "vm", threadId: ThreadId.make("thread") } : null,
+        detail,
+        queueReason: { code, retryAt: null },
+      });
+      // A repository maintainer can configure the workflow but cannot administer the organization.
+      await mount(true);
+
+      const memberContent = text(renderer!.toJSON());
+      expect(memberContent).toContain(title);
+      expect(memberContent).toMatch(/organization admin/i);
+      expect(memberContent).not.toContain("Waiting for execution");
+      expect(memberContent).not.toContain("Waiting for an execution target");
+      expect(memberContent).not.toContain(detail);
+      expect(memberContent).not.toContain(label);
+      const href = `/settings/organization#${hash}`;
+      const recoveryLinks = () =>
+        renderer!.root.findAllByType("a").filter((link) => link.props.href === href);
+      expect(recoveryLinks()).toHaveLength(0);
+
+      await act(() => renderer!.update(view("job", true, true)));
+
+      expect(text(renderer!.toJSON())).toContain(title);
+      expect(recoveryLinks()).toHaveLength(1);
+      expect(text(renderer!.toJSON())).toContain(label);
+    },
+  );
+
+  it("announces a new blocker in the same status region when a queued run is polled", async () => {
+    fixture.call.mockResolvedValue(queued);
+    await mount();
+    const status = () => renderer!.root.findByProps({ role: "status" });
+    const initialStatus = status();
+    expect(initialStatus.children.join("")).toBe("Queued");
+
+    fixture.call.mockResolvedValue({
+      ...queued,
+      queueReason: { code: linearReconnect.code, retryAt: null },
+      detail: linearReconnect.detail,
+    });
+    await pollRun();
+
+    expect(status()).toBe(initialStatus);
+    expect(status().children.join("")).toMatch(/Queued.*Linear needs reconnecting/);
+  });
+
+  it("moves focus to the run heading when a poll removes the focused recovery link", async () => {
+    fixture.call.mockResolvedValue({
+      ...queued,
+      queueReason: { code: linearReconnect.code, retryAt: null },
+      detail: linearReconnect.detail,
+    });
+    const body = {};
+    let focused = body;
+    const ownerDocument = {
+      body,
+      get activeElement() {
+        // The browser moves focus to the body once it removes a focused link.
+        const content = text(renderer?.toJSON() ?? null);
+        return focused === recoveryLink && !content.includes(linearReconnect.label)
+          ? body
+          : focused;
+      },
+    };
+    const recoveryLink = { ownerDocument };
+    const heading = {
+      ownerDocument,
+      focus() {
+        focused = heading;
+      },
+    };
+    await mount(
+      true,
+      {
+        createNodeMock(element) {
+          if (element.type === "h1") return heading;
+          if (
+            element.type === "a" &&
+            (element.props as { href?: string }).href === "/settings/organization#workflow-sources"
+          )
+            return recoveryLink;
+          return null;
+        },
+      },
+      true,
+    );
+
+    expect(text(renderer!.toJSON())).toContain(linearReconnect.label);
+    focused = recoveryLink;
+    fixture.call.mockResolvedValue({
+      ...queued,
+      detail: "Waiting for a workflow VM slot.",
+      queueReason: { code: "vm_waiting_capacity", retryAt: null },
+    });
+    await pollRun();
+
+    expect(text(renderer!.toJSON())).not.toContain(linearReconnect.label);
+    expect(ownerDocument.activeElement).toBe(heading);
+  });
+
+  it("preserves a newer relay error when a queued reason remains after a failed retry", async () => {
+    const queueReason = { code: "vm_waiting_capacity", retryAt: null } as const;
+    fixture.call.mockResolvedValue({
+      ...queued,
+      queueReason,
+      detail: "Waiting for a workflow VM slot.",
+    });
+    await mount();
+    expect(text(renderer!.toJSON())).toContain("Waiting for a VM slot");
+
+    const detail =
+      "Could not reach the workflow VM or confirm its response. Launchpad will retry automatically.";
+    fixture.call.mockResolvedValue({ ...queued, queueReason, detail });
+    await press("Refresh run");
+
+    const content = text(renderer!.toJSON());
+    expect(content).toContain(detail);
+    expect(content).not.toContain(
+      "This run will start automatically when a slot becomes available.",
+    );
+  });
+
+  it("returns to the running view when a queued reason remains on an acknowledged running run", async () => {
+    const queueReason = { code: "vm_limit_disabled", retryAt: null } as const;
+    fixture.call.mockResolvedValue({ ...queued, queueReason });
+    await mount();
+    expect(text(renderer!.toJSON())).toContain("Workflow VMs disabled");
+
+    fixture.call.mockResolvedValue({
+      ...job,
+      status: "running",
+      progress: { ...job.progress!, status: "running", checkpoint: null },
+      detail: "The agent started.",
+      queueReason,
+    });
+    await press("Refresh run");
+
+    const content = text(renderer!.toJSON());
+    expect(content).toContain("Running");
+    expect(content).toContain("The agent started.");
+    expect(content).not.toContain("Workflow VMs disabled");
   });
 });
 
@@ -627,9 +882,7 @@ it.each([
       manualPause: pausing ? { state: "paused" } : null,
     },
   });
-  const poll = vi.mocked(window.setInterval).mock.lastCall?.[0];
-  if (typeof poll !== "function") throw new Error("Expected a live run poll");
-  await act(() => poll());
+  await pollRun();
 
   expect(nodes).toHaveLength(2);
   expect(ownerDocument.activeElement).toBe(nodes[1]);

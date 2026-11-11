@@ -18,7 +18,7 @@ import { resolveRelayClerkTokenOptions } from "../../cloud/publicConfig";
 import { runtime } from "../../lib/runtime";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
-import { SettingsRow, SettingsSection } from "./settingsLayout";
+import { SettingsRow, SettingsSearchTarget, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 import { WorkflowVmPolicySettings } from "./WorkflowVmPolicySettings";
 
@@ -230,7 +230,9 @@ function ThreadVmPolicyEditor({
           Reload policy
         </Button>
       </div>
-      <WorkflowVmPolicySettings organizationId={organizationId} />
+      <SettingsSearchTarget id={searchableSetting("workflow-vms").id}>
+        <WorkflowVmPolicySettings organizationId={organizationId} />
+      </SettingsSearchTarget>
     </SettingsSection>
   );
 }
