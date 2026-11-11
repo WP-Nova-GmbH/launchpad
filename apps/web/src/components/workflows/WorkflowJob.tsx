@@ -3,6 +3,7 @@ import {
   ActivityIcon,
   ArrowLeftIcon,
   ArrowUpRightIcon,
+  ChevronDownIcon,
   CloudIcon,
   MessageSquareIcon,
   MonitorIcon,
@@ -10,6 +11,7 @@ import {
   PlayIcon,
   RefreshCwIcon,
   RotateCwIcon,
+  SquareIcon,
 } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
@@ -63,7 +65,16 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { useDiffPanelStore } from "../../diffPanelStore";
 import { useRightPanelStore } from "../../rightPanelStore";
 import { cn, randomUUID } from "../../lib/utils";
+import {
+  AlertDialog,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { Button } from "../ui/button";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { WorkflowProgress } from "./WorkflowProgress";
 import {
@@ -71,7 +82,6 @@ import {
   useWorkflowDrafts,
   useWorkflowJobReads,
   workflowError,
-  confirmWorkflow,
 } from "./workflowState";
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
@@ -134,6 +144,9 @@ export function WorkflowJob({
   const resumeButton = useRunActionFocus(key);
   const runHeading = useRef<HTMLHeadingElement>(null);
   const retryPublishingButton = useRunActionFocus(key, runHeading);
+  const retryCancellationButton = useRunActionFocus(key, runHeading);
+  const runControlsTrigger = useRef<HTMLButtonElement>(null);
+  const [cancelDialogKey, setCancelDialogKey] = useState<string | null>(null);
   const queuedRecoveryLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
   const resultRequest = useRef<{ key: string } | null>(null);
   useLayoutEffect(
@@ -152,6 +165,7 @@ export function WorkflowJob({
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const [reviewingCurrentResult, setReviewingCurrentResult] = useState(true);
   const [feedbackView, setFeedbackView] = useState<{ key: string; open: boolean } | null>(null);
+  const [collapsedDraftKey, setCollapsedDraftKey] = useState<string | null>(null);
   const feedbackInput = useRef<HTMLTextAreaElement>(null);
   const feedbackButton = useRef<HTMLButtonElement>(null);
   const feedbackFocus = useRef<"input" | "button" | null>(null);
@@ -160,26 +174,41 @@ export function WorkflowJob({
   const reviewChanged = reviewApproval === "inspect";
   const checkingReturnedReview = reviewApproval === "checking";
   const viewerControls = workflowViewerControls(selectedJob, canConfigure);
+  const cancelling = selectedJob?.status === "cancelling";
+  const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
+  const canCancelRun = viewerControls.canCancel && !terminal && !cancelling;
+  if (cancelDialogKey !== null && (cancelDialogKey !== key || !canCancelRun)) {
+    setCancelDialogKey(null);
+  }
   const approvalPending = workflowApprovalPending(selectedJob);
   const responseDrafts = drafts.responses[key] ?? {};
   const response = checkpoint ? (responseDrafts[checkpoint.checkpointId] ?? "") : "";
   const feedbackKey = `${key}:${checkpoint?.checkpointId ?? ""}`;
   const feedbackOpen = feedbackView?.key === feedbackKey ? feedbackView.open : !!response;
+  const manualHold =
+    selectedJob?.status === "paused" && selectedJob.progress?.manualPause?.state === "paused";
+  if (collapsedDraftKey !== null && (!manualHold || collapsedDraftKey !== feedbackKey)) {
+    setCollapsedDraftKey(null);
+  }
   const waiting =
     !!checkpoint &&
-    !!selectedJob &&
-    !isTerminalWorkflowJob(selectedJob.status) &&
+    !terminal &&
+    !cancelling &&
     (manualState.status === "awaiting_input" || manualState.status === "awaiting_review");
   const input = checkpoint?.kind === "input";
   const composingFeedback =
-    waiting && !input && feedbackOpen && viewerControls.canRespond && !approvalPending;
+    waiting &&
+    !manualHold &&
+    !input &&
+    feedbackOpen &&
+    viewerControls.canRespond &&
+    !approvalPending;
   useLayoutEffect(() => {
     if (feedbackFocus.current === "input") feedbackInput.current?.focus();
     if (feedbackFocus.current === "button") feedbackButton.current?.focus();
     feedbackFocus.current = null;
   });
   const busy = !!read.mutation;
-  const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
   const refresh = useCallback(async () => {
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId);
     if (!request) return;
@@ -226,20 +255,39 @@ export function WorkflowJob({
   }, [refresh, terminal, selectedJob?.progress?.resultSaving?.state, read.mutation, scope, jobId]);
   const respond = async (operation: Operation) => {
     if (!selectedJob || busy || (manualState.responsePending && operation !== "cancel")) return;
-    const currentRead = appAtomRegistry.get(workflowJobReadAtom).jobs[key] ?? emptyWorkflowJobRead;
+    const currentReads = appAtomRegistry.get(workflowJobReadAtom);
+    const currentRead = currentReads.jobs[key] ?? emptyWorkflowJobRead;
+    if (operation === "cancel" || operation === "retry_cancellation") {
+      const currentJob = currentRead.job;
+      if (
+        currentReads.activeKey !== key ||
+        !currentJob ||
+        !workflowViewerControls(currentJob, canConfigure).canCancel ||
+        isTerminalWorkflowJob(currentJob.status)
+      )
+        return;
+      if (operation === "cancel" && currentJob.status === "cancelling") return;
+      if (
+        operation === "retry_cancellation" &&
+        (currentRead.job !== selectedJob ||
+          currentJob.status !== "cancelling" ||
+          currentJob.responsePending ||
+          !currentJob.progress?.retryableCancellation)
+      )
+        return;
+    }
     const currentReview = appAtomRegistry.get(workflowDraftAtom).reviews[key];
     if (
       (operation === "approve" &&
         (!viewerControls.canApprove ||
           currentRead.job !== selectedJob ||
           workflowReviewApprovalState(currentReview, currentRead) !== "allowed")) ||
-      ((operation === "input" || operation === "request_changes") && !viewerControls.canRespond) ||
-      ((operation === "cancel" || operation === "retry_cancellation") && !viewerControls.canCancel)
+      ((operation === "input" || operation === "request_changes") && !viewerControls.canRespond)
     )
       return;
     if (
       ["approve", "input", "request_changes"].includes(operation) &&
-      (!selectedJob.progress?.checkpoint || isTerminalWorkflowJob(selectedJob.status))
+      (!selectedJob.progress?.checkpoint || terminal || cancelling || manualState.checkpointBlocked)
     )
       return;
     if (
@@ -393,8 +441,12 @@ export function WorkflowJob({
       }
     }
   };
+  const keepPausedFeedbackOpenOnResume = () => {
+    if (manualHold && !input && !feedbackOpen) setFeedbackView({ key: feedbackKey, open: true });
+  };
   const setResponse = (text: string) => {
     if (!checkpoint) return;
+    keepPausedFeedbackOpenOnResume();
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
       ...state,
       responses: {
@@ -473,6 +525,7 @@ export function WorkflowJob({
     !!checkpointStep && checkpointStep.title === selectedJob.workflow?.definition.name;
   const approval =
     !terminal &&
+    !cancelling &&
     !!checkpoint &&
     viewerControls.canApprove &&
     (manualState.status === "awaiting_review" ||
@@ -556,10 +609,17 @@ export function WorkflowJob({
       : paused && !publishingFailure
         ? PauseIcon
         : null;
-  const manualHold = paused && selectedJob.progress?.manualPause?.state === "paused";
   const pausedBeforeStep = manualHold && manualState.status === "waiting_capacity" && !checkpoint;
   const showPauseDetail = manualHold && !confirmationPending;
   const statusLabel = workflowStatusLabel(selectedJob.status);
+  const runName = selectedJob.workflow?.definition.name ?? "Workflow run";
+  const runIssue = selectedJob.issueSnapshot ?? selectedJob.event;
+  const runContext = runIssue
+    ? `${runIssue.identifier} ${runIssue.title}`
+    : selectedJob.instruction;
+  const canPauseRun = canConfigure && manualState.canPause;
+  const cancellationNeedsAttention =
+    selectedJob.progress?.retryableCancellation === true && !manualState.responsePending;
   const queueReason = selectedJob.queueReason?.code;
   const queueReasonTask =
     queueReason &&
@@ -638,52 +698,70 @@ export function WorkflowJob({
         </Button>
       </div>
     ) : null;
+  const draftOpen = !manualHold || collapsedDraftKey !== feedbackKey;
   const checkpointResponse =
     waiting &&
     checkpoint &&
     viewerControls.canRespond &&
     !approvalPending &&
-    (input || feedbackOpen) ? (
-      <form
-        className="space-y-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void respond(input ? "input" : "request_changes");
+    (input || feedbackOpen || (manualHold && !!response.trim())) ? (
+      <details
+        key={feedbackKey}
+        open={draftOpen}
+        className={cn(manualHold && "space-y-2 border-t pt-3")}
+        onToggle={(event) => {
+          const open = event.currentTarget.open;
+          if (!manualHold || open === draftOpen) return;
+          setCollapsedDraftKey(open ? null : feedbackKey);
         }}
       >
-        <label className="block space-y-2">
-          {input ? (
-            <span className="text-sm font-medium">{checkpoint.question}</span>
-          ) : (
-            <span className="sr-only">Feedback for the agent</span>
-          )}
-          <Textarea
-            ref={feedbackInput}
-            aria-label={input ? "Checkpoint answer" : "Rework feedback"}
-            placeholder={input ? undefined : "Describe the changes…"}
-            rows={input ? 3 : 5}
-            maxLength={8000}
-            value={response}
-            onChange={(event) => setResponse(event.target.value)}
-          />
-        </label>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-xs text-muted-foreground">Draft kept until acknowledged.</p>
-          <div className="ml-auto">
-            <Button
-              type="submit"
-              size="sm"
-              disabled={busy || manualState.checkpointBlocked || !response.trim()}
-            >
-              {manualState.responsePending
-                ? "Response pending"
-                : input
-                  ? "Submit answer"
-                  : "Send changes"}
-            </Button>
-          </div>
-        </div>
-      </form>
+        <summary hidden={!manualHold} className="cursor-pointer text-sm font-medium">
+          {manualHold ? (input ? "Answer draft" : "Feedback draft") : null}
+        </summary>
+        <form
+          className="space-y-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void respond(input ? "input" : "request_changes");
+          }}
+        >
+          <label className="block space-y-2">
+            {input ? (
+              <span className="text-sm font-medium">{checkpoint.question}</span>
+            ) : (
+              <span className="sr-only">Feedback for the agent</span>
+            )}
+            <Textarea
+              ref={feedbackInput}
+              aria-label={input ? "Checkpoint answer" : "Rework feedback"}
+              placeholder={input ? undefined : "Describe the changes…"}
+              rows={input ? 3 : 5}
+              maxLength={8000}
+              value={response}
+              onFocus={keepPausedFeedbackOpenOnResume}
+              onChange={(event) => setResponse(event.target.value)}
+            />
+          </label>
+          {!manualHold ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-xs text-muted-foreground">Draft kept until acknowledged.</p>
+              <div className="ml-auto">
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={busy || manualState.checkpointBlocked || !response.trim()}
+                >
+                  {manualState.responsePending
+                    ? "Response pending"
+                    : input
+                      ? "Submit answer"
+                      : "Send changes"}
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </form>
+      </details>
     ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
       <p className="text-sm text-muted-foreground">
         This checkpoint requires a repository maintainer.
@@ -692,19 +770,94 @@ export function WorkflowJob({
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl space-y-6 wrap-anywhere">
       {runNavigation}
+      <AlertDialog
+        open={canCancelRun && cancelDialogKey === key}
+        onOpenChange={(open) => {
+          if (!open) setCancelDialogKey(null);
+        }}
+      >
+        <AlertDialogPopup
+          finalFocus={() =>
+            runControlsTrigger.current && !runControlsTrigger.current.disabled
+              ? runControlsTrigger.current
+              : runHeading.current
+          }
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle>Cancel this run?</AlertDialogTitle>
+            <AlertDialogDescription className="wrap-anywhere">
+              <span className="block font-medium text-popover-foreground">{runName}</span>
+              <span className="mt-0.5 mb-2 line-clamp-3">
+                {runContext.length > 200 ? `${runContext.slice(0, 200).trimEnd()}…` : runContext}
+              </span>
+              This stops the workflow. Results already saved remain available.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <Button variant="outline" onClick={() => setCancelDialogKey(null)}>
+              Keep run
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={busy || !canCancelRun}
+              onClick={() => {
+                setCancelDialogKey(null);
+                void respond("cancel");
+              }}
+            >
+              Cancel run
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
       <header>
         <span role="status" className="sr-only">
           {queuedTask ? `${statusLabel}. ${queuedTask.title}` : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
-            {selectedJob.workflow?.definition.name ?? "Workflow run"}
+            {runName}
           </h1>
-          {!StatusIcon ? (
-            <span aria-hidden className="text-sm font-medium">
-              {statusLabel}
-            </span>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-3">
+            {!StatusIcon && !cancelling ? (
+              <span aria-hidden className="text-sm font-medium">
+                {statusLabel}
+              </span>
+            ) : null}
+            {canPauseRun || canCancelRun ? (
+              <Menu>
+                <MenuTrigger
+                  ref={runControlsTrigger}
+                  disabled={busy}
+                  render={<Button size="sm" variant="outline" />}
+                >
+                  Run controls
+                  <ChevronDownIcon aria-hidden />
+                </MenuTrigger>
+                <MenuPopup align="end">
+                  {canPauseRun ? (
+                    <MenuItem disabled={busy} onClick={() => void respond("pause")}>
+                      <PauseIcon aria-hidden />
+                      {manualState.status === "awaiting_input" ||
+                      manualState.status === "awaiting_review"
+                        ? "Pause at this checkpoint"
+                        : "Pause after current step"}
+                    </MenuItem>
+                  ) : null}
+                  {canCancelRun ? (
+                    <MenuItem
+                      variant="destructive"
+                      disabled={busy}
+                      onClick={() => setCancelDialogKey(key)}
+                    >
+                      <SquareIcon aria-hidden />
+                      Cancel run
+                    </MenuItem>
+                  ) : null}
+                </MenuPopup>
+              </Menu>
+            ) : null}
+          </div>
         </div>
         <WorkflowIssueDetails key={key} job={selectedJob} />
         {selectedJob.origin?.kind === "automation" ? (
@@ -747,7 +900,32 @@ export function WorkflowJob({
       ) : null}
       <div className="min-w-0 space-y-5">
         <section className="space-y-4" aria-label="Current workflow task">
-          {queuedTask ? (
+          {cancelling ? (
+            <WorkflowAlert
+              title={cancellationNeedsAttention ? "Cancellation needs attention" : "Canceling run"}
+              variant={cancellationNeedsAttention ? "warning" : "info"}
+              actions={
+                cancellationNeedsAttention && viewerControls.canCancel ? (
+                  <Button
+                    ref={retryCancellationButton}
+                    size="sm"
+                    variant="outline"
+                    aria-disabled={busy}
+                    onClick={() => void respond("retry_cancellation")}
+                  >
+                    <RotateCwIcon aria-hidden />
+                    Retry cancellation
+                  </Button>
+                ) : undefined
+              }
+            >
+              {selectedJob.detail ??
+                selectedJob.progress?.detail ??
+                (cancellationNeedsAttention
+                  ? "The environment couldn’t confirm that the run stopped."
+                  : "Waiting for the environment to confirm the run has stopped.")}
+            </WorkflowAlert>
+          ) : queuedTask ? (
             <WorkflowQueuedTask
               task={queuedTask}
               organizationAdmin={organizationAdmin}
@@ -860,7 +1038,7 @@ export function WorkflowJob({
               Waiting for an execution target. No steps have started.
             </p>
           ) : null}
-          {manualState.message && !showPauseDetail ? (
+          {!cancelling && manualState.message && !showPauseDetail ? (
             <WorkflowAlert
               title={confirmationPending ? "Waiting for confirmation" : "Run needs attention"}
               variant={confirmationPending ? "info" : "warning"}
@@ -868,7 +1046,8 @@ export function WorkflowJob({
               {manualState.message}
             </WorkflowAlert>
           ) : null}
-          {!failed &&
+          {!cancelling &&
+          !failed &&
           !publishingFailure &&
           !cancelledVm &&
           !queuedTask &&
@@ -876,8 +1055,9 @@ export function WorkflowJob({
           !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
-          {(reviewChanged && selectedJob.runtime?.kind !== "vm") ||
-          (checkingReturnedReview && reviewingCurrentResult && !read.error) ? (
+          {!cancelling &&
+          ((reviewChanged && selectedJob.runtime?.kind !== "vm") ||
+            (checkingReturnedReview && reviewingCurrentResult && !read.error)) ? (
             <WorkflowAlert
               title={reviewChanged ? "Review changed" : "Checking the current review"}
               variant={reviewChanged ? "warning" : "info"}
@@ -888,6 +1068,7 @@ export function WorkflowJob({
             </WorkflowAlert>
           ) : null}
           {waiting &&
+          !manualHold &&
           !input &&
           !composingFeedback &&
           (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) &&
@@ -917,7 +1098,7 @@ export function WorkflowJob({
               onReviewTargetChange={setReviewingCurrentResult}
             />
           ) : null}
-          {selectedJob.progress?.resultSaving ? (
+          {!cancelling && selectedJob.progress?.resultSaving ? (
             <WorkflowAlert
               title={
                 selectedJob.progress.resultSaving.state === "failed"
@@ -961,6 +1142,7 @@ export function WorkflowJob({
             </WorkflowAlert>
           ) : null}
           {(approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
+          !manualHold &&
           !composingFeedback &&
           (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) ? (
             <div className="flex flex-wrap gap-2">
@@ -1010,7 +1192,8 @@ export function WorkflowJob({
             </div>
           ) : null}
           {!inputInTask ? checkpointResponse : null}
-          {canConfigure &&
+          {!cancelling &&
+          canConfigure &&
           manualState.status === "paused" &&
           selectedJob.progress?.retryablePreparation ? (
             <Button
@@ -1043,48 +1226,6 @@ export function WorkflowJob({
         <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-2 border-t pt-3">
           <WorkflowProgress key={key} job={selectedJob} />
           {!paused ? resumeAction : null}
-          {(viewerControls.canCancel || (canConfigure && manualState.canPause)) && !terminal ? (
-            <details className="ml-auto min-w-0">
-              <summary className="cursor-pointer py-1 text-sm text-muted-foreground">
-                More controls
-              </summary>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {canConfigure && manualState.canPause ? (
-                  <Button variant="outline" disabled={busy} onClick={() => void respond("pause")}>
-                    {["preparing", "running", "waiting_capacity"].includes(manualState.status ?? "")
-                      ? "Pause after current step"
-                      : "Pause workflow"}
-                  </Button>
-                ) : null}
-                {viewerControls.canCancel ? (
-                  <Button
-                    variant="destructive-outline"
-                    disabled={
-                      busy ||
-                      (selectedJob.status === "cancelling" &&
-                        (manualState.responsePending ||
-                          !selectedJob.progress?.retryableCancellation))
-                    }
-                    onClick={async () => {
-                      if (selectedJob.status === "cancelling") void respond("retry_cancellation");
-                      else if (
-                        await confirmWorkflow(
-                          `Cancel this run: ${selectedJob.issueSnapshot?.identifier ?? selectedJob.event?.identifier ?? selectedJob.instruction.slice(0, 140)}?`,
-                        )
-                      )
-                        void respond("cancel");
-                    }}
-                  >
-                    {selectedJob.status === "cancelling"
-                      ? selectedJob.progress?.retryableCancellation && !manualState.responsePending
-                        ? "Retry cancellation"
-                        : "Cancellation pending"
-                      : "Cancel run"}
-                  </Button>
-                ) : null}
-              </div>
-            </details>
-          ) : null}
         </div>
       </div>
     </div>

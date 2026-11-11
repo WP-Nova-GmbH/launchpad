@@ -1,6 +1,9 @@
 import {
   act,
   cloneElement,
+  createContext,
+  useContext,
+  useState,
   type PropsWithChildren,
   type ReactElement,
   type Ref,
@@ -36,7 +39,6 @@ const fixture = vi.hoisted(() => ({
   navigate: vi.fn(),
   select: vi.fn(),
   panel: vi.fn(),
-  confirm: vi.fn(),
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
@@ -48,7 +50,6 @@ vi.mock("@tanstack/react-router", () => ({
   }: PropsWithChildren<{ to: string; hash?: string; ref?: Ref<HTMLAnchorElement> }>) =>
     createElement("a", { href: hash ? `${to}#${hash}` : to, ref }, children),
 }));
-vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: fixture.confirm }));
 vi.mock("../../state/threads", () => ({ openPortableThreadChat: "open" }));
 vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => fixture.open }));
 vi.mock("../../diffPanelStore", () => ({
@@ -79,6 +80,62 @@ vi.mock("../ui/button", () => ({
     render ? cloneElement(render, props) : createElement("button", props),
 }));
 vi.mock("../ui/textarea", () => ({ Textarea: "textarea" }));
+vi.mock("../ui/menu", () => {
+  const MenuState = createContext<[boolean, (open: boolean) => void]>([false, () => {}]);
+  return {
+    Menu: ({ children }: PropsWithChildren) => {
+      const state = useState(false);
+      return <MenuState.Provider value={state}>{children}</MenuState.Provider>;
+    },
+    MenuTrigger: ({
+      render,
+      children,
+    }: PropsWithChildren<{
+      render: ReactElement<{ onClick: () => void; children?: ReactElement }>;
+    }>) => {
+      const [open, setOpen] = useContext(MenuState);
+      return cloneElement(
+        render,
+        { onClick: () => setOpen(!open) },
+        children ?? render.props.children,
+      );
+    },
+    MenuPopup: ({ children }: PropsWithChildren) =>
+      useContext(MenuState)[0] ? <div role="menu">{children}</div> : null,
+    MenuItem: ({
+      children,
+      onClick,
+      disabled,
+    }: PropsWithChildren<{ onClick: () => void; disabled?: boolean }>) => {
+      const [, setOpen] = useContext(MenuState);
+      return (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            setOpen(false);
+            onClick();
+          }}
+        >
+          {children}
+        </button>
+      );
+    },
+    MenuItemLabel: ({ children }: PropsWithChildren) => children,
+  };
+});
+vi.mock("../ui/alert-dialog", () => {
+  const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
+  return {
+    AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "alertdialog" }, children) : null,
+    AlertDialogPopup: part,
+    AlertDialogHeader: part,
+    AlertDialogTitle: part,
+    AlertDialogDescription: part,
+    AlertDialogFooter: part,
+  };
+});
 import { WorkflowJob } from "./WorkflowJob";
 import { SavedWorkflowResults } from "./SavedWorkflowResults";
 
@@ -165,6 +222,14 @@ async function press(label: string) {
     findButton(label).props.onClick();
   });
 }
+const cancelDialog = () => renderer!.root.findByProps({ role: "alertdialog" });
+async function confirmCancellation() {
+  const button = cancelDialog()
+    .findAllByType("button")
+    .find((node) => text(node) === "Cancel run");
+  expect(button).toBeDefined();
+  await act(() => button!.props.onClick());
+}
 async function pollRun() {
   const poll = vi.mocked(window.setInterval).mock.lastCall?.[0];
   if (typeof poll !== "function") throw new Error("Expected a live run poll");
@@ -195,7 +260,6 @@ beforeEach(() => {
   fixture.navigate.mockReset();
   fixture.select.mockReset();
   fixture.panel.mockReset();
-  fixture.confirm.mockReset().mockResolvedValue(true);
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -473,6 +537,60 @@ describe("workflow run presentation", () => {
     expect(renderer!.root.findByType("textarea").props.value).toBe("Add a regression test");
     expect(fixture.call).toHaveBeenCalledTimes(2);
   });
+  it("keeps review feedback reachable during a manual hold and shows the role requirement after access changes", async () => {
+    const vmReview: RepositoryWorkflowJob = {
+      ...review,
+      runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+    };
+    const paused: RepositoryWorkflowJob = {
+      ...vmReview,
+      status: "paused",
+      progress: {
+        ...vmReview.progress!,
+        revision: 4,
+        status: "paused",
+        underlyingStatus: "awaiting_review",
+        manualPauseSupported: true,
+        manualPause: { state: "paused" },
+      },
+    };
+    fixture.call.mockResolvedValue(vmReview);
+    await mount();
+    await press("Request changes");
+    await act(() =>
+      renderer!.root.findByType("textarea").props.onChange({
+        target: { value: "Add a regression test" },
+      }),
+    );
+    await press("Back to review");
+
+    fixture.call.mockResolvedValue(paused);
+    await pollRun();
+
+    const draft = renderer!.root
+      .findAllByType("details")
+      .find((disclosure) => text(disclosure).includes("Feedback draft"));
+    expect(draft?.findByType("textarea").props.value).toBe("Add a regression test");
+    expect(text(renderer!.toJSON())).toContain("Saved results");
+    expect(findButton("Back to review")).toBeUndefined();
+    expect(findButton("Send changes")).toBeUndefined();
+
+    fixture.call.mockResolvedValue({
+      ...paused,
+      viewerControls: { canApprove: false, canRespond: false, canCancel: true },
+    });
+    await pollRun();
+
+    const requirement = "This checkpoint requires a repository maintainer.";
+    expect(text(renderer!.toJSON())).toContain(requirement);
+    expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
+    expect(
+      renderer!.root
+        .findAllByType("details")
+        .some((disclosure) => text(disclosure).includes(requirement)),
+    ).toBe(false);
+  });
+
   it("reopens a retained draft for a new checkpoint instead of inheriting the previous Back choice", async () => {
     const key = workflowSessionKey(scope, job.jobId);
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
@@ -1342,6 +1460,109 @@ describe("workflow run outcomes", () => {
   });
 });
 
+describe("workflow cancellation", () => {
+  const running: RepositoryWorkflowJob = {
+    ...job,
+    status: "running",
+    progress: { ...job.progress!, status: "running" },
+    viewerControls: { canApprove: false, canRespond: false, canCancel: true },
+  };
+  const cancellationFailed: RepositoryWorkflowJob = {
+    ...running,
+    status: "cancelling",
+    progress: {
+      ...running.progress!,
+      revision: 4,
+      status: "cancelling",
+      retryableCancellation: true,
+    },
+  };
+
+  it("closes confirmation when the viewer loses permission while it is open", async () => {
+    fixture.call.mockResolvedValue(running);
+    await mount(false);
+    const beforeOpening = fixture.call.mock.calls.length;
+    await press("Run controls");
+    await press("Cancel run");
+    expect(text(cancelDialog())).toContain(running.instruction);
+    expect(fixture.call).toHaveBeenCalledTimes(beforeOpening);
+
+    fixture.call.mockResolvedValue({
+      ...running,
+      viewerControls: { ...running.viewerControls!, canCancel: false },
+    });
+    await pollRun();
+
+    expect(renderer!.root.findAllByProps({ role: "alertdialog" })).toHaveLength(0);
+    expect(findButton("Cancel run")).toBeUndefined();
+  });
+
+  it("shows pending cancellation and gives authorized viewers a retry after it fails", async () => {
+    const recoveryDetail =
+      "Cancellation is not confirmed. Update the environment to finish cancelling this job.";
+    fixture.call.mockResolvedValue({
+      ...running,
+      status: "cancelling",
+      detail: recoveryDetail,
+      responsePending: true,
+    });
+    await mount(false);
+
+    expect(
+      renderer!.root
+        .findAllByProps({ role: "status" })
+        .some(
+          (status) =>
+            text(status).includes("Canceling run") && text(status).includes(recoveryDetail),
+        ),
+    ).toBe(true);
+    expect(findButton("Retry cancellation")).toBeUndefined();
+
+    fixture.call.mockResolvedValue({
+      ...cancellationFailed,
+      viewerControls: { ...running.viewerControls!, canCancel: false },
+    });
+    await pollRun();
+
+    expect(text(renderer!.toJSON())).toContain("Cancellation needs attention");
+    expect(findButton("Retry cancellation")).toBeUndefined();
+
+    fixture.call.mockResolvedValue(cancellationFailed);
+    await pollRun();
+    const retryButton = findButton("Retry cancellation");
+    expect(retryButton).toBeDefined();
+    expect(
+      renderer!.root
+        .findAllByProps({ role: "alert" })
+        .some(
+          (alert) =>
+            text(alert).includes("Cancellation needs attention") &&
+            alert.findAllByType("button").includes(retryButton),
+        ),
+    ).toBe(true);
+
+    const retryPending: RepositoryWorkflowJob = {
+      ...cancellationFailed,
+      responsePending: true,
+    };
+    const retry = vi.fn().mockResolvedValue(retryPending);
+    fixture.call
+      .mockResolvedValue(retryPending)
+      .mockImplementationOnce((request) => request({ respondToWorkflowJob: retry }, "token"));
+    await press("Retry cancellation");
+
+    expect(retry).toHaveBeenCalledExactlyOnceWith({
+      clerkToken: "token",
+      repositoryId: scope.repositoryId,
+      jobId: job.jobId,
+      payload: { operation: "retry_cancellation", expectedRevision: 4 },
+    });
+    expect(text(renderer!.toJSON())).toContain("Canceling run");
+    expect(text(renderer!.toJSON())).not.toContain("Cancellation needs attention");
+    expect(findButton("Retry cancellation")).toBeUndefined();
+  });
+});
+
 describe("queued workflow recovery", () => {
   const queued = {
     ...job,
@@ -1368,7 +1589,8 @@ describe("queued workflow recovery", () => {
     expect(content).not.toContain("Waiting for an execution target");
     expect(content).toContain("This run will start automatically when a slot becomes available.");
     expect(content).not.toContain("Waiting for a VM slot.");
-    expect(content).toContain("More controls");
+    expect(content).toContain("Run controls");
+    await press("Run controls");
     expect(findButton("Cancel run").props.disabled).toBe(false);
 
     const cancelled = { ...queued, status: "cancelled", detail: null };
@@ -1377,8 +1599,15 @@ describe("queued workflow recovery", () => {
       .mockResolvedValue(cancelled)
       .mockImplementationOnce((request) => request({ respondToWorkflowJob: cancel }, "token"));
     await press("Cancel run");
+    expect(text(cancelDialog())).toContain(queued.instruction);
+    expect(cancel).not.toHaveBeenCalled();
+    await press("Keep run");
+    expect(renderer!.root.findAllByProps({ role: "alertdialog" })).toHaveLength(0);
+    expect(cancel).not.toHaveBeenCalled();
+    await press("Run controls");
+    await press("Cancel run");
+    await confirmCancellation();
 
-    expect(fixture.confirm).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledWith({
       clerkToken: "token",
       repositoryId: scope.repositoryId,
@@ -1614,12 +1843,22 @@ it("resumes a paused input checkpoint with its answer draft intact", async () =>
       manualPause: null,
     },
   };
-  fixture.call.mockResolvedValue(paused);
+  fixture.call.mockResolvedValue({
+    ...resumed,
+    progress: { ...resumed.progress!, revision: paused.progress!.revision - 1 },
+  });
   await mount();
   const answer = () => renderer!.root.findByType("textarea");
   const submit = () => renderer!.root.findByProps({ type: "submit" });
-  await act(() => answer().props.onChange({ target: { value: "Staging first." } }));
-  expect(submit().props.disabled).toBe(true);
+  const draftEditor = answer();
+  await act(() => draftEditor.props.onChange({ target: { value: "Staging first." } }));
+
+  fixture.call.mockResolvedValue(paused);
+  await pollRun();
+
+  expect(answer()).toBe(draftEditor);
+  expect(text(renderer!.toJSON())).toContain("Answer draft");
+  expect(renderer!.root.findAllByProps({ type: "submit" })).toHaveLength(0);
 
   const resume = vi.fn().mockResolvedValue(resumed);
   fixture.call
@@ -1636,6 +1875,7 @@ it("resumes a paused input checkpoint with its answer draft intact", async () =>
       }),
     }),
   );
+  expect(answer()).toBe(draftEditor);
   expect(answer().props.value).toBe("Staging first.");
   expect(submit().props.disabled).toBe(false);
 });
