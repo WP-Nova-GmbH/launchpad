@@ -71,9 +71,11 @@ function workflowProgressStatus(job: RepositoryWorkflowJob, recovery?: WorkflowR
 export function WorkflowProgress({
   job,
   recovery,
+  preparing,
 }: {
   job: RepositoryWorkflowJob;
   recovery: WorkflowRecovery | null;
+  preparing?: boolean;
 }) {
   const steps = job.workflow?.definition.steps;
   if (!steps?.length) return null;
@@ -84,6 +86,23 @@ export function WorkflowProgress({
     step,
     state: recordedSteps.has(step.id) ? workflowStepState(job, step.id) : null,
   }));
+  const reworked =
+    (progress?.generation ?? 0) > 0 || progress?.steps?.some(({ generation }) => generation > 0);
+  // The executor marks the Agent at the cursor active while its workspace is still being prepared.
+  const preparationCursorState = job.status === "preparing" ? "running" : "waiting";
+  const beforeFirstStep =
+    preparing &&
+    !reworked &&
+    !progress?.checkpoint &&
+    !progress?.responses?.length &&
+    rows.every(
+      ({ step, state }, index) =>
+        state === "pending" ||
+        (index === 0 &&
+          step.kind === "agent" &&
+          step.id === progress?.stepId &&
+          state === preparationCursorState),
+    );
   const complete = rows.filter(({ state }) => state === "completed").length;
   const hasCompleteCount = rows.every(({ state }) => state !== null);
   const failed = job.status === "failed";
@@ -111,7 +130,9 @@ export function WorkflowProgress({
   );
   const pointedStep = rows[currentIndex];
   const current =
-    !terminal || (stopped && (progress?.hasThread !== false || pointedStep?.step.kind === "input"))
+    !beforeFirstStep &&
+    (!terminal ||
+      (stopped && (progress?.hasThread !== false || pointedStep?.step.kind === "input")))
       ? pointedStep
       : undefined;
 
@@ -131,9 +152,11 @@ export function WorkflowProgress({
     else context = `${title} (${statusLabel})`;
   }
 
-  const completionCount = hasCompleteCount ? `${complete} of ${steps.length} steps complete` : null;
-  const reworked =
-    (progress?.generation ?? 0) > 0 || progress?.steps?.some(({ generation }) => generation > 0);
+  const completionCount = beforeFirstStep
+    ? "No steps started"
+    : hasCompleteCount
+      ? `${complete} of ${steps.length} steps complete`
+      : null;
   const laterStep = reworked
     ? { ...notReachedStep, label: "Not reached on this attempt" }
     : notReachedStep;
@@ -158,9 +181,11 @@ export function WorkflowProgress({
               {completionCount}
             </span>
           ) : null}
-          <span className="col-start-2 col-end-3 text-xs text-muted-foreground sm:col-end-4">
-            {context}
-          </span>
+          {!beforeFirstStep ? (
+            <span className="col-start-2 col-end-3 text-xs text-muted-foreground sm:col-end-4">
+              {context}
+            </span>
+          ) : null}
         </summary>
         <ol aria-label="Workflow steps" className="divide-y border-t">
           {rows.map((row, index) => {
@@ -173,7 +198,8 @@ export function WorkflowProgress({
                 pointedStep && index > currentIndex && row.state === "pending"
                   ? laterStep
                   : incompleteStep;
-            } else if (!terminal && row.state === "pending") presentation = upcomingStep;
+            } else if (beforeFirstStep || (!terminal && row.state === "pending"))
+              presentation = upcomingStep;
             const { label, Icon, tone } = presentation;
             return (
               <li

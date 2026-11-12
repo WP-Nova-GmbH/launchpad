@@ -5,6 +5,7 @@ import {
   ArrowUpRightIcon,
   ChevronDownIcon,
   ClipboardCheckIcon,
+  ClockIcon,
   CloudIcon,
   MessageSquareIcon,
   MonitorIcon,
@@ -162,10 +163,11 @@ export function WorkflowJob({
   const [pendingRetry, setPendingRetry] = useState<{
     key: string;
     epoch: number;
-    operation: WorkflowRecoveryOperation;
+    operation: WorkflowRecoveryOperation | "retry_preparation";
   } | null>(null);
   const retryPublishingButton = useRunActionFocus(key, runHeading);
   const retryCancellationButton = useRunActionFocus(key, runHeading);
+  const retryPreparationButton = useRunActionFocus(key, runHeading);
   const runControlsTrigger = useRef<HTMLButtonElement>(null);
   const [cancelDialogKey, setCancelDialogKey] = useState<string | null>(null);
   const queuedRecoveryLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
@@ -332,9 +334,24 @@ export function WorkflowJob({
       (!canConfigure || !actionState.canRetry || currentRead.job !== selectedJob)
     )
       return;
+    if (
+      operation === "retry_preparation" &&
+      (!canConfigure ||
+        currentReads.activeKey !== key ||
+        currentRead.job !== selectedJob ||
+        selectedJob.status !== "paused" ||
+        selectedJob.progress?.status !== "paused" ||
+        !selectedJob.progress.retryablePreparation ||
+        manualState.checkpointBlocked)
+    )
+      return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId, randomUUID());
     if (!request) return;
-    if (operation === "retry_saving" || (operation === "approve" && finishing)) {
+    if (
+      operation === "retry_preparation" ||
+      operation === "retry_saving" ||
+      (operation === "approve" && finishing)
+    ) {
       setPendingRetry({ key, epoch: request.epoch, operation });
     }
     const current = appAtomRegistry.get(workflowDraftAtom);
@@ -649,12 +666,14 @@ export function WorkflowJob({
   const running = selectedJob.status === "running";
   const needsInput = selectedJob.status === "awaiting_input";
   const paused = selectedJob.status === "paused";
+  const activeRetry =
+    read.mutation && pendingRetry?.key === key && pendingRetry.epoch === read.epoch
+      ? pendingRetry.operation
+      : undefined;
   const recovery = workflowCompletionRecovery(
     selectedJob,
     finishing,
-    read.mutation && pendingRetry?.key === key && pendingRetry.epoch === read.epoch
-      ? pendingRetry.operation
-      : undefined,
+    activeRetry === "retry_preparation" ? undefined : activeRetry,
   );
   const recoveryInTask = !!recovery && !terminal && !paused;
   const recoveryRetry = hasResultSave ? "retry_saving" : "approve";
@@ -733,6 +752,58 @@ export function WorkflowJob({
     queueReasonTask && (!detail || queueReasonTask.relayDetails.includes(detail))
       ? queueReasonTask
       : undefined;
+  const preparationFailed =
+    paused &&
+    selectedJob.progress?.status === "paused" &&
+    selectedJob.progress.retryablePreparation === true;
+  // Older relays report only that a response is pending. An unsaved publication
+  // can also have a retry pending, so keep confirmation generic when both coexist.
+  const preparationRetryRequested =
+    preparationFailed &&
+    manualState.responsePending &&
+    !selectedJob.pendingResponseOperation &&
+    !selectedJob.resultSaveRetryPending &&
+    !hasResultSave &&
+    !approvalPending;
+  const preparationInTask =
+    !queuedTask &&
+    !publishingFailure &&
+    !selectedJob.progress?.manualPause &&
+    !selectedJob.pendingManualControl &&
+    (preparationFailed ||
+      (selectedJob.status === "preparing" && !recovery && !confirmationPending));
+  const sendingPreparationRetry = activeRetry === "retry_preparation";
+  const preparationRetrying = sendingPreparationRetry || preparationRetryRequested;
+  const preparationSteps = selectedJob.workflow?.definition.steps;
+  const preparingStep =
+    selectedJob.progress?.status === "preparing"
+      ? preparationSteps?.find(({ id }) => id === selectedJob.progress?.stepId)
+      : undefined;
+  const preparingWorkspace =
+    machine &&
+    selectedJob.progress?.generation === 0 &&
+    preparingStep?.kind === "agent" &&
+    preparingStep === preparationSteps?.find(({ kind }) => kind === "agent");
+  const preparationTitle = preparationRetryRequested
+    ? "Retry requested"
+    : sendingPreparationRetry
+      ? "Requesting retry…"
+      : preparationFailed
+        ? "Couldn’t prepare the workspace"
+        : preparingWorkspace
+          ? "Preparing the workspace"
+          : preparingStep
+            ? `Preparing “${preparingStep.title}”`
+            : "Preparing run";
+  const preparationAnnouncement = paused
+    ? [statusLabel, preparationTitle, recovery?.title].filter(Boolean).join(". ")
+    : preparationTitle;
+  const preparationFailureDetail = selectedJob.progress?.detail ?? detail;
+  const preparationRelayDetail =
+    selectedJob.detail !== preparationFailureDetail &&
+    selectedJob.detail !== "Response saved; waiting for the environment."
+      ? selectedJob.detail
+      : null;
   const taskTitle = composingFeedback
     ? "Request changes"
     : checkpointResponsePending
@@ -955,16 +1026,18 @@ export function WorkflowJob({
               ? checkpointConfirmationTitle
               : queuedTask
                 ? `${statusLabel}. ${queuedTask.title}`
-                : recovery
-                  ? `${statusLabel}. ${recovery.title}`
-                  : statusLabel}
+                : preparationInTask
+                  ? preparationAnnouncement
+                  : recovery
+                    ? `${statusLabel}. ${recovery.title}`
+                    : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
             {runName}
           </h1>
           <div className="flex flex-wrap items-center gap-3">
-            {!TaskIcon && !cancelling && !recoveryInTask ? (
+            {(!TaskIcon || preparationInTask) && !cancelling && !recoveryInTask ? (
               <span aria-hidden className="text-sm font-medium">
                 {statusLabel}
               </span>
@@ -1108,6 +1181,45 @@ export function WorkflowJob({
             </WorkflowOutcome>
           ) : recoveryInTask ? (
             recoveryCard
+          ) : preparationInTask ? (
+            <WorkflowOutcome
+              title={preparationTitle}
+              announce={false}
+              tone={preparationFailed && !preparationRetrying ? "warning" : "neutral"}
+              icon={preparationFailed && !preparationRetrying ? undefined : ClockIcon}
+              actions={
+                preparationFailed && !preparationRetrying && canConfigure ? (
+                  <Button
+                    ref={retryPreparationButton}
+                    size="sm"
+                    variant="outline"
+                    disabled={busy || manualState.checkpointBlocked}
+                    onClick={() => void respond("retry_preparation")}
+                  >
+                    <RotateCwIcon aria-hidden />
+                    Retry preparation
+                  </Button>
+                ) : undefined
+              }
+            >
+              <p className="wrap-anywhere">
+                {preparationRetryRequested
+                  ? target
+                    ? `Waiting for ${target.machineLabel} to confirm the retry.`
+                    : "Waiting for the environment to confirm the retry."
+                  : sendingPreparationRetry
+                    ? "Sending the preparation retry request."
+                    : preparationFailed
+                      ? (preparationFailureDetail ?? "Workspace setup failed.")
+                      : (detail ??
+                        (preparingStep && !preparingWorkspace
+                          ? "Waiting for the execution environment to start this step."
+                          : "Waiting for the execution environment to get the run ready."))}
+              </p>
+              {preparationFailed && preparationRelayDetail ? (
+                <p className="wrap-anywhere">{preparationRelayDetail}</p>
+              ) : null}
+            </WorkflowOutcome>
           ) : cancelledVm ? null : (
             <div
               className={
@@ -1177,6 +1289,7 @@ export function WorkflowJob({
           {!cancelling &&
           !checkpointResponsePending &&
           (!recoveryInTask || selectedJob.pendingManualControl) &&
+          !(preparationInTask && preparationRetryRequested) &&
           !selectedJob.resultSaveRetryPending &&
           manualState.message &&
           !showPauseDetail ? (
@@ -1193,6 +1306,7 @@ export function WorkflowJob({
           !cancelledVm &&
           !queuedTask &&
           !recoveryInTask &&
+          !preparationInTask &&
           detail &&
           !(
             checkpointResponsePending && detail === "Response saved; waiting for the environment."
@@ -1317,18 +1431,6 @@ export function WorkflowJob({
               ) : null}
             </div>
           ) : null}
-          {!cancelling &&
-          canConfigure &&
-          manualState.status === "paused" &&
-          selectedJob.progress?.retryablePreparation ? (
-            <Button
-              variant="outline"
-              disabled={busy || manualState.checkpointBlocked}
-              onClick={() => void respond("retry_preparation")}
-            >
-              Retry preparation
-            </Button>
-          ) : null}
         </section>
         <WorkflowUnsentDrafts
           key={`drafts:${key}`}
@@ -1350,7 +1452,12 @@ export function WorkflowJob({
           </a>
         ) : null}
         <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-2 border-t pt-3">
-          <WorkflowProgress key={key} job={selectedJob} recovery={recovery} />
+          <WorkflowProgress
+            key={key}
+            job={selectedJob}
+            recovery={recovery}
+            preparing={preparationInTask}
+          />
           {!paused ? resumeAction : null}
         </div>
       </div>

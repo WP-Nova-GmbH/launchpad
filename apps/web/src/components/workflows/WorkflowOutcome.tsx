@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { CircleAlertIcon, FileDiffIcon, TriangleAlertIcon } from "lucide-react";
+import { CircleAlertIcon, FileDiffIcon, TriangleAlertIcon, type LucideIcon } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 export function WorkflowOutcome({
@@ -7,14 +7,19 @@ export function WorkflowOutcome({
   children,
   actions,
   tone = "neutral",
+  icon,
+  announce = true,
 }: {
   title: string;
   children: ReactNode;
   actions?: ReactNode;
   tone?: "error" | "warning" | "neutral";
+  icon?: LucideIcon | undefined;
+  announce?: boolean;
 }) {
   const Icon =
-    tone === "error" ? CircleAlertIcon : tone === "warning" ? TriangleAlertIcon : FileDiffIcon;
+    icon ??
+    (tone === "error" ? CircleAlertIcon : tone === "warning" ? TriangleAlertIcon : FileDiffIcon);
   return (
     <div
       className={cn(
@@ -34,7 +39,10 @@ export function WorkflowOutcome({
             tone === "neutral" && "text-muted-foreground",
           )}
         />
-        <div className="min-w-0 space-y-1" role={tone === "neutral" ? "status" : "alert"}>
+        <div
+          className="min-w-0 space-y-1"
+          role={announce ? (tone === "neutral" ? "status" : "alert") : undefined}
+        >
           <h2 className="text-sm font-semibold">{title}</h2>
           <div
             className={cn(

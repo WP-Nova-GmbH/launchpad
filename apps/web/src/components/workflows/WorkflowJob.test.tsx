@@ -1400,6 +1400,325 @@ describe("workflow run outcomes", () => {
       .findAllByType("section")
       .find((section) => section.props["aria-label"] === "Current workflow task")!;
 
+  const preparationFailure = {
+    ...job,
+    workflow,
+    status: "paused",
+    progress: {
+      ...job.progress!,
+      revision: 17,
+      status: "paused",
+      underlyingStatus: "paused",
+      detail: "The workspace setup command exited with code 1.",
+      checkpoint: null,
+      stepId: "agent",
+      generation: 0,
+      retryablePreparation: true,
+      manualPauseSupported: true,
+      steps: [
+        { stepId: "agent", generation: 0, status: "waiting" },
+        { stepId: "push", generation: 0, status: "pending" },
+      ],
+    },
+  } satisfies RepositoryWorkflowJob;
+
+  it("retries the current preparation and distinguishes local, relay, and executor states", async () => {
+    fixture.call.mockResolvedValue(preparationFailure);
+    await mount();
+
+    const runStatus = () => renderer!.root.findByType("header").findByProps({ role: "status" });
+    const statusRegion = runStatus();
+    expect(text(statusRegion)).toContain("Couldn’t prepare the workspace");
+    expect(text(currentRunTask())).toContain(preparationFailure.progress.detail);
+    expect(currentRunTask().findAllByType("button")).toContain(findButton("Retry preparation"));
+
+    const requested = {
+      ...preparationFailure,
+      detail: "Response saved; waiting for the environment.",
+      responsePending: true,
+    } satisfies RepositoryWorkflowJob;
+    const reply = deferred();
+    const retry = vi.fn().mockReturnValue(reply.promise);
+    fixture.call
+      .mockResolvedValue(requested)
+      .mockImplementationOnce((request) => request({ respondToWorkflowJob: retry }, "token"));
+    await press("Retry preparation");
+
+    expect(text(currentRunTask())).toContain("Requesting retry…");
+    expect(runStatus()).toBe(statusRegion);
+    expect(text(runStatus())).toContain("Requesting retry…");
+    expect(findButton("Retry preparation")).toBeUndefined();
+    expect(retry).toHaveBeenCalledExactlyOnceWith({
+      clerkToken: "token",
+      repositoryId: scope.repositoryId,
+      jobId: job.jobId,
+      payload: {
+        operation: "retry_preparation",
+        expectedRevision: preparationFailure.progress.revision,
+      },
+    });
+    await act(async () => {
+      reply.resolve(requested);
+      await reply.promise;
+    });
+    expect(text(currentRunTask())).toContain("Retry requested");
+    expect(runStatus()).toBe(statusRegion);
+    expect(text(runStatus())).toContain("Retry requested");
+    expect(text(currentRunTask())).not.toContain("Requesting retry…");
+    expect(findButton("Retry preparation")).toBeUndefined();
+
+    fixture.call.mockResolvedValue({
+      ...preparationFailure,
+      status: "preparing",
+      progress: {
+        ...preparationFailure.progress,
+        status: "preparing",
+        underlyingStatus: "preparing",
+        revision: 18,
+        detail: null,
+        retryablePreparation: false,
+        steps: [
+          { stepId: "agent", generation: 0, status: "running" },
+          { stepId: "push", generation: 0, status: "pending" },
+        ],
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+
+    expect(text(currentRunTask())).toContain("Preparing the workspace");
+    expect(text(currentRunTask())).not.toContain("Retry requested");
+    expect(text(currentRunTask())).not.toContain(preparationFailure.progress.detail);
+    expect(findButton("Retry preparation")).toBeUndefined();
+  });
+
+  it("shows preparation errors to viewers and keeps manual pause ahead of recovery", async () => {
+    fixture.call.mockResolvedValue(preparationFailure);
+    await mount(false);
+    expect(text(currentRunTask())).toContain("Couldn’t prepare the workspace");
+    expect(text(currentRunTask())).toContain(preparationFailure.progress.detail);
+    expect(findButton("Retry preparation")).toBeUndefined();
+
+    await act(() => renderer!.update(view()));
+    fixture.call.mockResolvedValue({
+      ...preparationFailure,
+      responsePending: true,
+      pendingManualControl: {
+        operation: "pause",
+        controlId: "pause-during-preparation",
+        expectedRevision: preparationFailure.progress.revision,
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(renderer!.toJSON())).toContain("Pause requested");
+    expect(text(currentRunTask())).not.toContain("Retry requested");
+
+    fixture.call.mockResolvedValue({
+      ...preparationFailure,
+      progress: {
+        ...preparationFailure.progress,
+        revision: 18,
+        manualPause: { state: "requested" },
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(findButton("Resume workflow")).toBeDefined();
+    expect(findButton("Retry preparation")).toBeUndefined();
+    expect(text(currentRunTask())).not.toContain("Retry requested");
+  });
+
+  it("keeps VM preparation retry available alongside independent result storage", async () => {
+    const vmFailure = {
+      ...preparationFailure,
+      runtime: { kind: "vm", threadId: preparationFailure.progress.threadId },
+      workflow: {
+        ...workflow,
+        definition: {
+          ...workflow.definition,
+          target: { kind: "vm", baseBranch: "main" },
+          steps: [workflow.definition.steps[0]!],
+        },
+      },
+      progress: {
+        ...preparationFailure.progress,
+        steps: [preparationFailure.progress.steps[0]!],
+      },
+    } satisfies RepositoryWorkflowJob;
+    const publication = {
+      publicationId: "c5540cf3-802e-41c9-b6b6-832d2f6ba867",
+      resultId: null,
+    };
+    const saving = {
+      ...vmFailure,
+      progress: {
+        ...vmFailure.progress,
+        resultSaving: { ...publication, state: "saving", retryable: false, detail: null },
+      },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(saving);
+    await mount();
+
+    expect(text(currentRunTask())).toContain("Couldn’t prepare the workspace");
+    expect(text(renderer!.toJSON())).toContain("Saving run state");
+    expect(findButton("Retry preparation").props.disabled).not.toBe(true);
+
+    const failed = {
+      ...vmFailure,
+      progress: {
+        ...vmFailure.progress,
+        revision: 18,
+        resultSaving: {
+          ...publication,
+          state: "failed",
+          retryable: true,
+          detail: "Storage offline",
+        },
+      },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(failed);
+    await pollRun();
+    expect(text(currentRunTask())).toContain(preparationFailure.progress.detail);
+    expect(text(renderer!.root.findByType("header").findByProps({ role: "status" }))).toContain(
+      "Couldn’t save run state",
+    );
+    expect(findButton("Retry preparation").props.disabled).not.toBe(true);
+    expect(findButton("Retry saving")).toBeDefined();
+
+    fixture.call.mockResolvedValue({
+      ...failed,
+      responsePending: true,
+      resultSaveRetryPending: true,
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(currentRunTask())).not.toContain("Retry requested");
+    expect(text(renderer!.toJSON())).toContain("Waiting for retry confirmation");
+    const retry = findButton("Retry preparation");
+    expect(!retry || retry.props.disabled || retry.props["aria-disabled"]).toBe(true);
+
+    fixture.call.mockResolvedValue({
+      ...failed,
+      responsePending: true,
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(currentRunTask())).toContain("Waiting for confirmation");
+    expect(text(currentRunTask())).not.toContain("Retry requested");
+    expect(findButton("Retry preparation").props.disabled).toBe(true);
+  });
+
+  it("shows the first setup before any steps and names the current Agent on later preparation", async () => {
+    const firstPreparation = {
+      ...preparationFailure,
+      status: "preparing",
+      progress: {
+        ...preparationFailure.progress,
+        status: "preparing",
+        underlyingStatus: "preparing",
+        detail: null,
+        hasThread: true,
+        retryablePreparation: false,
+        steps: [
+          { stepId: "agent", generation: 0, status: "running" },
+          { stepId: "push", generation: 0, status: "pending" },
+        ],
+      },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(firstPreparation);
+    await mount();
+
+    const progressPanel = () => renderer!.root.findByProps({ "aria-label": "Run progress" });
+    const progressSummary = () => text(progressPanel().findByType("summary"));
+    expect(progressSummary()).toContain("No steps started");
+    expect(progressPanel().findAllByProps({ "aria-current": "step" })).toHaveLength(0);
+
+    fixture.call.mockResolvedValue({
+      ...preparationFailure,
+      progress: { ...preparationFailure.progress, revision: 18, hasThread: true },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(progressSummary()).toContain("No steps started");
+
+    fixture.call.mockResolvedValue({
+      ...firstPreparation,
+      progress: { ...firstPreparation.progress, revision: 19, steps: undefined },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(progressSummary()).not.toContain("No steps started");
+
+    fixture.call.mockResolvedValue({
+      ...firstPreparation,
+      workflow: {
+        ...workflow,
+        definition: {
+          ...workflow.definition,
+          steps: [
+            {
+              id: "scope",
+              title: "Set scope",
+              kind: "input",
+              question: "Which scope?",
+              role: "member",
+            },
+            workflow.definition.steps[0]!,
+          ],
+        },
+      },
+      progress: {
+        ...firstPreparation.progress,
+        revision: 20,
+        steps: [
+          { stepId: "scope", generation: 0, status: "completed" },
+          { stepId: "agent", generation: 0, status: "running" },
+        ],
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(currentRunTask())).toContain("Preparing the workspace");
+    expect(progressSummary()).toContain("1 of 2 steps complete");
+
+    const laterAgent = {
+      id: "verify",
+      title: "Verify deployment",
+      kind: "agent",
+      instruction: "Check the deployed result.",
+      modelSelection: null,
+    } as const;
+    fixture.call.mockResolvedValue({
+      ...firstPreparation,
+      workflow: {
+        ...workflow,
+        definition: {
+          ...workflow.definition,
+          steps: [workflow.definition.steps[0]!, laterAgent],
+        },
+      },
+      progress: {
+        ...firstPreparation.progress,
+        revision: 21,
+        stepId: laterAgent.id,
+        steps: [
+          { stepId: "agent", generation: 0, status: "completed" },
+          { stepId: laterAgent.id, generation: 0, status: "running" },
+        ],
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(currentRunTask())).toContain(`Preparing “${laterAgent.title}”`);
+    expect(progressSummary()).toContain("1 of 2 steps complete");
+    expect(progressSummary()).not.toContain("No steps started");
+
+    fixture.call.mockResolvedValue({
+      ...firstPreparation,
+      progress: {
+        ...firstPreparation.progress,
+        revision: 22,
+        generation: 1,
+        steps: firstPreparation.progress.steps.map((step) => ({ ...step, generation: 1 })),
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(currentRunTask())).not.toContain("Preparing the workspace");
+    expect(progressSummary()).not.toContain("No steps started");
+  });
+
   it("shows the saved-result blocker and lets only maintainers retry the current publication", async () => {
     const saving = savingAgentResult("saving");
     const failedResult = savingAgentResult("failed");
