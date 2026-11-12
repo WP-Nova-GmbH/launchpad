@@ -75,7 +75,7 @@ it.live(
             const [admitted] = yield* store.listJobs("repo");
             const jobId = admitted!.jobId;
             const h = yield* harness;
-            yield* Ref.set(h.branch, `launchpad-job/${jobId}`);
+            yield* Ref.set(h.branch, `launchpad/${jobId}`);
             yield* Ref.set(h.head, baseCommit);
             yield* Ref.set(h.remoteBase, baseCommit);
             const auth = yield* workflowAccess(h, "org", "repo").pipe(
@@ -161,7 +161,7 @@ it.live(
                 onHead: (sha) => Ref.set(h.head, sha),
               },
               undefined,
-              "launchpad-job",
+              "launchpad",
             );
             const runner = yield* h.newRunner.pipe(
               Effect.provideService(RepositoryAccess, auth.access),

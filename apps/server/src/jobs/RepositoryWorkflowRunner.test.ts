@@ -545,7 +545,7 @@ it.effect("accepts a job once, bounds bursts, and freezes its definition", () =>
   ),
 );
 
-it.effect.each(["launchpad-job", "t3-job"] as const)(
+it.effect.each(["launchpad", "launchpad-job", "t3-job"] as const)(
   "recovers accepted work on the %s branch without another prompt",
   (prefix) =>
     test(
@@ -554,17 +554,17 @@ it.effect.each(["launchpad-job", "t3-job"] as const)(
         const scope = yield* Scope.make();
         const first = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
         yield* first.handle(request());
-        assert.equal(
-          (yield* h.starts)[0]?.bootstrap?.prepareWorktree?.branch,
-          "launchpad-job/job-1",
-        );
+        assert.equal((yield* h.starts)[0]?.bootstrap?.prepareWorktree?.branch, "launchpad/job-1");
         yield* Scope.close(scope, Exit.void);
-        if (prefix === "t3-job") {
+        if (prefix !== "launchpad") {
           const store = yield* Store.WorkflowRunStore;
           const { jobBranchPrefix: _prefix, ...accepted } = (yield* store.get("job-1"))!;
-          yield* store.save(accepted);
-          yield* Ref.set(h.branch, "t3-job/job-1");
-          yield* Ref.update(h.currentThread, (value) => ({ ...value!, branch: "t3-job/job-1" }));
+          yield* store.save(
+            prefix === "t3-job" ? accepted : { ...accepted, jobBranchPrefix: prefix },
+          );
+          const branch = `${prefix}/job-1`;
+          yield* Ref.set(h.branch, branch);
+          yield* Ref.update(h.currentThread, (value) => ({ ...value!, branch }));
         }
         const restarted = yield* h.newRunner;
         yield* h.complete;
@@ -649,7 +649,7 @@ it.effect.each([
         });
         current = {
           ...current,
-          branch: "launchpad-job/job-1",
+          branch: "launchpad/job-1",
           worktreePath: "/jobs/job-1",
           promptQueue: {
             ...current.promptQueue!,
@@ -1219,7 +1219,7 @@ it.effect(
           modelSelection: MODEL,
           runtimeMode: "full-access",
           interactionMode: "default",
-          branch: "launchpad-job/job-1",
+          branch: "launchpad/job-1",
           worktreePath: "/jobs/job-1",
           createdAt: NOW,
         };

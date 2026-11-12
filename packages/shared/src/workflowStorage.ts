@@ -6,12 +6,12 @@ import {
 } from "@t3tools/contracts/workflows";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 
-export const LAUNCHPAD_JOB_BRANCH_PREFIX = "launchpad-job";
+export const LAUNCHPAD_JOB_BRANCH_PREFIX = "launchpad";
 
 /** Use a stable branch name outside the auto-renamed t3code namespace. */
 export function jobBranchName(
   jobId: string,
-  prefix: "t3-job" | typeof LAUNCHPAD_JOB_BRANCH_PREFIX = "t3-job",
+  prefix: "t3-job" | "launchpad-job" | typeof LAUNCHPAD_JOB_BRANCH_PREFIX = "t3-job",
 ): string {
   const sanitized = jobId.replaceAll(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   return `${prefix}/${sanitized.length > 0 ? sanitized : "job"}`;

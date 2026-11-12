@@ -177,7 +177,7 @@ export function thread(jobId = "job-1"): OrchestrationThread {
 }
 export function completed(previous: OrchestrationThread, messageId?: string): OrchestrationThread {
   const jobId = previous.id.split(":")[1]!;
-  const branch = previous.branch ?? `launchpad-job/${jobId}`;
+  const branch = previous.branch ?? `launchpad/${jobId}`;
   const count = messageId ? previous.checkpoints.length + 1 : 1;
   const turnId = TurnId.make(messageId ? `${jobId}-turn-${count}` : `${jobId}-turn`);
   return {
@@ -280,7 +280,7 @@ export const harness = Effect.gen(function* () {
   const checkpointTrees = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
   const remoteBase = yield* Ref.make("base-sha");
   const head = yield* Ref.make("base-sha");
-  const branch = yield* Ref.make("launchpad-job/job-1");
+  const branch = yield* Ref.make("launchpad/job-1");
   const project = yield* decodeProject({
     id: PROJECT,
     title: "Repo",

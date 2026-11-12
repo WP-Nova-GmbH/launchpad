@@ -439,7 +439,7 @@ it.effect(
   "publishes a new Machine run to its Launchpad branch and observes completion on replay",
   () =>
     Effect.gen(function* () {
-      const h = yield* harness("none", undefined, undefined, "launchpad-job");
+      const h = yield* harness("none", undefined, undefined, "launchpad");
       yield* h.actions.execute(id, h.io);
       yield* h.actions.execute(id, h.io);
       assert.deepEqual(h.counts(), { commits: 1, pushes: 1 });

@@ -130,7 +130,7 @@ export const WorkflowRun = Schema.Struct({
   ),
   jobId: Schema.String,
   /** Existing runs without this field keep the branch chosen before the prefix change. */
-  jobBranchPrefix: Schema.optional(Schema.Literal(LAUNCHPAD_JOB_BRANCH_PREFIX)),
+  jobBranchPrefix: Schema.optional(Schema.Literals([LAUNCHPAD_JOB_BRANCH_PREFIX, "launchpad-job"])),
   origin: Schema.optional(WorkflowOrigin),
   userId: Schema.NullOr(TrimmedNonEmptyString),
   repositoryCanonicalKey: Schema.String,
