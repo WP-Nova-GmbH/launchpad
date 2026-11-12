@@ -234,11 +234,19 @@ describe("Workflow step editing", () => {
     expect(JSON.stringify(renderer!.toJSON())).toContain(
       "Select the managed default before saving",
     );
+    const picker = () => renderer!.root.findByProps({ "aria-label": "Managed Codex model" });
+    const [issueId, approvalsId] = picker().props["aria-describedby"].split(" ");
+    expect(picker().props["aria-invalid"]).toBe(true);
+    expect(renderer!.root.findByProps({ id: issueId }).props.children).toContain(
+      "Select the managed default before saving",
+    );
     expect(definition.steps[1]).toMatchObject({
       modelSelection: { instanceId: workflowVmCodexInstanceId, model: "saved-model" },
     });
     await click("Use managed default");
     expect(definition.steps[1]).toMatchObject({ modelSelection: null });
+    expect(picker().props["aria-invalid"]).toBeUndefined();
+    expect(picker().props["aria-describedby"]).toBe(approvalsId);
   });
 
   it("selects explicit models using the managed Codex instance", async () => {

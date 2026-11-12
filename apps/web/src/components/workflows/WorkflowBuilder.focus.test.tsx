@@ -47,11 +47,13 @@ class FocusNode {
   disabled = false;
   value = "";
   scrollTop = 0;
+  focusOptions: FocusOptions | undefined;
   get ownerDocument() {
     return focusDocument;
   }
-  focus() {
+  focus(options?: FocusOptions) {
     focusDocument.activeElement = this;
+    this.focusOptions = options;
   }
   matches() {
     return this.disabled;
@@ -127,11 +129,19 @@ vi.mock("./WorkflowCanvas", async () => ({
 }));
 vi.mock("./WorkflowTriggerInspector", async () => ({
   ...(await vi.importActual("./WorkflowTriggerInspector")),
-  WorkflowTriggerInspector: ({ onClose }: { onClose: () => void }) =>
-    createElement("button", { "aria-label": "Close trigger settings", onClick: onClose }),
+  WorkflowTriggerInspector: ({ onClose, onSave }: { onClose: () => void; onSave: () => void }) =>
+    createElement(
+      "div",
+      null,
+      createElement("button", { "aria-label": "Close trigger settings", onClick: onClose }),
+      createElement("button", { onClick: onSave }, "Save workflow"),
+    ),
 }));
+const modelIssues = vi.hoisted(() =>
+  vi.fn<() => { stepId: string; title: string; detail: string }[]>(),
+);
 vi.mock("./WorkflowStepEditor", () => ({
-  useWorkflowEditorModels: () => ({ issues: [] }),
+  useWorkflowEditorModels: () => ({ issues: modelIssues() }),
   WorkflowStepEditor: (props: StepProps) => {
     const step = props.definition.steps.find((entry) => entry.id === props.selectedId)!;
     const field = step.kind === "agent" ? "instruction" : "question";
@@ -184,6 +194,12 @@ vi.mock("./WorkflowStepEditor", () => ({
                 ),
               ),
           }),
+      step.kind === "agent"
+        ? createElement("button", {
+            "data-focus-key": `${step.id}:model`,
+            ref: (node: HTMLElement | null) => props.registerField("model", node),
+          })
+        : null,
       blocked
         ? createElement(
             "div",
@@ -465,6 +481,7 @@ beforeEach(() => {
   cache.clear();
   request.mockReset().mockRejectedValue(new Error("Unexpected request"));
   navigate.mockReset();
+  modelIssues.mockReset().mockReturnValue([]);
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
 });
@@ -531,6 +548,124 @@ describe("Save recovery focus", () => {
   );
 });
 
+describe("Editor validation focus", () => {
+  it("describes a missing name, focuses it on Save, and clears the error after editing", async () => {
+    await mount();
+    const nameInput = () =>
+      renderer!.root
+        .findAllByType("input")
+        .find((input) => input.props["aria-label"] === "Workflow name")!;
+    await act(() => nameInput().props.onChange({ target: { value: "" } }));
+
+    field("save").focus();
+    await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+
+    expect(focusDocument.activeElement).toBe(field("name"));
+    expect(nameInput().props["aria-invalid"]).toBe(true);
+    const descriptionId = nameInput().props["aria-describedby"];
+    expect(descriptionId).toEqual(expect.any(String));
+    expect(renderer!.root.findByProps({ id: descriptionId }).children).toContain(
+      "Enter a workflow name.",
+    );
+    expect(draft().error).toBeNull();
+    expect(recoveryButton("Reload saved version")).toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+
+    await act(() => nameInput().props.onChange({ target: { value: "Reviewed implementation" } }));
+
+    expect(nameInput().props["aria-invalid"]).toBeFalsy();
+    expect(renderer!.root.findAllByProps({ id: descriptionId })).toHaveLength(0);
+  });
+
+  it("keeps focus on the missing workflow name after closing the Trigger sheet from Save", async () => {
+    width = 600;
+    await mount(false, { automationSupported: true });
+    await act(() =>
+      editWorkflowDraft(scope, id(), (current) => ({
+        ...current,
+        definition: { ...current.definition, name: "" },
+      })),
+    );
+    await act(() => canvas().props.onTrigger());
+    expect(draft().triggerSetup).toBe(true);
+
+    await act(() => recoveryButton("Save workflow").props.onClick());
+
+    expect(draft().triggerSetup).toBe(false);
+    expect(focusDocument.activeElement).toBe(field("name"));
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("focuses the chosen VM model warning and still sends Save to the first unresolved model", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    await mount(true);
+    modelIssues.mockReturnValue([
+      { stepId: "agent", title: "Implement change", detail: "The selected model is unavailable." },
+      { stepId: "verify", title: "Verify implementation", detail: "Choose an available model." },
+    ]);
+    await act(() =>
+      editWorkflowDraft(scope, id(), (current) => {
+        const agent = current.definition.steps[0]!;
+        return {
+          ...current,
+          targetConfirmed: true,
+          definition: {
+            ...current.definition,
+            steps: [
+              { ...agent, title: "Implement change" },
+              { ...agent, id: "verify", title: "Verify implementation" },
+            ],
+          },
+        };
+      }),
+    );
+    request.mockClear();
+
+    const verifyModel = renderer!.root
+      .findAllByType("button")
+      .find(
+        (button) =>
+          button.props["aria-label"] === "Review model for Agent step 2: Verify implementation",
+      )!;
+    expect(verifyModel.children).toContain("Review model");
+    await act(() => verifyModel.props.onClick({ currentTarget: new FocusNode() }));
+    expect(draft().selectedStepId).toBe("verify");
+    expect(focusDocument.activeElement).toBe(field("verify:model"));
+    expect(field("verify:model").focusOptions?.preventScroll).toBe(false);
+
+    await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+    expect(draft().selectedStepId).toBe("agent");
+    expect(focusDocument.activeElement).toBe(field("agent:model"));
+    expect(field("agent:model").focusOptions?.preventScroll).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+
+    modelIssues.mockReturnValue([
+      { stepId: "agent", title: "", detail: "The selected model is unavailable." },
+      { stepId: "verify", title: "Agent step 1", detail: "Choose an available model." },
+    ]);
+    await act(() =>
+      editWorkflowDraft(scope, id(), (current) => ({
+        ...current,
+        definition: {
+          ...current.definition,
+          steps: current.definition.steps.map((step) => ({
+            ...step,
+            title: step.id === "agent" ? "" : "Agent step 1",
+          })),
+        },
+      })),
+    );
+    const reviewLabels = renderer!.root
+      .findAllByType("button")
+      .filter((button) => button.children.includes("Review model"))
+      .map((button) => button.props["aria-label"]);
+    expect(reviewLabels).toEqual([
+      "Review model for Agent step 1",
+      "Review model for Agent step 2: Agent step 1",
+    ]);
+  });
+});
+
 describe("Inspector presentation focus", () => {
   it.each([1200, 600])(
     "focuses Add a step after removing the only step at width %i",
@@ -557,6 +692,7 @@ describe("Inspector presentation focus", () => {
     await changeWidth(800);
     const narrow = field("agent:instruction");
     expect(focusDocument.activeElement === narrow).toBe(true);
+    expect(narrow.focusOptions?.preventScroll).toBe(true);
     expect([
       narrow.selectionStart,
       narrow.selectionEnd,
@@ -574,9 +710,8 @@ describe("Inspector presentation focus", () => {
     expect(draft().selectedStepId).toBe("agent");
     expect(draft().definition.steps[0]).toMatchObject({ instruction: before.value });
   });
-  it("consumes validation focus before restoring a subsequently edited title", async () => {
+  it("opens missing Agent instructions from the warning and consumes Save focus", async () => {
     await mount();
-    await inspect();
     await act(() =>
       editWorkflowDraft(scope, id(), (current) => ({
         ...current,
@@ -588,8 +723,21 @@ describe("Inspector presentation focus", () => {
         },
       })),
     );
+    expect(renderer!.root.findAllByProps({ title: "Add Agent instructions" })).toHaveLength(1);
+    await act(() =>
+      recoveryButton("Review Agent instructions").props.onClick({ currentTarget: new FocusNode() }),
+    );
+    expect(draft().selectedStepId).toBe("agent");
+    expect(focusDocument.activeElement).toBe(field("agent:instruction"));
+    expect(field("agent:instruction").focusOptions?.preventScroll).toBe(false);
+
+    field("save").focus();
     await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
-    expect(focusDocument.activeElement === field("agent:instruction")).toBe(true);
+    expect(focusDocument.activeElement).toBe(field("agent:instruction"));
+    expect(field("agent:instruction").focusOptions?.preventScroll).toBe(false);
+    expect(draft().error).toBeNull();
+    expect(recoveryButton("Reload saved version")).toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
     const title = field("agent:title");
     title.focus();
     title.setSelectionRange(1, 4);
@@ -598,6 +746,14 @@ describe("Inspector presentation focus", () => {
     expect([field("agent:title").selectionStart, field("agent:title").selectionEnd]).toEqual([
       1, 4,
     ]);
+
+    await act(() =>
+      renderer!.root.findByProps({ "data-focus-key": "agent:instruction" }).props.onChange({
+        target: { value: "Implement the change." },
+      }),
+    );
+    await act(() => renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick());
+    expect(renderer!.root.findAllByProps({ title: "Add Agent instructions" })).toHaveLength(0);
   });
   it.each([1200, 600])(
     "returns focus to the canvas trigger after dismissing trigger settings at width %i",

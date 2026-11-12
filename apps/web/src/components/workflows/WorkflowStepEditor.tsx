@@ -178,6 +178,7 @@ export function WorkflowStepEditor({
   openWorkflowSettings,
   insertPushBranch,
   registerField,
+  instructionError,
 }: {
   definition: WorkflowDefinition;
   selectedId: string | null;
@@ -193,6 +194,7 @@ export function WorkflowStepEditor({
   openWorkflowSettings: () => void;
   insertPushBranch: () => void;
   registerField: (field: string, node: HTMLElement | null) => void;
+  instructionError?: string | undefined;
 }) {
   const id = useId();
   const removingStep = useRef(false);
@@ -228,6 +230,7 @@ export function WorkflowStepEditor({
   const triggerLabel = step?.kind === "agent" ? models.triggerLabel(step) : undefined;
   const vm = definition.target.kind === "vm";
   const vmModelIssue = vm ? models.issues.find((issue) => issue.stepId === step?.id) : undefined;
+  const agentInstructionError = step?.kind === "agent" ? instructionError : undefined;
   return (
     <div className="space-y-3">
       {step ? (
@@ -321,15 +324,20 @@ export function WorkflowStepEditor({
               </p>
             ) : null}
             {step.kind === "agent" || step.kind === "input" ? (
-              <label
+              <div
                 className={
                   step.kind === "agent"
                     ? `block space-y-1 text-sm ${styles["workflow-agent-instructions"]}`
                     : "block space-y-1 text-sm"
                 }
               >
-                <span>{step.kind === "agent" ? "Agent instructions" : "Required question"}</span>
+                <label className="block" htmlFor={`${id}-prompt`}>
+                  {step.kind === "agent" ? "Agent instructions" : "Required question"}
+                </label>
                 <Textarea
+                  id={`${id}-prompt`}
+                  aria-invalid={agentInstructionError ? true : undefined}
+                  aria-describedby={agentInstructionError ? `${id}-instruction-issue` : undefined}
                   ref={(node) =>
                     registerField(step.kind === "agent" ? "instruction" : "question", node)
                   }
@@ -346,7 +354,12 @@ export function WorkflowStepEditor({
                     )
                   }
                 />
-              </label>
+                {agentInstructionError ? (
+                  <p id={`${id}-instruction-issue`} className="text-xs text-destructive-foreground">
+                    {agentInstructionError}
+                  </p>
+                ) : null}
+              </div>
             ) : null}
             {step.kind === "agent" ? (
               <div className="space-y-2">
@@ -376,7 +389,10 @@ export function WorkflowStepEditor({
                     >
                       <SelectTrigger
                         aria-label="Managed Codex model"
-                        aria-describedby={`${id}-approvals`}
+                        aria-invalid={vmModelIssue ? true : undefined}
+                        aria-describedby={
+                          vmModelIssue ? `${id}-model-issue ${id}-approvals` : `${id}-approvals`
+                        }
                         ref={(node) => registerField("model", node)}
                       >
                         <SelectValue>{triggerLabel}</SelectValue>
@@ -405,7 +421,7 @@ export function WorkflowStepEditor({
                           </Button>
                         }
                       >
-                        {vmModelIssue.detail}
+                        <span id={`${id}-model-issue`}>{vmModelIssue.detail}</span>
                       </WorkflowAlert>
                     ) : !vmModels ? (
                       <WorkflowAlert title="VM model choices unavailable" variant="info">

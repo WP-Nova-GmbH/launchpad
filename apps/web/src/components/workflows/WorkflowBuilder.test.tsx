@@ -46,7 +46,7 @@ import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry
 const { navigate, confirmation, modelIssues } = vi.hoisted(() => ({
   navigate: vi.fn(),
   confirmation: vi.fn<() => Promise<boolean>>(),
-  modelIssues: vi.fn<() => ReadonlyArray<{ stepId: string }>>(),
+  modelIssues: vi.fn<() => ReadonlyArray<{ stepId: string; title: string; detail: string }>>(),
 }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => navigate }));
 vi.mock("../../lib/runtime", () => ({ runtime: {} }));
@@ -1394,7 +1394,9 @@ describe("VM authoring", () => {
       definition: { ...original.definition, target: { kind: "vm", baseBranch: "main" } },
       automation: recoveryAuto,
     };
-    modelIssues.mockReturnValue([{ stepId: "agent" }]);
+    modelIssues.mockReturnValue([
+      { stepId: "agent", title: "Agent", detail: "Choose a model supported by this VM build." },
+    ]);
     read.mockResolvedValueOnce({ status: "connected" });
     await mount({
       ...base,
@@ -1417,15 +1419,20 @@ describe("VM authoring", () => {
     );
     const off = { enabled: false, trigger: recoveryTrigger };
     const receipt = { ...workflow, revision: workflow.revision + 1, automation: off };
+    const write = deferred<RepositoryWorkflow>();
     read.mockImplementationOnce(async () => {
       expect(editor(workflow.workflowId).operation).toMatchObject({
         expectedRevision: workflow.revision,
         definition: workflow.definition,
         automation: off,
       });
-      return receipt;
+      return write.promise;
     });
+    expect(button("Review model")?.props.disabled).toBeFalsy();
     await click("Save Off only");
+    expect(button("Review model")?.props.disabled).toBe(true);
+    await act(() => write.resolve(receipt));
+    expect(button("Review model")?.props.disabled).toBeFalsy();
     expect(editor(workflow.workflowId)).toMatchObject({
       baseline: receipt,
       definition: { name: "" },
@@ -1439,7 +1446,9 @@ describe("VM authoring", () => {
       ...saved("saved-vm", 5, newWorkflowDraft([], "review", true)!.definition),
       automation: recoveryAuto,
     };
-    modelIssues.mockReturnValue([{ stepId: "agent" }]);
+    modelIssues.mockReturnValue([
+      { stepId: "agent", title: "Agent", detail: "Choose a model supported by this VM build." },
+    ]);
     read.mockResolvedValueOnce({ status: "connected" });
     await mount({
       ...base,

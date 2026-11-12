@@ -334,16 +334,7 @@ function WorkflowBuilderEditor({
     )
       return;
     if (!draft.operation && !turnOffOnly) {
-      const problem = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
-      if (problem) {
-        edit((draft) => ({
-          ...draft,
-          selectedStepId: problem.stepId ?? draft.selectedStepId,
-          error: problem.message,
-        }));
-        return;
-      }
-      if (!draft.targetConfirmed) return;
+      if (issue || !draft.targetConfirmed) return;
       const automation = workflowDraftAutomation(draft);
       if (
         automationSupported &&
@@ -704,6 +695,7 @@ function WorkflowBuilderEditor({
 type WorkflowFieldFocus = {
   field: string;
   stepId: string | null;
+  scrollIntoView?: boolean;
   selection?: {
     start: number;
     end: number;
@@ -810,6 +802,7 @@ function WorkflowBuilderWorkspace({
   const mounted = useRef(true);
   const workspace = useRef<HTMLFormElement>(null);
   const settingsId = useId();
+  const nameErrorId = `${settingsId}-name-error`;
   const executionTargetControl = useRef<HTMLButtonElement>(null);
   const saveControl = useRef<HTMLButtonElement>(null);
   const saveRecoveryControl = useRef<HTMLButtonElement>(null);
@@ -851,9 +844,19 @@ function WorkflowBuilderWorkspace({
     !settingsOpen &&
     selected?.kind === "action" &&
     (issue.stepId === selected.id || !!vm);
-  const editorIssue = publishingIssueInInspector ? null : issue;
+  const missingName = !draft.definition.name.trim();
+  const instructionIssue =
+    issue?.field === "instruction"
+      ? draft.definition.steps.find(
+          (step) => step.id === issue.stepId && step.kind === "agent" && !step.instruction.trim(),
+        )
+      : undefined;
+  const fieldValidationIssue = (issue?.field === "name" && missingName) || !!instructionIssue;
+  const editorIssue = publishingIssueInInspector || fieldValidationIssue ? null : issue;
   const editorError =
-    publishingIssueInInspector && !draft.operation && draft.error === issue?.message
+    !draft.operation &&
+    (publishingIssueInInspector || fieldValidationIssue) &&
+    draft.error === issue?.message
       ? null
       : draft.error;
   const machine = draft.definition.target.kind === "machine" ? draft.definition.target : null;
@@ -961,7 +964,10 @@ function WorkflowBuilderWorkspace({
       (request.field === "repair" ? focusableField(`${request.stepId}:repair-warning`) : undefined);
     focusRequest.current = null;
     if (!node) return false;
-    node.focus({ preventScroll: request.field !== "repair" && request.field !== "repair-warning" });
+    node.focus({
+      preventScroll:
+        !request.scrollIntoView && request.field !== "repair" && request.field !== "repair-warning",
+    });
     if (
       request.selection &&
       (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)
@@ -1048,7 +1054,16 @@ function WorkflowBuilderWorkspace({
       '[aria-label="Configure workflow trigger"]',
     );
   const inspectorReturnTarget = () => {
-    if (returnFocus.current?.isConnected) return returnFocus.current;
+    const opener = returnFocus.current;
+    if (opener?.isConnected && !opener.matches(':disabled, [aria-disabled="true"]')) return opener;
+    if (opener?.matches("[data-workflow-validation-action]"))
+      return (
+        workspace.current?.querySelector<HTMLButtonElement>(
+          "[data-workflow-validation-action]:not(:disabled)",
+        ) ??
+        (pending || reading ? null : (saveRecoveryControl.current ?? saveControl.current)) ??
+        executionTargetControl.current
+      );
     if (triggerOpen) return canvasTrigger();
     return settingsOpen ? executionTargetControl.current : null;
   };
@@ -1076,6 +1091,7 @@ function WorkflowBuilderWorkspace({
     setFocusRequest({
       field: problem.publishing ? "repair" : problem.field,
       stepId: problem.stepId,
+      scrollIntoView: !!instructionIssue,
     });
   };
   const reviewIssueAction = editorIssue ? (
@@ -1096,6 +1112,11 @@ function WorkflowBuilderWorkspace({
       {editorIssue.publishing ? "Review publishing step" : "Review settings"}
     </Button>
   ) : null;
+  const reviewModel = (stepId: string, opener?: HTMLElement) => {
+    choose(stepId);
+    if (opener) returnFocus.current = opener;
+    setFocusRequest({ field: "model", stepId, scrollIntoView: true });
+  };
   const insertPushBranch = () => {
     if (selected?.kind !== "action" || selected.action !== "open_pull_request") return;
     const preceding = draft.definition.steps[draft.definition.steps.indexOf(selected) - 1];
@@ -1122,8 +1143,11 @@ function WorkflowBuilderWorkspace({
     }
     const problem = issue;
     if (problem) {
-      if (problem.publishing) returnFocus.current = submitter ?? saveControl.current;
-      edit((current) => ({ ...current, error: problem.message }));
+      if (problem.field === "name" && missingName)
+        returnFocus.current = fields.current.get("name") ?? null;
+      else if (problem.publishing || instructionIssue)
+        returnFocus.current = submitter ?? saveControl.current;
+      if (!fieldValidationIssue) edit((current) => ({ ...current, error: problem.message }));
       setSettingsOpen(false);
       setTriggerOpen(false);
       select(problem.stepId ?? "");
@@ -1181,10 +1205,7 @@ function WorkflowBuilderWorkspace({
     }
     const modelIssue = vm ? models.issues[0] : undefined;
     if (modelIssue) {
-      setTriggerOpen(false);
-      setSettingsOpen(false);
-      select(modelIssue.stepId);
-      setFocusRequest({ field: "model", stepId: modelIssue.stepId });
+      reviewModel(modelIssue.stepId, submitter ?? saveControl.current ?? undefined);
       return;
     }
     setFocusRequest(null);
@@ -1508,6 +1529,11 @@ function WorkflowBuilderWorkspace({
       selectedId={selected.id}
       models={models}
       vmModels={vmAuthoring?.models}
+      instructionError={
+        selected.kind === "agent" && !selected.instruction.trim()
+          ? "Enter instructions for this Agent step."
+          : undefined
+      }
       targetConfirmed={draft.targetConfirmed}
       machineCheckoutAvailable={!!target}
       disabled={pending}
@@ -1548,7 +1574,11 @@ function WorkflowBuilderWorkspace({
           <input
             className={styles["workflow-editor-title"]}
             aria-label="Workflow name"
+            aria-invalid={missingName || undefined}
+            aria-describedby={missingName ? nameErrorId : undefined}
+            placeholder="Workflow name"
             data-workflow-field="name"
+            required
             ref={(node) => registerField("name", node)}
             maxLength={120}
             disabled={pending}
@@ -1560,6 +1590,11 @@ function WorkflowBuilderWorkspace({
               }))
             }
           />
+          {missingName ? (
+            <p id={nameErrorId} role="alert" className="mt-1 text-xs text-destructive-foreground">
+              Enter a workflow name.
+            </p>
+          ) : null}
           <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
             <Tooltip>
               <TooltipTrigger
@@ -1654,6 +1689,7 @@ function WorkflowBuilderWorkspace({
       showSaveRecovery ||
       notice ||
       editorIssue ||
+      instructionIssue ||
       models.issues.length ? (
         <div className={styles["workflow-editor-notices"]}>
           {vmRunUnavailable ? (
@@ -1799,7 +1835,79 @@ function WorkflowBuilderWorkspace({
               {editorIssue.message}
             </WorkflowAlert>
           ) : null}
-          {models.issues.length ? (
+          {instructionIssue ? (
+            <WorkflowAlert
+              title="Add Agent instructions"
+              variant="warning"
+              actions={
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={pending}
+                  data-workflow-validation-action
+                  onClick={(event) => {
+                    choose(instructionIssue.id);
+                    returnFocus.current = event.currentTarget;
+                    setFocusRequest({
+                      field: "instruction",
+                      stepId: instructionIssue.id,
+                      scrollIntoView: true,
+                    });
+                  }}
+                >
+                  Review Agent instructions
+                </Button>
+              }
+            >
+              {instructionIssue.title}
+            </WorkflowAlert>
+          ) : null}
+          {vm && models.issues.length ? (
+            <WorkflowAlert title="Agent models need attention" variant="warning">
+              <ul className="divide-y divide-warning/25">
+                {models.issues.map((modelIssue) => {
+                  const stepIndex = draft.definition.steps.findIndex(
+                    ({ id }) => id === modelIssue.stepId,
+                  );
+                  const step = draft.definition.steps[stepIndex];
+                  const model = step?.kind === "agent" ? step.modelSelection?.model : undefined;
+                  const name = step?.title.trim();
+                  const stepLabel = stepIndex >= 0 ? `Agent step ${stepIndex + 1}` : "Agent step";
+                  const title = name ? `${stepLabel}: ${name}` : stepLabel;
+                  return (
+                    <li
+                      key={modelIssue.stepId}
+                      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-2 first:pt-0 last:pb-0"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-medium text-foreground">{title}</p>
+                        <p className="text-xs text-foreground">
+                          {model ? (
+                            <>
+                              <span className="font-mono">{model}</span>{" "}
+                            </>
+                          ) : null}
+                          {modelIssue.detail}
+                        </p>
+                      </div>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        aria-label={`Review model for ${title}`}
+                        disabled={pending}
+                        data-workflow-validation-action
+                        onClick={(event) => reviewModel(modelIssue.stepId, event.currentTarget)}
+                      >
+                        Review model
+                      </Button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </WorkflowAlert>
+          ) : models.issues.length ? (
             <WorkflowAlert
               title="Agent models need attention"
               variant="warning"
@@ -1811,8 +1919,7 @@ function WorkflowBuilderWorkspace({
                   onClick={() => {
                     const first = models.issues[0];
                     if (!first) return;
-                    choose(first.stepId);
-                    setFocusRequest({ field: "model", stepId: first.stepId });
+                    reviewModel(first.stepId);
                   }}
                 >
                   Review model settings
