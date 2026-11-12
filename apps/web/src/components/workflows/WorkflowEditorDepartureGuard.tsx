@@ -1,10 +1,13 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import { useBlocker } from "@tanstack/react-router";
 import {
   workflowDraftAtom,
   workflowSessionKey,
   workflowEditorDirty,
+  workflowDraftAutomation,
+  sameWorkflowAutomation,
+  sameWorkflowDefinition,
   discardWorkflowEditor,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -23,12 +26,17 @@ import { Button } from "../ui/button";
 export function WorkflowEditorDepartureGuard({
   scope,
   id,
+  reading,
   onDiscard,
+  onCheckSavedVersion,
 }: {
   scope: WorkflowScope;
   id: string;
+  reading: boolean;
   onDiscard: () => void;
+  onCheckSavedVersion: () => void;
 }) {
+  const stayButtonRef = useRef<HTMLButtonElement>(null);
   const drafts = useAtomValue(workflowDraftAtom);
   const current =
     drafts.accountId === scope.accountId
@@ -63,37 +71,94 @@ export function WorkflowEditorDepartureGuard({
   useEffect(() => {
     if (blocker.status === "blocked" && !unsaved) blocker.proceed();
   }, [blocker, unsaved]);
-  const submitted = !!current?.operation;
+  const operation = current?.operation;
+  const unconfirmed = operation?.state === "uncertain";
+  const canCheckSavedVersion = unconfirmed && !reading;
+  const name =
+    operation?.definition.name.trim() ||
+    current?.definition.name.trim() ||
+    current?.baseline?.definition.name.trim();
+  const workflow = name ? (
+    <strong className="font-medium text-popover-foreground">{name}</strong>
+  ) : (
+    "this workflow"
+  );
+  const automationAfterSave = operation?.includesAutomation
+    ? operation.automation
+    : current?.baseline?.automation;
+  const hasUnsubmittedEdits =
+    current &&
+    operation &&
+    (!sameWorkflowDefinition(current.definition, operation.definition) ||
+      !sameWorkflowAutomation(workflowDraftAutomation(current), automationAfterSave));
+  const stayButton = (
+    <Button
+      key="stay"
+      ref={stayButtonRef}
+      type="button"
+      variant={operation ? "default" : "outline"}
+      onClick={() => {
+        blocker.reset?.();
+        if (canCheckSavedVersion) onCheckSavedVersion();
+      }}
+    >
+      {canCheckSavedVersion ? "Check saved version" : operation ? "Stay" : "Keep editing"}
+    </Button>
+  );
+  const leaveButton = (
+    <Button
+      key="leave"
+      type="button"
+      variant={operation ? "outline" : "destructive"}
+      onClick={() => {
+        onDiscard();
+        discardWorkflowEditor(appAtomRegistry, scope, id);
+        blocker.proceed?.();
+      }}
+    >
+      {operation ? "Leave anyway" : "Discard and leave"}
+    </Button>
+  );
+
   return (
     <AlertDialog
-      open={blocker.status === "blocked"}
+      open={blocker.status === "blocked" && unsaved}
       onOpenChange={(open) => {
         if (!open) blocker.reset?.();
       }}
     >
-      <AlertDialogPopup>
+      <AlertDialogPopup initialFocus={stayButtonRef}>
         <AlertDialogHeader>
-          <AlertDialogTitle>Discard unsaved changes?</AlertDialogTitle>
-          <AlertDialogDescription>
-            Your unsaved workflow changes will be lost.
-            {submitted ? " A submitted Save may still complete; leaving does not cancel it." : ""}
+          <AlertDialogTitle>
+            {unconfirmed
+              ? "Save not confirmed"
+              : operation
+                ? "Save in progress"
+                : "Discard unsaved changes?"}
+          </AlertDialogTitle>
+          <AlertDialogDescription className="wrap-anywhere">
+            {unconfirmed ? (
+              <>
+                The save for {workflow} may have completed.
+                {canCheckSavedVersion ? " Stay in the editor to check the saved version." : null}
+              </>
+            ) : operation ? (
+              <>The save for {workflow} may still complete after you leave.</>
+            ) : (
+              <>Your unsaved edits to {workflow} will be lost.</>
+            )}
+            {operation ? (
+              <span className="mt-2 block">
+                If you leave and the save doesn’t complete, your edits will be lost.
+              </span>
+            ) : null}
+            {hasUnsubmittedEdits ? (
+              <span className="mt-2 block">Edits outside that save will be lost if you leave.</span>
+            ) : null}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <Button type="button" variant="outline" onClick={() => blocker.reset?.()}>
-            Keep editing
-          </Button>
-          <Button
-            type="button"
-            variant="destructive"
-            onClick={() => {
-              onDiscard();
-              discardWorkflowEditor(appAtomRegistry, scope, id);
-              blocker.proceed?.();
-            }}
-          >
-            Discard and leave
-          </Button>
+          {operation ? [leaveButton, stayButton] : [stayButton, leaveButton]}
         </AlertDialogFooter>
       </AlertDialogPopup>
     </AlertDialog>

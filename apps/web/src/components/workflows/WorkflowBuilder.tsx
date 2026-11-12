@@ -1550,7 +1550,13 @@ function WorkflowBuilderWorkspace({
             </span>
           </div>
         </div>
-        <WorkflowEditorDepartureGuard scope={scope} id={draft.workflowId} onDiscard={onDepart} />
+        <WorkflowEditorDepartureGuard
+          scope={scope}
+          id={draft.workflowId}
+          reading={reading}
+          onDiscard={onDepart}
+          onCheckSavedVersion={reconcile}
+        />
         <div className={styles["workflow-editor-actions"]}>
           <Button
             type="button"
