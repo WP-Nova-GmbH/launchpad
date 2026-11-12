@@ -48,6 +48,11 @@ class FocusNode {
   value = "";
   scrollTop = 0;
   focusOptions: FocusOptions | undefined;
+  constructor(private readonly attributes: Record<string, unknown> = {}) {}
+  getAttribute(name: string) {
+    const value = this.attributes[name];
+    return typeof value === "string" ? value : null;
+  }
   get ownerDocument() {
     return focusDocument;
   }
@@ -267,9 +272,22 @@ vi.mock("../ui/tooltip", () => ({
     render ? cloneElement(render, {}, children) : children,
   TooltipPopup: () => null,
 }));
-vi.mock("../ui/button", () => ({
-  Button: (props: Record<string, unknown>) => createElement("button", props),
-}));
+vi.mock("../ui/button", () => {
+  function ReviewQuestionButton(props: Record<string, unknown>) {
+    useLayoutEffect(
+      () => () => {
+        const node = nodes.get("review-question");
+        if (node) node.isConnected = false;
+      },
+      [],
+    );
+    return createElement("button", { ...props, "data-focus-key": "review-question" });
+  }
+  return {
+    Button: (props: Record<string, unknown>) =>
+      createElement(props.children === "Review question" ? ReviewQuestionButton : "button", props),
+  };
+});
 vi.mock("../ui/input", () => ({
   Input: (props: Record<string, unknown>) => createElement("input", props),
 }));
@@ -428,8 +446,8 @@ async function mount(
         if (!key) return null;
         const cacheKey = `${presentation}:${key}`;
         let node = cache.get(cacheKey);
-        if (!node) {
-          node = element.type === "button" ? new FocusNode() : new TextField();
+        if (!node?.isConnected) {
+          node = element.type === "button" ? new FocusNode(props) : new TextField();
           cache.set(cacheKey, node);
         }
         node.value = typeof props.value === "string" ? props.value : "";
@@ -595,6 +613,81 @@ describe("Editor validation focus", () => {
     expect(focusDocument.activeElement).toBe(field("name"));
     expect(request).not.toHaveBeenCalled();
   });
+
+  it.each([1200, 600])(
+    "opens and returns focus from a missing Input question at width %i",
+    async (editorWidth) => {
+      width = editorWidth;
+      await mount();
+      await act(() =>
+        editWorkflowDraft(scope, id(), (current) => ({
+          ...current,
+          definition: {
+            ...current.definition,
+            steps: [
+              ...current.definition.steps,
+              {
+                id: "input",
+                kind: "input",
+                title: "Choose release target",
+                question: "   ",
+                role: "maintainer",
+              },
+            ],
+          },
+        })),
+      );
+
+      expect(renderer!.root.findAllByProps({ title: "Add a question" })).toHaveLength(1);
+      const openQuestion = async () => {
+        const button = recoveryButton("Review question");
+        const opener = button.instance as FocusNode;
+        opener.focus();
+        await act(() => button.props.onClick({ currentTarget: opener }));
+        expect(opener.isConnected).toBe(false);
+        return opener;
+      };
+      const closeQuestion = async () => {
+        await act(() =>
+          renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick(),
+        );
+        if (editorWidth < 920) {
+          const remounted = recoveryButton("Review question");
+          if (remounted) expect(focusDocument.activeElement).not.toBe(remounted.instance);
+          await act(() => completeOpening!(false));
+        }
+      };
+      const firstOpener = await openQuestion();
+      expect(focusDocument.activeElement).toBe(field("input:question"));
+      expect(field("input:question").focusOptions?.preventScroll).toBe(false);
+      expect(renderer!.root.findAllByProps({ title: "Add a question" })).toHaveLength(0);
+
+      await closeQuestion();
+      expect(renderer!.root.findAllByProps({ title: "Add a question" })).toHaveLength(1);
+      const remountedOpener = recoveryButton("Review question").instance;
+      expect(remountedOpener).not.toBe(firstOpener);
+      expect(focusDocument.activeElement).toBe(remountedOpener);
+
+      field("save").focus();
+      await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+      expect(draft().selectedStepId).toBe("input");
+      expect(focusDocument.activeElement).toBe(field("input:question"));
+      expect(field("input:question").focusOptions?.preventScroll).toBe(false);
+      expect(draft().error).toBeNull();
+      expect(request).not.toHaveBeenCalled();
+
+      await closeQuestion();
+      await openQuestion();
+      await act(() =>
+        renderer!.root.findByProps({ "data-focus-key": "input:question" }).props.onChange({
+          target: { value: "Which release should this change target?" },
+        }),
+      );
+      await closeQuestion();
+      expect(renderer!.root.findAllByProps({ title: "Add a question" })).toHaveLength(0);
+      expect(focusDocument.activeElement).toBe(field("save"));
+    },
+  );
 
   it("focuses the chosen VM model warning and still sends Save to the first unresolved model", async () => {
     request.mockResolvedValue({ status: "connected" });

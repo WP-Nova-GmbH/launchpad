@@ -836,6 +836,8 @@ function WorkflowBuilderWorkspace({
   });
   const fields = useRef(new Map<string, HTMLElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
+  const questionReviewControl = useRef<HTMLButtonElement>(null);
+  const questionFocusPending = useRef(false);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
   const panelOpen = triggerOpen || settingsOpen || !!selected;
   const publishingIssueInInspector =
@@ -845,13 +847,16 @@ function WorkflowBuilderWorkspace({
     selected?.kind === "action" &&
     (issue.stepId === selected.id || !!vm);
   const missingName = !draft.definition.name.trim();
-  const instructionIssue =
-    issue?.field === "instruction"
-      ? draft.definition.steps.find(
-          (step) => step.id === issue.stepId && step.kind === "agent" && !step.instruction.trim(),
-        )
-      : undefined;
-  const fieldValidationIssue = (issue?.field === "name" && missingName) || !!instructionIssue;
+  const invalidStep = draft.definition.steps.find((step) => step.id === issue?.stepId);
+  const missingStepPrompt =
+    (issue?.field === "instruction" &&
+      invalidStep?.kind === "agent" &&
+      !invalidStep.instruction.trim()) ||
+    (issue?.field === "question" && invalidStep?.kind === "input" && !invalidStep.question.trim());
+  const questionInInspector =
+    issue?.field === "question" && issue.stepId === selected?.id && !triggerOpen && !settingsOpen;
+  const showPromptNotice = missingStepPrompt && !questionInInspector;
+  const fieldValidationIssue = (issue?.field === "name" && missingName) || missingStepPrompt;
   const editorIssue = publishingIssueInInspector || fieldValidationIssue ? null : issue;
   const editorError =
     !draft.operation &&
@@ -1056,24 +1061,44 @@ function WorkflowBuilderWorkspace({
   const inspectorReturnTarget = () => {
     const opener = returnFocus.current;
     if (opener?.isConnected && !opener.matches(':disabled, [aria-disabled="true"]')) return opener;
+    const fallback =
+      (pending || reading ? null : (saveRecoveryControl.current ?? saveControl.current)) ??
+      executionTargetControl.current;
+    const questionStepId = opener?.getAttribute("data-workflow-question-review");
+    if (questionStepId) {
+      const action = questionReviewControl.current;
+      return action?.getAttribute("data-workflow-question-review") === questionStepId &&
+        !action.disabled
+        ? action
+        : fallback;
+    }
     if (opener?.matches("[data-workflow-validation-action]"))
       return (
         workspace.current?.querySelector<HTMLButtonElement>(
           "[data-workflow-validation-action]:not(:disabled)",
-        ) ??
-        (pending || reading ? null : (saveRecoveryControl.current ?? saveControl.current)) ??
-        executionTargetControl.current
+        ) ?? fallback
       );
     if (triggerOpen) return canvasTrigger();
     return settingsOpen ? executionTargetControl.current : null;
   };
+  const restoreQuestionFocus = () => {
+    if (!questionFocusPending.current) return;
+    questionFocusPending.current = false;
+    inspectorReturnTarget()?.focus();
+  };
+  useEffect(() => {
+    if (docked && !panelOpen) restoreQuestionFocus();
+  });
   const close = () => {
-    returnFocus.current = inspectorReturnTarget() ?? null;
+    // The question action remounts after closing.
+    const questionOpener = !!returnFocus.current?.getAttribute("data-workflow-question-review");
+    questionFocusPending.current = questionOpener;
+    if (!questionOpener) returnFocus.current = inspectorReturnTarget() ?? null;
     setFocusRequest(null);
     setSettingsOpen(false);
     setTriggerOpen(false);
     select("");
-    returnFocus.current?.focus();
+    if (!questionOpener) returnFocus.current?.focus();
   };
   const openSettings = () => {
     setTriggerOpen(false);
@@ -1091,7 +1116,7 @@ function WorkflowBuilderWorkspace({
     setFocusRequest({
       field: problem.publishing ? "repair" : problem.field,
       stepId: problem.stepId,
-      scrollIntoView: !!instructionIssue,
+      scrollIntoView: missingStepPrompt,
     });
   };
   const reviewIssueAction = editorIssue ? (
@@ -1145,7 +1170,7 @@ function WorkflowBuilderWorkspace({
     if (problem) {
       if (problem.field === "name" && missingName)
         returnFocus.current = fields.current.get("name") ?? null;
-      else if (problem.publishing || instructionIssue)
+      else if (problem.publishing || missingStepPrompt)
         returnFocus.current = submitter ?? saveControl.current;
       if (!fieldValidationIssue) edit((current) => ({ ...current, error: problem.message }));
       setSettingsOpen(false);
@@ -1529,11 +1554,6 @@ function WorkflowBuilderWorkspace({
       selectedId={selected.id}
       models={models}
       vmModels={vmAuthoring?.models}
-      instructionError={
-        selected.kind === "agent" && !selected.instruction.trim()
-          ? "Enter instructions for this Agent step."
-          : undefined
-      }
       targetConfirmed={draft.targetConfirmed}
       machineCheckoutAvailable={!!target}
       disabled={pending}
@@ -1689,7 +1709,7 @@ function WorkflowBuilderWorkspace({
       showSaveRecovery ||
       notice ||
       editorIssue ||
-      instructionIssue ||
+      showPromptNotice ||
       models.issues.length ? (
         <div className={styles["workflow-editor-notices"]}>
           {vmRunUnavailable ? (
@@ -1835,9 +1855,9 @@ function WorkflowBuilderWorkspace({
               {editorIssue.message}
             </WorkflowAlert>
           ) : null}
-          {instructionIssue ? (
+          {showPromptNotice && issue && invalidStep ? (
             <WorkflowAlert
-              title="Add Agent instructions"
+              title={issue.field === "question" ? "Add a question" : "Add Agent instructions"}
               variant="warning"
               actions={
                 <Button
@@ -1846,21 +1866,21 @@ function WorkflowBuilderWorkspace({
                   variant="outline"
                   disabled={pending}
                   data-workflow-validation-action
+                  data-workflow-question-review={
+                    issue.field === "question" ? invalidStep.id : undefined
+                  }
+                  ref={issue.field === "question" ? questionReviewControl : undefined}
                   onClick={(event) => {
-                    choose(instructionIssue.id);
+                    choose(invalidStep.id);
                     returnFocus.current = event.currentTarget;
-                    setFocusRequest({
-                      field: "instruction",
-                      stepId: instructionIssue.id,
-                      scrollIntoView: true,
-                    });
+                    focusIssue(issue);
                   }}
                 >
-                  Review Agent instructions
+                  {issue.field === "question" ? "Review question" : "Review Agent instructions"}
                 </Button>
               }
             >
-              {instructionIssue.title}
+              {invalidStep.title}
             </WorkflowAlert>
           ) : null}
           {vm && models.issues.length ? (
@@ -1986,6 +2006,9 @@ function WorkflowBuilderWorkspace({
             onOpenChange={(open) => {
               if (!open && presentation.current === false) close();
             }}
+            onOpenChangeComplete={(open) => {
+              if (!open && !panelOpen && presentation.current === false) restoreQuestionFocus();
+            }}
           >
             <SheetPopup
               showCloseButton={false}
@@ -2002,7 +2025,12 @@ function WorkflowBuilderWorkspace({
                 return !focusPending();
               }}
               finalFocus={() => {
-                if (!mounted.current || presentation.current !== false) return false;
+                if (
+                  !mounted.current ||
+                  presentation.current !== false ||
+                  returnFocus.current?.getAttribute("data-workflow-question-review")
+                )
+                  return false;
                 return inspectorReturnTarget() ?? true;
               }}
             >

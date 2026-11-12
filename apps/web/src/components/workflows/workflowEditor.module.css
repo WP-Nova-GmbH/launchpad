@@ -587,13 +587,6 @@
   min-height: 9rem;
   resize: vertical;
 }
-.workflow-checkpoint-note {
-  padding: 10px 12px;
-  border-radius: 8px;
-  font-size: 12px;
-  background: var(--warning-surface);
-  color: var(--muted-foreground);
-}
 @container workflow-canvas (max-width:640px) {
   .workflow-canvas-scroll {
     --workflow-shift: 0px;

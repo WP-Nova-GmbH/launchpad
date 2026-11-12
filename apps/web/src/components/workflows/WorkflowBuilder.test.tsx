@@ -685,7 +685,8 @@ describe("Canvas editor state", () => {
     await submit();
     expect(read).not.toHaveBeenCalled();
     expect(editor(id).selectedStepId).toBe("empty-input");
-    expect(editor(id).error).toContain("Question");
+    expect(editor(id).error).toBeNull();
+    expect(renderer!.root.findAllByProps({ title: "Add a question" })).toHaveLength(0);
     expect(renderer!.root.findByProps({ "data-testid": "step-fixture" }).props.selectedId).toBe(
       "empty-input",
     );

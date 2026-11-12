@@ -178,7 +178,6 @@ export function WorkflowStepEditor({
   openWorkflowSettings,
   insertPushBranch,
   registerField,
-  instructionError,
 }: {
   definition: WorkflowDefinition;
   selectedId: string | null;
@@ -194,7 +193,6 @@ export function WorkflowStepEditor({
   openWorkflowSettings: () => void;
   insertPushBranch: () => void;
   registerField: (field: string, node: HTMLElement | null) => void;
-  instructionError?: string | undefined;
 }) {
   const id = useId();
   const removingStep = useRef(false);
@@ -230,7 +228,12 @@ export function WorkflowStepEditor({
   const triggerLabel = step?.kind === "agent" ? models.triggerLabel(step) : undefined;
   const vm = definition.target.kind === "vm";
   const vmModelIssue = vm ? models.issues.find((issue) => issue.stepId === step?.id) : undefined;
-  const agentInstructionError = step?.kind === "agent" ? instructionError : undefined;
+  const promptError =
+    step?.kind === "agent" && !step.instruction.trim()
+      ? "Enter instructions for this Agent step."
+      : step?.kind === "input" && !step.question.trim()
+        ? "Enter a question for this Input step."
+        : undefined;
   return (
     <div className="space-y-3">
       {step ? (
@@ -318,11 +321,6 @@ export function WorkflowStepEditor({
             </div>
           </header>
           <fieldset disabled={disabled} className={styles["workflow-inspector-fields"]}>
-            {step.kind === "input" ? (
-              <p className={styles["workflow-checkpoint-note"]}>
-                The workflow waits here until someone answers.
-              </p>
-            ) : null}
             {step.kind === "agent" || step.kind === "input" ? (
               <div
                 className={
@@ -332,17 +330,17 @@ export function WorkflowStepEditor({
                 }
               >
                 <label className="block" htmlFor={`${id}-prompt`}>
-                  {step.kind === "agent" ? "Agent instructions" : "Required question"}
+                  {step.kind === "agent" ? "Agent instructions" : "Question"}
                 </label>
                 <Textarea
                   id={`${id}-prompt`}
-                  aria-invalid={agentInstructionError ? true : undefined}
-                  aria-describedby={agentInstructionError ? `${id}-instruction-issue` : undefined}
+                  aria-invalid={promptError ? true : undefined}
+                  aria-describedby={promptError ? `${id}-prompt-issue` : undefined}
                   ref={(node) =>
                     registerField(step.kind === "agent" ? "instruction" : "question", node)
                   }
                   required
-                  rows={6}
+                  rows={step.kind === "input" ? 3 : 6}
                   maxLength={32000}
                   data-workflow-field={step.kind === "agent" ? "instruction" : "question"}
                   value={step.kind === "agent" ? step.instruction : step.question}
@@ -354,9 +352,13 @@ export function WorkflowStepEditor({
                     )
                   }
                 />
-                {agentInstructionError ? (
-                  <p id={`${id}-instruction-issue`} className="text-xs text-destructive-foreground">
-                    {agentInstructionError}
+                {step.kind === "input" || promptError ? (
+                  <p
+                    id={`${id}-prompt-issue`}
+                    aria-live={step.kind === "input" ? "polite" : undefined}
+                    className="text-xs text-destructive-foreground empty:sr-only"
+                  >
+                    {promptError}
                   </p>
                 ) : null}
               </div>
@@ -491,7 +493,7 @@ export function WorkflowStepEditor({
             ) : (
               <div className="space-y-1">
                 <p id={`${id}-role`} className="text-sm">
-                  {step.kind === "review" ? "Who can review?" : "Who can respond?"}
+                  {step.kind === "review" ? "Who can review?" : "Who can answer?"}
                 </p>
                 <Select
                   value={step.role}
@@ -501,6 +503,7 @@ export function WorkflowStepEditor({
                 >
                   <SelectTrigger
                     aria-labelledby={`${id}-role`}
+                    aria-describedby={step.kind === "input" ? `${id}-role-help` : undefined}
                     data-workflow-field="role"
                     ref={(node) => registerField("role", node)}
                   >
@@ -513,6 +516,11 @@ export function WorkflowStepEditor({
                     <SelectItem value="member">Any repository member</SelectItem>
                   </SelectPopup>
                 </Select>
+                {step.kind === "input" ? (
+                  <p id={`${id}-role-help`} className="text-xs text-muted-foreground">
+                    The run waits for an answer before continuing.
+                  </p>
+                ) : null}
               </div>
             )}
             {step.kind === "review" ? (

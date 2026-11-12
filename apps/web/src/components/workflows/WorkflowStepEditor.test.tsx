@@ -132,6 +132,51 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 describe("Workflow step editing", () => {
+  it("clears a missing Input question error while keeping the selected responder", async () => {
+    await mount({
+      initial: {
+        ...original,
+        steps: [
+          {
+            id: "input",
+            kind: "input",
+            title: "Choose release target",
+            question: "Which release should this change target?",
+            role: "member",
+          },
+          ...original.steps,
+        ],
+      },
+      selection: "input",
+    });
+    const question = () => renderer!.root.findByType("textarea");
+    const error = renderer!.root.findByProps({ "aria-live": "polite" });
+    expect(error.children).toHaveLength(0);
+    await act(() =>
+      renderer!.root
+        .findByProps({ "data-workflow-model-select": true })
+        .props.onValueChange("maintainer"),
+    );
+    await act(() => question().props.onChange({ target: { value: "   " } }));
+
+    expect(question().props["aria-invalid"]).toBe(true);
+    const descriptionId = question().props["aria-describedby"];
+    expect(descriptionId).toEqual(expect.any(String));
+    expect(renderer!.root.findByProps({ id: descriptionId })).toBe(error);
+    expect(error.children).toContain("Enter a question for this Input step.");
+
+    const replacement = "Which version should we publish?";
+    await act(() => question().props.onChange({ target: { value: replacement } }));
+    expect(question().props["aria-invalid"]).toBeFalsy();
+    expect(question().props["aria-describedby"]).toBeUndefined();
+    expect(renderer!.root.findByProps({ id: descriptionId })).toBe(error);
+    expect(error.children).toHaveLength(0);
+    expect(definition.steps[0]).toMatchObject({
+      question: replacement,
+      role: "maintainer",
+    });
+  });
+
   it("updates Open PR readiness when a Push branch follows its latest Agent", async () => {
     await mount({
       initial: {
