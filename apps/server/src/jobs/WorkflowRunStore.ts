@@ -20,7 +20,10 @@ import {
   WorkflowManualControl,
   WorkflowManualPause,
 } from "@t3tools/contracts/workflows";
-import { normalizeStoredWorkflow } from "@t3tools/shared/workflowStorage";
+import {
+  LAUNCHPAD_JOB_BRANCH_PREFIX,
+  normalizeStoredWorkflow,
+} from "@t3tools/shared/workflowStorage";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -126,6 +129,8 @@ export const WorkflowRun = Schema.Struct({
     }),
   ),
   jobId: Schema.String,
+  /** Existing runs without this field keep the branch chosen before the prefix change. */
+  jobBranchPrefix: Schema.optional(Schema.Literal(LAUNCHPAD_JOB_BRANCH_PREFIX)),
   origin: Schema.optional(WorkflowOrigin),
   userId: Schema.NullOr(TrimmedNonEmptyString),
   repositoryCanonicalKey: Schema.String,

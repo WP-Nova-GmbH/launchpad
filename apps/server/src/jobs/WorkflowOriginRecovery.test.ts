@@ -633,10 +633,10 @@ it.effect.each(["initial", "successor", "unavailable-provider"] as const)(
         yield* auth.access.apply({ ...auth.policy, revision: 3 }, true);
         yield* runner.handle(automated(control("status")));
         assert.isFalse((yield* store.get("job-1"))!.executionReserved);
-        yield* Ref.set(h.branch, "t3-job/other-job");
+        yield* Ref.set(h.branch, "launchpad-job/other-job");
         yield* h.completeCurrent;
         yield* runner.handle(control("status", "other-job"));
-        yield* Ref.set(h.branch, "t3-job/job-1");
+        yield* Ref.set(h.branch, "launchpad-job/job-1");
         yield* runner.handle(automated(control("status")));
         yield* runner.handle(automated(control("status")));
         const resumed = (yield* store.get("job-1"))!;

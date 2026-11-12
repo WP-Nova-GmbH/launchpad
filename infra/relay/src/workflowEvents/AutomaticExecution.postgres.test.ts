@@ -54,7 +54,10 @@ import {
   PROJECT,
   workflow,
 } from "../../../../apps/server/src/jobs/RepositoryWorkflowRunner.test-fixture.ts";
-import { harness as publishingHarness } from "../../../../apps/server/src/jobs/WorkflowActions.test-fixture.ts";
+import {
+  baseCommit,
+  harness as publishingHarness,
+} from "../../../../apps/server/src/jobs/WorkflowActions.test-fixture.ts";
 if (!databaseUrl) throw new Error("Automatic execution proof requires disposable PostgreSQL.");
 const decodeRequest = Schema.decodeUnknownSync(Schema.fromJsonString(RelayCloudDispatchJobRequest));
 it.live(
@@ -72,7 +75,9 @@ it.live(
             const [admitted] = yield* store.listJobs("repo");
             const jobId = admitted!.jobId;
             const h = yield* harness;
-            yield* Ref.set(h.branch, `t3-job/${jobId}`);
+            yield* Ref.set(h.branch, `launchpad-job/${jobId}`);
+            yield* Ref.set(h.head, baseCommit);
+            yield* Ref.set(h.remoteBase, baseCommit);
             const auth = yield* workflowAccess(h, "org", "repo").pipe(
               Effect.provideService(ServerEnvironmentIdentity, {
                 getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
@@ -145,14 +150,19 @@ it.live(
                 },
               },
             );
-            const publishing = yield* publishingHarness("none", {
-              jobId,
-              base: "base-sha",
-              tree: "prepared-tree",
-              remoteName: "origin",
-              access: auth.access,
-              onHead: (sha) => Ref.set(h.head, sha),
-            });
+            const publishing = yield* publishingHarness(
+              "none",
+              {
+                jobId,
+                base: baseCommit,
+                tree: "prepared-tree",
+                remoteName: "origin",
+                access: auth.access,
+                onHead: (sha) => Ref.set(h.head, sha),
+              },
+              undefined,
+              "launchpad-job",
+            );
             const runner = yield* h.newRunner.pipe(
               Effect.provideService(RepositoryAccess, auth.access),
               Effect.provideService(WorkflowActions, publishing.actions),

@@ -177,11 +177,12 @@ export function thread(jobId = "job-1"): OrchestrationThread {
 }
 export function completed(previous: OrchestrationThread, messageId?: string): OrchestrationThread {
   const jobId = previous.id.split(":")[1]!;
+  const branch = previous.branch ?? `launchpad-job/${jobId}`;
   const count = messageId ? previous.checkpoints.length + 1 : 1;
   const turnId = TurnId.make(messageId ? `${jobId}-turn-${count}` : `${jobId}-turn`);
   return {
     ...previous,
-    branch: `t3-job/${jobId}`,
+    branch,
     worktreePath: `/jobs/${jobId}`,
     latestTurn: {
       turnId,
@@ -209,7 +210,7 @@ export function completed(previous: OrchestrationThread, messageId?: string): Or
         ...previous.promptQueue!.preparation!,
         state: "ready",
         settled: true,
-        target: { branch: `t3-job/${jobId}`, worktreePath: `/jobs/${jobId}` },
+        target: { branch, worktreePath: `/jobs/${jobId}` },
       },
       admissions: [
         ...(messageId ? previous.promptQueue!.admissions : []),
@@ -277,8 +278,9 @@ export const harness = Effect.gen(function* () {
   const captureStarted = yield* Queue.unbounded<void>();
   const captureCount = yield* Ref.make(0);
   const checkpointTrees = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  const remoteBase = yield* Ref.make("base-sha");
   const head = yield* Ref.make("base-sha");
-  const branch = yield* Ref.make("t3-job/job-1");
+  const branch = yield* Ref.make("launchpad-job/job-1");
   const project = yield* decodeProject({
     id: PROJECT,
     title: "Repo",
@@ -592,7 +594,9 @@ export const harness = Effect.gen(function* () {
       fetchRemote: () => Ref.update(fetches, (count) => count + 1),
       resolveDefaultBranchName: () => Effect.succeed("main"),
       resolveRemoteTrackingCommit: () =>
-        Effect.succeed({ commitSha: "base-sha", remoteRefName: "origin/main" }),
+        Ref.get(remoteBase).pipe(
+          Effect.map((commitSha) => ({ commitSha, remoteRefName: "origin/main" })),
+        ),
     }),
     Layer.mock(CheckpointStore)({
       captureCheckpoint: () =>
@@ -664,6 +668,7 @@ export const harness = Effect.gen(function* () {
     captureStarted,
     captureCount,
     checkpointTrees,
+    remoteBase,
     head,
     branch,
     retryMode,

@@ -28,6 +28,7 @@ import {
   type WorkflowControl,
   type WorkflowControlResult,
 } from "@t3tools/contracts/workflows";
+import { LAUNCHPAD_JOB_BRANCH_PREFIX, jobBranchName } from "@t3tools/shared/workflowStorage";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -81,7 +82,6 @@ import {
   isOrchestrationCommandRejection,
   OrchestrationCommandPreviouslyRejectedError,
 } from "../orchestration/Errors.ts";
-import { jobBranchName } from "./Layers/JobRunner.ts";
 
 export interface WorkflowRequest {
   readonly jobId: string;
@@ -689,7 +689,7 @@ export const make = Effect.gen(function* () {
                       prepareWorktree: {
                         projectCwd: project.value.workspaceRoot,
                         baseBranch: run.baseSha,
-                        branch: jobBranchName(run.jobId),
+                        branch: jobBranchName(run.jobId, run.jobBranchPrefix),
                         startFromOrigin: false,
                         requireWorktree: true,
                       },
@@ -728,8 +728,11 @@ export const make = Effect.gen(function* () {
     if (!run.worktreePath || !run.progress.checkpoint || run.progress.checkpoint.kind === "input")
       return "The saved result is unavailable. Cancel the job and run it again.";
     if (
-      (yield* readWorkflowHead(git, run.worktreePath, jobBranchName(run.jobId))) !==
-      run.preparedHead
+      (yield* readWorkflowHead(
+        git,
+        run.worktreePath,
+        jobBranchName(run.jobId, run.jobBranchPrefix),
+      )) !== run.preparedHead
     )
       return "The prepared branch changed after this review was created. Cancel the job and run it again.";
     const cwd = run.worktreePath;
@@ -779,7 +782,10 @@ export const make = Effect.gen(function* () {
             .pipe(Effect.ignoreCause({ log: true })),
         ),
       );
-    if ((yield* readWorkflowHead(git, cwd, jobBranchName(run.jobId))) !== run.preparedHead)
+    if (
+      (yield* readWorkflowHead(git, cwd, jobBranchName(run.jobId, run.jobBranchPrefix))) !==
+      run.preparedHead
+    )
       return "The prepared branch changed after this review was created. Cancel the job and run it again.";
     return current.treeId !== reviewedTree
       ? "Prepared files changed after this review was created. Cancel the job and run it again."
@@ -1717,7 +1723,11 @@ export const make = Effect.gen(function* () {
     }
     if (run.progress.status !== "awaiting_review" && next.progress.status === "awaiting_review") {
       const head = next.worktreePath
-        ? yield* readWorkflowHead(git, next.worktreePath, jobBranchName(next.jobId))
+        ? yield* readWorkflowHead(
+            git,
+            next.worktreePath,
+            jobBranchName(next.jobId, next.jobBranchPrefix),
+          )
         : null;
       next =
         head !== null
@@ -2344,6 +2354,7 @@ export const make = Effect.gen(function* () {
         }
         run = {
           jobId: request.jobId,
+          ...(runtime.kind === "machine" ? { jobBranchPrefix: LAUNCHPAD_JOB_BRANCH_PREFIX } : {}),
           origin,
           userId: origin.kind === "manual" ? origin.userId : null,
           repositoryCanonicalKey: request.repositoryCanonicalKey,
@@ -2668,8 +2679,11 @@ export const make = Effect.gen(function* () {
             if (
               !run.worktreePath ||
               !run.preparedHead ||
-              (yield* readWorkflowHead(git, run.worktreePath, jobBranchName(run.jobId))) !==
-                run.preparedHead
+              (yield* readWorkflowHead(
+                git,
+                run.worktreePath,
+                jobBranchName(run.jobId, run.jobBranchPrefix),
+              )) !== run.preparedHead
             )
               return result(
                 run,

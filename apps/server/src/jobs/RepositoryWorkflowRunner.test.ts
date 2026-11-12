@@ -545,29 +545,45 @@ it.effect("accepts a job once, bounds bursts, and freezes its definition", () =>
   ),
 );
 
-it.effect("recovers accepted work without another prompt and waits for a finalized result", () =>
-  test(
-    Effect.gen(function* () {
-      const h = yield* harness;
-      const scope = yield* Scope.make();
-      const first = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
-      yield* first.handle(request());
-      yield* Scope.close(scope, Exit.void);
-      const restarted = yield* h.newRunner;
-      yield* h.complete;
-      yield* Ref.update(h.currentThread, (value) => ({
-        ...value!,
-        promptQueue: { ...value!.promptQueue!, finalizedTurnId: null },
-      }));
-      assert.strictEqual((yield* restarted.handle(control("status"))).progress?.status, "running");
-      yield* h.complete;
-      assert.strictEqual(
-        (yield* restarted.handle(control("status"))).progress?.status,
-        "awaiting_review",
-      );
-      assert.strictEqual((yield* h.starts).length, 1);
-    }),
-  ),
+it.effect.each(["launchpad-job", "t3-job"] as const)(
+  "recovers accepted work on the %s branch without another prompt",
+  (prefix) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const scope = yield* Scope.make();
+        const first = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+        yield* first.handle(request());
+        assert.equal(
+          (yield* h.starts)[0]?.bootstrap?.prepareWorktree?.branch,
+          "launchpad-job/job-1",
+        );
+        yield* Scope.close(scope, Exit.void);
+        if (prefix === "t3-job") {
+          const store = yield* Store.WorkflowRunStore;
+          const { jobBranchPrefix: _prefix, ...accepted } = (yield* store.get("job-1"))!;
+          yield* store.save(accepted);
+          yield* Ref.set(h.branch, "t3-job/job-1");
+          yield* Ref.update(h.currentThread, (value) => ({ ...value!, branch: "t3-job/job-1" }));
+        }
+        const restarted = yield* h.newRunner;
+        yield* h.complete;
+        yield* Ref.update(h.currentThread, (value) => ({
+          ...value!,
+          promptQueue: { ...value!.promptQueue!, finalizedTurnId: null },
+        }));
+        assert.strictEqual(
+          (yield* restarted.handle(control("status"))).progress?.status,
+          "running",
+        );
+        yield* h.complete;
+        assert.strictEqual(
+          (yield* restarted.handle(control("status"))).progress?.status,
+          "awaiting_review",
+        );
+        assert.strictEqual((yield* h.starts).length, 1);
+      }),
+    ),
 );
 
 it.effect.each([
@@ -633,7 +649,7 @@ it.effect.each([
         });
         current = {
           ...current,
-          branch: "t3-job/job-1",
+          branch: "launchpad-job/job-1",
           worktreePath: "/jobs/job-1",
           promptQueue: {
             ...current.promptQueue!,
@@ -1203,7 +1219,7 @@ it.effect(
           modelSelection: MODEL,
           runtimeMode: "full-access",
           interactionMode: "default",
-          branch: "t3-job/job-1",
+          branch: "launchpad-job/job-1",
           worktreePath: "/jobs/job-1",
           createdAt: NOW,
         };
@@ -1422,6 +1438,7 @@ const prepareVmWorkflow = Effect.fnUntraced(function* (h: Effect.Success<typeof 
     id: binding.threadId,
     branch: "t3-job/job-1",
   });
+  yield* Ref.set(h.branch, "t3-job/job-1");
   yield* fence.prepare({ ...binding, relayUrl: "https://relay.test" });
   return { fence, binding, workflowVm, start };
 });

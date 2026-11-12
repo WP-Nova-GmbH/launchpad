@@ -435,17 +435,19 @@ it.effect("resumes VM publishing only with a matching saved checkpoint object", 
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.effect("publishes the pinned commit once and observes completion on replay", () =>
-  Effect.gen(function* () {
-    const h = yield* harness();
-    yield* h.actions.execute(id, h.io);
-    yield* h.actions.execute(id, h.io);
-    assert.deepEqual(h.counts(), { commits: 1, pushes: 1 });
-    const run = yield* h.io.read;
-    assert.equal(run.actions![0]!.state, "completed");
-    assert.equal(run.preparedHead, commitAt(1));
-    assert.isTrue(run.actions![0]!.commands.every((command) => command.stopped));
-  }).pipe(Effect.provide(NodeServices.layer)),
+it.effect(
+  "publishes a new Machine run to its Launchpad branch and observes completion on replay",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* harness("none", undefined, undefined, "launchpad-job");
+      yield* h.actions.execute(id, h.io);
+      yield* h.actions.execute(id, h.io);
+      assert.deepEqual(h.counts(), { commits: 1, pushes: 1 });
+      const run = yield* h.io.read;
+      assert.equal(run.actions![0]!.state, "completed");
+      assert.equal(run.preparedHead, commitAt(1));
+      assert.isTrue(run.actions![0]!.commands.every((command) => command.stopped));
+    }).pipe(Effect.provide(NodeServices.layer)),
 );
 for (const fault of ["commit-reply", "push-reply"] as const)
   it.effect(`reconciles ${fault} without repeating the effect`, () =>

@@ -352,6 +352,7 @@ export const make = Effect.gen(function* () {
         return yield* new WorkflowActionError({ message: "The publishing action changed." });
       const cwd = run.worktreePath!;
       const { remoteName, remoteUrl } = run.publication!;
+      const branch = jobBranchName(run.jobId, run.jobBranchPrefix);
       const github = run.runtime.kind === "machine" && isGitHubHttpsRemote(remoteUrl);
       const executeGit = (
         args: ReadonlyArray<string>,
@@ -400,8 +401,7 @@ export const make = Effect.gen(function* () {
         );
       const readTree = (revision: string) =>
         readWorkflowTree(git, cwd, revision).pipe(Effect.mapError(error));
-      const readHead = () =>
-        readWorkflowHead(git, cwd, jobBranchName(run.jobId)).pipe(Effect.mapError(error));
+      const readHead = () => readWorkflowHead(git, cwd, branch).pipe(Effect.mapError(error));
       const verify = Effect.fn("WorkflowActions.verify")(function* () {
         run = yield* requireRun(io);
         action = get(run, id)!;
@@ -480,7 +480,6 @@ export const make = Effect.gen(function* () {
           return yield* new WorkflowActionError({
             message: "Push the current saved result before opening its PR.",
           });
-        const branch = jobBranchName(run.jobId);
         const observed = yield* text([
           "ls-remote",
           "--refs",
@@ -759,7 +758,7 @@ export const make = Effect.gen(function* () {
         });
       if ((yield* readTree(run.baseSha!)) === action.tree && !run.publication!.publishedHead)
         return yield* new WorkflowActionError({ message: "No changes to publish." });
-      const ref = `refs/heads/${jobBranchName(run.jobId)}`;
+      const ref = `refs/heads/${branch}`;
       const remoteHead = () =>
         text(["ls-remote", "--refs", "--", remoteUrl, ref]).pipe(
           Effect.map((value) => value.split(/\s/)[0] || null),

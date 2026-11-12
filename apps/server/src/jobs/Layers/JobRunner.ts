@@ -7,7 +7,7 @@ import {
   type OrchestrationThread,
   type RuntimeMode,
 } from "@t3tools/contracts";
-import { jobBranchName } from "@t3tools/shared/workflowStorage";
+import { LAUNCHPAD_JOB_BRANCH_PREFIX, jobBranchName } from "@t3tools/shared/workflowStorage";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -339,7 +339,7 @@ const make = Effect.gen(function* () {
     // Jobs always build on what is actually on the remote: an executor's
     // checkout is long-lived and its local base branch may be arbitrarily
     // stale.
-    const branch = jobBranchName(request.jobId);
+    const branch = jobBranchName(request.jobId, LAUNCHPAD_JOB_BRANCH_PREFIX);
     const worktreePath = yield* Effect.gen(function* () {
       yield* gitWorkflow.fetchRemote({ cwd: workspaceRoot, remoteName: "origin" });
       const remoteBase = yield* gitWorkflow.resolveRemoteTrackingCommit({

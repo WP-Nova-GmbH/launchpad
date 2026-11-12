@@ -146,9 +146,13 @@ export const harness = (
     beforeArm?: Effect.Effect<void, EnvironmentAuthorizationError>;
   },
   gitOverride?: (input: Parameters<ExecuteGit>[0]) => ReturnType<ExecuteGit> | undefined,
+  jobBranchPrefix?: WorkflowRun["jobBranchPrefix"],
 ) =>
   Effect.gen(function* () {
-    const state = yield* Ref.make(initial());
+    const state = yield* Ref.make({
+      ...initial(),
+      ...(jobBranchPrefix ? { jobBranchPrefix } : {}),
+    });
     let saveFails = fault === "pr-save";
     const io: WorkflowActionIO = {
       read: Ref.get(state),
@@ -170,7 +174,7 @@ export const harness = (
           }),
         ),
     };
-    const branchName = `t3-job/${binding?.jobId ?? "job"}`;
+    const branchName = `${jobBranchPrefix ?? "t3-job"}/${binding?.jobId ?? "job"}`;
     let head = binding?.base ?? baseCommit;
     let parent = head;
     let host = "host";
