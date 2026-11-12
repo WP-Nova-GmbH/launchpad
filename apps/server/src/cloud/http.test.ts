@@ -1,6 +1,13 @@
+import {
+  WORKFLOW_PROTOCOL,
+  type WorkflowControl,
+  type WorkflowControlResult,
+  type WorkflowVmDispatchBinding,
+} from "@t3tools/contracts/workflows";
 import * as NodeCrypto from "node:crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -26,6 +33,7 @@ import {
   DESKTOP_UPDATE_RESTART_MARKER_FILE,
   EnvironmentId,
   ProjectId,
+  ThreadId,
   type OrchestrationProjectShell,
 } from "@t3tools/contracts";
 import { RelayClientTracer } from "@t3tools/shared/relayTracing";
@@ -53,9 +61,18 @@ import { CLOUD_CLI_DESIRED_LINK_SECRET } from "./CliState.ts";
 import * as CliTokenManager from "./CliTokenManager.ts";
 import {
   RelayManagedEndpointRecoveryRegistrationRequest,
+  RelayOrganizationId,
+  WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES,
   type RelayLinkProofRequest,
 } from "@t3tools/contracts/relay";
+import { THREAD_VM_IDENTITY_SECRET } from "../relay/ThreadVmEnrollment.ts";
 import {
+  encodeThreadVmInitialState,
+  THREAD_VM_INITIAL_STATE_SECRET,
+} from "../relay/ThreadVmInitialStateRecord.ts";
+import {
+  CLOUD_MACHINE_IDENTITY,
+  encodeCloudMachineIdentityJson,
   CLOUD_ENDPOINT_CONFIRMED_ORIGIN,
   CLOUD_ENDPOINT_RUNTIME_CONFIG,
   CLOUD_LINKED_USER_ID,
@@ -103,6 +120,10 @@ const storeFailure = (tag: "AlreadyExists" | "PermissionDenied") =>
 const unusedSecretStoreOperation = () => Effect.die("unused secret-store operation");
 const decodeManagedTunnelRecoveryRegistration = Schema.decodeUnknownEffect(
   Schema.fromJsonString(RelayManagedEndpointRecoveryRegistrationRequest),
+);
+
+const decodeManagedTunnelLinkRequest = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ managedTunnelsEnabled: Schema.Boolean })),
 );
 
 function makeSecretStore(
@@ -469,6 +490,127 @@ describe("releaseManagedTunnelOnShutdown", () => {
     [RELAY_URL_SECRET, "https://relay.example.test"],
     [CLOUD_CLI_DESIRED_LINK_SECRET, "managed"],
   ] as const;
+
+  it.effect(
+    "keeps cached link secrets and makes no provisioning requests when tunnels are disabled",
+    () => {
+      const { store, values } = makeMemorySecretStore(managedLinkSecrets);
+      const initial = new Map(values);
+      const applyConfigCalls: Array<unknown> = [];
+      const requests: Array<HttpClientRequest.HttpClientRequest> = [];
+      const disabled = {
+        _tag: "EnvironmentCloudEndpointUnavailableError",
+        endpointRuntimeStatus: { status: "disabled" },
+      };
+      return Effect.gen(function* () {
+        expect(yield* startManagedCloudTunnelIfOriginConfirmed("http://127.0.0.1:3773")).toBe(
+          false,
+        );
+        expect(
+          yield* Effect.flip(registerManagedCloudTunnelRecovery("http://127.0.0.1:3773")),
+        ).toMatchObject(disabled);
+        expect(
+          yield* Effect.flip(recoverManagedCloudTunnel("http://127.0.0.1:3773")),
+        ).toMatchObject(disabled);
+        expect(
+          yield* Effect.flip(reconcileDesiredCloudLink("http://127.0.0.1:3773")),
+        ).toMatchObject(disabled);
+        expect(yield* releaseManagedTunnelOnShutdown()).toBe(false);
+        expect(requests).toEqual([]);
+        expect(applyConfigCalls).toEqual([]);
+        expect(values).toEqual(initial);
+      }).pipe(
+        provideReleaseHarness({ store, applyConfigCalls, requests }),
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({ env: { T3CODE_DISABLE_MANAGED_TUNNELS: "1" } }),
+          ),
+        ),
+      );
+    },
+  );
+
+  it.effect("still links a publish-only identity when managed tunnels are disabled", () => {
+    const { store, values } = makeMemorySecretStore([
+      [CLOUD_CLI_DESIRED_LINK_SECRET, "publish_only"],
+    ]);
+    const applyConfigCalls: Array<unknown> = [];
+    const requests: Array<HttpClientRequest.HttpClientRequest> = [];
+    const mintKeyPair = NodeCrypto.generateKeyPairSync("ed25519", {
+      publicKeyEncoding: { format: "pem", type: "spki" },
+      privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    });
+    const descriptor = {
+      environmentId: EnvironmentId.make("env_123"),
+      label: "Test environment",
+      platform: { os: "linux", arch: "arm64" },
+      serverVersion: "0.0.0-test",
+      capabilities: { repositoryIdentity: true },
+    } as const;
+    return Effect.gen(function* () {
+      expect(yield* reconcileDesiredCloudLink("http://127.0.0.1:3773")).toBe("publish_only");
+      expect(requests.map((request) => request.url)).toEqual([
+        "http://127.0.0.1:8610/v1/client/environment-link-challenges",
+        "http://127.0.0.1:8610/v1/client/environment-links",
+      ]);
+      for (const request of requests) {
+        const body = request.body;
+        expect(body._tag).toBe("Uint8Array");
+        if (body._tag === "Uint8Array") {
+          expect(
+            yield* decodeManagedTunnelLinkRequest(new TextDecoder().decode(body.body)),
+          ).toMatchObject({
+            managedTunnelsEnabled: false,
+          });
+        }
+      }
+      expect(applyConfigCalls).toEqual([null]);
+      expect(new TextDecoder().decode(values.get(CLOUD_LINKED_USER_ID))).toBe("user-123");
+      expect(new TextDecoder().decode(values.get(RELAY_ENVIRONMENT_CREDENTIAL_SECRET))).toBe(
+        "environment-credential",
+      );
+    }).pipe(
+      Effect.provideService(
+        ServerEnvironment.ServerEnvironment,
+        ServerEnvironment.ServerEnvironment.of({
+          getEnvironmentId: Effect.succeed(descriptor.environmentId),
+          getDescriptor: Effect.succeed(descriptor),
+        }),
+      ),
+      provideReleaseHarness({
+        store,
+        applyConfigCalls,
+        requests,
+        respond: () =>
+          requests.length === 1
+            ? Response.json({ challenge: "test-challenge", expiresAt: "2030-01-01T00:00:00Z" })
+            : Response.json({
+                ok: true,
+                cloudUserId: "user-123",
+                environmentId: "env_123",
+                endpoint: {
+                  httpBaseUrl: "http://127.0.0.1:3773",
+                  wsBaseUrl: "ws://127.0.0.1:3773",
+                  providerKind: "manual",
+                },
+                endpointRuntime: null,
+                relayIssuer: "http://127.0.0.1:8610",
+                environmentCredential: "environment-credential",
+                cloudMintPublicKey: mintKeyPair.publicKey,
+              }),
+      }),
+      Effect.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromEnv({
+            env: {
+              T3CODE_DISABLE_MANAGED_TUNNELS: "1",
+              T3CODE_RELAY_URL: "http://127.0.0.1:8610",
+            },
+          }),
+        ),
+      ),
+    );
+  });
 
   it.effect("does not recreate a link that was unlinked while startup registration retried", () => {
     const { store, values } = makeMemorySecretStore(managedLinkSecrets);
@@ -1265,6 +1407,7 @@ describe("cloudDispatchJobHandler", () => {
   });
 
   const encode = (value: string) => new TextEncoder().encode(value);
+  const encodeSecretRecord = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
   function makeDispatchSecretStore(): ServerSecretStore.ServerSecretStore["Service"] {
     const values = new Map<string, Uint8Array>([
@@ -1384,6 +1527,10 @@ describe("cloudDispatchJobHandler", () => {
     readonly audience?: string;
     readonly repositoryCanonicalKey?: string;
     readonly subject?: string;
+    readonly workflowControl?: WorkflowControl;
+    readonly workflowOrigin?: unknown;
+    readonly workflowVmBinding?: WorkflowVmDispatchBinding;
+    readonly requestedBy?: string;
   }) =>
     Effect.gen(function* () {
       const now = yield* DateTime.now;
@@ -1404,6 +1551,12 @@ describe("cloudDispatchJobHandler", () => {
           repositoryCanonicalKey: options?.repositoryCanonicalKey ?? REPOSITORY_CANONICAL_KEY,
           baseBranch: "main",
           instruction: "Add a health check endpoint",
+          ...(options?.workflowControl ? { workflowControl: options.workflowControl } : {}),
+          ...(options?.workflowVmBinding ? { workflowVmBinding: options.workflowVmBinding } : {}),
+          ...(options?.workflowOrigin === undefined
+            ? {}
+            : { workflowOrigin: options.workflowOrigin }),
+          ...(options?.requestedBy === undefined ? {} : { requestedBy: options.requestedBy }),
         },
       });
     });
@@ -1421,6 +1574,195 @@ describe("cloudDispatchJobHandler", () => {
       Effect.scoped,
       Effect.provide(NodeServices.layer),
     );
+
+  it.effect("signs bounded workflow controls only for the guest's exact setup binding", () =>
+    Effect.gen(function* () {
+      const h = yield* makeDispatchHarness();
+      const binding = {
+        jobId: "job-1",
+        organizationId: "org-1",
+        repositoryId: "repo-1",
+        threadId: ThreadId.make("workflow:job-1"),
+        allocationId: "allocation-1",
+        environmentId: ENVIRONMENT_ID,
+        generation: 1,
+        operationId: "operation-1",
+        projectId: PROJECT_ID,
+      };
+      const { threadId, allocationId, repositoryId, generation, operationId } = binding;
+      const scope = { threadId, allocationId, repositoryId, generation };
+      const revision = "a".repeat(40);
+      yield* h.dependencies.secrets.set(
+        THREAD_VM_IDENTITY_SECRET,
+        encode(
+          yield* encodeSecretRecord({
+            scope,
+            operationId,
+            environmentId: ENVIRONMENT_ID,
+            relayUrl: RELAY_ISSUER,
+            relayIssuer: RELAY_ISSUER,
+            environmentCredential: "guest-credential",
+            cloudMintPublicKey: relayKeyPair.publicKey,
+          }),
+        ),
+      );
+      yield* h.dependencies.secrets.set(
+        THREAD_VM_INITIAL_STATE_SECRET,
+        encode(
+          yield* encodeThreadVmInitialState({
+            input: {
+              title: "VM job",
+              modelSelection: projectShell.defaultModelSelection!,
+              createdAt: NOW,
+              workflow: {
+                jobId: binding.jobId,
+                organizationId: RelayOrganizationId.make(binding.organizationId),
+                installationId: "github-app",
+                baseBranch: "main",
+              },
+              workspace: {
+                operationId,
+                scope,
+                canonicalKey: REPOSITORY_CANONICAL_KEY,
+                branch: "t3-job/job-1",
+                revision,
+              },
+            },
+            workspaceRoot: WORKSPACE_ROOT,
+            receipt: {
+              version: 1,
+              operationId,
+              scope,
+              environmentId: ENVIRONMENT_ID,
+              projectId: PROJECT_ID,
+              workspaceRoot: WORKSPACE_ROOT,
+              revision,
+              sequence: 1,
+              execution: "frozen",
+            },
+          }),
+        ),
+      );
+      const calls: unknown[] = [];
+      let workflowResult: WorkflowControlResult = {
+        protocol: WORKFLOW_PROTOCOL,
+        outcome: "missing",
+        detail: null,
+        progress: null,
+      };
+      const dependencies = {
+        ...h.dependencies,
+        workflowRunner: {
+          handle: (request: import("../jobs/RepositoryWorkflowRunner.ts").WorkflowRequest) => {
+            calls.push(request);
+            return Effect.succeed(workflowResult);
+          },
+        },
+      } satisfies CloudDispatchJobDependencies;
+      const workflowControl: WorkflowControl = {
+        operation: "status",
+        organizationId: binding.organizationId,
+        repositoryId: binding.repositoryId,
+        projectId: binding.projectId,
+      };
+      for (const candidate of [
+        undefined,
+        { ...binding, allocationId: "another-allocation" },
+        { ...binding, generation: 2 },
+      ]) {
+        const proof = yield* signDispatchProof({
+          workflowControl,
+          workflowOrigin: { kind: "manual", userId: LINKED_CLOUD_USER_ID },
+          ...(candidate ? { workflowVmBinding: candidate } : {}),
+        });
+        expect(
+          (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof }, true)))._tag,
+        ).toBe("EnvironmentHttpUnauthorizedError");
+      }
+      expect(calls).toEqual([]);
+      const proof = yield* signDispatchProof({
+        workflowControl,
+        workflowVmBinding: binding,
+        workflowOrigin: { kind: "manual", userId: LINKED_CLOUD_USER_ID },
+      });
+      expect(
+        (yield* cloudDispatchJobHandler(dependencies, { proof }, true)).workflowResult?.outcome,
+      ).toBe("missing");
+      expect(calls).toEqual([
+        expect.objectContaining({
+          workflowVm: {
+            binding,
+            workspaceRoot: WORKSPACE_ROOT,
+            baseBranch: "main",
+            baseSha: revision,
+          },
+        }),
+      ]);
+
+      const responses = Array.from({ length: 100 }, (_, index) => ({
+        checkpointId: `answered-${index}`,
+        stepId: "input",
+        generation: index,
+        operation: "input" as const,
+        userId: LINKED_CLOUD_USER_ID,
+        createdAt: NOW,
+        text: index === 0 ? "Original reply" : `${"\u0001".repeat(490)}🧪`,
+      }));
+      const checkpoint = {
+        checkpointId: "current-checkpoint",
+        kind: "input" as const,
+        stepId: "input",
+        generation: 100,
+        role: "member" as const,
+        question: `é${"\u0001".repeat(31_997)}🧪`,
+      };
+      const detail = "界".repeat(64 * 1024);
+      workflowResult = {
+        protocol: WORKFLOW_PROTOCOL,
+        outcome: "accepted",
+        detail,
+        progress: {
+          threadId,
+          revision: 100,
+          status: "awaiting_input",
+          detail,
+          checkpoint,
+          responses,
+        },
+      };
+      const retry = yield* signDispatchProof({
+        workflowControl: {
+          ...workflowControl,
+          operation: "input",
+          checkpointId: responses[0]!.checkpointId,
+          expectedRevision: 1,
+          text: responses[0]!.text,
+        },
+        workflowVmBinding: binding,
+        workflowOrigin: { kind: "manual", userId: LINKED_CLOUD_USER_ID },
+      });
+      const bounded = yield* cloudDispatchJobHandler(dependencies, { proof: retry }, true);
+      const now = yield* DateTime.now;
+      const signed = yield* verifyRelayJwt({
+        publicKey: environmentKeyPair.publicKey,
+        token: bounded.proof,
+        typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+        issuer: `t3-env:${ENVIRONMENT_ID}`,
+        audience: normalizeRelayIssuer(RELAY_ISSUER),
+        nowEpochSeconds: Math.floor(now.epochMilliseconds / 1_000),
+      });
+      expect(
+        (yield* Effect.promise(() => Response.json(bounded).arrayBuffer())).byteLength,
+      ).toBeLessThanOrEqual(WORKFLOW_VM_DISPATCH_RESPONSE_MAX_BYTES);
+      expect(signed.workflowResult).toEqual(bounded.workflowResult);
+      expect(bounded.workflowResult?.detail?.length).toBeLessThan(detail.length);
+      expect(bounded.workflowResult?.progress).toMatchObject({ checkpoint, revision: 100 });
+      const retained = bounded.workflowResult?.progress?.responses ?? [];
+      expect(retained.length).toBeLessThan(responses.length);
+      expect(retained.at(0)).toEqual(responses.at(0));
+      expect(retained.at(-1)).toEqual(responses.at(-1));
+    }).pipe(provideDispatchHarness),
+  );
 
   it.effect("accepts a job for a repository this environment already holds", () =>
     Effect.gen(function* () {
@@ -1463,6 +1805,171 @@ describe("cloudDispatchJobHandler", () => {
         accepted: true,
       });
     }).pipe(provideDispatchHarness),
+  );
+
+  it.effect(
+    "verifies automation subjects and signed origins without creating a human session",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeDispatchHarness();
+        yield* harness.dependencies.secrets.set(
+          CLOUD_MACHINE_IDENTITY,
+          encode(
+            yield* encodeCloudMachineIdentityJson({
+              machineId: "machine-1",
+              organizationId: "org-1",
+              role: "agent_executor",
+            }),
+          ),
+        );
+        const origin = {
+          kind: "automation",
+          organizationId: "org-1",
+          repositoryId: "repo-1",
+          workflowId: "flow",
+          source: {
+            provider: "linear",
+            applicationId: "app",
+            workspaceId: "ws",
+            connectionId: "connection",
+            grantId: "grant",
+          },
+          occurrenceId: "event",
+        } as const;
+        const control: WorkflowControl = {
+          operation: "status",
+          organizationId: "org-1",
+          repositoryId: "repo-1",
+          projectId: PROJECT_ID,
+        };
+        const calls: unknown[] = [];
+        const dependencies = {
+          ...harness.dependencies,
+          workflowRunner: {
+            handle: (request: import("../jobs/RepositoryWorkflowRunner.ts").WorkflowRequest) => {
+              calls.push(request);
+              return Effect.succeed({
+                protocol: 8 as const,
+                outcome: "missing" as const,
+                detail: null,
+                progress: null,
+              });
+            },
+          },
+        };
+        for (const options of [
+          { subject: "user_alice", workflowOrigin: origin },
+          { subject: "workflow:other-job", workflowOrigin: origin },
+          { subject: "workflow:job-1", workflowOrigin: { ...origin, repositoryId: "other" } },
+          {
+            subject: "workflow:job-1",
+            workflowOrigin: { ...origin, source: { provider: "linear" } },
+          },
+          { subject: "workflow:job-1" },
+        ]) {
+          const proof = yield* signDispatchProof({ ...options, workflowControl: control });
+          expect(
+            (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof }, true)))._tag,
+          ).toBe("EnvironmentHttpUnauthorizedError");
+        }
+        expect(calls).toEqual([]);
+        const personal = yield* signDispatchProof({
+          subject: "workflow:job-1",
+          workflowOrigin: origin,
+          workflowControl: control,
+        });
+        expect(
+          (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof: personal })))._tag,
+        ).toBe("EnvironmentHttpUnauthorizedError");
+        const proof = yield* signDispatchProof({
+          subject: "workflow:job-1",
+          workflowOrigin: origin,
+          workflowControl: control,
+          requestedBy: "bob",
+        });
+        const response = yield* cloudDispatchJobHandler(dependencies, { proof }, true);
+        expect(response.workflowResult?.protocol).toBe(8);
+        expect(calls).toEqual([expect.objectContaining({ origin, requestedBy: "bob" })]);
+        expect(calls[0]).not.toHaveProperty("userId");
+        expect(
+          (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof }, true)))._tag,
+        ).toBe("EnvironmentHttpConflictError");
+      }).pipe(provideDispatchHarness),
+  );
+
+  it.effect(
+    "keeps workflow controls on the enrolled organization endpoint and signs their progress/nonce",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeDispatchHarness();
+        const control: WorkflowControl = {
+          operation: "status",
+          organizationId: "org-1",
+          repositoryId: "repo-1",
+          projectId: PROJECT_ID,
+        };
+        const personalProof = yield* signDispatchProof({ workflowControl: control });
+        expect(
+          (yield* Effect.flip(
+            cloudDispatchJobHandler(harness.dependencies, { proof: personalProof }, true),
+          ))._tag,
+        ).toBe("EnvironmentHttpUnauthorizedError");
+        yield* harness.dependencies.secrets.set(
+          CLOUD_MACHINE_IDENTITY,
+          encode(
+            yield* encodeCloudMachineIdentityJson({
+              machineId: "machine-1",
+              organizationId: "org-1",
+              role: "agent_executor",
+            }),
+          ),
+        );
+        const workflowResult = {
+          protocol: 4 as const,
+          outcome: "accepted" as const,
+          detail: null,
+          progress: {
+            revision: 4,
+            status: "awaiting_review" as const,
+            threadId: ThreadId.make("workflow-thread"),
+            detail: null,
+            checkpoint: null,
+            approvalPending: true,
+            retryableApproval: false,
+          },
+        };
+        const dependencies = {
+          ...harness.dependencies,
+          workflowRunner: { handle: () => Effect.succeed(workflowResult) },
+        };
+        const proof = yield* signDispatchProof({ workflowControl: control });
+        const response = yield* cloudDispatchJobHandler(dependencies, { proof }, true);
+        expect(response.workflowResult).toEqual(workflowResult);
+        expect(harness.runs).toEqual([]);
+        const signed = yield* verifyRelayJwt({
+          publicKey: environmentKeyPair.publicKey,
+          token: response.proof,
+          typ: RELAY_DISPATCH_JOB_RESPONSE_TYP,
+          issuer: `t3-env:${ENVIRONMENT_ID}`,
+          audience: normalizeRelayIssuer(RELAY_ISSUER),
+          nowEpochSeconds: Math.floor((yield* DateTime.now).epochMilliseconds / 1000),
+        });
+        expect(signed).toMatchObject({ workflowResult, requestId: `dispatch-${dispatchJti}` });
+        const replay = yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof }, true));
+        expect(replay._tag).toBe("EnvironmentHttpConflictError");
+        const wrongEndpoint = yield* signDispatchProof({ workflowControl: control });
+        expect(
+          (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof: wrongEndpoint })))
+            ._tag,
+        ).toBe("EnvironmentHttpUnauthorizedError");
+        const anotherOrg = yield* signDispatchProof({
+          workflowControl: { ...control, organizationId: "org-2" },
+        });
+        expect(
+          (yield* Effect.flip(cloudDispatchJobHandler(dependencies, { proof: anotherOrg }, true)))
+            ._tag,
+        ).toBe("EnvironmentHttpUnauthorizedError");
+      }).pipe(provideDispatchHarness),
   );
 
   it.effect("refuses an unregistered repository instead of failing", () =>

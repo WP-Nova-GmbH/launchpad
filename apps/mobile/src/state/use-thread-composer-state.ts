@@ -123,7 +123,7 @@ export function useThreadDraftForThread(input: {
   };
 }
 
-export function useThreadComposerState() {
+export function useThreadComposerState(readOnlyWorkflowVm = false) {
   const {
     selectedThread: selectedThreadShell,
     selectedThreadCreation,
@@ -336,7 +336,7 @@ export function useThreadComposerState() {
   }, [selectedThreadDetail, selectedThreadSessionActivity, selectedThreadShell]);
 
   const onSendMessage = useCallback(async () => {
-    if (!selectedThreadShell) {
+    if (readOnlyWorkflowVm || !selectedThreadShell) {
       return null;
     }
     // The server has not created this thread yet. Queuing a follow-up against
@@ -490,6 +490,7 @@ export function useThreadComposerState() {
     );
     return messageId;
   }, [
+    readOnlyWorkflowVm,
     selectedEnvironmentRuntime?.connectionState,
     selectedEnvironmentRuntime?.serverConfig,
     selectedThreadCreation,

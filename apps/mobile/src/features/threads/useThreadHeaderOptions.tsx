@@ -17,6 +17,7 @@ export function useThreadHeaderOptions(props: {
   readonly headerColor: string;
   readonly usesNativeHeaderGlass: boolean;
   readonly gitControls: Parameters<typeof ThreadGitControls>[0];
+  readonly workspaceEnabled: boolean;
   readonly onReturnToThread?: () => void;
 }) {
   const navigation = useNavigation();
@@ -103,8 +104,9 @@ export function useThreadHeaderOptions(props: {
     // Search lives in the persistent sidebar, so the split header keeps
     // the git controls on the RIGHT (no center items — center space is
     // reserved for future breadcrumbs/status).
-    unstable_headerRightItems: () =>
-      layout.usesSplitView ? threadCenterHeaderItems : compactRightHeaderItems,
+    unstable_headerRightItems: props.workspaceEnabled
+      ? () => (layout.usesSplitView ? threadCenterHeaderItems : compactRightHeaderItems)
+      : undefined,
     unstable_headerSubtitle: props.usesNativeHeaderGlass ? props.subtitle : undefined,
     contentStyle: undefined,
   };
@@ -112,7 +114,7 @@ export function useThreadHeaderOptions(props: {
     options,
     sidebar: false,
     fallback:
-      !layout.usesSplitView && !props.usesNativeHeaderGlass ? (
+      props.workspaceEnabled && !layout.usesSplitView && !props.usesNativeHeaderGlass ? (
         <ThreadGitControls {...props.gitControls} showActionControls />
       ) : null,
   };

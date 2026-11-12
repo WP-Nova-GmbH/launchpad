@@ -13,7 +13,7 @@ import { AppText as Text } from "../../components/AppText";
 import { SymbolView } from "../../components/AppSymbol";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { environmentServerConfigsAtom } from "../../state/server";
-import { environmentThreadShells } from "../../state/threads";
+import { navigationThreadShellsAtom } from "../../state/threads";
 import {
   pendingThreadOrderAtom,
   threadDropBusyAtom,
@@ -26,7 +26,7 @@ import {
   threadDragAction,
   type ThreadMoveDestination,
 } from "./threadOrder";
-import { getThreadListV2OrderedSection } from "./threadListV2";
+import { getThreadListV2ArrangementThreads, getThreadListV2OrderedSection } from "./threadListV2";
 
 const ROW_HEIGHT = 56;
 const HEADER_HEIGHT = 48;
@@ -148,8 +148,12 @@ function DragHandle(props: {
 
 export function ThreadArrangementSheet(props: { onClose: () => void }) {
   const insets = useSafeAreaInsets();
-  const threads = useAtomValue(environmentThreadShells.threadShellsAtom);
+  const allThreads = useAtomValue(navigationThreadShellsAtom);
   const configs = useAtomValue(environmentServerConfigsAtom);
+  const threads = useMemo(
+    () => getThreadListV2ArrangementThreads(allThreads, configs),
+    [allThreads, configs],
+  );
   const queuedThreadKeys = useAtomValue(queuedThreadKeysAtom);
   const pendingOrder = useAtomValue(pendingThreadOrderAtom);
   const dropBusy = useAtomValue(threadDropBusyAtom);

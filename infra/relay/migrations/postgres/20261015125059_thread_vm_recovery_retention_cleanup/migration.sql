@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_backup_recoveries" ADD COLUMN "retention_retired_at" timestamp with time zone;

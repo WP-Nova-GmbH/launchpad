@@ -5,5 +5,9 @@
     "types": ["node"],
     "lib": ["ESNext", "esnext.disposable"]
   },
-  "include": ["**/*.ts"]
+  "include": [
+    "**/*.ts",
+    "../infra/relay/src/deploymentConfig.ts",
+    "../infra/relay/scripts/dev-relay-tunnel.ts"
+  ]
 }

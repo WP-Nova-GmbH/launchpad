@@ -1,3 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  vmWorkloadCommand,
+} from "../../vmWorkloadCommand.ts";
 import {
   ApprovalRequestId,
   DEFAULT_MODEL,
@@ -19,8 +26,20 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { normalizeModelSlug } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
+import type * as Cause from "effect/Cause";
+import * as NodeChildSpawner from "@effect/platform-node/NodeChildProcessSpawner";
+import {
+  readVmHarnessIdentity,
+  stopIdleVmHarness,
+  verifyWorkflowVmHarnessPeer,
+  VmWorkloadError,
+  type VmHarnessIdentity,
+  type VmHarnessStopAdmission,
+} from "../../vmWorkload.ts";
+import type { WorkflowCodexProxy } from "../../relay/WorkflowCodexProxy.ts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -30,6 +49,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -38,8 +58,13 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
-import { ProviderAdapterValidationError } from "../Errors.ts";
-import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
+import { ProviderAdapterValidationError, ProviderAdapterProcessError } from "../Errors.ts";
+import {
+  MANAGED_CODEX_MODEL_PROVIDER,
+  managedCodexModelIssue,
+  codexSessionAppServerArgs,
+  workflowCodexSandboxPolicy,
+} from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
   buildCodexAdditionalContext,
@@ -84,6 +109,9 @@ function configuredMcpToolAvailability(
 
 export const CodexResumeCursorSchema = Schema.Struct({
   threadId: Schema.String,
+  /** Transferred conversations must never recover by starting a different thread. */
+  resumePolicy: Schema.optionalKey(Schema.Literal("require-existing")),
+  portableStateId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))),
 });
 const CodexUserInputAnswerObject = Schema.Struct({
   answers: Schema.Array(Schema.String),
@@ -175,6 +203,10 @@ export interface CodexSessionRuntimeOptions {
   readonly threadId: ThreadId;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly binaryPath: string;
+  readonly managedConnectionId?: string;
+  readonly workflowProxy?: Pick<WorkflowCodexProxy, "baseUrl" | "bindPeer"> & {
+    readonly permitEnv: string;
+  };
   readonly homePath?: string;
   readonly launchArgs?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -183,6 +215,7 @@ export interface CodexSessionRuntimeOptions {
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
+  readonly requireResume?: boolean | undefined;
   readonly appServerArgs?: ReadonlyArray<string>;
   /** The provider's model list; supplies the display name for runtime info. */
   readonly models?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
@@ -226,6 +259,10 @@ export interface CodexSessionRuntimeShape {
   ) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
+  readonly readConversationSource: Effect.Effect<
+    { readonly threadId: string; readonly rolloutPath: string },
+    CodexSessionRuntimeError
+  >;
   readonly rollbackThread: (
     numTurns: number,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
@@ -241,11 +278,18 @@ export interface CodexSessionRuntimeShape {
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly events: Stream.Stream<ProviderEvent, never>;
-  readonly close: Effect.Effect<void>;
+  readonly close: Effect.Effect<void, ProviderAdapterProcessError>;
+  /** VM native-writer receipt only; detached workload ownership stays with the supervisor. */
+  readonly closeNativeWriter?: Effect.Effect<void, ProviderAdapterProcessError>;
+  readonly closeIdleVmHarness?: (
+    operationId: string,
+    admit: VmHarnessStopAdmission,
+  ) => Effect.Effect<boolean, CodexSessionRuntimeError>;
 }
 
 export type CodexSessionRuntimeError =
   | ProviderAdapterValidationError
+  | VmWorkloadError
   | CodexErrors.CodexAppServerError
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
@@ -560,6 +604,7 @@ function buildThreadStartParams(input: {
   readonly runtimeMode: RuntimeMode;
   readonly model: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
+  readonly modelProvider?: string;
 }): EffectCodexSchema.V2ThreadStartParams {
   const config = runtimeModeToThreadConfig(input.runtimeMode);
   return {
@@ -568,6 +613,7 @@ function buildThreadStartParams(input: {
     sandbox: config.sandbox,
     approvalsReviewer: config.approvalsReviewer,
     ...(input.model ? { model: input.model } : {}),
+    ...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
     ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
   };
 }
@@ -628,6 +674,7 @@ const SKILL_MENTION_PATTERN =
 export function buildTurnStartParams(input: {
   readonly threadId: string;
   readonly runtimeMode: RuntimeMode;
+  readonly workflowVm?: boolean;
   readonly prompt?: string;
   readonly attachments?: ReadonlyArray<{
     readonly type: "localImage";
@@ -670,7 +717,9 @@ export function buildTurnStartParams(input: {
     input: turnInput,
     approvalPolicy: config.approvalPolicy,
     approvalsReviewer: config.approvalsReviewer,
-    sandboxPolicy: runtimeModeToTurnSandboxPolicy(input.runtimeMode),
+    sandboxPolicy: input.workflowVm
+      ? workflowCodexSandboxPolicy()
+      : runtimeModeToTurnSandboxPolicy(input.runtimeMode),
     ...(input.model ? { model: input.model } : {}),
     ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
@@ -720,6 +769,9 @@ const CodexThreadResumeMetadata = Schema.Struct({
   thread: Schema.Struct({ id: Schema.String }),
 });
 const decodeCodexThreadResumeMetadata = Schema.decodeUnknownEffect(CodexThreadResumeMetadata);
+const decodeCodexThreadModelProvider = Schema.decodeUnknownEffect(
+  Schema.Struct({ modelProvider: Schema.String }),
+);
 
 interface CodexThreadOpenClient {
   readonly raw: {
@@ -747,17 +799,47 @@ export const openCodexThread = (input: {
   readonly requestedModel: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
   readonly resumeThreadId: string | undefined;
+  readonly resumePolicy?: CodexResumeCursor["resumePolicy"];
+  readonly requireResume?: boolean | undefined;
+  readonly modelProvider?: string;
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
+  const requireResume = input.requireResume === true || input.resumePolicy === "require-existing";
+  const verifyModelProvider = (response: unknown) =>
+    input.modelProvider
+      ? decodeCodexThreadModelProvider(response).pipe(
+          Effect.mapError(() =>
+            CodexErrors.CodexAppServerRequestError.invalidRequest(
+              "Codex did not confirm the selected organization model provider.",
+            ),
+          ),
+          Effect.filterOrFail(
+            (value) => value.modelProvider === input.modelProvider,
+            () =>
+              CodexErrors.CodexAppServerRequestError.invalidRequest(
+                "Codex did not use the selected organization model provider. Finish VM preparation before continuing.",
+              ),
+          ),
+          Effect.asVoid,
+        )
+      : Effect.void;
   const startParams = buildThreadStartParams({
     cwd: input.cwd,
     runtimeMode: input.runtimeMode,
     model: input.requestedModel,
     serviceTier: input.serviceTier,
+    ...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
   });
 
   if (resumeThreadId === undefined) {
-    return input.client.request("thread/start", startParams);
+    if (requireResume) {
+      return Effect.fail(
+        CodexErrors.CodexAppServerRequestError.invalidRequest(
+          "A required Codex conversation cannot be resumed without its native thread ID.",
+        ),
+      );
+    }
+    return input.client.request("thread/start", startParams).pipe(Effect.tap(verifyModelProvider));
   }
 
   // Older providers may still return history despite excludeTurns. Only the
@@ -770,6 +852,7 @@ export const openCodexThread = (input: {
       excludeTurns: true,
     })
     .pipe(
+      Effect.tap(verifyModelProvider),
       Effect.flatMap((response) =>
         decodeCodexThreadResumeMetadata(response).pipe(
           Effect.mapError((error) =>
@@ -781,14 +864,23 @@ export const openCodexThread = (input: {
           ),
         ),
       ),
-      Effect.catchIf(isRecoverableThreadResumeError, (error) =>
-        Effect.logWarning("codex app-server thread resume fell back to fresh start", {
-          threadId: input.threadId,
-          requestedRuntimeMode: input.runtimeMode,
-          resumeThreadId,
-          recoverable: true,
-          cause: error,
-        }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
+      Effect.filterOrFail(
+        (response) => !requireResume || response.thread.id === resumeThreadId,
+        () =>
+          CodexErrors.CodexAppServerRequestError.invalidRequest(
+            "Codex resumed a different conversation than the required native thread ID.",
+          ),
+      ),
+      Effect.catchIf(
+        (error) => !requireResume && isRecoverableThreadResumeError(error),
+        (error) =>
+          Effect.logWarning("codex app-server thread resume fell back to fresh start", {
+            threadId: input.threadId,
+            requestedRuntimeMode: input.runtimeMode,
+            resumeThreadId,
+            recoverable: true,
+            cause: error,
+          }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
       ),
     );
 };
@@ -1244,6 +1336,33 @@ const readCodexHistoryMode = Effect.fn("readCodexHistoryMode")(function* (
   return metadata.thread.historyMode;
 });
 
+const ConversationSource = Schema.Struct({
+  thread: Schema.Struct({
+    id: Schema.String.check(
+      Schema.isPattern(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i),
+    ),
+    path: Schema.NonEmptyString,
+    historyMode: Schema.Literal("paginated"),
+  }),
+});
+const decodeConversationSource = Schema.decodeUnknownEffect(ConversationSource);
+export const readCodexConversationSource = Effect.fn("readCodexConversationSource")(function* (
+  client: Pick<CodexHistoryClient, "raw">,
+  threadId: string,
+) {
+  const response = yield* client.raw.request("thread/read", { threadId, includeTurns: false });
+  const source = yield* decodeConversationSource(response).pipe(
+    Effect.mapError((error) =>
+      CodexErrors.CodexAppServerRequestError.invalidPayload("thread/read", "decode-payload", error),
+    ),
+  );
+  if (source.thread.id !== threadId)
+    return yield* CodexErrors.CodexAppServerRequestError.internalError(
+      "Native checkpoint belongs to another conversation.",
+    );
+  return { threadId, rolloutPath: source.thread.path };
+});
+
 export const readCodexThread = Effect.fn("readCodexThread")(function* (
   client: CodexHistoryClient,
   threadId: string,
@@ -1303,6 +1422,56 @@ export const rollbackCodexThread = Effect.fn("rollbackCodexThread")(function* (
   return { threadId, turns: snapshot.turns.slice(0, retainedCount) };
 });
 
+const isMissingProcess = Schema.is(Schema.Struct({ code: Schema.Literal("ESRCH") }));
+
+/** Stop only the captured child; a lost leader with surviving children is unconfirmed ownership. */
+export const stopCodexProcess = Effect.fn("CodexSessionRuntime.stopProcess")(function* (
+  threadId: ThreadId,
+  child: Pick<ChildProcessSpawner.ChildProcessHandle, "pid" | "isRunning" | "kill" | "exitCode">,
+) {
+  const failure = (cause: unknown) =>
+    new ProviderAdapterProcessError({
+      provider: PROVIDER,
+      threadId,
+      detail: "The original Codex process tree could not be confirmed stopped.",
+      cause,
+    });
+  const platform = yield* HostProcessPlatform;
+  const running = yield* child.isRunning.pipe(Effect.mapError(failure));
+  if (platform === "win32") {
+    if (!running) return yield* failure("The original native tree ownership was lost.");
+    // The spawner falls back to leader-only killing when taskkill fails. That is not tree proof.
+    yield* Effect.callback<void, ProviderAdapterProcessError>((resume) => {
+      NodeChildProcess.execFile(
+        "taskkill",
+        ["/pid", String(child.pid), "/t", "/f"],
+        { windowsHide: true, timeout: 3_000 },
+        (error) => resume(error ? Effect.fail(failure(error)) : Effect.void),
+      );
+    });
+    yield* child.exitCode.pipe(Effect.ignore);
+  } else if (running)
+    yield* child
+      .kill({ forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER })
+      .pipe(Effect.mapError(failure));
+  if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+    return yield* failure("The native child is still running.");
+  if (platform === "win32") return;
+  const absent = yield* Effect.try({
+    try: () => {
+      try {
+        process.kill(-Number(child.pid), 0);
+        return false;
+      } catch (cause) {
+        if (isMissingProcess(cause)) return true;
+        throw cause;
+      }
+    },
+    catch: failure,
+  });
+  if (!absent) return yield* failure("The owned process group is still present.");
+});
+
 export const makeCodexSessionRuntime = (
   options: CodexSessionRuntimeOptions,
 ): Effect.Effect<
@@ -1312,9 +1481,19 @@ export const makeCodexSessionRuntime = (
 > =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const runtimeScope = yield* Scope.Scope;
+    const parentScope = yield* Scope.Scope;
+    const trackWorkloads = yield* VmWorkloadTracking;
+    const controlSpawner = yield* VmControlSpawner;
+    if (options.workflowProxy && (!trackWorkloads || !controlSpawner))
+      return yield* new CodexErrors.CodexAppServerSpawnError({
+        command: `${options.binaryPath} app-server`,
+        cause: "Workflow Codex process verification is unavailable.",
+      });
+    const runtimeScope = trackWorkloads
+      ? yield* Scope.fork(parentScope, "sequential")
+      : parentScope;
     const crypto = yield* Crypto.Crypto;
-    const events = yield* Queue.unbounded<ProviderEvent>();
+    const events = yield* Queue.unbounded<ProviderEvent, Cause.Done<void>>();
     const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
     const pendingUserInputsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingUserInput>());
@@ -1325,6 +1504,9 @@ export const makeCodexSessionRuntime = (
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
+    const closeLock = yield* Semaphore.make(1);
+    let shutdownConfirmed = false;
+    let nativeStopped = false;
     let interruptEpoch = 0;
     /** The `additionalContext` of the latest `turn/start`, restored after compaction. */
     const lastAdditionalContextRef =
@@ -1339,23 +1521,43 @@ export const makeCodexSessionRuntime = (
       ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
     };
     const extendEnv = options.environment === undefined;
-    const appServerArgs = codexSessionAppServerArgs(options.appServerArgs, options.launchArgs);
+    const appServerArgs = codexSessionAppServerArgs(
+      options.appServerArgs,
+      options.launchArgs,
+      options.managedConnectionId,
+      options.workflowProxy,
+    );
     const spawnCommand = yield* resolveSpawnCommand(options.binaryPath, appServerArgs, {
       env,
       extendEnv,
     });
+    if (trackWorkloads && spawnCommand.shell)
+      return yield* new CodexErrors.CodexAppServerSpawnError({
+        command: `${options.binaryPath} app-server`,
+        cause: "VM workloads require a direct executable.",
+      });
+    const trackedLaunch = trackWorkloads
+      ? vmWorkloadCommand(spawnCommand.command, spawnCommand.args, "provider")
+      : undefined;
+    const launch = trackedLaunch ?? spawnCommand;
+    let harnessIdentity: VmHarnessIdentity | undefined;
+    let idleOperation: string | undefined;
+    let vmStopping = false;
+    let vmInputDrained = false;
+    let vmShutdownComplete = false;
     const child = yield* spawner
       .spawn(
-        ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+        ChildProcess.make(launch.command, launch.args, {
           cwd: options.cwd,
           env,
           extendEnv,
           forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER,
-          shell: spawnCommand.shell,
+          shell: launch.shell,
         }),
       )
       .pipe(
         Effect.provideService(Scope.Scope, runtimeScope),
+        Effect.provideService(NodeChildSpawner.ProcessOnlyCleanup, trackWorkloads),
         Effect.mapError(
           (cause) =>
             new CodexErrors.CodexAppServerSpawnError({
@@ -1372,7 +1574,10 @@ export const makeCodexSessionRuntime = (
     const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
       Effect.provide(clientContext),
     );
-    const serverNotifications = yield* Queue.unbounded<CodexServerNotification>();
+    const serverNotifications = yield* Queue.unbounded<
+      CodexServerNotification | { readonly barrier: Deferred.Deferred<void> }
+    >();
+    let handlingNotification = false;
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = (purpose: CodexErrors.CodexAppServerIdentifierPurpose) =>
       crypto.randomUUIDv4.pipe(
@@ -1399,6 +1604,15 @@ export const makeCodexSessionRuntime = (
       updatedAt: sessionCreatedAt,
     } satisfies ProviderSession;
     const sessionRef = yield* Ref.make<ProviderSession>(initialSession);
+    const resumeCursorFor = (threadId: string): CodexResumeCursor => ({
+      threadId,
+      ...(options.resumeCursor?.portableStateId
+        ? { portableStateId: options.resumeCursor.portableStateId }
+        : {}),
+      ...(options.resumeCursor?.resumePolicy
+        ? { resumePolicy: options.resumeCursor.resumePolicy }
+        : {}),
+    });
     const offerEvent = (event: ProviderEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
 
     const emitEvent = (event: Omit<ProviderEvent, "id" | "provider" | "createdAt">) =>
@@ -2054,7 +2268,7 @@ export const makeCodexSessionRuntime = (
             return Effect.void;
           }
           return updateSession(sessionRef, {
-            resumeCursor: { threadId: payload.thread.id },
+            resumeCursor: resumeCursorFor(payload.thread.id),
           });
         }),
       ),
@@ -2422,7 +2636,20 @@ export const makeCodexSessionRuntime = (
     );
 
     yield* Stream.fromQueue(serverNotifications).pipe(
-      Stream.runForEach(handleRawNotification),
+      Stream.runForEach((notification) =>
+        "barrier" in notification
+          ? Deferred.succeed(notification.barrier, undefined).pipe(Effect.asVoid)
+          : Effect.sync(() => {
+              handlingNotification = true;
+            }).pipe(
+              Effect.andThen(handleRawNotification(notification)),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  handlingNotification = false;
+                }),
+              ),
+            ),
+      ),
       Effect.forkIn(runtimeScope),
     );
 
@@ -2488,7 +2715,16 @@ export const makeCodexSessionRuntime = (
 
     const start = Effect.fn("CodexSessionRuntime.start")(function* () {
       yield* emitSessionEvent("session/connecting", "Starting Codex App Server session.");
-      yield* client.request("initialize", buildCodexInitializeParams());
+      const initialized = yield* client.request("initialize", buildCodexInitializeParams());
+      if (
+        options.resumeCursor?.portableStateId &&
+        (!resolvedHomePath || initialized.codexHome !== resolvedHomePath)
+      )
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "startSession",
+          issue: "Codex started with a different home than the transferred conversation requires.",
+        });
       yield* client.notify("initialized", undefined);
 
       const requestedModel = normalizeCodexModelSlug(options.model);
@@ -2501,15 +2737,52 @@ export const makeCodexSessionRuntime = (
         requestedModel,
         serviceTier: options.serviceTier,
         resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
+        ...(options.resumeCursor?.resumePolicy
+          ? { resumePolicy: options.resumeCursor.resumePolicy }
+          : {}),
+        requireResume:
+          options.managedConnectionId && options.resumeCursor ? true : options.requireResume,
+        ...(options.managedConnectionId ? { modelProvider: MANAGED_CODEX_MODEL_PROVIDER } : {}),
       });
+      if (options.managedConnectionId) {
+        const issue = managedCodexModelIssue(opened.model);
+        if (issue)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue,
+          });
+      }
 
+      if (trackedLaunch && controlSpawner) {
+        const identity = yield* readVmHarnessIdentity(trackedLaunch.workloadId, child.pid).pipe(
+          Effect.provideService(VmControlSpawner, controlSpawner),
+          Effect.result,
+        );
+        if (identity._tag === "Success") harnessIdentity = identity.success;
+        if (options.workflowProxy) {
+          if (identity._tag === "Failure")
+            return yield* new CodexErrors.CodexAppServerSpawnError({
+              command: `${options.binaryPath} app-server`,
+              cause: identity.failure,
+            });
+          options.workflowProxy.bindPeer((listenerPort, clientPort, signal) =>
+            Effect.runPromise(
+              verifyWorkflowVmHarnessPeer(identity.success, listenerPort, clientPort).pipe(
+                Effect.provideService(VmControlSpawner, controlSpawner),
+              ),
+              { signal },
+            ),
+          );
+        }
+      }
       const providerThreadId = opened.thread.id;
       const session = {
         ...(yield* Ref.get(sessionRef)),
         status: "ready",
         cwd: opened.cwd,
         model: opened.model,
-        resumeCursor: { threadId: providerThreadId },
+        resumeCursor: resumeCursorFor(providerThreadId),
         updatedAt: yield* nowIso,
       } satisfies ProviderSession;
       yield* Ref.set(sessionRef, session);
@@ -2527,36 +2800,163 @@ export const makeCodexSessionRuntime = (
       return providerThreadId;
     });
 
-    const close = Effect.gen(function* () {
-      const alreadyClosed = yield* Ref.getAndSet(closedRef, true);
-      if (alreadyClosed) {
-        return;
+    const close = closeLock.withPermit(
+      Effect.gen(function* () {
+        if (shutdownConfirmed) return;
+        yield* Ref.set(closedRef, true);
+        // Explicit kill reports errors; scoped release alone ignores termination failures.
+        if (!nativeStopped) {
+          yield* stopCodexProcess(options.threadId, child);
+          nativeStopped = true;
+        }
+        yield* settlePendingApprovals("cancel").pipe(Effect.ignore);
+        yield* settlePendingUserInputs({}).pipe(Effect.ignore);
+        yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
+        yield* Scope.close(runtimeScope, Exit.void).pipe(
+          Effect.catchCause((cause) =>
+            Effect.fail(
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId: options.threadId,
+                detail: "Codex runtime cleanup failed.",
+                cause,
+              }),
+            ),
+          ),
+        );
+        yield* Queue.shutdown(serverNotifications);
+        yield* Queue.shutdown(events);
+        shutdownConfirmed = true;
+      }),
+    );
+
+    const drainVmNativeWriter = Effect.gen(function* () {
+      if (vmShutdownComplete) return;
+      if (!vmInputDrained) {
+        yield* child.exitCode.pipe(Effect.exit);
+        yield* client.raw.awaitInputDrained!;
+        const barrier = yield* Deferred.make<void>();
+        yield* Queue.offer(serverNotifications, { barrier });
+        yield* Deferred.await(barrier);
+        vmInputDrained = true;
       }
-      yield* settlePendingApprovals("cancel");
-      yield* settlePendingUserInputs({});
-      yield* updateSession(sessionRef, {
-        status: "closed",
-        activeTurnId: undefined,
-      });
-      yield* emitSessionEvent("session/closed", "Session stopped").pipe(
-        Effect.catch((cause) =>
-          Effect.logError("Failed to emit Codex session closed event.", { cause }),
-        ),
-      );
+      if (!(yield* Ref.get(closedRef))) {
+        yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
+        yield* emitSessionEvent("session/closed", "Session stopped");
+        yield* Ref.set(closedRef, true);
+      }
       yield* Scope.close(runtimeScope, Exit.void);
       yield* Queue.shutdown(serverNotifications);
-      yield* Queue.shutdown(events);
+      yield* Queue.end(events);
+      vmShutdownComplete = true;
     });
+
+    const closeNativeWriter = closeLock.withPermit(
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (vmShutdownComplete) return;
+          const failure = (cause: unknown) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: options.threadId,
+              detail: "The VM Codex native writer could not be confirmed stopped.",
+              cause,
+            });
+          if (!trackWorkloads || !client.raw.awaitInputDrained)
+            return yield* failure("Native-writer shutdown requires VM output-drain receipts.");
+          yield* Ref.set(closedRef, true);
+          yield* settlePendingApprovals("cancel").pipe(Effect.ignore);
+          yield* settlePendingUserInputs({}).pipe(Effect.ignore);
+          // ProcessOnlyCleanup preserves tool workloads in the VM's supervised cgroup.
+          if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+            yield* child
+              .kill({ forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER })
+              .pipe(Effect.mapError(failure));
+          if (yield* child.isRunning.pipe(Effect.mapError(failure)))
+            return yield* failure("The native writer is still running.");
+          yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
+          yield* drainVmNativeWriter.pipe(
+            Effect.catchCause((cause) => Effect.fail(failure(cause))),
+          );
+        }),
+      ),
+    );
+
+    const closeIdleVmHarness = Effect.fn("CodexSessionRuntime.close_idle_vm")(function* (
+      operationId: string,
+      admit: VmHarnessStopAdmission,
+    ) {
+      if (
+        !trackWorkloads ||
+        !harnessIdentity ||
+        !controlSpawner ||
+        !client.raw.reserveIdleShutdown ||
+        !client.raw.releaseIdleShutdown ||
+        !client.raw.awaitInputDrained
+      )
+        return false;
+      const ownedHarness = harnessIdentity;
+      if (idleOperation && idleOperation !== operationId) return false;
+      if (vmShutdownComplete) return true;
+      if (!idleOperation) {
+        const idle = Effect.gen(function* () {
+          const state = yield* Ref.get(sessionRef);
+          return (
+            (state.status === "ready" || state.status === "error") &&
+            !state.activeTurnId &&
+            !(yield* Ref.get(collabChildLiveTurnsRef)).size &&
+            !(yield* Ref.get(pendingApprovalsRef)).size &&
+            !(yield* Ref.get(pendingUserInputsRef)).size &&
+            !(yield* Ref.get(closedRef)) &&
+            !handlingNotification &&
+            (yield* Queue.size(serverNotifications)) <= 0
+          );
+        });
+        if (!(yield* idle)) return false;
+        // The round trip orders prior notifications; recheck state changed while it ran.
+        yield* readCodexConversationSource(client, yield* readProviderThreadId);
+        if (!(yield* idle)) return false;
+        if (!(yield* client.raw.reserveIdleShutdown)) return false;
+        idleOperation = operationId;
+      }
+      // Admission and its accepted shutdown drain as one sequence, even when the
+      // HTTP caller disappears. A timeout never proves a native writer stopped.
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (!vmStopping) {
+            const result = yield* admit(
+              stopIdleVmHarness(ownedHarness, operationId).pipe(
+                Effect.provideService(VmControlSpawner, controlSpawner),
+              ),
+            );
+            if (!result.admitted) {
+              idleOperation = undefined;
+              yield* client.raw.releaseIdleShutdown!;
+              return false;
+            }
+            vmStopping = true;
+          }
+          yield* drainVmNativeWriter;
+          return true;
+        }),
+      );
+    }, closeLock.withPermit);
 
     return {
       start,
+      ...(trackWorkloads ? { closeNativeWriter } : {}),
+      closeIdleVmHarness,
       getSession: Ref.get(sessionRef),
       compactThread: (beforeDispatch) =>
         Effect.gen(function* () {
           const startedAtEpoch = interruptEpoch;
           const providerThreadId = yield* readProviderThreadId;
           yield* beforeDispatch ?? Effect.void;
-          if (interruptEpoch !== startedAtEpoch || (yield* Ref.get(closedRef)))
+          if (
+            interruptEpoch !== startedAtEpoch ||
+            idleOperation !== undefined ||
+            (yield* Ref.get(closedRef))
+          )
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "compactThread",
@@ -2580,11 +2980,21 @@ export const makeCodexSessionRuntime = (
           const normalizedModel = normalizeCodexModelSlug(
             input.model ?? (yield* Ref.get(sessionRef)).model,
           );
+          if (options.managedConnectionId && normalizedModel) {
+            const issue = managedCodexModelIssue(normalizedModel);
+            if (issue)
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue,
+              });
+          }
           const models = options.models ? yield* options.models : [];
           const modelName = models.find((model) => model.slug === normalizedModel)?.name;
           const params = yield* buildTurnStartParams({
             threadId: providerThreadId,
             runtimeMode: options.runtimeMode,
+            workflowVm: options.workflowProxy !== undefined,
             ...(input.input ? { prompt: input.input } : {}),
             ...(input.attachments ? { attachments: input.attachments } : {}),
             ...(normalizedModel ? { model: normalizedModel } : {}),
@@ -2602,7 +3012,11 @@ export const makeCodexSessionRuntime = (
           });
           yield* Ref.set(lastAdditionalContextRef, params.additionalContext);
           yield* input.beforeDispatch ?? Effect.void;
-          if (interruptEpoch !== startedAtEpoch || (yield* Ref.get(closedRef))) {
+          if (
+            interruptEpoch !== startedAtEpoch ||
+            idleOperation !== undefined ||
+            (yield* Ref.get(closedRef))
+          ) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "sendTurn",
@@ -2630,7 +3044,7 @@ export const makeCodexSessionRuntime = (
             return {
               threadId: options.threadId,
               turnId: TurnId.make(response.turnId),
-              resumeCursor: { threadId: providerThreadId },
+              resumeCursor: resumeCursorFor(providerThreadId),
             } satisfies ProviderTurnStartResult;
           }
           const rawResponse = yield* client.raw.request("turn/start", params);
@@ -2657,7 +3071,7 @@ export const makeCodexSessionRuntime = (
             threadId: options.threadId,
             turnId,
             ...(resumedProviderThreadId
-              ? { resumeCursor: { threadId: resumedProviderThreadId } }
+              ? { resumeCursor: resumeCursorFor(resumedProviderThreadId) }
               : {}),
           } satisfies ProviderTurnStartResult;
         }),
@@ -2705,6 +3119,24 @@ export const makeCodexSessionRuntime = (
             turnId: effectiveTurnId,
           });
         }),
+      readConversationSource: Effect.gen(function* () {
+        const session = yield* Ref.get(sessionRef);
+        if (
+          (session.status !== "ready" && session.status !== "error") ||
+          session.activeTurnId ||
+          (yield* Ref.get(collabChildLiveTurnsRef)).size > 0 ||
+          (yield* Ref.get(pendingApprovalsRef)).size > 0 ||
+          (yield* Ref.get(pendingUserInputsRef)).size > 0 ||
+          (yield* Ref.get(closedRef))
+        )
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "checkpointConversation",
+            issue:
+              "Wait for the native conversation and its child turns to settle before checkpointing.",
+          });
+        return yield* readCodexConversationSource(client, yield* readProviderThreadId);
+      }),
       readThread: Effect.gen(function* () {
         const providerThreadId = yield* readProviderThreadId;
         return yield* readCodexThread(client, providerThreadId);

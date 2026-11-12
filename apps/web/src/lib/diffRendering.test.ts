@@ -1,4 +1,5 @@
 import { hydratePartialDiff } from "@pierre/diffs";
+import { makeGitReviewPatchFixtures } from "@t3tools/shared/testing/gitReviewPatch";
 import { describe, expect, it } from "vite-plus/test";
 import { resolveDiffReviewPosition } from "../reviewCommentContext";
 import {
@@ -36,6 +37,68 @@ describe("buildPatchCacheKey", () => {
 });
 
 describe("getRenderablePatch", () => {
+  it("preserves literal Git names, file types, and copies in strict review", () => {
+    const { trailing, rename, quoted, fileType, copy, interior } = makeGitReviewPatchFixtures();
+    expect(trailing).toContain("+++ b/file.txt \t");
+    expect(rename).toContain("rename to  renamed.txt ");
+    expect(quoted).toContain('"b/quoted\\tname.txt"');
+    expect(fileType).toContain("deleted file mode 100644");
+    expect(fileType).toContain("new file mode 120000");
+    expect(copy).toContain("copy from copy-source.txt\ncopy to copy-target.txt");
+    for (const patch of [trailing, rename, quoted, fileType, copy]) {
+      expect(getRenderablePatch(patch)?.kind).toBe("files");
+      expect(
+        getRenderablePatch(patch, "strict-review", { preservePatchWhitespace: true }),
+      ).toMatchObject({ kind: "raw", text: patch });
+    }
+    const rendered = getRenderablePatch(interior, "strict-review", {
+      preservePatchWhitespace: true,
+    });
+    expect(rendered?.kind).toBe("files");
+    if (rendered?.kind !== "files") return;
+    expect(rendered.files.map(resolveFileDiffPath)).toEqual(["interior space.txt"]);
+    expect(rendered.files[0]?.additionLines).toContain("++ b/header-lookalike \n");
+    expect(rendered.files[0]?.additionLines).toContain("copy from x\n");
+  });
+
+  it.each([false, true])("preserves mode changes in strict review (text hunks: %s)", (withText) => {
+    const patch = [
+      "diff --git a/setup.sh b/setup.sh",
+      "old mode 100644",
+      "new mode 100755",
+      ...(withText
+        ? ["--- a/setup.sh", "+++ b/setup.sh", "@@ -1 +1 @@", "-echo before", "+echo after"]
+        : []),
+      "",
+    ].join("\n");
+    expect(getRenderablePatch(patch)?.kind).toBe("files");
+    expect(
+      getRenderablePatch(patch, "strict-review", { preservePatchWhitespace: true }),
+    ).toMatchObject({ kind: "raw", text: patch });
+  });
+
+  it("renders and caches significant whitespace at the end of a strict checkpoint patch", () => {
+    const patch = (addition: string) =>
+      [
+        "diff --git a/doc.md b/doc.md",
+        "--- a/doc.md",
+        "+++ b/doc.md",
+        "@@ -1 +1 @@",
+        "-before",
+        `+${addition}`,
+        "",
+      ].join("\n");
+    const parse = (addition: string) =>
+      getRenderablePatch(patch(addition), "strict-review", { preservePatchWhitespace: true });
+    const plain = parse("line");
+    const hardBreak = parse("line  ");
+    expect(plain?.kind).toBe("files");
+    expect(hardBreak?.kind).toBe("files");
+    if (plain?.kind !== "files" || hardBreak?.kind !== "files") return;
+    expect(hardBreak.files[0]?.additionLines.join("").replace(/\n$/, "")).toBe("line  ");
+    expect(hardBreak.files[0]?.cacheKey).not.toBe(plain.files[0]?.cacheKey);
+  });
+
   it("hides indentation changes around inserted JSX without moving review lines", () => {
     const patch = [
       "diff --git a/item.tsx b/item.tsx",

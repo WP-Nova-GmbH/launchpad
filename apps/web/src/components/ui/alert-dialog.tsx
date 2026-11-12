@@ -41,21 +41,30 @@ function AlertDialogPopup({
   className,
   bottomStickOnMobile = true,
   portalContainer,
+  variant = "default",
   ...props
 }: AlertDialogPrimitive.Popup.Props & {
   bottomStickOnMobile?: boolean;
   portalContainer?: AlertDialogPrimitive.Portal.Props["container"];
+  /** Bound the popup to the viewport when its body contains a scrolling region. */
+  variant?: "default" | "scrollable";
 }) {
   return (
     <AlertDialogPortal container={portalContainer}>
       <AlertDialogBackdrop />
       <AlertDialogViewport
-        className={cn(bottomStickOnMobile && "max-sm:grid-rows-[1fr_auto] max-sm:p-0 max-sm:pt-12")}
+        className={cn(
+          variant === "scrollable" && "grid-rows-[minmax(0,1fr)] items-center",
+          bottomStickOnMobile && "max-sm:p-0 max-sm:pt-12",
+          bottomStickOnMobile &&
+            (variant === "scrollable" ? "max-sm:items-end" : "max-sm:grid-rows-[1fr_auto]"),
+        )}
       >
         <AlertDialogPrimitive.Popup
           className={cn(
             DIALOG_POPUP_CLASS,
-            "row-start-2 max-h-full max-w-lg text-popover-foreground",
+            "max-h-full max-w-lg text-popover-foreground",
+            variant === "scrollable" ? "row-start-1 overflow-hidden" : "row-start-2",
             bottomStickOnMobile && DIALOG_MOBILE_SHEET_CLASS,
             className,
           )}

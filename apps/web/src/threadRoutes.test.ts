@@ -1,18 +1,106 @@
 import { describe, expect, it } from "vite-plus/test";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
-import { ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { DraftId } from "./composerDraftStore";
 
 import {
   buildDraftThreadRouteParams,
   buildThreadRouteParams,
+  isCurrentThreadMoveHandoff,
   resolveActiveThreadRouteRef,
   resolveThreadRouteRenderState,
   resolveThreadRouteRef,
   resolveThreadRouteTarget,
+  threadMoveHandoffPhase,
 } from "./threadRoutes";
 
 describe("threadRoutes", () => {
+  const destination = scopeThreadRef(EnvironmentId.make("vm"), ThreadId.make("thread"));
+  const handoff = {
+    ...destination,
+    accountId: "owner",
+    relayUrl: "https://relay.example.test",
+    generation: 3,
+  };
+
+  it("only follows the exact destination confirmed by the current relay placement", () => {
+    const placement = {
+      ...destination,
+      generation: 3,
+      operationId: null,
+      projectId: "project",
+      ownerUserId: "owner",
+      repositoryId: "repository",
+      organizationId: "organization",
+    };
+    const matches = (
+      current: Parameters<typeof isCurrentThreadMoveHandoff>[4],
+      account = handoff.accountId,
+      relay = handoff.relayUrl,
+      route = destination,
+    ) => isCurrentThreadMoveHandoff(handoff, route, account, relay, current);
+
+    expect(matches(placement)).toBe(true);
+    expect(matches(undefined)).toBe(false);
+    expect(matches(placement, "other")).toBe(false);
+    expect(matches(placement, "owner", "https://other.example.test")).toBe(false);
+    expect(matches({ ...placement, generation: 4 })).toBe(false);
+    expect(matches({ ...placement, operationId: "another-move" })).toBe(false);
+    expect(
+      matches(placement, "owner", handoff.relayUrl, {
+        ...destination,
+        threadId: ThreadId.make("other"),
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps opening through reconnect and stale snapshots, then opens the current VM", () => {
+    const opening = {
+      handoff,
+      connection: "reconnecting" as const,
+      liveRouting: undefined,
+      liveArchivedThread: false,
+      deleted: false,
+      readFailed: false,
+    };
+    const live = { generation: 3, phase: "active" as const, relayUrl: "http://127.0.0.1:8610" };
+    expect(threadMoveHandoffPhase(opening)).toBe("opening");
+    expect(threadMoveHandoffPhase({ ...opening, connection: "connected" })).toBe("opening");
+    expect(
+      threadMoveHandoffPhase({
+        ...opening,
+        connection: "connected",
+        liveRouting: { ...live, generation: 2 },
+      }),
+    ).toBe("opening");
+    expect(
+      threadMoveHandoffPhase({
+        ...opening,
+        connection: "connected",
+        liveRouting: { ...live, phase: "frozen" },
+      }),
+    ).toBe("opening");
+    expect(threadMoveHandoffPhase({ ...opening, connection: "connected", liveRouting: live })).toBe(
+      "opened",
+    );
+    expect(threadMoveHandoffPhase({ ...opening, connection: "error" })).toBe("blocked");
+    expect(threadMoveHandoffPhase({ ...opening, deleted: true })).toBe("unavailable");
+    expect(threadMoveHandoffPhase({ ...opening, connection: "connected", readFailed: true })).toBe(
+      "unreadable",
+    );
+    expect(
+      threadMoveHandoffPhase({
+        ...opening,
+        connection: "connected",
+        readFailed: true,
+        liveRouting: live,
+      }),
+    ).toBe("opened");
+    expect(
+      threadMoveHandoffPhase({ ...opening, connection: "connected", liveArchivedThread: true }),
+    ).toBe("opened");
+  });
+
   it("builds canonical thread route params from a scoped ref", () => {
     const ref = scopeThreadRef("env-1" as never, ThreadId.make("thread-1"));
 

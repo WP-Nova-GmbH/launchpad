@@ -113,6 +113,34 @@ const testLayer = OrchestrationCommandReceiptRepositoryLive.pipe(
   Layer.provide(SqlitePersistenceMemory),
 );
 
+it.effect(
+  "rejects an anonymous move before admission while leaving ordinary local messages usable",
+  () =>
+    Effect.gen(function* () {
+      const { layer, state, freshCommands } = yield* fixture;
+      state.enabled = false;
+      yield* Effect.gen(function* () {
+        const move: OrchestrationCommand = {
+          type: "thread.move.enqueue",
+          commandId,
+          threadId,
+          messageId: MessageId.make("move"),
+          destination: { kind: "vm" },
+          position: "next",
+          createdAt,
+        };
+        expect(yield* authorizeOrchestrationCommand({}, move).pipe(Effect.flip)).toMatchObject({
+          _tag: "EnvironmentAuthorizationError",
+          message: "Sign in to Launchpad Connect before moving this thread.",
+        });
+        expect(freshCommands()).toBe(0);
+        yield* authorizeOrchestrationCommand({}, enqueue());
+        yield* authorizeOrchestrationCommand(actor, move);
+        expect(freshCommands()).toBe(2);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.provide(testLayer)),
+);
+
 describe("command receipt scope", () => {
   it.effect(
     "reads rejected/accepted outcomes without a thread and rejects forged scope and revoked access",

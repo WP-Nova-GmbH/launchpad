@@ -1,0 +1,2 @@
+ALTER TABLE "relay_thread_commands" ADD COLUMN "archive_receipt_json" jsonb;--> statement-breakpoint
+ALTER TABLE "relay_thread_commands" ADD COLUMN "admitted_at" timestamp with time zone DEFAULT now() NOT NULL;

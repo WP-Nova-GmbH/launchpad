@@ -503,6 +503,54 @@ it.layer(NodeServices.layer)("SessionStore.layer", (it) => {
       }).pipe(Effect.provide(makeSessionStoreLayer())),
   );
 
+  it.effect("binds only a paired browser cookie, preserving its expiry and permissions", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const original = yield* sessions.issue({
+        subject: "one-time-token",
+        method: "browser-session-cookie",
+        scopes: ["orchestration:read", "orchestration:operate"],
+        ttl: Duration.hours(1),
+        client: { deviceType: "desktop", label: "Paired browser" },
+      });
+      const unrelated = yield* sessions.issue({
+        subject: "other-browser",
+        method: "browser-session-cookie",
+      });
+      const closed = yield* Deferred.make<void>();
+      yield* sessions.registerConnection(original.sessionId, Deferred.succeed(closed, undefined));
+      yield* TestClock.adjust(Duration.minutes(10));
+      const user = { userId: "alice", displayName: "Alice", imageUrl: null };
+      const next = yield* sessions.replaceBrowserIdentity(original.sessionId, user);
+      yield* Deferred.await(closed);
+      const verified = yield* sessions.verify(next.token);
+      expect(verified).toMatchObject({
+        subject: "one-time-token",
+        method: original.method,
+        scopes: original.scopes,
+        client: original.client,
+        user,
+      });
+      expect(verified.expiresAt?.epochMilliseconds).toBe(original.expiresAt.epochMilliseconds);
+      expect(yield* sessions.verify(original.token).pipe(Effect.flip)).toMatchObject({
+        _tag: "SessionTokenRevokedError",
+      });
+      expect((yield* sessions.verify(unrelated.token)).sessionId).toBe(unrelated.sessionId);
+      const detached = yield* sessions.replaceBrowserIdentity(next.sessionId, null);
+      expect((yield* sessions.verify(detached.token)).user).toBeUndefined();
+      for (const input of [
+        { subject: "desktop-bootstrap", method: "bearer-access-token" },
+        { subject: "cloud-connect", method: "browser-session-cookie" },
+        { subject: "reusable-dev-token", method: "browser-session-cookie" },
+      ] as const) {
+        const session = yield* sessions.issue(input);
+        expect(
+          yield* sessions.replaceBrowserIdentity(session.sessionId, user).pipe(Effect.flip),
+        ).toMatchObject({ _tag: "UnknownSessionTokenError" });
+      }
+    }).pipe(Effect.provide(Layer.merge(makeSessionStoreLayer(), TestClock.layer()))),
+  );
+
   it.effect("keeps the previous desktop session valid when replacement fails", () =>
     Effect.gen(function* () {
       const sessions = yield* SessionStore.SessionStore;

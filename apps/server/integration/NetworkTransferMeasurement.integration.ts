@@ -93,6 +93,12 @@ export interface WebSocketTransferTotals {
   readonly wireBytes: number;
   readonly decodedBytes: number;
   readonly messages: number;
+  readonly rpcChunks?: ReadonlyArray<WebSocketRpcChunk>;
+}
+
+interface WebSocketRpcChunk {
+  readonly items: number;
+  readonly detailEventSequences: ReadonlyArray<number>;
 }
 
 export interface WebSocketTransferRecorder {
@@ -120,6 +126,39 @@ function rawDataBytes(data: NodeSocket.NodeWS.RawData): number {
   return data.byteLength;
 }
 
+const isRpcChunk = Schema.is(
+  Schema.Struct({ _tag: Schema.Literal("Chunk"), values: Schema.Array(Schema.Unknown) }),
+);
+const isDetailEvent = Schema.is(
+  Schema.Struct({
+    kind: Schema.Literal("event"),
+    event: Schema.Struct({ sequence: Schema.Number }),
+  }),
+);
+
+/** Retains chunk sizes and event cursors without retaining response payloads. */
+export function rpcChunksFromMessage(data: NodeSocket.NodeWS.RawData): WebSocketRpcChunk[] {
+  const buffer = Array.isArray(data)
+    ? Buffer.concat(data)
+    : data instanceof ArrayBuffer
+      ? Buffer.from(data)
+      : data;
+  const decoded: unknown = JSON.parse(buffer.toString("utf8"));
+  const responses: ReadonlyArray<unknown> = Array.isArray(decoded) ? decoded : [decoded];
+  return responses.flatMap((response) =>
+    isRpcChunk(response)
+      ? [
+          {
+            items: response.values.length,
+            detailEventSequences: response.values.flatMap((item) =>
+              isDetailEvent(item) ? [item.event.sequence] : [],
+            ),
+          },
+        ]
+      : [],
+  );
+}
+
 function makeWebSocketTransferRecorder(): WebSocketTransferRecorder {
   let socket: NodeWebSocketWithTransport | null = null;
   // Held separately from the WebSocket so wire totals survive a close, which
@@ -127,6 +166,7 @@ function makeWebSocketTransferRecorder(): WebSocketTransferRecorder {
   let transport: NodeWebSocketWithTransport["_socket"] | null = null;
   let decodedBytes = 0;
   let messages = 0;
+  const rpcChunks: WebSocketRpcChunk[] = [];
   let resolveOpen: () => void = () => {};
   const opened = new Promise<void>((resolve) => {
     resolveOpen = resolve;
@@ -147,6 +187,7 @@ function makeWebSocketTransferRecorder(): WebSocketTransferRecorder {
         const bytes = rawDataBytes(data);
         decodedBytes += bytes;
         messages += 1;
+        rpcChunks.push(...rpcChunksFromMessage(data));
       });
       return nextSocket as unknown as globalThis.WebSocket;
     },
@@ -154,6 +195,7 @@ function makeWebSocketTransferRecorder(): WebSocketTransferRecorder {
       wireBytes: transport?.bytesRead ?? socket?._socket?.bytesRead ?? 0,
       decodedBytes,
       messages,
+      rpcChunks: rpcChunks.slice(),
     }),
     negotiatedExtensions: () => socket?.extensions ?? "",
     awaitOpen: Effect.promise(() => opened).pipe(
@@ -173,6 +215,9 @@ export function transferDelta(
     wireBytes: Math.max(0, end.wireBytes - start.wireBytes),
     decodedBytes: Math.max(0, end.decodedBytes - start.decodedBytes),
     messages: Math.max(0, end.messages - start.messages),
+    ...(start.rpcChunks !== undefined && end.rpcChunks !== undefined
+      ? { rpcChunks: end.rpcChunks.slice(start.rpcChunks.length) }
+      : {}),
   };
 }
 

@@ -1,0 +1,2 @@
+ALTER TABLE "relay_thread_vm_bindings" ADD COLUMN "deletion_endpoint_removed_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_restores" ADD COLUMN "deletion_cleaned_at" timestamp with time zone;

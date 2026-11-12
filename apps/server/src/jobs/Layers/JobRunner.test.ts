@@ -27,7 +27,7 @@ import { OrchestrationEngineService } from "../../orchestration/Services/Orchest
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { JobRunner } from "../Services/JobRunner.ts";
 import { GATE_FAIL_MARKER, GATE_PASS_MARKER, m0Workflow, type JobWorkflow } from "../workflow.ts";
-import { JobRunnerLive, jobBranchName } from "./JobRunner.ts";
+import { JobRunnerLive } from "./JobRunner.ts";
 
 const PROJECT_ID = ProjectId.make("project-job");
 const WORKSPACE_ROOT = "/tmp/job-workspace";
@@ -184,7 +184,7 @@ const makeHarness = (options: HarnessOptions = {}) =>
       resolveRemoteTrackingCommit: () =>
         Effect.succeed({ commitSha: "deadbeef", remoteRefName: "refs/remotes/origin/main" }),
       createWorktree: () =>
-        Effect.succeed({ worktree: { path: WORKTREE_PATH, refName: jobBranchName("job-1") } }),
+        Effect.succeed({ worktree: { path: WORKTREE_PATH, refName: "launchpad/job-1" } }),
     });
 
     const gitManagerLayer = Layer.mock(GitManager)({
@@ -251,7 +251,7 @@ it.effect("runs the walking skeleton end to end and reports the pull request", (
     assert.equal(outcome.status, "completed");
     assert.equal(outcome.failedStepId, null);
     assert.equal(outcome.pullRequestUrl, "https://example.test/pr/1");
-    assert.equal(outcome.branch, "t3-job/job-1");
+    assert.equal(outcome.branch, "launchpad/job-1");
     assert.deepEqual(
       stackedActions.map((action) => action.action),
       ["commit_push", "create_pr"],

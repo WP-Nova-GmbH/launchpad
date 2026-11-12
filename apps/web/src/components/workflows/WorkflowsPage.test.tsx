@@ -1,0 +1,1927 @@
+import {
+  act,
+  cloneElement,
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+  type ComponentProps,
+  type PropsWithChildren,
+  type ReactElement,
+} from "react";
+import { create, type ReactTestRenderer, type ReactTestRendererJSON } from "react-test-renderer";
+import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
+import * as Effect from "effect/Effect";
+import * as Data from "effect/Data";
+import { it } from "@effect/vitest";
+import * as Queue from "effect/Queue";
+import * as Cause from "effect/Cause";
+import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
+import {
+  RelayMachineId,
+  RelayRepositoryId,
+  type RelayOrganizationProject,
+} from "@t3tools/contracts/relay";
+import type {
+  RepositoryWorkflow,
+  SaveRepositoryWorkflow,
+  WorkflowJobPage,
+  WorkflowJobPageQuery,
+  WorkflowCatalog,
+} from "@t3tools/contracts/workflows";
+import type { ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
+import {
+  setWorkflowSessionAccount,
+  startNewWorkflowDraft,
+  workflowDraftAtom,
+  workflowSessionKey,
+  updateWorkflowDrafts,
+  type WorkflowEditorDraft,
+  type WorkflowScope,
+} from "@t3tools/client-runtime/relay/workflow-session";
+import {
+  readConfirmDialogState,
+  registerConfirmDialogHost,
+  respondToConfirmDialog,
+} from "../../confirmDialog";
+import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
+import { workflowVmCodexInstanceId } from "../settings/workflowModels";
+
+const fixture = vi.hoisted(() => ({
+  definitions: vi.fn<() => Promise<ReadonlyArray<RepositoryWorkflow>>>(),
+  page: vi.fn<(query: WorkflowJobPageQuery) => Promise<WorkflowJobPage>>(),
+  navigate: vi.fn(),
+  refreshCatalog: vi.fn<() => void | Promise<void>>(),
+  codexStatus: vi.fn<() => Promise<"connected" | "disconnected" | "reconnect_required">>(),
+  tab: "runs",
+  workflowId: undefined as string | undefined,
+  supported: false,
+  vmAuthoring: undefined as WorkflowCatalog["vmAuthoring"],
+  vmExecutionAvailable: false,
+  vmAutomationAvailable: false,
+  projectsUnavailable: false,
+  projects: [] as ReadonlyArray<RelayOrganizationProject>,
+  repositories: undefined as typeof catalog.repositories | undefined,
+  repositoryError: null as string | null,
+  authStatus: "ready" as "loading" | "error" | "ready",
+  signedIn: true,
+  save: vi.fn<(payload: typeof SaveRepositoryWorkflow.Type) => Promise<RepositoryWorkflow>>(),
+}));
+vi.mock("@clerk/react", () => ({
+  useAuth: () => ({
+    isLoaded: fixture.authStatus === "ready",
+    isSignedIn: fixture.signedIn,
+    userId: fixture.signedIn ? "account" : null,
+  }),
+  ClerkLoading: ({ children }: PropsWithChildren) =>
+    fixture.authStatus === "loading" ? children : null,
+  ClerkFailed: ({ children }: PropsWithChildren) =>
+    fixture.authStatus === "error" ? children : null,
+  ClerkLoaded: ({ children }: PropsWithChildren) =>
+    fixture.authStatus === "ready" ? children : null,
+}));
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => fixture.navigate,
+  useLocation: () => undefined,
+  useParams: () => ({ repositoryId: "repository", workflowId: fixture.workflowId }),
+  useSearch: () => ({ tab: fixture.tab }),
+}));
+vi.mock(import("../../cloud/publicConfig"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  hasCloudPublicConfig: () => true,
+}));
+vi.mock("../../cloud/managedRelayState", () => ({
+  useManagedRelayOrganizationCatalog: () => {
+    const [, refreshSnapshot] = useState(0);
+    const refresh = useCallback(() => {
+      const result = fixture.refreshCatalog();
+      if (result) void result.then(() => refreshSnapshot((version) => version + 1));
+      else refreshSnapshot((version) => version + 1);
+    }, []);
+    return {
+      data: fixture.repositoryError
+        ? undefined
+        : {
+            ...catalog,
+            repositories: fixture.repositories ?? catalog.repositories,
+            projects: fixture.projects,
+            ...(fixture.projectsUnavailable ? { projectsUnavailable: true } : {}),
+          },
+      accountId: "account",
+      refresh,
+      isPending: false,
+      error: fixture.repositoryError,
+    };
+  },
+}));
+vi.mock("../clerk/useT3ConnectAuthPrompt", () => ({
+  useT3ConnectAuthPrompt: () => ({ openAuthPrompt: fixture.navigate }),
+}));
+vi.mock("../../lib/runtime", () => ({ runtime: {} }));
+vi.mock("./workflowState", async () => ({
+  ...(await vi.importActual("./workflowState")),
+  useWorkflowClient: () => call,
+}));
+vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
+vi.mock("./WorkflowRun", () => ({ WorkflowRun: () => null }));
+vi.mock("./WorkflowJob", () => ({ WorkflowJob: () => null }));
+vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
+vi.mock("../../hooks/useSettings", () => ({
+  useEnvironmentSettings: () => DEFAULT_UNIFIED_SETTINGS,
+}));
+vi.mock("../../state/entities", () => ({ useProject: () => null }));
+vi.mock("../chat/ProviderModelPicker", () => ({ ProviderModelPicker: () => null }));
+vi.mock("../ui/button", () => ({
+  Button: (props: Record<string, unknown>) => createElement("button", props),
+}));
+vi.mock("../ui/input", () => ({
+  Input: (props: Record<string, unknown>) => createElement("input", props),
+}));
+vi.mock("../ui/collapsible", () => {
+  const Context = createContext({ open: false, setOpen: (_open: boolean) => {} });
+  return {
+    Collapsible: ({
+      children,
+      open,
+      onOpenChange,
+    }: PropsWithChildren<{ open?: boolean; onOpenChange?: (open: boolean) => void }>) => {
+      const [internalOpen, setInternalOpen] = useState(false);
+      const context = useMemo(
+        () => ({
+          open: open ?? internalOpen,
+          setOpen(next: boolean) {
+            setInternalOpen(next);
+            onOpenChange?.(next);
+          },
+        }),
+        [open, internalOpen, onOpenChange],
+      );
+      return <Context.Provider value={context}>{children}</Context.Provider>;
+    },
+    CollapsibleTrigger: ({
+      render,
+      children,
+      ...props
+    }: PropsWithChildren<
+      ComponentProps<"button"> & { render?: ReactElement<ComponentProps<"button">> }
+    >) => {
+      const { open, setOpen } = useContext(Context);
+      const triggerProps = { ...props, "aria-expanded": open, onClick: () => setOpen(!open) };
+      return render ? (
+        cloneElement(render, triggerProps, children)
+      ) : (
+        <button {...triggerProps}>{children}</button>
+      );
+    },
+    CollapsiblePanel: ({ children }: PropsWithChildren) =>
+      useContext(Context).open ? <div>{children}</div> : null,
+  };
+});
+vi.mock("../ui/dialog", () => {
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    Dialog: part,
+    DialogPopup: part,
+    DialogTitle: part,
+    DialogDescription: part,
+    DialogHeader: part,
+    DialogPanel: part,
+    DialogFooter: part,
+  };
+});
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: PropsWithChildren) => children,
+  TooltipTrigger: ({ render, children }: PropsWithChildren<{ render: ReactElement }>) =>
+    cloneElement(render, {}, children),
+  TooltipPopup: () => null,
+}));
+vi.mock("../ui/menu", () => {
+  const MenuState = createContext<[boolean, (open: boolean) => void]>([false, () => {}]);
+  return {
+    Menu: ({ children }: PropsWithChildren) => {
+      const state = useState(false);
+      return <MenuState.Provider value={state}>{children}</MenuState.Provider>;
+    },
+    MenuTrigger: ({
+      render,
+      children,
+    }: PropsWithChildren<{ render: ReactElement<{ onClick: () => void }> }>) => {
+      const [open, setOpen] = useContext(MenuState);
+      return cloneElement(render, { onClick: () => setOpen(!open) }, children);
+    },
+    MenuPopup: ({ children }: PropsWithChildren) => (useContext(MenuState)[0] ? children : null),
+    MenuItem: ({
+      children,
+      onClick,
+      disabled,
+    }: PropsWithChildren<{
+      onClick: () => void;
+      disabled?: boolean;
+    }>) => {
+      const [, setOpen] = useContext(MenuState);
+      return (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            setOpen(false);
+            onClick();
+          }}
+        >
+          {children}
+        </button>
+      );
+    },
+  };
+});
+vi.mock("../ui/select", () => {
+  const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
+  return {
+    Select: ({ children, ...props }: PropsWithChildren) =>
+      createElement("div", { ...props, "data-workflow-select": true }, children),
+    SelectButton: "button",
+    SelectTrigger: component,
+    SelectValue: component,
+    SelectPopup: component,
+    SelectItem: ({ children, ...props }: PropsWithChildren) =>
+      createElement("div", { ...props, "data-workflow-select-item": true }, children),
+  };
+});
+
+import { WorkflowsPage } from "./WorkflowsPage";
+import { editWorkflowDraft, newWorkflowDraft, type useWorkflowClient } from "./workflowState";
+
+const repositoryId = RelayRepositoryId.make("repository");
+const canonicalKey = "github.com/launchpad/example";
+const catalog = {
+  membership: { role: "admin", organization: { organizationId: "organization" } },
+  repositories: [
+    {
+      repository: {
+        repositoryId,
+        organizationId: "organization",
+        name: "Repository",
+        canonicalKeys: [canonicalKey],
+      },
+      role: "maintainer",
+    },
+  ],
+};
+const checkout: RelayOrganizationProject = {
+  environmentId: EnvironmentId.make("environment"),
+  projectId: ProjectId.make("project"),
+  machineId: RelayMachineId.make("machine"),
+  machineLabel: "Build machine",
+  title: "Workflow checkout",
+  repositoryCanonicalKey: canonicalKey,
+  createdAt: "now",
+  updatedAt: "now",
+  catalogUpdatedAt: "now",
+};
+type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+class FixtureReadError extends Data.TaggedError("FixtureReadError")<{ readonly message: string }> {}
+const readError = (cause: unknown) =>
+  new FixtureReadError({
+    message: cause instanceof Error ? cause.message : "Fixture read failed.",
+  });
+const client = {
+  readWorkflowCatalog: () =>
+    Effect.tryPromise({
+      try: async () => {
+        const workflows = await fixture.definitions();
+        return {
+          workflows,
+          vmAuthoring: fixture.vmAuthoring,
+          vmExecutionAvailable: fixture.vmExecutionAvailable,
+          vmAutomationAvailable: fixture.vmAutomationAvailable,
+          ...(fixture.supported
+            ? {
+                automationSupported: true,
+                automationSummaries: workflows.map((entry) => ({
+                  workflowId: entry.workflowId,
+                  revision: entry.revision,
+                  state: entry.automation?.enabled ? ("on" as const) : ("off" as const),
+                  reason: null,
+                })),
+              }
+            : {}),
+        };
+      },
+      catch: readError,
+    }),
+  listWorkflows: () => Effect.tryPromise({ try: () => fixture.definitions(), catch: readError }),
+  getCodexVmConnection: () =>
+    Effect.tryPromise({
+      try: async () => ({ status: await fixture.codexStatus() }),
+      catch: readError,
+    }),
+  saveWorkflow: ({ payload }: Parameters<Client["saveWorkflow"]>[0]) =>
+    Effect.tryPromise({ try: () => fixture.save(payload), catch: readError }),
+  pageWorkflowJobs: ({ query }: Parameters<Client["pageWorkflowJobs"]>[0]) =>
+    Effect.tryPromise({ try: () => fixture.page(query), catch: readError }),
+} as unknown as Client;
+let reads: Queue.Queue<Effect.Effect<void>>;
+let deliveries: Array<Promise<void>> = [];
+const call: ReturnType<typeof useWorkflowClient> = (operation) => {
+  const receipt = deferred<void>();
+  deliveries.push(receipt.promise);
+  return new Promise((resolve, reject) => {
+    Queue.offerUnsafe(
+      reads,
+      operation(client, "fixture-token").pipe(
+        Effect.matchCause({
+          onFailure: (cause) => {
+            reject(Cause.squash(cause));
+            receipt.resolve();
+          },
+          onSuccess: (value) => {
+            resolve(value);
+            receipt.resolve();
+          },
+        }),
+      ),
+    );
+  });
+};
+const workflow: RepositoryWorkflow = {
+  workflowId: "workflow",
+  repositoryId,
+  organizationId: "organization",
+  archived: false,
+  revision: 1,
+  definition: {
+    name: "Recovered workflow",
+    target: {
+      kind: "machine" as const,
+      environmentId: EnvironmentId.make("environment"),
+      projectId: ProjectId.make("project"),
+    },
+    steps: [
+      {
+        id: "agent",
+        kind: "agent",
+        title: "Implement",
+        instruction: "Implement",
+        modelSelection: null,
+      },
+    ],
+  },
+  createdAt: "2026-10-15",
+  updatedAt: "2026-10-15",
+};
+const row = (jobId: string) => ({
+  jobId,
+  repositoryId,
+  workflowId: workflow.workflowId,
+  runtime: workflow.definition.target.kind === "machine" ? workflow.definition.target : null,
+  instruction: jobId,
+  status: "done" as const,
+  detail: null,
+  createdAt: "2026-10-15",
+  updatedAt: "2026-10-15",
+});
+let renderer: ReactTestRenderer | undefined;
+function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | null): string {
+  if (!node) return "";
+  if (typeof node === "string") return node;
+  if (Array.isArray(node)) return node.map(text).join(" ");
+  return (node.children ?? []).map(text).join(" ");
+}
+const content = () => text(renderer!.toJSON());
+const button = (label: string) =>
+  renderer!.root
+    .findAllByType("button")
+    .find(
+      (node) =>
+        node.props["aria-label"] === label ||
+        node.children.filter((child) => typeof child === "string").join("") === label,
+    )!;
+async function press(label: string, waitForReads = true) {
+  const before = deliveries.length;
+  await act(async () => {
+    button(label).props.onClick();
+  });
+  if (waitForReads)
+    await act(async () => {
+      await Promise.all(deliveries.slice(before));
+    });
+}
+const starterScope = { accountId: "account", organizationId: "organization", repositoryId };
+const newWorkflowRoute = {
+  to: "/workflows/$repositoryId/new",
+  params: { repositoryId },
+};
+function retainedStarter() {
+  const state = appAtomRegistry.get(workflowDraftAtom);
+  const id = state.newWorkflowIds[workflowSessionKey(starterScope, "new")];
+  return id ? state.editors[workflowSessionKey(starterScope, id)] : undefined;
+}
+function starterOption(value: "review" | "publish") {
+  return renderer!.root
+    .findAllByType("input")
+    .find((input) => input.props.type === "radio" && input.props.value === value)!;
+}
+function deferred<A>() {
+  let resolve!: (value: A) => void;
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<A>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  deliveries = [];
+  fixture.definitions.mockReset();
+  fixture.page.mockReset();
+  fixture.navigate.mockReset();
+  fixture.refreshCatalog.mockReset();
+  fixture.codexStatus.mockReset().mockResolvedValue("connected");
+  fixture.save.mockReset();
+  fixture.tab = "runs";
+  fixture.workflowId = undefined;
+  fixture.supported = false;
+  fixture.vmAuthoring = undefined;
+  fixture.vmExecutionAvailable = false;
+  fixture.vmAutomationAvailable = false;
+  fixture.projectsUnavailable = false;
+  fixture.projects = [];
+  fixture.repositories = undefined;
+  fixture.repositoryError = null;
+  fixture.authStatus = "ready";
+  fixture.signedIn = true;
+  setWorkflowSessionAccount(appAtomRegistry, null);
+  setWorkflowSessionAccount(appAtomRegistry, "account");
+});
+afterEach(async () => {
+  await act(() => renderer?.unmount());
+  renderer = undefined;
+  vi.unstubAllGlobals();
+});
+it("replaces failed sign-in loading with an error and lets the user retry", async () => {
+  const reload = vi.fn();
+  vi.stubGlobal("window", { location: { reload } });
+  fixture.authStatus = "loading";
+  fixture.signedIn = false;
+  const page = () => (
+    <AppAtomRegistryProvider>
+      <WorkflowsPage />
+    </AppAtomRegistryProvider>
+  );
+  await act(async () => {
+    renderer = create(page());
+  });
+  expect(
+    renderer!.root.findAllByType("svg").filter((node) => node.props.role === "status"),
+  ).toHaveLength(1);
+
+  fixture.authStatus = "error";
+  await act(async () => renderer!.update(page()));
+  expect(content()).toContain("Could not load Launchpad Connect sign-in");
+  expect(
+    renderer!.root.findAllByType("div").filter((node) => node.props.role === "alert"),
+  ).toHaveLength(1);
+  expect(
+    renderer!.root.findAllByType("svg").filter((node) => node.props.role === "status"),
+  ).toHaveLength(0);
+  expect(fixture.definitions).not.toHaveBeenCalled();
+  await press("Retry", false);
+  expect(reload).toHaveBeenCalledOnce();
+
+  fixture.authStatus = "ready";
+  await act(async () => renderer!.update(page()));
+  expect(content()).toContain("Sign in to Launchpad Connect to manage repository workflows.");
+  expect(
+    renderer!.root.findAllByType("div").filter((node) => node.props.role === "alert"),
+  ).toHaveLength(0);
+});
+
+it.effect(
+  "waits for VM authoring capability and creates a VM draft when checkouts are unavailable",
+  () =>
+    Effect.gen(function* () {
+      const queue = yield* Queue.unbounded<Effect.Effect<void>>();
+      reads = queue;
+      yield* Effect.forever(
+        Queue.take(queue).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
+      ).pipe(Effect.forkScoped);
+      yield* Effect.promise(async () => {
+        const metadata = deferred<ReadonlyArray<RepositoryWorkflow>>();
+        fixture.tab = "workflows";
+        fixture.projectsUnavailable = true;
+        fixture.definitions.mockReturnValueOnce(metadata.promise);
+        await act(() => {
+          renderer = create(
+            <AppAtomRegistryProvider>
+              <WorkflowsPage />
+            </AppAtomRegistryProvider>,
+          );
+        });
+        const scope = { accountId: "account", organizationId: "organization", repositoryId };
+        const slot = workflowSessionKey(scope, "new");
+        expect(button("Create workflow")).toBeUndefined();
+        expect(appAtomRegistry.get(workflowDraftAtom).newWorkflowIds[slot]).toBeUndefined();
+        fixture.vmAuthoring = { models: null };
+        await act(async () => {
+          metadata.resolve([
+            {
+              ...workflow,
+              definition: {
+                ...workflow.definition,
+                target: { kind: "vm", baseBranch: "release/1.x" },
+              },
+            },
+          ]);
+          await Promise.all(deliveries);
+        });
+        expect(content()).toContain("release/1.x");
+        expect(content()).toContain("VM execution unavailable");
+        expect(button("Run")).toBeUndefined();
+        await press("Create workflow");
+        await press("Create draft");
+        const state = appAtomRegistry.get(workflowDraftAtom);
+        const id = state.newWorkflowIds[slot]!;
+        expect(state.editors[workflowSessionKey(scope, id)]).toMatchObject({
+          definition: { target: { kind: "vm", baseBranch: null } },
+          targetConfirmed: true,
+        });
+        expect(fixture.navigate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            to: "/workflows/$repositoryId/new",
+          }),
+        );
+      });
+    }),
+);
+
+it("keeps repository authorization failures separate from unavailable Machine checkouts", async () => {
+  fixture.repositoryError = "Repository access denied.";
+  await act(() => {
+    renderer = create(
+      <AppAtomRegistryProvider>
+        <WorkflowsPage />
+      </AppAtomRegistryProvider>,
+    );
+  });
+  expect(content()).toContain("Repository access denied.");
+  expect(button("Create workflow")).toBeUndefined();
+  expect(fixture.definitions).not.toHaveBeenCalled();
+});
+
+it.effect(
+  "recovers workflow names and metadata errors from Runs refresh while retaining the selected list view",
+  () =>
+    Effect.gen(function* () {
+      const queue = yield* Queue.unbounded<Effect.Effect<void>>();
+      reads = queue;
+      yield* Effect.forever(
+        Queue.take(queue).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
+      ).pipe(Effect.forkScoped);
+      yield* Effect.promise(async () => {
+        const metadata = deferred<ReadonlyArray<RepositoryWorkflow>>();
+        fixture.definitions
+          .mockRejectedValueOnce(new Error("Metadata offline"))
+          .mockReturnValueOnce(metadata.promise);
+        fixture.page
+          .mockResolvedValueOnce({ jobs: [row("Initial active run")], nextCursor: null })
+          .mockResolvedValueOnce({ jobs: [row("First history run")], nextCursor: "next" })
+          .mockResolvedValueOnce({ jobs: [row("Older history run")], nextCursor: null })
+          .mockResolvedValueOnce({ jobs: [row("Refreshed history run")], nextCursor: null });
+        await act(async () => {
+          renderer = create(
+            <AppAtomRegistryProvider>
+              <WorkflowsPage />
+            </AppAtomRegistryProvider>,
+          );
+        });
+        // Definitions settle first; their loaded state then mounts the independent runs read.
+        await act(async () => {
+          await deliveries[0];
+        });
+        await act(async () => {
+          await deliveries[1];
+        });
+        expect(content()).toContain("Metadata offline");
+        expect(content()).toContain("Workflow run");
+        await press("History");
+        await press("Load more runs");
+        expect(content()).toContain("Older history run");
+        await press("Refresh runs", false);
+        expect(button("Refresh runs").props.disabled).toBe(true);
+        await act(async () => {
+          metadata.resolve([workflow]);
+          await metadata.promise;
+          await Promise.all(deliveries.slice(-2));
+        });
+        expect(content()).toContain("Recovered workflow");
+        expect(content()).toContain("Refreshed history run");
+        expect(button("History").props["aria-pressed"]).toBe(true);
+        expect(content()).not.toContain("Metadata offline");
+        expect(content()).not.toContain("Older history run");
+        expect(button("Refresh runs").props.disabled).toBe(false);
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+const serve = Effect.gen(function* () {
+  reads = yield* Queue.unbounded<Effect.Effect<void>>();
+  yield* Effect.forever(
+    Queue.take(reads).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
+  ).pipe(Effect.forkScoped);
+});
+async function mountCatalog(
+  view: "catalog" | "builder" = "catalog",
+  options: Parameters<typeof create>[1] = {
+    createNodeMock: (element) => (element.type === "form" ? {} : null),
+  },
+) {
+  await act(() => {
+    renderer = create(
+      <AppAtomRegistryProvider>
+        <WorkflowsPage view={view} />
+      </AppAtomRegistryProvider>,
+      options,
+    );
+  });
+  await act(async () => {
+    await Promise.all(deliveries);
+  });
+}
+const vmWorkflow: RepositoryWorkflow = {
+  ...workflow,
+  definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+};
+async function mountVmEditor(saved = vmWorkflow) {
+  fixture.workflowId = saved.workflowId;
+  fixture.vmAuthoring = { models: null };
+  fixture.definitions.mockResolvedValue([saved]);
+  vi.stubGlobal("document", { activeElement: null });
+  vi.stubGlobal(
+    "HTMLElement",
+    class {
+      focus() {}
+    },
+  );
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(
+        private readonly resize: (entries: Array<{ contentRect: { width: number } }>) => void,
+      ) {}
+      observe() {
+        this.resize([{ contentRect: { width: 1200 } }]);
+      }
+      disconnect() {}
+    },
+  );
+  await mountCatalog("builder");
+  await act(async () => {
+    await Promise.all(deliveries);
+  });
+}
+
+const archivedWorkflow: RepositoryWorkflow = {
+  ...workflow,
+  archived: true,
+  definition: { ...workflow.definition, name: "Archived review" },
+  automation: {
+    enabled: false,
+    trigger: {
+      provider: "linear",
+      connectionId: "connection",
+      grantId: "grant",
+      teamId: "team",
+      event: "issue_created",
+      labelIds: [],
+    },
+  },
+};
+
+it.effect.each([true, false])(
+  "shows the archive count and chooses an initial disclosure state (active workflows: %s)",
+  (hasActive) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.projects = [checkout];
+        const activeWorkflow = { ...workflow, workflowId: "active" };
+        fixture.definitions.mockResolvedValue(
+          hasActive ? [activeWorkflow, archivedWorkflow] : [archivedWorkflow],
+        );
+        await mountCatalog();
+
+        expect(content()).toMatch(/Archived workflows\s+1/);
+        expect(button("Archived workflows").props["aria-expanded"]).toBe(!hasActive);
+        if (hasActive) {
+          expect(content()).not.toContain("No active workflows");
+          expect(button("Restore Archived review")).toBeUndefined();
+          await press("Archived workflows");
+        } else {
+          expect(content()).toContain("No active workflows");
+        }
+        expect(button("Restore Archived review")).toBeDefined();
+      });
+    }),
+);
+
+it.effect("keeps automatic triggering off and retains its rule when restoring a workflow", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.supported = true;
+      fixture.projects = [checkout];
+      fixture.definitions.mockResolvedValue([archivedWorkflow]);
+      fixture.save.mockImplementation(async () => {
+        const restored = {
+          ...archivedWorkflow,
+          revision: archivedWorkflow.revision + 1,
+          archived: false,
+          automation: archivedWorkflow.automation,
+        };
+        fixture.definitions.mockResolvedValue([restored]);
+        return restored;
+      });
+
+      const ownerDocument = { body: {}, activeElement: {} };
+      const restoreButton = { ownerDocument };
+      const focusRestoredEdit = vi.fn();
+      await mountCatalog("catalog", {
+        createNodeMock: (element) =>
+          element.type === "button" &&
+          (element.props as { "aria-label"?: string })["aria-label"] === "Edit Archived review"
+            ? { focus: focusRestoredEdit }
+            : null,
+      });
+      expect(content()).toContain("Automatic triggering stays off");
+      ownerDocument.activeElement = restoreButton;
+      await act(async () => {
+        button("Restore Archived review").props.onClick({ currentTarget: restoreButton });
+        // Disabling/removing the Restore control returns focus to the document.
+        ownerDocument.activeElement = ownerDocument.body;
+      });
+      await act(async () => {
+        await Promise.all(deliveries);
+      });
+      expect(focusRestoredEdit).toHaveBeenCalledOnce();
+      expect(fixture.save).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          workflowId: archivedWorkflow.workflowId,
+          expectedRevision: archivedWorkflow.revision,
+          archived: false,
+          automation: archivedWorkflow.automation,
+        }),
+      );
+      expect(button("Restore Archived review")).toBeUndefined();
+      expect(button("Run for Archived review")).toBeDefined();
+    });
+  }),
+);
+
+it.effect("opens execution settings instead of restoring an unavailable Machine target", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.projects = [{ ...checkout, projectId: ProjectId.make("replacement-project") }];
+      fixture.definitions.mockResolvedValue([archivedWorkflow]);
+      await mountCatalog();
+
+      expect(content()).toContain("Machine checkout unavailable");
+      expect(button("Restore Archived review").props.disabled).toBe(true);
+      await press("Choose checkout for Archived review");
+      expect(fixture.navigate).toHaveBeenCalledWith({
+        to: "/workflows/$repositoryId/$workflowId/edit",
+        params: { repositoryId, workflowId: archivedWorkflow.workflowId },
+        search: { settings: "execution" },
+      });
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect.each([
+  { hasPublishingStep: false, vmAvailable: true },
+  { hasPublishingStep: true, vmAvailable: true },
+  { hasPublishingStep: false, vmAvailable: false },
+])(
+  "offers VM recovery without a checkout when compatible and available ($hasPublishingStep, $vmAvailable)",
+  ({ hasPublishingStep, vmAvailable }) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.vmAuthoring = { models: null };
+        fixture.vmExecutionAvailable = vmAvailable;
+        fixture.projects = [];
+        const publishingStep = {
+          id: "push",
+          title: "Push branch",
+          kind: "action",
+          action: "push",
+        } as const;
+        fixture.definitions.mockResolvedValue([
+          hasPublishingStep
+            ? {
+                ...archivedWorkflow,
+                definition: {
+                  ...archivedWorkflow.definition,
+                  steps: [...archivedWorkflow.definition.steps, publishingStep],
+                },
+              }
+            : archivedWorkflow,
+        ]);
+        await mountCatalog();
+
+        expect(button("Restore Archived review").props.disabled).toBe(true);
+        if (hasPublishingStep || !vmAvailable) {
+          expect(button("Choose execution target for Archived review")).toBeUndefined();
+          expect(content()).toContain("To keep this workflow on a Machine");
+        } else {
+          expect(content()).toContain("Choose VM in Workflow settings and save before restoring.");
+          await press("Choose execution target for Archived review");
+          expect(fixture.navigate).toHaveBeenCalledWith({
+            to: "/workflows/$repositoryId/$workflowId/edit",
+            params: { repositoryId, workflowId: archivedWorkflow.workflowId },
+            search: { settings: "execution" },
+          });
+        }
+        expect(fixture.save).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+it.effect("retries the checkout catalog before allowing restore when it could not be loaded", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.projectsUnavailable = true;
+      fixture.definitions.mockResolvedValue([archivedWorkflow]);
+      await mountCatalog();
+
+      expect(content()).not.toContain("Machine checkout unavailable");
+      expect(button("Restore Archived review").props.disabled).toBe(true);
+      expect(button("Choose checkout for Archived review")).toBeUndefined();
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projectsUnavailable = false;
+        fixture.projects = [checkout];
+      });
+      await press("Retry loading checkouts");
+      expect(button("Restore Archived review").props.disabled).toBeFalsy();
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("keeps the Run draft reachable after VM receipt recovery while gated and archived", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.definitions.mockResolvedValue([vmWorkflow]);
+      await mountCatalog();
+      expect(content()).toContain("VM execution unavailable");
+      expect(button("Run")).toBeUndefined();
+
+      fixture.vmExecutionAvailable = true;
+      await press("Refresh workflows");
+      await press("Run");
+      const route = {
+        to: "/workflows/$repositoryId/$workflowId/run",
+        params: { repositoryId, workflowId: vmWorkflow.workflowId },
+      };
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [workflowSessionKey(scope, vmWorkflow.workflowId)]: {
+              instruction: "Task",
+              operation: {
+                requestId: "submitted",
+                instruction: "Task",
+                targetKind: "vm",
+                state: "uncertain",
+              },
+              startedJobId: null,
+              error: null,
+            },
+          },
+        })),
+      );
+      fixture.vmExecutionAvailable = false;
+      await press("Refresh workflows");
+      expect(button("Run")).toBeUndefined();
+      await press("View run submission");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [workflowSessionKey(scope, vmWorkflow.workflowId)]: {
+              instruction: "New instructions",
+              operation: null,
+              startedJobId: "existing-run",
+              error: null,
+            },
+          },
+        })),
+      );
+      expect(button("View run submission")).toBeUndefined();
+      await press("View retained instructions");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      fixture.definitions.mockResolvedValue([{ ...vmWorkflow, revision: 2, archived: true }]);
+      fixture.vmExecutionAvailable = true;
+      await press("Refresh workflows");
+      expect(button("Run")).toBeUndefined();
+      await press("View retained instructions");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+    });
+  }),
+);
+
+it.effect("reopens an uncertain Machine submission with no text after a VM switch or archive", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.definitions.mockResolvedValue([workflow]);
+      await mountCatalog();
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [workflowSessionKey(scope, workflow.workflowId)]: {
+              instruction: "",
+              operation: { requestId: "submitted", instruction: "Task", state: "uncertain" },
+              startedJobId: null,
+              error: null,
+            },
+          },
+        })),
+      );
+      const route = {
+        to: "/workflows/$repositoryId/$workflowId/run",
+        params: { repositoryId, workflowId: workflow.workflowId },
+      };
+      fixture.definitions.mockResolvedValue([
+        { ...workflow, definition: vmWorkflow.definition, revision: 2 },
+      ]);
+      await press("Refresh workflows");
+      expect(button("Run")).toBeUndefined();
+      await press("View run submission");
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+
+      fixture.definitions.mockResolvedValue([{ ...workflow, revision: 3, archived: true }]);
+      await press("Refresh workflows");
+      expect(button("Run")).toBeUndefined();
+      await press("View run submission");
+      expect(fixture.navigate).toHaveBeenCalledTimes(2);
+      expect(fixture.navigate).toHaveBeenLastCalledWith(route);
+    });
+  }),
+);
+
+it.effect("uses catalog Refresh to recover Machine choices and reload workflow definitions", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.projectsUnavailable = true;
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValueOnce([]).mockResolvedValueOnce([workflow]);
+      await mountCatalog();
+      expect(content()).toContain("Create your first workflow");
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projectsUnavailable = false;
+        fixture.projects = [checkout];
+      });
+      await press("Refresh workflows");
+      expect(content()).toContain(workflow.definition.name);
+      await press("Create workflow");
+      await press("Create draft");
+      expect(retainedStarter()?.targetConfirmed).toBe(false);
+    });
+  }),
+);
+
+it.effect("offers one first-workflow action and explains the unavailable publishing starter", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+      await mountCatalog();
+
+      expect(content()).toContain("Create your first workflow");
+      const createActions = renderer!.root
+        .findAllByType("button")
+        .filter(
+          (action) =>
+            action.children.filter((child) => typeof child === "string").join("") ===
+            "Create workflow",
+        );
+      expect(createActions).toHaveLength(1);
+      expect(button("Use template")).toBeUndefined();
+      await press("Create workflow");
+
+      expect(content()).toContain("Agent and review");
+      expect(content()).toContain("Review and open a pull request");
+      expect(content()).toContain("Requires a Machine checkout");
+      expect(starterOption("publish").props.disabled).toBe(true);
+      expect(starterOption("review").props.disabled).toBeFalsy();
+      expect(retainedStarter()).toBeUndefined();
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Create draft");
+      expect(retainedStarter()).toMatchObject({
+        baseline: null,
+        automation: { enabled: false, trigger: null },
+        definition: { target: { kind: "vm", baseBranch: null } },
+      });
+      expect(retainedStarter()?.definition.steps.map((step) => step.kind)).toEqual([
+        "agent",
+        "review",
+      ]);
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("does not reopen the template picker when returning from Runs", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+      fixture.page.mockResolvedValue({ jobs: [], nextCursor: null });
+      await mountCatalog();
+      await press("Create workflow");
+      expect(button("Create draft")).toBeDefined();
+
+      const renderPage = () =>
+        renderer!.update(
+          <AppAtomRegistryProvider>
+            <WorkflowsPage view="catalog" />
+          </AppAtomRegistryProvider>,
+        );
+      fixture.tab = "runs";
+      await act(renderPage);
+      expect(button("Create draft")).toBeUndefined();
+
+      fixture.tab = "workflows";
+      await act(renderPage);
+      expect(button("Create workflow")).toBeDefined();
+      expect(button("Create draft")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect("retries unavailable Machine checkouts and creates a publishing draft", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.projectsUnavailable = true;
+      fixture.definitions.mockResolvedValue([]);
+      await mountCatalog();
+      await press("Create workflow");
+
+      expect(content()).toContain("Could not load Machine checkouts");
+      expect(content()).not.toContain("Requires a Machine checkout");
+      expect(starterOption("publish").props.disabled).toBe(true);
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projectsUnavailable = false;
+        fixture.projects = [checkout];
+      });
+      await press("Retry loading checkouts");
+      expect(content()).not.toContain("Could not load Machine checkouts");
+      expect(starterOption("publish").props.disabled).toBeFalsy();
+
+      await act(() => starterOption("publish").props.onChange());
+      await press("Create draft");
+      const draft = retainedStarter();
+      expect(draft?.definition.target).toEqual({
+        kind: "machine",
+        environmentId: checkout.environmentId,
+        projectId: checkout.projectId,
+      });
+      expect(draft?.definition.steps.map((step) => step.title)).toEqual([
+        "Agent",
+        "Review changes",
+        "Push branch",
+        "Open PR",
+      ]);
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("resumes a retained workflow draft after retrying the catalog", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions
+        .mockRejectedValueOnce(new Error("Metadata offline"))
+        .mockResolvedValue([]);
+      const starter = newWorkflowDraft([], "review", true)!;
+      const draft = {
+        ...starter,
+        definition: { ...starter.definition, name: "Review the release" },
+      };
+      startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
+      await mountCatalog();
+
+      expect(content()).toContain(
+        "Your draft is kept. Retry to load workflow settings before resuming it.",
+      );
+      expect(button("Resume new workflow").props.disabled).toBe(true);
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Retry");
+      expect(button("Resume new workflow").props.disabled).toBe(false);
+      expect(button("Start another workflow").props.disabled).toBe(false);
+      await press("Resume new workflow");
+
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(retainedStarter()).toBe(draft);
+      expect(button("Create draft")).toBeUndefined();
+
+      await act(() => renderer!.unmount());
+      fixture.definitions.mockRejectedValueOnce(new Error("Metadata offline in editor"));
+      await mountCatalog("builder");
+      expect(content()).toContain(
+        "Your draft is kept. Retry to load workflow settings before resuming it.",
+      );
+      expect(button("Save")).toBeUndefined();
+
+      await press("Retry");
+      const name = renderer!.root.findByProps({ "aria-label": "Workflow name" });
+      expect(name.props.value).toBe(draft.definition.name);
+      expect(retainedStarter()).toBe(draft);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect("explains when a retained draft changes during replacement confirmation", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+      const draft = newWorkflowDraft([], "review", true)!;
+      startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
+      const unregister = registerConfirmDialogHost();
+      try {
+        await mountCatalog();
+        await press("Start another workflow");
+        await press("Create draft");
+        expect(readConfirmDialogState().status).toBe("confirming");
+
+        await act(() =>
+          editWorkflowDraft(starterScope, draft.workflowId, (current) => ({
+            ...current,
+            definition: { ...current.definition, name: "Changed during confirmation" },
+          })),
+        );
+        await act(async () => respondToConfirmDialog(true));
+
+        expect(content()).toContain(
+          "The retained draft changed while you were confirming. Review it before trying again.",
+        );
+        expect(retainedStarter()).toMatchObject({
+          workflowId: draft.workflowId,
+          definition: { name: "Changed during confirmation" },
+        });
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      } finally {
+        unregister();
+      }
+    });
+  }),
+);
+
+it.effect("copies using the checkout catalog refreshed while the source read is pending", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.projects = [checkout];
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([workflow]);
+      await mountCatalog();
+
+      const refreshed = deferred<void>();
+      fixture.refreshCatalog.mockReturnValueOnce(refreshed.promise);
+      await press("Refresh workflows");
+      await press(`More actions for ${workflow.definition.name}`);
+      await press("Copy workflow");
+
+      const source = deferred<ReadonlyArray<RepositoryWorkflow>>();
+      fixture.definitions.mockReturnValueOnce(source.promise);
+      const beforeCopy = deliveries.length;
+      await press("Create draft", false);
+      const copyReads = deliveries.slice(beforeCopy);
+      await act(() => {
+        fixture.projects = [];
+        refreshed.resolve();
+      });
+      await act(async () => {
+        source.resolve([workflow]);
+        await Promise.all(copyReads);
+      });
+
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      const state = appAtomRegistry.get(workflowDraftAtom);
+      const id = state.newWorkflowIds[workflowSessionKey(scope, "new")]!;
+      expect(state.editors[workflowSessionKey(scope, id)]).toMatchObject({
+        targetConfirmed: true,
+        definition: {
+          name: `Copy of ${workflow.definition.name}`,
+          target: { kind: "vm", baseBranch: null },
+        },
+      });
+      expect(fixture.navigate).toHaveBeenLastCalledWith({
+        to: "/workflows/$repositoryId/new",
+        params: { repositoryId },
+      });
+    });
+  }),
+);
+
+const otherRepositoryId = RelayRepositoryId.make("other-repository");
+const otherRemote = "github.com/partner/example";
+const otherRepository = {
+  ...catalog.repositories[0]!,
+  repository: {
+    ...catalog.repositories[0]!.repository,
+    repositoryId: otherRepositoryId,
+    canonicalKeys: [otherRemote],
+  },
+};
+const destinationCheckout = {
+  ...checkout,
+  projectId: ProjectId.make("destination-project"),
+  repositoryCanonicalKey: otherRemote,
+};
+const sourceScope = { accountId: "account", organizationId: "organization", repositoryId };
+const destinationScope = { ...sourceScope, repositoryId: otherRepositoryId };
+const copySource: RepositoryWorkflow = {
+  ...vmWorkflow,
+  definition: { ...vmWorkflow.definition, target: { kind: "vm", baseBranch: "release" } },
+  automation: {
+    enabled: true,
+    trigger: {
+      provider: "linear",
+      connectionId: "connection",
+      grantId: "grant",
+      teamId: "team",
+      event: "issue_created",
+      labelIds: ["label"],
+    },
+  },
+};
+
+const publishingCopySource: RepositoryWorkflow = {
+  ...workflow,
+  revision: workflow.revision + 1,
+  definition: {
+    ...workflow.definition,
+    name: "Publish release",
+    steps: [
+      ...workflow.definition.steps,
+      { id: "push", kind: "action", title: "Push branch", action: "push" },
+    ],
+  },
+};
+
+async function openCopyDialog(source = copySource, vmAuthoring = true) {
+  fixture.tab = "workflows";
+  fixture.repositories = [...catalog.repositories, otherRepository];
+  fixture.vmAuthoring = vmAuthoring ? { models: null } : undefined;
+  fixture.definitions.mockResolvedValue([source]);
+  await mountCatalog();
+  await press(`More actions for ${source.definition.name}`);
+  await press("Copy workflow");
+}
+
+function copyOption(remote: string) {
+  return renderer!.root
+    .findAllByType("button")
+    .find(
+      (node) =>
+        typeof node.props["aria-pressed"] === "boolean" &&
+        node.findAllByType("span").some((span) => span.children.includes(remote)),
+    );
+}
+
+async function openCopyDestinationPicker() {
+  const picker = renderer!.root
+    .findAllByType("button")
+    .find((node) => node.props["aria-expanded"] === false && node.props["aria-labelledby"])!;
+  await act(() => picker.props.onClick());
+  return renderer!.root
+    .findAllByType("input")
+    .find((node) => node.props["aria-label"] === "Search destination repositories")!;
+}
+
+async function chooseOtherCopyDestination() {
+  const search = await openCopyDestinationPicker();
+  expect(copyOption(canonicalKey)?.props["aria-pressed"]).toBe(true);
+  expect(copyOption(otherRemote)?.props["aria-pressed"]).toBe(false);
+
+  await act(() => search.props.onChange({ currentTarget: { value: "partner/example" } }));
+  expect(copyOption(canonicalKey)).toBeUndefined();
+  await act(() => copyOption(otherRemote)!.props.onClick());
+  expect(copyOption(otherRemote)?.props["aria-pressed"]).toBe(true);
+}
+
+function retainedCopyDraft(scope: WorkflowScope) {
+  const state = appAtomRegistry.get(workflowDraftAtom);
+  const id = state.newWorkflowIds[workflowSessionKey(scope, "new")];
+  return id ? state.editors[workflowSessionKey(scope, id)] : undefined;
+}
+
+function setDestinationDraft(draft: WorkflowEditorDraft) {
+  updateWorkflowDrafts(appAtomRegistry, destinationScope.accountId, (state) => ({
+    ...state,
+    newWorkflowIds: {
+      ...state.newWorkflowIds,
+      [workflowSessionKey(destinationScope, "new")]: draft.workflowId,
+    },
+    editors: {
+      ...state.editors,
+      [workflowSessionKey(destinationScope, draft.workflowId)]: draft,
+    },
+  }));
+}
+
+it.effect.each(["same", "another"] as const)(
+  "creates an unsaved VM workflow copy in the %s repository",
+  (destination) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        await openCopyDialog();
+        expect(content()).toContain("Latest saved version of");
+        expect(content()).toContain("Current repository");
+        const same = destination === "same";
+        if (!same) await chooseOtherCopyDestination();
+
+        await press("Create draft");
+
+        const scope = same ? sourceScope : destinationScope;
+        expect(retainedCopyDraft(scope)).toMatchObject({
+          baseline: null,
+          automation: { enabled: false, trigger: null },
+          definition: {
+            name: `Copy of ${copySource.definition.name}`,
+            target: { kind: "vm", baseBranch: same ? "release" : null },
+            steps: copySource.definition.steps,
+          },
+        });
+        expect(retainedCopyDraft(same ? destinationScope : sourceScope)).toBeUndefined();
+        expect(fixture.save).not.toHaveBeenCalled();
+        expect(fixture.navigate).toHaveBeenLastCalledWith({
+          to: "/workflows/$repositoryId/new",
+          params: { repositoryId: scope.repositoryId },
+        });
+      });
+    }),
+);
+
+it.effect("keeps search announcements in the same status region as results change", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      await openCopyDialog();
+      const search = await openCopyDestinationPicker();
+      const statusFor = (message: string) =>
+        renderer!.root
+          .findAllByProps({ role: "status" })
+          .find(
+            (status) => status.findAll((node) => node.children.join("") === message).length > 0,
+          );
+
+      await act(() => search.props.onChange({ currentTarget: { value: "partner/example" } }));
+      const results = statusFor("1 repository found.");
+      expect(results).toBeDefined();
+      expect(copyOption(otherRemote)).toBeDefined();
+
+      await act(() => search.props.onChange({ currentTarget: { value: "not-a-repository" } }));
+      expect(statusFor("No repositories match your search.")).toBe(results);
+      expect(copyOption(otherRemote)).toBeUndefined();
+
+      await act(() => search.props.onChange({ currentTarget: { value: "partner/example" } }));
+      expect(statusFor("1 repository found.")).toBe(results);
+    });
+  }),
+);
+
+it.effect("lets users review a changed saved execution target before copying", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.projects = [checkout, destinationCheckout];
+      await openCopyDialog();
+      await chooseOtherCopyDestination();
+      expect(content()).toContain("The VM draft starts from the destination’s default branch.");
+
+      fixture.definitions.mockResolvedValue([publishingCopySource]);
+      await press("Create draft");
+
+      expect(content()).toContain(
+        "The saved workflow’s execution target changed. Review the copy before continuing.",
+      );
+      expect(content()).toContain("Publish release");
+      expect(content()).not.toContain("The VM draft starts from the destination’s default branch.");
+      expect(retainedCopyDraft(destinationScope)).toBeUndefined();
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Create draft");
+      expect(retainedCopyDraft(destinationScope)?.definition.target).toEqual({
+        kind: "machine",
+        environmentId: destinationCheckout.environmentId,
+        projectId: destinationCheckout.projectId,
+      });
+      expect(fixture.navigate).toHaveBeenCalledWith({
+        to: "/workflows/$repositoryId/new",
+        params: { repositoryId: otherRepositoryId },
+      });
+    });
+  }),
+);
+
+it.effect.each([
+  { projectsUnavailable: false, source: publishingCopySource, vmAuthoring: true },
+  { projectsUnavailable: true, source: publishingCopySource, vmAuthoring: true },
+  { projectsUnavailable: true, source: workflow, vmAuthoring: false },
+])(
+  "distinguishes missing and unavailable destination checkouts (unavailable=$projectsUnavailable, VM authoring=$vmAuthoring)",
+  ({ projectsUnavailable, source, vmAuthoring }) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.projectsUnavailable = projectsUnavailable;
+        fixture.projects = [checkout];
+        await openCopyDialog(source, vmAuthoring);
+        await chooseOtherCopyDestination();
+
+        const missingCheckout =
+          "Enroll an organization machine with a checkout in the destination repository first.";
+        if (projectsUnavailable) {
+          expect(content()).not.toContain(missingCheckout);
+          expect(content()).toContain("Could not load Machine checkouts");
+          expect(button("Create draft").props.disabled).toBe(true);
+          fixture.refreshCatalog.mockImplementationOnce(() => {
+            fixture.projectsUnavailable = false;
+            fixture.projects = [checkout, destinationCheckout];
+          });
+          await press("Retry loading checkouts");
+          expect(content()).not.toContain("Could not load Machine checkouts");
+          expect(content()).not.toContain(missingCheckout);
+          expect(button("Create draft").props.disabled).toBe(false);
+        } else {
+          expect(content()).toContain(missingCheckout);
+          expect(button("Create draft").props.disabled).toBe(true);
+        }
+        expect(retainedCopyDraft(destinationScope)).toBeUndefined();
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+it.effect("preserves a destination draft edited while replacing the copy", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      const draft = newWorkflowDraft([], "review", true)!;
+      const retained = { ...draft, definition: { ...draft.definition, name: "Release notes" } };
+      setDestinationDraft(retained);
+      await openCopyDialog();
+      await chooseOtherCopyDestination();
+      expect(content()).toContain("Release notes");
+
+      const source = deferred<ReadonlyArray<RepositoryWorkflow>>();
+      fixture.definitions.mockReturnValueOnce(source.promise);
+      const beforeCopy = deliveries.length;
+      await press("Replace draft", false);
+      const revised = {
+        ...retained,
+        definition: { ...retained.definition, name: "Revised notes" },
+      };
+      await act(async () => {
+        setDestinationDraft(revised);
+        source.resolve([copySource]);
+        await Promise.all(deliveries.slice(beforeCopy));
+      });
+
+      expect(content()).toContain(
+        "The destination draft changed while copying. Review it before continuing.",
+      );
+      expect(content()).toContain("Revised notes");
+      expect(retainedCopyDraft(destinationScope)).toBe(revised);
+      await press("Keep existing draft");
+      expect(button("Replace draft")).toBeUndefined();
+      expect(retainedCopyDraft(destinationScope)).toBe(revised);
+      expect(fixture.navigate).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect.each(["pending", "uncertain"] as const)(
+  "prevents replacing a destination draft with a %s save",
+  (state) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        const draft = newWorkflowDraft([], "review", true)!;
+        setDestinationDraft({
+          ...draft,
+          operation: {
+            requestId: "save",
+            state,
+            definition: draft.definition,
+            archived: false,
+            expectedRevision: 0,
+          },
+        });
+        await openCopyDialog();
+        await chooseOtherCopyDestination();
+
+        const replacement = button("Replace draft") ?? button("Create draft");
+        expect(replacement === undefined || replacement.props.disabled).toBe(true);
+        expect(retainedCopyDraft(destinationScope)?.operation?.state).toBe(state);
+        expect(fixture.navigate).not.toHaveBeenCalled();
+      });
+    }),
+);
+
+it.effect("refreshes open editor dependencies and ignores a late Codex status failure", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.projectsUnavailable = true;
+      fixture.codexStatus.mockRejectedValueOnce(new Error("Initial status error"));
+      await mountVmEditor();
+      expect(content()).toContain("Could not check the organization's Codex connection.");
+      await act(() =>
+        renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+      );
+      await act(() =>
+        renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
+          target: { value: "release/1.x" },
+        }),
+      );
+      const findMachine = () => renderer!.root.findByProps({ type: "radio", value: "machine" });
+      expect(findMachine().props.disabled).toBe(true);
+      expect(content()).toContain("Machine checkouts could not be loaded.");
+
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projectsUnavailable = false;
+        fixture.projects = [checkout];
+      });
+      await press("Retry loading checkouts");
+      expect(findMachine().props.disabled).toBe(false);
+      expect(button("Retry loading checkouts")).toBeUndefined();
+
+      const earlierStatus = deferred<"connected">();
+      fixture.codexStatus.mockReturnValueOnce(earlierStatus.promise);
+      const firstRetry = deliveries.length;
+      await press("Refresh workflows", false);
+      const firstRetryReceipts = deliveries.slice(firstRetry);
+      await press("Refresh workflows");
+      expect(fixture.codexStatus).toHaveBeenCalledTimes(3);
+      expect(content()).not.toContain("Could not check the organization's Codex connection.");
+      await act(async () => {
+        earlierStatus.reject(new Error("Stale retry failed"));
+        await Promise.all(firstRetryReceipts);
+      });
+      expect(content()).not.toContain("Could not check the organization's Codex connection.");
+      expect(findMachine().props.disabled).toBe(false);
+      expect(renderer!.root.findByProps({ placeholder: "Repository default" }).props.value).toBe(
+        "release/1.x",
+      );
+      const targetGroup = renderer!.root
+        .findAllByType("div")
+        .find((node) => node.props.role === "radiogroup")!;
+      const machineRadio = Object.assign(new HTMLElement(), {
+        getAttribute: (name: string) => (name === "role" ? "radio" : null),
+        click: () => findMachine().props.onChange({ nativeEvent: {} }),
+      });
+      await act(() =>
+        targetGroup.props.onKeyDownCapture({
+          key: " ",
+          target: machineRadio,
+          preventDefault() {},
+          stopPropagation() {},
+        }),
+      );
+      expect(content()).toContain("Build machine · Workflow checkout");
+    });
+  }),
+);
+
+it.effect("keeps an explicit VM model through a missing proof and saves it once verified", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      const modelSelection = { instanceId: workflowVmCodexInstanceId, model: "saved-model" };
+      const saved: RepositoryWorkflow = {
+        ...vmWorkflow,
+        definition: {
+          ...vmWorkflow.definition,
+          steps: vmWorkflow.definition.steps.map((step) =>
+            step.kind === "agent" ? { ...step, modelSelection } : step,
+          ),
+        },
+      };
+      await mountVmEditor(saved);
+      const name = () => renderer!.root.findByProps({ "aria-label": "Workflow name" });
+      await act(() => name().props.onChange({ target: { value: "Edited VM workflow" } }));
+      const submit = () =>
+        act(async () => {
+          renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} });
+        });
+      await submit();
+      expect(content()).toContain("saved-model (Unverified)");
+      expect(content()).toContain("Select the managed default before saving");
+      expect(fixture.save).not.toHaveBeenCalled();
+      fixture.vmAuthoring = {
+        models: {
+          defaultModel: "saved-model",
+          models: [
+            { slug: "saved-model", name: "Verified model", isCustom: false, capabilities: null },
+          ],
+        },
+      };
+      await press("Refresh workflows");
+      expect(content()).toContain("Verified model");
+      expect(content()).not.toContain("Select the managed default before saving");
+      fixture.save.mockImplementation(async ({ definition }) => ({
+        ...saved,
+        revision: 2,
+        definition,
+      }));
+      await submit();
+      await act(async () => {
+        await Promise.all(deliveries);
+      });
+      expect(fixture.save).toHaveBeenCalledWith(
+        expect.objectContaining({
+          definition: expect.objectContaining({
+            name: "Edited VM workflow",
+            steps: [expect.objectContaining({ modelSelection })],
+          }),
+        }),
+      );
+    });
+  }),
+);
+
+for (const savedVm of [false, true])
+  it.effect(
+    `opens trigger settings for a ${savedVm ? "saved" : "draft"} VM workflow without enabling automation`,
+    () =>
+      Effect.gen(function* () {
+        yield* serve;
+        yield* Effect.promise(async () => {
+          fixture.tab = "workflows";
+          fixture.supported = true;
+          fixture.vmAuthoring = { models: null };
+          const scope = { accountId: "account", organizationId: "organization", repositoryId };
+          const key = workflowSessionKey(scope, workflow.workflowId);
+          const definition = {
+            ...workflow.definition,
+            target: { kind: "vm" as const, baseBranch: null },
+          };
+          const automation = { enabled: false, trigger: null };
+          const baseline = {
+            ...workflow,
+            definition: savedVm ? definition : workflow.definition,
+            automation,
+          };
+          fixture.definitions.mockResolvedValue([baseline]);
+          updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+            ...state,
+            editors: {
+              ...state.editors,
+              [key]: {
+                workflowId: workflow.workflowId,
+                definition,
+                baseline,
+                automation,
+                selectedStepId: "",
+                targetConfirmed: true,
+                operation: null,
+                error: "Save could not be completed.",
+              },
+            },
+          }));
+          await mountCatalog();
+          await press(`More actions for ${workflow.definition.name}`);
+          expect(button("Set up automatic triggering")).toBeUndefined();
+          await press("Trigger settings");
+          expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
+            triggerSetup: true,
+            definition,
+            automation,
+          });
+          expect(fixture.save).not.toHaveBeenCalled();
+        });
+      }),
+  );
+
+for (const retained of [false, true])
+  it.effect(
+    `opens trigger setup while preserving saved Off (retained unknown draft: ${retained})`,
+    () =>
+      Effect.gen(function* () {
+        yield* serve;
+        yield* Effect.promise(async () => {
+          fixture.tab = "workflows";
+          fixture.supported = true;
+          fixture.definitions.mockResolvedValue([
+            { ...workflow, automation: { enabled: false, trigger: null } },
+          ]);
+          if (retained) {
+            const scope = { accountId: "account", organizationId: "organization", repositoryId };
+            updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+              ...state,
+              editors: {
+                ...state.editors,
+                [workflowSessionKey(scope, workflow.workflowId)]: {
+                  workflowId: workflow.workflowId,
+                  definition: { ...workflow.definition, name: "Retained name" },
+                  baseline: workflow,
+                  automation: { enabled: false, trigger: null },
+                  selectedStepId: "",
+                  targetConfirmed: true,
+                  operation: null,
+                  error: null,
+                },
+              },
+            }));
+          }
+          await mountCatalog();
+          await press(`More actions for ${workflow.definition.name}`);
+          await press("Set up automatic triggering");
+          expect(fixture.navigate).toHaveBeenCalledWith(
+            expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
+          );
+          const draft =
+            appAtomRegistry.get(workflowDraftAtom).editors[
+              workflowSessionKey(
+                { accountId: "account", organizationId: "organization", repositoryId },
+                workflow.workflowId,
+              )
+            ];
+          expect(draft?.triggerSetup).toBe(true);
+          expect(draft?.automation?.enabled).toBe(false);
+          expect(draft?.automationResolved).toBe(true);
+          if (retained) expect(draft?.definition.name).toBe("Retained name");
+          expect(draft?.baseline?.automation?.enabled).toBe(false);
+          expect(fixture.save).not.toHaveBeenCalled();
+        });
+      }),
+  );
+it.effect(
+  "keeps automation unknown against a legacy relay that omits capability even with an On record",
+  () =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.definitions.mockResolvedValue([
+          { ...workflow, automation: { enabled: true, trigger: null } },
+        ]);
+        await mountCatalog();
+        expect(content()).toContain("Automation state unavailable on this relay");
+        expect(content()).not.toContain("Manual run");
+        await press(`More actions for ${workflow.definition.name}`);
+        expect(button("Turn off automatic triggering")).toBeUndefined();
+        expect(button("Run")).toBeDefined();
+      });
+    }),
+);
+it.effect.each(["machine", "vm"] as const)(
+  "opens an Off %s draft without saving or discarding other workflow edits",
+  (kind) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.supported = true;
+        const trigger = {
+          provider: "linear",
+          connectionId: "connection",
+          grantId: "grant",
+          teamId: "team",
+          event: "issue_created",
+          labelIds: ["label"],
+        } as const;
+        const current: RepositoryWorkflow = {
+          ...workflow,
+          definition:
+            kind === "vm"
+              ? { ...workflow.definition, target: { kind: "vm", baseBranch: null } }
+              : workflow.definition,
+          automation: { enabled: true, trigger },
+        };
+        const scope = { accountId: "account", organizationId: "organization", repositoryId };
+        const key = workflowSessionKey(scope, workflow.workflowId);
+        fixture.definitions.mockResolvedValue([current]);
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          editors: {
+            ...state.editors,
+            [key]: {
+              workflowId: workflow.workflowId,
+              baseline: current,
+              definition: { ...current.definition, name: "Unsaved name" },
+              automation: { enabled: true, trigger },
+              automationResolved: true,
+              selectedStepId: "",
+              targetConfirmed: true,
+              operation: null,
+              error: null,
+            },
+          },
+        }));
+        await mountCatalog();
+        await press(`More actions for ${workflow.definition.name}`);
+        await press("Turn off automatic triggering");
+        expect(fixture.save).not.toHaveBeenCalled();
+        expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toMatchObject({
+          definition: { name: "Unsaved name" },
+          triggerSetup: true,
+          automation: { enabled: false, trigger },
+          baseline: { automation: { enabled: true, trigger } },
+        });
+        expect(fixture.navigate).toHaveBeenCalledWith(
+          expect.objectContaining({ to: "/workflows/$repositoryId/$workflowId/edit" }),
+        );
+      });
+    }),
+);
+
+it.effect("opens an enabled VM trigger draft when VM automation is available", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.supported = true;
+      fixture.vmAutomationAvailable = true;
+      fixture.vmAuthoring = { models: null };
+      const trigger = {
+        provider: "linear",
+        connectionId: "connection",
+        grantId: "grant",
+        teamId: "team",
+        event: "issue_created",
+        labelIds: [],
+      } as const;
+      const saved: RepositoryWorkflow = {
+        ...workflow,
+        definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+        automation: { enabled: false, trigger },
+      };
+      fixture.definitions.mockResolvedValue([saved]);
+      await mountCatalog();
+      await press(`More actions for ${workflow.definition.name}`);
+      await press("Turn on automatic triggering");
+      const scope = { accountId: "account", organizationId: "organization", repositoryId };
+      expect(
+        appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, saved.workflowId)],
+      ).toMatchObject({
+        triggerSetup: true,
+        automation: { enabled: true, trigger },
+        baseline: saved,
+      });
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);

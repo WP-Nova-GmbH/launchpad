@@ -131,6 +131,7 @@ import {
   usePreferredEditor,
 } from "../editorPreferences";
 import { openInEditorMenuLabel } from "../editorLabels";
+import { LiveWorkspaceContext } from "../lib/workflowResultGitAccess";
 import { resolveDiffThemeName, type DiffThemeName } from "../lib/diffRendering";
 import { fnv1a32 } from "../lib/diffRendering";
 import { LRUCache } from "../lib/lruCache";
@@ -2303,6 +2304,7 @@ function useChatMarkdownState({
   headingLevelOffset = 0,
   githubMedia = false,
 }: ChatMarkdownProps) {
+  const canUseLiveWorkspace = use(LiveWorkspaceContext);
   const { resolvedTheme } = useTheme();
   const [localMediaPreview, setLocalMediaPreview] = useState<ExpandedImagePreview | null>(null);
   const markdownRef = useRef<HTMLDivElement>(null);
@@ -2327,11 +2329,9 @@ function useChatMarkdownState({
   const pullRequestLinking = usePullRequestLinking(threadRef?.environmentId);
   const environmentId = threadRef?.environmentId ?? explicitEnvironmentId ?? null;
   const remoteOpen = useRemoteOpenResolution(environmentId);
-  const canUseShellActions = canUseMarkdownFileShellActions(
-    environmentId,
-    remoteOpen.state.mode,
-    remoteOpen.isResolved,
-  );
+  const canUseShellActions =
+    canUseLiveWorkspace &&
+    canUseMarkdownFileShellActions(environmentId, remoteOpen.state.mode, remoteOpen.isResolved);
   const preparedConnection = usePreparedConnection(environmentId);
   const openMarkdownMedia = useCallback(
     (source: string, resolvedFilePath?: string, clickedImage?: HTMLImageElement | null) => {
@@ -2641,7 +2641,7 @@ function useChatMarkdownState({
           targetPath={fileLinkMeta.targetPath}
           iconPath={fileLinkMeta.filePath}
           displayPath={fileLinkMeta.displayPath}
-          panelPath={panelPath}
+          panelPath={canUseLiveWorkspace ? panelPath : null}
           line={fileLinkMeta.line}
           label={labelParts.join(" · ")}
           copyMarkdown={copyMarkdown}
@@ -2650,7 +2650,7 @@ function useChatMarkdownState({
           {...(canUseShellActions ? { onOpen: openInPreferredEditor } : {})}
           onOpenInPanel={openFileInPanel}
           onOpenMedia={
-            threadRef && canPreviewMedia
+            canUseLiveWorkspace && threadRef && canPreviewMedia
               ? () => openMarkdownMedia(mediaPath, fileLinkMeta.filePath)
               : undefined
           }
@@ -2662,6 +2662,7 @@ function useChatMarkdownState({
           }
           revealLabel={revealInFileManagerLabel}
           onOpenInBrowser={
+            canUseLiveWorkspace &&
             threadRef &&
             isPreviewSupportedInRuntime() &&
             isBrowserPreviewFile(fileLinkMeta.filePath)
@@ -2673,6 +2674,7 @@ function useChatMarkdownState({
     },
     [
       canUseShellActions,
+      canUseLiveWorkspace,
       fileLinkParentSuffixByPath,
       openFileInPanel,
       openInPreferredEditor,
@@ -2872,6 +2874,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
     );
   },
   a: function MarkdownAnchor({ node, href, children, title: _title, ...props }) {
+    const canUseLiveWorkspace = use(LiveWorkspaceContext);
     const {
       cwd,
       environmentId,
@@ -2922,17 +2925,19 @@ const CHAT_MARKDOWN_COMPONENTS = {
       const confirmBeforeOpen = pullRequestAutolink === "reference";
       const pullRequestCandidateUrl =
         confirmBeforeOpen && href ? pullRequestCandidateUrlFromReferenceAutolink(href) : href;
-      const pullRequestPreviewTarget = pullRequestCandidateUrl
-        ? resolvePullRequestPreviewTarget({
-            environmentId,
-            projects,
-            pullRequestsEnabled: serverConfig?.environment.capabilities.pullRequests === true,
-            url: pullRequestCandidateUrl,
-          })
-        : null;
+      const pullRequestPreviewTarget =
+        canUseLiveWorkspace && pullRequestCandidateUrl
+          ? resolvePullRequestPreviewTarget({
+              environmentId,
+              projects,
+              pullRequestsEnabled: serverConfig?.environment.capabilities.pullRequests === true,
+              url: pullRequestCandidateUrl,
+            })
+          : null;
       const isSameDocumentLink = href?.startsWith("#") ?? false;
       const onClick = props.onClick;
-      const canOpenInPreview = Boolean(threadRef) && isPreviewSupportedInRuntime();
+      const canOpenInPreview =
+        canUseLiveWorkspace && Boolean(threadRef) && isPreviewSupportedInRuntime();
       const linkChildren = <MarkdownLinkContext value>{children}</MarkdownLinkContext>;
       const link = (
         <a
@@ -2974,7 +2979,8 @@ const CHAT_MARKDOWN_COMPONENTS = {
             // the panel it opens offers the browser as one of its actions.
             if (
               !href ||
-              openChangeRequestLink(event, href, undefined, environmentId ?? undefined)
+              (canUseLiveWorkspace &&
+                openChangeRequestLink(event, href, undefined, environmentId ?? undefined))
             ) {
               return;
             }
@@ -3012,8 +3018,9 @@ const CHAT_MARKDOWN_COMPONENTS = {
             event.stopPropagation();
             const api = readLocalApi();
             if (!api) return;
-            const threadLinkAction =
-              linkedThreadPullRequestFor(href) !== null
+            const threadLinkAction = !canUseLiveWorkspace
+              ? undefined
+              : linkedThreadPullRequestFor(href) !== null
                 ? "unlink-from-thread"
                 : resolveThreadPullRequest(href) === null
                   ? undefined
@@ -3141,6 +3148,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
       renderContextReference,
     } = use(ChatMarkdownRendererContext);
     const imageExpand = use(MarkdownLinkContext) ? undefined : expandMedia;
+    const canUseLiveWorkspace = use(LiveWorkspaceContext);
     const contextReference = typeof src === "string" ? parseComposerContextHref(src) : null;
     if (contextReference) {
       const label = alt || contextReference.contextId;
@@ -3169,6 +3177,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
     const githubMediaUrl =
       directUri === null ? null : githubMediaFetchUrl(resolveProtocolRelativeMediaUrl(directUri));
     if (
+      canUseLiveWorkspace &&
       githubMedia &&
       cwd !== undefined &&
       environmentId !== null &&
@@ -3237,7 +3246,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
         />
       );
     }
-    if (imageSource._tag === "WorkspaceFile" && threadRef) {
+    if (canUseLiveWorkspace && imageSource._tag === "WorkspaceFile" && threadRef) {
       return (
         <ChatMarkdownAssetImage
           environmentId={threadRef.environmentId}

@@ -1,3 +1,7 @@
+import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
+import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { canRecoverPrivateThreadLocation } from "@t3tools/client-runtime/relay/workflow-result";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
 import {
@@ -53,6 +57,7 @@ import { LoadingScreen } from "../../components/LoadingScreen";
 import { scopedThreadKey } from "../../lib/scopedEntities";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { connectionTone } from "../connection/connectionTone";
+import { EnvironmentConnectionNotice } from "../connection/EnvironmentConnectionNotice";
 import {
   useRemoteConnections,
   useRemoteConnectionStatus,
@@ -73,12 +78,14 @@ import {
 } from "../terminal/terminalLaunchContext";
 import { terminalDebugLog } from "../terminal/terminalDebugLog";
 import { ThreadDetailScreen, type ThreadDetailScreenProps } from "./ThreadDetailScreen";
+import { CurrentThreadLocation } from "./ThreadMoveControls";
 import { GitOverviewSheet } from "./git/GitOverviewSheet";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useSelectedThreadGitActions } from "../../state/use-selected-thread-git-actions";
 import { useSelectedThreadGitState } from "../../state/use-selected-thread-git-state";
 import { useSelectedThreadRequests } from "../../state/use-selected-thread-requests";
 import { useSelectedThreadWorktree } from "../../state/use-selected-thread-worktree";
+import { resolveWorkflowResultAccess } from "../../state/workflow-result-access";
 import { useThreadComposerState } from "../../state/use-thread-composer-state";
 import { threadEnvironment } from "../../state/threads";
 import { projectThreadContentPresentation } from "./threadContentPresentation";
@@ -94,6 +101,7 @@ import {
   type ThreadInspectorMode,
 } from "./thread-inspector-content-stack";
 import { threadRouteIsHydrating } from "./thread-route-hydration";
+import { savedWorkflowDiffParams } from "../review/reviewAvailability";
 
 function ThreadHeader(
   props: Parameters<typeof useThreadHeaderOptions>[0] & {
@@ -104,6 +112,7 @@ function ThreadHeader(
     readonly onToggleInspector: () => void;
     readonly onOpenGitInspector: () => void;
     readonly onOpenFilesInspector: () => void;
+    readonly onOpenSavedDiff?: () => void;
   },
 ) {
   const navigation = useNavigation();
@@ -135,11 +144,13 @@ function ThreadHeader(
         onPress: () => onOpenTerminal(null),
       });
     }
-    actions.push({
-      accessibilityLabel: "Open git controls",
-      icon: "point.topleft.down.curvedto.point.bottomright.up",
-      onPress: props.onOpenGitInspector,
-    });
+    if (props.workspaceEnabled) {
+      actions.push({
+        accessibilityLabel: "Open git controls",
+        icon: "point.topleft.down.curvedto.point.bottomright.up",
+        onPress: props.onOpenGitInspector,
+      });
+    }
     return actions;
   }, [
     props.inspectorMode,
@@ -151,6 +162,7 @@ function ThreadHeader(
     props.onReturnToThread,
     props.hasThreadCwd,
     props.hasWorkspaceRoot,
+    props.workspaceEnabled,
   ]);
 
   return (
@@ -160,9 +172,16 @@ function ThreadHeader(
         subtitle={props.subtitle}
         sidebar={native.sidebar}
         options={native.options}
-        optionsVersion={props.gitControls.projectScripts}
+        optionsVersion={[props.workspaceEnabled, props.gitControls.projectScripts]}
         trailing={
-          props.fileInspectorSupported && props.hasThreadCwd ? (
+          props.onOpenSavedDiff ? (
+            <ScreenHeaderButton
+              accessibilityLabel="View saved diffs"
+              icon="doc.text"
+              onPress={props.onOpenSavedDiff}
+              separateBackground
+            />
+          ) : props.fileInspectorSupported && props.hasThreadCwd ? (
             <ScreenHeaderButton
               accessibilityLabel={
                 props.inspectorMode !== null && panes.auxiliaryPaneVisible
@@ -185,7 +204,7 @@ function ThreadHeader(
                 else navigation.dispatch(StackActions.replace("Home"));
               }
         }
-        actions={androidHeaderActions}
+        actions={Platform.OS === "android" ? androidHeaderActions : undefined}
         hideBottomBorder
       />
       {native.fallback}
@@ -216,6 +235,7 @@ function OpeningThreadLoadingScreen() {
 }
 
 type ThreadRouteScreenRouteProps = StaticScreenProps<{
+  readonly workflowOrigin?: WorkflowResultOrigin;
   readonly environmentId: string;
   readonly threadId: string;
 }>;
@@ -251,7 +271,7 @@ function ThreadUnavailableScreen(props: {
   );
 }
 
-export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+function ThreadRouteScreenContent(props: ThreadRouteScreenProps) {
   const { state: workspaceState } = useWorkspaceState();
   const { connectionState } = useRemoteConnectionStatus();
   const { selectedThread } = useThreadSelection();
@@ -260,8 +280,20 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   const threadIdRaw = firstRouteParam(params.threadId);
   const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
   const routeEnvironmentRuntime = useRemoteEnvironmentRuntime(environmentId);
+  const relaySession = useAtomValue(managedRelaySessionAtom);
+  const privateLocationRecovery = canRecoverPrivateThreadLocation({
+    capabilities: routeEnvironmentRuntime?.serverConfig?.environment.capabilities,
+    origin: params.workflowOrigin,
+    accountId: relaySession?.accountId,
+    threadId: threadIdRaw,
+  });
+  const { readOnly, workspaceEnabled } = resolveWorkflowResultAccess(
+    routeEnvironmentRuntime?.serverConfig?.environment.capabilities ?? null,
+    params.workflowOrigin,
+    threadIdRaw,
+  );
   const routeEnvironmentShellState = useEnvironmentShellState(environmentId);
-  const { onReconnectEnvironment } = useRemoteConnections();
+  const { connectedEnvironments, onReconnectEnvironment } = useRemoteConnections();
   const navigation = useNavigation();
   const routeConnectionState =
     routeEnvironmentRuntime?.connectionState ?? (environmentId ? "available" : connectionState);
@@ -284,10 +316,6 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
   // loading placeholder while messages fetch, the floating pill above the
   // composer reports loading/syncing, and the composer's connection pill
   // reports connecting/reconnecting status.
-  if (selectedThread !== null && selectedThreadKey === routeThreadKey) {
-    return <ThreadRouteContent {...props} selectedThreadDetailState={selectedThreadDetailState} />;
-  }
-
   const stillHydrating = threadRouteIsHydrating({
     isLoadingConnections: workspaceState.isLoadingConnections,
     connectionState: routeConnectionState,
@@ -297,34 +325,76 @@ export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
     detailHasError: Option.isSome(selectedThreadDetailState.error),
   });
 
-  if (stillHydrating) {
-    return <OpeningThreadLoadingScreen />;
-  }
-
   return (
-    <ThreadUnavailableScreen
-      actionLabel={
-        routeEnvironmentRuntime === null ? "Manage environments" : "Reconnect environment"
-      }
-      onAction={() => {
-        if (routeEnvironmentRuntime !== null) {
-          onReconnectEnvironment(environmentId);
-          return;
-        }
-        navigation.navigate("SettingsSheet", {
-          screen: "SettingsContent",
-          params: { screen: "SettingsEnvironments" },
-        });
-      }}
-    />
+    <>
+      {!readOnly && privateLocationRecovery && (
+        <CurrentThreadLocation
+          key={routeThreadKey}
+          environmentId={environmentId}
+          threadId={ThreadId.make(threadIdRaw)}
+          recoverUnavailable={
+            selectedThreadKey !== routeThreadKey &&
+            !workspaceState.isLoadingConnections &&
+            (routeEnvironmentRuntime === null || !stillHydrating)
+          }
+        />
+      )}
+      {selectedThread !== null && selectedThreadKey === routeThreadKey ? (
+        <ThreadRouteContent
+          {...props}
+          readOnlyWorkflowVm={readOnly}
+          workspaceEnabled={workspaceEnabled}
+          selectedThreadDetailState={selectedThreadDetailState}
+        />
+      ) : routeEnvironmentRuntime !== null &&
+        routeConnectionState !== "connected" &&
+        selectedThreadDetailState.status !== "deleted" ? (
+        <View className="flex-1 bg-screen">
+          <EnvironmentConnectionNotice
+            environmentLabel={
+              connectedEnvironments.find((entry) => entry.environmentId === environmentId)
+                ?.environmentLabel ?? "Environment"
+            }
+            connection={{
+              phase: routeConnectionState,
+              error: routeEnvironmentRuntime.connectionError,
+              traceId: routeEnvironmentRuntime.connectionErrorTraceId,
+            }}
+            resourceName="thread"
+            onRetry={() => void onReconnectEnvironment(environmentId)}
+          />
+        </View>
+      ) : stillHydrating ? (
+        <OpeningThreadLoadingScreen />
+      ) : (
+        <ThreadUnavailableScreen
+          actionLabel={
+            routeEnvironmentRuntime === null ? "Manage environments" : "Reconnect environment"
+          }
+          onAction={() => {
+            if (routeEnvironmentRuntime !== null) {
+              onReconnectEnvironment(environmentId);
+              return;
+            }
+            navigation.navigate("SettingsSheet", {
+              screen: "SettingsContent",
+              params: { screen: "SettingsEnvironments" },
+            });
+          }}
+        />
+      )}
+    </>
   );
 }
 
 function ThreadRouteContent(
   props: ThreadRouteScreenProps & {
+    readonly readOnlyWorkflowVm: boolean;
+    readonly workspaceEnabled: boolean;
     readonly selectedThreadDetailState: ReturnType<typeof useSelectedThreadDetailState>;
   },
 ) {
+  const { readOnlyWorkflowVm, workspaceEnabled } = props;
   const { themeVariables } = useAppearancePreferences();
   const headerColor = themeVariables["--color-header"];
   const { fileInspector, layout, panes, showAuxiliaryPane, toggleAuxiliaryPane } =
@@ -354,9 +424,9 @@ function ThreadRouteContent(
     };
   }, [selectedThread, selectedThreadDetailState]);
   const { selectedThreadCwd } = useSelectedThreadWorktree();
-  const composer = useThreadComposerState();
-  const gitState = useSelectedThreadGitState();
-  const gitActions = useSelectedThreadGitActions();
+  const composer = useThreadComposerState(readOnlyWorkflowVm);
+  const gitState = useSelectedThreadGitState(workspaceEnabled);
+  const gitActions = useSelectedThreadGitActions(workspaceEnabled);
   const requests = useSelectedThreadRequests();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
   const pauseSharedQueue = useAtomCommand(threadEnvironment.pauseQueue, "pause shared queue");
@@ -367,11 +437,18 @@ function ThreadRouteContent(
   const threadId = firstRouteParam(params.threadId);
   const routeThreadIdentity =
     environmentIdRaw !== null && threadId !== null ? `${environmentIdRaw}:${threadId}` : null;
+  const handleOpenSavedDiff = useCallback(() => {
+    if (!readOnlyWorkflowVm || environmentId === null || threadId === null) return;
+    navigation.navigate(
+      "ThreadReview",
+      savedWorkflowDiffParams(environmentId, ThreadId.make(threadId), params.workflowOrigin),
+    );
+  }, [environmentId, navigation, params.workflowOrigin, readOnlyWorkflowVm, threadId]);
   const [inspectorSelection, setInspectorSelection] = useState<ThreadInspectorSelection | null>(
     () => (props.renderInspector ? { routeThreadIdentity, mode: "route" } : null),
   );
   const inspectorMode = (() => {
-    if (inspectorSelection?.routeThreadIdentity === routeThreadIdentity) {
+    if (workspaceEnabled && inspectorSelection?.routeThreadIdentity === routeThreadIdentity) {
       if (inspectorSelection.mode === "files" && selectedThreadCwd === null) {
         return null;
       }
@@ -452,7 +529,7 @@ function ThreadRouteContent(
     .join(" · ");
   /* ─── Git status for native header trigger ───────────────────────── */
   const gitStatus = useEnvironmentQuery(
-    selectedThread !== null && selectedThreadCwd !== null
+    workspaceEnabled && selectedThread !== null && selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
           input: { cwd: selectedThreadCwd },
@@ -460,7 +537,7 @@ function ThreadRouteContent(
       : null,
   );
   const knownTerminalSessions = useKnownTerminalSessions({
-    environmentId: selectedThread?.environmentId ?? null,
+    environmentId: workspaceEnabled ? (selectedThread?.environmentId ?? null) : null,
     threadId: selectedThread?.id ?? null,
   });
   const terminalMenuSessions = useMemo(
@@ -490,6 +567,7 @@ function ThreadRouteContent(
   const gitActionProgress = useGitActionProgress(gitActionProgressTarget);
 
   const handleOpenGitInspector = useCallback(() => {
+    if (!workspaceEnabled) return;
     if (!fileInspector.supported) {
       if (selectedThread === null) {
         return;
@@ -502,9 +580,16 @@ function ThreadRouteContent(
     }
     setInspectorSelection({ routeThreadIdentity, mode: "git" });
     showAuxiliaryPane("inspector");
-  }, [fileInspector.supported, navigation, routeThreadIdentity, selectedThread, showAuxiliaryPane]);
+  }, [
+    fileInspector.supported,
+    navigation,
+    routeThreadIdentity,
+    selectedThread,
+    showAuxiliaryPane,
+    workspaceEnabled,
+  ]);
   const handleOpenFilesInspector = useCallback(() => {
-    if (selectedThread === null || selectedThreadCwd === null) {
+    if (!workspaceEnabled || selectedThread === null || selectedThreadCwd === null) {
       return;
     }
     if (!fileInspector.supported) {
@@ -527,6 +612,7 @@ function ThreadRouteContent(
     selectedThread,
     selectedThreadCwd,
     showAuxiliaryPane,
+    workspaceEnabled,
   ]);
   const inspectorToggleActionRef = useRef({
     inspectorMode,
@@ -837,7 +923,7 @@ function ThreadRouteContent(
     );
   }, [navigation, routeThreadIdentity, selectedThreadCreation, selectedThreadProject]);
   const worktreeSetup = useWorktreeSetup({
-    environmentId: selectedThread?.environmentId ?? null,
+    environmentId: workspaceEnabled ? (selectedThread?.environmentId ?? null) : null,
     threadId: selectedThread?.id ?? null,
     activities: selectedThreadDetail?.activities ?? [],
     preparation: selectedThreadDetail?.promptQueue?.preparation,
@@ -997,6 +1083,8 @@ function ThreadRouteContent(
 
       <View className="flex-1 bg-screen android:overflow-hidden android:rounded-t-[28px] android:bg-thread-canvas">
         <ThreadDetailScreen
+          readOnlyWorkflowVm={readOnlyWorkflowVm}
+          workspaceFilesAvailable={workspaceEnabled}
           promptQueue={selectedThreadDetail?.promptQueue}
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
           contentPresentation={contentPresentation}
@@ -1027,7 +1115,7 @@ function ThreadRouteContent(
                   turnStartedAt: selectedThreadDetail?.latestTurn?.startedAt ?? null,
                   working: composer.activeWorkStartedAt !== null,
                   turnStarted: selectedThreadDetail?.latestTurn?.startedAt != null,
-                  onCancel: handleCancelWorktreeSetup,
+                  onCancel: selectedThreadDetail?.workflowJob ? null : handleCancelWorktreeSetup,
                   onWorkLocally:
                     !selectedThreadDetail?.promptQueue?.preparation &&
                     selectedThreadCreation?.outcome == null &&
@@ -1089,17 +1177,31 @@ function ThreadRouteContent(
         headerColor={headerColor}
         usesNativeHeaderGlass={usesNativeHeaderGlass}
         gitControls={threadGitControlProps}
-        hasThreadCwd={selectedThreadCwd !== null}
-        hasWorkspaceRoot={Boolean(selectedThreadProject?.workspaceRoot)}
+        workspaceEnabled={workspaceEnabled}
+        hasThreadCwd={workspaceEnabled && selectedThreadCwd !== null}
+        hasWorkspaceRoot={workspaceEnabled && Boolean(selectedThreadProject?.workspaceRoot)}
         fileInspectorSupported={fileInspector.supported}
         inspectorMode={inspectorMode}
         onToggleInspector={handleToggleInspector}
         onOpenGitInspector={handleOpenGitInspector}
         onOpenFilesInspector={handleOpenFilesInspector}
+        {...(readOnlyWorkflowVm ? { onOpenSavedDiff: handleOpenSavedDiff } : {})}
         onReturnToThread={props.onReturnToThread}
       />
 
       {renderThreadRouteBody()}
     </>
+  );
+}
+
+export function ThreadRouteScreen(props: ThreadRouteScreenProps) {
+  return (
+    <View className="flex-1">
+      <WorkflowResultReturn
+        origin={props.route.params.workflowOrigin}
+        threadId={props.route.params.threadId}
+      />
+      <ThreadRouteScreenContent {...props} />
+    </View>
   );
 }

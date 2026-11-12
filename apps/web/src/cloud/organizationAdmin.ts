@@ -27,11 +27,12 @@ import type {
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { runtime } from "../lib/runtime";
 import { decodedRelayClientError } from "./linkEnvironment";
 import { resolveRelayClerkTokenOptions } from "./publicConfig";
+import { refreshManagedRelayOrganizationCatalog } from "./managedRelayState";
 
 const isAccessRemovalStatus = Schema.is(RepositoryAccessRemovalStatus);
 
@@ -80,6 +81,8 @@ export interface OrganizationAdminState {
   readonly snapshot: OrganizationAdminSnapshot | null;
   readonly loading: boolean;
   readonly error: string | null;
+  readonly githubReadError: string | null;
+  readonly githubConnectionVerified: boolean;
   readonly busy: boolean;
   readonly accessRemoval: RepositoryAccessRemovalStatus | null;
   readonly issuedInvitations: ReadonlyArray<IssuedInvitation>;
@@ -123,12 +126,8 @@ export interface OrganizationAdminState {
   /** GitHub's install page for the App; the relay claims the installation on GitHub's callback. */
   readonly startGithubInstall: () => Promise<RelayGithubInstallResponse | null>;
   /** Installations of the App as GitHub reports them, for picking one that was installed directly. */
-  readonly listGithubInstallations: () => Promise<ReadonlyArray<RelayGithubInstallationCandidate> | null>;
+  readonly listGithubInstallations: () => Promise<ReadonlyArray<RelayGithubInstallationCandidate>>;
   readonly disconnectGithub: () => Promise<boolean>;
-  readonly provisionMachine: (input: {
-    readonly label: string;
-    readonly role: RelayMachineRole;
-  }) => Promise<boolean>;
   readonly connectMachine: (input: {
     readonly label: string;
     readonly role: RelayMachineRole;
@@ -162,12 +161,19 @@ function failureMessage(cause: unknown): string {
  * something else when it does not.
  */
 export function useOrganizationAdmin(): OrganizationAdminState {
-  const { getToken, isSignedIn } = useAuth();
+  const { getToken, isSignedIn, userId } = useAuth();
   const [snapshot, setSnapshot] = useState<OrganizationAdminSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [accessRemoval, setAccessRemoval] = useState<RepositoryAccessRemovalStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [githubReadFailure, setGithubReadFailure] = useState<{
+    userId: typeof userId;
+    organizationId: string;
+    installationId: string | null;
+    message: string;
+  } | null>(null);
+  const latestLoad = useRef(0);
   const [issuedInvitations, setIssuedInvitations] = useState<ReadonlyArray<IssuedInvitation>>([]);
   const [issuedMachineEnrollments, setIssuedMachineEnrollments] = useState<
     ReadonlyArray<IssuedMachineEnrollment>
@@ -195,14 +201,27 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     [getToken],
   );
 
+  const listGithubInstallations = useCallback(
+    () =>
+      call("Could not list GitHub installations", (client, clerkToken) =>
+        client.listGithubInstallations({ clerkToken }),
+      ),
+    [call],
+  );
+
   const load = useCallback(async () => {
+    const request = ++latestLoad.current;
     if (!isSignedIn) {
       setSnapshot(null);
       setAccessRemoval(null);
+      setGithubReadFailure(null);
+      setLoading(false);
       return;
     }
     setLoading(true);
     setError(null);
+    let githubOrganizationId: string | null = null;
+    let checkedInstallationId: string | null = null;
     try {
       const membership = await call("Could not read your organization", (client, clerkToken) =>
         client.getOrganization({ clerkToken }),
@@ -211,7 +230,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         const removal = await call("Could not read access removal status", (client, clerkToken) =>
           client.getAccessRemoval({ clerkToken }),
         ).catch(() => null);
-        if (removal)
+        if (removal && request === latestLoad.current)
           setAccessRemoval((current) =>
             current && current.revision > removal.revision ? current : removal,
           );
@@ -260,9 +279,12 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       const skills = await call("Could not list skills", (client, clerkToken) =>
         client.listSkills({ clerkToken }),
       );
+      if (request !== latestLoad.current) return;
+      githubOrganizationId = membership.organization.organizationId;
       const github = await call("Could not read the GitHub connection", (client, clerkToken) =>
         client.getGithubConnection({ clerkToken }),
       );
+      checkedInstallationId = github.connection?.installationId ?? null;
       // Only meaningful once an installation exists; asking otherwise is a
       // guaranteed not-found that would read as a failure.
       const githubRepositories = github.connection
@@ -270,6 +292,8 @@ export function useOrganizationAdmin(): OrganizationAdminState {
             client.listGithubRepositories({ clerkToken }),
           )
         : [];
+      if (request !== latestLoad.current) return;
+      setGithubReadFailure(null);
       setSnapshot({
         membership,
         members,
@@ -283,14 +307,30 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         skills,
       });
     } catch (cause) {
-      setError(failureMessage(cause));
+      if (request !== latestLoad.current) return;
+      const message = failureMessage(cause);
+      if (githubOrganizationId) {
+        setGithubReadFailure({
+          userId,
+          organizationId: githubOrganizationId,
+          installationId: checkedInstallationId,
+          message,
+        });
+      }
+      setError(message);
     } finally {
-      setLoading(false);
+      if (request === latestLoad.current) setLoading(false);
     }
-  }, [call, isSignedIn]);
+  }, [call, isSignedIn, userId]);
 
   useEffect(() => {
-    void load();
+    const initialRead = ++latestLoad.current;
+    queueMicrotask(() => {
+      if (initialRead === latestLoad.current) void load();
+    });
+    return () => {
+      latestLoad.current++;
+    };
   }, [load]);
 
   useEffect(() => {
@@ -322,6 +362,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       setError(null);
       try {
         const result = await run();
+        if (userId) refreshManagedRelayOrganizationCatalog(userId);
         if (
           typeof result === "object" &&
           result !== null &&
@@ -339,7 +380,16 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         setBusy(false);
       }
     },
-    [load],
+    [load, userId],
+  );
+
+  const githubFailure = githubReadFailure?.userId === userId ? githubReadFailure : null;
+  const installation = snapshot?.github.connection;
+  const githubConnectionVerified = Boolean(
+    installation &&
+    (!githubFailure ||
+      (githubFailure.organizationId === snapshot?.membership.organization.organizationId &&
+        githubFailure.installationId === installation.installationId)),
   );
 
   return {
@@ -347,6 +397,8 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     snapshot,
     loading,
     error,
+    githubReadError: githubFailure?.message ?? null,
+    githubConnectionVerified,
     busy,
     accessRemoval,
     issuedInvitations,
@@ -482,16 +534,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         setBusy(false);
       }
     },
-    listGithubInstallations: async () => {
-      try {
-        return await call("Could not list GitHub installations", (client, clerkToken) =>
-          client.listGithubInstallations({ clerkToken }),
-        );
-      } catch (cause) {
-        setError(failureMessage(cause));
-        return null;
-      }
-    },
+    listGithubInstallations,
     disconnectGithub: () =>
       mutate("Could not disconnect GitHub", () =>
         call("Could not disconnect GitHub", (client, clerkToken) =>
@@ -502,12 +545,6 @@ export function useOrganizationAdmin(): OrganizationAdminState {
       mutate("Could not revoke access", () =>
         call("Could not revoke access", (client, clerkToken) =>
           client.revokeAccess({ clerkToken, ...input }),
-        ),
-      ),
-    provisionMachine: (input) =>
-      mutate("Could not provision the machine", () =>
-        call("Could not provision the machine", (client, clerkToken) =>
-          client.provisionMachine({ clerkToken, payload: input }),
         ),
       ),
     connectMachine: (input) =>

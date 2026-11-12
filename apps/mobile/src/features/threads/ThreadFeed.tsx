@@ -171,9 +171,14 @@ import {
   THREAD_DISCLOSURE_TRANSITION_MS,
   WORK_GROUP_TOGGLE_HEIGHT,
 } from "./thread-work-log";
-import { appendPendingThreadMessages, type PendingThreadFeedEntry } from "./pending-thread-feed";
+import {
+  appendPendingThreadMessages,
+  type InlineThreadPrompt,
+  type PendingThreadFeedEntry,
+} from "./pending-thread-feed";
 import type { QueuedThreadMessage } from "../../state/thread-outbox-model";
 import { promptAttributionLabel } from "@t3tools/client-runtime/state/threads";
+import { InlinePromptActions } from "./SharedPromptQueue";
 import { useMarkdownCodeHighlight } from "./markdownCodeHighlightState";
 import {
   assetEnvironment,
@@ -186,13 +191,9 @@ import { usePreparedConnection } from "../../state/session";
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { composerDocumentAttachmentRecord } from "../../lib/composerContext";
 import * as Option from "effect/Option";
-import {
-  basename,
-  fileRoutePathSegments,
-  isAbsolutePath,
-  resolveWorkspaceRelativeFilePath,
-} from "../files/filePath";
+import { fileRoutePathSegments } from "../files/filePath";
 import { fileChipMenu, resolveFileChipTarget, type FileChipAction } from "./fileChipMenu";
+import { resolveThreadMarkdownLink } from "./threadMarkdownLink";
 import { useFileChipShare } from "./useFileChipShare";
 import {
   MarkdownImageAvailableWidthContext,
@@ -246,11 +247,17 @@ function isFreshTimestamp(input: string): boolean {
 }
 
 export interface ThreadFeedProps {
+  readonly workspaceFilesAvailable: boolean;
   readonly worktreeSetup?: WorktreeSetupCardProps | null;
   readonly setupWorkingStartedAt?: string | null;
   readonly queuedMessages: ReadonlyArray<QueuedThreadMessage>;
   readonly dispatchingMessageId: MessageId | null;
   readonly onEditPendingMessage: (message: QueuedThreadMessage) => void;
+  readonly inlinePrompt?: InlineThreadPrompt | null;
+  readonly onEditSharedPrompt?: (messageId: string) => void;
+  readonly onRemoveSharedPrompt?: (messageId: string) => void;
+  readonly onPauseSharedPrompt?: () => void;
+  readonly sharedPromptActionsDisabled?: boolean;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly workspaceRoot?: string | null;
@@ -545,10 +552,9 @@ function MessageAttachmentFile(props: {
 }
 
 /**
- * An attachment type this build does not know (newer server). Rendered as an
- * inert row: the name is still useful, but there is nothing to open.
+ * An attachment whose content is unavailable. Its name remains in the conversation.
  */
-function MessageAttachmentUnknown(props: { readonly name: string }) {
+function MessageAttachmentName(props: { readonly name: string }) {
   return (
     <View className="flex-row items-center gap-2 py-1">
       <PierreEntryIcon path={props.name} kind="file" size={16} />
@@ -1360,6 +1366,11 @@ function renderFeedEntry(
     | "skills"
     | "dispatchingMessageId"
     | "onEditPendingMessage"
+    | "onEditSharedPrompt"
+    | "onRemoveSharedPrompt"
+    | "onPauseSharedPrompt"
+    | "sharedPromptActionsDisabled"
+    | "workspaceFilesAvailable"
   > & {
     readonly copiedRowId: string | null;
     readonly expandedWorkRows: Record<string, boolean>;
@@ -1553,7 +1564,7 @@ function renderFeedEntry(
       );
       return (
         <View className="mb-5 items-end">
-          {message.author ? (
+          {message.author || message.workflowOrigin ? (
             <Text className="mb-1 pr-0.5 font-t3-medium text-xs text-foreground-secondary">
               {promptAttributionLabel(message)}
             </Text>
@@ -1571,7 +1582,9 @@ function renderFeedEntry(
             }}
           >
             {entry.pendingMessage?.attachments.map((attachment) =>
-              attachment.type === "image" && attachment.uploadedAttachmentId ? (
+              !props.workspaceFilesAvailable ? (
+                <MessageAttachmentName key={attachment.id} name={attachment.name} />
+              ) : attachment.type === "image" && attachment.uploadedAttachmentId ? (
                 <MessageAttachmentImage
                   key={attachment.id}
                   environmentId={props.environmentId}
@@ -1589,14 +1602,16 @@ function renderFeedEntry(
                   style={{ width: 180, height: 140, borderRadius: 14 }}
                 />
               ) : (
-                <MessageAttachmentUnknown key={attachment.id} name={attachment.name} />
+                <MessageAttachmentName key={attachment.id} name={attachment.name} />
               ),
             )}
             {/* An empty container still takes a gap, which pads every attachment-free bubble. */}
             {visibleAttachments.length > 0 ? (
               <View className={inlineAttachmentIds.size ? "flex-row flex-wrap gap-2" : "gap-2"}>
                 {visibleAttachments.map((attachment) => {
-                  return isImageAttachment(attachment) ? (
+                  return !props.workspaceFilesAvailable ? (
+                    <MessageAttachmentName key={attachment.id} name={attachment.name} />
+                  ) : isImageAttachment(attachment) ? (
                     <MessageAttachmentImage
                       key={attachment.id}
                       environmentId={props.environmentId}
@@ -1619,7 +1634,7 @@ function renderFeedEntry(
                       onPressVideo={props.onPressVideo}
                     />
                   ) : (
-                    <MessageAttachmentUnknown key={attachment.id} name={attachment.name} />
+                    <MessageAttachmentName key={attachment.id} name={attachment.name} />
                   );
                 })}
               </View>
@@ -1631,6 +1646,7 @@ function renderFeedEntry(
                 <UserMessageContent
                   text={renderedText}
                   environmentId={props.environmentId}
+                  workspaceFilesAvailable={props.workspaceFilesAvailable}
                   context={message.context}
                   markdownStyles={styles}
                   reviewCommentColors={props.reviewCommentColors}
@@ -1642,12 +1658,17 @@ function renderFeedEntry(
             ) : null}
           </View>
           <View className="mt-1 flex-row items-center justify-end gap-1 pr-0.5">
-            <Text className="font-t3-medium text-xs tabular-nums text-foreground-secondary">
-              {entry.pendingMessage && !entry.acknowledged
-                ? entry.pendingMessage.submissionProtocol === "review-required"
-                  ? "Delivery unknown · Review required"
-                  : "Waiting to submit"
-                : timestampLabel}
+            <Text
+              accessibilityLiveRegion={entry.queuedPrompt ? "polite" : undefined}
+              className="font-t3-medium text-xs tabular-nums text-foreground-secondary"
+            >
+              {entry.queuedPrompt
+                ? entry.queuedPrompt.status
+                : entry.pendingMessage && !entry.acknowledged
+                  ? entry.pendingMessage.submissionProtocol === "review-required"
+                    ? "Delivery unknown · Review required"
+                    : "Waiting to submit"
+                  : timestampLabel}
             </Text>
             {entry.pendingMessage &&
             !entry.acknowledged &&
@@ -1678,6 +1699,16 @@ function renderFeedEntry(
               >
                 <SymbolView name="pencil" size={14} tintColor={iconSubtleColor} />
               </Pressable>
+            ) : null}
+            {entry.queuedPrompt ? (
+              <InlinePromptActions
+                prompt={entry.queuedPrompt.prompt}
+                disabled={props.sharedPromptActionsDisabled}
+                onEdit={props.onEditSharedPrompt}
+                onRemove={props.onRemoveSharedPrompt}
+                onPause={props.onPauseSharedPrompt}
+                tintColor={iconSubtleColor}
+              />
             ) : null}
             {message.text.trim().length > 0 ? (
               <CopyTextButton
@@ -1732,7 +1763,9 @@ function renderFeedEntry(
           </MarkdownImageAvailableWidthContext>
         ) : null}
         {attachments.map((attachment) => {
-          return isImageAttachment(attachment) ? (
+          return !props.workspaceFilesAvailable ? (
+            <MessageAttachmentName key={attachment.id} name={attachment.name} />
+          ) : isImageAttachment(attachment) ? (
             <MessageAttachmentImage
               key={attachment.id}
               environmentId={props.environmentId}
@@ -1751,7 +1784,7 @@ function renderFeedEntry(
               onPressVideo={props.onPressVideo}
             />
           ) : (
-            <MessageAttachmentUnknown key={attachment.id} name={attachment.name} />
+            <MessageAttachmentName key={attachment.id} name={attachment.name} />
           );
         })}
         {showAssistantMeta ? (
@@ -1797,6 +1830,7 @@ function renderFeedEntry(
 type UserMessageContentProps = {
   readonly text: string;
   readonly environmentId: EnvironmentId;
+  readonly workspaceFilesAvailable: boolean;
   readonly context?: OrchestrationMessageContext;
   readonly markdownStyles: MarkdownStyleSet;
   readonly reviewCommentColors: ReviewCommentColors;
@@ -1823,6 +1857,7 @@ function UserMessageContent(props: UserMessageContentProps) {
       props.linkHandlers.onLinkPress?.(record.path);
       return;
     }
+    if (!props.workspaceFilesAvailable && record && "attachmentId" in record) return;
     // Documents open in the file screen; pictures, video and PDF keep their native viewers.
     const document = composerDocumentAttachmentRecord(record);
     if (document) {
@@ -2100,102 +2135,53 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const userBubbleColor = theme["--color-user-bubble"];
   const onMarkdownLinkPress = useCallback(
     (href: string) => {
-      const presentation = resolveMarkdownLinkPresentation(href);
-      if (presentation.kind === "file") {
-        const relativePath = resolveWorkspaceRelativeFilePath(
-          props.workspaceRoot,
-          presentation.path,
-        );
-        if (relativePath) {
-          void Haptics.selectionAsync();
-          if (isPdfFile({ name: relativePath })) {
-            setExpandedFile(
-              (current) =>
-                current ?? {
-                  kind: "pdf",
-                  name: relativePath.split("/").at(-1),
-                  environmentId: props.environmentId,
-                  resource: {
-                    _tag: "workspace-file",
-                    threadId: props.threadId,
-                    path: relativePath,
-                  },
-                },
-            );
-            return;
-          }
-          navigation.navigate("ThreadFile", {
-            environmentId: String(props.environmentId),
-            threadId: String(props.threadId),
-            path: fileRoutePathSegments(relativePath),
-            ...(presentation.line ? { line: String(presentation.line) } : {}),
-          });
-          return;
-        }
-      }
-
-      const media = resolveMarkdownMediaPreview(href, {
+      const action = resolveThreadMarkdownLink(href, {
         environmentId: props.environmentId,
         threadId: props.threadId,
         workspaceRoot: props.workspaceRoot,
+        workspaceFilesAvailable: props.workspaceFilesAvailable,
       });
-      if (media) {
-        void Haptics.selectionAsync();
-        if (media.kind === "video") {
-          setExpandedVideo((current) => current ?? media.source);
-        } else {
-          setExpandedFile((current) => current ?? media.source);
-        }
-        return;
-      }
-
-      // A host file outside the workspace, such as a report an agent wrote to
-      // a temp directory, opens read-only in the file screen.
-      if (presentation.kind === "file" && isAbsolutePath(presentation.path)) {
-        void Haptics.selectionAsync();
-        if (isPdfFile({ name: presentation.path })) {
-          setExpandedFile(
-            (current) =>
-              current ?? {
-                kind: "pdf",
-                name: basename(presentation.path),
-                environmentId: props.environmentId,
-                resource: {
-                  _tag: "media-file",
-                  threadId: props.threadId,
-                  path: presentation.path,
-                },
-              },
-          );
+      if (!action) return;
+      switch (action.kind) {
+        case "copy-path":
+          copyTextWithHaptic(action.path);
           return;
-        }
-        navigation.navigate("ThreadFile", {
-          environmentId: String(props.environmentId),
-          threadId: String(props.threadId),
-          path: fileRoutePathSegments(presentation.path),
-          ...(presentation.line ? { line: String(presentation.line) } : {}),
-        });
-        return;
-      }
-
-      if (presentation.kind !== "file" && presentation.href) {
-        if (/^https?:\/\//i.test(presentation.href) && isPdfFile({ name: presentation.href })) {
-          setExpandedFile(
-            (current) => current ?? { kind: "pdf", uri: presentation.href!, name: "Document.pdf" },
-          );
+        case "file":
+          void Haptics.selectionAsync();
+          navigation.navigate("ThreadFile", {
+            environmentId: String(props.environmentId),
+            threadId: String(props.threadId),
+            path: fileRoutePathSegments(action.path),
+            ...(action.line ? { line: String(action.line) } : {}),
+          });
           return;
-        }
-        void tryOpenExternalUrl(presentation.href, "markdown-link");
+        case "video":
+          void Haptics.selectionAsync();
+          setExpandedVideo((current) => current ?? action.source);
+          return;
+        case "image":
+        case "pdf":
+          if (action.kind === "image" || "resource" in action.source) void Haptics.selectionAsync();
+          setExpandedFile((current) => current ?? action.source);
+          return;
+        case "external":
+          void tryOpenExternalUrl(action.url, "markdown-link");
       }
     },
-    [props.environmentId, props.threadId, props.workspaceRoot, navigation],
+    [
+      navigation,
+      props.environmentId,
+      props.threadId,
+      props.workspaceFilesAvailable,
+      props.workspaceRoot,
+    ],
   );
   const markdownLinkHandlers = useMemo<MarkdownLinkHandlers>(
     () => ({
       onLinkPress: onMarkdownLinkPress,
       fileContextMenu: (href) => {
         const target = resolveFileChipTarget(href, props.workspaceRoot);
-        return target ? fileChipMenu(target) : undefined;
+        return target ? fileChipMenu(target, props.workspaceFilesAvailable) : undefined;
       },
       onFileContextMenuAction: (href, actionId) => {
         const target = resolveFileChipTarget(href, props.workspaceRoot);
@@ -2208,15 +2194,15 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             if (target.relativePath) copyTextWithHaptic(target.relativePath);
             return;
           case "open-file":
-            onMarkdownLinkPress(href);
+            if (props.workspaceFilesAvailable) onMarkdownLinkPress(href);
             return;
           case "save":
-            shareFileChip(target);
+            if (props.workspaceFilesAvailable) shareFileChip(target);
             return;
         }
       },
     }),
-    [onMarkdownLinkPress, props.workspaceRoot, shareFileChip],
+    [onMarkdownLinkPress, props.workspaceFilesAvailable, props.workspaceRoot, shareFileChip],
   );
   const renderMarkdownImage = useCallback<MarkdownImageRenderer>(
     (image) => {
@@ -2224,6 +2210,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         environmentId: props.environmentId,
         threadId: props.threadId,
         workspaceRoot: props.workspaceRoot,
+        workspaceFilesAvailable: props.workspaceFilesAvailable,
         imageEmbed: true,
       });
       if (media?.kind === "video") {
@@ -2247,7 +2234,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           />
         );
       }
-      if (imageSource._tag === "Blocked") {
+      if (imageSource._tag === "Blocked" || !props.workspaceFilesAvailable) {
         return <ThreadMarkdownImageUnavailable alt={image.alt} />;
       }
       return (
@@ -2265,10 +2252,11 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         />
       );
     },
-    [props.environmentId, props.threadId, props.workspaceRoot],
+    [props.environmentId, props.threadId, props.workspaceFilesAvailable, props.workspaceRoot],
   );
   const renderViewedImage = useCallback<MarkdownImageRenderer>(
     (image) => {
+      if (!props.workspaceFilesAvailable) return <ThreadMarkdownImageUnavailable alt={image.alt} />;
       const viewedImage = resolveViewedImageAsset(image.href, {
         threadId: props.threadId,
         workspaceRoot: props.workspaceRoot,
@@ -2297,7 +2285,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         />
       ) : null;
     },
-    [props.environmentId, props.threadId, props.workspaceRoot],
+    [props.environmentId, props.threadId, props.workspaceFilesAvailable, props.workspaceRoot],
   );
   const markdownStyles = useMarkdownStyles(onMarkdownLinkPress, renderMarkdownImage);
   const reviewCommentColors = useReviewCommentColors();
@@ -2484,9 +2472,11 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         ),
         props.feed,
         props.queuedMessages,
+        props.inlinePrompt,
       ),
     [
       props.queuedMessages,
+      props.inlinePrompt,
       expandedTurnIds,
       expandedWorkGroupIds,
       props.activeWorkStartedAt,
@@ -2776,8 +2766,13 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         <ThreadMediaVisibility>
           {renderFeedEntry(info, {
             environmentId: props.environmentId,
+            workspaceFilesAvailable: props.workspaceFilesAvailable,
             dispatchingMessageId: props.dispatchingMessageId,
             onEditPendingMessage: props.onEditPendingMessage,
+            onEditSharedPrompt: props.onEditSharedPrompt,
+            onRemoveSharedPrompt: props.onRemoveSharedPrompt,
+            onPauseSharedPrompt: props.onPauseSharedPrompt,
+            sharedPromptActionsDisabled: props.sharedPromptActionsDisabled,
             copiedRowId,
             expandedWorkRows,
             expandedReasoningMessageIds,
@@ -2823,6 +2818,10 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       setupAnchorIndex,
       props.dispatchingMessageId,
       props.onEditPendingMessage,
+      props.onEditSharedPrompt,
+      props.onRemoveSharedPrompt,
+      props.onPauseSharedPrompt,
+      props.sharedPromptActionsDisabled,
       copiedRowId,
       disclosureToggleSettling,
       expandedWorkRows,
@@ -2852,6 +2851,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       props.environmentId,
       props.onUseArtifactTemplate,
       props.skills,
+      props.workspaceFilesAvailable,
       renderMarkdownImage,
       renderViewedImage,
     ],
@@ -3025,15 +3025,33 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           <View pointerEvents="none" style={StyleSheet.absoluteFill}>
             <ThreadFeedPlaceholder
               title="No conversation yet"
-              detail="Ask the agent to inspect the repo, run a command, or continue the active thread."
+              detail={
+                props.workspaceFilesAvailable
+                  ? "Ask the agent to inspect the repo, run a command, or continue the active thread."
+                  : "Messages will appear here."
+              }
               topInset={topContentInset}
               bottomInset={bottomContentInset}
               horizontalPadding={horizontalPadding}
             />
           </View>
         ) : null}
-        <VideoPreviewModal source={expandedVideo} onRequestClose={() => setExpandedVideo(null)} />
-        <FilePreviewModal source={expandedFile} onRequestClose={() => setExpandedFile(null)} />
+        <VideoPreviewModal
+          source={
+            props.workspaceFilesAvailable || (expandedVideo && "uri" in expandedVideo)
+              ? expandedVideo
+              : null
+          }
+          onRequestClose={() => setExpandedVideo(null)}
+        />
+        <FilePreviewModal
+          source={
+            props.workspaceFilesAvailable || (expandedFile && "uri" in expandedFile)
+              ? expandedFile
+              : null
+          }
+          onRequestClose={() => setExpandedFile(null)}
+        />
       </View>
     </PresentationSource>
   );

@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Predicate from "effect/Predicate";
 
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
 import { ProviderSessionDirectoryPersistenceError, ProviderValidationError } from "../Errors.ts";
@@ -146,7 +147,13 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
             binding.runtimePayload,
           ),
         },
-        options,
+        {
+          ...options,
+          preserveContinuation: !(
+            Predicate.isObject(binding.runtimePayload) &&
+            Predicate.hasProperty(binding.runtimePayload, "providerContinuation")
+          ),
+        },
       )
       .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.upsert:upsert")));
   });
@@ -194,8 +201,14 @@ const makeProviderSessionDirectory = Effect.gen(function* () {
       ),
     );
 
+  const confirmShutdown: ProviderSessionDirectoryShape["confirmShutdown"] = (input) =>
+    repository
+      .confirmShutdown(input)
+      .pipe(Effect.mapError(toPersistenceError("ProviderSessionDirectory.confirmShutdown")));
+
   return {
     upsert,
+    confirmShutdown,
     recordImportedTranscript,
     getProvider,
     getBinding,

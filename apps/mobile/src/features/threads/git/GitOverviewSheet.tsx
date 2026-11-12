@@ -326,9 +326,9 @@ export function GitOverviewSheet(props: GitOverviewSheetProps) {
                     tintColorClassName="accent-foreground-muted"
                   />
                   <Text className="text-xs text-foreground-muted">
-                    {chain.kind === "native" ? "Stack" : "Branch stack"} · {chain.layers.length} PRs
-                    · bottom to top
+                    {chain.kind === "native" ? "Stack" : "Branch stack"} ({chain.layers.length} PRs)
                   </Text>
+                  <Text className="text-xs text-foreground-muted">Bottom to top</Text>
                 </View>
               ) : null}
               {chain.layers.map((link, index) => (

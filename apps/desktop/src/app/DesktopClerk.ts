@@ -156,8 +156,8 @@ export const make = Effect.gen(function* () {
         return yield* Effect.interrupt;
       }
 
-      yield* electronApp.on("second-instance", () => {
-        void runPromise(
+      const revealMainWindow = () =>
+        runPromise(
           Effect.gen(function* () {
             const mainWindow = yield* electronWindow.currentMainOrFirst;
             if (Option.isSome(mainWindow)) {
@@ -165,6 +165,15 @@ export const make = Effect.gen(function* () {
             }
           }),
         );
+
+      yield* electronApp.on("second-instance", () => {
+        void revealMainWindow();
+      });
+      const codexVmReturnUrl = `${ElectronProtocol.getDesktopScheme(environment.isDevelopment)}://codex-vm-sign-in`;
+      yield* electronApp.on("open-url", (event: Electron.Event, url: string) => {
+        if (url !== codexVmReturnUrl) return;
+        event.preventDefault();
+        void revealMainWindow();
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });

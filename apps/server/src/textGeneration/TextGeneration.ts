@@ -15,6 +15,28 @@ import * as SourceControlProviderRegistry from "../sourceControl/SourceControlPr
 import * as ThreadTitleLinks from "./ThreadTitleLinks.ts";
 import type { TextGenerationPolicy } from "./TextGenerationPolicy.ts";
 
+/** Fixed explanations are safe to persist with a supervisor verdict. */
+export const WORKFLOW_APPROVAL_FAILURE_DETAILS = {
+  credential: "The workflow supervisor's Codex credential is unavailable.",
+  preflight: "The workflow supervisor's Codex model or account could not be prepared.",
+  transport: "The workflow supervisor could not reach Codex.",
+  http: "Codex returned an unsuccessful workflow approval HTTP response.",
+  contentType: "Codex returned an unsupported workflow approval response type.",
+  stream: "The workflow approval response stream could not be read.",
+  missingTerminal: "Codex ended the workflow approval response without completing it.",
+  malformedTerminal: "Codex returned a malformed workflow approval completion.",
+  outputItem: "Codex returned an invalid or unfinished workflow approval output item.",
+  conflictingOutput: "Codex returned conflicting workflow approval output items.",
+  failed: "Codex reported a failed workflow approval response.",
+  incomplete: "Codex reported an incomplete workflow approval response.",
+  upstreamError: "Codex reported an error while generating the workflow approval.",
+  refusal: "Codex refused to provide a workflow approval verdict.",
+  output: "Codex returned an unsupported workflow approval output shape.",
+  verdictJson: "Codex returned invalid JSON for the workflow approval verdict.",
+  verdictSchema: "Codex returned an invalid workflow approval verdict.",
+  timeout: "The workflow supervisor timed out waiting for Codex.",
+} as const;
+
 export interface CommitMessageGenerationInput {
   cwd: string;
   branch: string | null;
@@ -97,6 +119,8 @@ export interface ApprovalVerdictGenerationInput {
   requestDetail?: string | undefined;
   /** The instruction the step was given, so the verdict can judge relevance. */
   stepInstruction: string;
+  jobContext?: string | undefined;
+  reviewConstraint?: string | undefined;
   policy?: TextGenerationPolicy | undefined;
   /** What model and provider to use for generation. */
   modelSelection: ModelSelection;

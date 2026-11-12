@@ -1,8 +1,10 @@
 import { EnvironmentId, ThreadId, type ThreadJumpKeybindingCommand } from "@t3tools/contracts";
+import { workflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
 import { useEffect } from "react";
 
 export type HardwareKeyboardCommand =
   | ThreadJumpKeybindingCommand
+  | "threadVms"
   | "commandPalette"
   | "paletteNext"
   | "palettePrevious"
@@ -78,7 +80,7 @@ export function parseActiveThreadPath(pathname: string): {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
 } | null {
-  const match = /^\/threads\/([^/]+)\/([^/]+)(?:\/|$)/.exec(pathname);
+  const match = /^\/threads\/([^/?#]+)\/([^/?#]+)(?:[/?#]|$)/.exec(pathname);
   if (!match?.[1] || !match[2]) return null;
   try {
     return {
@@ -88,4 +90,21 @@ export function parseActiveThreadPath(pathname: string): {
   } catch {
     return null;
   }
+}
+
+export function activeThreadWorkflowOrigin(
+  thread: ReturnType<typeof parseActiveThreadPath>,
+  params: object | undefined,
+  accountId: string | undefined,
+) {
+  if (
+    !thread ||
+    !params ||
+    !("environmentId" in params) ||
+    params.environmentId !== thread.environmentId ||
+    !("threadId" in params) ||
+    params.threadId !== thread.threadId
+  )
+    return undefined;
+  return workflowResultOrigin(params, accountId, thread.threadId) ?? undefined;
 }

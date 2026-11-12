@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_allocations" ADD COLUMN "sealed_traffic_access_token" text;

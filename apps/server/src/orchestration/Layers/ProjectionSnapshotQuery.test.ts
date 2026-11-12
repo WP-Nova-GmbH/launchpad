@@ -636,7 +636,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const threadDetail = yield* snapshotQuery.getThreadDetailById(ThreadId.make("thread-1"));
       assert.equal(threadDetail._tag, "Some");
       if (threadDetail._tag === "Some") {
-        assert.deepEqual(threadDetail.value, snapshot.threads[0]);
+        assert.deepEqual(threadDetail.value, { ...snapshot.threads[0]!, workflowJob: null });
       }
 
       const threadShell = yield* snapshotQuery.getThreadShellById(ThreadId.make("thread-1"));
@@ -3602,6 +3602,46 @@ projectionSnapshotLayer("ProjectionSnapshotQuery activities by kind", (it) => {
         [["setup-live", "worktree-setup", { phase: "running" }]],
       );
       assert.deepEqual(yield* query.listActivitiesByKind("nope"), []);
+    }),
+  );
+});
+
+projectionSnapshotLayer("portable thread routing", (it) => {
+  it.effect("exposes durable ownership on active, individual and archived shells", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const query = yield* ProjectionSnapshotQuery;
+      const id = ThreadId.make("routing-marker-thread");
+      yield* sql`INSERT INTO projection_projects
+        (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+        VALUES ('routing-marker-project', 'Project', '/routing-marker', '[]', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z')`;
+      yield* sql`INSERT INTO projection_threads
+        (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
+        VALUES (${id}, 'routing-marker-project', 'Thread', '{"provider":"codex","model":"gpt-5"}',
+          'full-access', 'default', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z')`;
+      assert.isUndefined(Option.getOrThrow(yield* query.getThreadShellById(id)).relayRouting);
+      yield* sql`INSERT INTO thread_execution_fences
+        (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+        VALUES (${id}, 'https://relay.example.test', 'source', 'routing-marker-project', 3, 'enrollment-operation', 'frozen')`;
+      for (const phase of ["frozen", "active", "draining", "retired"] as const) {
+        yield* sql`UPDATE thread_execution_fences SET phase = ${phase} WHERE thread_id = ${id}`;
+        const expected = { relayUrl: "https://relay.example.test", generation: 3, phase };
+        assert.deepStrictEqual(
+          (yield* query.getShellSnapshot()).threads.find((thread) => thread.id === id)
+            ?.relayRouting,
+          expected,
+        );
+        assert.deepStrictEqual(
+          Option.getOrThrow(yield* query.getThreadShellById(id)).relayRouting,
+          expected,
+        );
+      }
+      yield* sql`UPDATE projection_threads SET archived_at = '2026-10-07T00:00:01Z' WHERE thread_id = ${id}`;
+      assert.deepStrictEqual(
+        (yield* query.getArchivedShellSnapshot()).threads.find((thread) => thread.id === id)
+          ?.relayRouting,
+        { relayUrl: "https://relay.example.test", generation: 3, phase: "retired" },
+      );
     }),
   );
 });

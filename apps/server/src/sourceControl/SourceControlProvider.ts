@@ -22,6 +22,7 @@ export type ResolveSourceControlLink = (input: {
 }) => Effect.Effect<SourceControlLinkSubject, SourceControlProviderError> | undefined;
 
 export interface SourceControlProviderContext {
+  readonly repository?: string;
   readonly provider: SourceControlProviderInfo;
   readonly remoteName: string;
   readonly remoteUrl: string;
@@ -96,6 +97,15 @@ export class SourceControlProvider extends Context.Service<
   SourceControlProvider,
   {
     readonly kind: SourceControlProviderKind;
+    readonly workflowPublishingTargeted?: boolean;
+    readonly getChangeRequestDetails?: (input: {
+      readonly cwd: string;
+      readonly context?: SourceControlProviderContext;
+      readonly reference: string;
+    }) => Effect.Effect<
+      { readonly request: ChangeRequest; readonly body: string; readonly complete: boolean },
+      SourceControlProviderError
+    >;
     /** Optional capability for issue and change-request subjects. */
     readonly resolveLink?: ResolveSourceControlLink;
     readonly listChangeRequests: (input: {
@@ -120,7 +130,7 @@ export class SourceControlProvider extends Context.Service<
       readonly headSelector: string;
       readonly title: string;
       readonly bodyFile: string;
-    }) => Effect.Effect<void, SourceControlProviderError>;
+    }) => Effect.Effect<void | { readonly url: string | null }, SourceControlProviderError>;
     readonly getRepositoryCloneUrls: (input: {
       readonly cwd: string;
       readonly context?: SourceControlProviderContext;

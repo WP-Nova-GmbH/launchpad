@@ -1,6 +1,7 @@
 import {
   EventId,
   ProviderInstanceId,
+  TextGenerationError,
   ThreadId,
   type OrchestrationCommand,
   type OrchestrationEvent,
@@ -8,18 +9,21 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Logger from "effect/Logger";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as Crypto from "effect/Crypto";
 
 import type { OrchestrationEngineShape } from "../orchestration/Services/OrchestrationEngine.ts";
-import type {
-  ApprovalVerdictGenerationInput,
-  ApprovalVerdictGenerationResult,
-  TextGeneration,
+import {
+  WORKFLOW_APPROVAL_FAILURE_DETAILS,
+  type ApprovalVerdictGenerationInput,
+  type ApprovalVerdictGenerationResult,
+  type TextGeneration,
 } from "../textGeneration/TextGeneration.ts";
 import { attachApprovalSupervisor, SUPERVISOR_VERDICT_ACTIVITY_KIND } from "./supervisor.ts";
 
@@ -29,6 +33,8 @@ const MODEL_SELECTION = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.3-codex",
 };
+const isTextGenerationError = Schema.is(TextGenerationError);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 let nextSequence = 0;
 
@@ -38,7 +44,7 @@ function approvalRequestedEvent(input: {
   readonly detail?: string;
   readonly threadId?: ThreadId;
   readonly payloadOverride?: unknown;
-}): OrchestrationEvent {
+}): Extract<OrchestrationEvent, { readonly type: "thread.activity-appended" }> {
   nextSequence += 1;
   const threadId = input.threadId ?? THREAD_ID;
   return {
@@ -72,9 +78,15 @@ function approvalRequestedEvent(input: {
 }
 
 interface SupervisorHarnessOptions {
+  readonly supervisor?: Partial<
+    Pick<
+      Parameters<typeof attachApprovalSupervisor>[0],
+      "resolveCwd" | "jobContext" | "reviewConstraint" | "stepInstruction" | "workflowVm"
+    >
+  >;
   readonly verdict?: (
     input: ApprovalVerdictGenerationInput,
-  ) => ApprovalVerdictGenerationResult | "fail";
+  ) => ApprovalVerdictGenerationResult | "fail" | TextGenerationError;
 }
 
 interface SupervisorHarness {
@@ -122,9 +134,11 @@ const makeHarness = (options: SupervisorHarnessOptions = {}): Effect.Effect<Supe
               verdict: "approve" as const,
               reasoning: "looks routine",
             };
-            return answer === "fail"
-              ? Effect.fail(new Error("model unavailable") as never)
-              : Effect.succeed(answer);
+            return isTextGenerationError(answer)
+              ? Effect.fail(answer)
+              : answer === "fail"
+                ? Effect.fail(new Error("model unavailable") as never)
+                : Effect.succeed(answer);
           }),
         ),
     } as unknown as TextGeneration["Service"];
@@ -174,6 +188,7 @@ function withSupervisor<A>(
         stepInstruction: "Add a health endpoint",
         cwd: "/tmp/worktree",
         modelSelection: MODEL_SELECTION,
+        ...options.supervisor,
       });
       return yield* use(harness);
     }),
@@ -260,6 +275,39 @@ it.effect("consults the model for an ordinary command and accepts its approval",
     assert.equal(response?.type === "thread.approval.respond" ? response.decision : null, "accept");
   }),
 );
+
+for (const reason of ["workspace", "step", "context"] as const) {
+  it.effect(`escalates workflow approval with invalid ${reason} without a model call`, () =>
+    withSupervisor(
+      {
+        supervisor: {
+          stepInstruction: reason === "step" ? "s".repeat(32_001) : "Add a health endpoint",
+          jobContext: reason === "context" ? "j".repeat(32_001) : "Fix the requested issue",
+          reviewConstraint: "Require human review",
+          resolveCwd: Effect.succeed(reason === "workspace" ? null : "/jobs/worktree"),
+        },
+      },
+      (h) =>
+        Effect.gen(function* () {
+          yield* h.emit(
+            approvalRequestedEvent({
+              requestId: `invalid-${reason}`,
+              requestType: "command_execution_approval",
+              detail: "pnpm test",
+            }),
+          );
+          const verdict = yield* h.awaitDispatch(isVerdictActivity);
+          assert.equal((yield* Ref.get(h.modelCalls)).length, 0);
+          assert.equal((yield* Ref.get(h.dispatched)).filter(isApprovalResponse).length, 0);
+          assert.equal(
+            verdict.type === "thread.activity.append" &&
+              (verdict.activity.payload as { verdict: string }).verdict,
+            "escalate",
+          );
+        }),
+    ),
+  );
+}
 
 it.effect("declines when the model denies, and does not end the step", () =>
   Effect.gen(function* () {
@@ -370,6 +418,76 @@ it.effect("escalates when the supervisor model cannot be reached", () =>
     const responses = decisions.filter(isApprovalResponse);
     assert.equal(responses.length, 1);
   }),
+);
+
+it.effect.each(["known", "unknown"] as const)(
+  "records one safe %s inference failure before declining a workflow VM tool",
+  (kind) =>
+    Effect.gen(function* () {
+      const logs: unknown[] = [];
+      const logger = Logger.make(({ message }) => logs.push(message));
+      const { decisions, modelCalls } = yield* withSupervisor(
+        {
+          supervisor: { workflowVm: true },
+          verdict: () =>
+            new TextGenerationError({
+              operation: "generateApprovalVerdict",
+              detail:
+                kind === "known"
+                  ? WORKFLOW_APPROVAL_FAILURE_DETAILS.malformedTerminal
+                  : "private provider error sentinel",
+              cause: new Error("private cause sentinel"),
+            }),
+        },
+        (harness) =>
+          Effect.gen(function* () {
+            const requested = approvalRequestedEvent({
+              requestId: "req-invalid-verdict",
+              requestType: "command_execution_approval",
+              detail: "pnpm test",
+            });
+            yield* harness.emit(requested);
+            yield* harness.emit(requested);
+            yield* harness.emit(
+              approvalRequestedEvent({
+                requestId: "req-after-failure",
+                requestType: "file_read_approval",
+                detail: "read src/a.ts",
+              }),
+            );
+            yield* harness.awaitDispatch(
+              (command) => isApprovalResponse(command) && command.requestId === "req-after-failure",
+            );
+            return {
+              decisions: yield* Ref.get(harness.dispatched),
+              modelCalls: yield* Ref.get(harness.modelCalls),
+            };
+          }),
+      ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+
+      assert.equal(modelCalls.length, 1);
+      const first = decisions[0];
+      assert.ok(first && first.type === "thread.activity.append");
+      assert.deepEqual(first.activity.payload, {
+        requestId: "req-invalid-verdict",
+        requestType: "command_execution_approval",
+        verdict: "deny",
+        reasoning:
+          (kind === "known"
+            ? WORKFLOW_APPROVAL_FAILURE_DETAILS.malformedTerminal
+            : "The supervisor model did not return a usable approval verdict.") +
+          " Workflow VM tool approvals cannot be handed to a human.",
+        consultedModel: true,
+      });
+      assert.equal(decisions[1]?.type, "thread.approval.respond");
+      assert.equal(
+        decisions[1]?.type === "thread.approval.respond" ? decisions[1].decision : null,
+        "decline",
+      );
+      const stored = encodeJson({ decisions, logs });
+      assert.ok(!stored.includes("private provider error sentinel"));
+      assert.ok(!stored.includes("private cause sentinel"));
+    }),
 );
 
 it.effect("records every verdict as an activity with its reasoning", () =>
@@ -502,4 +620,84 @@ it.effect("ignores approvals on other threads", () =>
       ["req-after"],
     );
   }),
+);
+
+it.effect.each(["deny", "escalate"] as const)(
+  "recovers a persisted %s without another model decision or response identity",
+  (verdict) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* attachApprovalSupervisor({
+        engine: harness.engine,
+        textGeneration: harness.textGeneration,
+        crypto: yield* Crypto.Crypto,
+        threadId: THREAD_ID,
+        stepInstruction: "Implement",
+        cwd: "/tmp/worktree",
+        modelSelection: MODEL_SELECTION,
+        workflowVm: verdict === "escalate",
+        replayEvents: Stream.fromIterable([
+          approvalRequestedEvent({ requestId: "resolved" }),
+          approvalRequestedEvent({ requestId: "pending" }),
+        ]),
+        resolvedRequestIds: new Set(["resolved"]),
+        recordedVerdicts: new Map([["pending", verdict]]),
+      });
+      const response = yield* harness.awaitDispatch(isApprovalResponse);
+      assert.strictEqual(
+        response.type === "thread.approval.respond" ? response.decision : null,
+        "decline",
+      );
+      assert.strictEqual(response.commandId, `server:supervisor:${THREAD_ID}:pending:respond`);
+      assert.strictEqual((yield* Ref.get(harness.modelCalls)).length, 0);
+      assert.strictEqual((yield* Ref.get(harness.dispatched)).length, 1);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+it.effect("replays only the unresolved blocking questions on a read-only VM", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness();
+    const question = (requestId: string, async = false) => {
+      const event = approvalRequestedEvent({ requestId });
+      return {
+        ...event,
+        payload: {
+          ...event.payload,
+          activity: {
+            ...event.payload.activity,
+            kind: "user-input.requested",
+            payload: { requestId, ...(async ? { responseMode: "message" } : {}) },
+          },
+        },
+      };
+    };
+    const pending = question("pending");
+    yield* attachApprovalSupervisor({
+      engine: harness.engine,
+      textGeneration: harness.textGeneration,
+      crypto: yield* Crypto.Crypto,
+      threadId: THREAD_ID,
+      stepInstruction: "Implement",
+      cwd: "/tmp/worktree",
+      modelSelection: MODEL_SELECTION,
+      workflowVm: true,
+      resolvedUserInputIds: new Set(["resolved"]),
+      replayEvents: Stream.fromIterable([
+        question("resolved"),
+        question("async", true),
+        pending,
+        pending,
+        approvalRequestedEvent({ requestId: "after", requestType: "file_read_approval" }),
+      ]),
+    });
+    yield* harness.awaitDispatch(isApprovalResponse);
+    assert.deepEqual(
+      (yield* Ref.get(harness.dispatched)).flatMap((command) =>
+        command.type === "thread.user-input.respond"
+          ? [[String(command.requestId), command.answers, String(command.commandId)]]
+          : [],
+      ),
+      [["pending", {}, `server:supervisor:${THREAD_ID}:pending:user-input`]],
+    );
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

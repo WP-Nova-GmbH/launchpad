@@ -19,7 +19,11 @@ import {
   allEnvironmentProjectSnapshotsReadyAtom,
   allEnvironmentShellsBootstrappedAtom,
 } from "./shell";
-import { environmentThreadDetails, environmentThreadShells } from "./threads";
+import {
+  environmentThreadDetails,
+  environmentThreadShells,
+  navigationThreadShellsAtom,
+} from "./threads";
 
 const EMPTY_THREAD_REFS: ReadonlyArray<ScopedThreadRef> = Object.freeze([]);
 
@@ -75,7 +79,7 @@ export function useServerConfigs(): ReadonlyMap<EnvironmentId, ServerConfig> {
 }
 
 export function useThreadShells(): ReadonlyArray<EnvironmentThreadShell> {
-  return useAtomValue(environmentThreadShells.threadShellsAtom);
+  return useAtomValue(navigationThreadShellsAtom);
 }
 
 export function useAllEnvironmentShellsBootstrapped(): boolean {
@@ -89,7 +93,11 @@ export function useAllEnvironmentProjectSnapshotsReady(): boolean {
 export function useThreadShellsForProjectRefs(
   refs: ReadonlyArray<ScopedProjectRef>,
 ): ReadonlyArray<EnvironmentThreadShell> {
-  return useAtomValue(environmentThreadShells.threadShellsForProjectRefsAtom(refs));
+  const shells = useAtomValue(navigationThreadShellsAtom);
+  return useMemo(() => {
+    const projects = new Set(refs.map((ref) => `${ref.environmentId}:${ref.projectId}`));
+    return shells.filter((shell) => projects.has(`${shell.environmentId}:${shell.projectId}`));
+  }, [shells, refs]);
 }
 
 export function useProject(ref: ScopedProjectRef | null): EnvironmentProject | null {
@@ -252,5 +260,5 @@ export function readEnvironmentThreadRefs(
 }
 
 export function readThreadShells(): ReadonlyArray<EnvironmentThreadShell> {
-  return appAtomRegistry.get(environmentThreadShells.threadShellsAtom);
+  return appAtomRegistry.get(navigationThreadShellsAtom);
 }

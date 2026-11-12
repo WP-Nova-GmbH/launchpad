@@ -166,6 +166,13 @@ function bindProviderContext(
 
   return SourceControlProvider.SourceControlProvider.of({
     kind: provider.kind,
+    ...(provider.workflowPublishingTargeted ? { workflowPublishingTargeted: true } : {}),
+    ...(provider.getChangeRequestDetails
+      ? {
+          getChangeRequestDetails: (input) =>
+            provider.getChangeRequestDetails!({ ...input, context: input.context ?? context }),
+        }
+      : {}),
     ...(provider.resolveLink ? { resolveLink: provider.resolveLink } : {}),
     listChangeRequests: (input) =>
       provider.listChangeRequests({

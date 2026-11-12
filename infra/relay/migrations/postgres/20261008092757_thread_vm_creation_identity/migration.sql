@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_provisions" ADD COLUMN "creation_identity_fenced" boolean DEFAULT false NOT NULL;

@@ -1,0 +1,638 @@
+// @effect-diagnostics nodeBuiltinImport:off - Exercises the standalone Node template builder and its real HTTP boundary.
+import * as NodeCrypto from "node:crypto";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as NodeHttp from "node:http";
+import * as NodeChildProcess from "node:child_process";
+import { Template } from "e2b";
+import * as ConfigProvider from "effect/ConfigProvider";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
+import { it as effectIt } from "@effect/vitest";
+import { afterEach, describe, it, expect, vi } from "vite-plus/test";
+import {
+  buildTemplate,
+  prepareTemplateContext,
+  validateBuildTarget,
+  writeJsonAtomically,
+} from "./e2b-build-template.mjs";
+import { loadDevThreadVmRuntimeSettings } from "./dev-thread-vm-template.ts";
+import {
+  WORKFLOW_VM_ISOLATION_VERSION,
+  workflowVmModelProofPath,
+} from "../src/threads/ThreadVmWorkflowModelProof.ts";
+
+const { buildMock } = vi.hoisted(() => ({ buildMock: vi.fn<typeof Template.build>() }));
+vi.mock("e2b", async (original) => {
+  const sdk = await original<typeof import("e2b")>();
+  return {
+    ...sdk,
+    Template: new Proxy(sdk.Template, {
+      get: (target, property, receiver) =>
+        property === "build" ? buildMock : Reflect.get(target, property, receiver),
+    }),
+  };
+});
+
+const decodeTemplate = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      steps: Schema.Array(
+        Schema.Struct({ type: Schema.String, args: Schema.Array(Schema.Unknown) }),
+      ),
+    }),
+  ),
+);
+const decodeJsonObject = Schema.decodeSync(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
+// oxlint-disable-next-line t3code/no-global-process-runtime -- The fixture executes a real POSIX shebang on the host.
+const hostPlatform = NodeOS.platform();
+
+afterEach(() => {
+  buildMock.mockReset();
+  vi.unstubAllEnvs();
+});
+
+async function buildFixture() {
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-build-"));
+  const archive = NodePath.join(directory, "release.tar.gz");
+  const payload = Buffer.from("packaged archive fixture");
+  await NodeFSP.writeFile(archive, payload);
+  const selected = NodePath.join(directory, "active", "template.json");
+  vi.stubEnv("E2B_TEMPLATE_FILE", selected);
+  vi.stubEnv("E2B_API_URL", "http://127.0.0.1:3000/");
+  return {
+    directory,
+    selected,
+    args: {
+      "server-archive": archive,
+      "server-sha256": NodeCrypto.createHash("sha256").update(payload).digest("hex"),
+      output: NodePath.join(directory, "receipts", "build.json"),
+    },
+  };
+}
+
+describe("runner build publication", () => {
+  it.each(["model-first", "isolation-first", "concurrent"] as const)(
+    "retains the isolation receipt for the same build after %s publication",
+    async (order) => {
+      const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-proof-"));
+      const model = { buildId: "fixture-build", templateRef: "fixture:build-runner" };
+      const isolation = { ...model, isolationVersion: WORKFLOW_VM_ISOLATION_VERSION };
+      const path = workflowVmModelProofPath(
+        NodePath.join(directory, "template.json"),
+        model.buildId,
+      );
+      const publishModel = () => writeJsonAtomically(path, model, { ifAbsent: true });
+      const publishIsolation = () => writeJsonAtomically(path, isolation);
+      const read = async () => decodeJsonObject(await NodeFSP.readFile(path, "utf8"));
+      try {
+        if (order === "model-first") {
+          expect(await publishModel()).toBe(true);
+          expect(await read()).toEqual(model);
+          await publishIsolation();
+        } else if (order === "isolation-first") {
+          await publishIsolation();
+          expect(await publishModel()).toBe(false);
+        } else {
+          await Promise.all([publishModel(), publishIsolation()]);
+        }
+        expect(await read()).toEqual(isolation);
+        expect(await NodeFSP.readdir(directory)).toEqual([NodePath.basename(path)]);
+      } finally {
+        await NodeFSP.rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects a relative selected-template path before requesting a build", async () => {
+    const fixture = await buildFixture();
+    try {
+      vi.stubEnv("E2B_TEMPLATE_FILE", " .t3/template.json ");
+      await expect(buildTemplate(fixture.args, "fixture-key")).rejects.toThrow(
+        "must be an absolute path",
+      );
+      expect(buildMock).not.toHaveBeenCalled();
+      await expect(NodeFSP.readFile(fixture.args.output)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await NodeFSP.rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("loads the relay .env with environment precedence and creates unique default receipts beside the script", async () => {
+    const fixture = await buildFixture();
+    try {
+      const relay = NodePath.join(fixture.directory, "infra", "relay");
+      const scripts = NodePath.join(relay, "scripts");
+      await NodeFSP.mkdir(scripts, { recursive: true });
+      await NodeFSP.cp(
+        new URL("../../e2b/template/", import.meta.url),
+        NodePath.join(fixture.directory, "infra", "e2b", "template"),
+        { recursive: true },
+      );
+      const source = await NodeFSP.readFile(
+        new URL("./e2b-build-template.mjs", import.meta.url),
+        "utf8",
+      );
+      const entrypoint = NodePath.join(scripts, "e2b-build-template.mjs");
+      await NodeFSP.writeFile(entrypoint, source.replace('from "e2b"', 'from "./sdk.mjs"'));
+      await NodeFSP.writeFile(
+        NodePath.join(scripts, "sdk.mjs"),
+        `
+        export function Template() { return { fromDockerfile() { return {}; } }; }
+        Template.build = async (_template, name, options) => ({
+          templateId: "cli-template", buildId: "cli-build", name, alias: name, tags: options.tags,
+        });
+      `,
+      );
+      await NodeFSP.writeFile(
+        NodePath.join(relay, ".env"),
+        "E2B_API_URL=http://127.0.0.1:3000\nE2B_API_KEY=fixture-key\n",
+      );
+      for (const apiUrl of [undefined, "http://127.0.0.1:9000"]) {
+        const result = NodeChildProcess.spawnSync(
+          process.execPath,
+          [
+            entrypoint,
+            "--server-archive",
+            fixture.args["server-archive"],
+            "--server-sha256",
+            fixture.args["server-sha256"],
+          ],
+          {
+            cwd: fixture.directory,
+            env: { E2B_TEMPLATE_FILE: " ", ...(apiUrl ? { E2B_API_URL: apiUrl } : {}) },
+            encoding: "utf8",
+          },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        const selected = JSON.parse(
+          await NodeFSP.readFile(NodePath.join(relay, ".t3", "e2b-template.json"), "utf8"),
+        );
+        expect(selected.apiUrl).toBe(apiUrl ?? "http://127.0.0.1:3000");
+        expect(selected.state).toBe("built");
+      }
+      const receipts = await NodeFSP.readdir(NodePath.join(relay, ".t3", "e2b-builds"));
+      expect(receipts).toHaveLength(2);
+      for (const path of receipts) {
+        const receipt = JSON.parse(
+          await NodeFSP.readFile(NodePath.join(relay, ".t3", "e2b-builds", path), "utf8"),
+        );
+        expect(receipt.name).toBe("launchpad-arm64");
+      }
+      await expect(NodeFSP.readdir(NodePath.join(fixture.directory, ".t3"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await NodeFSP.rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  effectIt.effect("publishes a successful immutable build that the relay can load", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* Effect.acquireRelease(Effect.promise(buildFixture), (fixture) =>
+          Effect.promise(() => NodeFSP.rm(fixture.directory, { recursive: true, force: true })),
+        );
+        const { selected, receipt } = yield* Effect.promise(async () => {
+          const build = buildMock.mockImplementation(async (...args: unknown[]) => {
+            const options = args[2] as { tags: string[] };
+            const receipt = JSON.parse(await NodeFSP.readFile(fixture.args.output, "utf8"));
+            expect(receipt.state).toBe("building");
+            await expect(NodeFSP.readFile(fixture.selected)).rejects.toMatchObject({
+              code: "ENOENT",
+            });
+            return {
+              alias: "launchpad-arm64",
+              name: "launchpad-arm64",
+              templateId: "fixture-template",
+              buildId: "fixture-build",
+              tags: options.tags,
+            };
+          });
+          await buildTemplate(fixture.args, "fixture-key");
+          expect(build).toHaveBeenCalledWith(
+            expect.anything(),
+            "launchpad-arm64",
+            expect.objectContaining({
+              apiUrl: "http://127.0.0.1:3000",
+              retries: 0,
+              cpuCount: 2,
+              memoryMB: 4096,
+              minFreeDiskMb: 21504,
+            }),
+          );
+          const selected = await NodeFSP.readFile(fixture.selected, "utf8");
+          const receipt = decodeJsonObject(await NodeFSP.readFile(fixture.args.output, "utf8"));
+          expect(decodeJsonObject(selected)).toEqual({
+            schemaVersion: 1,
+            state: "built",
+            apiUrl: "http://127.0.0.1:3000",
+            templateRef: `fixture-template:${receipt.buildTag}`,
+            buildId: "fixture-build",
+          });
+          expect(receipt).toMatchObject({
+            state: "built",
+            templateId: "fixture-template",
+            serverSha256: fixture.args["server-sha256"],
+            resources: {
+              cpuCount: 2,
+              memoryMB: 4096,
+              minFreeDiskMb: 21504,
+              minUsableDiskMb: 20480,
+            },
+          });
+          for (const field of [
+            "dockerfileSha256",
+            "activitySha256",
+            "workloadSha256",
+            "workflowExecSha256",
+            "workflowCheckpointReaderSha256",
+            "workloadServiceSha256",
+            "installerSha256",
+          ])
+            expect(receipt[field]).toMatch(/^[a-f0-9]{64}$/);
+          expect(receipt.installerSha256).toBe(
+            NodeCrypto.createHash("sha256")
+              .update(
+                await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
+              )
+              .digest("hex"),
+          );
+          expect(receipt.workflowExecSha256).toBe(
+            NodeCrypto.createHash("sha256")
+              .update(
+                await NodeFSP.readFile(
+                  new URL("../../e2b/template/workflow-exec.c", import.meta.url),
+                ),
+              )
+              .digest("hex"),
+          );
+          expect(await NodeFSP.readdir(NodePath.dirname(fixture.selected))).toEqual([
+            "template.json",
+          ]);
+          return { selected, receipt };
+        });
+        const settings = yield* loadDevThreadVmRuntimeSettings.pipe(
+          Effect.provideService(
+            FileSystem.FileSystem,
+            FileSystem.makeNoop({
+              readFileString: (path) =>
+                path === fixture.selected
+                  ? Effect.succeed(selected)
+                  : Effect.fail(
+                      PlatformError.systemError({
+                        _tag: "NotFound",
+                        module: "FileSystem",
+                        method: "readFileString",
+                      }),
+                    ),
+            }),
+          ),
+          Effect.provide(
+            ConfigProvider.layer(
+              ConfigProvider.fromUnknown({
+                RELAY_THREAD_VM_PROVISIONING_ENABLED: true,
+                E2B_API_URL: "http://127.0.0.1:3000",
+                E2B_SANDBOX_URL: "http://127.0.0.1:3002",
+                E2B_API_KEY: "fixture-key",
+                E2B_TEMPLATE_FILE: fixture.selected,
+                E2B_HOST_ID: "fixture-host",
+                E2B_MAX_RUNNING_VMS: 2,
+                E2B_PUBLIC_RELAY_URL: "https://relay.example.com",
+                E2B_HOST_ADDRESSES: "192.0.2.10",
+              }),
+            ),
+          ),
+        );
+        expect(settings?.compute.templateId).toBe(receipt.templateRef);
+        expect(settings?.templateBuildId).toBe(receipt.buildId);
+      }),
+    ),
+  );
+
+  it.each([
+    { templateId: "" },
+    { templateId: "bad:template" },
+    { buildId: "bad/build" },
+    { tags: ["another-build"] },
+  ])("preserves the prior selection when a completed build is malformed: %j", async (invalid) => {
+    const fixture = await buildFixture();
+    try {
+      await NodeFSP.mkdir(NodePath.dirname(fixture.selected));
+      const previous = '{"state":"built","templateRef":"previous:build-keep"}\n';
+      await NodeFSP.writeFile(fixture.selected, previous);
+      buildMock.mockImplementation(async (...args: unknown[]) => ({
+        alias: "launchpad-arm64",
+        name: "launchpad-arm64",
+        templateId: "fixture-template",
+        buildId: "fixture-build",
+        tags: (args[2] as { tags: string[] }).tags,
+        ...invalid,
+      }));
+      await expect(buildTemplate(fixture.args, "fixture-key")).rejects.toThrow(
+        "invalid template identity",
+      );
+      expect(await NodeFSP.readFile(fixture.selected, "utf8")).toBe(previous);
+      expect(JSON.parse(await NodeFSP.readFile(fixture.args.output, "utf8")).state).toBe(
+        "building",
+      );
+    } finally {
+      await NodeFSP.rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the prior selection and diagnostic receipt when E2B fails", async () => {
+    const fixture = await buildFixture();
+    try {
+      await NodeFSP.mkdir(NodePath.dirname(fixture.selected));
+      const previous = '{"state":"built","templateRef":"previous:build-keep"}\n';
+      await NodeFSP.writeFile(fixture.selected, previous);
+      buildMock.mockRejectedValue(new Error("fixture build failed"));
+      await expect(buildTemplate(fixture.args, "fixture-key")).rejects.toThrow(
+        "fixture build failed",
+      );
+      expect(await NodeFSP.readFile(fixture.selected, "utf8")).toBe(previous);
+      expect(JSON.parse(await NodeFSP.readFile(fixture.args.output, "utf8")).state).toBe(
+        "building",
+      );
+    } finally {
+      await NodeFSP.rm(fixture.directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("E2B runner build inputs", () => {
+  it.skipIf(hostPlatform === "win32")(
+    "executes the parsed native shim and preserves trusted tools under stock finalization",
+    async () => {
+      const dockerfile = await NodeFSP.readFile(
+        new URL("../../e2b/template/Dockerfile", import.meta.url),
+        "utf8",
+      );
+      const template = decodeTemplate(
+        await Template.toJSON(Template().fromDockerfile(dockerfile), false),
+      );
+      const installer = await NodeFSP.readFile(
+        new URL("../../e2b/template/install.sh", import.meta.url),
+        "utf8",
+      );
+      expect(template.steps.filter((step) => step.type === "RUN").map((step) => step.args)).toEqual(
+        [["bash /opt/launchpad-package/install.sh"]],
+      );
+      expect(template.steps.filter((step) => step.type === "COPY")).toHaveLength(1);
+      expect(template.steps).toHaveLength(7);
+      const syntax = NodeChildProcess.spawnSync("/bin/bash", ["-n"], {
+        input: installer,
+        encoding: "utf8",
+      });
+      expect(syntax.status, syntax.stderr).toBe(0);
+      const nativeSetup =
+        /^node --input-type=module <<'JAVASCRIPT'\n([\s\S]*?)\nJAVASCRIPT$/mu.exec(installer)?.[1];
+      expect(nativeSetup).toBeDefined();
+      const fixture = await NodeFSP.realpath(
+        await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-shim-")),
+      );
+      try {
+        const image = fixture + "/image";
+        const prefix = image + "/opt/launchpad/node/lib/node_modules/";
+        const root = prefix + "@openai/codex";
+        const optional = root + "/node_modules/@openai/codex-linux-arm64";
+        const native = optional + "/vendor/aarch64-unknown-linux-musl/bin/codex";
+        const shim = image + "/opt/launchpad/node/bin/codex";
+        const manifest = image + "/opt/launchpad/codex-native.json";
+        await NodeFSP.mkdir(NodePath.dirname(native), { recursive: true });
+        await NodeFSP.mkdir(NodePath.dirname(shim));
+        await NodeFSP.writeFile(root + "/package.json", JSON.stringify({ version: "0.159.3" }));
+        await NodeFSP.writeFile(
+          optional + "/package.json",
+          JSON.stringify({ version: "0.159.3-linux-arm64" }),
+        );
+        await NodeFSP.writeFile(
+          native,
+          '#!/bin/sh\nif [ "$1" = --version ]; then printf "codex-cli 0.159.3\\n"; exit 0; fi\nprintf "%s\\n" "$$" "$1" "$CODEX_MANAGED_PACKAGE_ROOT" "$CODEX_MANAGED_BY_NPM" "${CODEX_MANAGED_BY_PNPM-unset}"\n',
+          { mode: 0o755 },
+        );
+        const command = nativeSetup!.replaceAll("/opt/launchpad", image + "/opt/launchpad");
+        const environment = {
+          PATH: `${NodePath.dirname(process.execPath)}:${NodePath.dirname(shim)}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          CODEX_MANAGED_BY_PNPM: "stale",
+        };
+        await NodeFSP.writeFile(shim, "old shim", { mode: 0o755 });
+        const setup = NodeChildProcess.spawnSync(
+          process.execPath,
+          ["--input-type=module", "-e", command],
+          {
+            env: environment,
+            encoding: "utf8",
+          },
+        );
+        expect(setup.status, setup.stderr).toBe(0);
+        expect(setup.stdout).toBe("");
+        expect(JSON.parse(await NodeFSP.readFile(manifest, "utf8"))).toEqual({
+          version: "0.159.3",
+          executable: native,
+          sha256: NodeCrypto.createHash("sha256")
+            .update(await NodeFSP.readFile(native))
+            .digest("hex"),
+        });
+        const launched = NodeChildProcess.spawnSync(shim, ["argument with spaces"], {
+          env: environment,
+          encoding: "utf8",
+        });
+        expect(launched.status, launched.stderr).toBe(0);
+        expect(launched.stdout.trim().split("\n")).toEqual([
+          String(launched.pid),
+          "argument with spaces",
+          root,
+          "1",
+          "unset",
+        ]);
+        // Exercise stock finalization's mode change on the installer's helper destinations.
+        // The native distribution and its manifest retain the protected parent chain.
+        const protectedFiles = [shim, native, manifest];
+        for (const installation of installer
+          .split("\n")
+          .filter((line) => /^install -m0(?:644|755) \S+ \/opt\/launchpad\//u.test(line))) {
+          const [, , source, destination] = installation.split(" ");
+          expect([
+            "/opt/launchpad-package/workload.py",
+            "/opt/launchpad-package/workflow-checkpoint-reader.py",
+            "/opt/launchpad-package/activity.py",
+            "/opt/launchpad-package/install.sh",
+          ]).toContain(source);
+          expect([
+            "/opt/launchpad/bin/launchpad-workload",
+            "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py",
+            "/opt/launchpad/bin/launchpad-activity",
+            "/opt/launchpad/install.sh",
+          ]).toContain(destination);
+          const staged = image + source;
+          await NodeFSP.mkdir(NodePath.dirname(staged), { recursive: true });
+          await NodeFSP.copyFile(
+            new URL("../../e2b/template/" + NodePath.basename(source!), import.meta.url),
+            staged,
+          );
+          const target = image + destination;
+          await NodeFSP.mkdir(NodePath.dirname(target), { recursive: true });
+          const copied = NodeChildProcess.spawnSync(
+            "/bin/sh",
+            ["-c", installation.replaceAll("/opt/launchpad", image + "/opt/launchpad")],
+            { encoding: "utf8" },
+          );
+          expect(copied.status, copied.stderr).toBe(0);
+          protectedFiles.push(target);
+        }
+        expect(protectedFiles).toHaveLength(7);
+        const local = image + "/usr/local";
+        await NodeFSP.mkdir(local, { recursive: true });
+        const finalized = NodeChildProcess.spawnSync("chmod", ["-R", "777", local]);
+        expect(finalized.status).toBe(0);
+        expect((await NodeFSP.stat(local)).mode & 0o777).toBe(0o777);
+        for (const file of protectedFiles) {
+          expect((await NodeFSP.stat(file)).mode & 0o022, file).toBe(0);
+          for (
+            let parent = NodePath.dirname(file);
+            parent !== image;
+            parent = NodePath.dirname(parent)
+          )
+            expect((await NodeFSP.stat(parent)).mode & 0o022, parent).toBe(0);
+        }
+        // Wrong optional distribution must fail before exchanging either artifact.
+        const manifestBefore = await NodeFSP.readFile(manifest);
+        const shimBefore = await NodeFSP.readFile(shim);
+        await NodeFSP.writeFile(
+          optional + "/package.json",
+          JSON.stringify({ version: "0.159.2-linux-arm64" }),
+        );
+        const rejected = NodeChildProcess.spawnSync(
+          process.execPath,
+          ["--input-type=module", "-e", command],
+          {
+            env: environment,
+            encoding: "utf8",
+          },
+        );
+        expect(rejected.status).not.toBe(0);
+        expect(await NodeFSP.readFile(manifest)).toEqual(manifestBefore);
+        expect(await NodeFSP.readFile(shim)).toEqual(shimBefore);
+      } finally {
+        await NodeFSP.rm(fixture, { recursive: true, force: true });
+      }
+    },
+  );
+  it("copies only the verified package, never sibling state or credentials", async () => {
+    const source = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-source-"));
+    let context: string | undefined;
+    try {
+      const payload = Buffer.from("packaged archive fixture");
+      const archive = NodePath.join(source, "release.tar.gz");
+      await NodeFSP.writeFile(archive, payload);
+      await NodeFSP.writeFile(NodePath.join(source, ".env"), "must stay on host");
+      const hash = NodeCrypto.createHash("sha256").update(payload).digest("hex");
+      const buildTag = "build-00000000-0000-4000-8000-000000000000";
+      context = await prepareTemplateContext(archive, hash, buildTag);
+      await NodeFSP.writeFile(archive, "replaced after staging");
+      expect((await NodeFSP.readdir(context)).sort()).toEqual([
+        "activity.py",
+        "install.sh",
+        "launchpad-workloads.service",
+        "runner-build-tag",
+        "server.sha256",
+        "server.tar.gz",
+        "workflow-checkpoint-reader.py",
+        "workflow-exec.c",
+        "workload.py",
+      ]);
+      expect(await NodeFSP.readFile(NodePath.join(context, "server.tar.gz"))).toEqual(payload);
+      expect(await NodeFSP.readFile(NodePath.join(context, "runner-build-tag"), "utf8")).toBe(
+        `${buildTag}\n`,
+      );
+      expect(await NodeFSP.readFile(NodePath.join(context, "install.sh"))).toEqual(
+        await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
+      );
+      expect(await NodeFSP.readFile(NodePath.join(context, "server.sha256"), "utf8")).toBe(
+        `${hash}  server.tar.gz\n`,
+      );
+      await expect(prepareTemplateContext(archive, hash, buildTag)).rejects.toThrow(
+        "does not match",
+      );
+    } finally {
+      if (context) await NodeFSP.rm(context, { recursive: true, force: true });
+      await NodeFSP.rm(source, { recursive: true, force: true });
+    }
+  });
+  it("requires an explicit API and keeps credentials out of URLs and receipts", () => {
+    expect(validateBuildTarget("http://127.0.0.1:3000/", "launchpad-arm64")).toBe(
+      "http://127.0.0.1:3000",
+    );
+    for (const url of ["", "file:///tmp/api", "https://secret@host/", "https://host/?token=secret"])
+      expect(() => validateBuildTarget(url, "launchpad")).toThrow();
+    expect(() => validateBuildTarget("https://host", "../another-template")).toThrow();
+  });
+});
+
+describe("runner template resources", () => {
+  it("sends the free-disk target through the pinned SDK to E2B", async () => {
+    const requests: { path: string; body: unknown }[] = [];
+    const server = NodeHttp.createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const path = request.url ?? "";
+      requests.push({ path, body: JSON.parse(Buffer.concat(chunks).toString()) });
+      if (path === "/v3/templates") {
+        response.writeHead(201, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            templateID: "fixture-template",
+            buildID: "fixture-build",
+            tags: ["fixture"],
+          }),
+        );
+      } else {
+        response.writeHead(
+          path === "/v2/templates/fixture-template/builds/fixture-build" ? 202 : 404,
+        );
+        response.end("{}");
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Missing test listener");
+    try {
+      const resources = {
+        cpuCount: 2,
+        memoryMB: 4096,
+        minFreeDiskMb: 21504,
+      };
+      const result = await Template.buildInBackground(
+        Template().fromImage("debian:bookworm-slim"),
+        "fixture",
+        {
+          apiUrl: `http://127.0.0.1:${address.port}`,
+          apiKey: "fixture-key",
+          tags: ["fixture"],
+          ...resources,
+        },
+      );
+      expect(requests[0]).toEqual({
+        path: "/v3/templates",
+        body: { name: "fixture", tags: ["fixture"], ...resources },
+      });
+      expect(requests).toHaveLength(2);
+      expect(result.templateId).toBe("fixture-template");
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+});

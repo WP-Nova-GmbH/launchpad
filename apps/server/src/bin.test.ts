@@ -1,3 +1,4 @@
+import { TerminalManager } from "./terminal/Manager.ts";
 // @effect-diagnostics nodeBuiltinImport:off - CLI integration exercises Node HTTP and filesystem boundaries.
 import * as NodeHttp from "node:http";
 import * as NodeFS from "node:fs";
@@ -21,6 +22,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -29,6 +31,15 @@ import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
+import {
+  threadVmEnrollmentCommand,
+  threadVmRestoreIdentityCommand,
+  threadVmRestoreCleanupCommand,
+  threadVmRestoreImportCommand,
+  threadVmSetupCommand,
+  threadVmServeCommand,
+  threadVmGitCredentialCommand,
+} from "./cli/threadVm.ts";
 import { cli, makeCli } from "./bin.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import {
@@ -82,6 +93,20 @@ const runCli = (args: ReadonlyArray<string>, command = cli) =>
 const runConnectCli = (args: ReadonlyArray<string>) => runCli(args, connectCli);
 const runCliWithRuntime = (args: ReadonlyArray<string>) =>
   runCli(args).pipe(Effect.provide(CliRuntimeLayer));
+const decodeGuestCodexModelPolicy = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      schemaVersion: Schema.Literal(1),
+      defaultModel: Schema.String,
+      modelSlugs: Schema.Array(Schema.String),
+      probeArgs: Schema.Array(Schema.String),
+      workflowSandboxPolicy: Schema.Struct({
+        type: Schema.Literal("externalSandbox"),
+        networkAccess: Schema.Literal("enabled"),
+      }),
+    }),
+  ),
+);
 
 const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
@@ -372,6 +397,7 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(
         orchestrationHttpApiLayer.pipe(
+          Layer.provide(Layer.mock(TerminalManager, { closeOwned: () => Effect.succeed(false) })),
           Layer.provide(Layer.mock(ThreadDeletionReactor)({ drainThrough: () => Effect.void })),
           Layer.provide(
             Layer.mock(ThreadPreparationReactor)({ drainAttemptThrough: () => Effect.void }),
@@ -881,3 +907,42 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
     }),
   );
 });
+
+it("private VM commands resolve their own server configuration", () => {
+  const commands = [
+    threadVmEnrollmentCommand,
+    threadVmRestoreIdentityCommand,
+    threadVmRestoreCleanupCommand,
+    threadVmRestoreImportCommand,
+    threadVmSetupCommand,
+    threadVmServeCommand,
+    threadVmGitCredentialCommand,
+  ] as const;
+  // The CLI resolves configuration from its selected base directory, rather
+  // than requiring an unrelated caller's running-server configuration.
+  const selfConfigured: Extract<
+    Command.Services<(typeof commands)[number]>,
+    ServerConfig.ServerConfig
+  > extends never
+    ? true
+    : never = true;
+  assert.isTrue(selfConfigured);
+});
+
+it.effect("reports the installed guest's credential-free Codex model policy", () =>
+  Effect.gen(function* () {
+    const { output } = yield* captureStdout(runCli(["__thread-vm-codex-model-policy"]));
+    const policy = yield* decodeGuestCodexModelPolicy(output);
+    assert.include(policy.modelSlugs, policy.defaultModel);
+    assert.equal(policy.probeArgs[0], "app-server");
+    assert.deepEqual(policy.workflowSandboxPolicy, {
+      type: "externalSandbox",
+      networkAccess: "enabled",
+    });
+    const configuration = policy.probeArgs.join(" ");
+    assert.include(configuration, `model="${policy.defaultModel}"`);
+    assert.include(configuration, 'base_url="http://127.0.0.1:1/v1"');
+    assert.include(configuration, 'auth={command="/usr/bin/false",args=[]');
+    assert.notInclude(configuration, "__thread-vm-codex-token");
+  }),
+);

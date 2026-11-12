@@ -1,3 +1,4 @@
+import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
 import { WorktreeSetupTracker } from "../../project/WorktreeSetupTracker.ts";
 import type { OrchestrationEvent, ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -44,6 +45,8 @@ export const logCleanupCauseUnlessInterrupted = <R, E>({
     ),
   );
 
+const isMissingProcess = Schema.is(Schema.Struct({ code: Schema.Literals(["ESRCH"]) }));
+
 /** A presence probe, never a signal to terminate a PID recovered from disk. */
 export const CleanupProcessProbe = Context.Reference<{
   readonly absent: (pid: number) => Effect.Effect<boolean>;
@@ -55,7 +58,7 @@ export const CleanupProcessProbe = Context.Reference<{
           process.kill(pid, 0);
           return false;
         } catch (cause) {
-          return Schema.is(Schema.Struct({ code: Schema.Literals(["ESRCH"]) }))(cause);
+          return isMissingProcess(cause);
         }
       }),
   }),
@@ -67,6 +70,7 @@ const make = Effect.gen(function* () {
   const setups = yield* WorktreeSetupTracker;
   const terminalManager = yield* TerminalManager.TerminalManager;
   const sql = yield* SqlClient.SqlClient;
+  const journal = yield* SetupProcessJournal;
   const probe = yield* CleanupProcessProbe;
   const scope = yield* Scope.Scope;
   const encodePids = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Schema.Int)));
@@ -79,7 +83,7 @@ const make = Effect.gen(function* () {
   type Job = {
     readonly threadId: ThreadId;
     readonly initial: Deferred.Deferred<void, ThreadCleanupError>;
-    readonly retry: Effect.Effect<void, ThreadCleanupError>;
+    readonly retry: (commandId?: string) => Effect.Effect<void, ThreadCleanupError>;
   };
   const jobs = new Map<string, Job>();
   const cleanupError = (threadId: ThreadId, cause: unknown) =>
@@ -93,14 +97,27 @@ const make = Effect.gen(function* () {
     FROM thread_cleanup_fences WHERE ${threadId === undefined ? sql`1 = 1` : sql`thread_id = ${threadId}`} ORDER BY deletion_sequence`;
   const clear = (fence: Fence) =>
     sql`DELETE FROM thread_cleanup_fences WHERE thread_id = ${fence.threadId} AND deletion_sequence = ${fence.sequence}`;
-  const recoverStored = (fence: Fence) =>
+  const recoverStored = (fence: Fence, commandId?: string) =>
     Effect.gen(function* () {
       if (fence.processIds === null)
         return yield* cleanupError(
           fence.threadId,
           "The previous server stopped before recording process ownership. Cleanup remains blocked; no process was stopped by an unverified PID.",
         );
-      const pids = yield* decodePids(fence.processIds);
+      const owners = yield* journal.owners(fence.threadId);
+      for (const owner of owners) {
+        const receipt = yield* commandId
+          ? journal.cleanup({ ...owner, commandId })
+          : journal.recover(owner);
+        yield* terminalManager.closeOwned({
+          threadId: receipt.threadId,
+          terminalId: receipt.terminalId,
+          receipt,
+        });
+      }
+      const pids = (yield* decodePids(fence.processIds)).filter(
+        (pid) => !owners.some((owner) => owner.pid === pid),
+      );
       for (const pid of pids)
         if (!(yield* probe.absent(pid)))
           return yield* cleanupError(
@@ -126,30 +143,42 @@ const make = Effect.gen(function* () {
           readonly stop: Effect.Effect<void, TerminalManager.TerminalError>;
         }
       | undefined;
-    const retry = mutex
-      .withPermit(
-        Effect.gen(function* () {
-          if (completed) return;
-          if (!live) yield* recoverStored(fence);
-          else {
-            yield* sql`INSERT OR IGNORE INTO thread_cleanup_fences (thread_id, deletion_sequence) VALUES (${fence.threadId}, ${fence.sequence})`;
-            // Capture once. A later drain retries these exact handles, never a replacement by ID.
-            captured ??= yield* terminalManager.captureCleanup(fence.threadId);
-            const encoded = yield* encodePids(captured.processIds);
-            yield* sql`UPDATE thread_cleanup_fences SET process_ids_json = ${encoded}
+    const retry = (commandId?: string) =>
+      mutex
+        .withPermit(
+          Effect.gen(function* () {
+            if (completed) return;
+            if (!live) yield* recoverStored(fence, commandId);
+            else {
+              yield* sql`INSERT OR IGNORE INTO thread_cleanup_fences (thread_id, deletion_sequence) VALUES (${fence.threadId}, ${fence.sequence})`;
+              if (commandId)
+                for (const owner of yield* journal.owners(fence.threadId)) {
+                  const receipt = yield* journal.cleanup({ ...owner, commandId });
+                  yield* terminalManager.closeOwned({ ...receipt, receipt });
+                }
+              // Capture once. A later drain retries these exact handles, never a replacement by ID.
+              captured ??= yield* terminalManager.captureCleanup(fence.threadId);
+              const encoded = yield* encodePids(captured.processIds);
+              yield* sql`UPDATE thread_cleanup_fences SET process_ids_json = ${encoded}
           WHERE thread_id = ${fence.threadId} AND deletion_sequence = ${fence.sequence}`;
-            yield* captured.stop;
-            yield* clear(fence);
-          }
-          completed = true;
-          jobs.delete(key);
-        }),
-      )
-      .pipe(
-        Effect.catchCause((cause) =>
-          Effect.fail(cleanupError(fence.threadId, Cause.pretty(cause))),
-        ),
-      );
+              yield* captured.stop;
+              for (const owner of yield* journal.owners(fence.threadId))
+                if (!(yield* journal.confirmed(owner)))
+                  return yield* cleanupError(
+                    fence.threadId,
+                    "Setup ownership is still unconfirmed.",
+                  );
+              yield* clear(fence);
+            }
+            completed = true;
+            jobs.delete(key);
+          }),
+        )
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.fail(cleanupError(fence.threadId, Cause.pretty(cause))),
+          ),
+        );
     jobs.set(key, { threadId: fence.threadId, initial, retry });
     yield* Effect.gen(function* () {
       if (live) {
@@ -161,7 +190,7 @@ const make = Effect.gen(function* () {
           threadId: fence.threadId,
         });
       }
-      yield* retry;
+      yield* retry();
     }).pipe(
       Effect.catchCause((cause) => Effect.fail(cleanupError(fence.threadId, Cause.pretty(cause)))),
       Effect.exit,
@@ -198,7 +227,7 @@ const make = Effect.gen(function* () {
   });
   const drainThrough: ThreadDeletionReactorShape["drainThrough"] = Effect.fn(
     "ThreadDeletionReactor.drainThrough",
-  )(function* (target, threadId) {
+  )(function* (target, threadId, commandId) {
     yield* SubscriptionRef.changes(seenSequence).pipe(
       Stream.filter((seen) => seen >= target),
       Stream.runHead,
@@ -208,7 +237,7 @@ const make = Effect.gen(function* () {
     );
     for (const job of pending) {
       const result = yield* Deferred.await(job.initial).pipe(Effect.result);
-      if (result._tag === "Failure") yield* job.retry;
+      if (result._tag === "Failure") yield* job.retry(commandId);
     }
   });
   return { start, drainThrough } satisfies ThreadDeletionReactorShape;

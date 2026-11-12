@@ -6,6 +6,7 @@ import {
 } from "@t3tools/client-runtime/environment";
 import { settlePromise, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { canSnooze, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
+import { THREAD_DELETE_WARNING } from "@t3tools/client-runtime/relay/threadVmControls";
 import { EnvironmentId, type ScopedThreadRef, ThreadId } from "@t3tools/contracts";
 import { resolveWorktreeCleanup } from "@t3tools/shared/projectSettings";
 import * as Cause from "effect/Cause";
@@ -18,7 +19,7 @@ import { getFallbackThreadIdAfterDelete, pinOrderKeyBetween } from "../component
 import { useComposerDraftStore } from "../composerDraftStore";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentServerConfigsAtom } from "../state/server";
-import { threadEnvironment } from "../state/threads";
+import { threadEnvironment, threadVmControls } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
@@ -45,6 +46,16 @@ import { useClientSettings } from "./useSettings";
 import * as ThreadUndo from "./threadUndo";
 import { showThreadUndoNotice } from "./showThreadUndoNotice";
 import { useAtomCommand } from "../state/use-atom-command";
+
+export function requiresThreadDeleteConfirmation(
+  target: ScopedThreadRef,
+  ordinaryConfirmation: boolean,
+) {
+  return (
+    ordinaryConfirmation ||
+    appAtomRegistry.get(threadVmControls.routeAtom(target.environmentId, target.threadId)) !== null
+  );
+}
 
 export class ThreadArchiveBlockedError extends Schema.TaggedError<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -857,15 +868,19 @@ export function useThreadActions() {
     async (target: ScopedThreadRef) => {
       const localApi = readLocalApi();
       const resolved = resolveThreadTarget(target);
-
-      if (confirmThreadDelete && localApi) {
+      const needsConfirmation = requiresThreadDeleteConfirmation(target, confirmThreadDelete);
+      if (needsConfirmation && !localApi) {
+        return settlePromise(() =>
+          Promise.reject(
+            new Error("The delete confirmation is unavailable. Open the thread and try again."),
+          ),
+        );
+      }
+      if (needsConfirmation && localApi) {
         const title = resolved?.thread.title ?? "this thread";
         const confirmationResult = await settlePromise(() =>
           localApi.dialogs.confirm(
-            [
-              `Delete thread "${title}"?`,
-              "This permanently clears conversation history for this thread.",
-            ].join("\n"),
+            [`Delete thread "${title}"?`, THREAD_DELETE_WARNING].join("\n"),
             { variant: "destructive" },
           ),
         );

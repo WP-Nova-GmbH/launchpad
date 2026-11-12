@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "orchestratorBuildVersion": "v0.16.202610271020-stock.518278060a15",
+  "source": {
+    "repository": "https://github.com/e2b-dev/runtime",
+    "commit": "518278060a154124a80d98f37253f8af77baf478",
+    "commitTimestamp": "2026-10-27T10:20:42Z",
+    "archiveUrl": "https://codeload.github.com/e2b-dev/runtime/legacy.tar.gz/518278060a154124a80d98f37253f8af77baf478",
+    "archiveSha256": "aca63499162abe11133e83d7f61501e3199b27f0e34ed6dbfa69af90efde522e",
+    "archiveDirectory": "e2b-dev-runtime-5182780"
+  }
+}

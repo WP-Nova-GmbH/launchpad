@@ -24,13 +24,22 @@ import type {
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
-import type { ProviderAdapterValidationError } from "../Errors.ts";
+import type { ProviderAdapterProbeError, ProviderAdapterValidationError } from "../Errors.ts";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
 export type ProviderAdmissionEvidence = "provider-ack" | "harness-dispatch";
 
+export interface ProviderSessionStartOptions {
+  readonly requireResume?: boolean;
+  readonly beforeStart?: (
+    runtimeEpisode: string,
+  ) => Effect.Effect<void, ProviderAdapterValidationError>;
+}
+
 export interface ProviderSendTurnCallbacks {
+  /** Effective policy for this operation, including released workflow threads. */
+  readonly sessionOptions?: ProviderSessionStartOptions;
   /** Revalidate after preparation, immediately before the native dispatch. A
    * failure proves this prompt was never handed to the provider. */
   readonly beforeDispatch?: Effect.Effect<void, ProviderAdapterValidationError>;
@@ -80,18 +89,43 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export interface ProviderConversationCheckpointInput {
+  readonly threadId: ThreadId;
+  readonly artifactRoot: string;
+  readonly referencedFiles: ReadonlyArray<string>;
+  /** First enrollment may retain a stopped local conversation with no earlier native checkpoint.
+   * The coordinator has already frozen ownership; this source is read without resuming a writer. */
+  readonly stoppedSource?: { readonly nativeThreadId: string; readonly cwd: string };
+}
+
 export interface ProviderAdapterShape<TError> {
+  /** Private VM recovery; false preserves a busy or unproven native writer. */
+  readonly stopIdleVmSession?: (
+    threadId: ThreadId,
+    operationId: string,
+    admit: import("../../vmWorkload.ts").VmHarnessStopAdmission,
+  ) => Effect.Effect<boolean, TError>;
+  /** Flush adapter output after its native writer has stopped. Codex moves require this receipt. */
+  readonly drainRuntimeEvents?: (threadId: ThreadId) => Effect.Effect<void, TError>;
   /**
    * Provider kind implemented by this adapter.
    */
   readonly provider: ProviderDriverKind;
   readonly capabilities: ProviderAdapterCapabilities;
 
+  /** Resume validation in a private runtime, physically closed before success.
+   * Only ProviderAdapterProbeError.cleanupConfirmed attests a safe failed retry;
+   * arbitrary errors, defects and interruption retain uncertain native ownership.
+   * Bootstrap events never enter this adapter's normal ingestion stream. */
+  readonly probeSession?: (
+    input: ProviderSessionStartInput,
+  ) => Effect.Effect<ProviderSession, TError | ProviderAdapterProbeError>;
   /**
    * Start a provider-backed session.
    */
   readonly startSession: (
     input: ProviderSessionStartInput,
+    options?: ProviderSessionStartOptions,
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**
@@ -128,10 +162,33 @@ export interface ProviderAdapterShape<TError> {
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, TError>;
 
-  /**
-   * Stop one provider session.
-   */
-  readonly stopSession: (threadId: ThreadId) => Effect.Effect<void, TError>;
+  /** Update server-owned continuity policy without restarting a live session. */
+  readonly updateSessionOptions?: (
+    threadId: ThreadId,
+    options: ProviderSessionStartOptions,
+  ) => Effect.Effect<void, TError>;
+
+  /** Proof retained by the exact adapter that completed native shutdown. */
+  readonly isSessionStopConfirmed?: (
+    threadId: ThreadId,
+    runtimeEpisode?: string,
+  ) => Effect.Effect<boolean>;
+  /** The exact VM native writer reached EOF; detached workload shutdown is separate. */
+  readonly isSessionWriterStopConfirmed?: (
+    threadId: ThreadId,
+    runtimeEpisode: string,
+  ) => Effect.Effect<boolean>;
+  readonly getSessionRuntimeEpisode?: (threadId: ThreadId) => Effect.Effect<string | undefined>;
+  readonly releaseSessionStopConfirmation?: (
+    threadId: ThreadId,
+    runtimeEpisode: string,
+  ) => Effect.Effect<void>;
+
+  /** Stop one provider session. */
+  readonly stopSession: (
+    threadId: ThreadId,
+    runtimeEpisode?: string,
+  ) => Effect.Effect<void, TError>;
 
   /**
    * List currently active provider sessions for this adapter.
@@ -155,6 +212,12 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
+
+  /** Close a settled native writer and export only its conversation, without credentials.
+   * Omitted means this provider cannot support portable thread recovery. */
+  readonly checkpointConversation?: (
+    input: ProviderConversationCheckpointInput,
+  ) => Effect.Effect<{ readonly directory: string; readonly nativeThreadId: string }, TError>;
 
   /**
    * Upload a thread to the provider when the adapter supports feedback.

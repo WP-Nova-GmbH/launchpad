@@ -1,6 +1,7 @@
 import * as UserDirectory from "../tenancy/UserDirectory.ts";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import {
+  WORKFLOW_LINEAR_CALLBACK_PATH,
   RelayClientAuth,
   RelayClientPrincipal,
   type RelayClientDeviceRecord,
@@ -20,6 +21,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Deferred from "effect/Deferred";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
@@ -32,7 +34,7 @@ import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import {
   RelayEnvironmentAuth,
   RelayEnvironmentPrincipal,
@@ -47,6 +49,8 @@ import {
   readJobForUser,
   RELAY_HTTP_ROUTER_CONFIG,
   RELAY_REQUEST_DEADLINE_MS,
+  RELAY_CHECKPOINT_REQUEST_DEADLINE_MS,
+  RELAY_MOVE_REQUEST_DEADLINE_MS,
   clientApi,
   relayCors,
   relayDocsRedirectRoute,
@@ -301,6 +305,84 @@ describe("relay DPoP failure mapping", () => {
 });
 
 describe("relay environment authentication", () => {
+  it.effect.each(["attempt", "review-secrets"] as const)(
+    "authorizes only the assigned VM thread's workflow/%s requests",
+    (endpoint) => {
+      const principal = {
+        credentialId: "vm-credential",
+        environmentId: "workflow-vm",
+        environmentPublicKey: "vm-public-key",
+        threadVm: {
+          allocationId: "workflow-allocation",
+          threadId: ThreadId.make("workflow:" + "a".repeat(64)),
+          repositoryId: "workflow-repository",
+          generation: 1,
+        },
+      };
+      const path = `/v1/environments/${principal.environmentId}/threads/${encodeURIComponent(principal.threadVm.threadId)}/workflow/${endpoint}`;
+      const credentials: EnvironmentCredentials.EnvironmentCredentials["Service"] = {
+        create: () => Effect.die("unused create"),
+        authenticate: () => Effect.succeed(Option.some(principal)),
+        revokeForEnvironmentPublicKey: () => Effect.die("unused revoke"),
+      };
+
+      return Effect.gen(function* () {
+        const auth = yield* RelayEnvironmentAuth;
+        for (const [method, url, expected] of [
+          ["POST", path, true],
+          ["POST", path.replace("workflow-vm", "other-vm"), false],
+          [
+            "POST",
+            path.replace(encodeURIComponent(principal.threadVm.threadId), "other-thread"),
+            false,
+          ],
+          ["GET", path, false],
+          ["PUT", path, false],
+          ["POST", path + "/extra", false],
+        ] as const) {
+          let reachedHandler = false;
+          const allowed = yield* auth
+            .environmentBearer(
+              Effect.gen(function* () {
+                expect(yield* RelayEnvironmentPrincipal).toEqual(principal);
+                reachedHandler = true;
+                return HttpServerResponse.empty();
+              }),
+              {
+                credential: Redacted.make("vm-credential"),
+                endpoint: {} as never,
+                group: {} as never,
+              },
+            )
+            .pipe(
+              Effect.as(true),
+              Effect.catchTag("RelayAuthInvalidError", (error) => {
+                expect(error.reason).toBe("not_authorized");
+                return Effect.succeed(false);
+              }),
+              Effect.provideService(
+                HttpServerRequest.HttpServerRequest,
+                HttpServerRequest.fromWeb(new Request("https://relay.test" + url, { method })),
+              ),
+            );
+          expect(allowed).toBe(expected);
+          expect(reachedHandler).toBe(expected);
+        }
+      }).pipe(
+        Effect.provideService(HttpServerRequest.ParsedSearchParams, {}),
+        Effect.provideService(HttpRouter.RouteContext, { params: {}, route: {} as never }),
+        Effect.provide(
+          relayEnvironmentAuthLayer.pipe(
+            Layer.provide(
+              Layer.succeed(EnvironmentCredentials.EnvironmentCredentials, credentials),
+            ),
+          ),
+        ),
+        Effect.scoped,
+      );
+    },
+  );
+
   it.effect("preserves credential lookup persistence failures as internal errors", () => {
     const failure = new EnvironmentCredentials.EnvironmentCredentialAuthenticatePersistenceError({
       stage: "lookup-credential",
@@ -1607,7 +1689,7 @@ describe("relay request tracing", () => {
       }),
   );
 
-  it.effect.each(["linear", "jira"])(
+  it.effect.each(["linear", "jira", "workflow-linear"])(
     "keeps %s callback credentials out of HTTP traces while the handler receives them",
     (service) =>
       Effect.gen(function* () {
@@ -1619,7 +1701,10 @@ describe("relay request tracing", () => {
             return span;
           },
         });
-        const callbackPath = `/v1/user/issue-trackers/${service}/callback`;
+        const callbackPath =
+          service === "workflow-linear"
+            ? WORKFLOW_LINEAR_CALLBACK_PATH
+            : `/v1/user/issue-trackers/${service}/callback`;
         const request = HttpServerRequest.fromWeb(
           new Request(`https://relay.test${callbackPath}?code=private-code&state=private-state`),
         );
@@ -1665,7 +1750,100 @@ describe("relay request tracing", () => {
       expect(spans[0]?.attributes.get("http.response.status_code")).toBe(504);
     }),
   );
+  it.effect(
+    "allows bounded checkpoint transfers beyond the interactive deadline and still times them out",
+    () =>
+      Effect.gen(function* () {
+        const request = HttpServerRequest.fromWeb(
+          new Request(
+            "https://relay.test/v1/environments/source/threads/thread/artifacts/00000000-0000-4000-8000-000000000076",
+            { method: "PUT" },
+          ),
+        );
+        const completed = yield* Deferred.make<void>();
+        const fiber = yield* traceRelayHttpRequestWith(
+          Deferred.await(completed).pipe(Effect.as(HttpServerResponse.empty({ status: 200 }))),
+          Layer.empty,
+        ).pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust(Duration.millis(RELAY_REQUEST_DEADLINE_MS + 1));
+        yield* Deferred.succeed(completed, undefined);
+        expect((yield* Fiber.join(fiber)).status).toBe(200);
+        const timedOut = yield* traceRelayHttpRequestWith(Effect.never, Layer.empty).pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+          Effect.forkChild,
+        );
+        yield* TestClock.adjust(Duration.millis(RELAY_CHECKPOINT_REQUEST_DEADLINE_MS));
+        expect((yield* Fiber.join(timedOut)).status).toBe(504);
+      }),
+  );
 });
+
+it.effect("gives only verified move publication the bounded full-archive deadline", () =>
+  Effect.gen(function* () {
+    for (const [method, suffix, deadline] of [
+      ["POST", "publish", RELAY_MOVE_REQUEST_DEADLINE_MS],
+      ["GET", "publish", RELAY_REQUEST_DEADLINE_MS],
+      ["POST", "ready", RELAY_REQUEST_DEADLINE_MS],
+    ] as const) {
+      const request = HttpServerRequest.fromWeb(
+        new Request(
+          `https://relay.test/v1/environments/source/threads/thread/moves/00000000-0000-4000-8000-000000000078/${suffix}`,
+          { method },
+        ),
+      );
+      const entered = yield* Deferred.make<void>();
+      const fiber = yield* traceRelayHttpRequestWith(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        Layer.empty,
+      ).pipe(Effect.provideService(HttpServerRequest.HttpServerRequest, request), Effect.forkChild);
+      yield* Deferred.await(entered);
+      if (deadline === RELAY_MOVE_REQUEST_DEADLINE_MS) {
+        yield* TestClock.adjust(Duration.millis(RELAY_CHECKPOINT_REQUEST_DEADLINE_MS));
+        expect(fiber.pollUnsafe() === undefined).toBe(true);
+        yield* TestClock.adjust(Duration.millis(deadline - RELAY_CHECKPOINT_REQUEST_DEADLINE_MS));
+      } else yield* TestClock.adjust(Duration.millis(deadline));
+      expect((yield* Fiber.join(fiber)).status).toBe(504);
+    }
+  }),
+);
+
+it.effect(
+  "applies preview handshake bounds instead of the relay API deadline only on the reserved host",
+  () =>
+    Effect.gen(function* () {
+      for (const hostname of [
+        "a".repeat(32) + ".previews.example.test",
+        "relay.example.test",
+        "previews.example.test.attacker.test",
+      ]) {
+        const completed = yield* Deferred.make<void>(),
+          entered = yield* Deferred.make<void>();
+        const request = HttpServerRequest.fromWeb(
+          new Request(`https://${hostname}/v1/mobile/devices`),
+        );
+        const pending = yield* traceRelayHttpRequestWith(
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(completed)),
+            Effect.as(HttpServerResponse.empty()),
+          ),
+          Layer.empty,
+          "https://previews.example.test",
+        ).pipe(
+          Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust(Duration.millis(RELAY_REQUEST_DEADLINE_MS + 1));
+        yield* Deferred.succeed(completed, undefined);
+        expect((yield* Fiber.join(pending)).status).toBe(
+          hostname.endsWith(".previews.example.test") ? 204 : 504,
+        );
+      }
+    }),
+);
 
 describe("relay routing fallback", () => {
   it.effect("publishes activity for escaped delegated thread IDs longer than 100 characters", () =>

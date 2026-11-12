@@ -7,6 +7,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 
@@ -50,6 +51,10 @@ export interface CodexAppServerPatchedProtocolOptions {
 }
 
 export interface CodexAppServerPatchedProtocol {
+  /** Close admission only after native requests settle; input remains drainable. */
+  readonly reserveIdleShutdown: Effect.Effect<boolean>;
+  readonly releaseIdleShutdown: Effect.Effect<void>;
+  readonly awaitInputDrained: Effect.Effect<void, CodexError.CodexAppServerError>;
   readonly incomingNotifications: Stream.Stream<CodexAppServerIncomingNotification>;
   readonly incomingRequests: Stream.Stream<CodexAppServerIncomingRequest>;
   readonly request: (
@@ -168,7 +173,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const terminationSignal = yield* Deferred.make<void>();
+    const inputDrained = yield* Deferred.make<void, CodexError.CodexAppServerError>();
     const activeRequestHandlers = yield* Ref.make(0);
+    const admission = yield* Semaphore.make(1);
+    let idleShutdownReserved = false;
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
       if (event.direction === "incoming" && !options.logIncoming) {
@@ -217,8 +225,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ] as const;
       }).pipe(Effect.flatten);
 
-    const offerOutgoing = (message: Record<string, unknown>) =>
+    const offerOutgoing = (message: Record<string, unknown>, response = false) =>
       Effect.gen(function* () {
+        if (idleShutdownReserved && !response)
+          return yield* new CodexError.CodexAppServerInputStreamEndedError({});
         const failure = yield* Ref.get(terminationFailure);
         if (Option.isSome(failure)) return yield* failure.value;
 
@@ -241,7 +251,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             () => new CodexError.CodexAppServerInputStreamEndedError({}),
           );
         }
-      });
+      }).pipe(admission.withPermits(1));
 
     const removePending = (requestId: string) =>
       Ref.update(pending, (current) => {
@@ -268,12 +278,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       }).pipe(Effect.flatten);
 
     const respond = (requestId: string | number, result: unknown) =>
-      offerOutgoing(toProtocolMessage(requestId, { result }));
+      offerOutgoing(toProtocolMessage(requestId, { result }), true);
 
     const respondError = (
       requestId: string | number,
       error: CodexError.CodexAppServerRequestError,
-    ) => offerOutgoing(toProtocolMessage(requestId, { error: error.toProtocolError() }));
+    ) => offerOutgoing(toProtocolMessage(requestId, { error: error.toProtocolError() }), true);
 
     const handleResponse = (response: typeof JsonRpcResponseEnvelope.Type) => {
       const requestId = String(response.id);
@@ -302,14 +312,19 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           if (!handler) return Effect.void;
 
           return Ref.modify(activeRequestHandlers, (count) =>
-            count >= MAX_BUFFERED_RAW_MESSAGES ? [false, count] : [true, count + 1],
+            idleShutdownReserved || count >= MAX_BUFFERED_RAW_MESSAGES
+              ? [false, count]
+              : [true, count + 1],
           ).pipe(
+            admission.withPermits(1),
             Effect.flatMap((accepted) => {
               if (!accepted) {
                 return respondError(
                   request.id,
                   CodexError.CodexAppServerRequestError.overloaded(
-                    "Too many Codex requests are already active.",
+                    idleShutdownReserved
+                      ? "Codex provider is stopping."
+                      : "Too many Codex requests are already active.",
                   ),
                 );
               }
@@ -420,10 +435,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         }).pipe(Effect.flatMap((lines) => Effect.forEach(lines, handleLine, { discard: true }))),
       ),
       Effect.matchEffect({
-        onFailure: (error) =>
-          handleTermination(() =>
-            Effect.succeed(normalizeIncomingError(error, "read-input-stream")),
-          ),
+        onFailure: (error) => {
+          const failure = normalizeIncomingError(error, "read-input-stream");
+          return Deferred.fail(inputDrained, failure).pipe(
+            Effect.andThen(handleTermination(() => Effect.succeed(failure))),
+          );
+        },
         onSuccess: () =>
           Effect.sync(() => {
             const line = remainder.join("");
@@ -432,13 +449,29 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           }).pipe(
             Effect.flatMap(handleLine),
             Effect.matchEffect({
-              onFailure: (error) => handleTermination(() => Effect.succeed(error)),
-              onSuccess: () =>
-                handleTermination(
-                  () =>
-                    options.terminationError ??
-                    Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
+              onFailure: (error) =>
+                Deferred.fail(inputDrained, error).pipe(
+                  Effect.andThen(handleTermination(() => Effect.succeed(error))),
                 ),
+              onSuccess: () =>
+                Effect.gen(function* () {
+                  if (yield* Ref.get(terminationHandled)) {
+                    const failure = yield* Ref.get(terminationFailure);
+                    return yield* Deferred.fail(
+                      inputDrained,
+                      Option.getOrElse(
+                        failure,
+                        () => new CodexError.CodexAppServerInputStreamEndedError({}),
+                      ),
+                    );
+                  }
+                  yield* Deferred.succeed(inputDrained, undefined);
+                  yield* handleTermination(
+                    () =>
+                      options.terminationError ??
+                      Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
+                  );
+                }),
             }),
           ),
       }),
@@ -474,6 +507,23 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       });
 
     return {
+      reserveIdleShutdown: Effect.gen(function* () {
+        if (idleShutdownReserved) return true;
+        if (
+          (yield* Ref.get(pending)).size ||
+          (yield* Ref.get(activeRequestHandlers)) ||
+          (yield* Queue.size(outgoing)) > 0 ||
+          remainder.length ||
+          (yield* Ref.get(terminationHandled))
+        )
+          return false;
+        idleShutdownReserved = true;
+        return true;
+      }).pipe(admission.withPermits(1)),
+      releaseIdleShutdown: Effect.sync(() => {
+        idleShutdownReserved = false;
+      }).pipe(admission.withPermits(1)),
+      awaitInputDrained: Deferred.await(inputDrained),
       incomingNotifications: Stream.fromQueue(incomingNotifications),
       incomingRequests: Stream.fromQueue(incomingRequests),
       request,

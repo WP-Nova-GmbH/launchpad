@@ -5,21 +5,12 @@
 #
 #   docker build -t launchpad-relay -f infra/relay/Dockerfile .
 #
-# The container runs with --network=host, because the relay binds loopback
-# and must reach the loopback endpoints its Docker machines advertise, and
-# with the host's Docker socket mounted, because machines are sibling
-# containers on the host daemon.
+# The container runs with --network=host to reach the host's loopback database.
+# Thread VMs are managed through the E2B API, without a Docker socket mount.
 FROM node:24-bookworm
 
-# The Docker CLI only; the daemon is the host's, reached through the socket.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl \
-  && install -m 0755 -d /etc/apt/keyrings \
-  && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
-  && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
-    > /etc/apt/sources.list.d/docker.list \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends docker-ce-cli \
+  && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 

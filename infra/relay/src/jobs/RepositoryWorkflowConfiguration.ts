@@ -1,0 +1,216 @@
+import type { PgClient } from "@effect/sql-pg/PgClient";
+import {
+  RELAY_WORKFLOW_ENV_MAX_ENTRIES,
+  RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES,
+  RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES,
+  isAllowedWorkflowEnvironmentName,
+  RelayOrganizationId,
+  RelayRepositoryId,
+  type RelayRepositoryWorkflowConfiguration,
+  type RelayUpdateRepositoryWorkflowConfiguration,
+} from "@t3tools/contracts/relay";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import type { RelaySecretBox } from "../auth/SecretBox.ts";
+
+export class RepositoryWorkflowConfigurationError extends Schema.TaggedError<RepositoryWorkflowConfigurationError>()(
+  "RepositoryWorkflowConfigurationError",
+  { reason: Schema.Literals(["invalid", "limit", "conflict", "storage"]) },
+) {}
+
+const failure = (reason: RepositoryWorkflowConfigurationError["reason"]) =>
+  new RepositoryWorkflowConfigurationError({ reason });
+
+const StoredEntry = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("variable"), name: Schema.String, value: Schema.String }),
+  Schema.Struct({
+    kind: Schema.Literal("secret"),
+    name: Schema.String,
+    sealed: Schema.String,
+    bytes: Schema.Int.check(
+      Schema.isBetween({ minimum: 1, maximum: RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES }),
+    ),
+  }),
+]);
+type StoredEntry = typeof StoredEntry.Type;
+const decodeEntries = Schema.decodeUnknownEffect(Schema.Array(StoredEntry));
+const SecretEnvelope = Schema.Struct({
+  purpose: Schema.Literal("repository-workflow-environment"),
+  organizationId: Schema.String,
+  repositoryId: Schema.String,
+  name: Schema.String,
+  value: Schema.String,
+});
+const SecretJson = Schema.fromJsonString(SecretEnvelope);
+const encodeSecret = Schema.encodeEffect(SecretJson);
+const decodeSecret = Schema.decodeUnknownEffect(SecretJson);
+const utf8 = new TextEncoder();
+
+type RepositoryScope = { readonly organizationId: string; readonly repositoryId: string };
+
+const entryBytes = (entry: StoredEntry): number =>
+  entry.kind === "secret" ? entry.bytes : utf8.encode(entry.value).byteLength;
+const validValue = (value: string): boolean =>
+  !/[\uD800-\uDFFF]/u.test(value) && !value.includes("\0");
+
+const readStored = Effect.fnUntraced(function* (sql: PgClient, scope: RepositoryScope) {
+  const [row] = yield* sql<{ revision: number; entries: unknown }>`
+    SELECT c.revision,c.entries FROM relay_repository_workflow_configurations c
+    JOIN relay_repositories r USING(repository_id)
+    WHERE c.repository_id=${scope.repositoryId} AND r.organization_id=${scope.organizationId}
+  `.pipe(Effect.mapError(() => failure("storage")));
+  if (!row) return { revision: 0, entries: [] as ReadonlyArray<StoredEntry> };
+  const entries = yield* decodeEntries(row.entries).pipe(Effect.mapError(() => failure("storage")));
+  if (
+    entries.length > RELAY_WORKFLOW_ENV_MAX_ENTRIES ||
+    new Set(entries.map((entry) => entry.name)).size !== entries.length ||
+    entries.some(
+      (entry) =>
+        !isAllowedWorkflowEnvironmentName(entry.name) ||
+        entryBytes(entry) > RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES ||
+        (entry.kind === "variable" && !validValue(entry.value)),
+    ) ||
+    entries.reduce((total, entry) => total + entryBytes(entry), 0) >
+      RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES
+  )
+    return yield* failure("storage");
+  return { revision: row.revision, entries };
+});
+
+const publicConfiguration = (
+  scope: RepositoryScope,
+  revision: number,
+  entries: ReadonlyArray<StoredEntry>,
+): RelayRepositoryWorkflowConfiguration => ({
+  organizationId: RelayOrganizationId.make(scope.organizationId),
+  repositoryId: RelayRepositoryId.make(scope.repositoryId),
+  revision,
+  entries: entries.map((entry) =>
+    entry.kind === "variable"
+      ? { kind: "variable", name: entry.name, value: entry.value }
+      : { kind: "secret", name: entry.name },
+  ),
+});
+
+export const getRepositoryWorkflowConfiguration = Effect.fnUntraced(function* (
+  sql: PgClient,
+  scope: RepositoryScope,
+) {
+  const { revision, entries } = yield* readStored(sql, scope);
+  return publicConfiguration(scope, revision, entries);
+});
+
+/** The caller holds maintainable-repository authority and the repository write lock. */
+export const updateRepositoryWorkflowConfiguration = Effect.fnUntraced(function* (
+  sql: PgClient,
+  box: RelaySecretBox["Service"],
+  scope: RepositoryScope,
+  { expectedRevision, mutation }: RelayUpdateRepositoryWorkflowConfiguration,
+) {
+  const { revision, entries } = yield* readStored(sql, scope);
+  if (revision !== expectedRevision) return yield* failure("conflict");
+  if (revision === 2_147_483_647) return yield* failure("limit");
+
+  const nextByName = new Map(entries.map((entry) => [entry.name, entry]));
+  if (mutation.kind === "delete") {
+    if (!nextByName.delete(mutation.name)) return yield* failure("invalid");
+  } else {
+    const incoming =
+      mutation.kind === "import"
+        ? mutation.entries
+        : [
+            {
+              kind: mutation.kind === "setVariable" ? ("variable" as const) : ("secret" as const),
+              name: mutation.name,
+              value: mutation.value,
+              replace: nextByName.has(mutation.name),
+            },
+          ];
+    if (
+      incoming.length === 0 ||
+      new Set(incoming.map((entry) => entry.name)).size !== incoming.length
+    )
+      return yield* failure("invalid");
+    let totalBytes = entries.reduce((total, entry) => total + entryBytes(entry), 0);
+    let totalEntries = entries.length;
+    const prepared = [];
+    for (const entry of incoming) {
+      const { name, kind, value, replace } = entry;
+      const previous = nextByName.get(name);
+      if (
+        !isAllowedWorkflowEnvironmentName(name) ||
+        replace !== !!previous ||
+        (previous && previous.kind !== kind) ||
+        !validValue(value) ||
+        (kind === "secret" && value.length === 0)
+      )
+        return yield* failure("invalid");
+      const bytes = utf8.encode(value).byteLength;
+      if (bytes > RELAY_WORKFLOW_ENV_VALUE_MAX_BYTES) return yield* failure("limit");
+      totalBytes += bytes - (previous ? entryBytes(previous) : 0);
+      if (!previous) totalEntries++;
+      prepared.push({ ...entry, bytes });
+    }
+    if (
+      totalEntries > RELAY_WORKFLOW_ENV_MAX_ENTRIES ||
+      totalBytes > RELAY_WORKFLOW_ENV_TOTAL_MAX_BYTES
+    )
+      return yield* failure("limit");
+
+    for (const { name, kind, value, bytes } of prepared) {
+      if (kind === "variable") {
+        nextByName.set(name, { kind, name, value });
+      } else {
+        const sealed = yield* encodeSecret({
+          purpose: "repository-workflow-environment",
+          organizationId: scope.organizationId,
+          repositoryId: scope.repositoryId,
+          name,
+          value,
+        }).pipe(
+          Effect.flatMap(box.seal),
+          Effect.mapError(() => failure("storage")),
+        );
+        nextByName.set(name, { kind, name, sealed, bytes });
+      }
+    }
+  }
+
+  const next = [...nextByName.values()].sort((left, right) => left.name.localeCompare(right.name));
+  const nextRevision = revision + 1;
+  yield* sql`
+    INSERT INTO relay_repository_workflow_configurations (repository_id,revision,entries)
+    VALUES (${scope.repositoryId},${nextRevision},${sql.json(next)})
+    ON CONFLICT (repository_id) DO UPDATE SET revision=excluded.revision,entries=excluded.entries
+  `.pipe(Effect.mapError(() => failure("storage")));
+  return publicConfiguration(scope, nextRevision, next);
+});
+
+/** Caller holds the live repository's shared lock through accepting preparation. */
+export const readWorkflowConfigurationForFreeze = Effect.fnUntraced(function* (
+  sql: PgClient,
+  box: RelaySecretBox["Service"],
+  scope: RepositoryScope,
+) {
+  const { revision, entries } = yield* readStored(sql, scope);
+  const values = yield* Effect.forEach(entries, (entry) =>
+    Effect.gen(function* () {
+      if (entry.kind === "variable")
+        return { kind: entry.kind, name: entry.name, value: entry.value } as const;
+      const envelope = yield* box.open(entry.sealed).pipe(
+        Effect.flatMap(decodeSecret),
+        Effect.mapError(() => failure("storage")),
+      );
+      if (
+        envelope.organizationId !== scope.organizationId ||
+        envelope.repositoryId !== scope.repositoryId ||
+        envelope.name !== entry.name ||
+        !validValue(envelope.value) ||
+        utf8.encode(envelope.value).byteLength !== entry.bytes
+      )
+        return yield* failure("storage");
+      return { kind: entry.kind, name: entry.name, value: envelope.value } as const;
+    }),
+  );
+  return { revision, values, hasSecrets: values.some((entry) => entry.kind === "secret") };
+});

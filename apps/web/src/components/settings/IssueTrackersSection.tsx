@@ -48,21 +48,16 @@ function connectionDescription(
   connection?: RelayIssueTrackerConnection,
 ) {
   if (connection?.authorization?.phase === "selecting_site")
-    return connection.accountLabel
-      ? `${connection.accountLabel} · Choose a site to finish the new connection.`
-      : "Choose a Jira site to finish connecting.";
+    return "Choose a Jira site to finish connecting.";
   if (connection?.status === "connecting")
     return "Not connected yet. Finish setup in your browser, then refresh.";
   if (connection?.status === "reconnect_required") {
-    return connection.accountLabel
-      ? `${connection.accountLabel} · Sign in again to read issues.`
-      : "Sign in again to read issues.";
+    return "Sign in again to read issues.";
   }
   if (connection?.status === "connected") {
-    const label = connection.accountLabel ?? "Connected to your account.";
     if (connection.searchEnabled === false && service === "jira")
-      return `${label} · Issue search needs additional authorization.`;
-    return label;
+      return "Issue search needs additional authorization.";
+    return connection.accountLabel ? null : "Connected to your account.";
   }
   return service === "linear"
     ? "Read issues from your Linear workspace."
@@ -244,7 +239,14 @@ export function IssueTrackersSection({
                   ) : null}
                 </span>
               }
-              description={connectionDescription(service, connection)}
+              description={
+                <span className="block space-y-1">
+                  {connection?.accountLabel ? (
+                    <span className="block">{connection.accountLabel}</span>
+                  ) : null}
+                  <span className="block">{connectionDescription(service, connection)}</span>
+                </span>
+              }
               control={
                 <div className="flex flex-wrap items-center gap-2">
                   {connection ? (

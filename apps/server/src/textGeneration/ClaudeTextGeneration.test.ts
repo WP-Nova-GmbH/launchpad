@@ -260,6 +260,28 @@ function withFakeClaudeEnv<A, E, R>(
 }
 
 it.layer(ClaudeTextGenerationTestLayer)("ClaudeTextGeneration", (it) => {
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    withFakeClaudeEnv(
+      {
+        output: '{"structured_output":{"verdict":"approve","reasoning":"In scope"}}',
+        stdinMustContain:
+          "Job context:\nFix JOB_CONTEXT\n\nRequired review constraint:\nREVIEW_REQUIRED",
+      },
+      (textGeneration) =>
+        textGeneration.generateApprovalVerdict({
+          cwd: process.cwd(),
+          toolKind: "command",
+          requestType: "command_execution_approval",
+          stepInstruction: "s".repeat(5_000),
+          jobContext: "Fix JOB_CONTEXT",
+          reviewConstraint: "REVIEW_REQUIRED",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("claudeAgent"),
+            SYNTHETIC_CLAUDE_STANDARD_MODEL,
+          ),
+        }),
+    ),
+  );
   it.effect("forwards Claude thinking settings without passing unsupported effort", () =>
     withFakeClaudeEnv(
       {

@@ -149,6 +149,30 @@ export class ServerSecretStore extends Context.Service<
   }
 >()("t3/auth/ServerSecretStore") {}
 
+const secretPath = (path: Path.Path, secretsDir: string, name: string) =>
+  path.join(secretsDir, `${name}.bin`);
+
+const readSecretFile = (fileSystem: FileSystem.FileSystem, path: string, name: string) =>
+  fileSystem.readFile(path).pipe(
+    Effect.map((bytes) => Option.some(Uint8Array.from(bytes))),
+    Effect.catch((cause) =>
+      cause.reason._tag === "NotFound"
+        ? Effect.succeedNone
+        : Effect.fail(new SecretStoreReadError({ resource: `secret ${name}`, cause })),
+    ),
+    Effect.withSpan("ServerSecretStore.get"),
+  );
+
+/** Read a persisted secret without initializing or securing its directory. */
+export const readExistingServerSecret = Effect.fnUntraced(function* (
+  secretsDir: string,
+  name: string,
+) {
+  const path = yield* Path.Path;
+  const fileSystem = yield* FileSystem.FileSystem;
+  return yield* readSecretFile(fileSystem, secretPath(path, secretsDir, name), name);
+});
+
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
@@ -167,23 +191,10 @@ export const make = Effect.gen(function* () {
     ),
   );
 
-  const resolveSecretPath = (name: string) => path.join(serverConfig.secretsDir, `${name}.bin`);
+  const resolveSecretPath = (name: string) => secretPath(path, serverConfig.secretsDir, name);
 
   const get: ServerSecretStore["Service"]["get"] = (name) =>
-    fileSystem.readFile(resolveSecretPath(name)).pipe(
-      Effect.map((bytes) => Option.some(Uint8Array.from(bytes))),
-      Effect.catch((cause) =>
-        cause.reason._tag === "NotFound"
-          ? Effect.succeedNone
-          : Effect.fail(
-              new SecretStoreReadError({
-                resource: `secret ${name}`,
-                cause,
-              }),
-            ),
-      ),
-      Effect.withSpan("ServerSecretStore.get"),
-    );
+    readSecretFile(fileSystem, resolveSecretPath(name), name);
 
   const set: ServerSecretStore["Service"]["set"] = (name, value) => {
     const secretPath = resolveSecretPath(name);

@@ -40,6 +40,7 @@ import {
   resolveFffNativeDependencies,
   STAGE_INSTALL_ARGS,
 } from "./build-desktop-artifact.ts";
+import { stageLinuxNodePty } from "./lib/cli-node-pty.ts";
 import { selectCliRuntimeExternalDependencies } from "./lib/cli-external-packages.ts";
 import { resolveCatalogDependencies } from "./lib/resolve-catalog.ts";
 
@@ -150,6 +151,7 @@ const requireInput = Effect.fn("requireInput")(function* (inputPath: string, hin
 const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (input: {
   readonly repoRoot: string;
   readonly stageDir: string;
+  readonly nodePtyDir: Option.Option<string>;
   readonly platform: BuildPlatform;
   readonly arch: BuildArch;
   readonly version: string;
@@ -219,9 +221,27 @@ const stageRuntimeExternals = Effect.fn("stageRuntimeExternals")(function* (inpu
     "vp install --prod (cli archive runtime externals)",
   );
 
+  if (input.platform === "linux") {
+    yield* stageLinuxNodePty({
+      packageDirectory: path.join(input.stageDir, "node_modules/node-pty"),
+      arch: input.arch,
+      ...(Option.isSome(input.nodePtyDir)
+        ? { nativePackageDirectory: input.nodePtyDir.value }
+        : {}),
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new CliArchiveInputMissingError({
+            inputPath: path.join(input.stageDir, "node_modules/node-pty"),
+            hint: cause.message,
+          }),
+      ),
+    );
+  }
+
   // pnpm's bookkeeping and the manifest only matter to pnpm; the runtime
-  // resolves packages by directory. node-pty ships every platform's prebuilds
-  // in one package (58 MB); only the archive's own platform loads.
+  // resolves packages by directory. node-pty ships Mac/Windows prebuilds
+  // together; Linux is staged above. Keep only the archive's own platform.
   const platformKey = cliArchivePlatformKey(input.platform, input.arch);
   const prebuildsDir = path.join(input.stageDir, "node_modules/node-pty/prebuilds");
   const foreignPrebuilds = (yield* fs
@@ -462,6 +482,7 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   readonly version: string;
   readonly outputDir: string;
   readonly resourceMonitorDir: Option.Option<string>;
+  readonly nodePtyDir: Option.Option<string>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -508,10 +529,18 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
   yield* Effect.log(`[cli-archive] Staging ${stem}...`);
   yield* fs.copyFile(builtExecutable, path.join(contentDir, executableName));
   yield* stageWebClient(webClient, path.join(contentDir, "client"));
-  yield* fs.copy(resourceMonitorDir, path.join(contentDir, "resource-monitor"));
+  const monitorTarget = path.join(contentDir, "resource-monitor");
+  yield* fs.copy(resourceMonitorDir, monitorTarget);
+  if (input.platform !== "win") {
+    // Root-installed archives also run under an unprivileged account. Private
+    // build staging permissions must not make the bundled monitor inaccessible.
+    yield* fs.chmod(monitorTarget, 0o755);
+    yield* fs.chmod(path.join(monitorTarget, "t3-resource-monitor"), 0o755);
+  }
   yield* stageRuntimeExternals({
     repoRoot,
     stageDir: contentDir,
+    nodePtyDir: input.nodePtyDir,
     platform: input.platform,
     arch: input.arch,
     version: input.version,
@@ -546,16 +575,23 @@ const buildCliArchive = Effect.fn("buildCliArchive")(function* (input: {
     // hard-links build outputs, and GNU tar records those as link entries.
     // The npm registry rejects a tarball containing any, and the npm platform
     // packages are re-packed from this archive's contents, so store every
-    // file as a file. macOS's bsdtar has no such flag; pnpm clones there.
+    // file as a file. Choose by build host, including cross builds: macOS's
+    // bsdtar has no such flag and pnpm clones there.
     yield* runCommand(
-      ChildProcess.make("tar", [
-        ...(input.platform === "linux" ? ["--hard-dereference"] : []),
-        "-czf",
-        archivePath,
-        "-C",
-        stageRoot,
-        stem,
-      ]),
+      ChildProcess.make(
+        "tar",
+        [
+          ...(hostPlatform === "linux" ? ["--hard-dereference"] : []),
+          ...(hostPlatform === "darwin" ? ["--no-xattrs"] : []),
+          "-czf",
+          archivePath,
+          "-C",
+          stageRoot,
+          stem,
+        ],
+        // Keep macOS extended attributes and AppleDouble files out of releases.
+        { env: { ...process.env, COPYFILE_DISABLE: "1" } },
+      ),
       "tar (gzip)",
     );
   }
@@ -573,6 +609,12 @@ const command = Command.make(
       Flag.withDescription("Release version for the archive name."),
     ),
     outputDir: Flag.String("output-dir").pipe(Flag.withDefault("release-cli")),
+    nodePtyDir: Flag.String("node-pty-dir").pipe(
+      Flag.withDescription(
+        "Matching node-pty package compiled on the target Linux architecture, for cross-packaging.",
+      ),
+      Flag.optional,
+    ),
     resourceMonitorDir: Flag.String("resource-monitor-dir").pipe(
       Flag.withDescription(
         "Directory laid out like dist/resource-monitor (defaults to apps/server/dist/resource-monitor).",

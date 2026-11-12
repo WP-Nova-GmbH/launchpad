@@ -88,7 +88,12 @@ export function completeIssueTrackerTurn(
   }
 }
 
-export function clearMcpProviderSession(threadId: ThreadId): void {
+export function clearMcpProviderSession(threadId: ThreadId, expectedSessionId?: string): void {
+  if (
+    expectedSessionId !== undefined &&
+    sessionsByThread.get(threadId)?.providerSessionId !== expectedSessionId
+  )
+    return;
   sessionsByThread.delete(threadId);
 }
 

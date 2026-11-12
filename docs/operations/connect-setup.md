@@ -174,3 +174,50 @@ for authorization and approval behavior.
 
 Automatic jobs, including webhook-triggered jobs, and external OpenCode servers are not
 supported by these connections.
+
+## Native Linear workflow connections
+
+Register a new Linear OAuth app for workflow automation. Use a new client ID and webhook signing
+secret when replacing the old person-owned workflow integration. Configure these on the relay:
+
+- `LINEAR_WORKFLOW_CLIENT_ID` and, if the app uses one, `LINEAR_WORKFLOW_CLIENT_SECRET`.
+- `LINEAR_WORKFLOW_ORGANIZATION_ID`, the Launchpad organization allowed to install and manage the
+  app. This is Launchpad's organization ID, not the Linear workspace ID.
+- `LINEAR_WORKFLOW_WEBHOOK_SECRET` and `LINEAR_WORKFLOW_WEBHOOK_GENERATION` for event intake. Change
+  the generation when the signing secret or app subscription coverage changes.
+
+Both the Worker and Node development relay use these settings. Register the exact callback
+`<relay issuer>/oauth/workflow-sources/linear/callback` in Linear. Configure Issue webhooks on the
+OAuth app with the HTTPS destination `<relay issuer>/webhooks/workflow-sources/linear`. The install
+uses the read-only app actor with PKCE. Keep the client and signing secrets on the relay.
+
+An admin of the configured Launchpad organization opens **Settings → Organization → Workflow
+sources** and installs the app in one Linear workspace. The app binding persists once setup
+starts. Changing the configured organization does not transfer that binding. For a fresh setup,
+grant repository access again and re-enable affected triggers with the new connection.
+
+The webhook receiver can verify delivery while job admission is off. It records observed Issue
+create and status-entry delivery for each team, authorization and webhook generation. Reconnecting
+preserves repository grants and starts delivery verification again. An API read or OAuth success
+alone does not verify webhook delivery.
+
+Keep `LINEAR_WORKFLOW_ADMISSION_ENABLED` absent or `false` in production until the isolated live
+provider and workflow checks pass. Verify install, reconnect, token rotation, signed team
+delivery, revocation ordering and actual provider retries. Then verify one new matching event
+starts one job for each matching workflow, including when Linear redelivers the event. Automatic VM
+runs also require `RELAY_WORKFLOW_VM_EXECUTION_ENABLED=true` and a verified workflow VM runner.
+Turning off Linear admission stops new event jobs. Turning off VM execution also holds first VM
+creation and first guest Start for automatic runs. Existing attempts can still reconcile or be
+cancelled.
+
+Unknown occurrences require a signed `webhookTimestamp` within 60 seconds. Authenticated retries
+of committed occurrences acknowledge without creating new jobs. If Linear preserves an old signing
+timestamp on a retry of an uncommitted event, that retry is rejected. Verify this behavior before
+enabling admission. Missing webhook configuration returns 503, invalid routing facts return 400,
+invalid signature or freshness returns 401, oversized payloads return 413, and persistence failures
+return 500. Keep callback queries, webhook payloads and OAuth credentials out of diagnostics.
+
+If an app configuration error prevents exchange or refresh, repair the relay configuration and
+try again. If credentials may have changed during a reconnect that Launchpad could not complete,
+an organization admin reconnects the same workspace. Reconnect does not require granting the same
+repositories again.

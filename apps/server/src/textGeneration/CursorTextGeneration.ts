@@ -270,6 +270,8 @@ export const makeCursorTextGeneration = Effect.fn("makeCursorTextGeneration")(fu
         requestType: input.requestType,
         requestDetail: input.requestDetail,
         stepInstruction: input.stepInstruction,
+        jobContext: input.jobContext,
+        reviewConstraint: input.reviewConstraint,
         policy: input.policy,
       });
 

@@ -1,15 +1,60 @@
+import type { RelayThreadDeletionRequest, RelayThreadDeletion } from "@t3tools/contracts/relay";
 /**
- * Organization, invitation, and repository calls against the relay.
+ * Organization, repository, and retained portable-thread calls against the relay.
  *
  * Separate from `ManagedRelayClient` on purpose: that service exists to reach
  * an environment, and it authenticates with DPoP-bound tokens to do it. These
- * calls only ever read and write relay-owned records with a plain Clerk
- * bearer, and they are used by administrative surfaces rather than by the
- * connection machinery.
+ * calls read and write relay-owned records with a plain Clerk bearer. Reading
+ * retained thread history does not connect to or wake its environment.
  */
-import type { RepositoryAccessRemovalStatus } from "@t3tools/contracts";
+import type {
+  PortableThreadCommand,
+  CommandId,
+  ThreadId,
+  RepositoryAccessRemovalStatus,
+} from "@t3tools/contracts";
 import {
   RelayApi,
+  type RelayCodexVmConnection,
+  type RelayCodexVmStartSignIn,
+  type RelayCodexVmStartSignInResponse,
+  type RelayCodexVmCompleteSignIn,
+  type RelayCodexVmSignInAttempt,
+  type RelayHealthResponse,
+  type ThreadVmPolicyRecord,
+  type WorkflowVmPolicyRecord,
+  type RelayThreadVmStatus,
+  type RelayThreadVmProviderAuth,
+  type RelayThreadVmProviderAuthRequest,
+  type RelayThreadVmCodexAuthSource,
+  type RelayThreadVmCodexAuthSelection,
+  type RelayThreadVmCodexPreference,
+  type RelayThreadVmCodexPreferenceRequest,
+  type RelayThreadVmPreviewResponse,
+  type RelayThreadVmCreateRequest,
+  type RelayThreadVmCreateResponse,
+  type RelayThreadVmSetup,
+  type RelayThreadVmResumeResponse,
+  type RelayThreadVmCancelSetupResponse,
+  type RelayThreadVmResetRequest,
+  type RelayThreadVmResetResponse,
+  type RelayThreadVmReset,
+  type RelayThreadVmRestoreRequest,
+  type RelayThreadVmRestoreResponse,
+  type RelayThreadVmRestore,
+  type RelayThreadVmBackupRecoveryCandidate,
+  type RelayThreadVmBackupRecoveryRequest,
+  type RelayThreadVmBackupRecoveryCancellation,
+  type RelayThreadVmReplacement,
+  type RelayThreadVmReplacementCandidate,
+  type RelayPortableThreadPlacement,
+  type RelayAssignedWorkflowThreadPlacement,
+  type RelayThreadActiveMove,
+  type RelayPortableThreadPage,
+  type RelayThreadHistoryPage,
+  type RelayThreadCurrentQueue,
+  type RelayThreadCommandReceipt,
+  type RelayThreadPendingCommandPage,
   type RelayConnectMachineResponse,
   type RelayIssueTrackerConnections,
   type RelayIssueTrackerService,
@@ -48,17 +93,38 @@ import {
   type RelayRepositoryAccessEntry,
   type RelayRepositoryId,
   type RelayRepositorySummary,
+  type RelayRepositoryWorkflowConfiguration,
+  type RelayUpdateRepositoryWorkflowConfiguration,
+  RelayAuthInvalidError,
+  RelayTenancyConflictError,
+  RelayTenancyForbiddenError,
+  RelayTenancyInvalidError,
+  RelayTenancyNotFoundError,
 } from "@t3tools/contracts/relay";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import type {
+  WorkflowSavedResult,
+  RepositoryWorkflow,
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  WorkflowJobPage,
+  WorkflowJobPageQuery,
+  SaveRepositoryWorkflow,
+  RunRepositoryWorkflow,
+  RespondToWorkflowJob,
+} from "@t3tools/contracts/workflows";
 import * as Context from "effect/Context";
+import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import {
   bearerHeaders,
   ManagedRelayUrlInvalidError,
+  ManagedRelayRequestFailedError,
   relayRequestError,
   timeoutRelayRequest,
   type ManagedRelayClientError,
@@ -68,10 +134,121 @@ export interface ManagedRelayTenancyClientOptions {
   readonly relayUrl: string;
 }
 
+interface ActiveThreadMoveRequest {
+  readonly clerkToken: string;
+  readonly threadId: ThreadId;
+  readonly operationId: string;
+  readonly sourceGeneration: number;
+}
+
+const isWorkflowEnvironmentError = Schema.is(
+  Schema.Union([
+    RelayAuthInvalidError,
+    RelayTenancyConflictError,
+    RelayTenancyForbiddenError,
+    RelayTenancyInvalidError,
+    RelayTenancyNotFoundError,
+  ]),
+);
+
+function workflowEnvironmentRequestError(
+  action: "read workflow environment" | "save workflow environment",
+) {
+  return (cause: unknown) =>
+    new ManagedRelayRequestFailedError({
+      action,
+      // Transport and schema errors can carry the complete request, including a secret.
+      cause: undefined,
+      ...(isWorkflowEnvironmentError(cause) ? { relayError: cause, traceId: cause.traceId } : {}),
+    });
+}
+
 export class ManagedRelayTenancyClient extends Context.Service<
   ManagedRelayTenancyClient,
   {
     readonly relayUrl: string;
+    readonly getHealth: () => Effect.Effect<RelayHealthResponse, ManagedRelayClientError>;
+    readonly readWorkflowCatalog: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<
+      import("@t3tools/contracts/workflows").WorkflowCatalog,
+      ManagedRelayClientError
+    >;
+    readonly listWorkflows: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<ReadonlyArray<RepositoryWorkflow>, ManagedRelayClientError>;
+    readonly saveWorkflow: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly payload: typeof SaveRepositoryWorkflow.Type;
+    }) => Effect.Effect<RepositoryWorkflow, ManagedRelayClientError>;
+    readonly listWorkflowJobs: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<ReadonlyArray<RepositoryWorkflowJobSummary>, ManagedRelayClientError>;
+    readonly pageWorkflowJobs: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly query: WorkflowJobPageQuery;
+    }) => Effect.Effect<WorkflowJobPage, ManagedRelayClientError>;
+    readonly runWorkflow: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly payload: typeof RunRepositoryWorkflow.Type;
+    }) => Effect.Effect<RepositoryWorkflowJob, ManagedRelayClientError>;
+    readonly getWorkflowJob: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+    }) => Effect.Effect<RepositoryWorkflowJob, ManagedRelayClientError>;
+    readonly getWorkflowJobResult: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+    }) => Effect.Effect<RelayAssignedWorkflowThreadPlacement, ManagedRelayClientError>;
+    readonly listSavedWorkflowResults: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      before?: number;
+    }) => Effect.Effect<
+      {
+        results: ReadonlyArray<WorkflowSavedResult>;
+        nextCursor: number | null;
+        threadId: ThreadId;
+        generation: number;
+      },
+      ManagedRelayClientError
+    >;
+    readonly readSavedWorkflowResult: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      resultId: string;
+    }) => Effect.Effect<{ result: WorkflowSavedResult; patch: string }, ManagedRelayClientError>;
+    readonly getSavedWorkflowHistory: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      resultId: string;
+      after: number;
+      limit: number;
+    }) => Effect.Effect<RelayThreadHistoryPage, ManagedRelayClientError>;
+    readonly downloadSavedWorkflowAttachment: (input: {
+      clerkToken: string;
+      repositoryId: RelayRepositoryId;
+      jobId: string;
+      resultId: string;
+      attachmentId: string;
+    }) => Effect.Effect<Uint8Array, ManagedRelayClientError>;
+    readonly respondToWorkflowJob: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+      readonly payload: typeof RespondToWorkflowJob.Type;
+    }) => Effect.Effect<RepositoryWorkflowJob, ManagedRelayClientError>;
     /** Also what creates the caller's organization the first time they ask. */
     readonly getOrganization: (input: {
       readonly clerkToken: string;
@@ -114,6 +291,15 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listRepositories: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayRepositorySummary>, ManagedRelayClientError>;
+    readonly getRepositoryWorkflowConfiguration: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+    }) => Effect.Effect<RelayRepositoryWorkflowConfiguration, ManagedRelayClientError>;
+    readonly updateRepositoryWorkflowConfiguration: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly payload: RelayUpdateRepositoryWorkflowConfiguration;
+    }) => Effect.Effect<RelayRepositoryWorkflowConfiguration, ManagedRelayClientError>;
     readonly listOrganizationProjects: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayOrganizationProject>, ManagedRelayClientError>;
@@ -153,6 +339,199 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly repositoryId: RelayRepositoryId;
       readonly userId: string;
     }) => Effect.Effect<RelayOkResponse, ManagedRelayClientError>;
+    readonly stagePortableThreadCommand: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly command: PortableThreadCommand;
+    }) => Effect.Effect<RelayThreadCommandReceipt, ManagedRelayClientError>;
+    readonly cancelActiveThreadMove: (
+      input: ActiveThreadMoveRequest,
+    ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
+    readonly retryActiveThreadMove: (
+      input: ActiveThreadMoveRequest & { readonly failedAttempt: number },
+    ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
+    readonly getThreadMoveCancellation: (
+      input: ActiveThreadMoveRequest,
+    ) => Effect.Effect<RelayThreadActiveMove, ManagedRelayClientError>;
+    readonly getPendingPortableThreadCommands: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly after: number;
+      readonly limit: number;
+    }) => Effect.Effect<RelayThreadPendingCommandPage, ManagedRelayClientError>;
+    readonly getPortableThreadCommandReceipt: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly commandId: string;
+    }) => Effect.Effect<RelayThreadCommandReceipt | null, ManagedRelayClientError>;
+    readonly listPortableThreads: (input: {
+      readonly clerkToken: string;
+      readonly after?: string;
+      readonly limit: number;
+    }) => Effect.Effect<RelayPortableThreadPage, ManagedRelayClientError>;
+    readonly getPortableThreadPlacement: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayPortableThreadPlacement, ManagedRelayClientError>;
+    readonly downloadPortableThreadAttachment: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly attachmentId: string;
+    }) => Effect.Effect<Uint8Array, ManagedRelayClientError>;
+    readonly getPortableThreadCurrentQueue: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly commandId?: CommandId;
+    }) => Effect.Effect<RelayThreadCurrentQueue, ManagedRelayClientError>;
+    readonly getPortableThreadHistory: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly after: number;
+      readonly limit: number;
+    }) => Effect.Effect<RelayThreadHistoryPage, ManagedRelayClientError>;
+    readonly openThreadVmPreview: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly port: number;
+    }) => Effect.Effect<RelayThreadVmPreviewResponse, ManagedRelayClientError>;
+    readonly getThreadVmStatus: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmStatus, ManagedRelayClientError>;
+    readonly getThreadVmProviderAuth: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmProviderAuth | null, ManagedRelayClientError>;
+    readonly getThreadVmProviderAuthSource: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmCodexAuthSource | null, ManagedRelayClientError>;
+    readonly getThreadVmCodexPreference: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmCodexPreference, ManagedRelayClientError>;
+    readonly setThreadVmCodexPreference: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmCodexPreferenceRequest;
+    }) => Effect.Effect<RelayThreadVmCodexPreference, ManagedRelayClientError>;
+    readonly selectThreadVmProviderAuthSource: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmProviderAuthRequest & {
+        readonly source: RelayThreadVmCodexAuthSelection;
+      };
+    }) => Effect.Effect<RelayThreadVmCodexAuthSource, ManagedRelayClientError>;
+    readonly startThreadVmProviderAuth: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmProviderAuthRequest;
+    }) => Effect.Effect<RelayThreadVmProviderAuth, ManagedRelayClientError>;
+    readonly cancelThreadVmProviderAuth: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmProviderAuthRequest & { readonly flowId: string };
+    }) => Effect.Effect<RelayThreadVmProviderAuth, ManagedRelayClientError>;
+    readonly getThreadVmSetup: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmSetup | null, ManagedRelayClientError>;
+    readonly resumeThreadVm: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmResumeResponse, ManagedRelayClientError>;
+    readonly cancelThreadVmSetup: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmCancelSetupResponse, ManagedRelayClientError>;
+    readonly createThreadVm: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayThreadVmCreateRequest;
+    }) => Effect.Effect<RelayThreadVmCreateResponse, ManagedRelayClientError>;
+    readonly permanentlyDeleteThread: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadDeletionRequest;
+    }) => Effect.Effect<RelayThreadDeletion, ManagedRelayClientError>;
+    readonly getThreadDeletion: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadDeletion, ManagedRelayClientError>;
+    readonly resetThreadVm: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmResetRequest;
+    }) => Effect.Effect<RelayThreadVmResetResponse, ManagedRelayClientError>;
+    readonly getThreadVmReset: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly operationId: string;
+    }) => Effect.Effect<RelayThreadVmReset, ManagedRelayClientError>;
+    readonly cancelThreadVmReset: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly operationId: string;
+    }) => Effect.Effect<RelayThreadVmReset, ManagedRelayClientError>;
+    readonly restoreThreadVm: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmRestoreRequest;
+    }) => Effect.Effect<RelayThreadVmRestoreResponse, ManagedRelayClientError>;
+    readonly getThreadVmBackupRecovery: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+    }) => Effect.Effect<RelayThreadVmBackupRecoveryCandidate | null, ManagedRelayClientError>;
+    readonly restoreThreadVmBackup: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmBackupRecoveryRequest;
+    }) => Effect.Effect<RelayThreadVmRestoreResponse, ManagedRelayClientError>;
+    readonly cancelThreadVmBackupRecovery: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly payload: RelayThreadVmBackupRecoveryRequest;
+    }) => Effect.Effect<RelayThreadVmBackupRecoveryCancellation, ManagedRelayClientError>;
+    readonly getThreadVmRestore: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly operationId: string;
+    }) => Effect.Effect<RelayThreadVmRestore, ManagedRelayClientError>;
+    readonly cancelThreadVmRestore: (input: {
+      readonly clerkToken: string;
+      readonly threadId: ThreadId;
+      readonly operationId: string;
+    }) => Effect.Effect<RelayThreadVmRestore, ManagedRelayClientError>;
+    readonly getThreadVmReplacementCandidates: (input: {
+      readonly clerkToken: string;
+      readonly requestId: string;
+    }) => Effect.Effect<ReadonlyArray<RelayThreadVmReplacementCandidate>, ManagedRelayClientError>;
+    readonly getThreadVmReplacement: (input: {
+      readonly clerkToken: string;
+      readonly requestId: string;
+    }) => Effect.Effect<RelayThreadVmReplacement, ManagedRelayClientError>;
+    readonly selectThreadVmReplacement: (input: {
+      readonly clerkToken: string;
+      readonly requestId: string;
+      readonly victimAllocationId: string;
+    }) => Effect.Effect<RelayThreadVmReplacement, ManagedRelayClientError>;
+    readonly cancelThreadVmReplacement: (input: {
+      readonly clerkToken: string;
+      readonly requestId: string;
+    }) => Effect.Effect<RelayThreadVmReplacement, ManagedRelayClientError>;
+    readonly getThreadVmPolicy: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<ThreadVmPolicyRecord, ManagedRelayClientError>;
+    readonly getWorkflowVmPolicy: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<WorkflowVmPolicyRecord, ManagedRelayClientError>;
+    readonly updateWorkflowVmPolicy: (input: {
+      readonly clerkToken: string;
+      readonly payload: WorkflowVmPolicyRecord;
+    }) => Effect.Effect<WorkflowVmPolicyRecord, ManagedRelayClientError>;
+    readonly updateThreadVmPolicy: (input: {
+      readonly clerkToken: string;
+      readonly payload: ThreadVmPolicyRecord;
+    }) => Effect.Effect<ThreadVmPolicyRecord, ManagedRelayClientError>;
     readonly listMachines: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayMachine>, ManagedRelayClientError>;
@@ -191,6 +570,28 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listProviderAccounts: (input: {
       readonly clerkToken: string;
     }) => Effect.Effect<ReadonlyArray<RelayProviderAccount>, ManagedRelayClientError>;
+    readonly getCodexVmConnection: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
+    readonly startCodexVmSignIn: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayCodexVmStartSignIn;
+    }) => Effect.Effect<RelayCodexVmStartSignInResponse, ManagedRelayClientError>;
+    readonly completeCodexVmSignIn: (input: {
+      readonly clerkToken: string;
+      readonly payload: RelayCodexVmCompleteSignIn;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
+    readonly getCodexVmSignInAttempt: (input: {
+      readonly clerkToken: string;
+      readonly attemptId: string;
+    }) => Effect.Effect<RelayCodexVmSignInAttempt | null, ManagedRelayClientError>;
+    readonly cancelCodexVmSignIn: (input: {
+      readonly clerkToken: string;
+      readonly attemptId: string;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
+    readonly disconnectCodexVmConnection: (input: {
+      readonly clerkToken: string;
+    }) => Effect.Effect<RelayCodexVmConnection, ManagedRelayClientError>;
     readonly saveProviderAccount: (input: {
       readonly clerkToken: string;
       readonly provider: RelayProviderAccountProvider;
@@ -253,7 +654,29 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     });
   return ManagedRelayTenancyClient.of({
     relayUrl,
+    getHealth: unavailable("clientRuntime.managedRelayTenancy.getHealth"),
     getOrganization: unavailable("clientRuntime.managedRelayTenancy.getOrganization"),
+    readWorkflowCatalog: unavailable("clientRuntime.managedRelayTenancy.readWorkflowCatalog"),
+    listWorkflows: unavailable("clientRuntime.managedRelayTenancy.listWorkflows"),
+    saveWorkflow: unavailable("clientRuntime.managedRelayTenancy.saveWorkflow"),
+    listWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.listWorkflowJobs"),
+    pageWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.pageWorkflowJobs"),
+    runWorkflow: unavailable("clientRuntime.managedRelayTenancy.runWorkflow"),
+    getWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJob"),
+    getWorkflowJobResult: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJobResult"),
+    listSavedWorkflowResults: unavailable(
+      "clientRuntime.managedRelayTenancy.listSavedWorkflowResults",
+    ),
+    readSavedWorkflowResult: unavailable(
+      "clientRuntime.managedRelayTenancy.readSavedWorkflowResult",
+    ),
+    getSavedWorkflowHistory: unavailable(
+      "clientRuntime.managedRelayTenancy.getSavedWorkflowHistory",
+    ),
+    downloadSavedWorkflowAttachment: unavailable(
+      "clientRuntime.managedRelayTenancy.downloadSavedWorkflowAttachment",
+    ),
+    respondToWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.respondToWorkflowJob"),
     renameOrganization: unavailable("clientRuntime.managedRelayTenancy.renameOrganization"),
     listMembers: unavailable("clientRuntime.managedRelayTenancy.listMembers"),
     updateMemberRole: unavailable("clientRuntime.managedRelayTenancy.updateMemberRole"),
@@ -264,6 +687,12 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     revokeInvitation: unavailable("clientRuntime.managedRelayTenancy.revokeInvitation"),
     acceptInvitation: unavailable("clientRuntime.managedRelayTenancy.acceptInvitation"),
     listRepositories: unavailable("clientRuntime.managedRelayTenancy.listRepositories"),
+    getRepositoryWorkflowConfiguration: unavailable(
+      "clientRuntime.managedRelayTenancy.getRepositoryWorkflowConfiguration",
+    ),
+    updateRepositoryWorkflowConfiguration: unavailable(
+      "clientRuntime.managedRelayTenancy.updateRepositoryWorkflowConfiguration",
+    ),
     listOrganizationProjects: unavailable(
       "clientRuntime.managedRelayTenancy.listOrganizationProjects",
     ),
@@ -275,6 +704,91 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     listAccess: unavailable("clientRuntime.managedRelayTenancy.listAccess"),
     grantAccess: unavailable("clientRuntime.managedRelayTenancy.grantAccess"),
     revokeAccess: unavailable("clientRuntime.managedRelayTenancy.revokeAccess"),
+    stagePortableThreadCommand: unavailable(
+      "clientRuntime.managedRelayTenancy.stagePortableThreadCommand",
+    ),
+    cancelActiveThreadMove: unavailable("clientRuntime.managedRelayTenancy.cancelActiveThreadMove"),
+    retryActiveThreadMove: unavailable("clientRuntime.managedRelayTenancy.retryActiveThreadMove"),
+    getThreadMoveCancellation: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadMoveCancellation",
+    ),
+    getPendingPortableThreadCommands: unavailable(
+      "clientRuntime.managedRelayTenancy.getPendingPortableThreadCommands",
+    ),
+    getPortableThreadCommandReceipt: unavailable(
+      "clientRuntime.managedRelayTenancy.getPortableThreadCommandReceipt",
+    ),
+    listPortableThreads: unavailable("clientRuntime.managedRelayTenancy.listPortableThreads"),
+    getPortableThreadPlacement: unavailable(
+      "clientRuntime.managedRelayTenancy.getPortableThreadPlacement",
+    ),
+    downloadPortableThreadAttachment: unavailable(
+      "clientRuntime.managedRelayTenancy.downloadPortableThreadAttachment",
+    ),
+    getPortableThreadCurrentQueue: unavailable(
+      "clientRuntime.managedRelayTenancy.getPortableThreadCurrentQueue",
+    ),
+    getPortableThreadHistory: unavailable(
+      "clientRuntime.managedRelayTenancy.getPortableThreadHistory",
+    ),
+    openThreadVmPreview: unavailable("clientRuntime.managedRelayTenancy.openThreadVmPreview"),
+    getThreadVmStatus: unavailable("clientRuntime.managedRelayTenancy.getThreadVmStatus"),
+    getThreadVmProviderAuth: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmProviderAuth",
+    ),
+    getThreadVmProviderAuthSource: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmProviderAuthSource",
+    ),
+    getThreadVmCodexPreference: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmCodexPreference",
+    ),
+    setThreadVmCodexPreference: unavailable(
+      "clientRuntime.managedRelayTenancy.setThreadVmCodexPreference",
+    ),
+    selectThreadVmProviderAuthSource: unavailable(
+      "clientRuntime.managedRelayTenancy.selectThreadVmProviderAuthSource",
+    ),
+    startThreadVmProviderAuth: unavailable(
+      "clientRuntime.managedRelayTenancy.startThreadVmProviderAuth",
+    ),
+    cancelThreadVmProviderAuth: unavailable(
+      "clientRuntime.managedRelayTenancy.cancelThreadVmProviderAuth",
+    ),
+    getThreadVmSetup: unavailable("clientRuntime.managedRelayTenancy.getThreadVmSetup"),
+    resumeThreadVm: unavailable("clientRuntime.managedRelayTenancy.resumeThreadVm"),
+    cancelThreadVmSetup: unavailable("clientRuntime.managedRelayTenancy.cancelThreadVmSetup"),
+    createThreadVm: unavailable("clientRuntime.managedRelayTenancy.createThreadVm"),
+    permanentlyDeleteThread: unavailable(
+      "clientRuntime.managedRelayTenancy.permanentlyDeleteThread",
+    ),
+    getThreadDeletion: unavailable("clientRuntime.managedRelayTenancy.getThreadDeletion"),
+    resetThreadVm: unavailable("clientRuntime.managedRelayTenancy.resetThreadVm"),
+    getThreadVmReset: unavailable("clientRuntime.managedRelayTenancy.getThreadVmReset"),
+    cancelThreadVmReset: unavailable("clientRuntime.managedRelayTenancy.cancelThreadVmReset"),
+    restoreThreadVm: unavailable("clientRuntime.managedRelayTenancy.restoreThreadVm"),
+    getThreadVmBackupRecovery: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmBackupRecovery",
+    ),
+    restoreThreadVmBackup: unavailable("clientRuntime.managedRelayTenancy.restoreThreadVmBackup"),
+    cancelThreadVmBackupRecovery: unavailable(
+      "clientRuntime.managedRelayTenancy.cancelThreadVmBackupRecovery",
+    ),
+    getThreadVmRestore: unavailable("clientRuntime.managedRelayTenancy.getThreadVmRestore"),
+    cancelThreadVmRestore: unavailable("clientRuntime.managedRelayTenancy.cancelThreadVmRestore"),
+    getThreadVmReplacementCandidates: unavailable(
+      "clientRuntime.managedRelayTenancy.getThreadVmReplacementCandidates",
+    ),
+    getThreadVmReplacement: unavailable("clientRuntime.managedRelayTenancy.getThreadVmReplacement"),
+    selectThreadVmReplacement: unavailable(
+      "clientRuntime.managedRelayTenancy.selectThreadVmReplacement",
+    ),
+    cancelThreadVmReplacement: unavailable(
+      "clientRuntime.managedRelayTenancy.cancelThreadVmReplacement",
+    ),
+    getThreadVmPolicy: unavailable("clientRuntime.managedRelayTenancy.getThreadVmPolicy"),
+    getWorkflowVmPolicy: unavailable("clientRuntime.managedRelayTenancy.getWorkflowVmPolicy"),
+    updateWorkflowVmPolicy: unavailable("clientRuntime.managedRelayTenancy.updateWorkflowVmPolicy"),
+    updateThreadVmPolicy: unavailable("clientRuntime.managedRelayTenancy.updateThreadVmPolicy"),
     listMachines: unavailable("clientRuntime.managedRelayTenancy.listMachines"),
     provisionMachine: unavailable("clientRuntime.managedRelayTenancy.provisionMachine"),
     connectMachine: unavailable("clientRuntime.managedRelayTenancy.connectMachine"),
@@ -288,6 +802,16 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     disconnectGithub: unavailable("clientRuntime.managedRelayTenancy.disconnectGithub"),
     listGithubRepositories: unavailable("clientRuntime.managedRelayTenancy.listGithubRepositories"),
     listProviderAccounts: unavailable("clientRuntime.managedRelayTenancy.listProviderAccounts"),
+    getCodexVmConnection: unavailable("clientRuntime.managedRelayTenancy.getCodexVmConnection"),
+    startCodexVmSignIn: unavailable("clientRuntime.managedRelayTenancy.startCodexVmSignIn"),
+    completeCodexVmSignIn: unavailable("clientRuntime.managedRelayTenancy.completeCodexVmSignIn"),
+    getCodexVmSignInAttempt: unavailable(
+      "clientRuntime.managedRelayTenancy.getCodexVmSignInAttempt",
+    ),
+    cancelCodexVmSignIn: unavailable("clientRuntime.managedRelayTenancy.cancelCodexVmSignIn"),
+    disconnectCodexVmConnection: unavailable(
+      "clientRuntime.managedRelayTenancy.disconnectCodexVmConnection",
+    ),
     saveProviderAccount: unavailable("clientRuntime.managedRelayTenancy.saveProviderAccount"),
     deleteProviderAccount: unavailable("clientRuntime.managedRelayTenancy.deleteProviderAccount"),
     listIssueTrackerConnections: unavailable(
@@ -323,6 +847,250 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
 
   return ManagedRelayTenancyClient.of({
     relayUrl,
+    getHealth: Effect.fnUntraced(
+      function* () {
+        return yield* client.health
+          .health({})
+          .pipe(
+            Effect.mapError(relayRequestError("read relay health")),
+            timeoutRelayRequest("Relay health read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getHealth"),
+      withRelayClientTracing,
+    ),
+    readWorkflowCatalog: Effect.fn("clientRuntime.managedRelayTenancy.readWorkflowCatalog")(
+      function* (input) {
+        return yield* client.workflows
+          .list({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("listWorkflows")),
+            timeoutRelayRequest("listWorkflows"),
+          );
+      },
+    ),
+    listWorkflows: Effect.fn("clientRuntime.managedRelayTenancy.listWorkflows")(function* (input) {
+      return yield* client.workflows
+        .list({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+        })
+        .pipe(
+          Effect.map((response) => response.workflows),
+          Effect.mapError(relayRequestError("listWorkflows")),
+          timeoutRelayRequest("listWorkflows"),
+        );
+    }),
+    saveWorkflow: Effect.fn("clientRuntime.managedRelayTenancy.saveWorkflow")(function* (input) {
+      return yield* client.workflows
+        .save({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+          payload: input.payload,
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("saveWorkflow")),
+          timeoutRelayRequest("saveWorkflow"),
+        );
+    }),
+    listWorkflowJobs: Effect.fn("clientRuntime.managedRelayTenancy.listWorkflowJobs")(
+      function* (input) {
+        return yield* client.workflows
+          .listJobs({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+          })
+          .pipe(
+            Effect.map((response) => response.jobs),
+            Effect.mapError(relayRequestError("listWorkflowJobs")),
+            timeoutRelayRequest("listWorkflowJobs"),
+          );
+      },
+    ),
+    pageWorkflowJobs: Effect.fn("clientRuntime.managedRelayTenancy.pageWorkflowJobs")(
+      function* (input) {
+        return yield* client.workflows
+          .pageJobs({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId },
+            query: input.query,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("pageWorkflowJobs")),
+            timeoutRelayRequest("pageWorkflowJobs"),
+          );
+      },
+    ),
+    runWorkflow: Effect.fn("clientRuntime.managedRelayTenancy.runWorkflow")(function* (input) {
+      return yield* client.workflows
+        .run({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+          payload: input.payload,
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("runWorkflow")),
+          timeoutRelayRequest("runWorkflow"),
+        );
+    }),
+    getWorkflowJob: Effect.fn("clientRuntime.managedRelayTenancy.getWorkflowJob")(
+      function* (input) {
+        return yield* client.workflows
+          .getJob({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("getWorkflowJob")),
+            timeoutRelayRequest("getWorkflowJob"),
+          );
+      },
+    ),
+    getWorkflowJobResult: Effect.fn("clientRuntime.managedRelayTenancy.getWorkflowJobResult")(
+      function* (input) {
+        return yield* client.workflows
+          .getJobResult({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("getWorkflowJobResult")),
+            timeoutRelayRequest("getWorkflowJobResult"),
+          );
+      },
+    ),
+    listSavedWorkflowResults: Effect.fn(
+      "clientRuntime.managedRelayTenancy.listSavedWorkflowResults",
+    )(function* (input) {
+      return yield* client.workflows
+        .listSavedResults({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          query: input.before === undefined ? {} : { before: input.before },
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("listSavedWorkflowResults")),
+          timeoutRelayRequest("listSavedWorkflowResults"),
+        );
+    }),
+    readSavedWorkflowResult: Effect.fn("clientRuntime.managedRelayTenancy.readSavedWorkflowResult")(
+      function* (input) {
+        return yield* client.workflows
+          .readSavedResult({
+            headers: bearerHeaders(input.clerkToken),
+            params: {
+              repositoryId: input.repositoryId,
+              jobId: input.jobId,
+              resultId: input.resultId,
+            },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("readSavedWorkflowResult")),
+            timeoutRelayRequest("readSavedWorkflowResult"),
+          );
+      },
+    ),
+    getSavedWorkflowHistory: Effect.fn("clientRuntime.managedRelayTenancy.getSavedWorkflowHistory")(
+      function* (input) {
+        return yield* client.workflows
+          .getSavedHistory({
+            headers: bearerHeaders(input.clerkToken),
+            params: {
+              repositoryId: input.repositoryId,
+              jobId: input.jobId,
+              resultId: input.resultId,
+            },
+            query: { after: input.after, limit: input.limit },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("getSavedWorkflowHistory")),
+            timeoutRelayRequest("getSavedWorkflowHistory"),
+          );
+      },
+    ),
+    downloadSavedWorkflowAttachment: Effect.fnUntraced(
+      function* (input) {
+        const body = yield* client.workflows
+          .getSavedAttachment({
+            headers: bearerHeaders(input.clerkToken),
+            params: {
+              repositoryId: input.repositoryId,
+              jobId: input.jobId,
+              resultId: input.resultId,
+              attachmentId: input.attachmentId,
+            },
+          })
+          .pipe(Effect.mapError(relayRequestError("read saved thread attachment")));
+        const parts: Uint8Array[] = [];
+        let size = 0;
+        yield* body.pipe(
+          Stream.mapError(relayRequestError("read saved thread attachment")),
+          Stream.runForEach((part) =>
+            Effect.gen(function* () {
+              size += part.length;
+              if (size > 50 * 1024 * 1024)
+                return yield* Effect.fail(
+                  new ManagedRelayRequestFailedError({
+                    action: "read saved thread attachment",
+                    cause: new Error("Attachment exceeded the download limit."),
+                  }),
+                );
+              parts.push(part);
+            }),
+          ),
+        );
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const part of parts) {
+          bytes.set(part, offset);
+          offset += part.length;
+        }
+        return bytes;
+      },
+      timeoutRelayRequest("Saved thread attachment download"),
+      Effect.withSpan("clientRuntime.managedRelayTenancy.downloadSavedWorkflowAttachment"),
+      withRelayClientTracing,
+    ),
+    respondToWorkflowJob: Effect.fn("clientRuntime.managedRelayTenancy.respondToWorkflowJob")(
+      function* (input) {
+        const request = {
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId, jobId: input.jobId },
+        };
+        const payload = input.payload;
+        const response = (() => {
+          switch (payload.operation) {
+            case "retry_saving":
+              return client.workflows.respond({ ...request, payload });
+            case "pause":
+              return client.workflows.respond({ ...request, payload });
+            case "resume":
+              return client.workflows.respond({ ...request, payload });
+            case "approve":
+              return client.workflows.respond({ ...request, payload });
+            case "input":
+              return client.workflows.respond({ ...request, payload });
+            case "request_changes":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_action":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_preparation":
+              return client.workflows.respond({ ...request, payload });
+            case "retry_cancellation":
+              return client.workflows.respond({ ...request, payload });
+            case "cancel":
+              return client.workflows.respond({ ...request, payload });
+          }
+        })();
+        return yield* response.pipe(
+          Effect.mapError(relayRequestError("respondToWorkflowJob")),
+          timeoutRelayRequest("respondToWorkflowJob"),
+        );
+      },
+    ),
     getOrganization: Effect.fnUntraced(
       function* (input) {
         return yield* client.organization
@@ -480,6 +1248,29 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.listRepositories"),
       withRelayClientTracing,
     ),
+    getRepositoryWorkflowConfiguration: (input) =>
+      client.repositories
+        .getRepositoryWorkflowConfiguration({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+        })
+        .pipe(
+          Effect.mapError(workflowEnvironmentRequestError("read workflow environment")),
+          timeoutRelayRequest("Workflow environment read"),
+          Effect.withTracerEnabled(false),
+        ),
+    updateRepositoryWorkflowConfiguration: (input) =>
+      client.repositories
+        .updateRepositoryWorkflowConfiguration({
+          headers: bearerHeaders(input.clerkToken),
+          params: { repositoryId: input.repositoryId },
+          payload: input.payload,
+        })
+        .pipe(
+          Effect.mapError(workflowEnvironmentRequestError("save workflow environment")),
+          timeoutRelayRequest("Workflow environment update"),
+          Effect.withTracerEnabled(false),
+        ),
     listOrganizationProjects: Effect.fnUntraced(
       function* (input) {
         return yield* client.organizationProjects
@@ -615,6 +1406,689 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           );
       },
       Effect.withSpan("clientRuntime.managedRelayTenancy.revokeAccess"),
+      withRelayClientTracing,
+    ),
+    stagePortableThreadCommand: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .stage({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: { command: input.command },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("queue portable thread command")),
+            timeoutRelayRequest("Portable thread command submission"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.stagePortableThreadCommand"),
+      withRelayClientTracing,
+    ),
+    cancelActiveThreadMove: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .cancelMove({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+            payload: { sourceGeneration: input.sourceGeneration },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel active thread move")),
+            timeoutRelayRequest("Active thread move cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelActiveThreadMove"),
+      withRelayClientTracing,
+    ),
+    getThreadMoveCancellation: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .getMoveCancellation({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+            query: { sourceGeneration: input.sourceGeneration },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read thread move cancellation")),
+            timeoutRelayRequest("Thread move cancellation read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadMoveCancellation"),
+      withRelayClientTracing,
+    ),
+    retryActiveThreadMove: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .retryMove({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+            payload: {
+              sourceGeneration: input.sourceGeneration,
+              failedAttempt: input.failedAttempt,
+            },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("retry active thread move")),
+            timeoutRelayRequest("Active thread move retry"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.retryActiveThreadMove"),
+      withRelayClientTracing,
+    ),
+    getPendingPortableThreadCommands: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .pending({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            query: { after: input.after, limit: input.limit },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read pending portable thread commands")),
+            timeoutRelayRequest("Pending portable thread commands"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getPendingPortableThreadCommands"),
+      withRelayClientTracing,
+    ),
+    getPortableThreadCommandReceipt: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadCommands
+          .receipt({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, commandId: input.commandId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read portable thread command receipt")),
+            timeoutRelayRequest("Portable thread command receipt read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getPortableThreadCommandReceipt"),
+      withRelayClientTracing,
+    ),
+    listPortableThreads: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadHistory
+          .listThreads({
+            headers: bearerHeaders(input.clerkToken),
+            query: {
+              limit: input.limit,
+              ...(input.after === undefined ? {} : { after: input.after }),
+            },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("list portable threads")),
+            timeoutRelayRequest("Portable thread list read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.listPortableThreads"),
+      withRelayClientTracing,
+    ),
+    getPortableThreadPlacement: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadHistory
+          .getPlacement({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read portable thread placement")),
+            timeoutRelayRequest("Portable thread placement read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getPortableThreadPlacement"),
+      withRelayClientTracing,
+    ),
+    downloadPortableThreadAttachment: Effect.fnUntraced(
+      function* (input) {
+        const body = yield* client.threadHistory
+          .getAttachment({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, attachmentId: input.attachmentId },
+          })
+          .pipe(Effect.mapError(relayRequestError("read saved thread attachment")));
+        const parts: Uint8Array[] = [];
+        let size = 0;
+        yield* body.pipe(
+          Stream.mapError(relayRequestError("read saved thread attachment")),
+          Stream.runForEach((part) =>
+            Effect.gen(function* () {
+              size += part.length;
+              if (size > 50 * 1024 * 1024)
+                return yield* Effect.fail(
+                  new ManagedRelayRequestFailedError({
+                    action: "read saved thread attachment",
+                    cause: new Error("Attachment exceeded the download limit."),
+                  }),
+                );
+              parts.push(part);
+            }),
+          ),
+        );
+        const bytes = new Uint8Array(size);
+        let offset = 0;
+        for (const part of parts) {
+          bytes.set(part, offset);
+          offset += part.length;
+        }
+        return bytes;
+      },
+      timeoutRelayRequest("Saved thread attachment download"),
+      Effect.withSpan("clientRuntime.managedRelayTenancy.downloadPortableThreadAttachment"),
+      withRelayClientTracing,
+    ),
+    getPortableThreadCurrentQueue: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadHistory
+          .getCurrentQueue({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            query: input.commandId ? { commandId: input.commandId } : {},
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read current thread queue")),
+            timeoutRelayRequest("Current thread queue read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getPortableThreadCurrentQueue"),
+      withRelayClientTracing,
+    ),
+    getPortableThreadHistory: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadHistory
+          .getHistory({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            query: { after: input.after, limit: input.limit },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read portable thread history")),
+            timeoutRelayRequest("Portable thread history read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getPortableThreadHistory"),
+      withRelayClientTracing,
+    ),
+    openThreadVmPreview: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .openPreview({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: { port: input.port },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("open private VM preview")),
+            timeoutRelayRequest("Private VM preview"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.openThreadVmPreview"),
+      withRelayClientTracing,
+    ),
+    getThreadVmStatus: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getStatus({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read thread VM status")),
+            timeoutRelayRequest("Thread VM status read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmStatus"),
+      withRelayClientTracing,
+    ),
+    getThreadVmProviderAuth: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getProviderAuth({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM Codex sign-in")),
+            timeoutRelayRequest("VM Codex sign-in read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmProviderAuth"),
+      withRelayClientTracing,
+    ),
+    getThreadVmProviderAuthSource: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getProviderAuthSource({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM Codex account source")),
+            timeoutRelayRequest("VM Codex account source read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmProviderAuthSource"),
+      withRelayClientTracing,
+    ),
+    getThreadVmCodexPreference: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getCodexPreference({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read saved VM Codex account")),
+            timeoutRelayRequest("Saved VM Codex account read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmCodexPreference"),
+      withRelayClientTracing,
+    ),
+    setThreadVmCodexPreference: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .setCodexPreference({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("save VM Codex account")),
+            timeoutRelayRequest("Saved VM Codex account write"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.setThreadVmCodexPreference"),
+      withRelayClientTracing,
+    ),
+    selectThreadVmProviderAuthSource: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .selectProviderAuthSource({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("select VM Codex account source")),
+            timeoutRelayRequest("VM Codex account source selection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.selectThreadVmProviderAuthSource"),
+      withRelayClientTracing,
+    ),
+    startThreadVmProviderAuth: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .startProviderAuth({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("start VM Codex sign-in")),
+            timeoutRelayRequest("VM Codex sign-in start"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.startThreadVmProviderAuth"),
+      withRelayClientTracing,
+    ),
+    cancelThreadVmProviderAuth: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .cancelProviderAuth({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel VM Codex sign-in")),
+            timeoutRelayRequest("VM Codex sign-in cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelThreadVmProviderAuth"),
+      withRelayClientTracing,
+    ),
+    getThreadVmSetup: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getSetup({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read thread VM setup")),
+            timeoutRelayRequest("Thread VM setup read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmSetup"),
+      withRelayClientTracing,
+    ),
+    resumeThreadVm: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .resume({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("resume thread VM")),
+            timeoutRelayRequest("Thread VM resume"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.resumeThreadVm"),
+      withRelayClientTracing,
+    ),
+    cancelThreadVmSetup: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .cancelSetup({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel thread VM setup")),
+            timeoutRelayRequest("Thread VM setup cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelThreadVmSetup"),
+      withRelayClientTracing,
+    ),
+    createThreadVm: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .create({ headers: bearerHeaders(input.clerkToken), payload: input.payload })
+          .pipe(
+            Effect.mapError(relayRequestError("create thread VM")),
+            timeoutRelayRequest("Thread VM creation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.createThreadVm"),
+      withRelayClientTracing,
+    ),
+    permanentlyDeleteThread: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .permanentlyDelete({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("permanently delete thread")),
+            timeoutRelayRequest("Thread deletion"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.permanentlyDeleteThread"),
+      withRelayClientTracing,
+    ),
+    getThreadDeletion: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getDeletion({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read thread deletion")),
+            timeoutRelayRequest("Thread deletion status"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadDeletion"),
+      withRelayClientTracing,
+    ),
+    resetThreadVm: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .reset({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("reset thread VM")),
+            timeoutRelayRequest("VM reset"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.resetThreadVm"),
+      withRelayClientTracing,
+    ),
+    getThreadVmReset: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getReset({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM reset")),
+            timeoutRelayRequest("VM reset status"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmReset"),
+      withRelayClientTracing,
+    ),
+    cancelThreadVmReset: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .cancelReset({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel VM reset")),
+            timeoutRelayRequest("VM reset cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelThreadVmReset"),
+      withRelayClientTracing,
+    ),
+    restoreThreadVm: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .restore({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("restore thread VM")),
+            timeoutRelayRequest("VM restore"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.restoreThreadVm"),
+      withRelayClientTracing,
+    ),
+    getThreadVmBackupRecovery: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getBackupRecovery({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM backup recovery")),
+            timeoutRelayRequest("VM backup recovery"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmBackupRecovery"),
+      withRelayClientTracing,
+    ),
+    restoreThreadVmBackup: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .restoreBackup({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("restore VM backup")),
+            timeoutRelayRequest("VM backup recovery"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.restoreThreadVmBackup"),
+      withRelayClientTracing,
+    ),
+    cancelThreadVmBackupRecovery: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .cancelBackupRecovery({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId },
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel VM backup recovery")),
+            timeoutRelayRequest("VM backup recovery"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelThreadVmBackupRecovery"),
+      withRelayClientTracing,
+    ),
+    getThreadVmRestore: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getRestore({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM restore")),
+            timeoutRelayRequest("VM restore status"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmRestore"),
+      withRelayClientTracing,
+    ),
+    cancelThreadVmRestore: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .cancelRestore({
+            headers: bearerHeaders(input.clerkToken),
+            params: { threadId: input.threadId, operationId: input.operationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel VM restore")),
+            timeoutRelayRequest("VM restore cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelThreadVmRestore"),
+      withRelayClientTracing,
+    ),
+    getThreadVmReplacementCandidates: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getReplacementCandidates({
+            headers: bearerHeaders(input.clerkToken),
+            params: { requestId: input.requestId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM replacement choices")),
+            timeoutRelayRequest("VM replacement choices"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmReplacementCandidates"),
+      withRelayClientTracing,
+    ),
+    getThreadVmReplacement: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .getReplacement({
+            headers: bearerHeaders(input.clerkToken),
+            params: { requestId: input.requestId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("read VM replacement")),
+            timeoutRelayRequest("VM replacement read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmReplacement"),
+      withRelayClientTracing,
+    ),
+    selectThreadVmReplacement: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .selectReplacement({
+            headers: bearerHeaders(input.clerkToken),
+            params: { requestId: input.requestId },
+            payload: { victimAllocationId: input.victimAllocationId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("select VM replacement")),
+            timeoutRelayRequest("VM replacement selection"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.selectThreadVmReplacement"),
+      withRelayClientTracing,
+    ),
+    cancelThreadVmReplacement: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVms
+          .cancelReplacement({
+            headers: bearerHeaders(input.clerkToken),
+            params: { requestId: input.requestId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("cancel VM replacement")),
+            timeoutRelayRequest("VM replacement cancellation"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.cancelThreadVmReplacement"),
+      withRelayClientTracing,
+    ),
+    getThreadVmPolicy: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVmPolicy
+          .getThreadVmPolicy({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("read thread VM policy")),
+            timeoutRelayRequest("Thread VM policy read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getThreadVmPolicy"),
+      withRelayClientTracing,
+    ),
+    getWorkflowVmPolicy: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVmPolicy
+          .getWorkflowVmPolicy({ headers: bearerHeaders(input.clerkToken) })
+          .pipe(
+            Effect.mapError(relayRequestError("read workflow VM limit")),
+            timeoutRelayRequest("Workflow VM limit read"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.getWorkflowVmPolicy"),
+      withRelayClientTracing,
+    ),
+    updateWorkflowVmPolicy: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVmPolicy
+          .updateWorkflowVmPolicy({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("save workflow VM limit")),
+            timeoutRelayRequest("Workflow VM limit update"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.updateWorkflowVmPolicy"),
+      withRelayClientTracing,
+    ),
+    updateThreadVmPolicy: Effect.fnUntraced(
+      function* (input) {
+        return yield* client.threadVmPolicy
+          .updateThreadVmPolicy({
+            headers: bearerHeaders(input.clerkToken),
+            payload: input.payload,
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("update thread VM policy")),
+            timeoutRelayRequest("Thread VM policy update"),
+          );
+      },
+      Effect.withSpan("clientRuntime.managedRelayTenancy.updateThreadVmPolicy"),
       withRelayClientTracing,
     ),
     listMachines: Effect.fnUntraced(
@@ -755,6 +2229,60 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
       Effect.withSpan("clientRuntime.managedRelayTenancy.listGithubRepositories"),
       withRelayClientTracing,
     ),
+    getCodexVmConnection: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .status({ headers: bearerHeaders(input.clerkToken) })
+        .pipe(
+          Effect.mapError(relayRequestError("read Codex VM connection")),
+          timeoutRelayRequest("Codex VM connection"),
+        );
+    }),
+    startCodexVmSignIn: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .start({ headers: bearerHeaders(input.clerkToken), payload: input.payload })
+        .pipe(
+          Effect.mapError(relayRequestError("start Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in"),
+        );
+    }),
+    completeCodexVmSignIn: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .complete({ headers: bearerHeaders(input.clerkToken), payload: input.payload })
+        .pipe(
+          Effect.mapError(relayRequestError("complete Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in completion"),
+        );
+    }),
+    getCodexVmSignInAttempt: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .attempt({
+          headers: bearerHeaders(input.clerkToken),
+          params: { attemptId: input.attemptId },
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("read Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in status"),
+        );
+    }),
+    cancelCodexVmSignIn: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .cancel({
+          headers: bearerHeaders(input.clerkToken),
+          payload: { attemptId: input.attemptId },
+        })
+        .pipe(
+          Effect.mapError(relayRequestError("cancel Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM sign-in cancellation"),
+        );
+    }),
+    disconnectCodexVmConnection: Effect.fnUntraced(function* (input) {
+      return yield* client.codexVmConnections
+        .disconnect({ headers: bearerHeaders(input.clerkToken) })
+        .pipe(
+          Effect.mapError(relayRequestError("disconnect Codex VM sign-in")),
+          timeoutRelayRequest("Codex VM disconnection"),
+        );
+    }),
     listProviderAccounts: Effect.fnUntraced(
       function* (input) {
         return yield* client.organization

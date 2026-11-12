@@ -33,6 +33,7 @@ public final class T3KeyboardCommandsView: ExpoView {
     let isPad = UIDevice.current.userInterfaceIdiom == .pad
     var commands = [
       enabledCommand("newTask", input: "n", modifiers: .command, action: #selector(newTask), title: "New Task"),
+      enabledCommand("threadVms", input: "v", modifiers: [.command, .alternate], action: #selector(openThreadVms), title: "VM Threads"),
       enabledCommand("focusSearch", input: "f", modifiers: .command, action: #selector(focusSearch), title: "Find"),
       isPad
         ? enabledCommand("commandPalette", input: "k", modifiers: .command, action: #selector(openCommandPalette), title: "Command Palette")
@@ -135,6 +136,7 @@ public final class T3KeyboardCommandsView: ExpoView {
   }
 
   @objc private func newTask() { emit("newTask") }
+  @objc private func openThreadVms() { emit("threadVms") }
   @objc private func openCommandPalette() { emit("commandPalette") }
   @objc private func paletteNext() { emit("paletteNext") }
   @objc private func palettePrevious() { emit("palettePrevious") }

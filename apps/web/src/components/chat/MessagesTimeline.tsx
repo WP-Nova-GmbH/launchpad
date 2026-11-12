@@ -1,4 +1,4 @@
-import { ArrowUpIcon, ClockIcon } from "lucide-react";
+import { ArrowUpIcon, ClockIcon, PauseIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import { ReadOnlySourcePreview } from "../files/AttachmentFilePreview";
 import { useRightPanelStore } from "~/rightPanelStore";
 import {
@@ -157,6 +157,7 @@ import {
 } from "./SnapShotAttachmentDetails";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesCard } from "./ChangedFilesTree";
+import { LiveWorkspaceContext } from "../../lib/workflowResultGitAccess";
 import { useAtomValue } from "@effect/atom-react";
 import { useFileContextMenuHandler } from "../../fileContextMenu";
 import { useProject, useThread } from "../../state/entities";
@@ -303,6 +304,9 @@ interface TimelineRowSharedState {
   onSteerQueuedMessage: (id: string) => void;
   steerQueuedMessageShortcutLabel: string | null;
   onRemoveQueuedMessage: (id: string) => void;
+  onEditSharedPrompt: ((id: MessageId) => void) | undefined;
+  onRemoveSharedPrompt: ((id: MessageId) => void) | undefined;
+  onPauseSharedPrompt: (() => void) | undefined;
 }
 
 interface TimelineRowActivityState {
@@ -397,6 +401,7 @@ const TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH = {
 // ---------------------------------------------------------------------------
 
 interface MessagesTimelineProps {
+  canUseLiveWorkspace?: boolean;
   citationRequest?: AssistantCitationRequest | null;
   citationHistoryLoading?: boolean;
   onCiteAssistantText?: (
@@ -469,6 +474,9 @@ interface MessagesTimelineProps {
   onSteerQueuedMessage?: (id: string) => void;
   steerQueuedMessageShortcutLabel?: string | null;
   onRemoveQueuedMessage?: (id: string) => void;
+  onEditSharedPrompt?: ((id: MessageId) => void) | undefined;
+  onRemoveSharedPrompt?: ((id: MessageId) => void) | undefined;
+  onPauseSharedPrompt?: (() => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +484,7 @@ interface MessagesTimelineProps {
 // ---------------------------------------------------------------------------
 
 export const MessagesTimeline = memo(function MessagesTimeline({
+  canUseLiveWorkspace = true,
   citationRequest = null,
   citationHistoryLoading = false,
   onCiteAssistantText,
@@ -527,6 +536,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onSteerQueuedMessage = NOOP_QUEUED_MESSAGE_ACTION,
   steerQueuedMessageShortcutLabel = null,
   onRemoveQueuedMessage = NOOP_QUEUED_MESSAGE_ACTION,
+  onEditSharedPrompt,
+  onRemoveSharedPrompt,
+  onPauseSharedPrompt,
 }: MessagesTimelineProps) {
   const listIdentityKey = displayThreadKey ?? routeThreadKey;
   const rememberedPosition = useMemo(
@@ -1167,6 +1179,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onSteerQueuedMessage,
       steerQueuedMessageShortcutLabel,
       onRemoveQueuedMessage,
+      onEditSharedPrompt,
+      onRemoveSharedPrompt,
+      onPauseSharedPrompt,
     }),
     [
       readyCitationRequest,
@@ -1203,6 +1218,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onSteerQueuedMessage,
       steerQueuedMessageShortcutLabel,
       onRemoveQueuedMessage,
+      onEditSharedPrompt,
+      onRemoveSharedPrompt,
+      onPauseSharedPrompt,
     ],
   );
   const backgroundWorktreeSetup =
@@ -1263,7 +1281,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     );
   }
 
-  return (
+  const timeline = (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
         <div
@@ -1351,6 +1369,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       </TimelineRowActivityCtx>
     </TimelineRowCtx>
   );
+  return <LiveWorkspaceContext value={canUseLiveWorkspace}>{timeline}</LiveWorkspaceContext>;
 });
 
 function keyExtractor(item: MessagesTimelineRow) {
@@ -1748,7 +1767,7 @@ function WorktreeSetupTimelineRow({
     <WorktreeSetupCard
       snapshot={row.snapshot}
       embedded={row.embedded}
-      onCancel={row.embedded ? null : ctx.onCancelWorktreeSetup}
+      onCancel={ctx.onCancelWorktreeSetup}
       onWorkLocally={
         !row.embedded && row.snapshot.phase === "running" ? ctx.onWorktreeSetupWorkLocally : null
       }
@@ -2107,7 +2126,9 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     <div className="group flex flex-col items-end gap-1">
       <div className="relative max-w-[80%] rounded-2xl bg-message p-3 text-message-foreground">
         <MessageAuthorHeading>
-          {author?.displayName ?? (author ? "Teammate" : "You")}
+          {row.message.workflowOrigin
+            ? `Workflow · ${row.message.workflowOrigin.workflowName}`
+            : (author?.displayName ?? (author ? "Teammate" : "You"))}
         </MessageAuthorHeading>
         {(regularImages.length > 0 || userVideos.length > 0) && (
           <div className="mb-2 grid max-w-[210px] grid-cols-2 gap-2">
@@ -2221,6 +2242,11 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </div>
       </div>
       {author ? <UserMessageAuthorSignature author={author} /> : null}
+      {row.message.pendingStatus ? (
+        <p role="status" className="max-w-[80%] pe-1 text-right text-xs text-muted-foreground">
+          {row.message.pendingStatus}
+        </p>
+      ) : null}
       {modificationAttribution ? (
         <p className="max-w-[80%] pe-1 text-right text-2xs text-muted-foreground">
           {modificationAttribution}
@@ -2237,7 +2263,37 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             </TooltipPopup>
           </Tooltip>
           <div className="flex items-center gap-0.5">
-            {typeof revertTurnCount === "number" && (
+            {row.message.pendingPrompt && ctx.onPauseSharedPrompt ? (
+              <Button
+                size="icon-xs"
+                variant="ghost-muted"
+                aria-label="Pause message delivery"
+                onClick={ctx.onPauseSharedPrompt}
+              >
+                <PauseIcon />
+              </Button>
+            ) : null}
+            {row.message.pendingPrompt?.state === "pending" && ctx.onEditSharedPrompt ? (
+              <Button
+                size="icon-xs"
+                variant="ghost-muted"
+                aria-label="Edit pending message"
+                onClick={() => ctx.onEditSharedPrompt?.(row.message.id)}
+              >
+                <PencilIcon />
+              </Button>
+            ) : null}
+            {row.message.pendingPrompt?.state === "pending" && ctx.onRemoveSharedPrompt ? (
+              <Button
+                size="icon-xs"
+                variant="ghost-muted"
+                aria-label="Remove pending message"
+                onClick={() => ctx.onRemoveSharedPrompt?.(row.message.id)}
+              >
+                <Trash2Icon />
+              </Button>
+            ) : null}
+            {!row.message.pendingStatus && typeof revertTurnCount === "number" && (
               <RevertUserMessageButton turnCount={revertTurnCount} messageId={row.message.id} />
             )}
             {resolvedContext.text && (
@@ -3433,6 +3489,7 @@ function AssistantChangedFilesSectionInner({
     serverEnvironment.configValueAtom(ctx.activeThreadEnvironmentId),
   );
   const onFileContextMenu = useFileContextMenuHandler(ctx.activeThreadEnvironmentId);
+  const canUseLiveWorkspace = use(LiveWorkspaceContext);
 
   return (
     <ChangedFilesCard
@@ -3444,19 +3501,22 @@ function AssistantChangedFilesSectionInner({
         setExpanded(routeThreadKey, turnSummary.turnId, !allDirectoriesExpanded)
       }
       onOpenTurnDiff={onOpenTurnDiff}
-      onFileContextMenu={(filePath, event) =>
-        onFileContextMenu(
-          {
-            environmentId: ctx.activeThreadEnvironmentId,
-            filePath,
-            workspaceRoot: ctx.workspaceRoot,
-            repositoryRoot:
-              thread?.worktreePath == null
-                ? activeProject?.repositoryIdentity?.rootPath
-                : undefined,
-          },
-          event,
-        )
+      onFileContextMenu={
+        canUseLiveWorkspace
+          ? (filePath, event) =>
+              onFileContextMenu(
+                {
+                  environmentId: ctx.activeThreadEnvironmentId,
+                  filePath,
+                  workspaceRoot: ctx.workspaceRoot,
+                  repositoryRoot:
+                    thread?.worktreePath == null
+                      ? activeProject?.repositoryIdentity?.rootPath
+                      : undefined,
+                },
+                event,
+              )
+          : undefined
       }
     />
   );
@@ -3471,17 +3531,18 @@ function UserMessageMentionChip(props: {
   copyMarkdown: string;
 }) {
   const ctx = use(TimelineRowCtx);
+  const canUseLiveWorkspace = use(LiveWorkspaceContext);
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <ContextChip
             kind="mention"
-            render={<button type="button" />}
-            aria-label={`Preview ${props.record.path}`}
+            render={canUseLiveWorkspace ? <button type="button" /> : <span />}
+            aria-label={canUseLiveWorkspace ? `Preview ${props.record.path}` : props.record.path}
             data-markdown-copy={props.copyMarkdown}
             onClick={() => {
-              if (ctx.threadRef)
+              if (canUseLiveWorkspace && ctx.threadRef)
                 useRightPanelStore.getState().openFile(ctx.threadRef, props.record.path);
             }}
           >

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo } from "react";
 import * as DateTime from "effect/DateTime";
 
-import type { EnvironmentId, OrchestrationCheckpointSummary, ThreadId } from "@t3tools/contracts";
+import {
+  TurnId,
+  type EnvironmentId,
+  type OrchestrationCheckpointSummary,
+  type ThreadId,
+} from "@t3tools/contracts";
+import { isCompleteWorkflowReviewDiff } from "@t3tools/client-runtime/state/threads";
+import type { WorkflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
 
 import { useCheckpointDiff } from "../../state/queries";
 import { useEnvironmentQuery } from "../../state/query";
@@ -13,6 +20,7 @@ import {
   getDefaultReviewSectionId,
   getReadyReviewCheckpoints,
   getReviewSectionIdForCheckpoint,
+  type ReviewSectionItem,
 } from "./reviewModel";
 import {
   setReviewAsyncError,
@@ -25,16 +33,28 @@ import {
 
 export function useReviewSections(input: {
   readonly enabled?: boolean;
+  readonly workspaceEnabled: boolean;
   readonly environmentId?: EnvironmentId;
   readonly threadId?: ThreadId;
   readonly reviewCache: ReviewCacheForThread;
+  readonly workflowCheckpoint?: WorkflowResultCheckpoint | undefined;
+  readonly workflowReviewRequestKey?: string | undefined;
 }) {
-  const { environmentId, reviewCache, threadId } = input;
+  const { environmentId, reviewCache, threadId, workspaceEnabled } = input;
+  const workflowTurnCount = input.workflowCheckpoint?.checkpointTurnCount;
+  const expectedTurnId = input.workflowCheckpoint
+    ? TurnId.make(input.workflowCheckpoint.turnId)
+    : undefined;
+  const workflowSectionId = workflowTurnCount === undefined ? null : `turn:${workflowTurnCount}`;
   const enabled = input.enabled ?? true;
   const selectedThread = useSelectedThreadDetail();
   const { selectedThreadCwd } = useSelectedThreadWorktree();
   const diffPreview = useEnvironmentQuery(
-    enabled && environmentId !== undefined && selectedThreadCwd !== null
+    enabled &&
+      workspaceEnabled &&
+      workflowSectionId === null &&
+      environmentId !== undefined &&
+      selectedThreadCwd !== null
       ? reviewEnvironment.diffPreview({
           environmentId,
           input: { cwd: selectedThreadCwd },
@@ -67,7 +87,7 @@ export function useReviewSections(input: {
     () =>
       buildReviewSectionItems({
         checkpoints: readyCheckpoints,
-        gitSections: diffPreview.data?.sources ?? reviewCache.gitSections,
+        gitSections: workspaceEnabled ? (diffPreview.data?.sources ?? reviewCache.gitSections) : [],
         turnDiffById: reviewCache.turnDiffById,
         loadingTurnIds,
         loadingGitSections: diffPreview.isPending,
@@ -79,9 +99,10 @@ export function useReviewSections(input: {
       readyCheckpoints,
       reviewCache.gitSections,
       reviewCache.turnDiffById,
+      workspaceEnabled,
     ],
   );
-  const selectedSection = useMemo(
+  const normalSection = useMemo(
     () =>
       reviewSections.find((section) => section.id === reviewCache.selectedSectionId) ??
       reviewSections[0] ??
@@ -102,6 +123,7 @@ export function useReviewSections(input: {
 
   useEffect(() => {
     if (
+      workflowSectionId === null &&
       reviewSections.length > 0 &&
       reviewCache.threadKey &&
       (!reviewCache.selectedSectionId || !selectedSectionIdExists)
@@ -114,44 +136,84 @@ export function useReviewSections(input: {
     reviewCache.threadKey,
     reviewSections.length,
     selectedSectionIdExists,
+    workflowSectionId,
   ]);
 
   let activeCheckpoint = readyCheckpoints[0] ?? null;
-  if (selectedSection?.kind === "turn") {
-    activeCheckpoint = checkpointBySectionId[selectedSection.id] ?? activeCheckpoint;
+  if (normalSection?.kind === "turn") {
+    activeCheckpoint = checkpointBySectionId[normalSection.id] ?? activeCheckpoint;
   }
-  const activeSectionId = activeCheckpoint
-    ? getReviewSectionIdForCheckpoint(activeCheckpoint)
-    : null;
+  const activeSectionId =
+    workflowSectionId ??
+    (activeCheckpoint ? getReviewSectionIdForCheckpoint(activeCheckpoint) : null);
+  const activeTurnCount = workflowTurnCount ?? activeCheckpoint?.checkpointTurnCount;
+  const strictWorkflowReview = workflowSectionId !== null;
   const activeTurnDiff = useCheckpointDiff({
     environmentId: enabled ? (environmentId ?? null) : null,
     threadId: enabled ? (threadId ?? null) : null,
     fromTurnCount:
-      enabled && activeCheckpoint ? Math.max(0, activeCheckpoint.checkpointTurnCount - 1) : null,
-    toTurnCount: enabled ? (activeCheckpoint?.checkpointTurnCount ?? null) : null,
+      enabled && activeTurnCount !== undefined ? Math.max(0, activeTurnCount - 1) : null,
+    toTurnCount: enabled ? (activeTurnCount ?? null) : null,
     ignoreWhitespace: false,
+    strictWorkflowReview,
+    expectedTurnId,
+    requestKey: input.workflowReviewRequestKey,
   });
+  const workflowDiff =
+    strictWorkflowReview &&
+    enabled &&
+    !activeTurnDiff.isPending &&
+    !activeTurnDiff.error &&
+    isCompleteWorkflowReviewDiff(activeTurnDiff.data, expectedTurnId)
+      ? activeTurnDiff.data
+      : null;
+  const workflowDiffError =
+    strictWorkflowReview && enabled && !activeTurnDiff.isPending && !workflowDiff
+      ? (activeTurnDiff.error ?? "A complete checkpoint diff is unavailable.")
+      : null;
+  const workflowSections = useMemo<ReadonlyArray<ReviewSectionItem> | null>(
+    () =>
+      workflowSectionId
+        ? [
+            {
+              id: workflowSectionId,
+              kind: "turn",
+              title: `Turn ${workflowTurnCount}`,
+              subtitle: null,
+              diff: workflowDiff?.diff ?? null,
+              isLoading: activeTurnDiff.isPending,
+            },
+          ]
+        : null,
+    [workflowSectionId, workflowTurnCount, workflowDiff?.diff, activeTurnDiff.isPending],
+  );
+  const selectedSection = workflowSections?.[0] ?? normalSection;
 
   useEffect(() => {
-    if (!reviewCache.threadKey || !activeSectionId) {
+    if (strictWorkflowReview || !reviewCache.threadKey || !activeSectionId) {
       return;
     }
     setReviewTurnDiffLoading(reviewCache.threadKey, activeSectionId, activeTurnDiff.isPending);
-  }, [activeSectionId, activeTurnDiff.isPending, reviewCache.threadKey]);
+  }, [activeSectionId, activeTurnDiff.isPending, reviewCache.threadKey, strictWorkflowReview]);
 
   useEffect(() => {
-    if (!reviewCache.threadKey || !activeSectionId || !activeTurnDiff.data) {
+    if (
+      strictWorkflowReview ||
+      !reviewCache.threadKey ||
+      !activeSectionId ||
+      !activeTurnDiff.data
+    ) {
       return;
     }
     setReviewTurnDiff(reviewCache.threadKey, activeSectionId, activeTurnDiff.data.diff);
     setReviewAsyncError(reviewCache.threadKey, null);
-  }, [activeSectionId, activeTurnDiff.data, reviewCache.threadKey]);
+  }, [activeSectionId, activeTurnDiff.data, reviewCache.threadKey, strictWorkflowReview]);
 
   useEffect(() => {
-    if (reviewCache.threadKey && activeTurnDiff.error) {
+    if (!strictWorkflowReview && reviewCache.threadKey && activeTurnDiff.error) {
       setReviewAsyncError(reviewCache.threadKey, activeTurnDiff.error);
     }
-  }, [activeTurnDiff.error, reviewCache.threadKey]);
+  }, [activeTurnDiff.error, reviewCache.threadKey, strictWorkflowReview]);
 
   const refreshSelectedSection = useCallback(async () => {
     if (!enabled) {
@@ -174,7 +236,9 @@ export function useReviewSections(input: {
   );
 
   return {
-    error: diffPreview.error ?? activeTurnDiff.error ?? reviewCache.asyncState.error,
+    error: strictWorkflowReview
+      ? workflowDiffError
+      : (diffPreview.error ?? activeTurnDiff.error ?? reviewCache.asyncState.error),
     isSelectedSectionPending:
       selectedSection?.kind === "turn" ? activeTurnDiff.isPending : diffPreview.isPending,
     loadingGitDiffs: diffPreview.isPending,
@@ -182,8 +246,10 @@ export function useReviewSections(input: {
       ? DateTime.formatIso(diffPreview.data.generatedAt)
       : undefined,
     loadingTurnIds,
-    reviewSections,
+    reviewSections: workflowSections ?? reviewSections,
     selectedSection,
+    workflowDiff,
+    workflowDiffError,
     refreshSelectedSection,
     selectSection,
   };

@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -252,4 +253,54 @@ it.layer(NodeServices.layer)("readBootstrapEnvelope", (it) => {
         assertNone(payload);
       }).pipe(Effect.provide(TestClock.layer())),
   );
+});
+
+it("reads a delayed stdin envelope without requiring EOF", async () => {
+  const bootstrapUrl = NodeURL.pathToFileURL(
+    NodePath.join(import.meta.dirname, "bootstrap.ts"),
+  ).href;
+  const program = `
+    import * as Effect from 'effect/Effect';
+    import * as Schema from 'effect/Schema';
+    import { readBootstrapEnvelope } from ${JSON.stringify(bootstrapUrl)};
+    // Opening stdin through libuv puts the inherited pipe in non-blocking mode,
+    // as envd does. The writer deliberately stays open after the envelope.
+    process.stdin.pause();
+    const result = Effect.runPromise(readBootstrapEnvelope(Schema.Struct({ mode: Schema.String }), 0, { timeoutMs: 10000 }));
+    process.stdout.write('reader-ready\\n');
+    const value = await result;
+    if (value._tag !== 'Some') process.exit(2);
+    process.stdout.write(JSON.stringify(value.value));
+  `;
+  const child = NodeChildProcess.spawn(process.execPath, ["--input-type=module", "-e", program], {
+    cwd: import.meta.dirname,
+    timeout: 15000,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        let stdout = "",
+          stderr = "",
+          sent = false;
+        child.on("error", reject);
+        child.stdin.on("error", () => {});
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk.toString();
+          if (!sent && stdout.includes("reader-ready\n")) {
+            sent = true;
+            child.stdin.write('{"mode":"thread-vm"}\n');
+          }
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk.toString();
+        });
+        child.on("close", (code) => resolve({ code, stdout, stderr }));
+      },
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, 'reader-ready\n{"mode":"thread-vm"}');
+  } finally {
+    if (child.exitCode === null) child.kill();
+  }
 });

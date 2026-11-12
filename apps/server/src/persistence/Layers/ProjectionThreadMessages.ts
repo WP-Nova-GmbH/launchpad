@@ -5,7 +5,12 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
-import { AuthSessionUser, ChatAttachment, OrchestrationMessageContext } from "@t3tools/contracts";
+import {
+  WorkflowAttribution,
+  AuthSessionUser,
+  ChatAttachment,
+  OrchestrationMessageContext,
+} from "@t3tools/contracts";
 
 import { toPersistenceSqlError } from "../Errors.ts";
 import {
@@ -25,6 +30,7 @@ const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
     attachments: Schema.NullOr(Schema.fromJsonString(Schema.Array(ChatAttachment))),
     context: Schema.NullOr(Schema.fromJsonString(OrchestrationMessageContext)),
     author: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    workflowOrigin: Schema.NullOr(Schema.fromJsonString(WorkflowAttribution)),
     editedBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
     steeredBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
   }),
@@ -46,6 +52,7 @@ function toProjectionThreadMessage(
     ...(row.attachments !== null ? { attachments: row.attachments } : {}),
     ...(row.context !== null ? { context: row.context } : {}),
     ...(row.author !== null ? { author: row.author } : {}),
+    ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
     ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
     ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
   };
@@ -70,6 +77,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           text,
           attachments_json,
           context_json,
+          workflow_origin_json,
           author_json,
           edited_by_json,
           steered_by_json,
@@ -99,6 +107,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
               WHERE message_id = ${row.messageId}
             )
           ),
+          ${row.workflowOrigin ? JSON.stringify(row.workflowOrigin) : null},
           COALESCE(
             ${nextAuthorJson},
             (
@@ -127,6 +136,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
             excluded.context_json,
             projection_thread_messages.context_json
           ),
+          workflow_origin_json = COALESCE(excluded.workflow_origin_json, projection_thread_messages.workflow_origin_json),
           author_json = COALESCE(excluded.author_json, projection_thread_messages.author_json),
           edited_by_json = COALESCE(excluded.edited_by_json, projection_thread_messages.edited_by_json),
           steered_by_json = COALESCE(excluded.steered_by_json, projection_thread_messages.steered_by_json),
@@ -202,6 +212,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -244,6 +255,7 @@ const makeProjectionThreadMessageRepository = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
