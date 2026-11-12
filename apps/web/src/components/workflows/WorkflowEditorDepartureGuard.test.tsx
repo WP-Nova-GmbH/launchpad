@@ -16,6 +16,7 @@ import {
   workflowSessionKey,
   setWorkflowSessionAccount,
   updateWorkflowDrafts,
+  type WorkflowEditorDraft,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 vi.mock("../ui/button", () => ({
@@ -158,7 +159,10 @@ function dialogText(
     .join("");
 }
 
-function setSaveState(saveState: "pending" | "uncertain") {
+function setSaveState(
+  saveState: "pending" | "uncertain",
+  saveRecovery?: WorkflowEditorDraft["saveRecovery"],
+) {
   updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
     const draft = state.editors[key]!;
     return {
@@ -166,6 +170,7 @@ function setSaveState(saveState: "pending" | "uncertain") {
       editors: {
         [key]: {
           ...draft,
+          saveRecovery,
           operation: {
             requestId: "save",
             state: saveState,
@@ -241,36 +246,46 @@ it("keeps edits on dialog dismissal and lets a cleared account leave without a p
 });
 
 it.each([
-  ["pending", "Save in progress", "Stay"],
-  ["uncertain", "Save not confirmed", "Check saved version"],
-] as const)("keeps or leaves a workflow with a %s save", async (saveState, title, stayAction) => {
-  setSaveState(saveState);
-  const initialDraft = appAtomRegistry.get(workflowDraftAtom).editors[key];
-  const { history } = await mount();
+  ["pending", undefined, "Save in progress", "Stay"],
+  ["uncertain", undefined, "Save not confirmed", "Check saved version"],
+  ["uncertain", "retryable", "Save didn’t land", "Keep editing"],
+  ["uncertain", "conflict", "Saved version changed", "Keep editing"],
+] as const)(
+  "keeps or leaves a %s save in the %s state",
+  async (saveState, recovery, title, stayAction) => {
+    setSaveState(saveState, recovery);
+    const initialDraft = appAtomRegistry.get(workflowDraftAtom).editors[key];
+    const { history } = await mount();
 
-  await act(async () => {
-    history.push("/settings");
-  });
-  expect(dialogText()).toContain(title);
-  expect(dialogText()).toContain(initialDraft?.definition.name);
-  expect(dialogText()).toContain(
-    "If you leave and the save doesn’t complete, your edits will be lost.",
-  );
-  await click(stayAction);
-  expect(history.location.pathname).toBe("/workflows");
-  expect(renderer!.root.findAllByProps({ "data-dialog": true })).toHaveLength(0);
-  expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBe(initialDraft);
-  expect(onDiscard).not.toHaveBeenCalled();
-  expect(onCheckSavedVersion).toHaveBeenCalledTimes(saveState === "uncertain" ? 1 : 0);
+    await act(async () => {
+      history.push("/settings");
+    });
+    expect(dialogText()).toContain(title);
+    expect(dialogText()).toContain(initialDraft?.definition.name);
+    if (recovery) {
+      expect(dialogText()).toContain("Your unsaved edits will be lost if you leave.");
+      expect(dialogText()).not.toContain("Check saved version");
+    } else {
+      expect(dialogText()).toContain(
+        "If you leave and the save doesn’t complete, your edits will be lost.",
+      );
+    }
+    await click(stayAction);
+    expect(history.location.pathname).toBe("/workflows");
+    expect(renderer!.root.findAllByProps({ "data-dialog": true })).toHaveLength(0);
+    expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBe(initialDraft);
+    expect(onDiscard).not.toHaveBeenCalled();
+    expect(onCheckSavedVersion).toHaveBeenCalledTimes(stayAction === "Check saved version" ? 1 : 0);
 
-  await act(async () => {
-    history.push("/settings");
-  });
-  await click("Leave anyway");
-  expect(history.location.pathname).toBe("/settings");
-  expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBeUndefined();
-  expect(onDiscard).toHaveBeenCalledOnce();
-});
+    await act(async () => {
+      history.push("/settings");
+    });
+    await click(recovery ? "Discard and leave" : "Leave anyway");
+    expect(history.location.pathname).toBe("/settings");
+    expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBeUndefined();
+    expect(onDiscard).toHaveBeenCalledOnce();
+  },
+);
 
 it("offers Stay while another read is active and restores Check when it finishes", async () => {
   setSaveState("uncertain");

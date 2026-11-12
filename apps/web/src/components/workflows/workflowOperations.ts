@@ -33,7 +33,7 @@ const workflowError = (cause: unknown) => {
   if (isRequestFailed(cause) && (isConflict(cause.cause) || isInvalid(cause.cause)))
     return cause.cause.message;
   if (cause instanceof Error && cause.message.includes("saveWorkflow"))
-    return "Save could not be confirmed. Your edits are retained. Retry to check the saved version.";
+    return "The relay did not confirm the save.";
   return cause instanceof Error ? cause.message : "The request could not be completed.";
 };
 const isRequestFailed = Schema.is(ManagedRelay.ManagedRelayRequestFailedError);
@@ -111,6 +111,13 @@ export function matchesWorkflowSave(saved: RepositoryWorkflow, operation: SaveOp
   );
 }
 
+export function workflowSaveRevisionMatches(
+  saved: RepositoryWorkflow | undefined,
+  operation: SaveOperation,
+) {
+  return (saved?.revision ?? 0) === operation.expectedRevision;
+}
+
 /** Apply only fields still equal to the captured request, preserving later edits independently. */
 export function applyWorkflowSaveReceipt(
   current: WorkflowEditorDraft,
@@ -137,6 +144,7 @@ export function applyWorkflowSaveReceipt(
     baseline: saved,
     targetConfirmed: sameTarget ? true : current.targetConfirmed,
     operation: null,
+    saveRecovery: undefined,
     error: null,
   };
 }
@@ -201,6 +209,7 @@ export async function saveWorkflowDraft(
             ? { automation: normalizeWorkflowAutomation(operation.automation) }
             : {}),
         operation,
+        saveRecovery: previous ? draft.saveRecovery : undefined,
         error: null,
       },
     },
@@ -210,34 +219,49 @@ export async function saveWorkflowDraft(
     const state = appAtomRegistry.get(workflowDraftAtom);
     return state.accountId === scope.accountId && state.editors[key]?.operation === operation;
   };
+  let saveRecovery: WorkflowEditorDraft["saveRecovery"] = previous ? "check-failed" : undefined;
+  const checkSavedVersion = async (read: SaveOptions["read"]) => {
+    const catalog = await read();
+    assertWorkflowSaveSupport(operation, catalog);
+    const current = catalog.workflows.find((entry) => entry.workflowId === id);
+    if (current && matchesWorkflowSave(current, operation)) return current;
+    if (workflowSaveRevisionMatches(current, operation)) return undefined;
+    saveRecovery = "conflict";
+    throw new Error(
+      "The saved workflow differs. Reload its saved version before saving again; your edits are retained.",
+    );
+  };
   try {
-    if (previous && typeof operation.includesAutomation !== "boolean")
+    if (previous && (!options || typeof operation.includesAutomation !== "boolean"))
       assertWorkflowSaveSupport(operation);
-    let saved: RepositoryWorkflow | undefined;
-    if (previous && options) {
-      const catalog = await options.read();
-      if (!ownsOperation()) return null;
-      assertWorkflowSaveSupport(operation, catalog);
-      const current = catalog.workflows.find((entry) => entry.workflowId === id);
-      if (current && matchesWorkflowSave(current, operation)) saved = current;
-      else if ((current?.revision ?? 0) !== operation.expectedRevision)
-        throw new Error(
-          "The saved workflow differs. Reload its saved version before saving again; your edits are retained.",
-        );
-    }
-    if (previous && !options && operation.includesAutomation) assertWorkflowSaveSupport(operation);
+    let saved = previous && options ? await checkSavedVersion(options.read) : undefined;
     if (!ownsOperation()) return null;
-    saved ??= await save({
-      workflowId: draft.workflowId,
-      expectedRevision: operation.expectedRevision,
-      definition: operation.definition,
-      archived: operation.archived,
-      ...(operation.includesAutomation ? { automation: operation.automation } : {}),
-    });
+    if (!saved) {
+      saveRecovery = undefined;
+      try {
+        saved = await save({
+          workflowId: draft.workflowId,
+          expectedRevision: operation.expectedRevision,
+          definition: operation.definition,
+          archived: operation.archived,
+          ...(operation.includesAutomation ? { automation: operation.automation } : {}),
+        });
+      } catch (cause) {
+        if (!previous || !definitiveRejection(cause)) throw cause;
+        // A rejection of the retry does not tell us whether the original save landed.
+        saveRecovery = "check-failed";
+        if (!options || !ownsOperation()) throw cause;
+        saved = await checkSavedVersion(options.read);
+        if (!ownsOperation()) return null;
+        if (!saved) {
+          // With the prior revision still current, the user can fix a rejected draft.
+          if (isRequestFailed(cause) && !isConflict(cause.cause)) saveRecovery = undefined;
+          throw cause;
+        }
+      }
+    }
     if (saved.workflowId !== id || !matchesWorkflowSave(saved, operation))
-      throw new Error(
-        "Save could not be confirmed. Your edits are retained. Retry to check the saved version.",
-      );
+      throw new Error("The relay did not return a matching save receipt.");
     if (appAtomRegistry.get(workflowDraftAtom).accountId === scope.accountId)
       appAtomRegistry.set(
         workflowCatalogRevisionAtom,
@@ -265,7 +289,11 @@ export async function saveWorkflowDraft(
           ...state.editors,
           [key]: {
             ...current,
-            operation: definitiveRejection(cause) ? null : { ...operation, state: "uncertain" },
+            operation:
+              !saveRecovery && definitiveRejection(cause)
+                ? null
+                : { ...operation, state: "uncertain" },
+            saveRecovery,
             error: workflowError(cause),
           },
         },

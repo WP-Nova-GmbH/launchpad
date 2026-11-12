@@ -81,6 +81,11 @@ import { updateWorkflowDrafts } from "@t3tools/client-runtime/relay/workflow-ses
 
 type WorkflowView = "catalog" | "builder" | "run" | "job";
 
+// Create and Edit share the mounted editor when the first save promotes the route.
+export function WorkflowEditorPage() {
+  return <WorkflowsPage view="builder" />;
+}
+
 export function WorkflowsPage({ view = "catalog" }: { view?: WorkflowView }) {
   return hasCloudPublicConfig() ? (
     <>

@@ -72,6 +72,7 @@ import {
 import {
   assertWorkflowSaveSupport,
   matchesWorkflowSave,
+  workflowSaveRevisionMatches,
   applyWorkflowSaveReceipt,
   normalizeWorkflowDefinitionForSave,
   workflowVmOffSave,
@@ -116,7 +117,7 @@ export function WorkflowBuilder(props: WorkflowBuilderProps) {
     : (props.workflowId ?? props.workflow?.workflowId);
   return (
     <WorkflowBuilderEditor
-      key={workflowSessionKey(props.scope, `${props.isNew ? "new" : "edit"}:${id ?? ""}`)}
+      key={workflowSessionKey(props.scope, id ? `editor:${id}` : props.isNew ? "new" : "missing")}
       {...props}
       isDeparting={isDeparting}
       onDepart={onDepart}
@@ -325,7 +326,13 @@ function WorkflowBuilderEditor({
   const edit = (update: (draft: WorkflowEditorDraft) => WorkflowEditorDraft) =>
     editWorkflowDraft(scope, draft.workflowId, update);
   const save = async (turnOffOnly = false) => {
-    if (pending) return;
+    const current = appAtomRegistry.get(workflowDraftAtom).editors[key];
+    if (
+      pending ||
+      readRequest.current ||
+      (current?.operation?.state === "uncertain" && current.saveRecovery !== "retryable")
+    )
+      return;
     if (!draft.operation && !turnOffOnly) {
       const problem = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
       if (problem) {
@@ -476,11 +483,7 @@ function WorkflowBuilderEditor({
       let applied = false;
       updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
         const current = state.editors[key];
-        if (
-          current?.operation?.requestId !== operation.requestId ||
-          current.operation.state !== "uncertain"
-        )
-          return state;
+        if (current?.operation !== operation) return state;
         applied = true;
         return {
           ...state,
@@ -490,9 +493,10 @@ function WorkflowBuilderEditor({
               ? applyWorkflowSaveReceipt(current, operation, saved!)
               : {
                   ...current,
-                  error: saved
-                    ? "The saved version differs. Keep editing or reload it before saving."
-                    : "Save could not be confirmed. Retry uses this same workflow ID.",
+                  saveRecovery: workflowSaveRevisionMatches(saved, operation)
+                    ? "retryable"
+                    : "conflict",
+                  error: null,
                 },
           },
         };
@@ -502,11 +506,13 @@ function WorkflowBuilderEditor({
       if (ownsRead(request))
         updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
           const current = state.editors[key];
-          return current?.operation?.requestId === operation.requestId &&
-            current.operation.state === "uncertain"
+          return current?.operation === operation
             ? {
                 ...state,
-                editors: { ...state.editors, [key]: { ...current, error: workflowError(cause) } },
+                editors: {
+                  ...state.editors,
+                  [key]: { ...current, saveRecovery: "check-failed", error: workflowError(cause) },
+                },
               }
             : state;
         });
@@ -806,6 +812,35 @@ function WorkflowBuilderWorkspace({
   const settingsId = useId();
   const executionTargetControl = useRef<HTMLButtonElement>(null);
   const saveControl = useRef<HTMLButtonElement>(null);
+  const saveRecoveryControl = useRef<HTMLButtonElement>(null);
+  const recoveringSave = draft.operation?.state === "uncertain";
+  const saveConflict = draft.saveRecovery === "conflict";
+  const saveRetryable = draft.saveRecovery === "retryable";
+  const saveCheckFailed = draft.saveRecovery === "check-failed";
+  const retryingSave = pending && saveRetryable;
+  const showSaveRecovery = recoveringSave || retryingSave;
+  const focusedRecoveryRemoval = useRef<HTMLButtonElement | null>(null);
+  const registerSaveRecoveryControl = useCallback((node: HTMLButtonElement | null) => {
+    saveRecoveryControl.current = node;
+    if (!node) return;
+    return () => {
+      if (node.ownerDocument.activeElement === node) focusedRecoveryRemoval.current = node;
+      saveRecoveryControl.current = null;
+    };
+  }, []);
+  useLayoutEffect(() => {
+    const previous = focusedRecoveryRemoval.current;
+    if (!previous) return;
+    const { activeElement, body } = previous.ownerDocument;
+    if (activeElement !== body && activeElement !== previous) {
+      focusedRecoveryRemoval.current = null;
+      return;
+    }
+    const target = saveRecoveryControl.current ?? saveControl.current;
+    if (!target || target.disabled) return;
+    focusedRecoveryRemoval.current = null;
+    target.focus();
+  });
   const fields = useRef(new Map<string, HTMLElement>());
   const returnFocus = useRef<HTMLElement | null>(null);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
@@ -1076,10 +1111,9 @@ function WorkflowBuilderWorkspace({
     setTriggerOpen(true);
   };
   const submit = async (submitter?: HTMLElement) => {
-    if (pending) return;
-    if (draft.operation?.state === "uncertain") {
-      setFocusRequest(null);
-      await save();
+    if (pending || reading) return;
+    if (recoveringSave) {
+      saveRecoveryControl.current?.focus();
       return;
     }
     if (offSave && !hasOtherEdits && !automation.enabled) {
@@ -1162,8 +1196,18 @@ function WorkflowBuilderWorkspace({
       automation={draft.automation ?? draft.baseline?.automation}
       savedAutomation={draft.baseline?.automation}
       unsaved={workflowEditorDirty(draft)}
-      retrySave={draft.operation?.state === "uncertain"}
       onSave={() => void submit()}
+      onReviewSave={
+        recoveringSave
+          ? () => {
+              setFocusRequest(null);
+              returnFocus.current = saveRecoveryControl.current;
+              setTriggerOpen(false);
+              select("");
+              if (docked) returnFocus.current?.focus();
+            }
+          : undefined
+      }
       onChooseMachine={openMachineSettings}
       supported={automationSupported}
       vmTarget={!!vm && draft.targetConfirmed}
@@ -1556,6 +1600,7 @@ function WorkflowBuilderWorkspace({
           reading={reading}
           onDiscard={onDepart}
           onCheckSavedVersion={reconcile}
+          saveRecoveryFocusRef={saveRecoveryControl}
         />
         <div className={styles["workflow-editor-actions"]}>
           <Button
@@ -1591,26 +1636,22 @@ function WorkflowBuilderWorkspace({
                 ? "View retained instructions"
                 : "Run"}
           </Button>
-          <div className="flex items-center gap-2">
-            <span role="status" className="text-xs text-muted-foreground">
-              {pending
-                ? "Saving…"
-                : draft.operation
-                  ? "Save needs retry"
-                  : workflowEditorDirty(draft)
-                    ? "Unsaved changes"
-                    : "Saved"}
-            </span>
-            <Button type="submit" disabled={pending} ref={saveControl}>
-              {draft.operation?.state === "uncertain" ? "Retry save" : "Save"}
-            </Button>
-          </div>
+          {!showSaveRecovery ? (
+            <div className="flex items-center gap-2">
+              <span role="status" className="text-xs text-muted-foreground">
+                {pending ? "Saving…" : workflowEditorDirty(draft) ? "Unsaved changes" : "Saved"}
+              </span>
+              <Button type="submit" disabled={pending || reading} ref={saveControl}>
+                Save
+              </Button>
+            </div>
+          ) : null}
         </div>
       </div>
       {vmRunUnavailable ||
       codexNotice ||
       editorError ||
-      draft.operation?.state === "uncertain" ||
+      showSaveRecovery ||
       notice ||
       editorIssue ||
       models.issues.length ? (
@@ -1649,14 +1690,67 @@ function WorkflowBuilderWorkspace({
               {codexNotice}
             </WorkflowAlert>
           ) : null}
-          {editorError || draft.operation?.state === "uncertain" ? (
+          {showSaveRecovery ? (
             <WorkflowAlert
               title={
-                draft.operation?.state === "uncertain"
-                  ? "Save not confirmed"
-                  : editorIssue?.message === editorError
-                    ? "Check workflow settings"
-                    : "Could not save workflow"
+                retryingSave
+                  ? "Retrying save…"
+                  : saveConflict
+                    ? "Saved version changed"
+                    : saveRetryable
+                      ? "Save didn’t land"
+                      : "Save not confirmed"
+              }
+              variant={saveRetryable ? "info" : "warning"}
+              actions={
+                <>
+                  {saveConflict || saveCheckFailed ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={reading}
+                      onClick={() => void reload()}
+                    >
+                      Reload saved version
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    size="sm"
+                    ref={registerSaveRecoveryControl}
+                    aria-disabled={reading || retryingSave}
+                    onClick={() => {
+                      if (reading || retryingSave) return;
+                      if (saveConflict) fields.current.get("name")?.focus();
+                      else if (saveRetryable) void save();
+                      else void reconcile();
+                    }}
+                  >
+                    {saveConflict
+                      ? "Keep editing"
+                      : saveRetryable
+                        ? "Retry original save"
+                        : "Check saved version"}
+                  </Button>
+                </>
+              }
+            >
+              {retryingSave
+                ? "Edits made since the original attempt stay in your draft."
+                : saveConflict
+                  ? "Your edits are still in this draft. Reloading replaces them with the saved version."
+                  : saveRetryable
+                    ? "The saved version is unchanged. Edits made since that attempt stay in your draft."
+                    : "The save may have completed. Your edits are still in the draft."}
+              {editorError ? <p>{editorError}</p> : null}
+            </WorkflowAlert>
+          ) : editorError ? (
+            <WorkflowAlert
+              title={
+                editorIssue?.message === editorError
+                  ? "Check workflow settings"
+                  : "Could not save workflow"
               }
               actions={
                 <>
@@ -1685,23 +1779,10 @@ function WorkflowBuilderWorkspace({
                   >
                     Reload saved version
                   </Button>
-                  {draft.operation?.state === "uncertain" ? (
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      disabled={pending || reading}
-                      onClick={() => void reconcile()}
-                    >
-                      Check saved version
-                    </Button>
-                  ) : null}
                 </>
               }
             >
-              {editorError ??
-                "Save could not be confirmed. Check the saved version before retrying."}{" "}
-              Your edits are kept.
+              {editorError} Your edits are kept.
             </WorkflowAlert>
           ) : null}
           {notice ? (

@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflow, RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import { RelayRepositoryId, RelayTenancyForbiddenError } from "@t3tools/contracts/relay";
+import {
+  WorkflowConflictError,
+  WorkflowInvalidError,
+  type RepositoryWorkflow,
+  type RepositoryWorkflowJob,
+  type WorkflowCatalog,
+} from "@t3tools/contracts/workflows";
+import { ManagedRelay } from "@t3tools/client-runtime/relay";
 import {
   setWorkflowSessionAccount,
   workflowDraftAtom,
@@ -314,6 +321,104 @@ it("preserves a saved rule when an editor retained from an older client has no a
 });
 
 describe("immutable Save recovery", () => {
+  it("keeps the original attempt when the retry cannot read the saved version", async () => {
+    await saveWorkflowDraft(scope, saved.workflowId, async () => {
+      throw new Error("Reply lost");
+    });
+    const attempt = appAtomRegistry.get(workflowDraftAtom).editors[key]!.operation;
+    const forbidden = new RelayTenancyForbiddenError({
+      code: "tenancy_forbidden",
+      reason: "no_repository_access",
+      traceId: "trace",
+    });
+    const read = vi
+      .fn<() => Promise<WorkflowCatalog>>()
+      .mockRejectedValueOnce(
+        new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "listWorkflows",
+          cause: forbidden,
+          relayError: forbidden,
+        }),
+      )
+      .mockResolvedValueOnce({ workflows: [saved] });
+    const write = vi.fn();
+    const options = { automationSupported: false, read };
+    expect(await saveWorkflowDraft(scope, saved.workflowId, write, undefined, options)).toBeNull();
+    const draft = appAtomRegistry.get(workflowDraftAtom).editors[key]!;
+    expect(draft.operation).toEqual(attempt);
+    expect(draft.saveRecovery).toBe("check-failed");
+    expect(await saveWorkflowDraft(scope, saved.workflowId, write, undefined, options)).toEqual(
+      saved,
+    );
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["conflict", "matched", undefined],
+    ["conflict", "changed", "conflict"],
+    ["conflict", "unchanged", "check-failed"],
+    ["conflict", "unavailable", "check-failed"],
+    ["validation", "matched", undefined],
+    ["validation", "unchanged", undefined],
+    ["validation", "unavailable", "check-failed"],
+  ] as const)(
+    "checks the original attempt after a %s rejection when the saved version is %s",
+    async (rejection, observed, recovery) => {
+      await saveWorkflowDraft(scope, saved.workflowId, async () => {
+        throw new Error("Reply lost");
+      });
+      const attempt = appAtomRegistry.get(workflowDraftAtom).editors[key]!.operation;
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        editors: {
+          [key]: {
+            ...state.editors[key]!,
+            definition: { ...saved.definition, name: "Later local edits" },
+            saveRecovery: "retryable",
+          },
+        },
+      }));
+      const changed = { ...saved, definition: { ...saved.definition, name: "Saved elsewhere" } };
+      const read = vi
+        .fn<() => Promise<WorkflowCatalog>>()
+        .mockResolvedValueOnce({ workflows: [] })
+        .mockImplementationOnce(async () => {
+          if (observed === "unavailable") throw new Error("Read failed");
+          const workflows =
+            observed === "matched" ? [saved] : observed === "changed" ? [changed] : [];
+          return { workflows };
+        });
+      const write = vi.fn(async () => {
+        expect(appAtomRegistry.get(workflowDraftAtom).editors[key]?.saveRecovery).toBe("retryable");
+        throw new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "saveWorkflow",
+          cause:
+            rejection === "conflict"
+              ? new WorkflowConflictError({ message: "This workflow changed." })
+              : new WorkflowInvalidError({ message: "The Machine checkout is unavailable." }),
+        });
+      });
+      const result = await saveWorkflowDraft(scope, saved.workflowId, write, undefined, {
+        automationSupported: false,
+        read,
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(write).toHaveBeenCalledExactlyOnceWith({
+        workflowId: saved.workflowId,
+        expectedRevision: 0,
+        definition: saved.definition,
+        archived: false,
+      });
+      const draft = appAtomRegistry.get(workflowDraftAtom).editors[key]!;
+      expect(draft.definition.name).toBe("Later local edits");
+      expect(result).toEqual(observed === "matched" ? saved : null);
+      expect(draft.operation).toEqual(recovery ? attempt : null);
+      expect(draft.saveRecovery).toBe(recovery);
+      if (rejection === "validation" && observed === "unchanged")
+        expect(draft.error).toBe("The Machine checkout is unavailable.");
+    },
+  );
+
   it("does not weaken automation confirmation after relay support disappears", async () => {
     installSavedAutomation();
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({

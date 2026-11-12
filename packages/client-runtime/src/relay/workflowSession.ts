@@ -56,6 +56,7 @@ export interface WorkflowEditorDraft {
   readonly targetConfirmed: boolean;
   /** Editor-only VM choice while Machine is selected. Retained until the draft is reset or VM is selected again. */
   readonly lastVmTarget?: typeof WorkflowVmTarget.Type;
+  readonly saveRecovery?: "retryable" | "conflict" | "check-failed" | undefined;
   readonly operation: {
     readonly requestId: string;
     readonly state: "pending" | "uncertain";

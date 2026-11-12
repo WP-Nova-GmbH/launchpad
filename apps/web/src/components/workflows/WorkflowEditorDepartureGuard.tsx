@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import { useBlocker } from "@tanstack/react-router";
 import {
@@ -27,12 +27,14 @@ export function WorkflowEditorDepartureGuard({
   scope,
   id,
   reading,
+  saveRecoveryFocusRef,
   onDiscard,
   onCheckSavedVersion,
 }: {
   scope: WorkflowScope;
   id: string;
   reading: boolean;
+  saveRecoveryFocusRef?: RefObject<HTMLButtonElement | null>;
   onDiscard: () => void;
   onCheckSavedVersion: () => void;
 }) {
@@ -73,7 +75,9 @@ export function WorkflowEditorDepartureGuard({
   }, [blocker, unsaved]);
   const operation = current?.operation;
   const unconfirmed = operation?.state === "uncertain";
-  const canCheckSavedVersion = unconfirmed && !reading;
+  const saveConflict = current?.saveRecovery === "conflict";
+  const knownSaveOutcome = unconfirmed && (saveConflict || current?.saveRecovery === "retryable");
+  const canCheckSavedVersion = unconfirmed && !knownSaveOutcome && !reading;
   const name =
     operation?.definition.name.trim() ||
     current?.definition.name.trim() ||
@@ -89,6 +93,7 @@ export function WorkflowEditorDepartureGuard({
   const hasUnsubmittedEdits =
     current &&
     operation &&
+    !knownSaveOutcome &&
     (!sameWorkflowDefinition(current.definition, operation.definition) ||
       !sameWorkflowAutomation(workflowDraftAutomation(current), automationAfterSave));
   const stayButton = (
@@ -102,7 +107,11 @@ export function WorkflowEditorDepartureGuard({
         if (canCheckSavedVersion) onCheckSavedVersion();
       }}
     >
-      {canCheckSavedVersion ? "Check saved version" : operation ? "Stay" : "Keep editing"}
+      {canCheckSavedVersion
+        ? "Check saved version"
+        : operation && !knownSaveOutcome
+          ? "Stay"
+          : "Keep editing"}
     </Button>
   );
   const leaveButton = (
@@ -116,7 +125,7 @@ export function WorkflowEditorDepartureGuard({
         blocker.proceed?.();
       }}
     >
-      {operation ? "Leave anyway" : "Discard and leave"}
+      {operation && !knownSaveOutcome ? "Leave anyway" : "Discard and leave"}
     </Button>
   );
 
@@ -127,17 +136,29 @@ export function WorkflowEditorDepartureGuard({
         if (!open) blocker.reset?.();
       }}
     >
-      <AlertDialogPopup initialFocus={stayButtonRef}>
+      <AlertDialogPopup
+        initialFocus={stayButtonRef}
+        finalFocus={knownSaveOutcome ? saveRecoveryFocusRef : undefined}
+      >
         <AlertDialogHeader>
           <AlertDialogTitle>
-            {unconfirmed
-              ? "Save not confirmed"
-              : operation
-                ? "Save in progress"
-                : "Discard unsaved changes?"}
+            {knownSaveOutcome
+              ? saveConflict
+                ? "Saved version changed"
+                : "Save didn’t land"
+              : unconfirmed
+                ? "Save not confirmed"
+                : operation
+                  ? "Save in progress"
+                  : "Discard unsaved changes?"}
           </AlertDialogTitle>
           <AlertDialogDescription className="wrap-anywhere">
-            {unconfirmed ? (
+            {knownSaveOutcome ? (
+              <>
+                The saved version of {workflow} {saveConflict ? "changed" : "is unchanged"}. Your
+                unsaved edits will be lost if you leave.
+              </>
+            ) : unconfirmed ? (
               <>
                 The save for {workflow} may have completed.
                 {canCheckSavedVersion ? " Stay in the editor to check the saved version." : null}
@@ -147,7 +168,7 @@ export function WorkflowEditorDepartureGuard({
             ) : (
               <>Your unsaved edits to {workflow} will be lost.</>
             )}
-            {operation ? (
+            {operation && !knownSaveOutcome ? (
               <span className="mt-2 block">
                 If you leave and the save doesn’t complete, your edits will be lost.
               </span>

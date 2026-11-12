@@ -56,10 +56,10 @@ export function WorkflowTriggerInspector({
   hasOtherEdits = false,
   resolved = true,
   disabled,
-  retrySave = false,
   onChange,
   onClose,
   onSave,
+  onReviewSave,
   onSaveOff,
   onChooseMachine,
   registerField,
@@ -74,10 +74,10 @@ export function WorkflowTriggerInspector({
   hasOtherEdits?: boolean;
   resolved?: boolean;
   disabled: boolean;
-  retrySave?: boolean;
   onChange: (automation: WorkflowAutomation) => void;
   onClose: () => void;
   onSave: () => void;
+  onReviewSave?: (() => void) | undefined;
   onSaveOff?: (() => void) | undefined;
   onChooseMachine: () => void;
   registerField?: RegisterField | undefined;
@@ -167,6 +167,11 @@ export function WorkflowTriggerInspector({
     : null;
   const unavailable = !supported || !resolved || vmTriggerUnavailable;
   const editableRule = !unavailable && !!source && !connectionUnknown;
+  const reviewSave = onReviewSave ? (
+    <Button type="button" size="sm" onClick={onReviewSave}>
+      Review save status
+    </Button>
+  ) : null;
   const saveOff = onSaveOff ? (
     <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={onSaveOff}>
       {hasOtherEdits ? "Save Off only" : "Turn off automatic runs"}
@@ -249,14 +254,8 @@ export function WorkflowTriggerInspector({
                 >
                   Choose a Machine target
                 </Button>
-                {retrySave ? (
-                  <Button type="button" size="sm" disabled={disabled} onClick={onSave}>
-                    Retry save
-                  </Button>
-                ) : (
-                  saveOff
-                )}
-                {value.enabled && !onSaveOff && !retrySave ? (
+                {reviewSave ?? saveOff}
+                {value.enabled && !onSaveOff && !onReviewSave ? (
                   <Button
                     type="button"
                     variant="outline"
@@ -706,13 +705,13 @@ export function WorkflowTriggerInspector({
                 </p>
               ) : null}
             </div>
-            <p className="text-xs text-muted-foreground">
-              {retrySave
-                ? "Retry saves the captured workflow change. Newer edits stay in your draft."
-                : hasOtherEdits && onSaveOff
+            {!onReviewSave ? (
+              <p className="text-xs text-muted-foreground">
+                {hasOtherEdits && onSaveOff
                   ? "Save Off only to keep your other changes as a draft."
                   : "Save applies all pending workflow changes. Only future matching events will start runs."}
-            </p>
+              </p>
+            ) : null}
             <div className="flex flex-wrap items-center justify-end gap-2">
               {triggerDirty ? (
                 <div className="mr-auto">
@@ -728,18 +727,18 @@ export function WorkflowTriggerInspector({
                 </div>
               ) : null}
               {saveOff}
-              <Button
-                type="button"
-                size="sm"
-                disabled={
-                  disabled ||
-                  (!retrySave &&
-                    (!validAutomation || (value.enabled && triggerDirty && !canEnable)))
-                }
-                onClick={onSave}
-              >
-                {retrySave ? "Retry save" : "Save workflow"}
-              </Button>
+              {reviewSave ?? (
+                <Button
+                  type="button"
+                  size="sm"
+                  disabled={
+                    disabled || !validAutomation || (value.enabled && triggerDirty && !canEnable)
+                  }
+                  onClick={onSave}
+                >
+                  Save workflow
+                </Button>
+              )}
             </div>
             {trigger ? (
               <div>

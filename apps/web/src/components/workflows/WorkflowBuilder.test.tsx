@@ -196,12 +196,17 @@ async function submit() {
     renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} });
   });
 }
+const button = (label: string) =>
+  renderer!.root.findAllByType("button").find((node) => {
+    const text = node.children
+      .filter((child) => typeof child === "string")
+      .join("")
+      .trim();
+    return text === label;
+  });
 async function click(label: string) {
   await act(async () => {
-    renderer!.root
-      .findAllByType("button")
-      .find((button) => button.props.children === label)!
-      .props.onClick();
+    button(label)!.props.onClick();
   });
 }
 async function rename(name: string) {
@@ -343,8 +348,11 @@ describe("Create route identity", () => {
     const old = saved(id);
     await submit();
     await rename("Newer save");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Save not confirmed");
+    expect(button("Retry save")).toBeUndefined();
+    expect(button("Retry original save")).toBeUndefined();
     read.mockResolvedValueOnce({ workflows: [old] });
-    await submit();
+    await click("Check saved version");
     expect(editor(id).baseline).toEqual(old);
     expect(editor(id).definition.name).toBe("Newer save");
     expect(editor(id).operation).toBeNull();
@@ -366,6 +374,64 @@ describe("Create route identity", () => {
     expect(editor(id).definition.name).toBe("Unsaved later edit");
     expect(editor(newId()).baseline).toBeNull();
   });
+});
+
+describe("Save recovery after a lost reply", () => {
+  it.each(["unchanged", "changed"] as const)(
+    "offers the recovery action appropriate to a %s saved revision",
+    async (revision) => {
+      const workflow = saved("flow", 4, newWorkflowDraft([project])!.definition);
+      await mount({ ...base, isNew: false, workflow });
+      await rename("Local edits");
+      read.mockRejectedValueOnce(new Error("Reply lost"));
+      await submit();
+      expect(button("Check saved version")).toBeDefined();
+      expect(button("Retry original save")).toBeUndefined();
+
+      const observed =
+        revision === "unchanged"
+          ? workflow
+          : {
+              ...workflow,
+              revision: 5,
+              definition: { ...workflow.definition, name: "Changes from another editor" },
+            };
+      const beforeCheck = read.mock.calls.length;
+      read.mockResolvedValueOnce({ workflows: [observed] });
+      await click("Check saved version");
+      expect(read).toHaveBeenCalledTimes(beforeCheck + 1);
+      expect(editor(workflow.workflowId).definition.name).toBe("Local edits");
+      expect(editor(workflow.workflowId).baseline).toEqual(workflow);
+
+      const content = JSON.stringify(renderer!.toJSON());
+      if (revision === "unchanged") {
+        expect(content).toContain("Save didn’t land");
+        expect(button("Retry original save")).toBeDefined();
+        return;
+      }
+
+      expect(content).toContain("Saved version changed");
+      expect(button("Retry original save")).toBeUndefined();
+      await submit();
+      expect(read).toHaveBeenCalledTimes(beforeCheck + 1);
+
+      await click("Keep editing");
+      expect(editor(workflow.workflowId).definition.name).toBe("Local edits");
+      expect(button("Retry original save")).toBeUndefined();
+
+      confirmation.mockResolvedValueOnce(false);
+      await click("Reload saved version");
+      expect(confirmation).toHaveBeenCalledOnce();
+      expect(read).toHaveBeenCalledTimes(beforeCheck + 1);
+      expect(editor(workflow.workflowId).definition.name).toBe("Local edits");
+
+      read.mockResolvedValueOnce({ workflows: [observed] });
+      await click("Reload saved version");
+      expect(editor(workflow.workflowId).baseline).toEqual(observed);
+      expect(editor(workflow.workflowId).definition).toEqual(observed.definition);
+      expect(editor(workflow.workflowId).operation).toBeNull();
+    },
+  );
 });
 
 describe("Reload buffer and view ownership", () => {
@@ -1111,7 +1177,7 @@ describe("VM authoring", () => {
       definition: receipt.definition,
     });
     read.mockResolvedValueOnce({ workflows: [receipt], vmAuthoring: { models: null } });
-    await submit();
+    await click("Check saved version");
     expect(editor(id).baseline?.definition.target).toEqual({
       kind: "vm",
       baseBranch: "release/1.x",
@@ -1445,10 +1511,18 @@ describe("captured automation recovery in the editor", () => {
         workflows: committed ? [receipt] : [],
         automationSupported: true,
       });
-      if (!committed) read.mockResolvedValueOnce(receipt);
       const before = read.mock.calls.length;
-      await submit();
-      expect(read.mock.calls.length - before).toBe(committed ? 1 : 2);
+      await click("Check saved version");
+      expect(read).toHaveBeenCalledTimes(before + 1);
+      if (!committed) {
+        expect(JSON.stringify(renderer!.toJSON())).toContain("Save didn’t land");
+        expect(editor(id).operation?.state).toBe("uncertain");
+        read
+          .mockResolvedValueOnce({ workflows: [], automationSupported: true })
+          .mockResolvedValueOnce(receipt);
+        await click("Retry original save");
+        expect(read).toHaveBeenCalledTimes(before + 3);
+      }
       expect(editor(id).baseline).toEqual(receipt);
       expect(editor(id).operation).toBeNull();
       expect(editor(id).definition.name).toBe("");

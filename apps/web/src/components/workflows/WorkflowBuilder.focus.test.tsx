@@ -10,8 +10,23 @@ import {
 } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  Outlet,
+  RouterProvider,
+  useParams,
+} from "@tanstack/react-router";
+import { Route as NewWorkflowRoute } from "../../routes/workflows.$repositoryId.new";
+import { Route as EditWorkflowRoute } from "../../routes/workflows.$repositoryId.$workflowId.edit";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import { WORKFLOW_MAX_STEPS, workflowPublishingPrerequisites } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_MAX_STEPS,
+  workflowPublishingPrerequisites,
+  type RepositoryWorkflow,
+} from "@t3tools/contracts/workflows";
 import {
   RelayMachineId,
   RelayRepositoryId,
@@ -32,6 +47,9 @@ class FocusNode {
   disabled = false;
   value = "";
   scrollTop = 0;
+  get ownerDocument() {
+    return focusDocument;
+  }
   focus() {
     focusDocument.activeElement = this;
   }
@@ -53,7 +71,14 @@ class TextField extends FocusNode {
     this.selectionDirection = direction;
   }
 }
-const focusDocument: { activeElement: FocusNode | null } = { activeElement: null };
+const focusDocument = {
+  activeElement: null as FocusNode | null,
+  body: new FocusNode(),
+  addEventListener() {},
+  removeEventListener() {},
+  querySelector: () => null,
+  getElementById: () => null,
+};
 const nodes = new Map<string, FocusNode>();
 const cache = new Map<string, FocusNode>();
 let triggerButton: FocusNode;
@@ -73,7 +98,19 @@ function runInitialFocus(callback: NonNullable<typeof initialSheetFocus>) {
   else if (target && typeof target !== "boolean") target.focus();
 }
 
-vi.mock("@tanstack/react-router", () => ({ useNavigate: () => () => {} }));
+let renderWorkflowRoute: ((workflowId?: string) => ReactElement) | undefined;
+const navigate = vi.hoisted(() => vi.fn());
+vi.mock("@tanstack/react-router", async (original) => ({
+  ...(await original<typeof import("@tanstack/react-router")>()),
+  useNavigate: () => navigate,
+}));
+vi.mock("./WorkflowsPage", () => {
+  function EditorPage() {
+    const params = useParams({ strict: false });
+    return renderWorkflowRoute?.("workflowId" in params ? params.workflowId : undefined);
+  }
+  return { WorkflowEditorPage: EditorPage, WorkflowsPage: EditorPage };
+});
 vi.mock("../../lib/runtime", () => ({ runtime: {} }));
 vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: () => Promise.resolve(false) }));
 vi.mock("./WorkflowCanvas", async () => ({
@@ -268,6 +305,9 @@ const draft = () =>
   appAtomRegistry.get(workflowDraftAtom).editors[workflowSessionKey(scope, id())]!;
 const canvas = () => renderer!.root.findByProps({ "data-testid": "canvas" });
 const field = (key: string) => nodes.get(key)! as TextField;
+const request = vi.fn<() => Promise<unknown>>().mockRejectedValue(new Error("Unexpected request"));
+const recoveryButton = (label: string) =>
+  renderer!.root.findAllByType("button").find((button) => button.children.includes(label))!;
 const reviewPublishingStep = () =>
   renderer!.root
     .findAllByType("button")
@@ -277,66 +317,113 @@ async function mount(
   {
     projects = vm ? [] : [project],
     automationSupported = false,
-  }: { projects?: ReadonlyArray<RelayOrganizationProject>; automationSupported?: boolean } = {},
+    useRoutes = false,
+  }: {
+    projects?: ReadonlyArray<RelayOrganizationProject>;
+    automationSupported?: boolean;
+    useRoutes?: boolean;
+  } = {},
 ) {
+  const editor = (workflowId?: string) => (
+    <AppAtomRegistryProvider>
+      <WorkflowBuilder
+        scope={scope}
+        repositoryName="Repository"
+        projects={projects}
+        vmAuthoring={vm ? { models: null } : undefined}
+        automationSupported={automationSupported}
+        isNew={!workflowId}
+        workflowId={workflowId}
+        workflow={undefined}
+        canConfigure
+        call={async <A,>() => (await request()) as A}
+        refresh={() => {}}
+        refreshProjects={() => {}}
+      />
+    </AppAtomRegistryProvider>
+  );
+  let tree = editor();
+  let router;
+  if (useRoutes) {
+    const root = createRootRoute({ component: Outlet });
+    const workflows = createRoute({
+      getParentRoute: () => root,
+      path: "workflows",
+      component: Outlet,
+    });
+    const createEditor = createRoute({
+      getParentRoute: () => workflows,
+      path: "$repositoryId/new",
+      component: NewWorkflowRoute.options.component!,
+    });
+    const savedEditor = createRoute({
+      getParentRoute: () => workflows,
+      path: "$repositoryId/$workflowId/edit",
+      component: EditWorkflowRoute.options.component!,
+    });
+    vi.stubGlobal("self", {});
+    vi.stubGlobal("window", {
+      origin: "http://localhost",
+      addEventListener() {},
+      removeEventListener() {},
+      scrollTo() {},
+    });
+    vi.stubGlobal("history", {});
+    vi.stubGlobal("addEventListener", () => {});
+    vi.stubGlobal("scrollTo", () => {});
+    router = createRouter({
+      isServer: false,
+      routeTree: root.addChildren([workflows.addChildren([createEditor, savedEditor])]),
+      history: createMemoryHistory({ initialEntries: ["/workflows/repository/new"] }),
+    });
+    navigate.mockImplementation(router.navigate);
+    await router.load();
+    renderWorkflowRoute = editor;
+    tree = <RouterProvider router={router} />;
+  }
   await act(() => {
-    renderer = create(
-      <AppAtomRegistryProvider>
-        <WorkflowBuilder
-          scope={scope}
-          repositoryName="Repository"
-          projects={projects}
-          vmAuthoring={vm ? { models: null } : undefined}
-          automationSupported={automationSupported}
-          isNew
-          workflow={undefined}
-          canConfigure
-          call={async () => {
-            throw new Error("Unexpected write");
-          }}
-          refresh={() => {}}
-          refreshProjects={() => {}}
-        />
-      </AppAtomRegistryProvider>,
-      {
-        createNodeMock: (element) => {
-          if (element.type === "form") {
-            return {
-              querySelector: (selector: string) =>
-                selector === '[aria-label="Configure workflow trigger"]' ? triggerButton : null,
-            };
-          }
-          const props = element.props as Record<string, unknown>;
-          const key =
-            typeof props["data-focus-key"] === "string"
-              ? props["data-focus-key"]
-              : props["aria-label"] === "Workflow name"
-                ? "name"
-                : typeof props["aria-label"] === "string" &&
-                    props["aria-label"].startsWith("Execution target: ")
-                  ? "header-target"
-                  : props["aria-label"] === "Close settings"
-                    ? "close-settings"
-                    : props.type === "submit"
-                      ? "save"
-                      : props.placeholder === "Repository default"
-                        ? "baseBranch"
+    renderer = create(tree, {
+      createNodeMock: (element) => {
+        if (element.type === "form") {
+          return {
+            querySelector: (selector: string) =>
+              selector === '[aria-label="Configure workflow trigger"]' ? triggerButton : null,
+          };
+        }
+        const props = element.props as Record<string, unknown>;
+        const key =
+          typeof props["data-focus-key"] === "string"
+            ? props["data-focus-key"]
+            : props["aria-label"] === "Workflow name"
+              ? "name"
+              : typeof props["aria-label"] === "string" &&
+                  props["aria-label"].startsWith("Execution target: ")
+                ? "header-target"
+                : props["aria-label"] === "Close settings"
+                  ? "close-settings"
+                  : props.type === "submit"
+                    ? "save"
+                    : props.placeholder === "Repository default"
+                      ? "baseBranch"
+                      : props.children === "Check saved version" ||
+                          props.children === "Retry original save"
+                        ? "recovery"
                         : null;
-          if (!key) return null;
-          const cacheKey = `${presentation}:${key}`;
-          let node = cache.get(cacheKey);
-          if (!node) {
-            node = element.type === "button" ? new FocusNode() : new TextField();
-            cache.set(cacheKey, node);
-          }
-          node.value = typeof props.value === "string" ? props.value : "";
-          node.disabled = !!props.disabled;
-          nodes.set(key, node);
-          return node;
-        },
+        if (!key) return null;
+        const cacheKey = `${presentation}:${key}`;
+        let node = cache.get(cacheKey);
+        if (!node) {
+          node = element.type === "button" ? new FocusNode() : new TextField();
+          cache.set(cacheKey, node);
+        }
+        node.value = typeof props.value === "string" ? props.value : "";
+        node.disabled = !!props.disabled;
+        nodes.set(key, node);
+        return node;
       },
-    );
+    });
   });
+  return router;
 }
 async function changeWidth(next: number) {
   if (width >= 920 !== next >= 920) presentation++;
@@ -376,13 +463,72 @@ beforeEach(() => {
   initialSheetFocus = undefined;
   nodes.clear();
   cache.clear();
+  request.mockReset().mockRejectedValue(new Error("Unexpected request"));
+  navigate.mockReset();
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
+  renderWorkflowRoute = undefined;
   vi.unstubAllGlobals();
+});
+
+describe("Save recovery focus", () => {
+  async function loseSaveReply() {
+    request.mockRejectedValueOnce(new Error("Save reply lost"));
+    await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+    return {
+      workflowId: id(),
+      organizationId: scope.organizationId,
+      repositoryId: scope.repositoryId,
+      revision: 1,
+      definition: draft().definition,
+      archived: false,
+      createdAt: "now",
+      updatedAt: "now",
+    } satisfies RepositoryWorkflow;
+  }
+
+  it("moves focus to Save after confirming a Create and keeps it through the edit route", async () => {
+    const router = (await mount(false, { useRoutes: true }))!;
+    const saved = await loseSaveReply();
+    const form = renderer!.root.findByType("form");
+    field("recovery").focus();
+    request.mockResolvedValueOnce({ workflows: [saved] });
+    await act(() => recoveryButton("Check saved version").props.onClick());
+    expect(router.state.location.pathname).toBe(`/workflows/repository/${saved.workflowId}/edit`);
+    expect(renderer!.root.findByType(WorkflowBuilder).props.isNew).toBe(false);
+    expect(renderer!.root.findByType("form")).toBe(form);
+    expect(focusDocument.activeElement).toBe(field("save"));
+  });
+
+  it.each([false, true])(
+    "keeps retry focus through the write and respects focus moved elsewhere (%s)",
+    async (moveFocus) => {
+      await mount();
+      const saved = await loseSaveReply();
+      const recovery = field("recovery");
+      recovery.focus();
+      request.mockResolvedValueOnce({ workflows: [] });
+      await act(() => recoveryButton("Check saved version").props.onClick());
+
+      let resolveWrite!: (workflow: RepositoryWorkflow) => void;
+      request.mockResolvedValueOnce({ workflows: [] }).mockReturnValueOnce(
+        new Promise<RepositoryWorkflow>((resolve) => {
+          resolveWrite = resolve;
+        }),
+      );
+      await act(() => recoveryButton("Retry original save").props.onClick());
+      expect(recoveryButton("Retry original save").props["aria-disabled"]).toBe(true);
+      expect(focusDocument.activeElement).toBe(recovery);
+      const target = field("header-target");
+      if (moveFocus) target.focus();
+      await act(() => resolveWrite(saved));
+      expect(focusDocument.activeElement).toBe(moveFocus ? target : field("save"));
+    },
+  );
 });
 
 describe("Inspector presentation focus", () => {
