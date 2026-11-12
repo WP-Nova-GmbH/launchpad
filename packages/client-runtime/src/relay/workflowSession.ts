@@ -83,6 +83,11 @@ export interface WorkflowRunDraft {
   readonly error: string | null;
 }
 
+interface WorkflowSessionSubmission extends WorkflowDraftSubmission {
+  readonly requestEpoch?: number;
+  readonly acceptedPending?: true;
+}
+
 export interface WorkflowDraftState {
   readonly accountId: string | null;
   readonly editors: Record<string, WorkflowEditorDraft>;
@@ -90,7 +95,7 @@ export interface WorkflowDraftState {
   readonly runs: Record<string, WorkflowRunDraft>;
   readonly responses: Record<string, Record<string, string>>;
   readonly manual: Record<string, WorkflowManualSubmission>;
-  readonly submitted: Record<string, Record<string, WorkflowDraftSubmission>>;
+  readonly submitted: Record<string, Record<string, WorkflowSessionSubmission>>;
   readonly reviews: Record<string, WorkflowReviewVisit>;
 }
 
@@ -650,12 +655,35 @@ export function settleWorkflowJobRequest(
   });
   if (accepted)
     updateWorkflowDrafts(registry, request.accountId, (drafts) => {
-      let responses = drafts.responses[request.key] ?? {};
-      for (const submission of Object.values(drafts.submitted[request.key] ?? {}))
+      const previousResponses = drafts.responses[request.key] ?? {};
+      let responses = previousResponses;
+      const submissions = drafts.submitted[request.key];
+      for (const submission of Object.values(submissions ?? {}))
         responses = clearAcknowledgedWorkflowDraft(responses, submission, result.progress);
-      return responses === drafts.responses[request.key] || !drafts.responses[request.key]
-        ? drafts
-        : { ...drafts, responses: { ...drafts.responses, [request.key]: responses } };
+
+      const pendingId = result.responsePending
+        ? result.progress?.checkpoint?.checkpointId
+        : undefined;
+      const submission = pendingId ? submissions?.[pendingId] : undefined;
+      // Only the reply to this send can attribute the queued response to this viewer.
+      const acceptedPending =
+        pendingId &&
+        previous.mutation &&
+        submission?.requestEpoch === request.epoch &&
+        submission.operation === result.pendingResponseOperation
+          ? { ...submissions, [pendingId]: { ...submission, acceptedPending: true as const } }
+          : null;
+      if (responses === previousResponses && !acceptedPending) return drafts;
+      return {
+        ...drafts,
+        responses:
+          responses === previousResponses
+            ? drafts.responses
+            : { ...drafts.responses, [request.key]: responses },
+        submitted: acceptedPending
+          ? { ...drafts.submitted, [request.key]: acceptedPending }
+          : drafts.submitted,
+      };
     });
   return accepted;
 }
@@ -684,7 +712,7 @@ export function recordWorkflowResponse(
   registry: AtomRegistry.AtomRegistry,
   scope: WorkflowScope,
   jobId: string,
-  submission: WorkflowDraftSubmission,
+  submission: WorkflowSessionSubmission,
 ) {
   if (
     !submission.checkpointId ||

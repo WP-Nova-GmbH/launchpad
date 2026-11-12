@@ -4,6 +4,7 @@ import {
   ArrowLeftIcon,
   ArrowUpRightIcon,
   ChevronDownIcon,
+  ClipboardCheckIcon,
   CloudIcon,
   MessageSquareIcon,
   MonitorIcon,
@@ -87,16 +88,18 @@ import {
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
 
 /** Keep focus in the run when an update moves or removes the focused action. */
-function useRunActionFocus<
-  Action extends HTMLButtonElement | HTMLAnchorElement = HTMLButtonElement,
->(runKey: string, fallback?: RefObject<HTMLElement | null>) {
+function useRunActionFocus<Action extends HTMLElement = HTMLButtonElement>(
+  runKey: string,
+  fallback?: RefObject<HTMLElement | null>,
+) {
   const action = useRef<Action | null>(null);
   const focusedRun = useRef<string | null>(null);
   const registerAction = useCallback(
     (node: Action | null) => {
       const previous = action.current;
-      if (!node && previous && previous.ownerDocument.activeElement === previous) {
-        focusedRun.current = runKey;
+      if (!node && previous) {
+        const focused = previous.ownerDocument.activeElement;
+        if (focused === previous || previous.contains?.(focused)) focusedRun.current = runKey;
       }
       action.current = node;
     },
@@ -143,6 +146,7 @@ export function WorkflowJob({
   const conversationButton = useRunActionFocus(key);
   const resumeButton = useRunActionFocus(key);
   const runHeading = useRef<HTMLHeadingElement>(null);
+  const checkpointForm = useRunActionFocus<HTMLFormElement>(key, runHeading);
   const retryPublishingButton = useRunActionFocus(key, runHeading);
   const retryCancellationButton = useRunActionFocus(key, runHeading);
   const runControlsTrigger = useRef<HTMLButtonElement>(null);
@@ -196,13 +200,6 @@ export function WorkflowJob({
     !cancelling &&
     (manualState.status === "awaiting_input" || manualState.status === "awaiting_review");
   const input = checkpoint?.kind === "input";
-  const composingFeedback =
-    waiting &&
-    !manualHold &&
-    !input &&
-    feedbackOpen &&
-    viewerControls.canRespond &&
-    !approvalPending;
   useLayoutEffect(() => {
     if (feedbackFocus.current === "input") feedbackInput.current?.focus();
     if (feedbackFocus.current === "button") feedbackButton.current?.focus();
@@ -343,13 +340,13 @@ export function WorkflowJob({
                 : operation === "retry_preparation" || operation === "retry_cancellation"
                   ? { operation, expectedRevision: selectedJob.progress!.revision }
                   : { operation };
-    const submitted = {
+    recordWorkflowResponse(appAtomRegistry, scope, jobId, {
       checkpointId: checkpoint?.checkpointId ?? null,
       operation,
       userId: scope.accountId,
       text: "text" in payload ? payload.text : null,
-    };
-    recordWorkflowResponse(appAtomRegistry, scope, jobId, submitted);
+      requestEpoch: request.epoch,
+    });
     try {
       const next = await call((client, token) =>
         client.respondToWorkflowJob({
@@ -523,6 +520,38 @@ export function WorkflowJob({
   const checkpointStep = selectedJob.workflow?.definition.steps.find((step) => step.id === stepId);
   const stepRepeatsWorkflowName =
     !!checkpointStep && checkpointStep.title === selectedJob.workflow?.definition.name;
+  const checkpointOperation = input ? "input" : "request_changes";
+  const submission = checkpoint ? drafts.submitted[key]?.[checkpoint.checkpointId] : undefined;
+  const ownSend =
+    submission?.userId === scope.accountId && submission.operation === checkpointOperation
+      ? submission
+      : undefined;
+  const sendingCheckpoint = !!read.mutation && ownSend?.requestEpoch === read.epoch;
+  const unknownCheckpointResponse =
+    manualState.responsePending &&
+    selectedJob.pendingResponseOperation === undefined &&
+    !selectedJob.pendingManualControl &&
+    (!selectedJob.progress?.resultSaving || selectedJob.progress.resultSaving.state === "saved");
+  const checkpointResponsePending =
+    waiting &&
+    !approvalPending &&
+    (sendingCheckpoint ||
+      unknownCheckpointResponse ||
+      (manualState.responsePending &&
+        selectedJob.pendingResponseOperation === checkpointOperation));
+  const submittedResponse =
+    checkpointResponsePending && ownSend && (sendingCheckpoint || ownSend.acceptedPending)
+      ? ownSend.text
+      : null;
+  const checkpointConfirmationTitle = "Waiting for confirmation";
+  const composingFeedback =
+    waiting &&
+    !checkpointResponsePending &&
+    !manualHold &&
+    !input &&
+    feedbackOpen &&
+    viewerControls.canRespond &&
+    !approvalPending;
   const approval =
     !terminal &&
     !cancelling &&
@@ -533,14 +562,12 @@ export function WorkflowJob({
         selectedJob.status === "finishing" &&
         selectedJob.progress?.retryableApproval));
   const oldDrafts = Object.entries(responseDrafts)
-    .filter(
-      ([id, text]) =>
-        (!waiting ||
-          !viewerControls.canRespond ||
-          approvalPending ||
-          id !== checkpoint?.checkpointId) &&
-        !!text.trim(),
-    )
+    .filter(([id, text]) => {
+      if (!text.trim()) return false;
+      if (id !== checkpoint?.checkpointId) return true;
+      if (checkpointResponsePending) return text !== submittedResponse;
+      return !waiting || !viewerControls.canRespond || approvalPending;
+    })
     .map(([id, text]) => ({
       id,
       text,
@@ -634,18 +661,21 @@ export function WorkflowJob({
       : undefined;
   const taskTitle = composingFeedback
     ? "Request changes"
-    : terminal
-      ? completed
-        ? "Workflow completed"
-        : statusLabel
-      : selectedJob.status === "queued"
-        ? "Waiting for execution"
-        : stepRepeatsWorkflowName
-          ? null
-          : (checkpointStep?.title ??
-            (StatusIcon ? null : workflowStatusLabel(manualState.status ?? selectedJob.status)));
+    : checkpointResponsePending
+      ? (checkpointStep?.title ?? (input ? "Input checkpoint" : "Review checkpoint"))
+      : terminal
+        ? completed
+          ? "Workflow completed"
+          : statusLabel
+        : selectedJob.status === "queued"
+          ? "Waiting for execution"
+          : stepRepeatsWorkflowName
+            ? null
+            : (checkpointStep?.title ??
+              (StatusIcon ? null : workflowStatusLabel(manualState.status ?? selectedJob.status)));
   const conversationInTask = running && !checkpoint;
-  const inputInTask = !!StatusIcon && input;
+  const checkpointPanel = composingFeedback || checkpointResponsePending;
+  const TaskIcon = checkpointPanel ? (input ? MessageSquareIcon : ClipboardCheckIcon) : StatusIcon;
   const resumeAction =
     canConfigure && manualState.canResume ? (
       <Button
@@ -668,7 +698,8 @@ export function WorkflowJob({
         {checkpoint && checkpoint.kind !== "input" ? (
           <Button
             variant={
-              (waiting && !input) || (completed && !selectedJob.progress.pullRequestUrl)
+              (waiting && !input && !checkpointResponsePending) ||
+              (completed && !selectedJob.progress.pullRequestUrl)
                 ? "default"
                 : "outline"
             }
@@ -699,74 +730,106 @@ export function WorkflowJob({
       </div>
     ) : null;
   const draftOpen = !manualHold || collapsedDraftKey !== feedbackKey;
-  const checkpointResponse =
-    waiting &&
+  const checkpointResponse = checkpointResponsePending ? (
+    <div className="space-y-3">
+      {checkpoint?.kind === "input" ? (
+        <p className="text-sm font-medium">{checkpoint.question}</p>
+      ) : null}
+      <WorkflowAlert title={checkpointConfirmationTitle} variant="info" announce={false}>
+        {unknownCheckpointResponse
+          ? "The run will update when the environment confirms the response."
+          : input
+            ? "The workflow continues once the environment confirms the answer."
+            : "Rework starts once the environment confirms the feedback."}
+      </WorkflowAlert>
+      {submittedResponse !== null ? (
+        <div className="space-y-1 rounded-md border bg-muted/25 px-3 py-2.5">
+          <h3 className="text-xs font-medium text-muted-foreground">
+            {sendingCheckpoint
+              ? input
+                ? "Answer being sent"
+                : "Feedback being sent"
+              : input
+                ? "Your last submitted answer"
+                : "Your last submitted feedback"}
+          </h3>
+          <p className="whitespace-pre-wrap text-sm">{submittedResponse}</p>
+        </div>
+      ) : null}
+    </div>
+  ) : waiting &&
     checkpoint &&
     viewerControls.canRespond &&
     !approvalPending &&
     (input || feedbackOpen || (manualHold && !!response.trim())) ? (
-      <details
-        key={feedbackKey}
-        open={draftOpen}
-        className={cn(manualHold && "space-y-2 border-t pt-3")}
-        onToggle={(event) => {
-          const open = event.currentTarget.open;
-          if (!manualHold || open === draftOpen) return;
-          setCollapsedDraftKey(open ? null : feedbackKey);
+    <details
+      key={feedbackKey}
+      open={draftOpen}
+      className={cn(manualHold && "space-y-2 border-t pt-3")}
+      onToggle={(event) => {
+        const open = event.currentTarget.open;
+        if (!manualHold || open === draftOpen) return;
+        setCollapsedDraftKey(open ? null : feedbackKey);
+      }}
+    >
+      <summary hidden={!manualHold} className="cursor-pointer text-sm font-medium">
+        {manualHold ? (input ? "Answer draft" : "Feedback draft") : null}
+      </summary>
+      <form
+        ref={checkpointForm}
+        className="space-y-3"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void respond(input ? "input" : "request_changes");
         }}
       >
-        <summary hidden={!manualHold} className="cursor-pointer text-sm font-medium">
-          {manualHold ? (input ? "Answer draft" : "Feedback draft") : null}
-        </summary>
-        <form
-          className="space-y-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void respond(input ? "input" : "request_changes");
-          }}
-        >
-          <label className="block space-y-2">
-            {input ? (
-              <span className="text-sm font-medium">{checkpoint.question}</span>
-            ) : (
-              <span className="sr-only">Feedback for the agent</span>
-            )}
-            <Textarea
-              ref={feedbackInput}
-              aria-label={input ? "Checkpoint answer" : "Rework feedback"}
-              placeholder={input ? undefined : "Describe the changes…"}
-              rows={input ? 3 : 5}
-              maxLength={8000}
-              value={response}
-              onFocus={keepPausedFeedbackOpenOnResume}
-              onChange={(event) => setResponse(event.target.value)}
-            />
-          </label>
-          {!manualHold ? (
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-xs text-muted-foreground">Draft kept until acknowledged.</p>
-              <div className="ml-auto">
+        <label className="block space-y-2">
+          <span className="text-sm font-medium">
+            {checkpoint.kind === "input" ? checkpoint.question : "Feedback for the agent"}
+          </span>
+          <Textarea
+            ref={feedbackInput}
+            placeholder={input ? undefined : "Describe the changes…"}
+            rows={input ? 3 : 4}
+            maxLength={8000}
+            value={response}
+            onFocus={keepPausedFeedbackOpenOnResume}
+            onChange={(event) => setResponse(event.target.value)}
+          />
+        </label>
+        {!manualHold ? (
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {composingFeedback ? (
+              <div className="mr-auto">
                 <Button
-                  type="submit"
+                  type="button"
+                  variant="ghost"
                   size="sm"
-                  disabled={busy || manualState.checkpointBlocked || !response.trim()}
+                  onClick={() => {
+                    feedbackFocus.current = "button";
+                    setFeedbackView({ key: feedbackKey, open: false });
+                  }}
                 >
-                  {manualState.responsePending
-                    ? "Response pending"
-                    : input
-                      ? "Submit answer"
-                      : "Send changes"}
+                  Back to review
                 </Button>
               </div>
-            </div>
-          ) : null}
-        </form>
-      </details>
-    ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
-      <p className="text-sm text-muted-foreground">
-        This checkpoint requires a repository maintainer.
-      </p>
-    ) : null;
+            ) : null}
+            <Button
+              type="submit"
+              size="sm"
+              disabled={busy || manualState.checkpointBlocked || !response.trim()}
+            >
+              {input ? "Submit answer" : "Send feedback"}
+            </Button>
+          </div>
+        ) : null}
+      </form>
+    </details>
+  ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
+    <p className="text-sm text-muted-foreground">
+      This checkpoint requires a repository maintainer.
+    </p>
+  ) : null;
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl space-y-6 wrap-anywhere">
       {runNavigation}
@@ -812,14 +875,18 @@ export function WorkflowJob({
       </AlertDialog>
       <header>
         <span role="status" className="sr-only">
-          {queuedTask ? `${statusLabel}. ${queuedTask.title}` : statusLabel}
+          {checkpointResponsePending
+            ? checkpointConfirmationTitle
+            : queuedTask
+              ? `${statusLabel}. ${queuedTask.title}`
+              : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
             {runName}
           </h1>
           <div className="flex flex-wrap items-center gap-3">
-            {!StatusIcon && !cancelling ? (
+            {!TaskIcon && !cancelling ? (
               <span aria-hidden className="text-sm font-medium">
                 {statusLabel}
               </span>
@@ -967,24 +1034,32 @@ export function WorkflowJob({
           ) : cancelledVm ? null : (
             <div
               className={
-                StatusIcon
+                TaskIcon
                   ? "space-y-3 rounded-lg border bg-card p-4 text-card-foreground"
                   : "space-y-3 border-t pt-5"
               }
             >
-              {StatusIcon || (!terminal && stepIndex >= 0) ? (
+              {TaskIcon || (!terminal && stepIndex >= 0) ? (
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  {StatusIcon ? (
+                  {TaskIcon ? (
                     <span
-                      aria-hidden
+                      aria-hidden={!composingFeedback}
                       className={cn(
                         "inline-flex items-center gap-2 text-sm font-medium",
-                        needsInput && "text-warning-foreground",
+                        (needsInput || composingFeedback) &&
+                          !checkpointResponsePending &&
+                          "text-warning-foreground",
                         running && "text-info-foreground",
                       )}
                     >
-                      <StatusIcon aria-hidden className="size-4" />
-                      {statusLabel}
+                      <TaskIcon aria-hidden className="size-4" />
+                      {checkpointResponsePending
+                        ? input
+                          ? "Input"
+                          : "Review"
+                        : composingFeedback
+                          ? (checkpointStep?.title ?? "Review")
+                          : statusLabel}
                     </span>
                   ) : null}
                   {!terminal && stepIndex >= 0 ? (
@@ -995,13 +1070,10 @@ export function WorkflowJob({
                   ) : null}
                 </div>
               ) : null}
-              {composingFeedback && checkpointStep && !stepRepeatsWorkflowName ? (
-                <p className="text-sm text-muted-foreground">{checkpointStep.title}</p>
-              ) : null}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="min-w-0 space-y-1">
                   {taskTitle ? (
-                    <h2 className={StatusIcon ? "text-base font-semibold" : "text-sm font-medium"}>
+                    <h2 className={TaskIcon ? "text-base font-semibold" : "text-sm font-medium"}>
                       {taskTitle}
                     </h2>
                   ) : null}
@@ -1014,23 +1086,10 @@ export function WorkflowJob({
                     </p>
                   ) : null}
                 </div>
-                {composingFeedback ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => {
-                      feedbackFocus.current = "button";
-                      setFeedbackView({ key: feedbackKey, open: false });
-                    }}
-                  >
-                    Back to review
-                  </Button>
-                ) : null}
                 {conversationInTask ? conversationActions : null}
                 {paused ? resumeAction : null}
               </div>
-              {inputInTask ? checkpointResponse : null}
+              {checkpointResponse}
             </div>
           )}
           {selectedJob.status === "queued" && !queuedTask ? (
@@ -1038,7 +1097,7 @@ export function WorkflowJob({
               Waiting for an execution target. No steps have started.
             </p>
           ) : null}
-          {!cancelling && manualState.message && !showPauseDetail ? (
+          {!cancelling && !checkpointResponsePending && manualState.message && !showPauseDetail ? (
             <WorkflowAlert
               title={confirmationPending ? "Waiting for confirmation" : "Run needs attention"}
               variant={confirmationPending ? "info" : "warning"}
@@ -1052,6 +1111,9 @@ export function WorkflowJob({
           !cancelledVm &&
           !queuedTask &&
           detail &&
+          !(
+            checkpointResponsePending && detail === "Response saved; waiting for the environment."
+          ) &&
           !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
@@ -1071,6 +1133,7 @@ export function WorkflowJob({
           !manualHold &&
           !input &&
           !composingFeedback &&
+          !checkpointResponsePending &&
           (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) &&
           stepIndex >= 0 ? (
             <p className="text-sm text-muted-foreground">
@@ -1144,8 +1207,9 @@ export function WorkflowJob({
           {(approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
           !manualHold &&
           !composingFeedback &&
+          !checkpointResponsePending &&
           (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) ? (
-            <div className="flex flex-wrap gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {approval ? (
                 <Button
                   variant={
@@ -1189,9 +1253,11 @@ export function WorkflowJob({
                   Request changes
                 </Button>
               ) : null}
+              {waiting && !input && viewerControls.canRespond && response.trim() ? (
+                <p className="text-xs text-muted-foreground">Feedback draft kept</p>
+              ) : null}
             </div>
           ) : null}
-          {!inputInTask ? checkpointResponse : null}
           {!cancelling &&
           canConfigure &&
           manualState.status === "paused" &&
@@ -1208,6 +1274,7 @@ export function WorkflowJob({
         <WorkflowUnsentDrafts
           key={`drafts:${key}`}
           drafts={oldDrafts}
+          activeCheckpointId={checkpointResponsePending ? checkpoint?.checkpointId : undefined}
           fallbackFocus={runHeading}
           onDiscard={(draft) => changeRetainedDraft(draft, false)}
           onRestore={(draft) => changeRetainedDraft(draft, true)}

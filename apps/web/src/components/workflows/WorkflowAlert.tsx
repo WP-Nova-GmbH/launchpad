@@ -8,11 +8,13 @@ export function WorkflowAlert({
   children,
   actions,
   variant = "error",
+  announce = true,
 }: {
   title: string;
   children: ReactNode;
   actions?: ReactNode;
   variant?: "error" | "warning" | "info";
+  announce?: boolean;
 }) {
   const Icon =
     variant === "warning" ? TriangleAlertIcon : variant === "info" ? InfoIcon : CircleAlertIcon;
@@ -21,7 +23,7 @@ export function WorkflowAlert({
       <Alert
         variant={variant}
         controlAlignment="first-line"
-        role={variant === "info" ? "status" : "alert"}
+        role={announce ? (variant === "info" ? "status" : "alert") : undefined}
       >
         <Icon />
         <AlertTitle role="heading" aria-level={2}>

@@ -266,11 +266,13 @@ function DraftRow({
 
 export function WorkflowUnsentDrafts({
   drafts,
+  activeCheckpointId,
   onDiscard,
   onRestore,
   fallbackFocus,
 }: {
   drafts: readonly RetainedCheckpointDraft[];
+  activeCheckpointId?: string | undefined;
   onDiscard: (draft: RetainedCheckpointDraft) => boolean;
   onRestore: (draft: RetainedCheckpointDraft) => boolean;
   fallbackFocus?: RefObject<HTMLElement | null>;
@@ -305,7 +307,11 @@ export function WorkflowUnsentDrafts({
   return (
     <section
       className="rounded-lg border bg-muted/20 text-sm wrap-anywhere"
-      aria-label="Earlier checkpoint drafts"
+      aria-label={
+        drafts.some(({ id }) => id === activeCheckpointId)
+          ? "Checkpoint drafts"
+          : "Earlier checkpoint drafts"
+      }
     >
       <div className="flex flex-wrap items-center gap-2 px-4 py-3">
         <FileTextIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
@@ -322,7 +328,13 @@ export function WorkflowUnsentDrafts({
         <DraftRow
           key={draft.id}
           draft={draft}
-          label={drafts.length > 1 ? `Earlier response ${index + 1}` : "Earlier response"}
+          label={
+            draft.id === activeCheckpointId
+              ? "Current checkpoint"
+              : drafts.length > 1
+                ? `Earlier response ${index + 1}`
+                : "Earlier response"
+          }
           onFocusedRemoval={markFocusedRemoval}
           onDiscard={(entry) => {
             if (onDiscard(entry)) {

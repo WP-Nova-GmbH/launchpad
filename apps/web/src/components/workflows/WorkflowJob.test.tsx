@@ -537,6 +537,188 @@ describe("workflow run presentation", () => {
     expect(renderer!.root.findByType("textarea").props.value).toBe("Add a regression test");
     expect(fixture.call).toHaveBeenCalledTimes(2);
   });
+  const checkpointQuestion = "Who should receive the migration first?";
+  const inputCheckpoint: RepositoryWorkflowJob = {
+    ...review,
+    status: "awaiting_input",
+    progress: {
+      ...review.progress!,
+      status: "awaiting_input",
+      checkpoint: {
+        checkpointId: "checkpoint",
+        stepId: "rollout",
+        generation: 0,
+        kind: "input",
+        role: "member",
+        question: checkpointQuestion,
+      },
+    },
+  };
+  const currentTask = () =>
+    renderer!.root
+      .findAllByType("section")
+      .find((section) => section.props["aria-label"] === "Current workflow task")!;
+  const submitCheckpoint = () =>
+    act(async () => {
+      currentTask().findByType("form").props.onSubmit({ preventDefault: vi.fn() });
+    });
+  const headerStatus = () =>
+    renderer!.root
+      .findAllByType("header")
+      .flatMap((header) => header.findAllByType("span"))
+      .find((span) => span.props.role === "status");
+
+  it.each(["input", "request_changes"] as const)(
+    "shows the exact submitted %s while waiting and preserves a newer draft after acknowledgement",
+    async (operation) => {
+      const active = operation === "input" ? inputCheckpoint : review;
+      const pending: RepositoryWorkflowJob = {
+        ...active,
+        responsePending: true,
+        pendingResponseOperation: operation,
+      };
+      const key = workflowSessionKey(scope, job.jobId);
+      const submitted = "Use staging first.\nAdd coverage for the retry path.";
+      const newerDraft = "A newer draft kept while delivery is pending.";
+      fixture.call.mockResolvedValue(active);
+      await mount();
+      const liveStatus = headerStatus();
+      expect(liveStatus).toBeDefined();
+
+      if (operation === "request_changes") {
+        await press("Request changes");
+        expect(text(currentTask())).toContain("Send feedback");
+        expect(text(currentTask())).toContain("Back to review");
+      }
+      const editor = currentTask().findByType("textarea");
+      if (operation === "input") {
+        expect(text(currentTask())).toContain(checkpointQuestion);
+        expect(text(currentTask())).toContain("Submit answer");
+        // An overriding ARIA label would hide the visible question from assistive technology.
+        expect(editor.props["aria-label"] ?? checkpointQuestion).toBe(checkpointQuestion);
+      }
+      await act(() => editor.props.onChange({ target: { value: submitted } }));
+
+      const send = vi.fn().mockResolvedValue(pending);
+      fixture.call
+        .mockResolvedValue(pending)
+        .mockImplementationOnce((request) => request({ respondToWorkflowJob: send }, "token"));
+      await submitCheckpoint();
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          payload: {
+            checkpointId: "checkpoint",
+            expectedRevision: active.progress!.revision,
+            operation,
+            text: submitted,
+          },
+        }),
+      );
+
+      await act(() => {
+        updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+          ...state,
+          responses: { ...state.responses, [key]: { checkpoint: newerDraft } },
+        }));
+      });
+      fixture.call.mockResolvedValue({ ...pending, progress: { ...pending.progress! } });
+      await pollRun();
+      const waiting = text(currentTask());
+      expect(headerStatus()).toBe(liveStatus);
+      expect(text(liveStatus!)).toMatch(/confirmation|pending/i);
+      expect(waiting.match(/Waiting for confirmation/g)).toHaveLength(1);
+      const lastSubmitted =
+        operation === "input" ? "Your last submitted answer" : "Your last submitted feedback";
+      expect(waiting).toContain(lastSubmitted);
+      expect(waiting).toContain(submitted);
+      expect(waiting).not.toContain(newerDraft);
+      expect(currentTask().findAllByType("textarea")).toHaveLength(0);
+      expect(findButton("Back to review")).toBeUndefined();
+      expect(findButton(operation === "input" ? "Submit answer" : "Send feedback")).toBeUndefined();
+      expect(findButton("Open conversation")).toBeDefined();
+      if (operation === "request_changes") {
+        expect(findButton("Inspect saved diff")).toBeDefined();
+        expect(findButton("Approve result")).toBeUndefined();
+      }
+
+      // A relay retry can update the job timestamp while the same checkpoint is still waiting.
+      fixture.call.mockResolvedValue({
+        ...pending,
+        updatedAt: "2026-10-28",
+        progress: { ...pending.progress! },
+      });
+      await pollRun();
+      expect(text(currentTask())).toContain(lastSubmitted);
+      expect(text(currentTask())).toContain(submitted);
+
+      await act(() => renderer!.unmount());
+      await mount();
+      expect(text(currentTask())).toContain(lastSubmitted);
+      expect(text(currentTask())).toContain(submitted);
+      expect(text(currentTask())).not.toContain(newerDraft);
+
+      fixture.call.mockResolvedValue({
+        ...job,
+        progress: {
+          ...job.progress!,
+          revision: active.progress!.revision + 1,
+          checkpoint: null,
+          responses: [
+            {
+              checkpointId: "checkpoint",
+              stepId: operation === "input" ? "rollout" : "review",
+              generation: 0,
+              operation,
+              userId: scope.accountId,
+              text: submitted,
+              createdAt: job.updatedAt,
+            },
+          ],
+        },
+      } satisfies RepositoryWorkflowJob);
+      await pollRun();
+
+      expect(text(currentTask())).not.toContain("Waiting for confirmation");
+      expect(appAtomRegistry.get(workflowDraftAtom).responses[key]?.checkpoint).toBe(newerDraft);
+    },
+  );
+
+  it.each(["request_changes", undefined] as const)(
+    "keeps a failed local draft separate from a pending %s response",
+    async (operation) => {
+      const pending: RepositoryWorkflowJob = {
+        ...review,
+        responsePending: true,
+        ...(operation === undefined ? {} : { pendingResponseOperation: operation }),
+      };
+      const key = workflowSessionKey(scope, job.jobId);
+      const localDraft = "Private feedback in the unsent draft.";
+      fixture.call.mockResolvedValue(review);
+      await mount();
+      await press("Request changes");
+      await act(() =>
+        currentTask()
+          .findByType("textarea")
+          .props.onChange({ target: { value: localDraft } }),
+      );
+      const reject = vi.fn().mockRejectedValue(new Error("A response is already pending."));
+      fixture.call
+        .mockResolvedValue(pending)
+        .mockImplementationOnce((request) => request({ respondToWorkflowJob: reject }, "token"));
+      await submitCheckpoint();
+      await pollRun();
+
+      expect(text(currentTask())).toContain("Waiting for confirmation");
+      expect(text(currentTask())).not.toMatch(/submitted feedback/i);
+      expect(text(currentTask())).not.toContain(localDraft);
+      expect(currentTask().findAllByType("textarea")).toHaveLength(0);
+      expect(findButton("Send feedback")).toBeUndefined();
+      expect(findButton("Copy draft")).toBeDefined();
+      expect(text(renderer!.toJSON())).toContain(localDraft);
+      expect(appAtomRegistry.get(workflowDraftAtom).responses[key]?.checkpoint).toBe(localDraft);
+    },
+  );
+
   it("keeps review feedback reachable during a manual hold and shows the role requirement after access changes", async () => {
     const vmReview: RepositoryWorkflowJob = {
       ...review,
@@ -573,7 +755,7 @@ describe("workflow run presentation", () => {
     expect(draft?.findByType("textarea").props.value).toBe("Add a regression test");
     expect(text(renderer!.toJSON())).toContain("Saved results");
     expect(findButton("Back to review")).toBeUndefined();
-    expect(findButton("Send changes")).toBeUndefined();
+    expect(findButton("Send feedback")).toBeUndefined();
 
     fixture.call.mockResolvedValue({
       ...paused,
