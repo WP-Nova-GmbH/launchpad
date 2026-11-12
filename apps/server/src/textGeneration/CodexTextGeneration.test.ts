@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -8,6 +9,7 @@ import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import { createModelSelection } from "@t3tools/shared/model";
 import { expect } from "vite-plus/test";
 import { FetchHttpClient } from "effect/unstable/http";
@@ -812,6 +814,27 @@ it.layer(CodexTextGenerationTestLayer)("CodexTextGeneration", (it) => {
           expect(generated.subject.endsWith(".")).toBe(false);
           expect(generated.body).toBe("- added migration\n- updated tests");
           expect(generated.branch).toBeUndefined();
+        }),
+    ),
+  );
+
+  it.effect("generates a commit message after the caller's scope closes", () =>
+    withFakeCodexEnv(
+      { output: JSON.stringify({ subject: "Add help output", body: "" }) },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const requestScope = yield* Scope.make();
+          yield* Scope.close(requestScope, Exit.void);
+          const generated = yield* textGeneration
+            .generateCommitMessage({
+              cwd: process.cwd(),
+              branch: "feature/help",
+              stagedSummary: "M verify-env.sh",
+              stagedPatch: "diff --git a/verify-env.sh b/verify-env.sh",
+              modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+            })
+            .pipe(Effect.provideService(Scope.Scope, requestScope));
+          expect(generated.subject).toBe("Add help output");
         }),
     ),
   );

@@ -40,7 +40,9 @@ import {
   parseRemoteRefWithRemoteNames,
 } from "../git/remoteRefs.ts";
 import { ServerConfig } from "../config.ts";
+import { CurrentWorkflowCommand } from "../processRunner.ts";
 import { VmCoordinatorProcess, WorkflowVmGuest } from "../vmWorkloadCommand.ts";
+import { VcsProcess } from "./VcsProcess.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const gitProcesses = Semaphore.makeUnsafe(8);
@@ -157,6 +159,7 @@ interface ExecuteGitOptions {
   allowNonZeroExit?: boolean | undefined;
   fallbackErrorDetail?: string | undefined;
   env?: NodeJS.ProcessEnv | undefined;
+  githubRemoteUrl?: string | undefined;
   maxOutputBytes?: number | undefined;
   appendTruncationMarker?: boolean | undefined;
   progress?: GitVcsDriver.ExecuteGitProgress | undefined;
@@ -826,6 +829,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const vcsProcess = yield* Effect.serviceOption(VcsProcess);
   const { worktreesDir } = yield* ServerConfig;
   const crypto = yield* Crypto.Crypto;
 
@@ -838,6 +842,53 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       const timeoutMs = input.timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : input.timeoutMs;
       const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const appendTruncationMarker = input.appendTruncationMarker ?? false;
+
+      // Machine network operations need GitHub credentials, and publishing commands
+      // must be tracked by the same process runner that settles their ownership.
+      if (input.githubRemoteUrl || (yield* CurrentWorkflowCommand)) {
+        if (Option.isNone(vcsProcess)) {
+          return yield* new GitCommandError({
+            ...gitCommandContext(commandInput),
+            detail: "Workflow Git process execution is unavailable.",
+          });
+        }
+        const result = yield* vcsProcess.value
+          .run({
+            operation: input.operation,
+            command: "git",
+            args: input.args,
+            cwd: input.cwd,
+            ...(input.githubRemoteUrl
+              ? { credentials: "github", credentialUrl: input.githubRemoteUrl }
+              : { credentials: "none" }),
+            ...(input.env ? { env: input.env } : {}),
+            ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
+            ...(timeoutMs === null ? {} : { timeoutMs }),
+            maxOutputBytes,
+            appendTruncationMarker,
+            allowNonZeroExit: true,
+          })
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new GitCommandError({
+                  ...gitCommandContext(commandInput),
+                  detail: "Workflow Git process execution failed.",
+                  cause,
+                }),
+            ),
+          );
+        if (!input.allowNonZeroExit && result.exitCode !== 0) {
+          return yield* new GitCommandError({
+            ...gitCommandContext(commandInput),
+            detail: "Git command exited with a non-zero status.",
+            exitCode: result.exitCode,
+            stdoutLength: result.stdout.length,
+            stderrLength: result.stderr.length,
+          });
+        }
+        return result;
+      }
 
       const runGitCommand = Effect.fn("runGitCommand")(function* () {
         const isolated = (yield* WorkflowVmGuest) && !(yield* VmCoordinatorProcess);
@@ -995,6 +1046,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       args,
       ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
       ...(options.env !== undefined ? { env: options.env } : {}),
+      ...(options.githubRemoteUrl ? { githubRemoteUrl: options.githubRemoteUrl } : {}),
       allowNonZeroExit: true,
       ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(options.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
@@ -3299,15 +3351,133 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const fetchRemote: GitVcsDriver.GitVcsDriver["Service"]["fetchRemote"] = Effect.fn("fetchRemote")(
     function* (input) {
-      const args = ["fetch", "--quiet", input.remoteName];
+      const githubRemoteUrl = input.githubRemoteUrl;
+      let refspecs: ReadonlyArray<string> = [];
+      const fetchFlags: string[] = [];
+      const httpConfig: string[] = [];
+      const fetchConfig: string[] = [];
+      const env: NodeJS.ProcessEnv = { ...STATUS_UPSTREAM_REFRESH_ENV };
+      if (githubRemoteUrl) {
+        const operation = "GitVcsDriver.fetchRemote.verifyRemote";
+        const args = ["remote", "get-url", "--all", "--", input.remoteName];
+        const destination = yield* executeGit(operation, input.cwd, args, {
+          env: STATUS_UPSTREAM_REFRESH_ENV,
+        });
+        if (
+          destination.stdoutTruncated ||
+          destination.stdout.replace(/\r?\n$/, "") !== githubRemoteUrl
+        ) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({ operation, cwd: input.cwd, args }),
+            detail: "The Git remote no longer resolves to the workflow repository.",
+          });
+        }
+
+        // A URL fetch does not inherit settings from the checkout's named remote.
+        const remote = input.remoteName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const configOperation = "GitVcsDriver.fetchRemote.readSettings";
+        const configArgs = [
+          "config",
+          "--null",
+          "--get-regexp",
+          "--",
+          `^remote\\.${remote}\\.(fetch|proxy|proxyauthmethod|tagopt|prune|prunetags)$`,
+        ];
+        const configured = yield* executeGit(configOperation, input.cwd, configArgs, {
+          allowNonZeroExit: true,
+        });
+        if (
+          configured.stdoutTruncated ||
+          (configured.exitCode !== 0 && configured.exitCode !== 1)
+        ) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: configOperation,
+              cwd: input.cwd,
+              args: configArgs,
+            }),
+            detail: "Could not read the workflow repository's fetch settings.",
+          });
+        }
+        const settings = configured.stdout
+          .split("\0")
+          .filter(Boolean)
+          .map((entry) => {
+            const separator = entry.indexOf("\n");
+            const key = separator === -1 ? entry : entry.slice(0, separator);
+            return [
+              key.slice(key.lastIndexOf(".") + 1),
+              separator === -1 ? "true" : entry.slice(separator + 1),
+            ] as const;
+          });
+        const get = (key: string) => settings.findLast(([name]) => name === key)?.[1];
+        refspecs = settings.flatMap(([key, value]) => (key === "fetch" && value ? [value] : []));
+        const tagOpt = get("tagopt");
+        if (tagOpt === "--tags" || tagOpt === "--no-tags") fetchFlags.push(tagOpt);
+        for (const [name, configKey, variable, args] of [
+          ["proxy", `http.${githubRemoteUrl}.proxy`, "LAUNCHPAD_WORKFLOW_GIT_PROXY", httpConfig],
+          [
+            "proxyauthmethod",
+            `http.${githubRemoteUrl}.proxyAuthMethod`,
+            "LAUNCHPAD_WORKFLOW_GIT_PROXY_AUTH",
+            httpConfig,
+          ],
+          ["prune", "fetch.prune", "LAUNCHPAD_WORKFLOW_GIT_PRUNE", fetchConfig],
+          ["prunetags", "fetch.pruneTags", "LAUNCHPAD_WORKFLOW_GIT_PRUNE_TAGS", fetchConfig],
+        ] as const) {
+          const value = get(name);
+          if (value === undefined) continue;
+          env[variable] = value;
+          args.push(`--config-env=${configKey}=${variable}`);
+        }
+      }
+      const args = [
+        ...httpConfig,
+        ...fetchConfig,
+        "fetch",
+        "--quiet",
+        ...fetchFlags,
+        ...(githubRemoteUrl ? ["--", githubRemoteUrl] : [input.remoteName]),
+      ];
       const options = {
-        env: STATUS_UPSTREAM_REFRESH_ENV,
+        env,
+        githubRemoteUrl,
         fallbackErrorDetail: `git fetch ${input.remoteName} failed`,
       };
+      const recordDefaultBranch = Effect.gen(function* () {
+        if (
+          !githubRemoteUrl ||
+          (yield* resolveDefaultBranchName(input.cwd, input.remoteName)) !== null
+        )
+          return;
+        const advertised = yield* executeGitWithStableDiagnostics(
+          "GitVcsDriver.fetchRemote.readDefaultBranch",
+          input.cwd,
+          [...httpConfig, "ls-remote", "--symref", "--", githubRemoteUrl, "HEAD"],
+          options,
+        );
+        if (advertised.stdoutTruncated) return;
+        const branch = /^ref: refs\/heads\/([^\t\r\n]+)\tHEAD\r?$/m.exec(advertised.stdout)?.[1];
+        if (
+          !branch ||
+          !(yield* remoteBranchExists({
+            cwd: input.cwd,
+            remoteName: input.remoteName,
+            refName: branch,
+          }))
+        )
+          return;
+        yield* runGit("GitVcsDriver.fetchRemote.recordDefaultBranch", input.cwd, [
+          "symbolic-ref",
+          `refs/remotes/${input.remoteName}/HEAD`,
+          `refs/remotes/${input.remoteName}/${branch}`,
+        ]);
+      });
+      const allArgs = [...args, ...refspecs];
       const fetchAll = executeGitWithStableDiagnostics(
         "GitVcsDriver.fetchRemote",
         input.cwd,
-        args,
+        allArgs,
         {
           ...options,
           allowNonZeroExit: true,
@@ -3321,7 +3491,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
                   ...gitCommandContext({
                     operation: "GitVcsDriver.fetchRemote",
                     cwd: input.cwd,
-                    args,
+                    args: allArgs,
                   }),
                   detail: fetchFailureDetail(result.stderr) ?? options.fallbackErrorDetail,
                   ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
@@ -3330,6 +3500,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
                 }),
               ),
         ),
+        Effect.andThen(recordDefaultBranch),
       );
       if (input.refName === undefined) {
         return yield* fetchAll.pipe(Effect.asVoid);
@@ -3347,7 +3518,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         scopedArgs,
         { ...options, allowNonZeroExit: true },
       );
-      if (result.exitCode === 0) return;
+      if (result.exitCode === 0) return yield* recordDefaultBranch;
       if (
         result.stderr
           .split(/\r?\n/)

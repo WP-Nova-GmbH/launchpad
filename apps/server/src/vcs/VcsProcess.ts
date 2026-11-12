@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import { CheckoutAccess, CheckoutReservedError } from "../workspace/CheckoutAccess.ts";
 import * as Redacted from "effect/Redacted";
 import { privateThreadVmGitArgs, privateThreadVmSourceControlEnv } from "./threadVmCredentials.ts";
@@ -40,6 +41,9 @@ export interface VcsProcessInput {
   readonly stdin?: string;
   readonly onStdoutChunk?: (chunk: Uint8Array) => void;
   readonly env?: NodeJS.ProcessEnv;
+  /** `github` is for a Git network command targeting a validated github.com HTTPS URL. */
+  readonly credentials?: "none" | "github";
+  readonly credentialUrl?: string;
   readonly allowNonZeroExit?: boolean;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
@@ -71,6 +75,54 @@ const OUTPUT_TRUNCATED_MARKER = "\n\n[truncated]";
 const VCS_PROCESS_CONCURRENCY = 8;
 const GITHUB_PROCESS_CONCURRENCY = 4;
 const isCheckoutReservedError = Schema.is(CheckoutReservedError);
+
+function workflowGitHubArgs(
+  url: string,
+  args: ReadonlyArray<string>,
+  useRunnerCredential: boolean,
+): ReadonlyArray<string> | null {
+  const commandIndex = args.findIndex((arg) => !arg.startsWith("--config-env="));
+  const command = args[commandIndex];
+  const config: string[] = [];
+  let commandArgs = args;
+  if (command === "fetch" || command === "push" || command === "ls-remote") {
+    const separator = args.indexOf("--");
+    if (separator <= commandIndex || args[separator + 1] !== url) return null;
+    // Git applies only its longest matching rewrite once. A fresh exact alias
+    // pins the URL for this process without consulting the checkout's named remote.
+    const alias = `launchpad-workflow://${NodeCrypto.randomUUID()}`;
+    config.push("-c", `url.${url}.insteadOf=${alias}`);
+    if (command === "push") config.push("-c", `url.${url}.pushInsteadOf=${alias}`);
+    commandArgs = [
+      ...args.slice(0, commandIndex),
+      command,
+      ...(command === "ls-remote" ? [] : ["--no-recurse-submodules"]),
+      ...args.slice(commandIndex + 1, separator + 1),
+      alias,
+      ...args.slice(separator + 2),
+    ];
+  }
+  return [
+    ...config,
+    ...(useRunnerCredential
+      ? [
+          "-c",
+          "credential.helper=",
+          "-c",
+          "credential.useHttpPath=true",
+          "-c",
+          `credential.${url}.helper=!gh auth git-credential`,
+        ]
+      : []),
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "http.followRedirects=false",
+    "-c",
+    `http.${url}.followRedirects=false`,
+    ...commandArgs,
+  ];
+}
 
 export const CHECKPOINT_CAPTURE_OPERATION = "GitVcsDriver.checkpoints.captureCheckpoint";
 
@@ -135,12 +187,12 @@ const makeWithAccess = Effect.fnUntraced(function* (access?: CheckoutAccess["Ser
     yield* OrganizationSourceControlCredentials.OrganizationSourceControlCredentials;
   // Applied on top of whatever environment the caller asks for: a caller
   // setting GIT_TERMINAL_PROMPT for a clone must not lose the credential.
-  const resolveRunnerEnv = (
+  const resolveRunnerCredentialEnv = (
     requested: NodeJS.ProcessEnv | undefined,
   ): Effect.Effect<NodeJS.ProcessEnv | null> => {
     const baseEnv = requested ?? globalThis.process.env;
     const withCredential = (organizationToken: string | null) =>
-      runnerSourceControlEnv(baseEnv, organizationToken) ?? requested ?? null;
+      runnerSourceControlEnv(baseEnv, organizationToken);
     return hasRunnerSourceControlCredential()
       ? Effect.sync(() => withCredential(null))
       : Effect.map(organizationCredentials.github, (credential) =>
@@ -162,6 +214,7 @@ const makeWithAccess = Effect.fnUntraced(function* (access?: CheckoutAccess["Ser
     // code. Only explicit coordinator operations may receive VM Git credentials.
     const isolated = (yield* WorkflowVmGuest) && !(yield* VmCoordinatorProcess);
     const privateVm = organizationCredentials.threadVm;
+    const beginOwner = yield* ProcessRunner.CurrentWorkflowCommand;
     const needsGithubToken = input.command === "gh" && !input.args.includes("--version");
     const vmAuthUnavailable = () =>
       new VcsProcessExitError({
@@ -175,6 +228,18 @@ const makeWithAccess = Effect.fnUntraced(function* (access?: CheckoutAccess["Ser
       privateVm && needsGithubToken
         ? yield* privateVm.github.pipe(Effect.mapError(vmAuthUnavailable))
         : null;
+    // Local workflow Git can invoke repository filters and commit hooks.
+    const localOwnedGit = input.command === "git" && beginOwner !== null;
+    const githubUrl =
+      !isolated && !privateVm && input.command === "git" && input.credentials === "github"
+        ? input.credentialUrl
+        : undefined;
+    const requestRunnerCredentials =
+      input.credentials === "github" ? githubUrl : input.credentials !== "none" && !localOwnedGit;
+    const runnerEnv =
+      !isolated && !privateVm && requestRunnerCredentials
+        ? yield* resolveRunnerCredentialEnv(input.env)
+        : null;
     const resolvedEnv = isolated
       ? workflowVmGitEnvironment(input.env)
       : privateVm
@@ -182,13 +247,33 @@ const makeWithAccess = Effect.fnUntraced(function* (access?: CheckoutAccess["Ser
             input.env ?? globalThis.process.env,
             vmToken ? Redacted.value(vmToken) : null,
           )
-        : yield* resolveRunnerEnv(input.env);
+        : githubUrl
+          ? {
+              ...(runnerEnv ?? input.env),
+              GCM_INTERACTIVE: "never",
+              GH_PROMPT_DISABLED: "1",
+              GIT_ALLOW_PROTOCOL: "https",
+              GIT_ASKPASS: "",
+              GIT_TERMINAL_PROMPT: "0",
+              SSH_ASKPASS: "",
+              SSH_ASKPASS_REQUIRE: "never",
+            }
+          : (runnerEnv ?? input.env ?? null);
     const args =
       !isolated && privateVm && input.command === "git"
         ? privateThreadVmGitArgs(input.args)
-        : input.args;
+        : githubUrl
+          ? workflowGitHubArgs(githubUrl, input.args, Boolean(runnerEnv?.GH_TOKEN))
+          : input.args;
+    if (args === null) {
+      return yield* new VcsProcessExitError({
+        ...baseError,
+        exitCode: 1,
+        detail: "The Git transfer does not target the approved workflow repository.",
+        failureKind: "command-failed",
+      });
+    }
 
-    const beginOwner = yield* ProcessRunner.CurrentWorkflowCommand;
     const owner = beginOwner
       ? yield* beginOwner.pipe(
           Effect.mapError((cause) => new VcsProcessSpawnError({ ...baseError, cause })),

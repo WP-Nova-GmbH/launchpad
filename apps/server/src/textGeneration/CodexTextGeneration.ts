@@ -244,7 +244,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     return { imagePaths };
   });
 
-  const runCodexJson = Effect.fn("runCodexJson")(function* <S extends Schema.Top>({
+  function* runCodexJsonWithTempFiles<S extends Schema.Top>({
     operation,
     cwd,
     prompt,
@@ -265,7 +265,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     imagePaths?: ReadonlyArray<string>;
     cleanupPaths?: ReadonlyArray<string>;
     modelSelection: ModelSelection;
-  }): Effect.fn.Return<S["Type"], TextGenerationError, S["DecodingServices"]> {
+  }): Effect.fn.Return<S["Type"], TextGenerationError, S["DecodingServices"] | Scope.Scope> {
     const schemaJson = yield* encodeJsonForOperation(
       operation,
       toJsonSchemaObject(outputSchemaJson),
@@ -398,7 +398,9 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         }),
       );
     }).pipe(Effect.ensuring(cleanup));
-  });
+  }
+
+  const runCodexJson = Effect.fn("runCodexJson")(runCodexJsonWithTempFiles, Effect.scoped);
 
   const generateCommitMessage: TextGeneration.TextGeneration["Service"]["generateCommitMessage"] =
     Effect.fn("CodexTextGeneration.generateCommitMessage")(function* (input) {

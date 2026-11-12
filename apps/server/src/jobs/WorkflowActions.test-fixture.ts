@@ -22,6 +22,8 @@ import { WorkflowRun } from "./WorkflowRunStore.ts";
 import { make, WorkflowActionError, type WorkflowActionIO } from "./WorkflowActions.ts";
 
 export const id = "workflow:job:action:push:0";
+export const baseCommit = "a".repeat(40);
+export const commitAt = (index: number) => index.toString(16).padStart(40, "0");
 const decodeRun = Schema.decodeUnknownSync(WorkflowRun);
 type ExecuteGit = GitVcsDriver["Service"]["execute"];
 export function initial() {
@@ -63,11 +65,11 @@ export function initial() {
     },
     modelSelection: { instanceId: "codex", model: "test" },
     baseBranch: "main",
-    baseSha: "base",
+    baseSha: baseCommit,
     promptDispatched: true,
     executionReserved: true,
     worktreePath: "/job",
-    preparedHead: "base",
+    preparedHead: baseCommit,
     approvedBy: null,
     publication: {
       remoteName: "upstream",
@@ -89,7 +91,7 @@ export function initial() {
       generation: 0,
       started: true,
       stepStartedAt: "now",
-      completed: [{ stepId: "agent", generation: 0, checkpoint, head: "base" }],
+      completed: [{ stepId: "agent", generation: 0, checkpoint, head: baseCommit }],
       responses: [],
       feedback: null,
     },
@@ -101,7 +103,7 @@ export function initial() {
         operation: "push",
         state: "running",
         phase: "prepare",
-        parent: "base",
+        parent: baseCommit,
         tree: "prepared",
         checkpointRef: "refs/review",
         commitMessage: null,
@@ -169,7 +171,7 @@ export const harness = (
         ),
     };
     const branchName = `t3-job/${binding?.jobId ?? "job"}`;
-    let head = binding?.base ?? "base";
+    let head = binding?.base ?? baseCommit;
     let parent = head;
     let host = "host";
     let remote: string | null = null;
@@ -363,6 +365,9 @@ export const harness = (
           Effect.gen(function* () {
             const override = gitOverride?.(input);
             if (override) return yield* override;
+            if (input.operation === "WorkflowActions.verifyRemote")
+              return output("https://github.com/acme/repo.git\n");
+            if (input.operation === "WorkflowActions.checkLfs") return output("");
             const args = input.args;
             if (args[0] === "ls-remote")
               return output(remote ? `${remote}\trefs/heads/${branchName}\n` : "");
@@ -373,7 +378,7 @@ export const harness = (
               const revision = args.at(-1);
               if (revision === "HEAD^{commit}") return output(head);
               return output(
-                revision === `${binding?.base ?? "base"}^{tree}`
+                revision === `${binding?.base ?? baseCommit}^{tree}`
                   ? "base-tree"
                   : revision === `${head}^{tree}`
                     ? (unreplacedCommitTree ?? tree)
@@ -385,6 +390,7 @@ export const harness = (
             if (args[0] === "rev-parse") return output(args[1] === "HEAD" ? head : tree);
             if (args[0] === "--no-replace-objects" && args[1] === "merge-base") return output("");
             if (args[0] === "push") {
+              assert.include(args, "--no-follow-tags");
               assert.equal(args.at(-2), "https://github.com/acme/repo.git");
               assert.equal(args.at(-1), `${head}:refs/heads/${branchName}`);
               const result = yield* invoke(
@@ -408,7 +414,7 @@ export const harness = (
               Effect.gen(function* () {
                 commits++;
                 parent = head;
-                head = commits === 1 ? "commit" : `commit-${commits}`;
+                head = commitAt(commits);
                 dirty = false;
                 if (binding) yield* binding.onHead(head);
                 if (lose === "hook") tree = "unreviewed";

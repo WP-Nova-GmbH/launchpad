@@ -46,7 +46,7 @@ import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import type { WorkflowResultCapture } from "./WorkflowResultOutbox.ts";
 import { ownershipReleased } from "./workflowOwnership.ts";
 import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
-import { GitVcsDriver } from "../vcs/GitVcsDriver.ts";
+import { GitVcsDriver, isGitHubHttpsRemote } from "../vcs/GitVcsDriver.ts";
 import { WORKFLOW_CHECKPOINT_READ_TIMEOUT_MS } from "../vcs/WorkflowCheckpointReader.ts";
 import { SetupProcessJournal } from "../terminal/SetupProcessJournal.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
@@ -2325,7 +2325,13 @@ export const make = Effect.gen(function* () {
           baseBranch = vm.baseBranch;
           baseSha = vm.baseSha;
         } else {
-          yield* git.fetchRemote({ cwd: project.value.workspaceRoot, remoteName: remote });
+          yield* git.fetchRemote({
+            cwd: project.value.workspaceRoot,
+            remoteName: remote,
+            ...(isGitHubHttpsRemote(identity.locator.remoteUrl)
+              ? { githubRemoteUrl: identity.locator.remoteUrl }
+              : {}),
+          });
           const branch = yield* git.resolveDefaultBranchName(project.value.workspaceRoot, remote);
           if (branch === null)
             return result(null, "unavailable", "The remote default branch could not be resolved.");

@@ -5,7 +5,7 @@ import * as Redacted from "effect/Redacted";
 import { ThreadVmRepositoryCredentialError } from "../relay/ThreadVmRepositoryCredentials.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
-import { HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
+import { HostProcessPlatform, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
@@ -652,6 +652,208 @@ describe("VcsProcess.run on a managed executor", () => {
       Effect.map((result) => expect(result.stdout).not.toBe("ghs_organization")),
       provideLive,
     ),
+  );
+
+  it.effect.skipIf(HostProcessPlatform.defaultValue() === "win32")(
+    "secures workflow Git with runner or ambient credentials",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "launchpad-managed-vcs-" });
+        const credentialUrl = "https://github.com/acme/repo.git";
+        const gh = `${cwd}/gh`;
+        yield* fs.writeFileString(
+          gh,
+          `#!/bin/sh\n[ "$*" = 'auth git-credential get' ] || exit 1\nprintf 'username=fixture\\npassword=%s\\n' "$GH_TOKEN"\n`,
+        );
+        yield* fs.chmod(gh, 0o700);
+        const input = {
+          ...baseInput,
+          cwd,
+          env: {
+            PATH: `${cwd}:${process.env.PATH ?? ""}`,
+            GIT_CONFIG_COUNT: "0",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_NOSYSTEM: "1",
+          },
+        };
+        const setupGit = (...args: string[]) => run({ ...input, args }).pipe(provideLive);
+        yield* setupGit("init", "--quiet");
+        const hook = `${cwd}/.git/hooks/pre-commit`;
+        yield* fs.writeFileString(hook, "#!/bin/sh\nexit 1\n");
+        yield* fs.chmod(hook, 0o700);
+        const commitArgs = [
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@example.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Fixture",
+        ];
+        const local = yield* run({
+          ...input,
+          credentials: "none",
+          args: commitArgs,
+          allowNonZeroExit: true,
+        }).pipe(provideExecutor);
+        expect(local.exitCode).not.toBe(0);
+        yield* setupGit("config", `http.${credentialUrl}.followRedirects`, "true");
+        yield* setupGit("config", `credential.${credentialUrl}.useHttpPath`, "false");
+        yield* setupGit(
+          "config",
+          `credential.${credentialUrl}.helper`,
+          "!f() { printf 'username=local\\npassword=local\\n'; }; f",
+        );
+        const askpass = `${cwd}/askpass`;
+        yield* fs.writeFileString(
+          askpass,
+          "#!/bin/sh\necho 'fixture askpass invoked' >&2\nexit 1\n",
+        );
+        yield* fs.chmod(askpass, 0o700);
+        yield* setupGit("config", "core.askPass", askpass);
+        const otherRepo = "https://github.com/acme/other.git";
+        yield* setupGit("config", `url.${otherRepo}.insteadOf`, credentialUrl);
+        yield* setupGit("config", `url.${otherRepo}.pushInsteadOf`, "launchpad-workflow://");
+        const workflowGit = { ...input, credentials: "github", credentialUrl } as const;
+        const modes = [
+          { provide: provideExecutor, password: "ghs_organization", useHttpPath: true },
+          { provide: provideLive, password: "local", useHttpPath: false },
+        ];
+        for (const { provide, password, useHttpPath } of modes) {
+          yield* run({ ...workflowGit, args: commitArgs }).pipe(provide);
+          const redirect = yield* run({
+            ...workflowGit,
+            args: ["config", "--get-urlmatch", "http.followRedirects", credentialUrl],
+          }).pipe(provide);
+          expect(redirect.stdout.trim()).toBe("false");
+          const credential = yield* run({
+            ...workflowGit,
+            args: ["credential", "fill"],
+            stdin: `url=${credentialUrl}\n\n`,
+          }).pipe(provide);
+          expect(credential.stdout).toContain(`password=${password}\n`);
+          expect(credential.stdout.includes("path=acme/repo.git\n")).toBe(useHttpPath);
+          for (const otherUrl of [
+            "https://github.com/acme/repo-other.git",
+            "https://example.invalid/acme/repo.git",
+          ]) {
+            const outside = yield* run({
+              ...workflowGit,
+              args: ["credential", "fill"],
+              stdin: `url=${otherUrl}\n\n`,
+              allowNonZeroExit: true,
+            }).pipe(provide);
+            expect(outside.exitCode).not.toBe(0);
+            expect(outside.stdout).toBe("");
+            expect(outside.stderr).not.toContain("fixture askpass invoked");
+          }
+        }
+
+        // Inspect the actual launch arguments without a network connection.
+        const git = `${cwd}/git`;
+        yield* fs.writeFileString(
+          git,
+          `#!/bin/sh\nprintf '%s\\n' "$GIT_ALLOW_PROTOCOL" "$GIT_TERMINAL_PROMPT" "$GIT_ASKPASS" "$SSH_ASKPASS" "$@"\n`,
+        );
+        yield* fs.chmod(git, 0o700);
+        const realGit = (...args: string[]) =>
+          run({ ...input, env: { ...input.env, PATH: process.env.PATH }, args }).pipe(provideLive);
+        const aliases = new Set<string>();
+        for (const { provide } of modes) {
+          for (const operation of ["fetch", "push", "ls-remote"]) {
+            const proxyOption = `--config-env=http.${credentialUrl}.proxy=TEST_GIT_PROXY`;
+            const launched = yield* run({
+              ...workflowGit,
+              args: [proxyOption, operation, "--", credentialUrl],
+              env: { ...input.env, GIT_ASKPASS: askpass, SSH_ASKPASS: askpass, TEST_GIT_PROXY: "" },
+            }).pipe(provide);
+            const lines = launched.stdout.trim().split("\n");
+            expect(lines.slice(0, 4)).toEqual(["https", "0", "", ""]);
+            const alias = lines.at(-1)!;
+            expect(alias).toMatch(/^launchpad-workflow:\/\/[\da-f-]+$/);
+            expect(aliases.has(alias)).toBe(false);
+            aliases.add(alias);
+            const command = lines.indexOf(operation);
+            expect(lines[command - 1]).toBe(proxyOption);
+            expect(lines.slice(command)).toEqual([
+              operation,
+              ...(operation === "ls-remote" ? [] : ["--no-recurse-submodules"]),
+              "--",
+              alias,
+            ]);
+            // Ask real Git to resolve the exact arguments without opening a transport.
+            yield* realGit("config", "remote.verify.url", alias);
+            const resolved = yield* realGit(
+              ...lines.slice(4, command - 1),
+              "remote",
+              "get-url",
+              ...(operation === "push" ? ["--push"] : []),
+              "--all",
+              "--",
+              "verify",
+            );
+            expect(resolved.stdout.trim()).toBe(credentialUrl);
+          }
+        }
+        yield* run({ ...workflowGit, args: ["push", "--", otherRepo] }).pipe(
+          provideExecutor,
+          Effect.flip,
+          Effect.tap((error) =>
+            Effect.sync(() => expect(error.message).toContain("approved workflow repository")),
+          ),
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps runner credentials away from owned local Git and explicit opt-outs", () =>
+    Effect.gen(function* () {
+      const launches: ProcessRunner.ProcessRunInput[] = [];
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: (input) =>
+            Effect.sync(() => {
+              launches.push(input);
+              return {
+                code: ChildProcessSpawner.ExitCode(0),
+                stdout: "",
+                stderr: "",
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              };
+            }),
+        }),
+        Effect.provideService(
+          OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+          { threadVm: null, github: Effect.die("Local Git must not request runner credentials.") },
+        ),
+      );
+      const owner = {
+        executable: "/runner",
+        capture: () => Effect.void,
+        arm: Effect.void,
+        completed: () => Effect.void,
+        stop: Effect.void,
+      } satisfies ProcessRunner.OwnedCommand;
+      const input = { ...baseInput, args: ["add", "-A"], env: { GIT_INDEX_FILE: "/tmp/index" } };
+      yield* service
+        .run(input)
+        .pipe(Effect.provideService(ProcessRunner.CurrentWorkflowCommand, Effect.succeed(owner)));
+      yield* service.run({ ...input, credentials: "none" });
+      yield* service.run({ ...input, credentials: "github" });
+      expect(launches).toHaveLength(3);
+      expect(launches[0]?.owner).toBe(owner);
+      for (const launch of launches) {
+        expect(launch.args).toEqual(input.args);
+        expect(launch.env).toEqual(input.env);
+      }
+    }),
   );
 });
 

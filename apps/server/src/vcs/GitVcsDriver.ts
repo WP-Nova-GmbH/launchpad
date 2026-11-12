@@ -61,6 +61,7 @@ export interface ExecuteGitInput {
   readonly args: ReadonlyArray<string>;
   readonly stdin?: string;
   readonly env?: NodeJS.ProcessEnv;
+  readonly githubRemoteUrl?: string;
   readonly allowNonZeroExit?: boolean;
   readonly timeoutMs?: number | null;
   readonly maxOutputBytes?: number;
@@ -265,6 +266,20 @@ export interface GitFetchRemoteInput {
   cwd: string;
   remoteName: string;
   refName?: string;
+  githubRemoteUrl?: string;
+}
+
+export function isGitHubHttpsRemote(remote: string): boolean {
+  const url = URL.parse(remote);
+  return (
+    url !== null &&
+    url.origin === "https://github.com" &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash &&
+    /^\/[\w.-]+\/[\w.-]+\/?$/.test(url.pathname)
+  );
 }
 
 export interface GitRemoteExistsInput {

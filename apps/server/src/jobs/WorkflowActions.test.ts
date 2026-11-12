@@ -6,10 +6,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 
 import * as ServerConfig from "../config.ts";
+import { CurrentWorkflowCommand } from "../processRunner.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import { readWorkflowHead, readWorkflowTree } from "./WorkflowActions.ts";
-import { harness, id } from "./WorkflowActions.test-fixture.ts";
+import { baseCommit, commitAt, harness, id } from "./WorkflowActions.test-fixture.ts";
 import { WorkflowRunStore } from "./WorkflowRunStore.ts";
 
 const realGitLayer = GitVcsDriver.layer.pipe(
@@ -117,7 +118,7 @@ it.effect("compares saved trees even when Git hides a changed submodule", () =>
   ),
 );
 
-it.effect("rejects fake ancestry before updating a published branch", () =>
+it.effect("requires original ancestry and pushes the job branch without tags", () =>
   Effect.gen(function* () {
     const { cwd, fs, driver, git, base } = yield* makeRealGit();
     yield* git(["commit", "--allow-empty", "-m", "published"]);
@@ -129,6 +130,8 @@ it.effect("rejects fake ancestry before updating a published branch", () =>
     const ref = "refs/heads/t3-job/job";
     yield* git(["init", "--bare", bare]);
     yield* git(["push", bare, `${published}:${ref}`]);
+    yield* git(["config", "push.followTags", "true"]);
+    yield* git(["tag", "--no-sign", "-a", "workflow-extra-tag", descendant, "-m", "fixture"]);
 
     const publishRework = Effect.fnUntraced(function* (candidate: string) {
       let useBare = false;
@@ -142,25 +145,31 @@ it.effect("rejects fake ancestry before updating a published branch", () =>
           });
         }
         if (input.args[0] === "ls-remote") {
-          return driver.execute({ ...input, cwd, args: ["ls-remote", "--refs", bare, ref] }).pipe(
-            Effect.map((result) => ({
-              ...result,
-              stdout: result.stdout.replace(published, "commit").replace(candidate, "commit-2"),
-            })),
-          );
+          return driver
+            .execute({ operation: input.operation, cwd, args: ["ls-remote", "--refs", bare, ref] })
+            .pipe(
+              Effect.map((result) => ({
+                ...result,
+                stdout: result.stdout
+                  .replace(published, commitAt(1))
+                  .replace(candidate, commitAt(2)),
+              })),
+            );
         }
         if (input.args[0] === "push") {
-          return driver.execute({
-            ...input,
-            cwd,
-            args: input.args.map((arg) =>
-              arg === "https://github.com/acme/repo.git"
-                ? bare
-                : arg
-                    .replace(`${ref}:commit`, `${ref}:${published}`)
-                    .replace("commit-2:", `${candidate}:`),
-            ),
-          });
+          return driver
+            .execute({
+              operation: input.operation,
+              cwd,
+              args: input.args.map((arg) =>
+                arg === "https://github.com/acme/repo.git"
+                  ? bare
+                  : arg
+                      .replace(`${ref}:${commitAt(1)}`, `${ref}:${published}`)
+                      .replace(`${commitAt(2)}:`, `${candidate}:`),
+              ),
+            })
+            .pipe(Effect.provideService(CurrentWorkflowCommand, null));
         }
       });
       yield* h.actions.execute(id, h.io);
@@ -185,6 +194,52 @@ it.effect("rejects fake ancestry before updating a published branch", () =>
 
     assert.equal((yield* publishRework(descendant))._tag, "Success");
     assert.equal(yield* git(["--git-dir", bare, "rev-parse", ref]), descendant);
+    assert.equal(yield* git(["--git-dir", bare, "tag", "--list"]), "");
+  }).pipe(Effect.provide(realGitLayer)),
+);
+
+it.effect("blocks workflow Push to a different effective push URL", () =>
+  Effect.gen(function* () {
+    const { cwd, driver, git } = yield* makeRealGit();
+    yield* git(["remote", "add", "upstream", "https://github.com/acme/repo.git"]);
+    yield* git(["remote", "set-url", "--push", "upstream", "https://github.com/acme/other.git"]);
+    const h = yield* harness("none", undefined, (input) =>
+      input.operation === "WorkflowActions.verifyRemote"
+        ? driver
+            .execute({ ...input, cwd })
+            .pipe(Effect.provideService(CurrentWorkflowCommand, null))
+        : undefined,
+    );
+    const failure = yield* Effect.flip(h.actions.execute(id, h.io));
+    assert.match(failure.message, /remote no longer resolves/);
+    assert.equal(h.counts().pushes, 0);
+  }).pipe(Effect.provide(realGitLayer)),
+);
+
+it.effect("reports a required Git LFS upload before attempting workflow Push", () =>
+  Effect.gen(function* () {
+    const { base, cwd, driver, fs, git } = yield* makeRealGit();
+    yield* fs.writeFileString(
+      `${cwd}/asset.bin`,
+      `version https://git-lfs.github.com/spec/v1\noid sha256:${"a".repeat(64)}\nsize 123\n`,
+    );
+    yield* git(["add", "asset.bin"]);
+    yield* git(["commit", "-m", "Add an LFS pointer"]);
+    const commit = yield* git(["rev-parse", "HEAD"]);
+    const h = yield* harness("none", undefined, (input) =>
+      input.operation === "WorkflowActions.checkLfs"
+        ? driver.execute({
+            ...input,
+            cwd,
+            args: input.args.map((arg) =>
+              arg.replace(commitAt(1), commit).replace(baseCommit, base),
+            ),
+          })
+        : undefined,
+    );
+    const failure = yield* Effect.flip(h.actions.execute(id, h.io));
+    assert.match(failure.message, /requires a Git LFS upload/);
+    assert.equal(h.counts().pushes, 0);
   }).pipe(Effect.provide(realGitLayer)),
 );
 
@@ -201,11 +256,12 @@ it.effect("refuses a lost commit reply when a graft supplies the expected parent
 
     const h = yield* harness("commit-reply", undefined, (input) =>
       input.args.includes("--format=%P")
-        ? driver
-            .execute({ ...input, cwd, args: [...input.args.slice(0, -1), unrelated] })
-            .pipe(
-              Effect.map((result) => ({ ...result, stdout: result.stdout.replace(base, "base") })),
-            )
+        ? driver.execute({ ...input, cwd, args: [...input.args.slice(0, -1), unrelated] }).pipe(
+            Effect.map((result) => ({
+              ...result,
+              stdout: result.stdout.replace(base, baseCommit),
+            })),
+          )
         : undefined,
     );
     assert.equal((yield* h.actions.execute(id, h.io).pipe(Effect.result))._tag, "Failure");
@@ -273,11 +329,12 @@ it.effect("checks the committed parent without running the checkout's signature 
 
     const h = yield* harness("none", undefined, (input) =>
       input.args.includes("--format=%P")
-        ? driver
-            .execute({ ...input, cwd, args: [...input.args.slice(0, -1), signed] })
-            .pipe(
-              Effect.map((result) => ({ ...result, stdout: result.stdout.replace(base, "base") })),
-            )
+        ? driver.execute({ ...input, cwd, args: [...input.args.slice(0, -1), signed] }).pipe(
+            Effect.map((result) => ({
+              ...result,
+              stdout: result.stdout.replace(base, baseCommit),
+            })),
+          )
         : undefined,
     );
     yield* h.actions.execute(id, h.io);
@@ -386,7 +443,7 @@ it.effect("publishes the pinned commit once and observes completion on replay", 
     assert.deepEqual(h.counts(), { commits: 1, pushes: 1 });
     const run = yield* h.io.read;
     assert.equal(run.actions![0]!.state, "completed");
-    assert.equal(run.preparedHead, "commit");
+    assert.equal(run.preparedHead, commitAt(1));
     assert.isTrue(run.actions![0]!.commands.every((command) => command.stopped));
   }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -507,7 +564,7 @@ it.effect("publishes revised rework to the same branch and preserves the job PR 
     yield* h.beginPr(1);
     yield* h.actions.execute("pr:1", h.io);
     const run = yield* h.io.read;
-    assert.equal(run.publication?.publishedHead, "commit-2");
+    assert.equal(run.publication?.publishedHead, commitAt(2));
     assert.equal(run.publication?.pullRequestUrl, "https://github.com/acme/repo/pull/17");
     assert.deepEqual(h.counts(), { commits: 2, pushes: 2 });
     assert.equal(h.prCounts().creates, 1);

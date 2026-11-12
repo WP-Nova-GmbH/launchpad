@@ -13,7 +13,7 @@ import * as Schema from "effect/Schema";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
 import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { GitManager } from "../git/GitManager.ts";
-import { GitVcsDriver, workflowGitEnvironment } from "../vcs/GitVcsDriver.ts";
+import { GitVcsDriver, isGitHubHttpsRemote, workflowGitEnvironment } from "../vcs/GitVcsDriver.ts";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
 import {
@@ -23,6 +23,7 @@ import {
 } from "../processRunner.ts";
 import type { WorkflowRun, WorkflowActionRecord } from "./WorkflowRunStore.ts";
 import { jobBranchName } from "./Layers/JobRunner.ts";
+import { workflowPushNeedsLfsUpload } from "./WorkflowPushLfs.ts";
 
 /** Publishing records a target, never credentials embedded in a remote URL. */
 export function workflowPublishingRemote(raw: string): string | null {
@@ -350,13 +351,42 @@ export const make = Effect.gen(function* () {
       if (!action)
         return yield* new WorkflowActionError({ message: "The publishing action changed." });
       const cwd = run.worktreePath!;
+      const { remoteName, remoteUrl } = run.publication!;
+      const github = run.runtime.kind === "machine" && isGitHubHttpsRemote(remoteUrl);
       const executeGit = (
         args: ReadonlyArray<string>,
         options?: { readonly allowNonZeroExit?: boolean; readonly env?: NodeJS.ProcessEnv },
       ) =>
-        git
-          .execute({ operation: "WorkflowActions", cwd, args, ...options })
-          .pipe(Effect.mapError(error));
+        Effect.gen(function* () {
+          const pushing = args[0] === "push";
+          const githubTransfer = github && (args[0] === "ls-remote" || pushing);
+          if (githubTransfer && pushing) {
+            const destination = yield* git
+              .execute({
+                operation: "WorkflowActions.verifyRemote",
+                cwd,
+                args: ["remote", "get-url", "--push", "--all", "--", remoteName],
+              })
+              .pipe(Effect.mapError(error));
+            if (
+              destination.stdoutTruncated ||
+              destination.stdout.replace(/\r?\n$/, "") !== remoteUrl
+            ) {
+              return yield* new WorkflowActionError({
+                message: "The Git remote no longer resolves to the reviewed repository.",
+              });
+            }
+          }
+          return yield* git
+            .execute({
+              operation: "WorkflowActions",
+              cwd,
+              args,
+              ...(githubTransfer ? { githubRemoteUrl: remoteUrl } : {}),
+              ...options,
+            })
+            .pipe(Effect.mapError(error));
+        });
       const text = (args: ReadonlyArray<string>) =>
         executeGit(args).pipe(Effect.map((result) => result.stdout.trim()));
       const originalHistory = (args: ReadonlyArray<string>, allowNonZeroExit = false) =>
@@ -455,7 +485,7 @@ export const make = Effect.gen(function* () {
           "ls-remote",
           "--refs",
           "--",
-          publication.remoteUrl,
+          remoteUrl,
           `refs/heads/${branch}`,
         ]);
         if (observed.split(/\s/)[0] !== head)
@@ -731,7 +761,7 @@ export const make = Effect.gen(function* () {
         return yield* new WorkflowActionError({ message: "No changes to publish." });
       const ref = `refs/heads/${jobBranchName(run.jobId)}`;
       const remoteHead = () =>
-        text(["ls-remote", "--refs", "--", run.publication!.remoteUrl, ref]).pipe(
+        text(["ls-remote", "--refs", "--", remoteUrl, ref]).pipe(
           Effect.map((value) => value.split(/\s/)[0] || null),
         );
       const observed = yield* remoteHead();
@@ -750,6 +780,19 @@ export const make = Effect.gen(function* () {
               message: "The job branch cannot be fast-forwarded safely.",
             });
         }
+        if (
+          github &&
+          (yield* workflowPushNeedsLfsUpload(git, {
+            cwd,
+            commitSha,
+            baseSha: run.baseSha!,
+            publishedSha: observed,
+          }).pipe(Effect.mapError(error)))
+        ) {
+          return yield* new WorkflowActionError({
+            message: "This change requires a Git LFS upload, which workflow Push does not support.",
+          });
+        }
         // The lease guards the exact old ref; ancestry above forbids a history rewrite.
         yield* owned(
           id,
@@ -757,8 +800,11 @@ export const make = Effect.gen(function* () {
           executeGit([
             "push",
             "--porcelain",
+            "--no-mirror",
+            "--no-follow-tags",
             `--force-with-lease=${ref}:${observed ?? ""}`,
-            run.publication!.remoteUrl,
+            "--",
+            remoteUrl,
             `${action.commitSha}:${ref}`,
           ]),
           "push",
