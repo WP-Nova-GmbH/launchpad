@@ -4,6 +4,8 @@ import * as Schema from "effect/Schema";
 import { useAtomValue } from "@effect/atom-react";
 import { threadVmControls } from "../../state/threads";
 import { ThreadId, type ChatAttachment } from "@t3tools/contracts";
+import type { RelayThreadDeletionRequest } from "@t3tools/contracts/relay";
+import { ManagedRelay } from "@t3tools/client-runtime/relay";
 import {
   WorkflowSavedResult,
   workflowApprovalCanRetry,
@@ -26,7 +28,14 @@ import {
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
-import { Columns2Icon, FileDiffIcon, Rows3Icon } from "lucide-react";
+import {
+  Columns2Icon,
+  FileDiffIcon,
+  RotateCwIcon,
+  Rows3Icon,
+  Trash2Icon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { ToggleGroup, Toggle } from "../ui/toggle-group";
 import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
 import { useIsMobile } from "../../hooks/useMediaQuery";
@@ -35,13 +44,40 @@ import { getRenderablePatch } from "../../lib/diffRendering";
 import { randomUUID } from "../../lib/utils";
 import { StyledDiffCodeView } from "../diffs/StyledDiffCodeView";
 import { SavedConversationMessage } from "../chat/SavedConversationMessage";
+import {
+  AlertDialog,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
-import { useWorkflowClient, confirmWorkflow } from "./workflowState";
+import { useWorkflowClient } from "./workflowState";
+import { WorkflowRequestNotSentError } from "./workflowOperations";
 
 const sameSavedResult = Schema.toEquivalence(WorkflowSavedResult);
+const isRequestFailed = Schema.is(ManagedRelay.ManagedRelayRequestFailedError);
+
+type DeletionTarget = { relayUrl: string; threadId: ThreadId; generation: number };
+type DeletionIntent = DeletionTarget & { payload: RelayThreadDeletionRequest };
+type DeletionState =
+  | { state: "confirming"; target: DeletionTarget }
+  | { state: "unconfirmed" | "blocked"; intent: DeletionIntent; relayChanged?: boolean }
+  | { state: "requesting" | "checking" | "requested" | "changed" | "unavailable" | "not-sent" };
+
+function sameThreadPlacement(left: DeletionTarget, right: DeletionTarget | null) {
+  return (
+    right !== null &&
+    left.relayUrl === right.relayUrl &&
+    left.threadId === right.threadId &&
+    left.generation === right.generation
+  );
+}
 
 export function SavedWorkflowResults({
   scope,
@@ -85,22 +121,44 @@ export function SavedWorkflowResults({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [retry, setRetry] = useState(0);
-  const deleteIntent = useRef<string | null>(null);
-  const [deletionRequested, setDeletionRequested] = useState(false);
-  const [deletionError, setDeletionError] = useState<string | null>(null);
+  const [deletion, setDeletion] = useState<DeletionState | null>(null);
+  const deletionInFlight = useRef(false);
+  const deletionIndexCheck = useRef<DeletionIntent | null>(null);
+  const savedResults = useRef<HTMLElement>(null);
+  const deletionStatus = useRef<HTMLDivElement>(null);
+  const deleteButton = useRef<HTMLButtonElement>(null);
+  const keepThreadButton = useRef<HTMLButtonElement>(null);
   const cancelled = job.status === "cancelled";
   const cancellationDetail = cancelled && (job.detail ?? job.progress?.detail);
   const threadState = savedWorkflowThreadState(job);
-  const deleted = deletionRequested || threadState === "deleted";
+  const deleted = deletion?.state === "requested" || threadState === "deleted";
+  const deletionUnavailable = deletion?.state === "unavailable";
+  const resultsUnavailable = deleted || (deletionUnavailable && !index);
+  const confirmingDeletion = deletion?.state === "confirming";
+  const retryIntent =
+    deletion?.state === "unconfirmed" || deletion?.state === "blocked" ? deletion : null;
+  const retryRelayChanged =
+    retryIntent &&
+    (index ? index.relayUrl !== retryIntent.intent.relayUrl : retryIntent.relayChanged);
   const waitingForThread = threadState === "not_started";
   const capabilities = useAtomValue(threadVmControls.capabilitiesAtom);
   const canDelete = canDeleteSavedWorkflowThread(job, canConfigure, capabilities);
   const latestDeletionAccess = useRef(canDelete);
   useLayoutEffect(() => {
-    latestDeletionAccess.current = canDelete;
-  }, [canDelete]);
+    latestDeletionAccess.current = canDelete && !deleted && !deletionUnavailable;
+    return () => {
+      latestDeletionAccess.current = false;
+    };
+  }, [canDelete, deleted, deletionUnavailable]);
+  if (
+    confirmingDeletion &&
+    (!canDelete || deleted || !sameThreadPlacement(deletion.target, index))
+  ) {
+    setDeletion(null);
+  }
   const active = useRef(true);
   const generation = useRef(0);
+  const indexEpoch = useRef(0);
   useEffect(() => {
     active.current = true;
     return () => {
@@ -125,6 +183,8 @@ export function SavedWorkflowResults({
   useEffect(() => {
     if (deleted || waitingForThread) return;
     let current = true;
+    const epoch = indexEpoch.current;
+    const checkedIntent = deletionIndexCheck.current;
     void call((client, token) =>
       client
         .listSavedWorkflowResults({
@@ -135,9 +195,15 @@ export function SavedWorkflowResults({
         .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl }))),
     )
       .then((data) => {
-        if (!current) return;
+        if (!current || epoch !== indexEpoch.current) return;
         setIndex((previous) => {
-          const previousResult = previous?.results.find(
+          if (
+            !previous ||
+            previous.relayUrl !== data.relayUrl ||
+            previous.threadId !== data.threadId
+          )
+            return data;
+          const previousResult = previous.results.find(
             (entry) => entry.resultId === selectedRef.current,
           );
           if (!previousResult) return data;
@@ -154,10 +220,18 @@ export function SavedWorkflowResults({
         });
         setError(null);
         setSelected((id) => id ?? data.results[0]?.resultId ?? null);
+        if (checkedIntent && deletionIndexCheck.current === checkedIntent) {
+          deletionIndexCheck.current = null;
+          const sameTarget = sameThreadPlacement(checkedIntent, data);
+          if (data.relayUrl !== checkedIntent.relayUrl || data.threadId !== checkedIntent.threadId)
+            setSelected(data.results[0]?.resultId ?? null);
+          setDeletion(
+            sameTarget ? { state: "blocked", intent: checkedIntent } : { state: "changed" },
+          );
+        }
       })
       .catch((cause) => {
-        if (current) {
-          reader.clear();
+        if (current && epoch === indexEpoch.current) {
           setIndex(null);
           setLoaded(null);
           setConversation(null);
@@ -176,7 +250,6 @@ export function SavedWorkflowResults({
     job.progress?.resultSaving?.state,
     job.progress?.checkpoint?.checkpointId,
     retry,
-    reader,
     deleted,
     waitingForThread,
   ]);
@@ -389,16 +462,18 @@ export function SavedWorkflowResults({
     setBusy(true);
     try {
       const page = await call((client, token) =>
-        client.listSavedWorkflowResults({
-          clerkToken: token,
-          repositoryId: scope.repositoryId,
-          jobId: job.jobId,
-          before: index.nextCursor!,
-        }),
+        client
+          .listSavedWorkflowResults({
+            clerkToken: token,
+            repositoryId: scope.repositoryId,
+            jobId: job.jobId,
+            before: index.nextCursor!,
+          })
+          .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl }))),
       );
       if (active.current && request === generation.current)
         setIndex((previous) =>
-          previous
+          previous && sameThreadPlacement(index, previous) && sameThreadPlacement(index, page)
             ? {
                 ...previous,
                 nextCursor: page.nextCursor,
@@ -408,7 +483,7 @@ export function SavedWorkflowResults({
                   ).values(),
                 ],
               }
-            : null,
+            : previous,
         );
     } catch {
       if (active.current && request === generation.current)
@@ -417,65 +492,118 @@ export function SavedWorkflowResults({
       if (active.current && request === generation.current) setBusy(false);
     }
   };
-  const deleteThread = async () => {
+  const openDeletion = () => {
     if (!index || busy || !canDelete) return;
-    if (
-      !deleteIntent.current &&
-      !(await confirmWorkflow(
-        "Permanently delete this workflow thread, its saved results and its VM workspace? This cannot be undone.",
-      ))
-    )
-      return;
-    if (
-      !latestDeletionAccess.current ||
-      !canDeleteSavedWorkflowThread(
+    const { threadId, generation, relayUrl } = index;
+    setDeletion({ state: "confirming", target: { threadId, generation, relayUrl } });
+  };
+  const clearSavedResults = () => {
+    indexEpoch.current++;
+    reader.clear();
+    generation.current++;
+    setLoaded(null);
+    setConversation(null);
+    setIndex(null);
+    setSelected(null);
+    setBrowsingHistory(false);
+    setBusy(false);
+  };
+  const refreshDeletionTarget = () => {
+    indexEpoch.current++;
+    setRetry((previous) => previous + 1);
+    void refresh();
+  };
+  const refreshDeletionStatus = () => {
+    deletionStatus.current?.focus();
+    setError(null);
+    refreshDeletionTarget();
+  };
+  const deleteThread = async () => {
+    if (deletionInFlight.current || !latestDeletionAccess.current || retryRelayChanged) return;
+    const canSubmit = () =>
+      active.current &&
+      latestDeletionAccess.current &&
+      canDeleteSavedWorkflowThread(
         job,
         canConfigure,
         appAtomRegistry.get(threadVmControls.capabilitiesAtom),
-      ) ||
-      !active.current
-    )
-      return;
-    deleteIntent.current ??= randomUUID();
-    setDeletionError(null);
-    const request = generation.current;
-    setBusy(true);
-    try {
-      await call((client, token) =>
-        client.permanentlyDeleteThread({
-          clerkToken: token,
-          threadId: index.threadId,
-          payload: {
-            operationId: deleteIntent.current!,
-            expectedGeneration: index.generation,
-            confirmWorkspaceLoss: true,
-          },
-        }),
       );
-      if (active.current && request === generation.current) {
-        reader.clear();
-        generation.current++;
-        setLoaded(null);
-        setConversation(null);
-        setIndex(null);
-        setDeletionRequested(true);
-        setBusy(false);
-        void refresh();
+    if (!canSubmit()) return;
+
+    let intent: DeletionIntent;
+    if (retryIntent) {
+      intent = retryIntent.intent;
+      deletionStatus.current?.focus();
+    } else if (deletion?.state === "confirming" && sameThreadPlacement(deletion.target, index)) {
+      intent = {
+        ...deletion.target,
+        payload: {
+          operationId: randomUUID(),
+          expectedGeneration: deletion.target.generation,
+          confirmWorkspaceLoss: true,
+        },
+      };
+    } else return;
+
+    deletionInFlight.current = true;
+    setDeletion({ state: "requesting" });
+    let relayChanged = false;
+    try {
+      await call((client, token) => {
+        relayChanged = client.relayUrl !== intent.relayUrl;
+        if (!canSubmit() || relayChanged)
+          throw new WorkflowRequestNotSentError("The workflow connection changed.");
+        return client.permanentlyDeleteThread({
+          clerkToken: token,
+          threadId: intent.threadId,
+          payload: intent.payload,
+        });
+      });
+      if (!active.current) return;
+      clearSavedResults();
+      setDeletion({ state: "requested" });
+      void refresh();
+    } catch (cause) {
+      if (!active.current) return;
+      const relayError = isRequestFailed(cause) ? cause.relayError : undefined;
+      if (
+        relayError?._tag === "RelayTenancyNotFoundError" &&
+        relayError.reason === "thread_not_found"
+      ) {
+        clearSavedResults();
+        setDeletion({ state: "unavailable" });
+        refreshDeletionTarget();
+      } else if (
+        relayError?._tag === "RelayTenancyConflictError" &&
+        relayError.reason === "thread_deletion_conflict"
+      ) {
+        deletionIndexCheck.current = intent;
+        setDeletion({ state: "checking" });
+        refreshDeletionTarget();
+      } else if (
+        relayError?._tag === "RelayTenancyConflictError" &&
+        relayError.reason === "thread_placement_changed"
+      ) {
+        clearSavedResults();
+        setDeletion({ state: "changed" });
+        refreshDeletionTarget();
+      } else if (cause instanceof WorkflowRequestNotSentError) {
+        if (relayChanged || !retryIntent) {
+          clearSavedResults();
+          refreshDeletionTarget();
+        }
+        setDeletion(
+          retryIntent
+            ? { ...retryIntent, ...(relayChanged ? { relayChanged: true } : {}) }
+            : { state: "not-sent" },
+        );
+      } else {
+        setDeletion({ state: "unconfirmed", intent });
       }
-    } catch {
-      if (active.current && request === generation.current) {
-        setDeletionError("Retry deleting to reconcile the same request.");
-        setBusy(false);
-      }
+    } finally {
+      deletionInFlight.current = false;
     }
   };
-  if (deleted)
-    return (
-      <div className="space-y-3 text-sm text-muted-foreground">
-        {cancellationDetail ? <p>{cancellationDetail}</p> : null}
-        <p>Thread deletion requested. Its saved results are no longer available.</p>
-      </div>
-    );
   const resultView = (
     <div
       id={`${tabId}-saved-results`}
@@ -635,7 +763,7 @@ export function SavedWorkflowResults({
         tabIndex={result ? 0 : undefined}
         className="space-y-3"
       >
-        {error ? (
+        {error && deletion?.state !== "checking" ? (
           <WorkflowAlert
             title="Could not read saved results"
             actions={
@@ -722,8 +850,13 @@ export function SavedWorkflowResults({
     </div>
   );
   return (
-    <section aria-label="Saved workflow results" className="space-y-3">
-      {partialResult ? (
+    <section
+      ref={savedResults}
+      tabIndex={-1}
+      aria-label="Saved workflow results"
+      className="space-y-3"
+    >
+      {!resultsUnavailable && partialResult ? (
         <WorkflowOutcome
           title={hasPartialChanges ? "Partial changes saved" : "Partial result saved"}
           actions={
@@ -753,27 +886,153 @@ export function SavedWorkflowResults({
       ) : cancellationDetail ? (
         <p className="text-sm text-muted-foreground">{cancellationDetail}</p>
       ) : null}
-      {resultView}
-      {canDelete ? (
+      {deleted || (deletion && !confirmingDeletion) ? (
+        <div ref={deletionStatus} tabIndex={-1}>
+          {deleted ? (
+            <WorkflowAlert title="Deletion requested" variant="info">
+              The conversation and saved results are no longer available. The run stays in history.
+            </WorkflowAlert>
+          ) : deletion?.state === "requesting" ? (
+            <WorkflowAlert title="Requesting deletion…" variant="info">
+              Waiting for the relay to confirm the request.
+            </WorkflowAlert>
+          ) : deletionUnavailable ? (
+            <WorkflowAlert
+              title={index ? "Deletion unavailable" : "Saved results unavailable"}
+              variant="warning"
+              actions={
+                !index ? (
+                  <Button size="sm" variant="outline" onClick={refreshDeletionStatus}>
+                    Refresh saved results
+                  </Button>
+                ) : undefined
+              }
+            >
+              {index
+                ? "You can still view this run’s saved results."
+                : "Refresh to check the run and saved results."}
+            </WorkflowAlert>
+          ) : deletion?.state === "not-sent" ? (
+            <WorkflowAlert title="Deletion request not sent" variant="warning">
+              Refresh the saved results or sign in, then confirm deletion again.
+            </WorkflowAlert>
+          ) : deletion?.state === "changed" ? (
+            <WorkflowAlert title="The workflow thread changed" variant="warning">
+              Check the refreshed saved results before requesting deletion again.
+            </WorkflowAlert>
+          ) : deletion?.state === "checking" ? (
+            <WorkflowAlert
+              title={
+                error ? "Could not refresh the workflow thread" : "Checking the workflow thread"
+              }
+              variant={error ? "warning" : "info"}
+              actions={
+                error ? (
+                  <Button size="sm" variant="outline" onClick={refreshDeletionStatus}>
+                    Refresh saved results
+                  </Button>
+                ) : undefined
+              }
+            >
+              {error
+                ? "Refresh saved results to check whether the deletion target has changed."
+                : "Checking whether the deletion target has changed."}
+            </WorkflowAlert>
+          ) : (
+            <Alert variant="warning" role="status">
+              <TriangleAlertIcon aria-hidden />
+              <AlertTitle role="heading" aria-level={2}>
+                {deletion?.state === "blocked" ? "Deletion blocked" : "Deletion not confirmed"}
+              </AlertTitle>
+              <AlertDescription>
+                {retryRelayChanged
+                  ? "Reconnect to the original relay to retry this deletion."
+                  : deletion?.state === "blocked"
+                    ? "The relay could not start deletion. Wait for any VM operations to finish, then retry."
+                    : canDelete
+                      ? "The request may already have been accepted. Retry to confirm the same deletion."
+                      : "The request may already have been accepted. Refresh the run to check its status."}
+              </AlertDescription>
+              {retryRelayChanged ? (
+                <AlertAction>
+                  <Button size="sm" variant="outline" onClick={refreshDeletionStatus}>
+                    Refresh saved results
+                  </Button>
+                </AlertAction>
+              ) : canDelete ? (
+                <AlertAction>
+                  <Button size="sm" variant="outline" onClick={() => void deleteThread()}>
+                    <RotateCwIcon aria-hidden />
+                    Retry deletion
+                  </Button>
+                </AlertAction>
+              ) : null}
+            </Alert>
+          )}
+        </div>
+      ) : null}
+      {!resultsUnavailable ? resultView : null}
+      {canDelete &&
+      !resultsUnavailable &&
+      (!deletion ||
+        confirmingDeletion ||
+        deletion.state === "changed" ||
+        deletion.state === "not-sent") ? (
         <details className="border-t pt-3">
           <summary className="cursor-pointer text-sm text-muted-foreground">More controls</summary>
-          <div className="mt-2 space-y-2">
-            {deletionError ? (
-              <WorkflowAlert title="Could not confirm thread deletion">
-                {deletionError}
-              </WorkflowAlert>
-            ) : null}
+          <div className="mt-2">
             <Button
+              ref={deleteButton}
               size="sm"
               variant="destructive-outline"
               disabled={busy || !index}
-              onClick={() => void deleteThread()}
+              onClick={openDeletion}
             >
               Delete thread permanently
             </Button>
           </div>
         </details>
       ) : null}
+      <AlertDialog
+        open={confirmingDeletion && canDelete && !deleted}
+        onOpenChange={(open) => {
+          if (!open && confirmingDeletion) setDeletion(null);
+        }}
+      >
+        <AlertDialogPopup
+          initialFocus={keepThreadButton}
+          finalFocus={() =>
+            deletionStatus.current ??
+            (deleteButton.current && !deleteButton.current.disabled
+              ? deleteButton.current
+              : savedResults.current)
+          }
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              <span className="flex items-start gap-2">
+                <Trash2Icon aria-hidden className="size-4 shrink-0 text-error" />
+                Delete workflow thread permanently?
+              </span>
+            </AlertDialogTitle>
+            <AlertDialogDescription className="wrap-anywhere">
+              <span className="mb-2 block font-medium text-popover-foreground">
+                {job.workflow?.definition.name ?? "Workflow run"}
+              </span>
+              The conversation, saved results, and VM workspace will be permanently deleted. The run
+              stays in history.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <Button ref={keepThreadButton} variant="outline" onClick={() => setDeletion(null)}>
+              Keep thread
+            </Button>
+            <Button variant="destructive" disabled={busy} onClick={() => void deleteThread()}>
+              Delete thread
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </section>
   );
 }

@@ -2,7 +2,11 @@ import { act, createElement, type PropsWithChildren } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import {
+  RelayRepositoryId,
+  RelayTenancyConflictError,
+  RelayTenancyNotFoundError,
+} from "@t3tools/contracts/relay";
 import { ThreadId } from "@t3tools/contracts";
 import type { RepositoryWorkflowJob, WorkflowSavedResult } from "@t3tools/contracts/workflows";
 import {
@@ -13,11 +17,10 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { Atom } from "effect/unstable/reactivity";
-import type { ManagedRelaySnapshotState } from "@t3tools/client-runtime/relay";
-import type { ThreadVmCapabilities } from "@t3tools/contracts/relay";
+import { ManagedRelay, type ManagedRelaySnapshotState } from "@t3tools/client-runtime/relay";
+import type { RelayThreadDeletion, ThreadVmCapabilities } from "@t3tools/contracts/relay";
 const fixture = vi.hoisted(() => ({
   call: vi.fn(),
-  confirm: vi.fn(),
   list: vi.fn(),
   read: vi.fn(),
   history: vi.fn(),
@@ -51,7 +54,6 @@ vi.mock("../../state/threads", () => ({
 }));
 vi.mock("./workflowState", () => ({
   useWorkflowClient: () => fixture.call,
-  confirmWorkflow: fixture.confirm,
 }));
 vi.mock("../diffs/StyledDiffCodeView", () => ({
   StyledDiffCodeView: (props: Record<string, unknown>) => createElement("pre", props),
@@ -75,7 +77,20 @@ vi.mock("../ui/select", () => ({
   SelectTrigger: ({ children }: PropsWithChildren) => children,
   SelectValue: ({ children }: PropsWithChildren) => children,
 }));
+vi.mock("../ui/alert-dialog", () => {
+  const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
+  return {
+    AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "alertdialog" }, children) : null,
+    AlertDialogPopup: part,
+    AlertDialogHeader: part,
+    AlertDialogTitle: part,
+    AlertDialogDescription: part,
+    AlertDialogFooter: part,
+  };
+});
 import { SavedWorkflowResults } from "./SavedWorkflowResults";
+import { WorkflowRequestNotSentError } from "./workflowOperations";
 const scope = {
   accountId: "account",
   organizationId: "org",
@@ -143,12 +158,14 @@ async function mount(currentJob = job, canConfigure = true) {
     renderer = create(view(currentJob, canConfigure));
   });
 }
-async function press(label: string) {
+const findButton = (label: string, root = renderer.root) =>
+  root.findAllByType("button").find((button) => button.children.includes(label));
+const deleteDialog = () => renderer.root.findAllByProps({ role: "alertdialog" })[0];
+async function press(label: string, root = renderer.root) {
+  const button = findButton(label, root);
+  expect(button).toBeDefined();
   await act(async () => {
-    await renderer.root
-      .findAllByType("button")
-      .find((b) => b.props.children === label)!
-      .props.onClick();
+    await button!.props.onClick();
   });
 }
 beforeEach(() => {
@@ -182,15 +199,20 @@ beforeEach(() => {
   });
   fixture.read.mockResolvedValue({ result, patch });
   fixture.history.mockResolvedValue({ entries: [] });
-  fixture.deletion.mockResolvedValue(undefined);
-  fixture.confirm.mockResolvedValue(true);
+  fixture.deletion.mockImplementation(async ({ threadId, payload }) => ({
+    threadId,
+    operationId: payload.operationId,
+    generation: payload.expectedGeneration,
+    phase: "stopping",
+    errorCode: null,
+  }));
   fixture.refresh.mockResolvedValue(undefined);
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
   vi.unstubAllGlobals();
 });
-const withClient = async (test: () => Promise<void>) => {
+const withClient = async (test: (client: { relayUrl: string }) => Promise<void>) => {
   // Model the HTTP transport boundary with promises; the component owns no Effect runtime.
   let response: unknown;
   const transport = (method: typeof fixture.list) => (input: unknown) => {
@@ -199,7 +221,11 @@ const withClient = async (test: () => Promise<void>) => {
   };
   const client = {
     relayUrl: "https://relay.invalid",
-    listSavedWorkflowResults: transport(fixture.list),
+    listSavedWorkflowResults: (input: unknown) => {
+      const relayUrl = client.relayUrl;
+      response = Promise.resolve(fixture.list(input)).then((data) => ({ ...data, relayUrl }));
+      return Effect.void;
+    },
     readSavedWorkflowResult: transport(fixture.read),
     getSavedWorkflowHistory: transport(fixture.history),
     permanentlyDeleteThread: transport(fixture.deletion),
@@ -210,7 +236,7 @@ const withClient = async (test: () => Promise<void>) => {
       return Promise.resolve(response);
     },
   );
-  await test();
+  await test(client);
 };
 it("requires the current saved diff to render before recording a Review visit", () =>
   withClient(async () => {
@@ -254,19 +280,275 @@ it("does not replace a selected result with a late reply for an older selection"
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(next.resultId);
     expect(fixture.refresh).not.toHaveBeenCalled();
   }));
-it("reconciles deletion with the same operation after an uncertain reply", () =>
+it("retries the exact deletion after an uncertain reply, even if the result index changes", () =>
   withClient(async () => {
-    fixture.deletion.mockRejectedValueOnce(new Error("reply lost")).mockResolvedValue(undefined);
+    fixture.deletion.mockRejectedValueOnce(new Error("Reply lost"));
+    const finished = { ...job, status: "done" } as const;
+    await mount(finished);
+    await press("Delete thread permanently");
+
+    expect(deleteDialog()).toBeDefined();
+    expect(fixture.deletion).not.toHaveBeenCalled();
+    await press("Delete thread", deleteDialog());
+    expect(deleteDialog()).toBeUndefined();
+    expect(JSON.stringify(renderer.toJSON())).toContain("Deletion not confirmed");
+    expect(renderer.root.findByType("pre")).toBeDefined();
+
+    expect(fixture.deletion).toHaveBeenCalledExactlyOnceWith({
+      clerkToken: "test",
+      threadId: "thread",
+      payload: {
+        operationId: expect.any(String),
+        expectedGeneration: 1,
+        confirmWorkspaceLoss: true,
+      },
+    });
+    const submitted = fixture.deletion.mock.calls[0]![0];
+
+    fixture.call.mockRejectedValueOnce(
+      new WorkflowRequestNotSentError("The workflow connection changed."),
+    );
+    await press("Retry deletion");
+    expect(deleteDialog()).toBeUndefined();
+    expect(fixture.deletion).toHaveBeenCalledOnce();
+    expect(JSON.stringify(renderer.toJSON())).not.toMatch(/deletion.{0,24}not sent/i);
+
+    const reads = fixture.list.mock.calls.length;
+    fixture.list.mockResolvedValue({
+      results: [result],
+      nextCursor: null,
+      threadId: "updated-thread",
+      generation: 2,
+      relayUrl: "https://relay.invalid",
+    });
+    await act(() =>
+      renderer.update(
+        view({
+          ...finished,
+          progress: {
+            ...job.progress!,
+            checkpoint: { ...job.progress!.checkpoint!, checkpointId: "refreshed-checkpoint" },
+          },
+        }),
+      ),
+    );
+    expect(fixture.list.mock.calls.length).toBeGreaterThan(reads);
+
+    let accept!: (receipt: RelayThreadDeletion) => void;
+    fixture.deletion.mockImplementationOnce(
+      () => new Promise<RelayThreadDeletion>((resolve) => (accept = resolve)),
+    );
+    const retry = findButton("Retry deletion");
+    expect(retry).toBeDefined();
+    await act(async () => {
+      void retry!.props.onClick();
+    });
+    expect(deleteDialog()).toBeUndefined();
+    expect(fixture.deletion.mock.calls).toEqual([[submitted], [submitted]]);
+    const pending = JSON.stringify(renderer.toJSON());
+    expect(pending).toContain("Requesting deletion…");
+    expect(pending).not.toContain("Deletion requested");
+    await act(() =>
+      accept({
+        threadId: ThreadId.make("thread"),
+        operationId: submitted.payload.operationId,
+        generation: 1,
+        phase: "stopping",
+        errorCode: null,
+      }),
+    );
+    const content = JSON.stringify(renderer.toJSON());
+    expect(content).toContain("Deletion requested");
+    expect(content).not.toContain("Deletion not confirmed");
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+  }));
+
+const deletionFailure = ManagedRelay.relayRequestError("permanently delete thread");
+
+it.each([
+  ["thread", 1],
+  ["thread", 2],
+  ["replacement-thread", 2],
+] as const)(
+  "checks thread %s generation %s after the relay blocks deletion",
+  (threadId, generation) =>
+    withClient(async () => {
+      await mount({ ...job, status: "done" });
+      const reads = fixture.list.mock.calls.length;
+      const freshResult =
+        threadId === "thread"
+          ? result
+          : {
+              ...result,
+              resultId: "77777777-7777-4777-8777-777777777777",
+              stepId: "Replacement Agent",
+            };
+      fixture.list.mockResolvedValue({
+        results: [freshResult],
+        nextCursor: null,
+        threadId,
+        generation,
+      });
+      fixture.read.mockResolvedValue({ result: freshResult, patch });
+      fixture.deletion.mockRejectedValueOnce(
+        deletionFailure(
+          new RelayTenancyConflictError({
+            code: "tenancy_conflict",
+            reason: "thread_deletion_conflict",
+            traceId: "deletion-conflict",
+          }),
+        ),
+      );
+      await press("Delete thread permanently");
+      await press("Delete thread", deleteDialog());
+
+      expect(fixture.list.mock.calls.length).toBeGreaterThan(reads);
+      expect(fixture.deletion).toHaveBeenCalledOnce();
+      const submitted = fixture.deletion.mock.calls[0]![0];
+      expect(submitted.payload.expectedGeneration).toBe(1);
+      if (generation === 1) {
+        expect(JSON.stringify(renderer.toJSON())).toMatch(/blocked|could not request deletion/i);
+        await press("Retry deletion");
+        expect(deleteDialog()).toBeUndefined();
+        expect(fixture.deletion.mock.calls).toEqual([[submitted], [submitted]]);
+      } else {
+        expect(findButton("Retry deletion")).toBeUndefined();
+        expect(renderer.root.findByType("pre").props.items[0].id).toContain(freshResult.resultId);
+        await press("Delete thread permanently");
+        expect(deleteDialog()).toBeDefined();
+        expect(fixture.deletion).toHaveBeenCalledOnce();
+        await press("Delete thread", deleteDialog());
+        expect(fixture.deletion).toHaveBeenLastCalledWith({
+          ...submitted,
+          threadId,
+          payload: { ...submitted.payload, operationId: expect.any(String), expectedGeneration: 2 },
+        });
+        expect(fixture.deletion.mock.calls[1]![0].payload.operationId).not.toBe(
+          submitted.payload.operationId,
+        );
+      }
+    }),
+);
+
+it("hides cached results while reconciling a deletion the relay can no longer find", () =>
+  withClient(async () => {
+    const finished = { ...job, status: "done" } as const;
+    await mount(finished);
+    expect(renderer.root.findByType("pre")).toBeDefined();
+    const unavailable = deletionFailure(
+      new RelayTenancyNotFoundError({
+        code: "tenancy_not_found",
+        reason: "thread_not_found",
+        traceId: "deleted-thread",
+      }),
+    );
+    fixture.deletion.mockRejectedValueOnce(unavailable);
+    fixture.list.mockRejectedValue(unavailable);
+    await press("Delete thread permanently");
+    await press("Delete thread", deleteDialog());
+
+    expect(fixture.refresh).toHaveBeenCalled();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+    expect(findButton("Retry deletion")).toBeUndefined();
+    expect(findButton("Delete thread permanently")?.props.disabled ?? true).toBe(true);
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("Deletion requested");
+
+    await act(() =>
+      renderer.update(
+        view({
+          ...finished,
+          progress: { ...job.progress!, threadDeletionRequested: true },
+        }),
+      ),
+    );
+    expect(JSON.stringify(renderer.toJSON())).toContain("Deletion requested");
+    expect(fixture.deletion).toHaveBeenCalledOnce();
+  }));
+
+it("restores only read access when the deletion endpoint hides lost maintainer authority", () =>
+  withClient(async () => {
+    await mount({ ...job, status: "done" });
+    fixture.deletion.mockRejectedValueOnce(
+      deletionFailure(
+        new RelayTenancyNotFoundError({
+          code: "tenancy_not_found",
+          reason: "thread_not_found",
+          traceId: "demoted-maintainer",
+        }),
+      ),
+    );
+    await press("Delete thread permanently");
+    await press("Delete thread", deleteDialog());
+
+    expect(fixture.refresh).toHaveBeenCalled();
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    expect(JSON.stringify(renderer.toJSON())).toContain("Deletion unavailable");
+    expect(findButton("Retry deletion")).toBeUndefined();
+    expect(findButton("Delete thread permanently")).toBeUndefined();
+  }));
+
+it("only retries an uncertain request when reconnected to its original relay", () =>
+  withClient(async (client) => {
+    const originalRelay = client.relayUrl;
+    fixture.deletion.mockRejectedValueOnce(new Error("Reply lost"));
     await mount({ ...job, status: "done" });
     await press("Delete thread permanently");
+    await press("Delete thread", deleteDialog());
+    const submitted = fixture.deletion.mock.calls[0]![0];
+
+    client.relayUrl = "https://replacement.invalid";
+    await press("Retry deletion");
+    expect(fixture.deletion).toHaveBeenCalledOnce();
+    expect(findButton("Retry deletion")).toBeUndefined();
+    expect(JSON.stringify(renderer.toJSON())).toContain("original relay");
+
+    client.relayUrl = originalRelay;
+    await press("Refresh saved results");
+    await press("Retry deletion");
+    expect(fixture.deletion.mock.calls).toEqual([[submitted], [submitted]]);
+  }));
+
+it("requires fresh confirmation when the first deletion request was never sent", () =>
+  withClient(async () => {
+    await mount({ ...job, status: "done" });
     await press("Delete thread permanently");
-    expect(fixture.deletion).toHaveBeenCalledTimes(2);
-    expect(fixture.deletion.mock.calls[0]![0].payload).toEqual(
-      fixture.deletion.mock.calls[1]![0].payload,
+    fixture.call.mockRejectedValueOnce(
+      new WorkflowRequestNotSentError("The workflow connection changed."),
     );
-    expect(fixture.confirm).toHaveBeenCalledOnce();
-    expect(JSON.stringify(renderer.toJSON())).toContain("Thread deletion requested");
-    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+    await press("Delete thread", deleteDialog());
+
+    expect(fixture.refresh).toHaveBeenCalled();
+    expect(fixture.deletion).not.toHaveBeenCalled();
+    expect(JSON.stringify(renderer.toJSON())).toMatch(
+      /deletion.{0,24}not sent|request was not sent/i,
+    );
+    expect(findButton("Retry deletion")).toBeUndefined();
+
+    await press("Delete thread permanently");
+    expect(deleteDialog()).toBeDefined();
+    expect(fixture.deletion).not.toHaveBeenCalled();
+    await press("Delete thread", deleteDialog());
+    expect(fixture.deletion).toHaveBeenCalledOnce();
+  }));
+
+it("ignores an older-results page from a different thread placement", () =>
+  withClient(async () => {
+    const currentPage = { results: [result], nextCursor: 1, threadId: "thread", generation: 1 };
+    fixture.list.mockImplementation(async ({ before }) =>
+      before
+        ? {
+            results: [{ ...result, resultId: "66666666-6666-4666-8666-666666666666" }],
+            nextCursor: null,
+            threadId: "replacement-thread",
+            generation: 2,
+          }
+        : currentPage,
+    );
+    await mount({ ...job, status: "done" });
+    await press("Load older results");
+    expect(findButton("Load older results")).toBeDefined();
+    expect(JSON.stringify(renderer.toJSON())).not.toContain("66666666-6666-4666-8666-666666666666");
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
   }));
 
 it("keeps earlier results read-only and returns to the exact current review", () =>
@@ -439,7 +721,7 @@ it("keeps Input-first runs empty until an Agent creates results, rather than cal
     });
     expect(fixture.list).not.toHaveBeenCalled();
     expect(JSON.stringify(renderer.toJSON())).toContain("No Agent result has been saved yet");
-    expect(JSON.stringify(renderer.toJSON())).not.toContain("deletion requested");
+    expect(JSON.stringify(renderer.toJSON())).not.toMatch(/deletion requested/i);
     await act(() => renderer.update(view(job)));
     expect(fixture.list).toHaveBeenCalled();
     expect(renderer.root.findAllByType("pre")).toHaveLength(1);
@@ -491,14 +773,11 @@ it.each([
       if (savedPatch) {
         fixture.deletion.mockRejectedValueOnce(new Error("Reply lost"));
         await press("Delete thread permanently");
-        const deletionError = renderer.root
-          .findAllByType("div")
-          .find((node) =>
-            node.children.some(
-              (child) =>
-                typeof child === "string" && /could not confirm thread deletion/i.test(child),
-            ),
-          )!;
+        await press("Delete thread", deleteDialog());
+        const deletionError = renderer.root.findAll(
+          (node) =>
+            typeof node.type === "string" && node.children.includes("Deletion not confirmed"),
+        )[0]!;
         for (let node: typeof deletionError | null = deletionError; node; node = node.parent) {
           expect(node.props.hidden).not.toBe(true);
         }
@@ -600,7 +879,7 @@ it("allows cleanup metadata for a cancellation before the first Agent without ca
     await mount({ ...job, status: "cancelled", progress: { ...job.progress!, hasThread: false } });
     expect(fixture.list).toHaveBeenCalledOnce();
     expect(JSON.stringify(renderer.toJSON())).toContain("No safely captured Agent result");
-    expect(JSON.stringify(renderer.toJSON())).not.toContain("deletion requested");
+    expect(JSON.stringify(renderer.toJSON())).not.toMatch(/deletion requested/i);
     expect(
       renderer.root
         .findAllByType("button")
@@ -615,7 +894,7 @@ it("preserves explicit deletion when reopening a run and makes no saved-result r
       progress: { ...job.progress!, threadDeletionRequested: true },
     });
     expect(fixture.list).not.toHaveBeenCalled();
-    expect(JSON.stringify(renderer.toJSON())).toContain("Thread deletion requested");
+    expect(JSON.stringify(renderer.toJSON())).toContain("Deletion requested");
   }));
 for (const state of [
   { data: capability(false), error: null, isPending: false },
@@ -634,19 +913,28 @@ for (const state of [
       ).toBe(false);
       expect(fixture.deletion).not.toHaveBeenCalled();
     }));
-it("rechecks capabilities after confirmation before sending deletion", () =>
+it("cannot submit a delete confirmation after permission becomes unavailable", () =>
   withClient(async () => {
-    fixture.confirm.mockImplementation(async () => {
+    await mount({ ...job, status: "done" });
+    await press("Delete thread permanently");
+    const confirm = findButton("Delete thread", deleteDialog())?.props.onClick;
+    expect(confirm).toBeTypeOf("function");
+
+    await act(() => {
       appAtomRegistry.set(capabilitiesAtom, {
         data: null,
         error: null,
         errorTraceId: null,
         isPending: false,
       });
-      return true;
     });
-    await mount({ ...job, status: "done" });
-    await press("Delete thread permanently");
+    expect(findButton("Delete thread permanently")).toBeUndefined();
+    const dialog = deleteDialog();
+    const visibleConfirm = dialog && findButton("Delete thread", dialog);
+    expect(visibleConfirm?.props.disabled ?? true).toBe(true);
+    await act(async () => {
+      await confirm();
+    });
     expect(fixture.deletion).not.toHaveBeenCalled();
   }));
 it("keeps deletion behind repository authority, completed cleanup and confirmation", () =>
@@ -668,7 +956,10 @@ it("keeps deletion behind repository authority, completed cleanup and confirmati
         .some((b) => b.props.children === "Delete thread permanently"),
     ).toBe(false);
     await act(() => renderer.update(view({ ...job, status: "done" })));
-    fixture.confirm.mockResolvedValue(false);
     await press("Delete thread permanently");
+    expect(deleteDialog()).toBeDefined();
+    await press("Keep thread", deleteDialog());
+    expect(deleteDialog()).toBeUndefined();
+    expect(renderer.root.findByType("pre")).toBeDefined();
     expect(fixture.deletion).not.toHaveBeenCalled();
   }));
