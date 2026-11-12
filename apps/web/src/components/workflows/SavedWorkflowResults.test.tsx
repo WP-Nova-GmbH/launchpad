@@ -343,6 +343,84 @@ it("keeps an opened diff in place when a new checkpoint arrives until Review lat
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(next.resultId);
     expect(fixture.target).toHaveBeenLastCalledWith(true);
   }));
+it.each(["awaiting_review", "finishing"] as const)(
+  "keeps the exact saved diff inspectable without prompting for another review during %s completion",
+  (status) =>
+    withClient(async () => {
+      const earlier = {
+        ...result,
+        resultId: "33333333-3333-4333-8333-333333333333",
+        turnId: "earlier",
+        createdAt: "2026-11-10T10:40:00Z",
+      };
+      fixture.list.mockResolvedValue({
+        results: [result, earlier],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+        relayUrl: "https://relay.invalid",
+      });
+      fixture.read.mockImplementation(({ resultId }: { resultId: string }) =>
+        Promise.resolve({ result: resultId === result.resultId ? result : earlier, patch }),
+      );
+      const finalizing = {
+        ...job,
+        status,
+        workflow: {
+          workflowId: job.workflowId,
+          repositoryId: job.repositoryId,
+          organizationId: scope.organizationId,
+          archived: false,
+          revision: 1,
+          createdAt: job.createdAt,
+          updatedAt: job.updatedAt,
+          definition: {
+            name: "Review implementation",
+            target: { kind: "vm", baseBranch: "main" },
+            steps: [
+              {
+                id: result.stepId,
+                title: "Implement",
+                kind: "agent",
+                instruction: "Make the change",
+                modelSelection: null,
+              },
+              { id: "review", title: "Review changes", kind: "review", role: "member" },
+            ],
+          },
+        },
+        progress: {
+          ...job.progress!,
+          status,
+          retryableApproval: true,
+          steps: [
+            { stepId: result.stepId, generation: 0, status: "completed" },
+            { stepId: "review", generation: 0, status: "completed" },
+          ],
+        },
+      } satisfies RepositoryWorkflowJob;
+      settleWorkflowJobRequest(
+        appAtomRegistry,
+        beginWorkflowJobRequest(appAtomRegistry, scope, job.jobId)!,
+        finalizing,
+      );
+      await mount(finalizing);
+      await act(() => renderer.root.findByType("pre").props.options.onPostRender());
+      expect(JSON.stringify(renderer.toJSON())).toContain("Latest result");
+      expect(JSON.stringify(renderer.toJSON())).not.toContain("Current review result");
+      expect(fixture.refresh).toHaveBeenCalledOnce();
+
+      await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
+      expect(renderer.root.findByType("pre").props.items[0].id).toContain(earlier.resultId);
+      const content = JSON.stringify(renderer.toJSON());
+      expect(content).not.toContain("A newer result needs review");
+      expect(content).not.toContain("Return to current review");
+      expect(content).not.toContain("Decisions apply to the current review");
+      await press("Open result for final checks");
+      expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    }),
+);
+
 it("retries the selected result after a load failure without jumping to another result", () =>
   withClient(async () => {
     fixture.read.mockRejectedValueOnce(new Error("Disconnected"));

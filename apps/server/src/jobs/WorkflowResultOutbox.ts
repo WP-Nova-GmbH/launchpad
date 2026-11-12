@@ -110,12 +110,17 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
       detail: string | null;
       permanent: number;
       resultId: string | null;
-    }>`SELECT publication_id AS "publicationId",status,detail,permanent,json_extract(result_json,'$.resultId') AS "resultId" FROM workflow_result_outbox WHERE job_id=${jobId} AND status!='acknowledged' ORDER BY revision LIMIT 1`.pipe(
+      stepId: string | null;
+    }>`SELECT publication_id AS "publicationId",status,detail,permanent,
+      json_extract(result_json,'$.resultId') AS "resultId",
+      json_extract(result_json,'$.stepId') AS "stepId"
+      FROM workflow_result_outbox WHERE job_id=${jobId} AND status!='acknowledged' ORDER BY revision LIMIT 1`.pipe(
       Effect.map(([row]): WorkflowResultSaving | undefined =>
         row
           ? {
               publicationId: row.publicationId,
               resultId: row.resultId,
+              ...(row.stepId ? { stepId: row.stepId } : {}),
               state: row.status === "failed" ? "failed" : "saving",
               detail: row.detail,
               retryable: row.status === "failed" && !row.permanent,

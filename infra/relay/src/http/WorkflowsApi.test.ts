@@ -900,3 +900,148 @@ it.effect(
       );
     }).pipe(Effect.provide(NodeCrypto.layer)),
 );
+
+it.effect("exposes the queued publication retry even after a workflow has ended", () =>
+  Effect.gen(function* () {
+    const h = yield* manualApiHarness;
+    const publicationId = "11111111-1111-4111-8111-111111111111";
+    yield* Ref.update(h.row, (row) => ({
+      ...row,
+      status: "cancelled" as const,
+      record: {
+        ...row.record,
+        runtime: { kind: "vm" as const, threadId: ThreadId.make("thread") },
+        status: "cancelled" as const,
+        progress: {
+          ...row.record.progress!,
+          status: "cancelled" as const,
+          checkpoint: null,
+          resultSaving: {
+            publicationId,
+            resultId: null,
+            state: "failed" as const,
+            retryable: true,
+            detail: "Storage unavailable",
+          },
+        },
+      },
+    }));
+    const submitted = yield* h.respond({
+      operation: "retry_saving",
+      publicationId,
+      expectedRevision: 5,
+    });
+    assert.strictEqual(submitted.responsePending, false);
+    assert.strictEqual(submitted.resultSaveRetryPending, true);
+    assert.strictEqual((yield* h.refresh())?.resultSaveRetryPending, true);
+    assert.strictEqual(yield* Ref.get(h.writes), 1);
+
+    yield* Ref.update(h.row, (row) => ({
+      ...row,
+      pendingControl: null,
+      record: {
+        ...row.record,
+        progress: {
+          ...row.record.progress!,
+          resultSaving: {
+            ...row.record.progress!.resultSaving!,
+            state: "saving" as const,
+            retryable: false,
+          },
+        },
+      },
+    }));
+    assert.isUndefined((yield* h.refresh())?.resultSaveRetryPending);
+  }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["finishing", "awaiting_review"] as const)(
+  "rejects cancel-only completion controls while allowing transient retries (%s)",
+  (status) =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const stop =
+        "The prepared branch changed after this review was created. Cancel the job and run it again.";
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        status,
+        record: {
+          ...row.record,
+          status,
+          workflow: {
+            workflowId: "flow",
+            repositoryId: "repo",
+            organizationId: "org",
+            archived: false,
+            revision: 1,
+            createdAt: row.createdAt,
+            updatedAt: row.createdAt,
+            definition: {
+              name: "Complete work",
+              target: { kind: "vm" as const, baseBranch: null },
+              steps: [
+                {
+                  id: "agent",
+                  title: "Implement",
+                  kind: "agent" as const,
+                  instruction: "Make the change",
+                  modelSelection: null,
+                },
+              ],
+            },
+          },
+          progress: {
+            ...row.record.progress!,
+            status,
+            detail: stop,
+            steps: [{ stepId: "agent", generation: 0, status: "completed" as const }],
+            checkpoint: {
+              checkpointId: "completion",
+              turnId: "turn",
+              checkpointRef: "ref",
+              checkpointTurnCount: 1,
+            },
+            retryableApproval: true,
+          },
+        },
+      }));
+      const retry = {
+        operation: "approve",
+        checkpointId: "completion",
+        expectedRevision: 5,
+      } as const;
+      const blocked = yield* h.refresh();
+      assert.strictEqual(blocked?.progress?.detail, stop);
+      assert.strictEqual(blocked?.progress?.retryableApproval, false);
+      assert.strictEqual((yield* Effect.flip(h.respond(retry)))._tag, "WorkflowConflictError");
+
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        record: {
+          ...row.record,
+          progress: { ...row.record.progress!, retryableApproval: false },
+        },
+      }));
+      assert.strictEqual((yield* Effect.flip(h.respond(retry)))._tag, "WorkflowConflictError");
+      assert.strictEqual(
+        (yield* Effect.flip(h.respond({ ...retry, operation: "request_changes", text: "Rework" })))
+          ._tag,
+        "WorkflowConflictError",
+      );
+      assert.strictEqual(yield* Ref.get(h.writes), 0);
+
+      yield* Ref.update(h.row, (row) => ({
+        ...row,
+        record: {
+          ...row.record,
+          progress: {
+            ...row.record.progress!,
+            detail: "Result verification could not finish. Retry approval.",
+            retryableApproval: true,
+          },
+        },
+      }));
+      assert.strictEqual((yield* h.refresh())?.progress?.retryableApproval, true);
+      assert.strictEqual((yield* h.respond(retry)).pendingResponseOperation, "approve");
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);

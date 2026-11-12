@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { cn } from "../../lib/utils";
+import type { WorkflowRecovery } from "./WorkflowCompletionRecovery";
 
 const completedStep = { label: "Completed", Icon: CheckIcon, tone: "text-success-foreground" };
 const upcomingStep = { label: "Upcoming", Icon: MinusIcon, tone: "text-muted-foreground" };
@@ -25,7 +26,7 @@ const activeStep = { Icon: ActivityIcon, tone: "text-info-foreground" };
 const waitingStep = { Icon: ClockIcon, tone: "text-warning-foreground" };
 const attentionStep = { Icon: CircleAlertIcon, tone: "text-error-foreground" };
 
-function workflowProgressStatus(job: RepositoryWorkflowJob, allStepsComplete: boolean) {
+function workflowProgressStatus(job: RepositoryWorkflowJob, recovery?: WorkflowRecovery | null) {
   const { status, progress, pendingManualControl, pendingResponseOperation } = job;
   if (status === "failed") return { ...attentionStep, label: "Failed" };
   if (status === "cancelled") return { ...upcomingStep, Icon: SquareIcon, label: "Canceled" };
@@ -39,16 +40,11 @@ function workflowProgressStatus(job: RepositoryWorkflowJob, allStepsComplete: bo
     };
   }
 
-  const saving = progress?.resultSaving?.state;
-  if (saving === "failed") return { ...attentionStep, label: "Couldn’t save result" };
-  if (saving === "saving") return { ...activeStep, label: "Saving result" };
+  if (recovery && status !== "paused") {
+    return { ...(recovery.blocked ? attentionStep : activeStep), label: recovery.title };
+  }
 
   const approvalPending = workflowApprovalPending(job);
-  if (status === "finishing" || (status === "awaiting_review" && allStepsComplete)) {
-    return progress?.retryableApproval && !approvalPending
-      ? { ...attentionStep, label: "Completion needs attention" }
-      : { ...activeStep, label: "Finishing" };
-  }
 
   if (status === "awaiting_input" || status === "awaiting_review") {
     if (status === "awaiting_review" && approvalPending)
@@ -72,7 +68,13 @@ function workflowProgressStatus(job: RepositoryWorkflowJob, allStepsComplete: bo
   return { ...activeStep, label: workflowStatusLabel(status) };
 }
 
-export function WorkflowProgress({ job }: { job: RepositoryWorkflowJob }) {
+export function WorkflowProgress({
+  job,
+  recovery,
+}: {
+  job: RepositoryWorkflowJob;
+  recovery: WorkflowRecovery | null;
+}) {
   const steps = job.workflow?.definition.steps;
   if (!steps?.length) return null;
 
@@ -91,17 +93,13 @@ export function WorkflowProgress({ job }: { job: RepositoryWorkflowJob }) {
   const waitingForInput = job.status === "awaiting_input";
   const waitingForReview = job.status === "awaiting_review";
   const waiting = waitingForInput || waitingForReview;
-  const saving = progress?.resultSaving?.state;
-  const resultSavePending = saving === "saving" || saving === "failed";
   const checkpoint = progress?.checkpoint;
   const waitingKind = waitingForInput ? "input" : "review";
   const checkpointStepId =
     waiting && checkpoint && (checkpoint.kind ?? "review") === waitingKind
       ? checkpoint.stepId
       : undefined;
-  const reportedStep = resultSavePending
-    ? (progress?.stepId ?? checkpointStepId)
-    : (checkpointStepId ?? progress?.stepId);
+  const reportedStep = recovery?.stepId ?? checkpointStepId ?? progress?.stepId;
   const activeRows = rows.filter(({ state }) => state === "running" || state === "waiting");
   const currentId =
     reportedStep ?? (!terminal && activeRows.length === 1 ? activeRows[0]?.step.id : undefined);
@@ -109,7 +107,7 @@ export function WorkflowProgress({ job }: { job: RepositoryWorkflowJob }) {
     ({ step, state }) =>
       step.id === currentId &&
       state !== "completed" &&
-      (!waiting || resultSavePending || step.kind === waitingKind),
+      (!waiting || step.id === recovery?.stepId || step.kind === waitingKind),
   );
   const pointedStep = rows[currentIndex];
   const current =
@@ -117,11 +115,13 @@ export function WorkflowProgress({ job }: { job: RepositoryWorkflowJob }) {
       ? pointedStep
       : undefined;
 
-  const currentStep = workflowProgressStatus(job, hasCompleteCount && complete === steps.length);
-  const statusLabel = currentStep.label;
+  const summary = workflowProgressStatus(job, recovery);
+  const statusLabel = summary.label;
+  const runLevelRecovery = recovery?.title === statusLabel && recovery.stepId !== current?.step.id;
+  const currentStep = runLevelRecovery ? workflowProgressStatus(job) : summary;
   const title = current?.step.title || "Untitled step";
   let context = statusLabel;
-  if (current) {
+  if (current && !runLevelRecovery) {
     if (stopped) context = `${statusLabel} at ${title}`;
     else if (statusLabel === "Approval pending" || statusLabel === "Response pending")
       context = `${statusLabel} for ${title}`;
@@ -141,7 +141,7 @@ export function WorkflowProgress({ job }: { job: RepositoryWorkflowJob }) {
   return (
     <div className="min-w-0 flex-[1_1_20rem]">
       <span role="status" className="sr-only">
-        {completionCount ? `${context}. ${completionCount}` : current ? context : null}
+        {completionCount ? `${context}. ${completionCount}` : current || recovery ? context : null}
       </span>
       <details
         aria-label="Run progress"

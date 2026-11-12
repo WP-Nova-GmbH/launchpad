@@ -1367,7 +1367,8 @@ describe("workflow run outcomes", () => {
         hasThread: true,
         resultSaving: {
           publicationId: "c5540cf3-802e-41c9-b6b6-832d2f6ba867",
-          resultId: null,
+          resultId: "11111111-1111-4111-8111-111111111111",
+          stepId: "agent",
           state,
           detail: null,
           retryable: state === "failed",
@@ -1394,6 +1395,266 @@ describe("workflow run outcomes", () => {
       },
     }) satisfies RepositoryWorkflowJob;
 
+  const currentRunTask = () =>
+    renderer!.root
+      .findAllByType("section")
+      .find((section) => section.props["aria-label"] === "Current workflow task")!;
+
+  it("shows the saved-result blocker and lets only maintainers retry the current publication", async () => {
+    const saving = savingAgentResult("saving");
+    const failedResult = savingAgentResult("failed");
+    const failed = {
+      ...failedResult,
+      progress: {
+        ...failedResult.progress,
+        revision: 9,
+        manualPauseSupported: true,
+        resultSaving: {
+          ...failedResult.progress.resultSaving,
+          publicationId: "84cb8223-35eb-4105-88d6-6a19f293e311",
+          detail: "The result store could not confirm the write.",
+        },
+      },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(saving);
+    await mount(false);
+
+    expect(text(currentRunTask())).toContain("Saving step result");
+    expect(text(currentRunTask())).toContain("Agent");
+    expect(text(currentRunTask())).toContain("Review changes");
+    expect(findButton("Retry saving")).toBeUndefined();
+
+    fixture.call.mockResolvedValue(failed);
+    await pollRun();
+    expect(text(currentRunTask())).toContain("Couldn’t save step result");
+    expect(text(currentRunTask())).toContain("The result store could not confirm the write.");
+    expect(text(currentRunTask())).toContain("Agent");
+    expect(text(currentRunTask())).toContain("Review changes");
+    expect(findButton("Retry saving")).toBeUndefined();
+    expect(findButton("Approve result")).toBeUndefined();
+    expect(findButton("Request changes")).toBeUndefined();
+    expect(renderer!.root.findByType(SavedWorkflowResults)).toBeDefined();
+
+    await act(() => renderer!.update(view()));
+    await press("Run controls");
+    expect(findButton("Pause at this checkpoint")).toBeDefined();
+    expect(findButton("Pause after current step")).toBeUndefined();
+    await press("Run controls");
+
+    fixture.call.mockResolvedValue({
+      ...failed,
+      responsePending: true,
+      pendingManualControl: {
+        operation: "pause",
+        controlId: "pause",
+        expectedRevision: failed.progress.revision,
+      },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(text(currentRunTask())).toContain("Couldn’t save step result");
+    expect(text(currentRunTask())).toContain("Pause requested");
+    expect(text(currentRunTask())).not.toContain("Waiting for retry confirmation");
+    expect(findButton("Retrying…")).toBeUndefined();
+
+    fixture.call.mockResolvedValue(failed);
+    await pollRun();
+    const queued = {
+      ...failed,
+      responsePending: true,
+      resultSaveRetryPending: true,
+    } satisfies RepositoryWorkflowJob;
+    const retrying = {
+      ...failed,
+      progress: {
+        ...failed.progress,
+        revision: 10,
+        resultSaving: {
+          ...failed.progress.resultSaving,
+          state: "saving",
+          detail: null,
+          retryable: false,
+        },
+      },
+    } satisfies RepositoryWorkflowJob;
+    const reply = deferred();
+    const retry = vi.fn().mockReturnValue(reply.promise);
+    fixture.call
+      .mockResolvedValue(queued)
+      .mockImplementationOnce((request) => request({ respondToWorkflowJob: retry }, "token"));
+    await press("Retry saving");
+
+    expect(findButton("Retrying…").props["aria-disabled"]).toBe(true);
+    await press("Retrying…");
+    expect(retry).toHaveBeenCalledExactlyOnceWith({
+      clerkToken: "token",
+      repositoryId: scope.repositoryId,
+      jobId: job.jobId,
+      payload: {
+        operation: "retry_saving",
+        publicationId: failed.progress.resultSaving.publicationId,
+        expectedRevision: failed.progress.revision,
+      },
+    });
+    await act(async () => {
+      reply.resolve(queued);
+      await reply.promise;
+    });
+    expect(text(currentRunTask())).toContain("Waiting for retry confirmation");
+    expect(findButton("Retry saving")).toBeUndefined();
+    expect(findButton("Retrying…").props["aria-disabled"]).toBe(true);
+    await press("Retrying…");
+    expect(retry).toHaveBeenCalledOnce();
+
+    fixture.call.mockResolvedValue(retrying);
+    await pollRun();
+    expect(text(currentRunTask())).toContain("Saving step result");
+    expect(findButton("Retrying…")).toBeUndefined();
+  });
+
+  it.each([
+    ["saving", "Saving run state"],
+    ["failed", "Couldn’t save run state"],
+  ] as const)("labels %s metadata without claiming the Agent finished", async (state, title) => {
+    const publication = savingAgentResult(state);
+    fixture.call.mockResolvedValue({
+      ...publication,
+      status: "running",
+      progress: {
+        ...publication.progress,
+        status: "running",
+        checkpoint: null,
+        resultSaving: {
+          publicationId: publication.progress.resultSaving.publicationId,
+          resultId: null,
+          state,
+          detail: null,
+          retryable: state === "failed",
+        },
+        steps: [
+          { stepId: "agent", generation: 0, status: "running" },
+          { stepId: "review", generation: 0, status: "pending" },
+        ],
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    const task = text(currentRunTask());
+    expect(task).toContain(title);
+    expect(task).not.toMatch(/step finished|waiting for this result|starts once the result/);
+    expect(Boolean(findButton("Retry saving"))).toBe(state === "failed");
+  });
+
+  it.each(["finishing", "awaiting_review"] as const)(
+    "retries completion from %s without reopening the finished review",
+    async (status) => {
+      const finalizing = finishing(true);
+      const blocked = {
+        ...finalizing,
+        status,
+        progress: {
+          ...finalizing.progress,
+          revision: 12,
+          status,
+          detail: "The environment couldn’t verify the final result.",
+        },
+      } satisfies RepositoryWorkflowJob;
+      fixture.call.mockResolvedValue(blocked);
+      await mount();
+
+      const task = text(currentRunTask());
+      expect(task).toContain("Completion blocked");
+      expect(task).toMatch(/2 of 2 steps (?:finished|complete)/);
+      expect(task).toContain("The environment couldn’t verify the final result.");
+      expect(findButton("Request changes")).toBeUndefined();
+      expect(findButton("Approve result")).toBeUndefined();
+      expect(findButton("Retry approval")).toBeUndefined();
+      expect(findButton("Inspect saved diff").props.disabled).not.toBe(true);
+      expect(findButton("Open conversation").props.disabled).not.toBe(true);
+
+      const pending = {
+        ...blocked,
+        responsePending: true,
+        pendingResponseOperation: "approve",
+        progress: { ...blocked.progress, revision: 13, approvalPending: true },
+      } satisfies RepositoryWorkflowJob;
+      const retry = vi.fn().mockResolvedValue(pending);
+      fixture.call
+        .mockResolvedValue(pending)
+        .mockImplementationOnce((request) => request({ respondToWorkflowJob: retry }, "token"));
+      await press("Retry completion");
+
+      expect(retry).toHaveBeenCalledExactlyOnceWith({
+        clerkToken: "token",
+        repositoryId: scope.repositoryId,
+        jobId: job.jobId,
+        payload: {
+          operation: "approve",
+          checkpointId: blocked.progress.checkpoint.checkpointId,
+          expectedRevision: blocked.progress.revision,
+        },
+      });
+      expect(text(currentRunTask())).not.toContain("Completion blocked");
+      expect(text(currentRunTask())).toContain("Finishing run");
+      expect(findButton("Retry completion")).toBeUndefined();
+      expect(findButton("Request changes")).toBeUndefined();
+      expect(findButton("Approve result")).toBeUndefined();
+    },
+  );
+
+  it("keeps a relay reconnect reason visible during final verification", async () => {
+    const reconnect = "Waiting for the selected environment to reconnect or acknowledge the job.";
+    fixture.call.mockResolvedValue({ ...finishing(false), detail: reconnect });
+    await mount();
+
+    expect(text(currentRunTask())).toContain("Finishing run");
+    expect(text(currentRunTask())).toContain(reconnect);
+    expect(findButton("Retry completion")).toBeUndefined();
+  });
+
+  it.each([
+    [false, "The saved review changed. Cancel the job and run it again."],
+    [true, "The saved workflow checkpoint is unavailable. Cancel the run and start again."],
+    [true, "The VM no longer owns this workflow. Cancel the run."],
+  ] as const)(
+    "hides completion retry for a cancel-only outcome with retryableApproval=%s",
+    async (retryableApproval, stop) => {
+      const finishingRun = finishing(false);
+      fixture.call.mockResolvedValue({
+        ...finishingRun,
+        status: "finishing",
+        progress: {
+          ...finishingRun.progress,
+          status: "finishing",
+          approvalPending: false,
+          retryableApproval,
+          detail: stop,
+        },
+      } satisfies RepositoryWorkflowJob);
+      await mount();
+
+      expect(text(currentRunTask())).toContain("Completion blocked");
+      expect(text(currentRunTask())).toContain(stop);
+      expect(findButton("Retry completion")).toBeUndefined();
+      expect(findButton("Request changes")).toBeUndefined();
+    },
+  );
+
+  it("does not treat a partially recorded review as finished", async () => {
+    fixture.call.mockResolvedValue({
+      ...awaitingReview,
+      progress: {
+        ...awaitingReview.progress,
+        retryableApproval: true,
+        steps: [awaitingReview.progress.steps[0]!],
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    expect(text(currentRunTask())).not.toContain("Completion blocked");
+    expect(findButton("Retry completion")).toBeUndefined();
+    expect(findButton("Retry approval")).toBeDefined();
+  });
+
   it.each([
     [
       "Pause requested",
@@ -1417,10 +1678,10 @@ describe("workflow run outcomes", () => {
         },
       },
     ],
-    ["Saving result", savingAgentResult("saving"), "Agent"],
-    ["Couldn’t save result", savingAgentResult("failed"), "Agent"],
+    ["Saving step result", savingAgentResult("saving"), "Agent"],
+    ["Couldn’t save step result", savingAgentResult("failed"), "Agent"],
     ["Finishing", finishing(false)],
-    ["Completion needs attention", finishing(true)],
+    ["Completion blocked", finishing(true)],
     [
       "Finishing",
       { ...finishing(true), responsePending: true, pendingResponseOperation: "approve" },

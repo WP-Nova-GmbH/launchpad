@@ -2129,11 +2129,12 @@ const multiRequest = () => ({
   ...request(),
   control: { ...request().control, operation: "start" as const, workflow: multiWorkflow },
 });
-it.effect.each(["review", "finalization", "timeout"] as const)(
+it.effect.each(["review", "finalization", "timeout", "fence lost"] as const)(
   "gives VM result verification its checkpoint capture budget (%s)",
   (boundary) =>
     test(
       Effect.gen(function* () {
+        const finalization = boundary === "finalization" || boundary === "fence lost";
         const h = yield* harness;
         const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
         yield* fence.activate(binding);
@@ -2149,14 +2150,13 @@ it.effect.each(["review", "finalization", "timeout"] as const)(
               definition: {
                 ...workflow.definition,
                 target: { kind: "vm", baseBranch: null },
-                steps:
-                  boundary === "finalization"
-                    ? [workflow.definition.steps[0]!]
-                    : [
-                        workflow.definition.steps[0]!,
-                        workflow.definition.steps[1]!,
-                        multiWorkflow.definition.steps[4]!,
-                      ],
+                steps: finalization
+                  ? [workflow.definition.steps[0]!]
+                  : [
+                      workflow.definition.steps[0]!,
+                      workflow.definition.steps[1]!,
+                      multiWorkflow.definition.steps[4]!,
+                    ],
               },
             },
           },
@@ -2192,7 +2192,7 @@ it.effect.each(["review", "finalization", "timeout"] as const)(
         yield* (yield* SqlClient.SqlClient)`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${binding.jobId}`;
         const result = (yield* runner.handle(status)).progress!;
         const response = { ...approve(result), workflowVm };
-        if (boundary !== "finalization")
+        if (!finalization)
           assert.isTrue((yield* runner.handle(response)).progress?.approvalPending);
         yield* Queue.take(h.captureStarted);
 
@@ -2202,6 +2202,21 @@ it.effect.each(["review", "finalization", "timeout"] as const)(
         assert.isFalse(pending.retryableApproval);
         assert.lengthOf(yield* h.starts, 1);
         assert.equal(yield* Ref.get(h.captureCount), 1);
+
+        if (boundary === "fence lost") {
+          const sql = yield* SqlClient.SqlClient;
+          // Simulate ownership being retired while the final check is waiting on capture.
+          yield* sql`UPDATE thread_execution_fences SET phase='retired' WHERE thread_id=${binding.threadId}`;
+          yield* TestClock.adjust("181 seconds");
+          const stopped = yield* h.awaitRun(
+            (run) => run.progress.revision > pending.revision && !run.progress.approvalPending,
+          );
+          assert.strictEqual(stopped.progress.status, "finishing");
+          assert.isFalse(stopped.progress.retryableApproval);
+          assert.include(stopped.progress.detail!, "VM no longer owns");
+          assert.isNull(stopped.approvalAttempt);
+          return;
+        }
 
         if (boundary === "timeout") {
           yield* TestClock.adjust("181 seconds");
@@ -2216,7 +2231,7 @@ it.effect.each(["review", "finalization", "timeout"] as const)(
         }
         yield* Ref.set(h.captureGate, null);
         yield* Deferred.succeed(gate, undefined);
-        if (boundary === "finalization") {
+        if (finalization) {
           const finished = yield* h.awaitRun((run) => run.progress.status === "done");
           assert.isFalse(finished.progress.approvalPending);
           assert.isFalse(finished.progress.retryableApproval);
@@ -2591,9 +2606,9 @@ it.effect(
       }),
     ),
 );
-it.effect(
-  "automatic completion verifies the final result and retries without inventing an approver",
-  () =>
+it.effect.each(["timeout", "files", "branch"] as const)(
+  "automatic completion distinguishes retryable verification from a stop (%s)",
+  (failure) =>
     test(
       Effect.gen(function* () {
         const h = yield* harness;
@@ -2610,16 +2625,52 @@ it.effect(
           },
         });
         yield* h.completeCurrent;
-        yield* Ref.set(h.workspaceTree, "changed-tree");
-        const blocked = (yield* settleResponse(h, runner, control("status"))).progress!;
-        assert.strictEqual(blocked.status, "finishing");
-        assert.isTrue(blocked.retryableApproval);
-        yield* Ref.set(h.workspaceTree, "prepared-tree");
-        assert.strictEqual(
-          (yield* settleResponse(h, runner, approve(blocked))).progress!.status,
-          "done",
+        const gate = yield* Deferred.make<void>();
+        yield* Ref.set(h.captureGate, gate);
+        const pending = (yield* runner.handle(control("status"))).progress!;
+        assert.strictEqual(pending.status, "finishing");
+        assert.isTrue(pending.approvalPending);
+        yield* Queue.take(h.captureStarted);
+
+        if (failure === "timeout") {
+          yield* TestClock.adjust("3 minutes");
+        } else {
+          if (failure === "files") yield* Ref.set(h.workspaceTree, "changed-tree");
+          else yield* Ref.set(h.headAfterCapture, "changed-head");
+          yield* Deferred.succeed(gate, undefined);
+        }
+
+        const stopped = yield* h.awaitRun(
+          (run) =>
+            run.progress.revision > pending.revision &&
+            run.progress.status === "finishing" &&
+            !run.progress.approvalPending,
         );
-        assert.isNull((yield* (yield* Store.WorkflowRunStore).get("job-1"))!.approvedBy);
+        const store = yield* Store.WorkflowRunStore;
+        if (failure === "timeout") {
+          assert.isTrue(stopped.progress.retryableApproval);
+          assert.include(stopped.progress.detail!, "Retry approval");
+          yield* Ref.set(h.captureGate, null);
+          const resumed = yield* settleResponse(h, runner, approve(stopped.progress));
+          assert.strictEqual(resumed.outcome, "accepted");
+          assert.strictEqual(resumed.progress?.status, "done");
+          assert.isNull((yield* store.get("job-1"))!.approvedBy);
+        } else {
+          assert.isFalse(stopped.progress.retryableApproval);
+          assert.include(
+            stopped.progress.detail!,
+            failure === "files" ? "files changed" : "branch changed",
+          );
+          assert.include(stopped.progress.detail!, "Cancel");
+          yield* Ref.set(h.workspaceTree, "prepared-tree");
+          yield* Ref.set(h.head, "base-sha");
+          yield* Ref.set(h.headAfterCapture, null);
+          yield* Ref.set(h.captureGate, null);
+          const refused = yield* runner.handle(approve(stopped.progress));
+          assert.strictEqual(refused.outcome, "conflict");
+          assert.strictEqual(refused.progress?.revision, stopped.progress.revision);
+          assert.strictEqual(yield* Ref.get(h.captureCount), 1);
+        }
       }),
     ),
 );

@@ -23,6 +23,7 @@ import {
 import {
   WORKFLOW_PROTOCOL,
   isTerminalWorkflowJob,
+  workflowApprovalCanRetry,
   WorkflowVmDispatchBinding,
   type WorkflowControl,
   type WorkflowControlResult,
@@ -991,6 +992,7 @@ export const make = Effect.gen(function* () {
                   const sequence = current.sequence;
                   const step = activeWorkflowStep(current);
                   const failed = Exit.isFailure(outcome);
+                  let retryable = failed;
                   let detail = failed
                     ? "Result verification could not finish. Retry approval."
                     : outcome.value;
@@ -1002,13 +1004,17 @@ export const make = Effect.gen(function* () {
                         step?.kind !== "review" ||
                         step.id !== response.stepId ||
                         sequence.generation !== response.generation))
-                  )
+                  ) {
+                    retryable = false;
                     detail = "The saved review changed. Cancel the job and run it again.";
+                  }
                   if (
                     current.runtime.kind === "vm" &&
                     !(yield* store.isVmFenceActive(current.runtime))
-                  )
+                  ) {
+                    retryable = false;
                     detail = "The VM no longer owns this workflow. Cancel the run.";
+                  }
                   let next: WorkflowRun;
                   if (!detail && response && sequence) {
                     next = advanceWorkflow({
@@ -1042,7 +1048,7 @@ export const make = Effect.gen(function* () {
                   } else {
                     next = {
                       ...current,
-                      approvalAttempt: failed ? current.approvalAttempt : null,
+                      approvalAttempt: retryable ? current.approvalAttempt : null,
                       approvedBy: detail ? current.approvedBy : attempt.approvedBy,
                       executionReserved: false,
                       progress: {
@@ -1050,8 +1056,7 @@ export const make = Effect.gen(function* () {
                         revision: current.progress.revision + 1,
                         status: detail ? current.progress.status : "done",
                         approvalPending: false,
-                        retryableApproval:
-                          failed || (!!detail && current.progress.status === "finishing"),
+                        retryableApproval: retryable,
                         detail:
                           detail ?? "Workflow completed; setup cleanup and final result verified.",
                       },
@@ -1886,7 +1891,13 @@ export const make = Effect.gen(function* () {
         outcome,
         detail,
         progress: run
-          ? { ...workflowProgress(run), executionReleased: ownershipReleased(run) }
+          ? {
+              ...workflowProgress(run),
+              ...(run.progress.retryableApproval
+                ? { retryableApproval: workflowApprovalCanRetry(run.progress) }
+                : {}),
+              executionReleased: ownershipReleased(run),
+            }
           : null,
       });
       if (
@@ -2453,7 +2464,7 @@ export const make = Effect.gen(function* () {
         )
           return result(run);
         if (
-          !run.progress.retryableApproval ||
+          !workflowApprovalCanRetry(run.progress) ||
           control.checkpointId !== attempt.checkpointId ||
           control.expectedRevision !== run.progress.revision
         )
@@ -2581,7 +2592,8 @@ export const make = Effect.gen(function* () {
         const previous = run.sequence.responses.find(
           (response) => response.checkpointId === control.checkpointId,
         );
-        if (previous && !run.progress.retryableApproval)
+        const retryableApproval = workflowApprovalCanRetry(run.progress);
+        if (previous && !retryableApproval)
           return result(
             run,
             previous.operation === control.operation &&
@@ -2591,7 +2603,7 @@ export const make = Effect.gen(function* () {
               : "conflict",
           );
         // Final completion retries use the existing cleanup attempt; no new response is recorded.
-        if (!(control.operation === "approve" && run.progress.retryableApproval)) {
+        if (!(control.operation === "approve" && retryableApproval)) {
           const checkpoint = run.progress.checkpoint;
           const step = activeWorkflowStep(run);
           if (
@@ -2717,7 +2729,8 @@ export const make = Effect.gen(function* () {
         checkpoint.checkpointId !== request.control.checkpointId ||
         run.worktreePath === null ||
         run.preparedHead === null ||
-        (accepted && !run.progress.retryableApproval)
+        ((run.progress.status === "finishing" || accepted) &&
+          !workflowApprovalCanRetry(run.progress))
       )
         return result(run, "conflict", "This review changed. Refresh before approving.");
       const preparation = (yield* readThread(run))?.promptQueue?.preparation;

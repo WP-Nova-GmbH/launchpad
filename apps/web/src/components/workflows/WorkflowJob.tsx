@@ -18,6 +18,11 @@ import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
+import {
+  WorkflowCompletionRecovery,
+  workflowCompletionRecovery,
+  type WorkflowRecoveryOperation,
+} from "./WorkflowCompletionRecovery";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
 import {
   WorkflowCheckpointHistory,
@@ -60,7 +65,12 @@ import {
   workflowReviewApprovalState,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
-import { isTerminalWorkflowJob, type WorkflowControl } from "@t3tools/contracts/workflows";
+import {
+  isTerminalWorkflowJob,
+  workflowApprovalCanRetry,
+  workflowIsFinishing,
+  type WorkflowControl,
+} from "@t3tools/contracts/workflows";
 import { TurnId } from "@t3tools/contracts";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { useDiffPanelStore } from "../../diffPanelStore";
@@ -147,6 +157,13 @@ export function WorkflowJob({
   const resumeButton = useRunActionFocus(key);
   const runHeading = useRef<HTMLHeadingElement>(null);
   const checkpointForm = useRunActionFocus<HTMLFormElement>(key, runHeading);
+  const retryCompletionButton = useRunActionFocus(key, runHeading);
+  const retrySavingButton = useRunActionFocus(key, runHeading);
+  const [pendingRetry, setPendingRetry] = useState<{
+    key: string;
+    epoch: number;
+    operation: WorkflowRecoveryOperation;
+  } | null>(null);
   const retryPublishingButton = useRunActionFocus(key, runHeading);
   const retryCancellationButton = useRunActionFocus(key, runHeading);
   const runControlsTrigger = useRef<HTMLButtonElement>(null);
@@ -194,11 +211,14 @@ export function WorkflowJob({
   if (collapsedDraftKey !== null && (!manualHold || collapsedDraftKey !== feedbackKey)) {
     setCollapsedDraftKey(null);
   }
+  const saving = selectedJob?.progress?.resultSaving;
+  const hasResultSave = !!saving && saving.state !== "saved";
+  const finishing = workflowIsFinishing(selectedJob);
+  const completionRetryable = finishing && workflowApprovalCanRetry(selectedJob?.progress);
+  const atCheckpoint =
+    manualState.status === "awaiting_input" || manualState.status === "awaiting_review";
   const waiting =
-    !!checkpoint &&
-    !terminal &&
-    !cancelling &&
-    (manualState.status === "awaiting_input" || manualState.status === "awaiting_review");
+    !hasResultSave && !finishing && !!checkpoint && !terminal && !cancelling && atCheckpoint;
   const input = checkpoint?.kind === "input";
   useLayoutEffect(() => {
     if (feedbackFocus.current === "input") feedbackInput.current?.focus();
@@ -233,7 +253,7 @@ export function WorkflowJob({
   useEffect(() => {
     if (read.mutation) return;
     void refresh();
-    if (terminal && selectedJob?.progress?.resultSaving?.state !== "saving") return;
+    if (terminal && saving?.state !== "saving" && !selectedJob?.resultSaveRetryPending) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState !== "hidden") void refresh();
     }, 5000);
@@ -249,7 +269,15 @@ export function WorkflowJob({
       document.removeEventListener("visibilitychange", focus);
       invalidateWorkflowJobRead(appAtomRegistry, scope, jobId);
     };
-  }, [refresh, terminal, selectedJob?.progress?.resultSaving?.state, read.mutation, scope, jobId]);
+  }, [
+    refresh,
+    terminal,
+    saving?.state,
+    selectedJob?.resultSaveRetryPending,
+    read.mutation,
+    scope,
+    jobId,
+  ]);
   const respond = async (operation: Operation) => {
     if (!selectedJob || busy || (manualState.responsePending && operation !== "cancel")) return;
     const currentReads = appAtomRegistry.get(workflowJobReadAtom);
@@ -277,6 +305,7 @@ export function WorkflowJob({
     if (
       (operation === "approve" &&
         (!viewerControls.canApprove ||
+          (finishing && !completionRetryable) ||
           currentRead.job !== selectedJob ||
           workflowReviewApprovalState(currentReview, currentRead) !== "allowed")) ||
       ((operation === "input" || operation === "request_changes") && !viewerControls.canRespond)
@@ -289,7 +318,13 @@ export function WorkflowJob({
       return;
     if (
       operation === "retry_saving" &&
-      (!canConfigure || !selectedJob.progress?.resultSaving?.retryable)
+      (!canConfigure ||
+        cancelling ||
+        selectedJob.resultSaveRetryPending ||
+        saving?.state !== "failed" ||
+        !saving.retryable ||
+        currentReads.activeKey !== key ||
+        currentRead.job !== selectedJob)
     )
       return;
     if (
@@ -299,6 +334,9 @@ export function WorkflowJob({
       return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId, randomUUID());
     if (!request) return;
+    if (operation === "retry_saving" || (operation === "approve" && finishing)) {
+      setPendingRetry({ key, epoch: request.epoch, operation });
+    }
     const current = appAtomRegistry.get(workflowDraftAtom);
     const checkpoint = selectedJob.progress?.checkpoint;
     let intent = current.manual[key];
@@ -557,10 +595,9 @@ export function WorkflowJob({
     !cancelling &&
     !!checkpoint &&
     viewerControls.canApprove &&
-    (manualState.status === "awaiting_review" ||
-      (canConfigure &&
-        selectedJob.status === "finishing" &&
-        selectedJob.progress?.retryableApproval));
+    (finishing
+      ? (canConfigure || manualState.status === "awaiting_review") && completionRetryable
+      : manualState.status === "awaiting_review");
   const oldDrafts = Object.entries(responseDrafts)
     .filter(([id, text]) => {
       if (!text.trim()) return false;
@@ -612,6 +649,43 @@ export function WorkflowJob({
   const running = selectedJob.status === "running";
   const needsInput = selectedJob.status === "awaiting_input";
   const paused = selectedJob.status === "paused";
+  const recovery = workflowCompletionRecovery(
+    selectedJob,
+    finishing,
+    read.mutation && pendingRetry?.key === key && pendingRetry.epoch === read.epoch
+      ? pendingRetry.operation
+      : undefined,
+  );
+  const recoveryInTask = !!recovery && !terminal && !paused;
+  const recoveryRetry = hasResultSave ? "retry_saving" : "approve";
+  const canRetryRecovery = hasResultSave
+    ? canConfigure && saving.state === "failed" && saving.retryable
+    : approval && (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult);
+  const recoveryCard = recovery ? (
+    <WorkflowCompletionRecovery
+      recovery={recovery}
+      action={
+        canRetryRecovery && (recovery.blocked || recovery.retrying) ? (
+          <Button
+            ref={hasResultSave ? retrySavingButton : retryCompletionButton}
+            aria-disabled={
+              busy ||
+              recovery.retrying ||
+              manualState.responsePending ||
+              (!hasResultSave &&
+                (reviewChanged || checkingReturnedReview || manualState.checkpointBlocked))
+            }
+            onClick={() => {
+              if (!recovery.retrying) void respond(recoveryRetry);
+            }}
+          >
+            <RotateCwIcon aria-hidden />
+            {recovery.retrying ? "Retrying…" : hasResultSave ? "Retry saving" : "Retry completion"}
+          </Button>
+        ) : undefined
+      }
+    />
+  ) : null;
   const action = actionState.action;
   const publishingFailure =
     paused &&
@@ -875,18 +949,22 @@ export function WorkflowJob({
       </AlertDialog>
       <header>
         <span role="status" className="sr-only">
-          {checkpointResponsePending
-            ? checkpointConfirmationTitle
-            : queuedTask
-              ? `${statusLabel}. ${queuedTask.title}`
-              : statusLabel}
+          {recoveryInTask
+            ? recovery.title
+            : checkpointResponsePending
+              ? checkpointConfirmationTitle
+              : queuedTask
+                ? `${statusLabel}. ${queuedTask.title}`
+                : recovery
+                  ? `${statusLabel}. ${recovery.title}`
+                  : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
             {runName}
           </h1>
           <div className="flex flex-wrap items-center gap-3">
-            {!TaskIcon && !cancelling ? (
+            {!TaskIcon && !cancelling && !recoveryInTask ? (
               <span aria-hidden className="text-sm font-medium">
                 {statusLabel}
               </span>
@@ -905,10 +983,7 @@ export function WorkflowJob({
                   {canPauseRun ? (
                     <MenuItem disabled={busy} onClick={() => void respond("pause")}>
                       <PauseIcon aria-hidden />
-                      {manualState.status === "awaiting_input" ||
-                      manualState.status === "awaiting_review"
-                        ? "Pause at this checkpoint"
-                        : "Pause after current step"}
+                      {atCheckpoint ? "Pause at this checkpoint" : "Pause after current step"}
                     </MenuItem>
                   ) : null}
                   {canCancelRun ? (
@@ -1031,6 +1106,8 @@ export function WorkflowJob({
               {detail ? <p>{detail}</p> : null}
               {canRetryPublishing ? <p>Retry starts at {publishingStep}.</p> : null}
             </WorkflowOutcome>
+          ) : recoveryInTask ? (
+            recoveryCard
           ) : cancelledVm ? null : (
             <div
               className={
@@ -1097,7 +1174,12 @@ export function WorkflowJob({
               Waiting for an execution target. No steps have started.
             </p>
           ) : null}
-          {!cancelling && !checkpointResponsePending && manualState.message && !showPauseDetail ? (
+          {!cancelling &&
+          !checkpointResponsePending &&
+          (!recoveryInTask || selectedJob.pendingManualControl) &&
+          !selectedJob.resultSaveRetryPending &&
+          manualState.message &&
+          !showPauseDetail ? (
             <WorkflowAlert
               title={confirmationPending ? "Waiting for confirmation" : "Run needs attention"}
               variant={confirmationPending ? "info" : "warning"}
@@ -1110,6 +1192,7 @@ export function WorkflowJob({
           !publishingFailure &&
           !cancelledVm &&
           !queuedTask &&
+          !recoveryInTask &&
           detail &&
           !(
             checkpointResponsePending && detail === "Response saved; waiting for the environment."
@@ -1118,6 +1201,7 @@ export function WorkflowJob({
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
           {!cancelling &&
+          !hasResultSave &&
           ((reviewChanged && selectedJob.runtime?.kind !== "vm") ||
             (checkingReturnedReview && reviewingCurrentResult && !read.error)) ? (
             <WorkflowAlert
@@ -1161,31 +1245,7 @@ export function WorkflowJob({
               onReviewTargetChange={setReviewingCurrentResult}
             />
           ) : null}
-          {!cancelling && selectedJob.progress?.resultSaving ? (
-            <WorkflowAlert
-              title={
-                selectedJob.progress.resultSaving.state === "failed"
-                  ? "Couldn’t save result"
-                  : "Saving result"
-              }
-              variant={selectedJob.progress.resultSaving.state === "failed" ? "error" : "info"}
-              actions={
-                canConfigure && selectedJob.progress.resultSaving.retryable ? (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={busy}
-                    onClick={() => void respond("retry_saving")}
-                  >
-                    Retry saving
-                  </Button>
-                ) : undefined
-              }
-            >
-              {selectedJob.progress.resultSaving.detail ??
-                "The next step starts after this result is saved. Cancel remains available."}
-            </WorkflowAlert>
-          ) : null}
+          {!recoveryInTask ? recoveryCard : null}
           {!conversationInTask && !failed && !publishingFailure ? conversationActions : null}
           {resultError ? (
             <WorkflowAlert
@@ -1204,7 +1264,8 @@ export function WorkflowJob({
               {resultError} Retry opening the result.
             </WorkflowAlert>
           ) : null}
-          {(approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
+          {!recovery &&
+          (approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
           !manualHold &&
           !composingFeedback &&
           !checkpointResponsePending &&
@@ -1234,9 +1295,7 @@ export function WorkflowJob({
                     : manualState.responsePending
                       ? "Response pending"
                       : selectedJob.progress?.retryableApproval
-                        ? selectedJob.status === "finishing"
-                          ? "Retry completion"
-                          : "Retry approval"
+                        ? "Retry approval"
                         : "Approve result"}
                 </Button>
               ) : null}
@@ -1291,7 +1350,7 @@ export function WorkflowJob({
           </a>
         ) : null}
         <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-2 border-t pt-3">
-          <WorkflowProgress key={key} job={selectedJob} />
+          <WorkflowProgress key={key} job={selectedJob} recovery={recovery} />
           {!paused ? resumeAction : null}
         </div>
       </div>

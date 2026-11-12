@@ -4,10 +4,16 @@ import * as Schema from "effect/Schema";
 import { useAtomValue } from "@effect/atom-react";
 import { threadVmControls } from "../../state/threads";
 import { ThreadId, type ChatAttachment } from "@t3tools/contracts";
-import { WorkflowSavedResult, type RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import {
+  WorkflowSavedResult,
+  workflowApprovalCanRetry,
+  workflowIsFinishing,
+  type RepositoryWorkflowJob,
+} from "@t3tools/contracts/workflows";
 import {
   makeWorkflowSavedResultReader,
   currentWorkflowSavedResult,
+  isCurrentWorkflowReviewResult,
   savedWorkflowThreadState,
   canDeleteSavedWorkflowThread,
   type SavedWorkflowResultRead,
@@ -175,14 +181,22 @@ export function SavedWorkflowResults({
     waitingForThread,
   ]);
   const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
-  const currentResult = currentWorkflowSavedResult(job, index?.results ?? []);
+  const finishing = workflowIsFinishing(job);
+  const retryableCompletion = finishing && workflowApprovalCanRetry(job.progress);
+  const results = index?.results ?? [];
+  const currentResult =
+    job.status === "finishing" && retryableCompletion
+      ? (results.find((entry) => isCurrentWorkflowReviewResult(job, entry)) ?? null)
+      : currentWorkflowSavedResult(job, results);
   const partialResult = cancelled && currentResult?.outcome === "cancelled" ? currentResult : null;
   const hasPartialChanges = !!partialResult && partialResult.patch.sizeBytes > 0;
   const reviewingCurrent = !!result && result.resultId === currentResult?.resultId;
   useLayoutEffect(() => {
     onReviewTargetChange?.(reviewingCurrent);
   }, [onReviewTargetChange, reviewingCurrent]);
+  const recorded = useRef<string | null>(null);
   const selectResult = (id: string | null) => {
+    if (id !== selected) recorded.current = null;
     setBrowsingHistory(true);
     setSelected(id);
   };
@@ -193,8 +207,13 @@ export function SavedWorkflowResults({
     if (currentResult) setSelected(currentResult.resultId);
     else setRetry((n) => n + 1);
   };
+  const saving = job.progress?.resultSaving?.state;
+  const resultSavePending = saving === "saving" || saving === "failed";
+  const reviewAvailable = job.status === "awaiting_review" && !resultSavePending && !finishing;
+  const canVerifyResult = !resultSavePending && (reviewAvailable || retryableCompletion);
+  const showFinalResultLink = retryableCompletion && currentResult && !resultSavePending;
   const resultLabel = reviewingCurrent
-    ? job.status === "awaiting_review"
+    ? reviewAvailable
       ? "Current review result"
       : "Latest result"
     : "Earlier result";
@@ -244,7 +263,6 @@ export function SavedWorkflowResults({
     [loaded],
   );
   const checkpoint = workflowResultCheckpoint(job.progress?.checkpoint);
-  const recorded = useRef<string | null>(null);
   const [renderedId, setRenderedId] = useState<string | null>(null);
   const recordVisible = useCallback(() => {
     if (
@@ -252,7 +270,8 @@ export function SavedWorkflowResults({
       !loaded ||
       loaded.result.resultId !== result?.resultId ||
       !checkpoint ||
-      job.status !== "awaiting_review" ||
+      !canVerifyResult ||
+      !reviewingCurrent ||
       patch?.kind === "raw" ||
       (loaded.patch !== "" && renderedId !== loaded.result.resultId) ||
       document.visibilityState === "hidden"
@@ -272,7 +291,8 @@ export function SavedWorkflowResults({
     loaded,
     result?.resultId,
     checkpoint,
-    job.status,
+    canVerifyResult,
+    reviewingCurrent,
     job.jobId,
     scope,
     patch,
@@ -510,7 +530,7 @@ export function SavedWorkflowResults({
           </div>
         ) : null}
       </div>
-      {job.status === "awaiting_review" && result && !reviewingCurrent ? (
+      {reviewAvailable && result && !reviewingCurrent ? (
         <WorkflowAlert
           title={browsingHistory ? "Earlier result" : "A newer result needs review"}
           variant="info"
@@ -527,6 +547,19 @@ export function SavedWorkflowResults({
           {browsingHistory
             ? "This saved result is read-only. Decisions apply to the current review."
             : "Your opened result has been kept in place. Open the current result before deciding."}
+        </WorkflowAlert>
+      ) : null}
+      {showFinalResultLink && result && !reviewingCurrent ? (
+        <WorkflowAlert
+          title="Earlier result"
+          variant="info"
+          actions={
+            <Button size="sm" variant="outline" onClick={returnToCurrent}>
+              Open result for final checks
+            </Button>
+          }
+        >
+          Open the saved result for this run before retrying completion.
         </WorkflowAlert>
       ) : null}
       {index?.nextCursor ? (
@@ -626,7 +659,9 @@ export function SavedWorkflowResults({
             Loading saved results…
           </p>
         ) : null}
-        {(waitingForThread || index) && !result ? (
+        {(waitingForThread || index) &&
+        !result &&
+        (!resultSavePending || job.status === "cancelling") ? (
           <p className="text-sm text-muted-foreground">
             {job.status === "failed" || job.status === "cancelled"
               ? "No safely captured Agent result is available."

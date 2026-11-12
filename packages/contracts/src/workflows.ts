@@ -171,6 +171,7 @@ export type WorkflowSaveReceipt = typeof WorkflowSaveReceipt.Type;
 export const WorkflowResultSaving = Schema.Struct({
   publicationId: Schema.String.check(Schema.isUUID()),
   resultId: Schema.NullOr(Schema.String.check(Schema.isUUID())),
+  stepId: Schema.optional(TrimmedNonEmptyString),
   state: Schema.Literals(["saving", "failed", "saved"]),
   detail: Schema.NullOr(Schema.String),
   retryable: Schema.Boolean,
@@ -391,6 +392,17 @@ export const WorkflowJobProgress = Schema.Struct({
 });
 export type WorkflowJobProgress = typeof WorkflowJobProgress.Type;
 
+/** Older executors marked final checks retryable even when they instructed the user to cancel. */
+export function workflowApprovalCanRetry(progress: WorkflowJobProgress | null | undefined) {
+  if (progress?.retryableApproval !== true) return false;
+  const detail = progress.detail?.trimEnd();
+  return !(
+    detail?.endsWith("Cancel the job and run it again.") ||
+    detail?.endsWith("Cancel the run and start again.") ||
+    detail?.endsWith("Cancel the run.")
+  );
+}
+
 export const RepositoryWorkflowJob = Schema.Struct({
   issueSnapshot: Schema.optional(WorkflowIssueSnapshot),
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
@@ -434,6 +446,8 @@ export const RepositoryWorkflowJob = Schema.Struct({
   progress: Schema.NullOr(WorkflowJobProgress),
   /** Relay response awaiting executor acknowledgement; derived from the durable pending control. */
   responsePending: Schema.optional(Schema.Boolean),
+  /** A publication retry accepted by the relay and awaiting the executor, even after the run ends. */
+  resultSaveRetryPending: Schema.optional(Schema.Boolean),
   pendingResponseOperation: Schema.optional(
     Schema.Literals(["approve", "input", "request_changes"]),
   ),
@@ -449,6 +463,26 @@ export const RepositoryWorkflowJob = Schema.Struct({
   updatedAt: Schema.String,
 });
 export type RepositoryWorkflowJob = typeof RepositoryWorkflowJob.Type;
+
+export function workflowAllStepsFinished(job: RepositoryWorkflowJob) {
+  const steps = job.workflow?.definition.steps;
+  const recorded = job.progress?.steps;
+  if (!steps?.length || !recorded?.length) return false;
+  const latest = new Map<string, (typeof recorded)[number]>();
+  for (const step of recorded) {
+    const previous = latest.get(step.stepId);
+    if (!previous || step.generation > previous.generation) latest.set(step.stepId, step);
+  }
+  return steps.every(({ id }) => latest.get(id)?.status === "completed");
+}
+
+/** Some executors retain the final Review checkpoint while running final checks. */
+export function workflowIsFinishing(job: RepositoryWorkflowJob | null) {
+  return (
+    job?.status === "finishing" ||
+    (job?.status === "awaiting_review" && workflowAllStepsFinished(job))
+  );
+}
 /** Lists carry a short context preview; the frozen definition/result is detail-only. */
 export const RepositoryWorkflowJobSummary = Schema.Struct({
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),

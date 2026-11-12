@@ -137,6 +137,10 @@ it.effect(
       }>`SELECT revision,result_json,record_json FROM workflow_result_outbox ORDER BY revision`;
       expect(rows).toHaveLength(2);
       expect(rows[0]?.result_json).toContain(captured.resultId);
+      expect(yield* outbox.saving(binding.jobId)).toMatchObject({
+        resultId: captured.resultId,
+        stepId: captured.stepId,
+      });
       expect(rows[1]).toMatchObject({
         revision: 2,
         result_json: null,
@@ -144,5 +148,9 @@ it.effect(
       });
       yield* outbox.enqueue({ binding, recordJson: '{"paused":true}', result: captured });
       expect(yield* sql`SELECT 1 FROM workflow_result_outbox`).toHaveLength(2);
+      yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE revision=1`;
+      const stateOnly = yield* outbox.saving(binding.jobId);
+      expect(stateOnly?.resultId).toBeNull();
+      expect(stateOnly).not.toHaveProperty("stepId");
     }).pipe(Effect.provide(memory)),
 );

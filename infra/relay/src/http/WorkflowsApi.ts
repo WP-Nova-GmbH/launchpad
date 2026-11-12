@@ -6,6 +6,8 @@ import {
   WorkflowManualControl,
   WorkflowSubmissionPendingError,
   isTerminalWorkflowJob,
+  workflowApprovalCanRetry,
+  workflowIsFinishing,
   type RespondToWorkflowJob,
   type RunRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
@@ -48,10 +50,19 @@ import { tenancyNotFound } from "./tenancyErrors.ts";
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
 
 const jobForClient = (row: WorkflowJobRecord) => {
-  const operation = row.pendingControl?.response.operation;
+  const pending = row.pendingControl?.response;
+  const operation = pending?.operation;
+  const progress = row.record.progress;
   return {
     ...row.record,
+    ...(progress?.retryableApproval && !workflowApprovalCanRetry(progress)
+      ? { progress: { ...progress, retryableApproval: false } }
+      : {}),
     responsePending: row.pendingControl !== null && !isTerminalWorkflowJob(row.record.status),
+    ...(pending?.operation === "retry_saving" &&
+    pending.publicationId === row.record.progress?.resultSaving?.publicationId
+      ? { resultSaveRetryPending: true }
+      : {}),
     ...(operation === "approve" || operation === "input" || operation === "request_changes"
       ? { pendingResponseOperation: operation }
       : {}),
@@ -294,19 +305,18 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     return yield* new WorkflowConflictError({
       message: "This preparation changed. Refresh before retrying.",
     });
+  const progress = row.record.progress;
+  const retryableApproval = workflowApprovalCanRetry(progress);
   if (
-    (payload.operation === "approve" ||
-      payload.operation === "input" ||
-      payload.operation === "request_changes") &&
-    (!(payload.operation === "input"
-      ? row.record.progress?.status === "awaiting_input"
-      : row.record.progress?.status === "awaiting_review" ||
-        (payload.operation === "approve" &&
-          row.record.progress?.status === "finishing" &&
-          row.record.progress.retryableApproval)) ||
-      (row.record.progress?.approvalPending && !row.record.progress?.retryableApproval) ||
-      payload.expectedRevision !== row.record.progress?.revision ||
-      payload.checkpointId !== row.record.progress?.checkpoint?.checkpointId)
+    checkpointResponse &&
+    ((workflowIsFinishing(row.record)
+      ? payload.operation !== "approve" || !retryableApproval
+      : progress?.status !==
+        (payload.operation === "input" ? "awaiting_input" : "awaiting_review")) ||
+      (payload.operation === "approve" && progress?.retryableApproval && !retryableApproval) ||
+      (progress?.approvalPending && !retryableApproval) ||
+      payload.expectedRevision !== progress?.revision ||
+      payload.checkpointId !== progress?.checkpoint?.checkpointId)
   )
     return yield* new WorkflowConflictError({
       message: "This review changed. Refresh before approving.",
