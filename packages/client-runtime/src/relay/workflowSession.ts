@@ -66,6 +66,11 @@ export interface WorkflowEditorDraft {
     readonly includesAutomation?: boolean;
     readonly archived: boolean;
     readonly expectedRevision: number;
+    /** Edits to discard only when an archive of the saved version is confirmed. */
+    readonly archiveDraft?: {
+      readonly definition: WorkflowDefinition;
+      readonly automation: WorkflowAutomation;
+    };
   } | null;
   readonly error: string | null;
 }

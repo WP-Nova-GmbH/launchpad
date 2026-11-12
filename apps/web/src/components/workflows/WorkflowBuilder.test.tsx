@@ -31,7 +31,8 @@ import {
   RelayRepositoryId,
   type RelayOrganizationProject,
 } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflow } from "@t3tools/contracts/workflows";
+import { WorkflowConflictError, type RepositoryWorkflow } from "@t3tools/contracts/workflows";
+import { ManagedRelay, type ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
   workflowDraftAtom,
   workflowSessionKey,
@@ -68,6 +69,18 @@ vi.mock("./WorkflowStepEditor", () => ({
     createElement("div", { ...props, "data-testid": "step-fixture" }),
   useWorkflowEditorModels: () => ({ issues: modelIssues() }),
 }));
+vi.mock("../ui/alert-dialog", () => {
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "alertdialog" }, children) : null,
+    AlertDialogPopup: part,
+    AlertDialogHeader: part,
+    AlertDialogTitle: part,
+    AlertDialogDescription: part,
+    AlertDialogFooter: part,
+  };
+});
 vi.mock("../ui/sheet", () => ({
   Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) => (open ? children : null),
   SheetPopup: ({ children }: PropsWithChildren) => children,
@@ -196,17 +209,18 @@ async function submit() {
     renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} });
   });
 }
-const button = (label: string) =>
-  renderer!.root.findAllByType("button").find((node) => {
+const archiveDialog = () => renderer!.root.findByProps({ role: "alertdialog" });
+const button = (label: string, root = renderer!.root) =>
+  root.findAllByType("button").find((node) => {
     const text = node.children
       .filter((child) => typeof child === "string")
       .join("")
       .trim();
     return text === label;
   });
-async function click(label: string) {
+async function click(label: string, root = renderer!.root) {
   await act(async () => {
-    button(label)!.props.onClick();
+    button(label, root)!.props.onClick();
   });
 }
 async function rename(name: string) {
@@ -1033,14 +1047,177 @@ describe("VM authoring", () => {
     expect(editor(workflow.workflowId).baseline).toEqual(restored);
   });
 
-  it("allows archiving an active workflow with a missing checkout", async () => {
+  it("archives a saved manual workflow with a missing checkout only after confirmation", async () => {
     const workflow = saved("active-machine", 1, newWorkflowDraft([project])!.definition);
     await mount({ ...base, workflow, isNew: false, openExecutionSettings: true, projects: [] });
 
+    await click("Archive workflow");
+    expect(read).not.toHaveBeenCalled();
+    expect(editor(workflow.workflowId).baseline).toEqual(workflow);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Archive workflow?");
+    expect(button("Cancel", archiveDialog())).toBeDefined();
+
     const archived = { ...workflow, revision: 2, archived: true };
     read.mockResolvedValueOnce(archived);
-    await click("Archive workflow");
+    await click("Archive workflow", archiveDialog());
+    expect(read).toHaveBeenCalledTimes(1);
     expect(editor(workflow.workflowId).baseline).toEqual(archived);
+  });
+
+  it("explains and turns off saved automatic triggering when archiving", async () => {
+    const workflow = {
+      ...saved("automatic-machine", 1, newWorkflowDraft([project])!.definition),
+      automation: recoveryAuto,
+    };
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      automationSupported: true,
+    });
+
+    await click("Archive workflow");
+    expect(read).not.toHaveBeenCalled();
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Automatic triggering turns off");
+
+    const archived = {
+      ...workflow,
+      revision: 2,
+      archived: true,
+      automation: { ...recoveryAuto, enabled: false },
+    };
+    read.mockResolvedValueOnce(archived);
+    await click("Archive workflow", archiveDialog());
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(editor(workflow.workflowId).baseline).toEqual(archived);
+  });
+
+  it("keeps unsaved edits on dismissal and archives the saved version after explicit discard", async () => {
+    const workflow = saved("edited-machine", 1, newWorkflowDraft([project])!.definition);
+    await mount({ ...base, workflow, isNew: false, openExecutionSettings: true });
+    await rename("Unsaved workflow name");
+
+    await click("Archive workflow");
+    await click("Keep editing", archiveDialog());
+    expect(read).not.toHaveBeenCalled();
+    expect(editor(workflow.workflowId).definition.name).toBe("Unsaved workflow name");
+
+    await click("Archive workflow");
+    expect(read).not.toHaveBeenCalled();
+    const archived = { ...workflow, revision: 2, archived: true };
+    read.mockResolvedValueOnce(archived);
+    await click("Discard edits and archive", archiveDialog());
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(editor(workflow.workflowId).baseline).toEqual(archived);
+    expect(editor(workflow.workflowId).definition).toEqual(workflow.definition);
+  });
+
+  it.each(["rejected", "unconfirmed"] as const)(
+    "retains edits through a %s archive request",
+    async (outcome) => {
+      type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+      const saveWorkflow = vi.fn<Client["saveWorkflow"]>();
+      const client = { saveWorkflow, readWorkflowCatalog: vi.fn() } as unknown as Client;
+      const call: Props["call"] = async <A,>(operation: Parameters<Props["call"]>[0]) => {
+        void operation(client, "fixture-token");
+        return (await read()) as A;
+      };
+      const workflow = saved("archive-attempt", 1, newWorkflowDraft([project])!.definition);
+      const id = workflow.workflowId;
+      await mount({ ...base, workflow, call, isNew: false, openExecutionSettings: true });
+      await rename("Unsaved archive edits");
+      const reply = deferred<RepositoryWorkflow>();
+      read.mockReturnValueOnce(reply.promise);
+
+      await click("Archive workflow");
+      await click("Discard edits and archive", archiveDialog());
+      expect(saveWorkflow).toHaveBeenCalledExactlyOnceWith({
+        clerkToken: "fixture-token",
+        repositoryId: scope.repositoryId,
+        payload: {
+          workflowId: id,
+          expectedRevision: workflow.revision,
+          definition: workflow.definition,
+          archived: true,
+        },
+      });
+      expect(editor(id).operation?.state).toBe("pending");
+      expect(editor(id).definition.name).toBe("Unsaved archive edits");
+
+      await act(async () => {
+        reply.reject(
+          outcome === "rejected"
+            ? new ManagedRelay.ManagedRelayRequestFailedError({
+                action: "saveWorkflow",
+                cause: new WorkflowConflictError({ message: "This workflow changed." }),
+              })
+            : new Error("Reply lost"),
+        );
+      });
+      expect(editor(id).baseline).toEqual(workflow);
+      expect(editor(id).definition.name).toBe("Unsaved archive edits");
+      if (outcome === "rejected") {
+        expect(editor(id).operation).toBeNull();
+        return;
+      }
+
+      expect(editor(id).operation?.state).toBe("uncertain");
+      const archived = { ...workflow, revision: 2, archived: true };
+      read.mockResolvedValueOnce({ workflows: [archived] });
+      await click("Check saved version");
+      expect(saveWorkflow).toHaveBeenCalledOnce();
+      expect(editor(id).operation).toBeNull();
+      expect(editor(id).baseline).toEqual(archived);
+      expect(editor(id).definition).toEqual(archived.definition);
+    },
+  );
+
+  it("keeps unsaved edits when a newer saved version invalidates the archive confirmation", async () => {
+    const workflow = saved("archive-conflict", 1, newWorkflowDraft([project])!.definition);
+    const props = { ...base, workflow, isNew: false, openExecutionSettings: true };
+    await mount(props);
+    await rename("Unsaved archive edits");
+    await click("Archive workflow");
+    expect(button("Discard edits and archive", archiveDialog())?.props.disabled).toBeFalsy();
+    const capturedDraft = editor(workflow.workflowId);
+
+    const newer = {
+      ...workflow,
+      revision: 2,
+      definition: { ...workflow.definition, name: "Changed in another editor" },
+    };
+    await act(() =>
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <WorkflowBuilder {...props} workflow={newer} />
+        </AppAtomRegistryProvider>,
+      ),
+    );
+
+    expect(editor(workflow.workflowId)).toBe(capturedDraft);
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saved version changed");
+    const dialog = archiveDialog();
+    const discardAndArchive = button("Discard edits and archive", dialog);
+    expect(!discardAndArchive || discardAndArchive.props.disabled === true).toBe(true);
+    expect(button("Keep editing", dialog)).toBeDefined();
+    expect(button("Discard edits and reload", dialog)).toBeDefined();
+    expect(read).not.toHaveBeenCalled();
+
+    await click("Keep editing", dialog);
+    expect(confirmation).not.toHaveBeenCalled();
+    expect(renderer!.root.findAllByProps({ role: "alertdialog" })).toHaveLength(0);
+    expect(read).not.toHaveBeenCalled();
+    expect(editor(workflow.workflowId).definition.name).toBe("Unsaved archive edits");
+    expect(editor(workflow.workflowId).baseline).toEqual(workflow);
+
+    await click("Archive workflow");
+    read.mockResolvedValueOnce({ workflows: [newer] });
+    await click("Discard edits and reload", archiveDialog());
+    expect(confirmation).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(editor(workflow.workflowId).baseline).toEqual(newer);
+    expect(editor(workflow.workflowId).definition).toEqual(newer.definition);
   });
 
   it.each([true, false])(

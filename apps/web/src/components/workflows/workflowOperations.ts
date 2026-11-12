@@ -124,16 +124,17 @@ export function applyWorkflowSaveReceipt(
   operation: SaveOperation,
   saved: RepositoryWorkflow,
 ): WorkflowEditorDraft {
+  const submittedDraft = operation.archiveDraft ?? operation;
+  const unchangedDefinition = sameWorkflowDefinition(current.definition, submittedDraft.definition);
   const unchangedAutomation = sameWorkflowAutomation(
     workflowDraftAutomation(current),
-    operation.automation,
+    submittedDraft.automation,
   );
   const sameTarget = sameWorkflowTarget(current.definition.target, operation.definition.target);
   return {
     ...current,
-    ...(sameWorkflowDefinition(current.definition, operation.definition)
-      ? { definition: saved.definition }
-      : {}),
+    ...(unchangedDefinition ? { definition: saved.definition } : {}),
+    ...(operation.archiveDraft && unchangedDefinition ? { selectedStepId: "" } : {}),
     ...(unchangedAutomation
       ? {
           automation: normalizeWorkflowAutomation(saved.automation),
@@ -142,7 +143,10 @@ export function applyWorkflowSaveReceipt(
         }
       : {}),
     baseline: saved,
-    targetConfirmed: sameTarget ? true : current.targetConfirmed,
+    targetConfirmed:
+      sameTarget || (operation.archiveDraft && unchangedDefinition)
+        ? true
+        : current.targetConfirmed,
     operation: null,
     saveRecovery: undefined,
     error: null,
@@ -179,9 +183,16 @@ export async function saveWorkflowDraft(
     return null;
   }
   const nextArchived = archived ?? draft.baseline?.archived ?? false;
-  const automation = offOnly?.automation ?? { ...workflowDraftAutomation(draft) };
+  const archiveBaseline =
+    !previous && archived === true && draft.baseline?.archived === false ? draft.baseline : null;
+  const sourceAutomation = archiveBaseline
+    ? normalizeWorkflowAutomation(archiveBaseline.automation)
+    : (offOnly?.automation ?? workflowDraftAutomation(draft));
   // Both archive and restore deliberately stay Off, before capturing the expected receipt.
-  if (archived !== undefined || nextArchived) automation.enabled = false;
+  const automation =
+    archived !== undefined || nextArchived
+      ? { ...sourceAutomation, enabled: false }
+      : sourceAutomation;
   const operation = previous
     ? {
         ...previous,
@@ -190,11 +201,21 @@ export async function saveWorkflowDraft(
     : {
         requestId: randomUUID(),
         state: "pending" as const,
-        definition: offOnly?.definition ?? normalizeWorkflowDefinitionForSave(draft.definition),
+        definition:
+          offOnly?.definition ??
+          normalizeWorkflowDefinitionForSave(archiveBaseline?.definition ?? draft.definition),
         automation,
         includesAutomation: automationSupported,
         archived: nextArchived,
         expectedRevision: draft.baseline?.revision ?? 0,
+        ...(archiveBaseline
+          ? {
+              archiveDraft: {
+                definition: draft.definition,
+                automation: workflowDraftAutomation(draft),
+              },
+            }
+          : {}),
       };
   const accepted = updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
     ...state,
@@ -202,10 +223,10 @@ export async function saveWorkflowDraft(
       ...state.editors,
       [key]: {
         ...draft,
-        ...(!previous && !offOnly ? { definition: operation.definition } : {}),
+        ...(!previous && !offOnly && !archiveBaseline ? { definition: operation.definition } : {}),
         ...(offOnly
           ? { automation: { ...workflowDraftAutomation(draft), enabled: false } }
-          : archived !== undefined
+          : archived !== undefined && !archiveBaseline
             ? { automation: normalizeWorkflowAutomation(operation.automation) }
             : {}),
         operation,

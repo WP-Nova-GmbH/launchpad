@@ -38,6 +38,15 @@ import {
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
+import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
+import {
+  AlertDialog,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { Input } from "../ui/input";
 import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
@@ -53,6 +62,7 @@ import {
   GitBranchIcon,
   ChevronRightIcon,
   ChevronDownIcon,
+  ToggleLeftIcon,
 } from "lucide-react";
 
 import {
@@ -392,11 +402,16 @@ function WorkflowBuilderEditor({
     readRequest.current = null;
     if (active.current) setReading(false);
   };
-  const reload = async () => {
+  const reload = async (confirmedDraft?: WorkflowEditorDraft) => {
     const request = beginRead();
     if (!request) return;
     try {
-      if (!(await confirmWorkflow("Discard unsaved edits and reload the saved workflow?"))) return;
+      if (
+        confirmedDraft
+          ? request.draft !== confirmedDraft
+          : !(await confirmWorkflow("Discard unsaved edits and reload the saved workflow?"))
+      )
+        return;
       if (
         !ownsRead(request) ||
         appAtomRegistry.get(workflowDraftAtom).editors[key] !== request.draft
@@ -539,10 +554,18 @@ function WorkflowBuilderEditor({
     } else
       edit(() => savedWorkflowDraft(captured.baseline!, workflowDraftAutomationResolved(captured)));
   };
-  const archive = async () => {
+  const archive = async (confirmedDraft?: WorkflowEditorDraft) => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
     const baseline = captured?.baseline;
     if (!captured || !baseline || captured.operation) return;
+    if (
+      confirmedDraft
+        ? confirmedDraft !== captured ||
+          baseline.archived ||
+          currentSaved?.revision !== baseline.revision
+        : !baseline.archived
+    )
+      return;
     const restoreBlocked = () =>
       baseline.archived &&
       !!restoreCheckoutIssue(
@@ -552,6 +575,7 @@ function WorkflowBuilderEditor({
       );
     if (restoreBlocked()) return;
     if (
+      baseline.archived &&
       workflowEditorDirty(captured) &&
       !(await confirmWorkflow(
         "Discard unsaved edits before changing this workflow's archive state?",
@@ -564,7 +588,8 @@ function WorkflowBuilderEditor({
       restoreBlocked()
     )
       return;
-    edit(() => savedWorkflowDraft(baseline, workflowDraftAutomationResolved(captured)));
+    if (baseline.archived)
+      edit(() => savedWorkflowDraft(baseline, workflowDraftAutomationResolved(captured)));
     if (
       await saveWorkflowDraft(
         scope,
@@ -673,6 +698,7 @@ function WorkflowBuilderEditor({
       codexNotice={checkCodex ? codexNotice : null}
       pending={pending}
       archived={archived}
+      savedRevision={currentSaved?.revision}
       vmRunUnavailable={vmRunUnavailable}
       hasRunSubmission={hasRunSubmission}
       hasRunInstructions={!!runDraft?.instruction.trim()}
@@ -720,6 +746,7 @@ function WorkflowBuilderWorkspace({
   codexNotice,
   pending,
   archived,
+  savedRevision,
   vmRunUnavailable,
   hasRunSubmission,
   hasRunInstructions,
@@ -751,6 +778,7 @@ function WorkflowBuilderWorkspace({
   codexNotice: string | null;
   pending: boolean;
   archived: boolean;
+  savedRevision: number | undefined;
   vmRunUnavailable: boolean;
   hasRunSubmission: boolean;
   hasRunInstructions: boolean;
@@ -765,10 +793,10 @@ function WorkflowBuilderWorkspace({
     repairOpenPrId?: string,
   ) => string | null;
   save: (turnOffOnly?: boolean) => Promise<void>;
-  reload: () => Promise<void>;
+  reload: (confirmedDraft?: WorkflowEditorDraft) => Promise<void>;
   reconcile: () => Promise<void>;
   discard: () => Promise<void>;
-  archive: () => Promise<void>;
+  archive: (confirmedDraft?: WorkflowEditorDraft) => Promise<void>;
   scope: WorkflowScope;
 }) {
   const navigate = useNavigate();
@@ -806,6 +834,25 @@ function WorkflowBuilderWorkspace({
   const executionTargetControl = useRef<HTMLButtonElement>(null);
   const saveControl = useRef<HTMLButtonElement>(null);
   const saveRecoveryControl = useRef<HTMLButtonElement>(null);
+  const archiveControl = useRef<HTMLButtonElement>(null);
+  const cancelArchiveControl = useRef<HTMLButtonElement>(null);
+  const [archiveConfirmation, setArchiveConfirmation] = useState<{
+    draft: WorkflowEditorDraft;
+    open: boolean;
+  } | null>(null);
+  const archiveDiscardsEdits =
+    !!archiveConfirmation && workflowEditorDirty(archiveConfirmation.draft);
+  const archiveBaseline = archiveConfirmation?.draft.baseline;
+  const archiveDisablesAutomation = archiveBaseline?.automation?.enabled === true;
+  const archiveVersionChanged =
+    !!archiveBaseline && savedRevision !== undefined && savedRevision > archiveBaseline.revision;
+  const archiveDialogOpen =
+    archiveConfirmation?.open === true && archiveConfirmation.draft === draft;
+  useLayoutEffect(() => {
+    if (archiveDialogOpen && archiveVersionChanged) cancelArchiveControl.current?.focus();
+  }, [archiveDialogOpen, archiveVersionChanged]);
+  const closeArchiveConfirmation = () =>
+    setArchiveConfirmation((current) => (current ? { ...current, open: false } : null));
   const recoveringSave = draft.operation?.state === "uncertain";
   const saveConflict = draft.saveRecovery === "conflict";
   const saveRetryable = draft.saveRecovery === "retryable";
@@ -1539,11 +1586,126 @@ function WorkflowBuilderWorkspace({
               size="sm"
               disabled={!!draft.operation || !!restoreIssue}
               aria-describedby={restoreIssue ? `${settingsId}-restore-warning` : undefined}
-              onClick={() => void archive()}
+              ref={archiveControl}
+              onClick={() => {
+                if (draft.baseline?.archived) void archive();
+                else setArchiveConfirmation({ draft, open: true });
+              }}
             >
               {draft.baseline.archived ? "Restore workflow" : "Archive workflow"}
             </Button>
           ) : null}
+          <AlertDialog
+            open={archiveDialogOpen}
+            onOpenChange={(open) => {
+              if (!open) closeArchiveConfirmation();
+            }}
+            onOpenChangeComplete={(open) => {
+              if (!open) setArchiveConfirmation(null);
+            }}
+          >
+            <AlertDialogPopup
+              variant="scrollable"
+              initialFocus={cancelArchiveControl}
+              finalFocus={() =>
+                archiveControl.current && !archiveControl.current.disabled
+                  ? archiveControl.current
+                  : (fields.current.get("close-settings") ?? executionTargetControl.current)
+              }
+            >
+              <AlertDialogHeader
+                className="min-h-0 overflow-y-auto overscroll-contain"
+                tabIndex={0}
+              >
+                <AlertDialogTitle>
+                  {archiveVersionChanged ? "Saved version changed" : "Archive workflow?"}
+                </AlertDialogTitle>
+                <AlertDialogDescription
+                  render={<div />}
+                  className="space-y-3 wrap-anywhere"
+                  aria-live="polite"
+                >
+                  {archiveVersionChanged ? (
+                    <p>
+                      Reload the saved workflow before archiving.
+                      {archiveDiscardsEdits
+                        ? " Your edits are still in this draft. Reloading replaces them with the saved version."
+                        : null}
+                    </p>
+                  ) : (
+                    <>
+                      <p>
+                        Archiving{" "}
+                        <strong className="font-medium text-popover-foreground">
+                          {archiveBaseline?.definition.name}
+                        </strong>{" "}
+                        prevents new runs and keeps its run history available.
+                        {!archiveDiscardsEdits && !archiveDisablesAutomation
+                          ? " You can restore it from Archived workflows."
+                          : null}
+                      </p>
+                      {archiveDisablesAutomation ? (
+                        <Alert role={undefined} controlAlignment="first-line">
+                          <ToggleLeftIcon aria-hidden />
+                          <AlertTitle>Automatic triggering turns off</AlertTitle>
+                          <AlertDescription>
+                            It stays off after you restore the workflow.
+                          </AlertDescription>
+                        </Alert>
+                      ) : null}
+                      {archiveDiscardsEdits ? (
+                        <WorkflowAlert
+                          title="Your unsaved edits will be lost"
+                          variant="warning"
+                          announce={false}
+                        >
+                          Archiving uses the last saved version.
+                        </WorkflowAlert>
+                      ) : null}
+                    </>
+                  )}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter className="shrink-0">
+                <Button
+                  ref={cancelArchiveControl}
+                  type="button"
+                  variant="outline"
+                  onClick={closeArchiveConfirmation}
+                >
+                  {archiveDiscardsEdits || archiveVersionChanged ? "Keep editing" : "Cancel"}
+                </Button>
+                {archiveVersionChanged ? (
+                  <Button
+                    key="reload"
+                    type="button"
+                    variant={archiveDiscardsEdits ? "destructive" : "default"}
+                    disabled={reading}
+                    onClick={() => {
+                      if (!archiveDialogOpen) return;
+                      closeArchiveConfirmation();
+                      void reload(archiveConfirmation.draft);
+                    }}
+                  >
+                    {archiveDiscardsEdits ? "Discard edits and reload" : "Reload saved version"}
+                  </Button>
+                ) : (
+                  <Button
+                    key="archive"
+                    type="button"
+                    variant={archiveDiscardsEdits ? "destructive" : "default"}
+                    onClick={() => {
+                      if (!archiveDialogOpen) return;
+                      closeArchiveConfirmation();
+                      void archive(archiveConfirmation.draft);
+                    }}
+                  >
+                    {archiveDiscardsEdits ? "Discard edits and archive" : "Archive workflow"}
+                  </Button>
+                )}
+              </AlertDialogFooter>
+            </AlertDialogPopup>
+          </AlertDialog>
         </footer>
       </fieldset>
     </div>
