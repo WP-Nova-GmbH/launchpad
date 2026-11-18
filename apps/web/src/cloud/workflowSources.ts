@@ -1,10 +1,11 @@
 import { useAuth } from "@clerk/react";
-import type { WorkflowSourceError } from "@t3tools/contracts/relay";
+import { WorkflowSourceError } from "@t3tools/contracts/relay";
 import type { ManagedRelay } from "@t3tools/client-runtime/relay";
 import { WorkflowSources } from "@t3tools/client-runtime/relay";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Cause from "effect/Cause";
+import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { runtime } from "../lib/runtime";
 import { resolveRelayClerkTokenOptions } from "./publicConfig";
@@ -13,8 +14,21 @@ type Operation<A> = (
   client: WorkflowSources.Client,
   token: string,
 ) => Effect.Effect<A, WorkflowSourceError | ManagedRelay.ManagedRelayClientError>;
+type SourceFailure = { message: string; code?: WorkflowSourceError["code"] | undefined };
+const isSourceError = Schema.is(WorkflowSourceError);
+
 /** Mount under the current account and resource key. */
-export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
+export function useWorkflowSources<T>(
+  accountId: string,
+  read: Operation<T>,
+  {
+    mergeSnapshot,
+    discardSnapshotOnError,
+  }: {
+    mergeSnapshot?: (previous: T | null, result: T) => T;
+    discardSnapshotOnError?: (code: SourceFailure["code"]) => boolean;
+  } = {},
+) {
   const { getToken, userId } = useAuth();
   const identity = useRef(userId);
   useLayoutEffect(() => {
@@ -26,7 +40,7 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
     writing = useRef(false),
     uncertain = useRef(false);
   const [snapshot, setSnapshot] = useState<T | null>(null),
-    [error, setError] = useState<string | null>(null);
+    [failure, setFailure] = useState<SourceFailure | null>(null);
   const [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(false),
     [unverified, setUnverified] = useState(false);
@@ -61,8 +75,8 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
     try {
       const result = await call(read, controller.signal);
       if (live.current && identity.current === accountId && request === version.current) {
-        setSnapshot(result);
-        setError(null);
+        setSnapshot((previous) => (mergeSnapshot ? mergeSnapshot(previous, result) : result));
+        setFailure(null);
         uncertain.current = false;
         setUnverified(false);
         return result;
@@ -70,16 +84,21 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
       return null;
     } catch (cause) {
       if (live.current && identity.current === accountId && request === version.current) {
-        if (WorkflowSources.accessRejected(cause)) setSnapshot(null);
-        setError(cause instanceof Error ? cause.message : "Could not load workflow sources.");
+        const code = isSourceError(cause) ? cause.code : undefined;
+        if (WorkflowSources.accessRejected(cause) || discardSnapshotOnError?.(code))
+          setSnapshot(null);
+        setFailure({
+          code,
+          message: cause instanceof Error ? cause.message : "Could not load workflow sources.",
+        });
       }
       return null;
     } finally {
       if (live.current && request === version.current) setLoading(false);
     }
-  }, [call, read, accountId]);
+  }, [call, read, accountId, mergeSnapshot, discardSnapshotOnError]);
   const refresh = useCallback(async () => {
-    if (!writing.current) await load();
+    if (live.current && !writing.current) await load();
   }, [load]);
   useEffect(() => {
     void refresh();
@@ -94,7 +113,7 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
     if (writing.current || uncertain.current) return null;
     writing.current = true;
     setBusy(true);
-    setError(null);
+    setFailure(null);
     ++version.current;
     try {
       const result = await call(operation);
@@ -106,7 +125,7 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
       if (verified === null) {
         uncertain.current = true;
         setUnverified(true);
-        setError((previous) => previous ?? "Refresh to verify this change.");
+        setFailure((previous) => previous ?? { message: "Refresh to verify this change." });
         return null;
       }
       return { result, snapshot: verified };
@@ -117,7 +136,9 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
         if (WorkflowSources.accessRejected(cause)) setSnapshot(null);
         await load();
         if (live.current)
-          setError(cause instanceof Error ? cause.message : "Refresh to verify this change.");
+          setFailure({
+            message: cause instanceof Error ? cause.message : "Refresh to verify this change.",
+          });
       }
       return null;
     } finally {
@@ -125,5 +146,14 @@ export function useWorkflowSources<T>(accountId: string, read: Operation<T>) {
       if (live.current) setBusy(false);
     }
   };
-  return { snapshot, error, busy, loading, unverified, refresh, mutate };
+  return {
+    snapshot,
+    error: failure?.message ?? null,
+    errorCode: failure?.code,
+    busy,
+    loading,
+    unverified,
+    refresh,
+    mutate,
+  };
 }

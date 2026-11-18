@@ -84,6 +84,7 @@ vi.mock("../ui/combobox", () => {
   const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
     Combobox: ({
+      children,
       value,
       items,
       onValueChange,
@@ -93,20 +94,25 @@ vi.mock("../ui/combobox", () => {
       items: Array<{ id: string; name: string }>;
       onValueChange: (item: { id: string; name: string }) => void;
     }>) =>
-      createElement("div", {
-        ...props,
-        "data-picker": true,
-        "data-options": items.map((item) => item.name),
-        value: value?.id ?? "",
-        onValueChange: (id: string) =>
-          onValueChange(items.find((item) => item.id === id) ?? { id, name: id }),
-      }),
+      createElement(
+        "div",
+        {
+          ...props,
+          "data-picker": true,
+          "data-options": items.map((item) => item.name),
+          value: value?.id ?? "",
+          onValueChange: (id: string) =>
+            onValueChange(items.find((item) => item.id === id) ?? { id, name: id }),
+        },
+        children,
+      ),
     ComboboxTrigger: part,
-    ComboboxPopup: () => null,
+    ComboboxPopup: part,
     ComboboxSearchInput: part,
     ComboboxList: () => null,
     ComboboxItem: part,
     ComboboxEmpty: part,
+    ComboboxStatus: part,
   };
 });
 vi.mock("../ui/select", () => {
@@ -1462,6 +1468,10 @@ async function mountTrigger(
   await drain();
 }
 const enableControl = () => renderer.root.findByProps({ role: "checkbox" });
+const teamPicker = () =>
+  renderer.root
+    .findAllByProps({ "data-picker": true })
+    .find((node) => node.props.value === "saved-team");
 
 it.effect("directs a maintainer without a grant to an organization admin", () =>
   Effect.gen(function* () {
@@ -1633,6 +1643,278 @@ it.effect("drops a late admin snapshot while the access sheet and trigger draft 
   }),
 );
 
+it.effect("keeps picker results and query while retrying the same metadata page", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      const platform = { id: "platform", name: "Platform" };
+      const firstPage = [{ id: "saved-team", name: "Saved team" }, platform];
+      const reads: (string | undefined)[] = [];
+      let markStarted!: () => void;
+      let releasePage!: (response: Response) => void;
+      const started = new Promise<void>((resolve) => (markStarted = resolve));
+      const blocked = new Promise<Response>((resolve) => (releasePage = resolve));
+      fixture.metadataReply = (kind, cursor) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        reads.push(cursor);
+        if (!cursor) return Response.json({ items: firstPage, nextCursor: "next-page" });
+        if (reads.length === 2) {
+          markStarted();
+          return blocked;
+        }
+        return Response.json({
+          items: [platform, { id: "platform-ops", name: "Platform Ops" }],
+          nextCursor: null,
+        });
+      };
+
+      await mountTrigger();
+      const expectRetainedPicker = () => {
+        expect(teamPicker()?.props["data-options"]).toEqual(["Saved team", "Platform"]);
+        expect(teamPicker()?.props.inputValue).toBe("plat");
+        expect(teamPicker()?.props.disabled).not.toBe(true);
+      };
+      await act(() => teamPicker()!.props.onInputValueChange("plat", { reason: "input-change" }));
+      await act(() => button("Load more teams").props.onClick());
+      await started;
+      try {
+        expectRetainedPicker();
+      } finally {
+        releasePage(new Response("temporarily unavailable", { status: 503 }));
+        await drain();
+      }
+      expectRetainedPicker();
+      expect(button("Retry loading teams")).toBeDefined();
+
+      await act(() => button("Retry loading teams").props.onClick());
+      await drain();
+      expect(reads).toEqual([undefined, "next-page", "next-page"]);
+      expect(teamPicker()?.props["data-options"]).toEqual([
+        "Saved team",
+        "Platform",
+        "Platform Ops",
+      ]);
+      expect(teamPicker()?.props.inputValue).toBe("plat");
+      expect(button("Load more teams")).toBeUndefined();
+      expect(button("Retry loading teams")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect("reloads from the first page when a cursor is rejected without losing the filter", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      const reads: (string | undefined)[] = [];
+      fixture.metadataReply = (kind, cursor) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        reads.push(cursor);
+        if (cursor) {
+          return Response.json(
+            {
+              _tag: "WorkflowSourceError",
+              code: "invalid_input",
+              message: "Metadata cursor belongs to another source or selection.",
+            },
+            { status: 400 },
+          );
+        }
+        return reads.length === 1
+          ? Response.json({ items: [{ id: "old", name: "Old Platform" }], nextCursor: "old-page" })
+          : Response.json({ items: [{ id: "new", name: "New Platform" }], nextCursor: null });
+      };
+
+      await mountTrigger();
+      await act(() => teamPicker()!.props.onInputValueChange("plat", { reason: "input-change" }));
+      const connectionReads = fixture.readCount;
+      await click("Load more teams");
+      expect(button("Retry loading teams")).toBeUndefined();
+      await click("Reload teams");
+
+      expect(fixture.readCount).toBeGreaterThan(connectionReads);
+      expect(reads).toEqual([undefined, "old-page", undefined]);
+      expect(teamPicker()?.props["data-options"]).toEqual(["Saved team", "New Platform"]);
+      expect(teamPicker()?.props.inputValue).toBe("plat");
+    });
+  }),
+);
+
+it.effect("rechecks the source when the first metadata page conflicts with reauthorization", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.metadataReply = (kind) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        return fixture.repo.sources[0]?.source.authorizationEpoch === 1
+          ? Response.json(
+              {
+                _tag: "WorkflowSourceError",
+                code: "conflict",
+                message: "The source changed while loading metadata.",
+              },
+              { status: 400 },
+            )
+          : Response.json({ items: [{ id: "new", name: "New Platform" }], nextCursor: null });
+      };
+      await mountTrigger();
+      const connectionReads = fixture.readCount;
+      fixture.repo = {
+        ...fixture.repo,
+        sources: fixture.repo.sources.map((entry) => ({
+          ...entry,
+          source: { ...entry.source, authorizationEpoch: 2 },
+        })),
+      };
+
+      await click("Reload teams");
+
+      expect(fixture.readCount).toBe(connectionReads + 1);
+      expect(teamPicker()?.props["data-options"]).toEqual(["Saved team", "New Platform"]);
+      expect(button("Reload teams")).toBeUndefined();
+    });
+  }),
+);
+
+it.effect("rechecks the workspace and shows reconnect guidance after metadata loses access", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.metadataReply = (kind, cursor) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        if (!cursor)
+          return Response.json({
+            items: [
+              {
+                id: "platform",
+                name:
+                  fixture.repo.sources[0]?.source.authorizationEpoch === 1
+                    ? "Old Platform"
+                    : "New Platform",
+              },
+            ],
+            nextCursor:
+              fixture.repo.sources[0]?.source.authorizationEpoch === 1 ? "next-page" : null,
+          });
+        return Response.json(
+          {
+            _tag: "WorkflowSourceError",
+            code: "reconnect_required",
+            message: "An organization admin must reconnect Linear.",
+          },
+          { status: 400 },
+        );
+      };
+      await mountTrigger();
+      expect(teamPicker()?.props["data-options"]).toContain("Old Platform");
+
+      const connectionReads = fixture.readCount;
+      await click("Load more teams");
+
+      expect(fixture.readCount).toBe(connectionReads + 1);
+      expect(words()).toContain("Reconnect required");
+      expect(button("Review connection")).toBeDefined();
+      expect(button("Retry loading teams")).toBeUndefined();
+      expect(teamPicker()).toBeUndefined();
+
+      fixture.repo = {
+        ...fixture.repo,
+        sources: fixture.repo.sources.map((entry) => ({
+          ...entry,
+          source: { ...entry.source, authorizationEpoch: 2 },
+        })),
+      };
+      await click("Refresh workspace access");
+      expect(button("Review connection")).toBeUndefined();
+      expect(teamPicker()?.props["data-options"]).toEqual(["Saved team", "New Platform"]);
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toEqual(
+        triggerInitial,
+      );
+    });
+  }),
+);
+
+it.effect("keeps loaded picker results and the filter during a same-source focus refresh", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.metadataReply = (kind, cursor) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        return cursor
+          ? Response.json({ items: [{ id: "ops", name: "Platform Ops" }], nextCursor: null })
+          : Response.json({
+              items: [{ id: "platform", name: "Platform" }],
+              nextCursor: "next-page",
+            });
+      };
+      await mountTrigger();
+      await act(() => teamPicker()!.props.onInputValueChange("plat", { reason: "input-change" }));
+      await click("Load more teams");
+
+      const refreshOnFocus = vi
+        .mocked(window.addEventListener)
+        .mock.calls.find(([type]) => type === "focus")?.[1];
+      if (typeof refreshOnFocus !== "function") throw new Error("Missing source focus listener");
+      let markStarted!: () => void;
+      let releaseRead!: () => void;
+      const started = new Promise<void>((resolve) => (markStarted = resolve));
+      const blocked = new Promise<void>((resolve) => (releaseRead = resolve));
+      fixture.fetch.mockImplementationOnce(async () => {
+        markStarted();
+        await blocked;
+        return Response.json(fixture.repo);
+      });
+      await act(() => refreshOnFocus(new Event("focus")));
+      await started;
+      const expectRetainedPicker = () => {
+        expect(teamPicker()?.props.inputValue).toBe("plat");
+        expect(teamPicker()?.props["data-options"]).toEqual([
+          "Saved team",
+          "Platform",
+          "Platform Ops",
+        ]);
+      };
+      try {
+        expect(words()).toContain("Checking workspace access");
+        expectRetainedPicker();
+      } finally {
+        releaseRead();
+        await drain();
+      }
+      expectRetainedPicker();
+    });
+  }),
+);
+
+it.effect("drops loaded picker results when the next metadata page rejects access", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.metadataReply = (kind, cursor) => {
+        if (kind !== "teams") return Response.json({ items: [], nextCursor: null });
+        return cursor
+          ? Response.json(
+              { _tag: "WorkflowSourceError", code: "forbidden", message: "Team access removed." },
+              { status: 400 },
+            )
+          : Response.json({
+              items: [{ id: "platform", name: "Platform" }],
+              nextCursor: "next-page",
+            });
+      };
+      await mountTrigger();
+      expect(words()).toContain("Platform");
+
+      await act(() => button("Load more teams").props.onClick());
+      await drain();
+
+      expect(words()).not.toContain("Platform");
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toMatchObject({
+        trigger: { teamId: "saved-team" },
+      });
+    });
+  }),
+);
+
 it.effect("discards pending metadata from before reconnect while preserving draft edits", () =>
   Effect.gen(function* () {
     yield* serveRequests;
@@ -1667,7 +1949,7 @@ it.effect("discards pending metadata from before reconnect while preserving draf
       );
       await drain();
 
-      await act(() => button("More teams").props.onClick());
+      await act(() => button("Load more teams").props.onClick());
       await started;
       const oldReadReceipt = fixture.deliveries.splice(0);
       try {

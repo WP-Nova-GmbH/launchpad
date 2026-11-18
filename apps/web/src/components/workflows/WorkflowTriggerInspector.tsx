@@ -1,10 +1,11 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { useCallback, useState } from "react";
+import { useCallback, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
 import { WorkflowAutomation, type WorkflowTrigger } from "@t3tools/contracts/workflows";
 import {
   RelayOrganizationId,
   type WorkflowRepositorySources,
+  type WorkflowSourceError,
   type WorkflowSourceMetadataPage,
   type WorkflowSourceSelection,
   type WorkflowSourceMetadataQuery,
@@ -27,6 +28,7 @@ import {
   ComboboxList,
   ComboboxItem,
   ComboboxEmpty,
+  ComboboxStatus,
 } from "../ui/combobox";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 import { Sheet, SheetPopup, SheetHeader, SheetTitle, SheetDescription } from "../ui/sheet";
@@ -89,6 +91,7 @@ export function WorkflowTriggerInspector({
   const complete = !!trigger && validAutomation;
   const triggerDirty = !sameWorkflowAutomation(value, savedAutomation);
   const [connectionsOpen, setConnectionsOpen] = useState<"connect" | "access" | null>(null);
+  const [reconnectKey, setReconnectKey] = useState<string | null>(null);
   const read = useCallback(
     (client: WorkflowSources.Client, token: string) => client.repository(token, scope.repositoryId),
     [scope.repositoryId],
@@ -100,9 +103,28 @@ export function WorkflowTriggerInspector({
       entry.grant.grantId === trigger?.grantId &&
       entry.source.connectionId === trigger?.connectionId,
   );
-  const connectionUnknown =
-    sources.loading || !!sources.error || sources.unverified || !sources.snapshot;
-  const sourceHealth = source ? WorkflowSources.sourceHealthLabel(source.source) : null;
+  const sourceKey = JSON.stringify([
+    scope.accountId,
+    scope.organizationId,
+    scope.repositoryId,
+    source?.source.connectionId,
+    source?.grant.grantId,
+    source?.grant.generation,
+    source?.source.authorizationEpoch,
+  ]);
+  const refreshSource = sources.refresh;
+  const requireReconnect = () => {
+    setReconnectKey(sourceKey);
+    void refreshSource();
+  };
+  const sourceVerified = !!sources.snapshot && !sources.error && !sources.unverified;
+  const connectionUnknown = sources.loading || !sourceVerified;
+  const sourceHealth =
+    reconnectKey === sourceKey
+      ? "Reconnect required"
+      : source
+        ? WorkflowSources.sourceHealthLabel(source.source)
+        : null;
   const connected = sourceHealth === "Connected";
   const canAllow = sources.snapshot?.canAllow === true;
   const canManage = sources.snapshot?.canManage === true;
@@ -114,15 +136,6 @@ export function WorkflowTriggerInspector({
     setConnectionsOpen(view);
     if (view === "access") void sources.refresh();
   };
-  const sourceKey = JSON.stringify([
-    scope.accountId,
-    scope.organizationId,
-    scope.repositoryId,
-    source?.source.connectionId,
-    source?.grant.grantId,
-    source?.grant.generation,
-    source?.source.authorizationEpoch,
-  ]);
   const readSelection = useCallback(
     (client: WorkflowSources.Client, token: string) =>
       trigger?.teamId && connected && !vmTriggerUnavailable && supported && resolved
@@ -146,7 +159,8 @@ export function WorkflowTriggerInspector({
   }>(scope.accountId, readSelection);
   // Keep the controls mounted while ensuring a previous rule cannot enable the new one.
   const criteria =
-    !connectionUnknown &&
+    sourceVerified &&
+    connected &&
     selected.snapshot?.trigger === trigger &&
     selected.snapshot?.sourceKey === sourceKey
       ? (selected.snapshot?.criteria ?? null)
@@ -166,7 +180,7 @@ export function WorkflowTriggerInspector({
     ? `When an issue ${trigger.event === "issue_created" ? "is created" : `enters ${criteria?.state?.name ?? (trigger.stateId || "a status you choose")}`} in ${criteria?.team?.name ?? (trigger.teamId || "a team you choose")}${trigger.labelIds.length ? ` with all labels: ${trigger.labelIds.map((id) => criteria?.labels.find((label) => label.id === id)?.name ?? id).join(", ")}` : ", with any labels"}.`
     : null;
   const unavailable = !supported || !resolved || vmTriggerUnavailable;
-  const editableRule = !unavailable && !!source && !connectionUnknown;
+  const editableRule = !unavailable && sourceVerified && connected;
   const reviewSave = onReviewSave ? (
     <Button type="button" size="sm" onClick={onReviewSave}>
       Review save status
@@ -457,6 +471,7 @@ export function WorkflowTriggerInspector({
             ) : null}
           </section>
           {editableRule &&
+          !connectionUnknown &&
           trigger?.teamId &&
           (selected.error ||
             criteria?.issues.length ||
@@ -495,7 +510,7 @@ export function WorkflowTriggerInspector({
           ) : null}
           {editableRule && trigger ? (
             <fieldset
-              disabled={disabled || !connected}
+              disabled={disabled || connectionUnknown}
               className={styles["workflow-trigger-section"]}
             >
               <h3 className="text-sm font-medium">Rule</h3>
@@ -541,6 +556,10 @@ export function WorkflowTriggerInspector({
                 grantId={trigger.grantId}
                 kind="teams"
                 label="Team"
+                disabled={disabled}
+                checkingAccess={sources.loading}
+                refreshSource={refreshSource}
+                onReconnectRequired={requireReconnect}
                 registerField={registerField}
                 value={trigger.teamId}
                 selectedName={criteria?.team?.name}
@@ -566,6 +585,10 @@ export function WorkflowTriggerInspector({
                   teamId={trigger.teamId}
                   kind="states"
                   label="Status"
+                  disabled={disabled}
+                  checkingAccess={sources.loading}
+                  refreshSource={refreshSource}
+                  onReconnectRequired={requireReconnect}
                   registerField={registerField}
                   value={trigger.stateId}
                   selectedName={criteria?.state?.name}
@@ -620,9 +643,13 @@ export function WorkflowTriggerInspector({
                         teamId={trigger.teamId}
                         kind="labels"
                         label="Label"
+                        addedIds={trigger.labelIds}
                         registerField={registerField}
                         value=""
-                        disabled={trigger.labelIds.length >= 100}
+                        disabled={disabled || trigger.labelIds.length >= 100}
+                        checkingAccess={sources.loading}
+                        refreshSource={refreshSource}
+                        onReconnectRequired={requireReconnect}
                         onChoose={(id) => {
                           if (!trigger.labelIds.includes(id) && trigger.labelIds.length < 100)
                             update({ ...trigger, labelIds: [...trigger.labelIds, id] });
@@ -814,7 +841,20 @@ export function WorkflowTriggerInspector({
   );
 }
 
-/** Search is bounded to the current page; an exact selected lookup supplies names from other pages. */
+type MetadataPage = WorkflowSourceMetadataPage & { cursor: string | null };
+const mergeMetadataPage = (previous: MetadataPage | null, page: MetadataPage) =>
+  previous && page.cursor
+    ? {
+        ...page,
+        items: [
+          ...new Map([...previous.items, ...page.items].map((item) => [item.id, item])).values(),
+        ],
+      }
+    : page;
+
+const discardMetadataOnError = (code: WorkflowSourceError["code"] | undefined) =>
+  code === "reconnect_required" || code === "invalid_input" || code === "conflict";
+
 function MetadataPicker({
   scope,
   grantId,
@@ -822,10 +862,14 @@ function MetadataPicker({
   kind,
   label,
   value,
+  addedIds,
   selectedName,
   onChoose,
   registerField,
   disabled = false,
+  checkingAccess,
+  refreshSource,
+  onReconnectRequired,
 }: {
   scope: WorkflowScope;
   grantId: string;
@@ -833,13 +877,18 @@ function MetadataPicker({
   kind: WorkflowSourceMetadataQuery["kind"];
   label: string;
   value: string;
+  addedIds?: ReadonlyArray<string>;
   selectedName?: string | undefined;
   onChoose: (id: string) => void;
   registerField?: RegisterField | undefined;
   disabled?: boolean;
+  checkingAccess: boolean;
+  refreshSource: () => Promise<void>;
+  onReconnectRequired: () => void;
 }) {
-  const [cursor, setCursor] = useState<string | undefined>();
-  const queryKey = JSON.stringify([grantId, teamId, kind, cursor]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const searchInput = useRef<HTMLInputElement>(null);
   const read = useCallback(
     (client: WorkflowSources.Client, token: string) =>
       client
@@ -849,31 +898,61 @@ function MetadataPicker({
           ...(teamId ? { teamId } : {}),
           ...(cursor ? { cursor } : {}),
         })
-        .pipe(Effect.map((page) => ({ key: queryKey, page }))),
-    [scope.repositoryId, grantId, kind, teamId, cursor, queryKey],
+        .pipe(Effect.map((page) => ({ ...page, cursor }))),
+    [scope.repositoryId, grantId, kind, teamId, cursor],
   );
-  const state = useWorkflowSources<{ key: string; page: WorkflowSourceMetadataPage }>(
-    scope.accountId,
-    read,
-  );
-  const page = state.snapshot?.key === queryKey ? state.snapshot.page : null;
+  const {
+    snapshot: page,
+    error,
+    errorCode,
+    loading,
+    refresh,
+  } = useWorkflowSources(scope.accountId, read, {
+    mergeSnapshot: mergeMetadataPage,
+    discardSnapshotOnError: discardMetadataOnError,
+  });
+  const reconnectRequired = errorCode === "reconnect_required";
+  const reportReconnectRequired = useEffectEvent(onReconnectRequired);
+  useLayoutEffect(() => {
+    if (reconnectRequired) reportReconnectRequired();
+  }, [reconnectRequired]);
+  const recheckSource =
+    errorCode === "conflict" || (cursor !== null && errorCode === "invalid_input");
+  const pending = loading || (!error && page?.cursor !== cursor);
+  const nextCursor = page?.nextCursor;
+  const optionLabel = kind === "states" ? "statuses" : kind;
   const name = selectedName ?? page?.items.find((item) => item.id === value)?.name;
   const items = page?.items ?? [];
   const options =
-    value && !items.some((item) => item.id === value)
+    page && value && !items.some((item) => item.id === value)
       ? [{ id: value, name: name ?? value }, ...items]
       : items;
+  const hasFooter = pending || error || nextCursor;
+  const action = recheckSource ? "Reload" : error ? "Retry" : "Load more";
+  const loadOptions = async () => {
+    searchInput.current?.focus({ preventScroll: true });
+    if (recheckSource) await refreshSource();
+    if (!error && nextCursor) {
+      setCursor(nextCursor);
+    } else if (!page && cursor) {
+      setCursor(null);
+    } else {
+      await refresh();
+    }
+  };
   return (
     <div className="grid gap-2">
       <p className="text-sm font-medium">{label}</p>
       <Combobox
         items={options}
         value={options.find((item) => item.id === value) ?? null}
+        inputValue={query}
+        onInputValueChange={setQuery}
         itemToStringLabel={(item) => item.name}
         isItemEqualToValue={(a, b) => a.id === b.id}
-        disabled={disabled || state.loading || !!state.error}
+        disabled={disabled}
         onValueChange={(item) => {
-          if (item) onChoose(item.id);
+          if (!checkingAccess && item) onChoose(item.id);
         }}
       >
         <ComboboxTrigger
@@ -891,63 +970,70 @@ function MetadataPicker({
         </ComboboxTrigger>
         <ComboboxPopup>
           <ComboboxSearchInput
-            aria-label={`Search ${kind} on this page`}
-            placeholder="Search this page…"
+            ref={searchInput}
+            aria-label={`Search loaded ${optionLabel}`}
+            placeholder={`Search loaded ${optionLabel}…`}
           />
-          <ComboboxEmpty>No matches on this page.</ComboboxEmpty>
+          <ComboboxEmpty>
+            {page
+              ? nextCursor
+                ? "No matches in loaded options"
+                : query.trim()
+                  ? `No matching ${optionLabel}`
+                  : `No ${optionLabel} available`
+              : null}
+          </ComboboxEmpty>
           <ComboboxList>
-            {(item: { id: string; name: string }) => (
-              <ComboboxItem key={item.id} value={item}>
-                {item.name}
-              </ComboboxItem>
-            )}
+            {(item: { id: string; name: string }) => {
+              const added = addedIds?.includes(item.id) ?? false;
+              return (
+                <ComboboxItem
+                  key={item.id}
+                  value={item}
+                  disabled={added || checkingAccess}
+                  aria-label={added ? `${item.name}, already added` : undefined}
+                >
+                  <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                  {added || item.id === value ? <CheckIcon aria-hidden /> : null}
+                </ComboboxItem>
+              );
+            }}
           </ComboboxList>
+          <div
+            className={`flex shrink-0 flex-wrap items-center justify-between ${hasFooter ? "border-t border-border/70" : ""}`}
+          >
+            <ComboboxStatus>
+              {pending ? (
+                error ? (
+                  "Retrying…"
+                ) : (
+                  `Loading ${page ? "more " : ""}${optionLabel}…`
+                )
+              ) : error ? (
+                <span className="text-warning-foreground">
+                  {recheckSource
+                    ? `Reload ${optionLabel} to refresh the options.`
+                    : `Couldn’t load ${cursor ? "more " : ""}${optionLabel}`}
+                </span>
+              ) : null}
+            </ComboboxStatus>
+            {!pending && !reconnectRequired && (error || nextCursor) ? (
+              <div className="ml-auto px-3 py-2">
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  disabled={disabled || checkingAccess}
+                  aria-label={`${action}${action === "Retry" ? " loading" : ""} ${optionLabel}`}
+                  onClick={() => void loadOptions()}
+                >
+                  {action}
+                </Button>
+              </div>
+            ) : null}
+          </div>
         </ComboboxPopup>
       </Combobox>
-      {state.error ? (
-        <WorkflowAlert
-          title={`Could not load ${label.toLowerCase()}`}
-          actions={
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={disabled || state.loading}
-              onClick={() => void state.refresh()}
-            >
-              Retry {label.toLowerCase()}
-            </Button>
-          }
-        >
-          {state.error} Your selected value is kept.
-        </WorkflowAlert>
-      ) : null}
-      {page?.nextCursor || cursor ? (
-        <div className="flex flex-wrap gap-2">
-          {page?.nextCursor ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              disabled={disabled || state.loading}
-              onClick={() => setCursor(page.nextCursor ?? undefined)}
-            >
-              More {kind}
-            </Button>
-          ) : null}
-          {cursor ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              disabled={disabled || state.loading}
-              onClick={() => setCursor(undefined)}
-            >
-              First page
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
     </div>
   );
 }
