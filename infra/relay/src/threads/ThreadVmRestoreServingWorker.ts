@@ -67,21 +67,48 @@ export function makeThreadVmRestoreServingWorker(
         }
         return yield* serving.recordObserved(claim, found[0].sandboxId);
       });
-      const retire = Effect.fnUntraced(function* (row: ThreadVmRestore) {
-        const recovery = yield* serving.beginBootRecovery(claim),
-          boot = recovery.bootReceipt!;
-        const current = yield* compute.inspect(boot.sandboxId);
-        if (current && !matches(row, current, boot.sandboxId))
-          return yield* new ThreadVmRestoreConflict({
-            message: "Native deletion target identity changed.",
+      const deferBootDeletion = restores.defer(claim, "boot_deletion_unconfirmed");
+      const retire = Effect.fnUntraced(
+        function* (row: ThreadVmRestore) {
+          const recovery = yield* serving.beginBootRecovery(claim),
+            boot = recovery.bootReceipt!;
+          const deletion = Effect.gen(function* () {
+            const current = yield* compute.inspect(boot.sandboxId);
+            if (current && !matches(row, current, boot.sandboxId)) {
+              if (row.workflowCheckpoint) return false;
+              return yield* new ThreadVmRestoreConflict({
+                message: "Native deletion target identity changed.",
+              });
+            }
+            yield* compute.destroy(boot.sandboxId);
+            return !row.workflowCheckpoint || (yield* compute.inspect(boot.sandboxId)) === null;
           });
-        yield* compute.destroy(boot.sandboxId);
-        yield* serving.retryStoppedBoot(claim, {
-          ...boot,
-          kind: "native-restore-deleted-boot-v1",
-          acknowledged: true,
-        });
-      });
+          const confirmed = yield* row.workflowCheckpoint
+            ? deletion.pipe(Effect.catchTag("ThreadVmComputeError", () => Effect.succeed(false)))
+            : deletion;
+          if (!confirmed) {
+            yield* deferBootDeletion;
+            return;
+          }
+          yield* serving.retryStoppedBoot(claim, {
+            ...boot,
+            kind: "native-restore-deleted-boot-v1",
+            acknowledged: true,
+          });
+        },
+        (retirement, row) =>
+          row.workflowCheckpoint
+            ? retirement.pipe(
+                Effect.onInterrupt(() =>
+                  deferBootDeletion.pipe(
+                    Effect.interruptible,
+                    Effect.timeout("5 seconds"),
+                    Effect.ignore,
+                  ),
+                ),
+              )
+            : retirement,
+      );
       if (claim.phase === "aborting") {
         let row: ThreadVmRestore = claim;
         if (!row.bootReceipt && row.bootCreateStarted) {

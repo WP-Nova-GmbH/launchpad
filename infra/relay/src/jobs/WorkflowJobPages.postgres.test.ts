@@ -110,6 +110,14 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
               for (const statement of foundation.split("--> statement-breakpoint"))
                 if (statement.trim() && !statement.includes("relay_thread_"))
                   yield* sql.unsafe(statement);
+              yield* sql`CREATE TEMP TABLE relay_thread_placements (
+                thread_id text, organization_id text, repository_id text, workflow_job_id text,
+                audience text, operation_id text
+              ) ON COMMIT DROP`;
+              yield* sql`CREATE TEMP TABLE relay_thread_vm_restores (
+                operation_id text, thread_id text, phase text, error_code text,
+                boot_recovery_started_at timestamptz, boot_receipt jsonb
+              ) ON COMMIT DROP`;
 
               expect((yield* store.getJob(waiting.jobId))?.record.origin).toEqual({
                 kind: "manual",
@@ -284,11 +292,42 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
                 };
                 yield* store.createJob(recovery);
               }
-              expect(
-                (yield* store.pageJobs("recovery-repo", { view: "attention" })).jobs.map(
-                  (item) => item.jobId,
-                ),
-              ).toEqual(["recovery-awaiting_input", "recovery-cancelling"]);
+              const cleanup = job("recovery-vm-cleanup", "cancelling", "recovery-repo");
+              const threadId = ThreadId.make("thread-native-cleanup");
+              cleanup.record = {
+                ...cleanup.record,
+                runtime: { kind: "vm", threadId },
+                progress: {
+                  revision: 1,
+                  status: "awaiting_input",
+                  threadId,
+                  detail: null,
+                  checkpoint: null,
+                },
+              };
+              yield* store.createJob(cleanup);
+              yield* sql`INSERT INTO relay_thread_placements VALUES
+                (${threadId},${cleanup.organizationId},${cleanup.repositoryId},${cleanup.jobId},'repository','restore-cleanup')`;
+              yield* sql`INSERT INTO relay_thread_vm_restores VALUES
+                ('restore-cleanup',${threadId},'aborting','boot_deletion_unconfirmed',clock_timestamp(),'{}'::jsonb)`;
+              const recoveryPage = yield* store.pageJobs("recovery-repo", {
+                view: "attention",
+                limit: 2,
+              });
+              expect(recoveryPage.jobs.map((item) => item.jobId)).toEqual([
+                "recovery-awaiting_input",
+                "recovery-cancelling",
+              ]);
+              expect(recoveryPage.nextCursor).not.toBeNull();
+              const cleanupPage = yield* store.pageJobs("recovery-repo", {
+                view: "attention",
+                limit: 2,
+                cursor: recoveryPage.nextCursor!,
+              });
+              expect(cleanupPage.jobs).toMatchObject([
+                { jobId: cleanup.jobId, needsAttention: true },
+              ]);
+              expect(cleanupPage.nextCursor).toBeNull();
 
               return yield* Effect.fail("rollback-pages" as const);
             }),

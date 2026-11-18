@@ -87,6 +87,8 @@ export const withDatabase = <A, E, R>(program: Effect.Effect<A, E, R>) =>
 CREATE TABLE relay_organization_members(organization_id text NOT NULL,user_id text NOT NULL UNIQUE,role text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026',PRIMARY KEY(organization_id,user_id));
 CREATE TABLE relay_repositories(repository_id text PRIMARY KEY,organization_id text NOT NULL,name text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026');
 CREATE TABLE relay_repository_access(repository_id text NOT NULL,user_id text NOT NULL,organization_id text NOT NULL,role text NOT NULL,created_at text DEFAULT '2026',updated_at text DEFAULT '2026',PRIMARY KEY(repository_id,user_id));
+CREATE TABLE relay_thread_placements(thread_id text PRIMARY KEY,operation_id text,workflow_job_id text,audience text,organization_id text,repository_id text);
+CREATE TABLE relay_thread_vm_restores(operation_id text PRIMARY KEY,thread_id text,phase text,error_code text,boot_recovery_started_at timestamptz,boot_receipt jsonb);
 CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_id text NOT NULL,organization_id text NOT NULL,created_at text DEFAULT '2026');`.split(
             ";",
           ))
@@ -119,7 +121,7 @@ CREATE TABLE relay_repository_aliases(canonical_key text PRIMARY KEY,repository_
           ]) {
             const migration = yield* fs.readFileString(file);
             for (const statement of migration.split("--> statement-breakpoint")) {
-              // This source harness has no VM tables. Execute the actual current
+              // This source harness only models VM recovery rows for run lists. Execute the actual current
               // workflow DDL; the complete migration chain has its own parity proof.
               if (
                 file.includes("workflow_execution_foundation") &&

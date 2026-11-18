@@ -28,6 +28,18 @@ const conflict = (message: string) => new ThreadVmCapacityConflict({ message });
 export const workflowVmCodexConnectionReady = (sql: PgClient) => sql`x.status='connected'
   AND (x.refresh_started_at IS NULL OR x.refresh_started_at::timestamptz>clock_timestamp()-interval '6 seconds')`;
 
+/** Use inside a transaction that is about to authorize work for the pinned connection. */
+export const lockReadyWorkflowVmCodexConnection = Effect.fnUntraced(function* (
+  sql: PgClient,
+  organizationId: string,
+  connectionId: string | null,
+) {
+  const [connection] = yield* sql`SELECT 1 FROM relay_codex_vm_connections x
+    WHERE x.organization_id=${organizationId} AND x.connection_id=${connectionId}
+      AND ${workflowVmCodexConnectionReady(sql)} FOR SHARE`;
+  return connection !== undefined;
+});
+
 /** Internal operator/worker API. A lost create or expired claim keeps its physical capacity. */
 export function makeThreadVmCapacityStore(sql: PgClient) {
   const get = Effect.fn("relay.vm_capacity.get")(function* (operationId: string) {
@@ -202,8 +214,12 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
                   OR (c.kind='create' AND t.operation_id=c.operation_id AND EXISTS (
                     SELECT 1 FROM relay_thread_vm_restores q WHERE q.operation_id=c.operation_id
                       AND q.thread_id=t.thread_id AND q.allocation_id=a.allocation_id
-                      AND q.generation=t.generation AND q.phase IN ('pending','preparing','prepared')
-                      AND q.serving_requested))))))`
+                      AND q.serving_requested AND q.host_id=c.host_id
+                      AND ((q.generation=t.generation AND q.phase IN ('pending','preparing','prepared'))
+                        OR (q.phase='committed' AND q.committed_at IS NOT NULL AND q.target_generation=t.generation
+                          AND a.compute_ref IS NULL AND c.compute_ref IS NULL
+                          AND q.boot_create_started_at IS NULL AND q.boot_receipt IS NULL
+                          AND q.boot_recovery_started_at IS NULL AND q.boot_ingress_recovery_claim_id IS NULL))))))))`
                   : sql`false`
             }
             AND (SELECT count(*) FROM relay_thread_vm_capacity occupied

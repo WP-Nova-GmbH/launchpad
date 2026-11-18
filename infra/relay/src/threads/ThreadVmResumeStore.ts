@@ -2,6 +2,7 @@ import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import {
+  lockReadyWorkflowVmCodexConnection,
   makeThreadVmCapacityStore,
   workflowVmCodexConnectionReady,
 } from "./ThreadVmCapacityStore.ts";
@@ -491,15 +492,6 @@ export function makeThreadVmResumeStore(sql: PgClient) {
       }),
     );
   });
-  const codexReady = Effect.fnUntraced(function* (
-    organizationId: string,
-    connectionId: string | null,
-  ) {
-    const [connection] = yield* sql`SELECT 1 FROM relay_codex_vm_connections x
-      WHERE x.organization_id=${organizationId} AND x.connection_id=${connectionId}
-        AND ${workflowVmCodexConnectionReady(sql)} FOR SHARE`;
-    return connection !== undefined;
-  });
   const requireCurrent = Effect.fnUntraced(function* (claim: ResumeClaim, dispatchConnect = false) {
     if (claim.workflowJobId) {
       const job = yield* lockWorkflowVmCheckpoint(sql, claim.workflowJobId);
@@ -532,7 +524,8 @@ export function makeThreadVmResumeStore(sql: PgClient) {
         if (response?.responseId !== claim.operationId || response.checkpointDispatch)
           return yield* conflict("The workflow checkpoint no longer permits this wake.");
         if (
-          !(yield* codexReady(
+          !(yield* lockReadyWorkflowVmCodexConnection(
+            sql,
             job.organizationId,
             job.record.vmAdmission?.codexConnectionId ?? null,
           ))
@@ -628,7 +621,8 @@ export function makeThreadVmResumeStore(sql: PgClient) {
           yield* requireActive(claim);
           if (
             park &&
-            (yield* codexReady(
+            (yield* lockReadyWorkflowVmCodexConnection(
+              sql,
               job.organizationId,
               job.record.vmAdmission?.codexConnectionId ?? null,
             ))

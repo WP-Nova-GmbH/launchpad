@@ -2,7 +2,6 @@ import * as PgClient from "@effect/sql-pg/PgClient";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId } from "@t3tools/contracts";
 import { Effect, Layer, Redacted, FileSystem } from "effect";
 import { RelayDb } from "../db.ts";
 import { make, type WorkflowJobRecord } from "./Workflows.ts";
@@ -30,6 +29,12 @@ describe.skipIf(!url)("automation origin (PostgreSQL)", () => {
               );
               for (const statement of initial.split("--> statement-breakpoint"))
                 yield* sql.unsafe(statement.replace("CREATE TABLE", "CREATE TEMP TABLE"));
+              yield* sql`CREATE TEMP TABLE relay_thread_placements (
+                thread_id text PRIMARY KEY, operation_id text, workflow_job_id text, audience text,
+                organization_id text, repository_id text)`;
+              yield* sql`CREATE TEMP TABLE relay_thread_vm_restores (
+                operation_id text PRIMARY KEY, thread_id text, phase text, error_code text,
+                boot_recovery_started_at timestamptz, boot_receipt jsonb)`;
               for (const status of ["queued", "dispatching", "awaiting_review", "done"]) {
                 const record = {
                   status,

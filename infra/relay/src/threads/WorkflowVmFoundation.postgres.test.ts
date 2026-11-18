@@ -33,6 +33,7 @@ import { makeThreadVmFinalSaveDeletionWorker } from "./ThreadVmFinalSaveDeletion
 import { makeThreadVmFinalSaveWorker } from "./ThreadVmFinalSaveWorker.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
 import { makeThreadVmRestoreServingStore } from "./ThreadVmRestoreServingStore.ts";
+import { makeThreadVmRestoreServingWorker } from "./ThreadVmRestoreServingWorker.ts";
 import { makeThreadVmRestoreEnrollmentStore } from "./ThreadVmRestoreEnrollmentStore.ts";
 import { makeThreadVmRestoreImportStore } from "./ThreadVmRestoreImportStore.ts";
 import { makeThreadVmRestoreWorker } from "./ThreadVmRestoreWorker.ts";
@@ -51,6 +52,7 @@ import { makeThreadVmServerWorker } from "./ThreadVmServerWorker.ts";
 import { makeThreadVmSetupStore } from "./ThreadVmSetupStore.ts";
 import { makeThreadVmSetupWorker } from "./ThreadVmSetupWorker.ts";
 import { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
+import { E2BRestoreError } from "../machines/E2BRestoreClient.ts";
 import { makeThreadVmPolicyStore } from "./ThreadVmPolicy.ts";
 import { makeThreadDeletionStore } from "./ThreadDeletionStore.ts";
 import { RelayDb } from "../db.ts";
@@ -3192,7 +3194,10 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
     for (const scenario of [
       "idle-revoked",
       "idle-restore",
+      "restore-codex-parking",
       "restored-native-cancel",
+      "restore-cancelled-after-commit",
+      "restore-revoked-after-commit",
       "loss-before-pause",
       "loss-after-pause",
       "loss-while-parked",
@@ -3203,14 +3208,22 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
     ] as const) {
       const revokeResponse = scenario === "idle-revoked";
       const sourceLoss = scenario.startsWith("loss-");
+      const parkRestore = scenario === "restore-codex-parking";
+      const abortCommitted =
+        scenario === "restore-cancelled-after-commit" ||
+        scenario === "restore-revoked-after-commit";
       it.effect(
         sourceLoss
           ? `reconciles the exact workflow source on ${scenario}`
           : revokeResponse
             ? "saves an automatic pre-Agent Input checkpoint, preserves it past expiry and restores only that checkpoint"
-            : scenario === "restored-native-cancel"
-              ? "cancels Input after native pause of its restored VM"
-              : "authorizes workflow pause and cold restore with the current VM credential",
+            : parkRestore
+              ? "parks a cold Input restore until its original Codex connection returns"
+              : scenario === "restored-native-cancel"
+                ? "cancels Input after native pause of its restored VM"
+                : abortCommitted
+                  ? `preserves the current saved checkpoint on ${scenario}`
+                  : "authorizes workflow pause and cold restore with the current VM credential",
         () =>
           Effect.gen(function* () {
             const f = yield* activeWorkflow(true);
@@ -3713,8 +3726,9 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
             expect(yield* makeThreadVmCapacityStore(f.sql).get(operationId)).toBeNull();
             yield* f.sql`UPDATE relay_workflow_jobs SET record=jsonb_set(record,'{progress,checkpoint,checkpointId}',to_jsonb(${checkpoint.checkpointId}::text))
           WHERE job_id=${f.workflowJobId}`;
-            const throughRecovery = sourceLoss || scenario === "idle-restore";
-            if (scenario === "idle-restore") {
+            const recoverSaved = scenario === "idle-restore" || parkRestore;
+            const throughRecovery = sourceLoss || recoverSaved;
+            if (recoverSaved) {
               yield* connectCodex;
               yield* f.sql`UPDATE relay_workflow_jobs SET pending_control=${f.sql.json(restoreResponse)} WHERE job_id=${f.workflowJobId}`;
             }
@@ -3743,26 +3757,433 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
             if (scenario === "loss-while-parked")
               expect(yield* f.capacity.admitNext(f.hostId, { workflowEnabled: true })).toBeNull();
             yield* connectCodex;
+            if (parkRestore) yield* f.capacity.configure(f.hostId, 1);
             expect(
               (yield* f.capacity.admitNext(f.hostId, { workflowEnabled: true }))?.operationId,
             ).toBe(operationId);
+            const setCodexStatus = (status: "connected" | "disconnected") =>
+              f.sql`UPDATE relay_codex_vm_connections SET status=${status} WHERE organization_id=${f.organizationId}`;
+            let catalogCalls = 0;
+            let catalogFails = false;
+            let disconnectDuringCatalog = false;
             const restoreWorker = makeThreadVmRestoreWorker(
               f.sql,
               objects,
               {
                 resolveSource: (sourceTemplateID, sourceBuildID) =>
-                  Effect.succeed({ sourceTemplateID, sourceBuildID }),
+                  Effect.gen(function* () {
+                    catalogCalls++;
+                    if (disconnectDuringCatalog)
+                      yield* setCodexStatus("disconnected").pipe(Effect.orDie);
+                    if (catalogFails)
+                      return yield* new E2BRestoreError({
+                        operation: "resolveSource",
+                        reason: "transport",
+                      });
+                    return { sourceTemplateID, sourceBuildID };
+                  }),
               },
               f.hostId,
             );
-            expect(yield* restoreWorker.runOne()).toBe(true);
+            if (parkRestore) {
+              const readmit = f.capacity.admitNext(f.hostId, { workflowEnabled: true });
+              const assertParked = Effect.gen(function* () {
+                expect((yield* f.capacity.get(operationId))?.state).toBe("waiting");
+                expect(yield* restores.get(operationId)).toMatchObject({
+                  claimId: null,
+                  errorCode: null,
+                });
+                expect((yield* (yield* Workflows).getJob(f.workflowJobId))?.pendingControl).toEqual(
+                  restoreResponse,
+                );
+                expect(
+                  (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+                ).toEqual({ state: "waiting_codex" });
+                const competitor = yield* seed({ hostId: f.hostId, personal: true });
+                yield* f.capacity.configure(f.hostId, 1);
+                expect((yield* readmit)?.operationId).toBe(competitor.operationId);
+                yield* f.capacity.cancelUnstarted(competitor.operationId);
+                yield* setCodexStatus("connected");
+                expect((yield* readmit)?.operationId).toBe(operationId);
+              });
+
+              yield* setCodexStatus("disconnected");
+              expect(yield* restoreWorker.runOne()).toBe(true);
+              expect(catalogCalls).toBe(0);
+              expect((yield* restores.get(operationId))?.phase).toBe("pending");
+              yield* assertParked;
+
+              catalogFails = true;
+              expect(yield* restoreWorker.runOne()).toBe(true);
+              expect((yield* f.capacity.get(operationId))?.state).toBe("reserved");
+              expect((yield* restores.get(operationId))?.errorCode).toBe("snapshot_unconfirmed");
+              yield* f.sql`UPDATE relay_thread_vm_restores SET retry_at=clock_timestamp() WHERE operation_id=${operationId}`;
+              disconnectDuringCatalog = true;
+              expect(yield* restoreWorker.runOne()).toBe(true);
+              expect(yield* restores.get(operationId)).toMatchObject({
+                phase: "preparing",
+                preparedReceipt: null,
+              });
+              yield* assertParked;
+
+              catalogFails = false;
+              expect(yield* restoreWorker.runOne()).toBe(true);
+              expect(yield* restores.get(operationId)).toMatchObject({
+                phase: "prepared",
+                preparedReceipt: { sourceTemplateId: snapshotId, sourceBuildId },
+              });
+              yield* assertParked;
+              expect(catalogCalls).toBe(3);
+            } else {
+              expect(yield* restoreWorker.runOne()).toBe(true);
+            }
             expect((yield* restores.get(operationId))?.phase).toBe("prepared");
+            if (parkRestore) {
+              const store = yield* Workflows;
+              const original = job.vmAdmission!.codexConnectionId;
+              const replaceConnection = (status: "connected" | "disconnected", id = original) =>
+                f.sql`UPDATE relay_codex_vm_connections SET status=${status},connection_id=${id}
+                  WHERE organization_id=${f.organizationId}`;
+              const admit = () => f.capacity.admitNext(f.hostId, { workflowEnabled: true });
+              const work = () => store.getJob(f.workflowJobId);
+              const due = f.sql`UPDATE relay_thread_vm_restores SET retry_at=clock_timestamp() WHERE operation_id=${operationId}`;
+              const sandboxId = NodeCrypto.randomUUID();
+              const sandbox = pausedSandbox(sandboxId, operationId, operationId, f.threadId, 2);
+              const observed: SandboxInfo = {
+                ...sandbox,
+                templateId: snapshotId,
+                state: "running",
+                metadata: { ...sandbox.metadata, "launchpad.restore": "v1" },
+              };
+              const nativeInspections: Array<SandboxInfo | null | "unavailable"> = [];
+              const deleteStarted = yield* Deferred.make<void>();
+              let creates = 0;
+              let lookups = 0;
+              let deletes = 0;
+              let deleteUnavailable = false;
+              let holdDelete = false;
+              let visible = false;
+              const worker = makeThreadVmRestoreServingWorker(
+                f.sql,
+                objects,
+                {
+                  createFromSnapshot: (request) =>
+                    Effect.gen(function* () {
+                      creates++;
+                      expect(request).toMatchObject({ operationId, generation: 2, bootAttempt: 0 });
+                      return yield* new ThreadVmComputeError({
+                        operation: "create",
+                        message: "Lost reply",
+                      });
+                    }),
+                  findOperation: (id) =>
+                    Effect.sync(() => {
+                      lookups++;
+                      expect(id).toBe(operationId);
+                      return visible ? [observed] : [];
+                    }),
+                  inspect: (id) =>
+                    Effect.gen(function* () {
+                      expect(id).toBe(sandboxId);
+                      const next = nativeInspections.shift();
+                      if (next !== undefined && next !== "unavailable") return next;
+                      return yield* new ThreadVmComputeError({
+                        operation: "inspect",
+                        message: "Temporary",
+                      });
+                    }),
+                  recoverIngress: () => Effect.die("No ingress before the boot is inspectable"),
+                  destroy: (id) =>
+                    Effect.gen(function* () {
+                      expect(id).toBe(sandboxId);
+                      deletes++;
+                      if (holdDelete) {
+                        yield* Deferred.succeed(deleteStarted, undefined);
+                        return yield* Effect.never;
+                      }
+                      if (deleteUnavailable)
+                        return yield* new ThreadVmComputeError({
+                          operation: "destroy",
+                          message: "Temporary",
+                        });
+                    }),
+                },
+                f.hostId,
+                () => Effect.die("No bootstrap before the boot is inspectable"),
+              );
+              for (const phase of ["prepared", "committed"] as const) {
+                const generation = phase === "prepared" ? 1 : 2;
+                yield* replaceConnection("disconnected");
+                expect(yield* worker.runOne()).toBe(true);
+                expect(yield* restores.get(operationId)).toMatchObject({
+                  phase,
+                  targetGeneration: phase === "prepared" ? null : generation,
+                  bootCreateStarted: false,
+                  bootReceipt: null,
+                });
+                expect(yield* f.placements.getAny(f.threadId)).toMatchObject({
+                  generation,
+                  operationId,
+                });
+                expect(yield* f.capacity.get(operationId)).toMatchObject({
+                  state: "waiting",
+                  computeRef: null,
+                });
+                expect(yield* work()).toMatchObject({
+                  status: "awaiting_input",
+                  pendingControl: restoreResponse,
+                  record: { progress: { revision: 1, checkpoint } },
+                });
+                expect(
+                  yield* f.sql`SELECT claim_id,claim_until FROM relay_thread_vm_restores WHERE operation_id=${operationId}`,
+                ).toEqual([{ claim_id: null, claim_until: null }]);
+                expect(
+                  (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+                ).toEqual({ state: "waiting_codex" });
+                expect(creates).toBe(0);
+
+                const competitor = yield* seed({ hostId: f.hostId, personal: true });
+                yield* f.capacity.configure(f.hostId, 1);
+                expect((yield* admit())?.operationId).toBe(competitor.operationId);
+                yield* f.capacity.cancelUnstarted(competitor.operationId);
+                yield* replaceConnection("connected", NodeCrypto.randomUUID());
+                expect(yield* admit()).toBeNull();
+                expect(yield* worker.runOne()).toBe(false);
+                expect((yield* work())?.pendingControl).toEqual(restoreResponse);
+                yield* replaceConnection("connected");
+                expect((yield* admit())?.operationId).toBe(operationId);
+                expect(yield* worker.runOne()).toBe(true);
+                expect((yield* f.placements.getAny(f.threadId))?.generation).toBe(2);
+              }
+
+              // The create crossed the native boundary. A disconnect cannot give away its slot.
+              expect(creates).toBe(1);
+              expect(yield* restores.get(operationId)).toMatchObject({
+                phase: "creating",
+                bootCreateStarted: true,
+                bootReceipt: null,
+              });
+              yield* replaceConnection("disconnected");
+              yield* due;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(lookups).toBe(1);
+              expect(yield* f.capacity.get(operationId)).toMatchObject({
+                state: "started",
+                computeRef: null,
+              });
+              const waiting = yield* seed({ hostId: f.hostId, personal: true });
+              yield* f.capacity.configure(f.hostId, 1);
+              expect(yield* admit()).toBeNull();
+              expect((yield* work())?.pendingControl).toEqual(restoreResponse);
+
+              yield* replaceConnection("connected");
+              visible = true;
+              yield* due;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(creates).toBe(1);
+              expect(lookups).toBe(2);
+              expect(yield* restores.get(operationId)).toMatchObject({
+                bootReceipt: { sandboxId, generation: 2, bootAttempt: 0 },
+              });
+              expect(yield* f.capacity.get(operationId)).toMatchObject({
+                state: "started",
+                computeRef: sandboxId,
+              });
+              expect((yield* work())?.pendingControl).toEqual(restoreResponse);
+              expect(deletes).toBe(0);
+
+              // A lost boot prompts cleanup, but the native delete acknowledgement can precede disappearance.
+              yield* replaceConnection("disconnected");
+              for (const attempt of [
+                {
+                  inspections: [null, { ...observed, metadata: {} }],
+                  deleteUnavailable: false,
+                  attempts: 0,
+                },
+                { inspections: [observed, observed], deleteUnavailable: false, attempts: 1 },
+                { inspections: [observed], deleteUnavailable: true, attempts: 2 },
+                {
+                  inspections: [observed, "unavailable" as const],
+                  deleteUnavailable: false,
+                  attempts: 3,
+                },
+              ]) {
+                nativeInspections.push(...attempt.inspections);
+                deleteUnavailable = attempt.deleteUnavailable;
+                yield* due;
+                expect(yield* worker.runOne()).toBe(true);
+                expect(nativeInspections).toEqual([]);
+                expect(deletes).toBe(attempt.attempts);
+                expect(yield* restores.get(operationId)).toMatchObject({
+                  bootRecoveryStarted: true,
+                  bootReceipt: { sandboxId, generation: 2, bootAttempt: 0 },
+                });
+                expect(yield* f.capacity.get(operationId)).toMatchObject({
+                  state: "started",
+                  computeRef: sandboxId,
+                });
+                expect(yield* admit()).toBeNull();
+                expect(
+                  (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+                ).toMatchObject({
+                  state: "recovery_error",
+                  detail: expect.stringMatching(
+                    /could not confirm deletion of the previous workflow VM/,
+                  ),
+                });
+              }
+              const attentionChecked = yield* f.sql
+                .withTransaction(
+                  Effect.gen(function* () {
+                    const current = (yield* work())!;
+                    yield* store.updateJob(
+                      current,
+                      { ...current.record, status: "cancelling" },
+                      {
+                        userId: f.ownerUserId,
+                        response: { operation: "cancel" },
+                      },
+                    );
+                    yield* f.sql`UPDATE relay_thread_vm_restores SET phase='aborting' WHERE operation_id=${operationId}`;
+                    const attention = yield* store.pageJobs(f.repositoryId, { view: "attention" });
+                    expect(attention.jobs).toMatchObject([
+                      { jobId: f.workflowJobId, status: "cancelling", needsAttention: true },
+                    ]);
+
+                    yield* f.sql`UPDATE relay_thread_vm_restores SET error_code=NULL WHERE operation_id=${operationId}`;
+                    expect(
+                      (yield* store.pageJobs(f.repositoryId, { view: "attention" })).jobs,
+                    ).toEqual([]);
+                    expect(
+                      (yield* store.pageJobs(f.repositoryId, { view: "active" })).jobs,
+                    ).toMatchObject([
+                      { jobId: f.workflowJobId, status: "cancelling", needsAttention: false },
+                    ]);
+                    return yield* Effect.fail("rollback-attention-check" as const);
+                  }),
+                )
+                .pipe(Effect.flip);
+              expect(attentionChecked).toBe("rollback-attention-check");
+
+              // An interrupted delete must report uncertainty even without a prior warning.
+              yield* f.sql`UPDATE relay_thread_vm_restores SET error_code=NULL,retry_at=clock_timestamp()
+                WHERE operation_id=${operationId}`;
+              nativeInspections.push(observed);
+              holdDelete = true;
+              const interrupted = yield* worker.runOne().pipe(Effect.forkChild);
+              yield* Deferred.await(deleteStarted);
+              yield* Fiber.interrupt(interrupted);
+              holdDelete = false;
+              expect(deletes).toBe(4);
+              expect(yield* f.capacity.get(operationId)).toMatchObject({
+                state: "started",
+                computeRef: sandboxId,
+              });
+              expect(yield* restores.get(operationId)).toMatchObject({
+                claimId: null,
+                errorCode: "boot_deletion_unconfirmed",
+                bootReceipt: { sandboxId, generation: 2, bootAttempt: 0 },
+              });
+              expect(
+                (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+              ).toMatchObject({
+                state: "recovery_error",
+                detail: expect.stringMatching(/could not confirm deletion/),
+              });
+              expect(yield* admit()).toBeNull();
+
+              nativeInspections.push(observed, null);
+              yield* due;
+              expect(yield* worker.runOne()).toBe(true);
+              expect(deletes).toBe(5);
+              expect(nativeInspections).toEqual([]);
+              expect(yield* restores.get(operationId)).toMatchObject({
+                phase: "committed",
+                targetGeneration: 2,
+                bootAttempt: 1,
+                bootCreateStarted: false,
+                bootReceipt: null,
+              });
+              expect(yield* worker.runOne()).toBe(true);
+              expect(yield* f.placements.getAny(f.threadId)).toMatchObject({
+                generation: 2,
+                operationId,
+              });
+              expect(yield* f.capacity.get(operationId)).toMatchObject({
+                state: "waiting",
+                computeRef: null,
+              });
+              expect(
+                (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+              ).toEqual({ state: "waiting_codex" });
+              expect((yield* admit())?.operationId).toBe(waiting.operationId);
+              expect((yield* work())?.pendingControl).toEqual(restoreResponse);
+              expect(creates).toBe(1);
+              return;
+            }
             const serving = makeThreadVmRestoreServingStore(f.sql, objects);
             const commit = (yield* serving.claim(f.hostId))!;
             const destination = yield* serving.commit(commit);
             expect(destination?.targetGeneration).toBe(2);
             expect(destination?.allocationId).toBe(operationId);
             expect((yield* f.placements.getAny(f.threadId))?.operationId).toBe(operationId);
+            if (abortCommitted) {
+              yield* f.sql`UPDATE relay_codex_vm_connections SET status='disconnected' WHERE organization_id=${f.organizationId}`;
+              expect(yield* serving.beginCreate((yield* serving.claim(f.hostId))!)).toBeNull();
+              expect(yield* f.capacity.get(operationId)).toMatchObject({
+                state: "waiting",
+                computeRef: null,
+              });
+              const cancelling = scenario === "restore-cancelled-after-commit";
+              if (cancelling) {
+                yield* f.sql`UPDATE relay_workflow_jobs SET status='cancelling',record=jsonb_set(record,'{status}','"cancelling"'),
+                  pending_control=${f.sql.json({ userId: f.ownerUserId, response: { operation: "cancel" } })} WHERE job_id=${f.workflowJobId}`;
+              } else {
+                yield* f.sql`DELETE FROM relay_organization_members WHERE organization_id=${f.organizationId} AND user_id=${f.ownerUserId}`;
+              }
+              expect(yield* advanceRecovery).toMatchObject({
+                status: cancelling ? "cancelling" : "awaiting_input",
+              });
+              const abort = (yield* serving.claim(f.hostId))!;
+              expect(abort.phase).toBe("aborting");
+              yield* serving.completeCommittedAbort(abort);
+              expect((yield* f.capacity.get(operationId))?.state).toBe("released");
+              expect(yield* f.placements.getAny(f.threadId)).toMatchObject({
+                generation: 2,
+                operationId: null,
+              });
+              expect(yield* makeThreadVmSavedDiskStore(f.sql).get(saved)).toMatchObject({
+                generation: 1,
+                phase: "available",
+              });
+              expect(
+                (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+              ).toEqual({ state: "saved" });
+              if (cancelling) {
+                expect(yield* advanceRecovery).toMatchObject({
+                  status: "cancelled",
+                  progress: { executionReleased: true },
+                });
+                return;
+              }
+              yield* connectCodex;
+              const replacementResponseId = NodeCrypto.randomUUID();
+              yield* f.sql`UPDATE relay_workflow_jobs SET pending_control=${f.sql.json({ ...restoreResponse, responseId: replacementResponseId })} WHERE job_id=${f.workflowJobId}`;
+              expect(yield* advanceRecovery).toMatchObject({ status: "awaiting_input" });
+              expect(yield* restores.get(replacementResponseId)).toMatchObject({
+                generation: 2,
+                sourceGeneration: 1,
+                savedDiskOperationId: saved,
+              });
+              expect(
+                (yield* f.capacity.admitNext(f.hostId, { workflowEnabled: true }))?.operationId,
+              ).toBe(replacementResponseId);
+              expect(yield* restoreWorker.runOne()).toBe(true);
+              expect(yield* serving.commit((yield* serving.claim(f.hostId))!)).toMatchObject({
+                targetGeneration: 3,
+              });
+              return;
+            }
             const create = (yield* serving.claim(f.hostId))!;
             if (revokeResponse) {
               yield* f.sql`DELETE FROM relay_organization_members WHERE organization_id=${f.organizationId} AND user_id=${f.ownerUserId}`;

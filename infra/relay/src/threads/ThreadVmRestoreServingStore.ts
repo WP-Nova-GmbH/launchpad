@@ -64,7 +64,7 @@ export function makeThreadVmRestoreServingStore(
           phase: ThreadVmRestore["phase"];
         }>`SELECT r.operation_id AS "operationId",t.workflow_job_id AS "workflowJobId",r.phase
         FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
-        JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
+        JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id AND c.allocation_id=r.allocation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         WHERE r.host_id=${hostId} AND r.serving_requested AND r.prepared_receipt->>'kind'='native-restore-catalog-v1'
           AND a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR
@@ -77,7 +77,10 @@ export function makeThreadVmRestoreServingStore(
             (r.phase='importing' AND (r.error_code IS NOT NULL OR r.boot_recovery_started_at IS NOT NULL)))
           AND (${allowStart} OR r.phase='aborting')
           AND r.boot_ingress_recovery_claim_id IS NULL AND r.retry_at<=clock_timestamp()
-          AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()) AND c.state IN ('reserved','started')
+          AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
+          AND (c.state IN ('reserved','started') OR (a.resource_kind='organization_workflow'
+            AND r.phase='aborting' AND c.state='waiting' AND c.compute_ref IS NULL
+            AND r.boot_create_started_at IS NULL AND r.boot_receipt IS NULL))
         ORDER BY r.retry_at,r.created_at,r.operation_id LIMIT 1`;
         if (!candidate) return null;
         if (
@@ -96,12 +99,15 @@ export function makeThreadVmRestoreServingStore(
           return null;
         const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
         const [claimed] =
-          yield* sql`UPDATE relay_thread_vm_restores SET claim_id=${claimId},claim_until=clock_timestamp()+interval '3 minutes'
+          yield* sql`UPDATE relay_thread_vm_restores r SET claim_id=${claimId},claim_until=clock_timestamp()+interval '3 minutes'
           WHERE operation_id=${row.operationId} AND retry_at<=clock_timestamp()
             AND (claim_until IS NULL OR claim_until<=clock_timestamp())
             AND boot_ingress_recovery_claim_id IS NULL
             AND EXISTS(SELECT 1 FROM relay_thread_vm_capacity c WHERE c.operation_id=${row.operationId}
-              AND c.allocation_id=${row.allocationId} AND c.state IN ('reserved','started'))
+              AND c.allocation_id=${row.allocationId}
+              AND (c.state IN ('reserved','started') OR (${row.workflowCheckpoint !== null}
+                AND r.phase='aborting' AND c.state='waiting' AND c.compute_ref IS NULL
+                AND r.boot_create_started_at IS NULL AND r.boot_receipt IS NULL)))
           RETURNING operation_id`;
         if (!claimed) return null;
         return { ...row, claimId };
@@ -164,6 +170,7 @@ export function makeThreadVmRestoreServingStore(
         if (row.phase !== "prepared" || row.preparedReceipt?.kind !== "native-restore-catalog-v1")
           return yield* conflict("Only a validated native snapshot can commit.");
         if (!(yield* startAuthorized(row))) return null;
+        if (yield* restores.parkForCodex(row, row.workflowJob, "reserved")) return null;
         yield* restores.requireSourceAbsent(row);
         yield* capacity.beginExecution(row.operationId);
         const [changed] = yield* sql<{
@@ -202,12 +209,18 @@ export function makeThreadVmRestoreServingStore(
           );
         const reservation = yield* capacity.get(row.operationId);
         if (
-          reservation?.state !== "started" ||
+          !reservation ||
+          (reservation.state !== "started" &&
+            !(row.workflowCheckpoint && reservation.state === "reserved")) ||
+          reservation.kind !== "create" ||
+          reservation.allocationId !== row.allocationId ||
           reservation.hostId !== row.hostId ||
           reservation.computeRef !== null
         )
           return yield* conflict("Restore execution capacity changed.");
         if (!(yield* startAuthorized(row))) return null;
+        if (yield* restores.parkForCodex(row, row.workflowJob, reservation.state)) return null;
+        if (reservation.state === "reserved") yield* capacity.beginExecution(row.operationId);
         yield* sql`UPDATE relay_thread_vm_restores SET phase='creating',boot_create_started_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
         return (yield* restores.get(row.operationId))!;
       }),
@@ -452,7 +465,10 @@ export function makeThreadVmRestoreServingStore(
             return yield* conflict("The committed cancellation still has an unsettled target.");
           const resourceKind = row.workflowCheckpoint ? "organization_workflow" : "personal";
           yield* allocations.requestDeletion(row.allocationId, resourceKind);
-          yield* sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE operation_id=${row.operationId} AND state='started' AND compute_ref IS NULL`;
+          yield* sql`UPDATE relay_thread_vm_capacity SET state='released'
+            WHERE operation_id=${row.operationId} AND allocation_id=${row.allocationId}
+              AND kind='create' AND host_id=${row.hostId} AND compute_ref IS NULL
+              AND (state='started' OR (${row.workflowCheckpoint !== null} AND state IN ('waiting','reserved')))`;
           yield* allocations.confirmDeleted({
             allocationId: row.allocationId,
             computeRef: null,

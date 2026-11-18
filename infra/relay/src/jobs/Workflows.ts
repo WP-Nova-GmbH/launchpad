@@ -515,10 +515,18 @@ export const make = Effect.gen(function* () {
         (${jobs.summary}->>'needsAttention' IS NOT DISTINCT FROM 'true'
           AND ${jobs.summary}#>>'{queueReason,code}' IS DISTINCT FROM 'vm_waiting_capacity')
         OR (${jobs.record}#>>'{runtime,kind}'='vm'
-          AND ${jobs.record}#>>'{vmRecovery,state}'='recovery_error'
           AND (${jobs.status} IN ('awaiting_review','awaiting_input')
             OR (${jobs.status}='cancelling'
-              AND ${jobs.record}#>>'{progress,status}' IN ('awaiting_review','awaiting_input')))) IS TRUE)`;
+              AND ${jobs.record}#>>'{progress,status}' IN ('awaiting_review','awaiting_input')))
+          AND (${jobs.record}#>>'{vmRecovery,state}'='recovery_error' OR EXISTS (
+            SELECT 1 FROM relay_thread_placements t JOIN relay_thread_vm_restores r
+              ON r.thread_id=t.thread_id
+              AND r.operation_id=COALESCE(t.operation_id,${jobs.pendingControl}->>'responseId')
+            WHERE t.workflow_job_id=${jobs.jobId} AND t.audience='repository'
+              AND t.thread_id=${jobs.record}#>>'{runtime,threadId}'
+              AND t.organization_id=${jobs.organizationId} AND t.repository_id=${jobs.repositoryId}
+              AND r.phase<>'completed' AND r.error_code='boot_deletion_unconfirmed'
+              AND r.boot_recovery_started_at IS NOT NULL AND r.boot_receipt IS NOT NULL))) IS TRUE)`;
       const rows = yield* persist(
         db
           .select({

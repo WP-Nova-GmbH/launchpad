@@ -31,6 +31,7 @@ export function makeThreadVmRestoreWorker(
         return;
       }
       const row = yield* store.beginPrepare(claim);
+      if (!row) return;
       const source = yield* compute.resolveSource(row.sourceTemplateId, row.sourceBuildId);
       yield* store.recordPrepared(claim, {
         version: 1,
@@ -40,9 +41,9 @@ export function makeThreadVmRestoreWorker(
       });
     }).pipe(
       Effect.catchTags({
-        E2BRestoreError: () => store.defer(claim, "snapshot_unconfirmed"),
-        ThreadVmRestoreConflict: () => store.defer(claim, "recovery_unconfirmed"),
-        ThreadNativeCheckpointConflict: () => store.defer(claim, "recovery_unconfirmed"),
+        E2BRestoreError: () => store.deferPreparation(claim, "snapshot_unconfirmed"),
+        ThreadVmRestoreConflict: () => store.deferPreparation(claim, "recovery_unconfirmed"),
+        ThreadNativeCheckpointConflict: () => store.deferPreparation(claim, "recovery_unconfirmed"),
       }),
     );
     return true;

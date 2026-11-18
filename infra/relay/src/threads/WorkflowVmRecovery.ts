@@ -13,6 +13,7 @@ import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
 import { workflowVmCodexConnectionReady } from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmRestoreStore } from "./ThreadVmRestoreStore.ts";
+import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 import { supersedeUnissuedWorkflowPause } from "./ThreadVmPauseStore.ts";
 import {
   makeThreadVmResumeStore,
@@ -25,6 +26,8 @@ const unconfirmedResume =
   "Launchpad could not confirm that the workflow VM resumed. Saved results are still available.";
 const unconfirmedSnapshot =
   "Launchpad could not confirm the workflow VM snapshot. Saved results are still available.";
+const unconfirmedBootDeletion =
+  "Launchpad could not confirm deletion of the previous workflow VM. Cleanup will retry automatically. Saved results are still available.";
 const lostSourceReconciliation =
   "The workflow VM is missing. Launchpad is confirming its removal before recovery.";
 
@@ -41,6 +44,7 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
       | WorkflowVmRecovery["state"]
       | "resume_unconfirmed"
       | "snapshot_unconfirmed"
+      | "boot_deletion_unconfirmed"
       | "source_loss_reconciling"
       | null;
   }>`
@@ -49,19 +53,22 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
         THEN COALESCE(j.record#>>'{vmRecovery,detail}',${recoveryUnavailable})
       END AS "storedRecoveryError",
       CASE
+      WHEN r.error_code='boot_deletion_unconfirmed' AND r.boot_recovery_started_at IS NOT NULL
+        AND r.boot_receipt IS NOT NULL THEN 'boot_deletion_unconfirmed'
       WHEN r.phase='aborted' OR (r.error_code IS NOT NULL AND r.phase IN ('pending','preparing','prepared'))
         THEN 'recovery_error'
-      WHEN r.phase IN ('pending','preparing','prepared') AND c.state IN ('waiting','reserved')
+      WHEN c.state='waiting' AND (r.phase IN ('pending','preparing','prepared','committed') OR x.phase='waiting')
+        AND NOT EXISTS (
+          SELECT 1 FROM relay_codex_vm_connections x WHERE x.organization_id=j.organization_id
+            AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
+            AND ${workflowVmCodexConnectionReady(sql)}) THEN 'waiting_codex'
+      WHEN r.phase IN ('pending','preparing','prepared','committed') AND c.state IN ('waiting','reserved')
         THEN 'waiting_capacity'
       WHEN r.phase IS NOT NULL OR (ready.phase='completed'
         AND (publication.manifest#>>'{binding,allocationId}' IS DISTINCT FROM a.allocation_id
           OR (publication.manifest#>>'{binding,generation}')::int IS DISTINCT FROM t.generation)) THEN 'restoring'
       WHEN x.phase='resuming' AND x.connect_claim_id IS NOT NULL
         AND (x.claim_until IS NULL OR x.claim_until<=clock_timestamp()) THEN 'resume_unconfirmed'
-      WHEN x.phase='waiting' AND c.state='waiting' AND NOT EXISTS (
-        SELECT 1 FROM relay_codex_vm_connections x WHERE x.organization_id=j.organization_id
-          AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
-          AND ${workflowVmCodexConnectionReady(sql)}) THEN 'waiting_codex'
       WHEN x.phase='waiting' AND c.state IN ('waiting','reserved') THEN 'waiting_capacity'
       WHEN x.phase IN ('waiting','resuming') OR
         (x.phase='completed' AND p.phase IN ('cancelled','completed') AND p.source_reopened_at IS NULL AND a.state='running')
@@ -83,8 +90,10 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
         THEN 'source_loss_reconciling'
       WHEN t.operation_id=f.operation_id AND f.phase IN ('frozen','saving','deleting') THEN 'paused'
       WHEN a.state IS NULL AND d.phase='available' AND f.phase='completed'
+        AND f.source_receipt#>>'{workflowCheckpoint,jobId}'=j.job_id
         AND f.source_receipt#>>'{workflowCheckpoint,checkpointId}'=j.record#>>'{progress,checkpoint,checkpointId}'
         AND f.source_receipt#>>'{workflowCheckpoint,publicationId}'=h.publication_id
+        AND f.source_receipt#>>'{workflowCheckpoint,publicationRevision}'=h.revision::text
         AND (f.source_receipt#>>'{workflowCheckpoint,checkpointGeneration}')::int=COALESCE((j.record#>>'{progress,checkpoint,generation}')::int,0)
         THEN 'saved'
       WHEN a.state IS NULL OR a.state='paused' THEN 'recovery_error'
@@ -100,9 +109,12 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
       AND r.operation_id=COALESCE(t.operation_id,j.pending_control->>'responseId') AND r.phase<>'completed'
     LEFT JOIN relay_thread_vm_restores ready ON ready.allocation_id=a.allocation_id AND ready.phase='completed'
     LEFT JOIN relay_thread_vm_capacity c ON c.operation_id=COALESCE(r.operation_id,x.operation_id)
-    LEFT JOIN relay_thread_vm_saved_disks d ON d.thread_id=t.thread_id AND d.phase='available'
-      AND d.generation=(SELECT MAX(d2.generation) FROM relay_thread_vm_saved_disks d2
-        WHERE d2.thread_id=t.thread_id AND d2.phase='available')
+    LEFT JOIN LATERAL (
+      SELECT s.operation_id,s.phase FROM relay_thread_vm_saved_disks s
+      WHERE s.thread_id=t.thread_id AND s.phase='available'
+        AND (s.generation=t.generation OR ${savedDiskHasCancelledRestorePlacement(sql)})
+      ORDER BY s.generation DESC,s.saved_at DESC,s.operation_id DESC LIMIT 1
+    ) d ON true
     LEFT JOIN relay_thread_vm_final_saves f ON f.thread_id=t.thread_id
       AND f.operation_id=COALESCE(t.operation_id,d.operation_id)
     LEFT JOIN relay_workflow_recovery_heads h ON h.job_id=j.job_id
@@ -121,6 +133,8 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
           return [[jobId, { state: "recovery_error", detail: unconfirmedResume }]];
         if (state === "snapshot_unconfirmed")
           return [[jobId, { state: "recovery_error", detail: unconfirmedSnapshot }]];
+        if (state === "boot_deletion_unconfirmed")
+          return [[jobId, { state: "recovery_error", detail: unconfirmedBootDeletion }]];
         if (state === "source_loss_reconciling")
           return [[jobId, { state: "recovery_error", detail: lostSourceReconciliation }]];
         if (state === "saved" && storedRecoveryError)
@@ -204,14 +218,16 @@ export function makeWorkflowVmRecovery(
         LEFT JOIN relay_thread_vm_restores r ON r.thread_id=t.thread_id AND r.operation_id=t.operation_id
         LEFT JOIN relay_thread_vm_final_saves f ON f.thread_id=t.thread_id AND f.operation_id=t.operation_id
         LEFT JOIN LATERAL (
-          SELECT d.operation_id FROM relay_thread_vm_saved_disks d JOIN relay_thread_vm_final_saves f USING(operation_id)
-          WHERE d.thread_id=t.thread_id AND d.generation=t.generation AND d.phase='available' AND f.phase='completed'
+          SELECT s.operation_id FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_final_saves f USING(operation_id)
+          WHERE s.thread_id=t.thread_id AND s.phase='available' AND f.phase='completed'
+            AND (s.generation=t.generation OR ${savedDiskHasCancelledRestorePlacement(sql)})
+            AND f.source_receipt#>>'{workflowCheckpoint,jobId}'=${row.jobId}
             AND f.source_receipt#>>'{workflowCheckpoint,checkpointId}'=${progress.checkpoint.checkpointId}
             AND f.source_receipt#>>'{workflowCheckpoint,checkpointGeneration}'=${String(progress.checkpoint.generation ?? 0)}
             AND EXISTS (SELECT 1 FROM relay_workflow_recovery_heads h WHERE h.job_id=${row.jobId}
               AND f.source_receipt#>>'{workflowCheckpoint,publicationId}'=h.publication_id
               AND f.source_receipt#>>'{workflowCheckpoint,publicationRevision}'=h.revision::text)
-          ORDER BY d.generation DESC LIMIT 1
+          ORDER BY s.generation DESC,s.saved_at DESC,s.operation_id DESC LIMIT 1
         ) d ON true
         WHERE t.thread_id=${threadId} AND t.workflow_job_id=${row.jobId} AND t.audience='repository'`;
           if (!placement) return null;

@@ -6,6 +6,8 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { E2BNativeSnapshotReceipt } from "../machines/E2BNativeSnapshotReceipt.ts";
+import { lockWorkflowVmCheckpoint } from "../jobs/WorkflowVmCheckpoint.ts";
+import type { WorkflowJobRecord } from "../jobs/Workflows.ts";
 import {
   NativeThreadVmRestoreCatalogReceipt,
   type NativeThreadVmRestoreBootReceipt,
@@ -14,7 +16,10 @@ import type { ThreadVmWarmRestoreBootstrapReceipt } from "@t3tools/contracts/rel
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
-import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
+import {
+  lockReadyWorkflowVmCodexConnection,
+  makeThreadVmCapacityStore,
+} from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmSavedDiskStore } from "./ThreadVmSavedDiskStore.ts";
 import { makeThreadVmRecoveryHistory } from "./ThreadVmRecoveryHistory.ts";
 import type { RelayThreadVmIndependentHistory } from "@t3tools/contracts/relay";
@@ -419,7 +424,7 @@ export function makeThreadVmRestoreStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId"
         FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
-        JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
+        JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id AND c.allocation_id=r.allocation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         WHERE r.host_id=${hostId} AND r.phase IN ('pending','preparing','prepared','aborting') AND r.committed_at IS NULL
           AND a.runtime_protocol='native-v1' AND a.resource_kind IN ('personal','organization_workflow')
@@ -430,8 +435,16 @@ export function makeThreadVmRestoreStore(
         if (!candidate) return null;
         const row = yield* lock(candidate.operationId);
         const id = yield* (yield* Crypto.Crypto).randomUUIDv4;
-        yield* sql`UPDATE relay_thread_vm_restores SET claim_id=${id},claim_until=clock_timestamp()+interval '3 minutes'
-        WHERE operation_id=${row.operationId}`;
+        const [claimed] =
+          yield* sql`UPDATE relay_thread_vm_restores r SET claim_id=${id},claim_until=clock_timestamp()+interval '3 minutes'
+          WHERE r.operation_id=${row.operationId} AND r.committed_at IS NULL
+            AND r.phase IN ('pending','preparing','prepared','aborting')
+            AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
+            AND (r.phase!='prepared' OR NOT r.serving_requested)
+            AND (r.phase='aborting' OR EXISTS(SELECT 1 FROM relay_thread_vm_capacity c
+              WHERE c.operation_id=r.operation_id AND c.allocation_id=r.allocation_id AND c.state='reserved'))
+          RETURNING r.operation_id`;
+        if (!claimed) return null;
         return { ...row, claimId: id };
       }),
     );
@@ -443,18 +456,65 @@ export function makeThreadVmRestoreStore(
     if (!valid) return yield* conflict("Restore worker claim expired or changed.");
     return row;
   });
+  /** Call with the workflow, placement and restore locked, before issuing a native boot. */
+  const parkForCodex = Effect.fnUntraced(function* (
+    row: ThreadVmRestore,
+    job: WorkflowJobRecord | null,
+    state: "reserved" | "started",
+  ) {
+    if (!row.workflowCheckpoint) return false;
+    if (job?.jobId !== row.workflowCheckpoint.jobId)
+      return yield* conflict("Workflow restore ownership changed.");
+    const ready = yield* lockReadyWorkflowVmCodexConnection(
+      sql,
+      job.organizationId,
+      job.record.vmAdmission?.codexConnectionId ?? null,
+    );
+    const [current] = yield* sql`SELECT 1 FROM relay_thread_vm_restores
+      WHERE operation_id=${row.operationId} AND claim_id=${row.claimId} AND claim_until>clock_timestamp()`;
+    if (!current) return yield* conflict("Restore worker claim expired or changed.");
+    if (ready) return false;
+    const [parked] = yield* sql`UPDATE relay_thread_vm_capacity c SET state='waiting'
+      FROM relay_thread_vm_restores r,relay_thread_vm_allocations a
+      WHERE c.operation_id=${row.operationId} AND c.allocation_id=${row.allocationId}
+        AND c.kind='create' AND c.host_id=${row.hostId} AND c.state=${state} AND c.compute_ref IS NULL
+        AND r.operation_id=c.operation_id AND r.phase=${row.phase} AND r.claim_id=${row.claimId}
+        AND r.claim_until>clock_timestamp() AND r.boot_create_started_at IS NULL AND r.boot_receipt IS NULL
+        AND r.boot_recovery_started_at IS NULL AND r.boot_ingress_recovery_claim_id IS NULL
+        AND a.allocation_id=c.allocation_id AND a.state='creating' AND a.compute_ref IS NULL AND a.deleted_at IS NULL
+        AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_enrollments e WHERE e.allocation_id=a.allocation_id)
+        AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_bindings b WHERE b.allocation_id=a.allocation_id)
+      RETURNING c.operation_id`;
+    if (!parked)
+      return yield* conflict("The unissued restore reservation changed before waiting for Codex.");
+    yield* sql`UPDATE relay_thread_vm_restores SET claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp()
+      WHERE operation_id=${row.operationId} AND claim_id=${row.claimId}`;
+    return true;
+  });
+  const lockPreparation = Effect.fnUntraced(function* (
+    input: ThreadVmRestoreClaim,
+    prior: ThreadVmRestore | null,
+  ) {
+    const workflowJobId = prior?.workflowCheckpoint?.jobId;
+    const job = workflowJobId ? yield* lockWorkflowVmCheckpoint(sql, workflowJobId) : null;
+    const row = yield* requireClaim(input);
+    if (row.workflowCheckpoint?.jobId !== workflowJobId)
+      return yield* conflict("Workflow restore ownership changed.");
+    return { row, job };
+  });
   const beginPrepare = Effect.fn("relay.thread_vm.restore.begin_prepare")(function* (
     input: ThreadVmRestoreClaim,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const row = yield* requireClaim(input);
+        const { row, job } = yield* lockPreparation(input, yield* get(input.operationId));
         if (
           !["pending", "preparing", "prepared"].includes(row.phase) ||
           row.servingCommitted ||
           (yield* capacity.get(row.operationId))?.state !== "reserved"
         )
           return yield* conflict("Restore catalog validation requires reserved capacity.");
+        if (yield* parkForCodex(row, job, "reserved")) return null;
         yield* requireRecovery(row);
         yield* sql`UPDATE relay_thread_vm_restores SET phase='preparing',prepare_started_at=COALESCE(prepare_started_at,clock_timestamp()) WHERE operation_id=${row.operationId}`;
         return (yield* get(row.operationId))!;
@@ -470,7 +530,7 @@ export function makeThreadVmRestoreStore(
     );
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const row = yield* requireClaim(input);
+        const { row, job } = yield* lockPreparation(input, yield* get(input.operationId));
         yield* requireRecovery(row);
         if (
           !["preparing", "prepared"].includes(row.phase) ||
@@ -480,6 +540,7 @@ export function makeThreadVmRestoreStore(
           return yield* conflict(
             "Native catalog does not identify the selected immutable snapshot.",
           );
+        yield* parkForCodex(row, job, "reserved");
         yield* sql`UPDATE relay_thread_vm_restores SET phase='prepared',prepared_receipt=${sql.json(decoded)},claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
         return (yield* get(row.operationId))!;
       }),
@@ -556,6 +617,27 @@ export function makeThreadVmRestoreStore(
       WHERE operation_id=${input.operationId} AND claim_id=${input.claimId}
         AND claim_until>clock_timestamp() AND phase NOT IN ('aborted','completed')`;
   });
+  const deferPreparation = Effect.fn("relay.thread_vm.restore.defer_preparation")(function* (
+    input: ThreadVmRestoreClaim,
+    errorCode: string,
+  ) {
+    const prior = yield* get(input.operationId);
+    if (!prior?.workflowCheckpoint) return yield* defer(input, errorCode);
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const { row, job } = yield* lockPreparation(input, prior);
+          if (
+            !row.servingCommitted &&
+            (row.phase === "pending" || row.phase === "preparing" || row.phase === "prepared") &&
+            (yield* parkForCodex(row, job, "reserved"))
+          )
+            return;
+          yield* defer(input, errorCode);
+        }),
+      )
+      .pipe(Effect.catchTag("ThreadVmRestoreConflict", () => defer(input, errorCode)));
+  });
   return {
     get,
     begin,
@@ -567,6 +649,8 @@ export function makeThreadVmRestoreStore(
     requestAbort,
     completeAbort,
     defer,
+    deferPreparation,
+    parkForCodex,
     // Shared by the serving coordinator; each mutation remains in its caller's transaction.
     lock,
     requireClaim,

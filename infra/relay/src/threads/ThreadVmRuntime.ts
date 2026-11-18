@@ -320,9 +320,16 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
         settings.hostId,
       ).runOne();
   }
-  const restoring = yield* sql`SELECT 1 FROM relay_thread_vm_restores
-    WHERE host_id=${settings.hostId} AND phase IN ('pending','preparing','prepared','aborting')
-      AND retry_at<=clock_timestamp() LIMIT 1`;
+  const restoring = yield* sql`SELECT 1 FROM relay_thread_vm_restores r
+    WHERE r.host_id=${settings.hostId} AND r.retry_at<=clock_timestamp()
+      AND (r.phase IN ('pending','preparing','prepared','aborting')
+        OR (${settings.restoreEnabled && settings.workflowExecutionEnabled === true}
+          AND r.phase='committed' AND r.serving_requested AND r.boot_create_started_at IS NULL
+          AND r.boot_receipt IS NULL AND r.boot_ingress_recovery_claim_id IS NULL
+          AND EXISTS (SELECT 1 FROM relay_thread_vm_capacity c JOIN relay_thread_vm_allocations a USING(allocation_id)
+            WHERE c.operation_id=r.operation_id AND c.allocation_id=r.allocation_id
+              AND c.kind='create' AND c.state='waiting' AND a.resource_kind='organization_workflow')))
+    LIMIT 1`;
   if (restoring.length) {
     const objects = yield* ThreadArtifactObjectStorage;
     const relay = yield* RelayConfiguration;
