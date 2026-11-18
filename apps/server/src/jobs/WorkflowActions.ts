@@ -1000,10 +1000,17 @@ export const make = Effect.gen(function* () {
           const { raw } = yield* approvedObject(pushed, head);
           yield* catchUp(pushed, head, raw);
           const marker = `<!-- launchpad-workflow-job:${run.jobId} -->`;
+          const pullNumber = (url: string) => {
+            const match =
+              /^https:\/\/github\.com\/([a-zA-Z0-9-]+\/[a-zA-Z0-9_.-]+)\/pull\/([1-9][0-9]*)$/u.exec(
+                url,
+              );
+            if (!match || match[1]?.toLowerCase() !== repository.toLowerCase()) return null;
+            const number = Number(match[2]);
+            return Number.isSafeInteger(number) ? number : null;
+          };
           const checkedPull = (pr: WorkflowVmPullRequest) =>
-            pr.number > 0 &&
-            pr.html_url.toLowerCase() ===
-              `https://${canonicalKey}/pull/${pr.number}`.toLowerCase() &&
+            pullNumber(pr.html_url) === pr.number &&
             pr.base.ref === run.baseBranch &&
             pr.head.ref === branch &&
             pr.base.repo.full_name.toLowerCase() === repository.toLowerCase() &&
@@ -1011,12 +1018,12 @@ export const make = Effect.gen(function* () {
           const lookup = Effect.fnUntraced(function* () {
             const known = (yield* io.read).publication?.pullRequestUrl;
             if (known) {
-              const number = Number(/\/pull\/([1-9][0-9]*)$/u.exec(known)?.[1]);
-              if (Number.isSafeInteger(number) && number > 0) {
+              const number = pullNumber(known);
+              if (number !== null) {
                 const pr = yield* protectedGit
                   .getPull(readToken.token, number)
                   .pipe(Effect.mapError(error));
-                if (checkedPull(pr) && pr.html_url === known) return pr;
+                if (pr.number === number && checkedPull(pr)) return pr;
               }
               return yield* new WorkflowActionError({
                 message: "The recorded PR no longer matches this job.",

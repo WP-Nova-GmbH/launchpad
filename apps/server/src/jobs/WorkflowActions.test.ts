@@ -748,7 +748,7 @@ for (const fault of ["commit-reply", "push-reply", "pr-reply"] as const)
   );
 
 it.effect(
-  "recovers a lost VM Push with real Git and checks the PR SHA without creating it twice",
+  "recovers a lost VM Push and recognizes the recorded GitHub PR without creating it twice",
   () =>
     Effect.gen(function* () {
       const { base, cwd, fs, driver, git } = yield* makeRealGit();
@@ -840,7 +840,7 @@ it.effect(
       const rejected = new Set<string>();
       const recoveredActions: string[] = [];
       const events: string[] = [];
-      const prUrl = "https://github.com/acme/repo/pull/1";
+      const prUrl = "https://github.com/Acme/Repo/pull/1";
       const bot = { name: "app[bot]", email: "123+app[bot]@users.noreply.github.com" };
       const io: WorkflowActionIO = {
         read: Effect.sync(() => state),
@@ -1064,6 +1064,26 @@ it.effect(
       assert.match(mismatch.message, /pull request head changed/i);
       assert.equal(state.publication!.pullRequestUrl, prUrl);
       assert.notEqual(state.actions![1]!.state, "completed");
+
+      const setSavedPull = (pullRequestUrl: string) =>
+        io.update((run) => ({ ...run, publication: { ...run.publication!, pullRequestUrl } }));
+      prHead = published;
+      for (const invalid of [
+        "https://github.com/other/repo/pull/1",
+        "https://github.com/acme/repo/PULL/1",
+      ]) {
+        yield* setSavedPull(invalid);
+        const invalidReceipt = yield* Effect.flip(execute("pr", restoredDir));
+        assert.match(invalidReceipt.message, /recorded PR no longer matches/i);
+      }
+
+      yield* setSavedPull(prUrl.toLowerCase());
+      prHead = "3".repeat(40);
+      const changedHead = yield* Effect.flip(execute("pr", restoredDir));
+      assert.match(changedHead.message, /pull request head changed/i);
+      assert.notInclude(events, "settle-pr");
+
+      yield* setSavedPull(prUrl.toLowerCase());
       prHead = published;
       yield* execute("pr", restoredDir);
       assert.equal(prCount, 1);

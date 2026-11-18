@@ -142,7 +142,7 @@ export const ensureWorkflowPublishingSavedDisk = Effect.fnUntraced(function* (
     SELECT ${operationId},a.thread_id,a.allocation_id,b.source_receipt->>'environmentId',
       b.generation,c.host_id,b.compute_ref,'running','source_loss',0,NULL,'completed',
       b.source_receipt,(b.source_receipt->>'sourceSequence')::int,
-      b.source_receipt->>'nativeCheckpointOperationId',b.operation_id,b.verified_at,a.deleted_at
+      b.source_receipt->>'nativeCheckpointOperationId',b.operation_id,b.verified_at,a.deleted_at::timestamptz
     FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id)
     JOIN LATERAL (SELECT host_id FROM relay_thread_vm_capacity c
       WHERE c.allocation_id=a.allocation_id AND c.compute_ref=b.compute_ref

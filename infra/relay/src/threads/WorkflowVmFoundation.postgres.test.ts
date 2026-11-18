@@ -29,6 +29,8 @@ import { makeThreadVmActivityWorker } from "./ThreadVmActivityWorker.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
 import { makeThreadVmBackupStore } from "./ThreadVmBackupStore.ts";
+import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
+import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadVmFinalSaveDeletionWorker } from "./ThreadVmFinalSaveDeletionWorker.ts";
 import { makeThreadVmFinalSaveWorker } from "./ThreadVmFinalSaveWorker.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
@@ -78,8 +80,8 @@ import {
 } from "../environments/EnvironmentConnector.ts";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { RelayConfiguration } from "../Config.ts";
-import { Organizations } from "../tenancy/Organizations.ts";
-import { Repositories } from "../tenancy/Repositories.ts";
+import { Organizations, layer as organizations } from "../tenancy/Organizations.ts";
+import { Repositories, layer as repositories } from "../tenancy/Repositories.ts";
 import { Machines } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
 import { WorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
@@ -612,6 +614,250 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect(cancelled?.progress?.executionReleased).toBe(true);
           expect(cancelled?.publicationOutcome?.state).toBe("unknown");
         }).pipe(Effect.provide(Layer.merge(workflows, NodeFileSystem.layer))),
+    );
+
+    it.effect("cold publishing Retry catalogs a pinned backup once after source loss", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow();
+        const {
+          sql,
+          allocationId,
+          organizationId,
+          ownerUserId,
+          repositoryId,
+          threadId,
+          workflowJobId,
+        } = f;
+        const fs = yield* FileSystem.FileSystem;
+        const objects = makeLocalThreadArtifactObjects(fs, yield* fs.makeTempDirectoryScoped());
+        const store = yield* Workflows;
+        const job = (yield* store.getJob(workflowJobId))!.record;
+        const { computeRef } = (yield* makeThreadVmAllocationStore(sql).getAny(allocationId))!;
+        const backupOperationId = NodeCrypto.randomUUID();
+        const retentionOperationId = NodeCrypto.randomUUID();
+        const captureOperationId = NodeCrypto.randomUUID();
+        const nativeCheckpointOperationId = NodeCrypto.randomUUID();
+        const attachmentOperationId = NodeCrypto.randomUUID();
+        const publicationId = NodeCrypto.randomUUID();
+        const workflowCheckpoint = {
+          jobId: workflowJobId,
+          checkpointId: "review-before-publishing",
+          checkpointGeneration: 0,
+          publicationId,
+          publicationRevision: 1,
+        };
+        const binding = {
+          ...f.principal.threadVm,
+          jobId: workflowJobId,
+          organizationId,
+          environmentId: f.owner.environmentId,
+          operationId: f.operationId,
+          projectId: `vm:${threadId}`,
+        };
+        const sha256 = "a".repeat(64);
+        const manifests = [
+          { operationId: nativeCheckpointOperationId, artifactId: NodeCrypto.randomUUID() },
+          { operationId: attachmentOperationId, artifactId: NodeCrypto.randomUUID() },
+        ] as const;
+        // Seed the already verified conversation and attachment manifests. The restore checks both pins.
+        for (const { operationId, artifactId } of manifests) {
+          yield* sql`INSERT INTO relay_thread_artifacts
+            (artifact_id,thread_id,operation_id,kind,storage_key,sha256,size_bytes,state)
+            VALUES(${artifactId},${threadId},${operationId},'manifest',${artifactId},${sha256},1,'complete')`;
+          yield* sql`INSERT INTO relay_thread_artifact_pins(artifact_id,operation_id)
+            VALUES(${artifactId},${`native-checkpoint:${nativeCheckpointOperationId}`})`;
+        }
+        const point = {
+          sourceEnvironmentId: f.owner.environmentId,
+          generation: 1,
+          sourceSequence: 0,
+          nativeThreadId: NodeCrypto.randomUUID(),
+        };
+        yield* sql`INSERT INTO relay_thread_native_checkpoints
+          (operation_id,thread_id,turn_id,capture_operation_id,source_environment_id,generation,source_sequence,
+            native_thread_id,native_manifest_sha256,archive_sha256,manifest_artifact_id,manifest_sha256,artifact_count)
+          VALUES(${nativeCheckpointOperationId},${threadId},'agent-turn',${captureOperationId},
+            ${point.sourceEnvironmentId},${point.generation},${point.sourceSequence},${point.nativeThreadId},
+            ${sha256},${sha256},${manifests[0].artifactId},${sha256},2)`;
+        yield* sql`INSERT INTO relay_thread_attachment_checkpoints
+          (native_checkpoint_operation_id,operation_id,manifest_artifact_id,manifest_sha256,attachment_manifest_sha256,artifact_count)
+          VALUES(${nativeCheckpointOperationId},${attachmentOperationId},${manifests[1].artifactId},${sha256},${sha256},1)`;
+        yield* sql`INSERT INTO relay_workflow_recovery_records
+          (publication_id,job_id,thread_id,revision,manifest_artifact_id,manifest_sha256,manifest_size_bytes,manifest)
+          VALUES(${publicationId},${workflowJobId},${threadId},1,${NodeCrypto.randomUUID()},${sha256},1,${sql.json({ binding })})`;
+        yield* sql`INSERT INTO relay_thread_vm_backups
+          (operation_id,allocation_id,generation,compute_ref,snapshot_name,phase,source_receipt)
+          VALUES(${backupOperationId},${allocationId},1,${computeRef},${backupOperationId},'pending',${sql.json(
+            {
+              allocationId,
+              computeRef,
+              threadId,
+              generation: 1,
+              environmentId: f.owner.environmentId,
+              provisionOperationId: f.operationId,
+              captureOperationId,
+              bootId: NodeCrypto.randomUUID(),
+              sealEpoch: 1,
+              sourceSequence: point.sourceSequence,
+              nativeCheckpointOperationId,
+              workflowCheckpoint,
+            },
+          )})`;
+        const backups = makeThreadVmBackupStore(sql);
+        const capture = (yield* backups.claim(f.hostId))!;
+        expect(yield* backups.beginCapture(capture)).toBe(true);
+        const sourceBuildId = NodeCrypto.randomUUID();
+        expect(
+          yield* backups.recordCapture(capture, {
+            snapshotId: backupOperationId,
+            sourceTemplateId: backupOperationId,
+            sourceBuildId,
+          }),
+        ).toBe(true);
+        yield* makeThreadVmBackupRetentionStore(sql).pin({
+          threadId,
+          backupOperationId,
+          operationId: retentionOperationId,
+        });
+        yield* makeThreadNativeCheckpointStore(sql, objects).pinCompleteForOperation({
+          threadId,
+          operationId: retentionOperationId,
+          checkpointOperationId: nativeCheckpointOperationId,
+          expected: point,
+        });
+
+        const step = {
+          kind: "action",
+          id: "open-pr",
+          title: "Open PR",
+          action: "open_pull_request",
+        } as const;
+        const push = { kind: "action", id: "push", title: "Push branch", action: "push" } as const;
+        const actionId = `workflow:${workflowJobId}:action:${step.id}:0`;
+        const action = {
+          actionId,
+          stepId: step.id,
+          generation: 0,
+          operation: step.action,
+          state: "uncertain",
+          detail: null,
+          commitSha: "b".repeat(40),
+          pullRequestUrl: "https://github.com/acme/example/pull/1",
+          retryable: true,
+        } as const;
+        const record: RepositoryWorkflowJob = {
+          ...job,
+          status: "paused",
+          workflow: {
+            ...job.workflow!,
+            definition: {
+              ...job.workflow!.definition,
+              steps: [...job.workflow!.definition.steps, push, step],
+            },
+          },
+          progress: {
+            revision: 5,
+            status: "paused",
+            threadId: ThreadId.make(threadId),
+            checkpoint: null,
+            detail: null,
+            stepId: step.id,
+            generation: 0,
+            actions: [action],
+          },
+        };
+        yield* sql`UPDATE relay_workflow_jobs SET status='paused',record=${sql.json(record)} WHERE job_id=${workflowJobId}`;
+        yield* sql`INSERT INTO relay_workflow_vm_publications(job_id,action_id,record)
+          VALUES(${workflowJobId},${actionId},${sql.json({
+            ...action,
+            stepGeneration: 0,
+            resultTurnId: "agent-turn",
+            checkpointRef: "refs/t3/result",
+            tree: "c".repeat(40),
+            parent: "a".repeat(40),
+            oldRemoteSha: action.commitSha,
+            canonicalKey: "github.com/acme/example",
+            installationId: "1",
+            branch: `launchpad/${workflowJobId}`,
+            baseBranch: "main",
+            binding,
+            recoverySource: { backupOperationId, retentionOperationId },
+            outcome: null,
+          })})`;
+        yield* sql`INSERT INTO relay_organizations VALUES(${organizationId},'Organization','2026','2026')`;
+        yield* sql`INSERT INTO relay_organization_members VALUES(${organizationId},${ownerUserId},'admin','2026','2026')`;
+        yield* sql`INSERT INTO relay_thread_vm_policies(organization_id) VALUES(${organizationId}) ON CONFLICT DO NOTHING`;
+        expect(
+          yield* makeThreadVmFinalSaveStore(sql, objects).reconcileMissingWorkflowSource({
+            allocationId,
+            threadId,
+            hostId: f.hostId,
+            generation: 1,
+            computeRef: computeRef!,
+            provisionOperationId: f.operationId,
+          }),
+        ).toBe(true);
+        expect(
+          yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks WHERE thread_id=${threadId}`,
+        ).toEqual([]);
+
+        const retry = respondToWorkflowJob(
+          { repositoryId, jobId: workflowJobId },
+          { operation: "retry_action", actionId, expectedRevision: 5 },
+        ).pipe(
+          Effect.provideService(RelayClientPrincipal, { userId: ownerUserId, token: "test" }),
+          Effect.provideService(ThreadArtifactObjectStorage, objects),
+          Effect.provide(
+            Layer.mergeAll(
+              organizations,
+              repositories,
+              Layer.mock(EnvironmentConnector)({ dispatchJob: () => Effect.die("Source is gone") }),
+              Layer.mock(Machines)({}),
+              Layer.mock(OrganizationProjectCatalog)({}),
+            ),
+          ),
+        );
+        expect((yield* retry).responsePending).toBe(true);
+        const retryId = (yield* store.getJob(workflowJobId))!.pendingControl!.responseId!;
+        expect((yield* retry).responsePending).toBe(true);
+        expect((yield* store.getJob(workflowJobId))!.pendingControl?.responseId).toBe(retryId);
+        const disks = yield* sql<{ operationId: string }>`SELECT d.operation_id AS "operationId",
+          d.backup_operation_id AS "backupOperationId",d.restore_operation_id AS "restoreOperationId",
+          s.completed_at=a.deleted_at::timestamptz AS "usesSourceDeletionTime"
+          FROM relay_thread_vm_saved_disks d JOIN relay_thread_vm_final_saves s USING(operation_id)
+          JOIN relay_thread_vm_allocations a ON a.allocation_id=s.allocation_id
+          WHERE d.thread_id=${threadId}`;
+        expect(disks).toEqual([
+          {
+            operationId: expect.any(String),
+            backupOperationId,
+            restoreOperationId: retryId,
+            usesSourceDeletionTime: true,
+          },
+        ]);
+        expect(
+          yield* sql`SELECT operation_id AS "operationId",allocation_id AS "allocationId",
+          saved_disk_operation_id AS "savedDiskOperationId", phase
+          FROM relay_thread_vm_restores WHERE thread_id=${threadId}`,
+        ).toEqual([
+          {
+            operationId: retryId,
+            allocationId: retryId,
+            savedDiskOperationId: disks[0]!.operationId,
+            phase: "pending",
+          },
+        ]);
+        expect(
+          yield* sql`SELECT a.allocation_id AS "allocationId",c.operation_id AS "capacityId"
+          FROM relay_thread_vm_allocations a JOIN relay_thread_vm_capacity c USING(allocation_id)
+          WHERE a.thread_id=${threadId} AND a.deleted_at IS NULL`,
+        ).toEqual([
+          {
+            allocationId: retryId,
+            capacityId: retryId,
+          },
+        ]);
+      }).pipe(Effect.provide(Layer.merge(workflows, NodeFileSystem.layer))),
     );
 
     for (const outcome of [
