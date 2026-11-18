@@ -593,7 +593,7 @@ const managedEndpointSweepLayer =
 const main = Effect.gen(function* () {
   const nodeHttp = yield* Effect.promise(() => import("node:http"));
   const threadVmSettings = yield* loadDevThreadVmRuntimeSettings;
-  yield* Effect.logInfo("Development relay listening", { port, issuer: relayIssuer, databaseUrl });
+  yield* Effect.logInfo("Development relay listening", { port, issuer: relayIssuer });
   // Handler requirements are deferred to the serve step rather than discharged
   // by the group layers, so this is where the runtime has to be supplied.
   return yield* Layer.launch(
