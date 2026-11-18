@@ -57,11 +57,9 @@ const setup = Effect.gen(function* () {
     max_running_workflow_vms integer NOT NULL DEFAULT 10
   )`;
   // This admission fixture omits the native VM migration chain. The queued Cancel
-  // path can retire an unused preparation, so provide its four empty lookup tables.
-  yield* sql`CREATE TABLE relay_thread_placements (
-    thread_id text PRIMARY KEY, workflow_job_id text, organization_id text,
-    repository_id text, environment_id text
-  )`;
+  // path can retire an unused preparation, so extend the shared placement table
+  // and provide the other empty lookup tables.
+  yield* sql`ALTER TABLE relay_thread_placements ADD COLUMN environment_id text`;
   yield* sql`CREATE TABLE relay_thread_vm_allocations (
     allocation_id text PRIMARY KEY, thread_id text, resource_kind text,
     state text, compute_ref text, deleted_at text
@@ -205,6 +203,42 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
         expect(rejected).toMatchObject({
           _tag: "WorkflowInvalidError",
           message: expect.stringContaining("Connect Codex"),
+        });
+        expect(yield* (yield* Workflows).listJobs("repo")).toHaveLength(0);
+      }),
+    ),
+  );
+
+  it.live("reports the saved revision rejected by GitHub preflight", () =>
+    testAdmission(
+      Effect.gen(function* () {
+        const branch = "release/missing";
+        const edited = yield* saveRepositoryWorkflow("repo", {
+          workflowId: request.workflowId,
+          expectedRevision: 1,
+          definition: { ...definition, target: { kind: "vm", baseBranch: branch } },
+          archived: false,
+        }).pipe(withPrincipal("maintainer"));
+
+        const rejection = yield* runRepositoryWorkflow("repo", request).pipe(
+          Effect.provide(
+            Layer.mock(GithubApp)({
+              resolveRepositoryBranch: (input) => {
+                expect(input.baseBranch).toBe(branch);
+                return new GithubRequestFailed({
+                  operation: "read-branch",
+                  status: 404,
+                  cause: "fixture",
+                });
+              },
+            }),
+          ),
+          Effect.flip,
+        );
+        expect(rejection).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          vmStartFailure: { kind: "base-branch-unavailable", branch },
+          vmStartFailureRevision: edited.revision,
         });
         expect(yield* (yield* Workflows).listJobs("repo")).toHaveLength(0);
       }),
@@ -396,7 +430,9 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
           const queued = yield* runRepositoryWorkflow("repo", request);
           const sql = (yield* RelayDb).$client;
           const threadId = `workflow:${queued.jobId}`;
-          yield* sql`INSERT INTO relay_thread_placements VALUES (${threadId},${queued.jobId},'org','repo',NULL)`;
+          yield* sql`INSERT INTO relay_thread_placements
+            (thread_id,workflow_job_id,organization_id,repository_id)
+            VALUES (${threadId},${queued.jobId},'org','repo')`;
           yield* sql`INSERT INTO relay_thread_vm_allocations VALUES
             (${queued.jobId},${threadId},'organization_workflow','creating',NULL,NULL)`;
           yield* sql`INSERT INTO relay_thread_vm_capacity VALUES (${queued.jobId},${queued.jobId},'waiting')`;

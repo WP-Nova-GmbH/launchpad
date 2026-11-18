@@ -329,7 +329,12 @@ export async function runWorkflowDraft(
   scope: WorkflowScope,
   id: string,
   intent:
-    | { kind: "start"; targetKind: WorkflowTarget["kind"]; replaceUncertain?: boolean }
+    | {
+        kind: "start";
+        targetKind: WorkflowTarget["kind"];
+        replaceUncertain?: boolean;
+        retryStart?: boolean;
+      }
     | { kind: "recover"; replayOnly: boolean },
   start: (payload: typeof RunRepositoryWorkflow.Type) => Promise<RepositoryWorkflowJob>,
 ) {
@@ -354,12 +359,26 @@ export async function runWorkflowDraft(
       ...(intent.targetKind === "vm" ? { targetKind: "vm" } : {}),
     };
   }
+  const retryingStart =
+    intent.kind === "start" &&
+    intent.retryStart &&
+    !previous &&
+    operation.targetKind === "vm" &&
+    draft.vmStartFailure?.kind === "github-verification-temporary";
   if (
     !updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
       ...state,
       runs: {
         ...state.runs,
-        [key]: { ...draft, operation, recovery, error: null, startedJobId: null },
+        [key]: {
+          ...draft,
+          operation,
+          recovery,
+          error: null,
+          startedJobId: null,
+          vmStartFailure: retryingStart ? draft.vmStartFailure : undefined,
+          vmStartFailureRevision: retryingStart ? draft.vmStartFailureRevision : undefined,
+        },
       },
     }))
   )
@@ -388,6 +407,8 @@ export async function runWorkflowDraft(
             recovery: undefined,
             startedJobId: job.jobId,
             error: null,
+            vmStartFailure: undefined,
+            vmStartFailureRevision: undefined,
           },
         },
       };
@@ -397,6 +418,14 @@ export async function runWorkflowDraft(
     const rejected =
       intent.kind === "start" &&
       (cause instanceof WorkflowRequestNotSentError || definitiveRejection(cause));
+    const vmStartRejection =
+      rejected &&
+      !previous &&
+      operation.targetKind === "vm" &&
+      isRequestFailed(cause) &&
+      isInvalid(cause.cause)
+        ? cause.cause
+        : undefined;
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const current = state.runs[key];
       if (current?.operation !== operation) return state;
@@ -413,6 +442,8 @@ export async function runWorkflowDraft(
                 : undefined,
             startedJobId: rejected ? draft.startedJobId : current.startedJobId,
             error: workflowError(cause),
+            vmStartFailure: vmStartRejection?.vmStartFailure,
+            vmStartFailureRevision: vmStartRejection?.vmStartFailureRevision,
           },
         },
       };

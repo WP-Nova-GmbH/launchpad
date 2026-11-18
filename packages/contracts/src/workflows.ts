@@ -757,10 +757,28 @@ export class WorkflowConflictError extends Schema.TaggedError<WorkflowConflictEr
   },
   { httpApiStatus: 409 },
 ) {}
+export const VmWorkflowStartFailure = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("github-access-missing"),
+    permission: Schema.optionalKey(
+      Schema.Literals(["contents-read", "contents-write", "contents-and-pull-requests-write"]),
+    ),
+    repository: Schema.optionalKey(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("base-branch-unavailable"),
+    branch: WorkflowVmTarget.fields.baseBranch,
+  }),
+  Schema.Struct({ kind: Schema.Literal("github-verification-temporary") }),
+]);
+export type VmWorkflowStartFailure = typeof VmWorkflowStartFailure.Type;
+
 export class WorkflowInvalidError extends Schema.TaggedError<WorkflowInvalidError>()(
   "WorkflowInvalidError",
   {
     message: Schema.String,
+    vmStartFailure: Schema.optionalKey(VmWorkflowStartFailure),
+    vmStartFailureRevision: Schema.optionalKey(RepositoryWorkflow.fields.revision),
   },
   { httpApiStatus: 400 },
 ) {}

@@ -4,6 +4,7 @@ import { EnvironmentId, ProjectId } from "./baseSchemas.ts";
 import {
   WorkflowDefinition,
   WorkflowCatalog,
+  WorkflowInvalidError,
   WorkflowJobPageQuery,
   WorkflowRuntime,
   RespondToWorkflowJob,
@@ -39,6 +40,32 @@ const definition = (steps: ReadonlyArray<WorkflowStep>) => ({
   steps,
 });
 describe("workflow boundaries", () => {
+  it("round-trips VM start failures and accepts errors from older relays", () => {
+    const decode = Schema.decodeUnknownSync(WorkflowInvalidError);
+    const encode = Schema.encodeSync(WorkflowInvalidError);
+    const legacy = { _tag: "WorkflowInvalidError", message: "Could not start workflow." };
+    for (const error of [
+      legacy,
+      { ...legacy, vmStartFailure: { kind: "github-access-missing" } },
+      {
+        ...legacy,
+        vmStartFailure: {
+          kind: "github-access-missing",
+          permission: "contents-read",
+          repository: "acme/project",
+        },
+      },
+      {
+        ...legacy,
+        vmStartFailure: { kind: "base-branch-unavailable", branch: null },
+        vmStartFailureRevision: 3,
+      },
+      { ...legacy, vmStartFailure: { kind: "github-verification-temporary" } },
+    ]) {
+      expect(encode(decode(error))).toEqual(error);
+    }
+  });
+
   it("separates a VM's saved branch intent from a machine execution binding", () => {
     expect(isDefinition({ ...definition([agent]), target: { kind: "vm", baseBranch: null } })).toBe(
       true,

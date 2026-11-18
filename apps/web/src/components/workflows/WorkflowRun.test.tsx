@@ -946,6 +946,134 @@ describe("VM Run submission recovery", () => {
     );
     expect(draft().startedJobId).toBe(job.jobId);
   });
+
+  it("recovers from an unavailable base branch without retaining its stale alert", async () => {
+    const message = "Choose an existing GitHub base branch with at least one commit.";
+    read.mockRejectedValueOnce(
+      new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        cause: new WorkflowInvalidError({
+          message,
+          vmStartFailure: { kind: "base-branch-unavailable", branch: "release/1.x" },
+          vmStartFailureRevision: vmWorkflow.revision,
+        }),
+      }),
+    );
+    const props = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, canConfigure: true };
+    await mount(props);
+    await submit();
+
+    expect(alertText()).toContain("Base branch unavailable");
+    await press("Edit workflow");
+    expect(navigate).toHaveBeenLastCalledWith({
+      to: "/workflows/$repositoryId/$workflowId/edit",
+      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+      search: { settings: "execution" },
+    });
+
+    await update({
+      ...props,
+      workflow: {
+        ...vmWorkflow,
+        revision: 2,
+        definition: { ...vmWorkflow.definition, target: { kind: "vm", baseBranch: "main" } },
+      },
+    });
+
+    expect(alertText()).toBe("");
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+    await submit();
+    expect(draft().startedJobId).toBe(job.jobId);
+  });
+
+  it.each([2, undefined])(
+    "shows the relay's branch failure when the catalog shows a different branch (rejected revision: %s)",
+    async (revision) => {
+      read.mockRejectedValueOnce(
+        new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: new WorkflowInvalidError({
+            message: "Choose an existing GitHub base branch with at least one commit.",
+            vmStartFailure: { kind: "base-branch-unavailable", branch: "release/2.x" },
+            ...(revision === undefined ? {} : { vmStartFailureRevision: revision }),
+          }),
+        }),
+      );
+      await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true });
+      await submit();
+
+      expect(alertText()).toContain("Base branch unavailable");
+      expect(alertText()).toContain("release/2.x");
+      if (revision !== undefined) expect(alertText()).toMatch(/workflow revision\s+2/);
+      expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+    },
+  );
+
+  it("clears required publishing permissions when a newer revision drops publishing steps", async () => {
+    read.mockRejectedValueOnce(
+      new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        cause: new WorkflowInvalidError({
+          message: "Grant the GitHub App Contents write access.",
+          vmStartFailure: { kind: "github-access-missing", permission: "contents-write" },
+          vmStartFailureRevision: vmWorkflow.revision,
+        }),
+      }),
+    );
+    const props = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true };
+    await mount({
+      ...props,
+      workflow: {
+        ...vmWorkflow,
+        definition: {
+          ...vmWorkflow.definition,
+          steps: [
+            ...vmWorkflow.definition.steps,
+            { id: "push", title: "Push branch", kind: "action", action: "push" },
+          ],
+        },
+      },
+    });
+    await submit();
+
+    expect(alertText()).toContain("Contents write access");
+    await update({ ...props, workflow: { ...vmWorkflow, revision: 2 } });
+    expect(alertText()).toBe("");
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+  });
+
+  it("keeps the same focusable Retry start button through a second verification failure", async () => {
+    const failure = new ManagedRelay.ManagedRelayRequestFailedError({
+      action: "runWorkflow",
+      cause: new WorkflowInvalidError({
+        message: "Could not verify the repository right now.",
+        vmStartFailure: { kind: "github-verification-temporary" },
+        vmStartFailureRevision: vmWorkflow.revision,
+      }),
+    });
+    const reply = deferred<void>();
+    read.mockRejectedValueOnce(failure).mockReturnValueOnce(
+      reply.promise.then(() => {
+        throw failure;
+      }),
+    );
+    await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true });
+    await submit();
+    const retry = button("Retry start");
+
+    await submit();
+    expect(button("Retrying start…")).toBe(retry);
+    expect(retry.props).toMatchObject({ disabled: false, "aria-disabled": true });
+    expect(messages("status").map(visibleText).join(" ")).toContain("Checking GitHub");
+    await submit();
+    expect(read).toHaveBeenCalledTimes(2);
+
+    await accept(reply, undefined);
+    expect(button("Retry start")).toBe(retry);
+    expect(retry.props["aria-disabled"]).toBeUndefined();
+    expect(alertText()).toContain("GitHub verification failed");
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+  });
 });
 
 describe("Uncertain Run confirmation ownership", () => {

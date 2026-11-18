@@ -80,6 +80,7 @@ export class GithubRequestFailed extends Schema.TaggedError<GithubRequestFailed>
   "GithubRequestFailed",
   {
     operation: Schema.Literals([
+      "sign-app-token",
       "read-app",
       "read-installation",
       "mint-token",
@@ -313,7 +314,9 @@ const appJwt = Effect.fn("relay.github.app_jwt")(function* (input: {
         new TextEncoder().encode(signingInput),
       ),
     );
-  }).pipe(Effect.mapError((cause) => new GithubRequestFailed({ operation: "mint-token", cause })));
+  }).pipe(
+    Effect.mapError((cause) => new GithubRequestFailed({ operation: "sign-app-token", cause })),
+  );
   return `${signingInput}.${base64Url(signature)}`;
 });
 

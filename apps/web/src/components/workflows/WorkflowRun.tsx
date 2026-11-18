@@ -8,6 +8,8 @@ import {
   UploadIcon,
   RefreshCwIcon,
   ArrowRightIcon,
+  SettingsIcon,
+  PencilIcon,
 } from "lucide-react";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowRequestNotSentError } from "./workflowOperations";
@@ -41,6 +43,7 @@ import {
 } from "./workflowState";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { searchableSetting } from "../settings/settingsSearch";
 
 type WorkflowRunProps = {
   scope: WorkflowScope;
@@ -49,6 +52,13 @@ type WorkflowRunProps = {
   call: ReturnType<typeof useWorkflowClient>;
   vmExecutionAvailable?: boolean;
   canConfigure?: boolean;
+  organizationAdmin?: boolean;
+};
+
+const githubPermissionLabels = {
+  "contents-read": "Contents read access",
+  "contents-write": "Contents write access",
+  "contents-and-pull-requests-write": "Contents and Pull requests write access",
 };
 
 type AdditionalRunConfirmation = {
@@ -85,6 +95,7 @@ function WorkflowRunForm({
   call,
   vmUnavailable,
   canConfigure = false,
+  organizationAdmin = false,
 }: WorkflowRunProps & { vmUnavailable: boolean }) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
@@ -127,11 +138,6 @@ function WorkflowRunForm({
   const editor = drafts.accountId === scope.accountId ? drafts.editors[key] : undefined;
   const unsavedDefinition =
     !!editor && !sameWorkflowDefinition(editor.definition, workflow.definition);
-  const editWorkflow = () =>
-    navigate({
-      to: "/workflows/$repositoryId/$workflowId/edit",
-      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
-    });
   const backToWorkflows = () =>
     navigate({
       to: "/workflows/$repositoryId",
@@ -153,6 +159,28 @@ function WorkflowRunForm({
   const pending = draft.operation?.state === "pending";
   const uncertain = draft.operation?.state === "uncertain";
   const runBlocked = vmUnavailable || workflow.archived;
+  const rejectedRevision = draft.vmStartFailureRevision;
+  const staleVmStartFailure =
+    draft.vmStartFailure &&
+    (savedTarget.kind !== "vm" ||
+      (rejectedRevision !== undefined && workflow.revision > rejectedRevision));
+  const retryingStart =
+    savedTarget.kind === "vm" &&
+    pending &&
+    draft.vmStartFailure?.kind === "github-verification-temporary";
+  const vmStartFailure =
+    !runBlocked && (retryingStart || (draft.error && !draft.operation && !staleVmStartFailure))
+      ? draft.vmStartFailure
+      : undefined;
+  const editWorkflow = () =>
+    navigate({
+      to: "/workflows/$repositoryId/$workflowId/edit",
+      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+      ...(vmStartFailure?.kind === "base-branch-unavailable"
+        ? { search: { settings: "execution" as const } }
+        : {}),
+    });
+  const canRetryStart = vmStartFailure?.kind === "github-verification-temporary";
   const replayOnly = runBlocked || savedTarget.kind !== "vm";
   const pendingRecovery =
     pending && draft.recovery?.kind !== "additional-rejected" ? draft.recovery : undefined;
@@ -240,6 +268,7 @@ function WorkflowRunForm({
               kind: "start",
               targetKind: savedTarget.kind,
               replaceUncertain: !!confirmed,
+              retryStart: canRetryStart,
             },
         (payload) => {
           const operation = confirmed
@@ -299,8 +328,111 @@ function WorkflowRunForm({
       ? "Check previous submission"
       : "Retry previous submission"
     : "Check runs";
+  let vmStartError;
+  switch (vmStartFailure?.kind) {
+    case "github-access-missing":
+      vmStartError = (
+        <WorkflowAlert
+          title="GitHub access missing"
+          actions={
+            organizationAdmin ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  void navigate({
+                    to: "/settings/organization",
+                    hash: searchableSetting("organization-github").id,
+                  })
+                }
+              >
+                <SettingsIcon aria-hidden />
+                GitHub settings
+              </Button>
+            ) : undefined
+          }
+        >
+          <p>
+            The organization’s GitHub App needs{" "}
+            {vmStartFailure.permission
+              ? githubPermissionLabels[vmStartFailure.permission]
+              : "access"}{" "}
+            to{" "}
+            {vmStartFailure.repository ? (
+              <strong className="font-medium">{vmStartFailure.repository}</strong>
+            ) : (
+              "this repository"
+            )}
+            .
+          </p>
+          {!organizationAdmin ? (
+            <p className="mt-1">
+              Ask an organization admin to grant access, then run the workflow again.
+            </p>
+          ) : null}
+        </WorkflowAlert>
+      );
+      break;
+    case "base-branch-unavailable":
+      vmStartError = (
+        <WorkflowAlert
+          title="Base branch unavailable"
+          actions={
+            canConfigure ? (
+              <Button
+                ref={registerRecoveryRegion}
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={editWorkflow}
+              >
+                <PencilIcon aria-hidden />
+                Edit workflow
+              </Button>
+            ) : undefined
+          }
+        >
+          {rejectedRevision !== undefined && rejectedRevision > workflow.revision ? (
+            <p className="mb-1">The start check used workflow revision {rejectedRevision}.</p>
+          ) : null}
+          {canConfigure ? "Choose" : "Ask a repository maintainer to choose"} an existing GitHub
+          branch with at least one commit in place of{" "}
+          {vmStartFailure.branch ? <code>{vmStartFailure.branch}</code> : "the repository default"}.
+        </WorkflowAlert>
+      );
+      break;
+    case "github-verification-temporary":
+      vmStartError = (
+        <div ref={registerRecoveryRegion}>
+          <WorkflowAlert
+            title={retryingStart ? "Checking GitHub" : "GitHub verification failed"}
+            variant={retryingStart ? "info" : "error"}
+            actions={
+              <Button
+                ref={recoveryControl}
+                type="submit"
+                variant="outline"
+                size="sm"
+                disabled={!draft.instruction.trim()}
+                aria-disabled={retryingStart || undefined}
+              >
+                <RefreshCwIcon aria-hidden />
+                {retryingStart ? "Retrying start…" : "Retry start"}
+              </Button>
+            }
+          >
+            {retryingStart
+              ? "Checking repository access and submitting the run."
+              : "GitHub could not verify the repository right now. Retry to check again and start the run."}
+          </WorkflowAlert>
+        </div>
+      );
+      break;
+  }
   const error =
-    draft.error && !uncertain ? (
+    vmStartError ??
+    (draft.error && !uncertain && !staleVmStartFailure ? (
       <WorkflowAlert
         title="Could not start this run"
         actions={
@@ -311,7 +443,7 @@ function WorkflowRunForm({
       >
         {draft.error} Your instructions are kept.
       </WorkflowAlert>
-    ) : null;
+    ) : null);
   const additionalRunError = additionalRejected ? (
     <WorkflowAlert title="Could not start the additional run">
       {draft.error} Your instructions are kept.
@@ -461,7 +593,7 @@ function WorkflowRunForm({
             <p className="text-xs font-medium">Saved workflow</p>
             <p className="text-xs text-muted-foreground">Revision {workflow.revision}</p>
           </div>
-          {canConfigure ? (
+          {canConfigure && vmStartFailure?.kind !== "base-branch-unavailable" ? (
             <Button
               type="button"
               variant="ghost"
@@ -586,15 +718,23 @@ function WorkflowRunForm({
       ) : (
         <>
           {instructions("Run instructions", true)}
-          <p className="text-xs text-muted-foreground">For this run only.</p>
+          <p className="text-xs text-muted-foreground">
+            {vmStartFailure ? "Your instructions are kept for this run." : "For this run only."}
+          </p>
         </>
       )}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <Button type="button" variant="ghost" size="sm" onClick={backToWorkflows}>
           Back to workflows
         </Button>
-        {!previousSubmission ? (
-          <Button type="submit" size="sm" disabled={pending || !draft.instruction.trim()}>
+        {!previousSubmission && !canRetryStart ? (
+          <Button
+            ref={registerRecoveryRegion}
+            type="submit"
+            size="sm"
+            disabled={!draft.instruction.trim()}
+            aria-disabled={pending || undefined}
+          >
             <PlayIcon aria-hidden />
             {pending ? "Submitting…" : "Run workflow"}
           </Button>

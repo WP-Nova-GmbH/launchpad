@@ -659,7 +659,8 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
     const githubApp = yield* Effect.serviceOption(GithubApp);
     if (Option.isNone(githubApp))
       return yield* new WorkflowInvalidError({
-        message: "Configure the GitHub App for this organization before running a VM workflow.",
+        message:
+          "Ask your Launchpad operator to configure the GitHub App before running this VM workflow.",
       });
     const github = yield* resolveWorkflowVmGitHub({
       organizationId,
@@ -668,7 +669,15 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
       publishingSteps: workflow.definition.steps,
     }).pipe(
       Effect.provideService(GithubApp, githubApp.value),
-      Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })),
+      Effect.mapError((error) => {
+        if (error._tag === "SqlError") return new WorkflowPersistenceError({ cause: error });
+        if (!error.vmStartFailure) return error;
+        return new WorkflowInvalidError({
+          message: error.message,
+          vmStartFailure: error.vmStartFailure,
+          vmStartFailureRevision: workflow.revision,
+        });
+      }),
     );
     vm = { codexConnectionId: codex.connectionId, github };
   } else {

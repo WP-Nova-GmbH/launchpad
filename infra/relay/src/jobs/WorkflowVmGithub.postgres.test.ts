@@ -176,61 +176,107 @@ describe("Workflow VM GitHub admission (PostgreSQL)", () => {
     ),
   );
 
-  it.live("rejects missing installation and wrong repository owner before calling GitHub", () =>
+  it.live("distinguishes missing App setup, missing installation, and wrong repository owner", () =>
     withDatabase(
       Effect.gen(function* () {
         const sql = yield* prepare;
-        const resolve = resolveWorkflowVmGitHub({ ...scope, baseBranch: null });
-        expect(yield* Effect.flip(resolve)).toMatchObject({
+        const resolve = (installUrl: string | null) =>
+          resolveWorkflowVmGitHub({ ...scope, baseBranch: null }).pipe(
+            Effect.provide(
+              Layer.mock(GithubApp)({
+                installUrl: Effect.succeed(installUrl),
+                resolveRepositoryBranch: () =>
+                  Effect.die("Unverified scope must not contact GitHub"),
+              }),
+            ),
+            Effect.flip,
+          );
+        const unconfigured = yield* resolve(null);
+        expect(unconfigured).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: "Ask your Launchpad operator to configure the GitHub App.",
+        });
+        expect(unconfigured).not.toHaveProperty("vmStartFailure");
+
+        const installUrl = "https://github.com/apps/launchpad-test/installations/new";
+        expect(yield* resolve(installUrl)).toMatchObject({
           _tag: "WorkflowInvalidError",
           message: "Connect the organization's GitHub App before running this VM workflow.",
+          vmStartFailure: { kind: "github-access-missing" },
         });
         yield* sql`INSERT INTO relay_github_installations VALUES
           ('org','42','wrong-owner','Organization','admin','now','now')`;
-        expect(yield* Effect.flip(resolve)).toMatchObject({
+        expect(yield* resolve(installUrl)).toMatchObject({
           _tag: "WorkflowInvalidError",
           message: "Set one GitHub repository URL owned by the connected GitHub account.",
         });
-      }).pipe(
-        Effect.provide(
-          Layer.mock(GithubApp)({
-            resolveRepositoryBranch: () => Effect.die("Unverified scope must not contact GitHub"),
-          }),
-        ),
-      ),
+      }),
     ),
   );
 
-  it.live("reports an actionable error for a missing GitHub branch", () =>
+  it.live("distinguishes an unavailable branch from a missing read grant", () =>
     withDatabase(
       Effect.gen(function* () {
         const sql = yield* prepare;
         yield* sql`INSERT INTO relay_github_installations VALUES
           ('org','42','acme','Organization','admin','now','now')`;
-        expect(
-          yield* Effect.flip(resolveWorkflowVmGitHub({ ...scope, baseBranch: "missing" })),
-        ).toMatchObject({
-          _tag: "WorkflowInvalidError",
-          message: "Choose an existing GitHub base branch with at least one commit.",
-        });
-      }).pipe(
-        Effect.provide(
-          Layer.mock(GithubApp)({
-            resolveRepositoryBranch: () =>
-              Effect.fail(
-                new GithubRequestFailed({
-                  operation: "read-branch",
-                  status: 404,
-                  cause: "GitHub responded 404",
-                }),
-              ),
-          }),
-        ),
-      ),
+        for (const [baseBranch, reply, message, vmStartFailure] of [
+          [
+            "release/2026.11",
+            { operation: "read-branch", status: 404 },
+            "Choose an existing GitHub base branch with at least one commit.",
+            { kind: "base-branch-unavailable", branch: "release/2026.11" },
+          ],
+          [
+            null,
+            { operation: "read-branch", status: 409 },
+            "Choose an existing GitHub base branch with at least one commit.",
+            { kind: "base-branch-unavailable", branch: null },
+          ],
+          [
+            "release/2026.11",
+            { operation: "mint-token", permissionDenied: true },
+            "Give the organization's GitHub App read access to this repository, then retry.",
+            {
+              kind: "github-access-missing",
+              permission: "contents-read",
+              repository: "acme/project",
+            },
+          ],
+          [
+            null,
+            { operation: "mint-token", status: 401 },
+            expect.stringContaining("Ask your Launchpad operator"),
+            undefined,
+          ],
+          [
+            null,
+            { operation: "sign-app-token" },
+            expect.stringContaining("Ask your Launchpad operator"),
+            undefined,
+          ],
+        ] as const) {
+          const result = yield* resolveWorkflowVmGitHub({ ...scope, baseBranch }).pipe(
+            Effect.provide(
+              Layer.mock(GithubApp)({
+                resolveRepositoryBranch: () =>
+                  Effect.fail(
+                    new GithubRequestFailed({ ...reply, cause: "GitHub request failed" }),
+                  ),
+              }),
+            ),
+            Effect.flip,
+          );
+          expect(result).toMatchObject({ _tag: "WorkflowInvalidError", message });
+          expect(result._tag === "WorkflowInvalidError" && result.vmStartFailure).toEqual(
+            vmStartFailure,
+          );
+        }
+      }),
     ),
   );
 
-  it.live("blocks publication preflight for a denied grant and distinguishes a throttle", () =>
+  it.live("distinguishes publishing access, throttling, and App authentication", () =>
     withDatabase(
       Effect.gen(function* () {
         const sql = yield* prepare;
@@ -244,12 +290,22 @@ describe("Workflow VM GitHub admission (PostgreSQL)", () => {
             { id: "pr", kind: "action", title: "Open PR", action: "open_pull_request" },
           ],
         });
-        for (const [reason, message] of [
+        for (const [reason, message, vmStartFailure] of [
           [
-            { permissionDenied: true },
+            { status: 403, permissionDenied: true },
             "Give the organization's GitHub App Contents and Pull requests write access for this workflow, then retry.",
+            {
+              kind: "github-access-missing",
+              permission: "contents-and-pull-requests-write",
+              repository: "acme/project",
+            },
           ],
-          [{ rateLimited: true }, "Could not verify this repository with GitHub. Try again."],
+          [
+            { status: 403, rateLimited: true },
+            "Could not verify this repository with GitHub. Try again.",
+            { kind: "github-verification-temporary" },
+          ],
+          [{ status: 401 }, expect.stringContaining("Ask your Launchpad operator"), undefined],
         ] as const) {
           const result = yield* resolve.pipe(
             Effect.provide(
@@ -264,8 +320,7 @@ describe("Workflow VM GitHub admission (PostgreSQL)", () => {
                   return Effect.fail(
                     new GithubRequestFailed({
                       operation: "mint-token",
-                      status: 403,
-                      cause: "GitHub responded 403",
+                      cause: "GitHub request failed",
                       ...reason,
                     }),
                   );
@@ -275,6 +330,9 @@ describe("Workflow VM GitHub admission (PostgreSQL)", () => {
             Effect.flip,
           );
           expect(result).toMatchObject({ _tag: "WorkflowInvalidError", message });
+          expect(result._tag === "WorkflowInvalidError" && result.vmStartFailure).toEqual(
+            vmStartFailure,
+          );
         }
       }),
     ),

@@ -170,6 +170,66 @@ describe("workflow writes surviving navigation", () => {
       operation: { state: "uncertain" },
     });
   });
+  it("keeps a temporary VM blocker and its instructions until the retry is acknowledged", async () => {
+    const intent = { kind: "start", targetKind: "vm" } as const;
+    const vmStartFailure = { kind: "github-verification-temporary" } as const;
+    const start = vi.fn(async () => {
+      throw new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        cause: new WorkflowInvalidError({
+          message: "GitHub unavailable.",
+          vmStartFailure,
+          vmStartFailureRevision: 3,
+        }),
+      });
+    });
+
+    await runWorkflowDraft(scope, saved.workflowId, intent, start);
+    expect(appAtomRegistry.get(workflowDraftAtom).runs[key]).toMatchObject({
+      instruction: "Task",
+      operation: null,
+      vmStartFailure,
+      vmStartFailureRevision: 3,
+    });
+
+    const result = deferred<RepositoryWorkflowJob>();
+    const retry = vi.fn(() => result.promise);
+    const retryIntent = { ...intent, retryStart: true };
+    const pending = runWorkflowDraft(scope, saved.workflowId, retryIntent, retry);
+    expect(retry).toHaveBeenCalledWith(expect.objectContaining({ instruction: "Task" }));
+    expect(appAtomRegistry.get(workflowDraftAtom).runs[key]).toMatchObject({
+      vmStartFailure,
+      vmStartFailureRevision: 3,
+      operation: { state: "pending" },
+    });
+    expect(await runWorkflowDraft(scope, saved.workflowId, retryIntent, retry)).toBeNull();
+    result.resolve(job);
+    expect(await pending).toEqual(job);
+    expect(appAtomRegistry.get(workflowDraftAtom).runs[key]?.vmStartFailure).toBeUndefined();
+    expect(
+      appAtomRegistry.get(workflowDraftAtom).runs[key]?.vmStartFailureRevision,
+    ).toBeUndefined();
+  });
+  it("uses submission confirmation when the VM transport fails", async () => {
+    await runWorkflowDraft(
+      scope,
+      saved.workflowId,
+      { kind: "start", targetKind: "vm" },
+      async () => {
+        throw new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          transportFailed: true,
+          cause: new WorkflowInvalidError({
+            message: "GitHub unavailable.",
+            vmStartFailure: { kind: "github-verification-temporary" },
+          }),
+        });
+      },
+    );
+    const draft = appAtomRegistry.get(workflowDraftAtom).runs[key];
+    expect(draft?.operation?.state).toBe("uncertain");
+    expect(draft?.vmStartFailure).toBeUndefined();
+  });
   it("discards a previous account's late Run result", async () => {
     const result = deferred<RepositoryWorkflowJob>();
     const pending = runWorkflowDraft(

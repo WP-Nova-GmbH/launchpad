@@ -1,5 +1,9 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
-import { WorkflowInvalidError, type WorkflowStep } from "@t3tools/contracts/workflows";
+import {
+  WorkflowInvalidError,
+  type VmWorkflowStartFailure,
+  type WorkflowStep,
+} from "@t3tools/contracts/workflows";
 import * as Effect from "effect/Effect";
 import { RelayDb } from "../db.ts";
 import {
@@ -17,23 +21,48 @@ export interface WorkflowVmGitHubResolution {
   readonly commitSha: string;
 }
 
-const invalid = (message: string) => new WorkflowInvalidError({ message });
-const tryAgain = () => invalid("Could not verify this repository with GitHub. Try again.");
+const invalid = (message: string, vmStartFailure?: VmWorkflowStartFailure) =>
+  new WorkflowInvalidError({ message, ...(vmStartFailure && { vmStartFailure }) });
+const tryAgain = () =>
+  invalid("Could not verify this repository with GitHub. Try again.", {
+    kind: "github-verification-temporary",
+  });
+const appSetupRequired = () => invalid("Ask your Launchpad operator to configure the GitHub App.");
+const appAuthenticationFailed = () =>
+  invalid("Ask your Launchpad operator to check the GitHub App credentials.");
+const appCredentialFailure = (error: GithubRequestFailed) =>
+  error.operation === "sign-app-token" ||
+  (error.operation === "mint-token" && error.status === 401);
 const bindingChanged = () => invalid("This repository's GitHub connection changed. Try again.");
 const githubRepositoryKey = "^github[.]com/[a-zA-Z0-9-]+/[a-zA-Z0-9_.-]+$";
 
-function gitHubReadFailure(error: GithubRequestFailed) {
+function gitHubReadFailure(error: GithubRequestFailed, branch: string | null, repository: string) {
   if (error.rateLimited) return tryAgain();
   const { status } = error;
+  if (appCredentialFailure(error)) return appAuthenticationFailed();
   if (error.operation === "read-branch" && (status === 404 || status === 409 || status === 422))
-    return invalid("Choose an existing GitHub base branch with at least one commit.");
+    return invalid("Choose an existing GitHub base branch with at least one commit.", {
+      kind: "base-branch-unavailable",
+      branch,
+    });
   if (status === 301 || status === 302 || status === 307 || status === 308)
     return invalid(
       "Check that this repository has its current GitHub URL in Organization settings.",
     );
-  if (status === 401 || status === 403 || status === 404 || status === 422)
+  if (
+    error.permissionDenied ||
+    status === 401 ||
+    status === 403 ||
+    status === 404 ||
+    status === 422
+  )
     return invalid(
       "Give the organization's GitHub App read access to this repository, then retry.",
+      {
+        kind: "github-access-missing",
+        ...(error.permissionDenied && { permission: "contents-read" }),
+        repository,
+      },
     );
   return tryAgain();
 }
@@ -50,7 +79,12 @@ export const selectWorkflowVmGitHubBinding = Effect.fnUntraced(function* (
     WHERE r.organization_id = ${input.organizationId} AND r.repository_id = ${input.repositoryId}
     ${lockInstallation ? sql`FOR SHARE OF g` : sql``}`;
   if (!installation)
-    return yield* invalid("Connect the organization's GitHub App before running this VM workflow.");
+    return yield* invalid(
+      "Connect the organization's GitHub App before running this VM workflow.",
+      {
+        kind: "github-access-missing",
+      },
+    );
   const aliases = yield* sql<{ canonicalKey: string }>`
     SELECT canonical_key AS "canonicalKey" FROM relay_repository_aliases
     WHERE organization_id = ${input.organizationId} AND repository_id = ${input.repositoryId}
@@ -71,8 +105,18 @@ export const resolveWorkflowVmGitHub = Effect.fn("WorkflowVmGitHub.resolve")(fun
   },
 ) {
   const sql = (yield* RelayDb).$client;
-  const binding = yield* selectWorkflowVmGitHubBinding(sql, input, false);
   const github = yield* GithubApp;
+  const binding = yield* selectWorkflowVmGitHubBinding(sql, input, false).pipe(
+    Effect.catchTag("WorkflowInvalidError", (error) =>
+      error.vmStartFailure?.kind === "github-access-missing"
+        ? github.installUrl.pipe(
+            Effect.flatMap((url) => Effect.fail(url ? error : appSetupRequired())),
+          )
+        : Effect.fail(error),
+    ),
+  );
+  const repository = binding.canonicalKey.slice("github.com/".length);
+  const missingAccess = { kind: "github-access-missing", repository } as const;
   const resolved = yield* github
     .resolveRepositoryBranch({
       ...binding,
@@ -80,11 +124,8 @@ export const resolveWorkflowVmGitHub = Effect.fn("WorkflowVmGitHub.resolve")(fun
     })
     .pipe(
       Effect.catchTags({
-        GithubAppNotConfigured: () =>
-          invalid(
-            "Configure the GitHub App in Organization settings before running this workflow.",
-          ),
-        GithubRequestFailed: gitHubReadFailure,
+        GithubAppNotConfigured: appSetupRequired,
+        GithubRequestFailed: (error) => gitHubReadFailure(error, input.baseBranch, repository),
       }),
       Effect.timeoutOrElse({ duration: "6 seconds", orElse: tryAgain }),
     );
@@ -98,17 +139,23 @@ export const resolveWorkflowVmGitHub = Effect.fn("WorkflowVmGitHub.resolve")(fun
     const access = openPr ? (push ? "workflow-publish" : "workflow-pr") : "workflow-push";
     yield* github.mintRepositoryToken({ ...binding, access }).pipe(
       Effect.catchTags({
-        GithubAppNotConfigured: () => invalid("Configure the GitHub App in Organization settings."),
+        GithubAppNotConfigured: appSetupRequired,
         GithubRequestFailed: (error) => {
+          if (appCredentialFailure(error)) return appAuthenticationFailed();
           if (error.permissionDenied)
             return invalid(
               openPr
                 ? "Give the organization's GitHub App Contents and Pull requests write access for this workflow, then retry."
                 : "Give the organization's GitHub App Contents write access for this workflow, then retry.",
+              {
+                ...missingAccess,
+                permission: openPr ? "contents-and-pull-requests-write" : "contents-write",
+              },
             );
           if (!error.rateLimited && error.status === 404)
             return invalid(
               "Give the organization's GitHub App access to this repository, then retry.",
+              missingAccess,
             );
           return tryAgain();
         },

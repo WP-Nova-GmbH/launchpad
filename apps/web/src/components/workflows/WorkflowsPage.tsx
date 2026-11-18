@@ -1365,6 +1365,7 @@ function WorkflowRepositoryView({
             workflow ? (
               <WorkflowRun
                 canConfigure={canConfigure}
+                organizationAdmin={organizationAdmin}
                 scope={scope}
                 workflow={workflow}
                 projects={projects}

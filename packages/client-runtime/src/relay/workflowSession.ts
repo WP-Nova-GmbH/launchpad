@@ -6,6 +6,7 @@ import type {
   WorkflowDefinition,
   WorkflowJobPage,
   RepositoryWorkflowJobSummary,
+  VmWorkflowStartFailure,
   WorkflowVmTarget,
 } from "@t3tools/contracts/workflows";
 import type { EnvironmentId, ThreadId, OrchestrationGetTurnDiffResult } from "@t3tools/contracts";
@@ -96,6 +97,9 @@ export interface WorkflowRunDraft {
     | undefined;
   readonly startedJobId: string | null;
   readonly error: string | null;
+  readonly vmStartFailure?: VmWorkflowStartFailure | undefined;
+  /** Saved revision checked by the relay when it rejected this start. */
+  readonly vmStartFailureRevision?: number | undefined;
 }
 
 interface WorkflowSessionSubmission extends WorkflowDraftSubmission {
