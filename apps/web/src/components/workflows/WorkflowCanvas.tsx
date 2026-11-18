@@ -483,9 +483,6 @@ function InsertMenu({
         {(["agent", "input", "review", "action", "open_pull_request"] as const).map((kind) => (
           <MenuItem
             key={kind}
-            disabled={
-              definition.target.kind === "vm" && (kind === "action" || kind === "open_pull_request")
-            }
             onClick={() => {
               if (valid && captured) {
                 inserted.current = true;
@@ -512,9 +509,6 @@ function InsertMenu({
                   : kind === "input"
                     ? "Human input"
                     : "Human review"}
-            {definition.target.kind === "vm" && (kind === "action" || kind === "open_pull_request")
-              ? " (Machine only)"
-              : ""}
           </MenuItem>
         ))}
       </MenuPopup>

@@ -884,6 +884,8 @@ def main(args):
         if setup_owner and len(command) != 4:
             raise ValueError('Invalid workflow setup owner launch')
         with locked() as gate:
+            if (STATE / (work_id + '.publishing-closed')).exists():
+                raise RuntimeError('The workflow publishing workload was closed')
             if transfer:
                 if (gate["bootId"] != boot_id or gate["sealedBy"] != operation_id
                         or gate["epoch"] != int(epoch)):
@@ -931,12 +933,31 @@ def main(args):
                 os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-provider', cwd, '--', str(executable), *command[1:]])
             os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec', cwd, '--', *command])
         os.execvpe(command[0], command, os.environ)
-    if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'stop-workflow-probe', 'verify-workflow-provider-peer', 'workflow-setup-control'} and os.getuid() == COORDINATOR_UID and workflow_guest():
+    if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'stop-workflow-probe', 'verify-workflow-provider-peer', 'workflow-setup-control', 'stop-workflow-publishing'} and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, *args])
     if action == 'workflow-recovery-state' and len(args) == 1 and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, action])
     if action == 'workflow-setup-control':
         print(json.dumps(workflow_setup_control(args[1:])))
+        return
+    if action == 'stop-workflow-publishing' and len(args) == 2:
+        if os.getuid() != 0 or not workflow_guest():
+            raise RuntimeError('Workflow publishing cleanup is unavailable')
+        import signal
+        signal.alarm(8)
+        work_id = identifier(args[1])
+        with locked() as gate:
+            # Deny a delayed launch with this exact ID after confirming it is stopped.
+            (STATE / (work_id + '.publishing-closed')).touch()
+            group = ROOT / work_id
+            if group.exists() and populated(group):
+                record = read_json(STATE / (work_id + '.json'))
+                if (record.get('id') != work_id or record.get('bootId') != gate['bootId']
+                        or record.get('kind') not in {'process', 'transfer'}):
+                    raise RuntimeError('Unknown publishing workload')
+                (group / 'cgroup.kill').write_text('1')
+                wait_cgroup_event(group, 'populated', '0', seconds=5)
+            print(json.dumps({'stopped': True}))
         return
     if action == 'stop-workflow-probe' and len(args) == 3:
         if os.getuid() != 0 or not workflow_guest():

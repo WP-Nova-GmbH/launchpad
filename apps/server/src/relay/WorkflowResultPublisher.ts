@@ -289,15 +289,14 @@ export function makeWorkflowResultPublisher(
     threadId: string,
   ) {
     yield* outbox.expire(threadId);
-    const intent = yield* outbox.next(threadId);
+    const intent = yield* outbox.claim(threadId);
+    if (!intent) return;
     const now = yield* Clock.currentTimeMillis;
-    if (!intent || intent.status !== "pending" || intent.retryAt > now) return;
     yield* attempt(intent).pipe(
-      lock.withPermit,
       Effect.timeout(intent.deadline - now),
       Effect.catch((error) => outbox.fail(intent, describe(error), permanent(error))),
     );
     yield* outbox.expire(threadId);
-  });
+  }, lock.withPermit);
   return { synchronize };
 }

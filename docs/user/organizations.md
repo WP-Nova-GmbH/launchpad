@@ -193,11 +193,8 @@ same view. For a Machine workflow, choose an enrolled organization machine and a
 that repository. You can also create and save a VM workflow without an enrolled machine or a
 Codex connection. VM workflows use the repository's default branch unless you enter a base
 branch override, and use the organization's Codex connection when execution is available.
-On development relays with VM workflow execution enabled, you can run a VM workflow manually.
+With VM workflow execution enabled, you can run a VM workflow manually or trigger it from Linear.
 Connect the organization's Codex account and give its GitHub App read access to the repository.
-VM runs use a read-only checkout and support Agent, Review, and Input steps. Automatic triggering
-uses a Machine target. To switch a workflow with automation On to VM, turn automation Off,
-choose VM, and save.
 Only repository maintainers and organization admins can manually start a VM workflow that uses
 repository secrets.
 
@@ -209,12 +206,19 @@ in a job must use compatible providers of the same kind so they can share the co
 Model changes are available when that provider supports them. If its configuration becomes
 incompatible during a job, cancel the job and run it again after correcting the workflow.
 
-Choose **Create workflow** and pick a template to open an unsaved draft. **Review and open a pull request**
-requires a Machine checkout of the repository. You can change the steps in the editor.
+Choose **Create workflow** and pick a template to open an unsaved draft. Use **Review and open a pull request**
+to set up a publishing workflow on a Machine or VM.
 
 **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy. A VM workflow copied to another repository starts from the destination's default branch. Copies start with automatic triggering Off and no trigger.
 
-**Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch. **Open PR** opens a PR against the base selected when the job was accepted; it requires a Push after the latest Agent step. Add Review before publishing when human approval is wanted. Workflows without publishing steps keep changes local. Publishing requires an updated Linux or macOS executor; PR publishing currently supports GitHub. Other forges are rejected before the run starts.
+**Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch.
+**Open PR** opens a pull request against the base selected when the job was accepted. Add a Push
+after the latest Agent step and a Review before publishing when you want human approval.
+On a VM, the GitHub App needs Contents write for Push and Pull requests write for Open PR.
+Launchpad checks these permissions before the VM starts. If publishing fails, **Retry publishing**
+continues from the saved result. Cancelled runs show any confirmed GitHub links and warn when the
+outcome could not be verified. Machine publishing requires an updated Linux or macOS executor,
+and Machine PR publishing supports GitHub.
 
 Anyone with repository access can run a Machine workflow with a description of the task and inspect the
 shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own

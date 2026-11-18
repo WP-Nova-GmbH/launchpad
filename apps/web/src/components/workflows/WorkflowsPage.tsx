@@ -70,7 +70,6 @@ import {
   newWorkflowDraft,
   copiedWorkflowDraft,
   workflowCopyNeedsCheckout,
-  workflowTemplateNeedsCheckout,
   type WorkflowTemplate,
   openNewWorkflowDraft,
   useActiveWorkflowView,
@@ -567,10 +566,7 @@ function WorkflowRepositoryView({
       const id = await openNewWorkflowDraft(scope, () => {
         const current = templateCatalog.current;
         if (!owns() || !current.canChooseTemplate || current.vmAuthoring === null) return null;
-        if (
-          workflowTemplateNeedsCheckout(template, !!current.vmAuthoring) &&
-          !current.projects.length
-        )
+        if (!current.vmAuthoring && !current.projects.length)
           throw new Error(
             current.projectsUnavailable
               ? "Machine checkouts could not be loaded. Retry loading checkouts."
@@ -819,8 +815,7 @@ function WorkflowRepositoryView({
               restoreIssue === "missing" &&
               projects.length === 0 &&
               !!vmAuthoring &&
-              vmExecutionAvailable &&
-              !steps.some((step) => step.kind === "action");
+              vmExecutionAvailable;
             const restoreHint = `workflow-restore-${workflow.workflowId}`;
             const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
             const canStartRun = !archived && !vmUnavailable;

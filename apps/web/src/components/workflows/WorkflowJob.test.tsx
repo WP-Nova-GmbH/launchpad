@@ -276,6 +276,34 @@ describe("workflow result location navigation", () => {
     viewerControls: { canApprove: true, canRespond: false, canCancel: true },
   } satisfies RepositoryWorkflowJob;
 
+  it.each(["confirmed", "unknown"] as const)(
+    "shows a cancelled VM run's %s GitHub outcome without opening the VM",
+    async (state) => {
+      const branchUrl = "https://github.com/acme/project/tree/launchpad%2Fjob";
+      const pullRequestUrl = "https://github.com/acme/project/pull/17";
+      fixture.call.mockResolvedValue({
+        ...vmReview,
+        status: "cancelled",
+        progress: { ...vmReview.progress, status: "cancelled", checkpoint: null },
+        publicationOutcome: {
+          state,
+          branchUrl,
+          pullRequestUrl: state === "confirmed" ? pullRequestUrl : null,
+        },
+      } satisfies RepositoryWorkflowJob);
+      await mount(false);
+      const anchors = renderer!.root.findAllByType("a");
+      expect(anchors.filter((anchor) => anchor.props.href === branchUrl)).toHaveLength(1);
+      expect(anchors.filter((anchor) => anchor.props.href === pullRequestUrl)).toHaveLength(
+        state === "confirmed" ? 1 : 0,
+      );
+      expect(text(renderer!.toJSON())).toContain(
+        state === "confirmed" ? "Published to GitHub" : "Publishing outcome unknown",
+      );
+      expect(fixture.open).not.toHaveBeenCalled();
+    },
+  );
+
   it("inspects VM results passively without registering or opening a live environment", async () => {
     fixture.call.mockResolvedValue(vmReview);
     await mount(false);

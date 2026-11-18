@@ -100,16 +100,13 @@ function PublishingStepSettings({
     );
   };
 
-  const vm = definition.target.kind === "vm";
-  if (vm || !targetConfirmed || !machineCheckoutAvailable) {
-    const checkoutUnavailable = !vm && targetConfirmed;
+  const checkoutUnavailable = definition.target.kind === "machine" && !machineCheckoutAvailable;
+  if (!targetConfirmed || checkoutUnavailable) {
     return warning(
-      checkoutUnavailable ? "Machine checkout unavailable" : "Machine target required",
-      vm
-        ? "This workflow uses a VM. Choose a Machine checkout to publish."
-        : checkoutUnavailable
-          ? "Choose an available Machine checkout to publish."
-          : "Choose a Machine checkout to publish.",
+      targetConfirmed ? "Machine checkout unavailable" : "Execution target required",
+      targetConfirmed
+        ? "Choose an available Machine checkout to publish."
+        : "Choose an execution target to publish.",
       {
         label: "Open workflow settings",
         icon: Settings2Icon,

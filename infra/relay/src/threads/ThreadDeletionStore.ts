@@ -273,13 +273,20 @@ export function makeThreadDeletionStore(sql: PgClient) {
   const clean = Effect.fn("relay.thread.delete.clean")(function* (claim: ThreadDeletionClaim) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* authorize(claim);
+        const deletion = yield* authorize(claim);
         if (
           (yield* sql`SELECT 1 FROM relay_thread_vm_allocations WHERE thread_id=${claim.threadId} AND deleted_at IS NULL`)
             .length
         )
           return yield* fail();
         yield* sql`UPDATE relay_thread_deletions SET phase='cleaning' WHERE thread_id=${claim.threadId}`;
+        if (deletion.workflowJobId) {
+          yield* sql`DELETE FROM relay_thread_vm_backup_pins p USING relay_workflow_vm_publications w
+            WHERE w.job_id=${deletion.workflowJobId}
+              AND p.backup_operation_id=w.record#>>'{recoverySource,backupOperationId}'
+              AND p.operation_id=w.record#>>'{recoverySource,retentionOperationId}'`;
+          yield* sql`DELETE FROM relay_workflow_vm_publications WHERE job_id=${deletion.workflowJobId}`;
+        }
         yield* sql`DELETE FROM relay_workflow_recovery_heads WHERE job_id IN(SELECT job_id FROM relay_workflow_recovery_records WHERE thread_id=${claim.threadId})`;
         yield* sql`DELETE FROM relay_workflow_saved_results WHERE thread_id=${claim.threadId}`;
         yield* sql`DELETE FROM relay_workflow_recovery_records WHERE thread_id=${claim.threadId}`;

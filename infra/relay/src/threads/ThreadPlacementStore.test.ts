@@ -5116,6 +5116,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             describe: () => Effect.die("unexpected app read"),
             mintInstallationToken: () => Effect.die("installation-wide tokens forbidden"),
             resolveRepositoryBranch: () => Effect.die("unexpected resolveRepositoryBranch"),
+            observeWorkflowPublication: () => Effect.die("unexpected publication observation"),
             mintRepositoryToken: (scope) =>
               Effect.gen(function* () {
                 expect(scope).toEqual({ installationId, canonicalKey });
@@ -7618,6 +7619,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             describe: () => Effect.die("unexpected"),
             mintInstallationToken: () => Effect.die("broad token forbidden"),
             resolveRepositoryBranch: () => Effect.die("unexpected resolveRepositoryBranch"),
+            observeWorkflowPublication: () => Effect.die("unexpected publication observation"),
             mintRepositoryToken: (scope) =>
               Effect.gen(function* () {
                 expect(scope).toEqual({ installationId, canonicalKey });

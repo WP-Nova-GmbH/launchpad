@@ -93,6 +93,7 @@ export const WorkflowActionRecord = Schema.Struct({
       identity: Schema.NullOr(Schema.String),
       boot: Schema.NullOr(BootEvidence),
       stopped: Schema.Boolean,
+      relayStopAcknowledged: Schema.optional(Schema.Boolean),
       code: Schema.NullOr(Schema.Int),
     }),
   ),
@@ -420,7 +421,11 @@ export const make = Effect.gen(function* () {
       Effect.map((rows) => (rows[0] ? decodeCancellation(rows[0].record_json) : null)),
     );
   const republishRestoredCheckpoint = Effect.fn("WorkflowRunStore.republishRestoredCheckpoint")(
-    function* (binding: WorkflowVmDispatchBinding, afterRestoredRevision: number) {
+    function* (
+      binding: WorkflowVmDispatchBinding,
+      afterRestoredRevision: number,
+      latestRelayRevision?: number,
+    ) {
       const [fence] = yield* sql`SELECT 1 WHERE ${activeVmFence(binding)}`;
       const run = yield* get(binding.jobId);
       if (
@@ -436,6 +441,7 @@ export const make = Effect.gen(function* () {
         binding,
         recordJson: yield* recoveryRecord(run),
         afterRestoredRevision,
+        ...(latestRelayRevision === undefined ? {} : { latestRelayRevision }),
       });
     },
   );

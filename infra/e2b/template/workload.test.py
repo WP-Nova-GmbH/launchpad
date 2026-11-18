@@ -1004,5 +1004,39 @@ class WorkflowWorkloadTest(unittest.TestCase):
         close.assert_called_once_with(91)
 
 
+
+class PublishingWorkloadStopTest(unittest.TestCase):
+    def test_stop_closes_exact_workload_and_prevents_registration_after_stop(self):
+        work_id = 'a' * 32
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            state = root / 'state'
+            state.mkdir()
+            group = root / work_id
+            group.mkdir()
+            (group / 'cgroup.events').write_text('populated 1\n')
+            (state / (work_id + '.json')).write_text(json.dumps({
+                'id': work_id, 'bootId': 'current-boot', 'kind': 'process',
+            }))
+            with (
+                mock.patch.object(workload, 'ROOT', root),
+                mock.patch.object(workload, 'STATE', state),
+                mock.patch.object(workload, 'workflow_guest', return_value=True),
+                mock.patch.object(workload, 'locked', return_value=contextlib.nullcontext({'bootId': 'current-boot'})),
+                mock.patch.object(signal, 'alarm'),
+                mock.patch.object(workload, 'wait_cgroup_event') as wait,
+            ):
+                output = io.StringIO()
+                with mock.patch.object(os, 'getuid', return_value=0), contextlib.redirect_stdout(output):
+                    workload.main(['stop-workflow-publishing', work_id])
+                self.assertEqual(json.loads(output.getvalue()), {'stopped': True})
+                self.assertEqual((group / 'cgroup.kill').read_text(), '1')
+                wait.assert_called_once_with(group, 'populated', '0', seconds=5)
+                self.assertTrue((state / (work_id + '.publishing-closed')).is_file())
+                with mock.patch.object(os, 'getuid', return_value=workload.COORDINATOR_UID):
+                    with self.assertRaisesRegex(RuntimeError, 'was closed'):
+                        workload.main(['run-workflow', work_id, 'process', '/workspace/project', '--', 'git', 'status'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -839,7 +839,7 @@ it.effect.each([
         await mountCatalog();
 
         expect(button("Restore Archived review").props.disabled).toBe(true);
-        if (hasPublishingStep || !vmAvailable) {
+        if (!vmAvailable) {
           expect(button("Choose execution target for Archived review")).toBeUndefined();
           expect(content()).toContain("To keep this workflow on a Machine");
         } else {
@@ -1019,7 +1019,7 @@ it.effect("uses catalog Refresh to recover Machine choices and reload workflow d
   }),
 );
 
-it.effect("offers one first-workflow action and explains the unavailable publishing starter", () =>
+it.effect("offers a publishing starter with a VM and no checkout", () =>
   Effect.gen(function* () {
     yield* serve;
     yield* Effect.promise(async () => {
@@ -1042,12 +1042,13 @@ it.effect("offers one first-workflow action and explains the unavailable publish
 
       expect(content()).toContain("Agent and review");
       expect(content()).toContain("Review and open a pull request");
-      expect(content()).toContain("Requires a Machine checkout");
-      expect(starterOption("publish").props.disabled).toBe(true);
+      expect(content()).not.toContain("Requires a Machine checkout");
+      expect(starterOption("publish").props.disabled).toBeFalsy();
       expect(starterOption("review").props.disabled).toBeFalsy();
       expect(retainedStarter()).toBeUndefined();
       expect(fixture.navigate).not.toHaveBeenCalled();
 
+      await act(() => starterOption("publish").props.onChange());
       await press("Create draft");
       expect(retainedStarter()).toMatchObject({
         baseline: null,
@@ -1057,6 +1058,8 @@ it.effect("offers one first-workflow action and explains the unavailable publish
       expect(retainedStarter()?.definition.steps.map((step) => step.kind)).toEqual([
         "agent",
         "review",
+        "action",
+        "action",
       ]);
       expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
       expect(fixture.save).not.toHaveBeenCalled();
@@ -1099,7 +1102,6 @@ it.effect("retries unavailable Machine checkouts and creates a publishing draft"
     yield* serve;
     yield* Effect.promise(async () => {
       fixture.tab = "workflows";
-      fixture.vmAuthoring = { models: null };
       fixture.projectsUnavailable = true;
       fixture.definitions.mockResolvedValue([]);
       await mountCatalog();
@@ -1462,10 +1464,15 @@ it.effect("lets users review a changed saved execution target before copying", (
       expect(fixture.navigate).not.toHaveBeenCalled();
 
       await press("Create draft");
-      expect(retainedCopyDraft(destinationScope)?.definition.target).toEqual({
-        kind: "machine",
-        environmentId: destinationCheckout.environmentId,
-        projectId: destinationCheckout.projectId,
+      expect(retainedCopyDraft(destinationScope)).toMatchObject({
+        targetConfirmed: false,
+        definition: {
+          target: {
+            kind: "machine",
+            environmentId: destinationCheckout.environmentId,
+            projectId: destinationCheckout.projectId,
+          },
+        },
       });
       expect(fixture.navigate).toHaveBeenCalledWith({
         to: "/workflows/$repositoryId/new",
@@ -1475,19 +1482,15 @@ it.effect("lets users review a changed saved execution target before copying", (
   }),
 );
 
-it.effect.each([
-  { projectsUnavailable: false, source: publishingCopySource, vmAuthoring: true },
-  { projectsUnavailable: true, source: publishingCopySource, vmAuthoring: true },
-  { projectsUnavailable: true, source: workflow, vmAuthoring: false },
-])(
-  "distinguishes missing and unavailable destination checkouts (unavailable=$projectsUnavailable, VM authoring=$vmAuthoring)",
-  ({ projectsUnavailable, source, vmAuthoring }) =>
+it.effect.each([false, true])(
+  "distinguishes missing and unavailable destination checkouts when VM authoring is off (unavailable=%s)",
+  (projectsUnavailable) =>
     Effect.gen(function* () {
       yield* serve;
       yield* Effect.promise(async () => {
         fixture.projectsUnavailable = projectsUnavailable;
         fixture.projects = [checkout];
-        await openCopyDialog(source, vmAuthoring);
+        await openCopyDialog(publishingCopySource, false);
         await chooseOtherCopyDestination();
 
         const missingCheckout =

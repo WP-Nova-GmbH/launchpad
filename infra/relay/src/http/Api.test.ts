@@ -305,7 +305,7 @@ describe("relay DPoP failure mapping", () => {
 });
 
 describe("relay environment authentication", () => {
-  it.effect.each(["attempt", "review-secrets"] as const)(
+  it.effect.each(["attempt", "review-secrets", "publishing"] as const)(
     "authorizes only the assigned VM thread's workflow/%s requests",
     (endpoint) => {
       const principal = {

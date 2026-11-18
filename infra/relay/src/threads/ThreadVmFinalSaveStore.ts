@@ -12,6 +12,7 @@ import {
 } from "../machines/E2BNativeSnapshotReceipt.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { lockWorkflowVmCheckpoint } from "../jobs/WorkflowVmCheckpoint.ts";
+import { readWorkflowVmPublishing } from "../jobs/WorkflowVmPublishing.ts";
 import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
@@ -323,10 +324,29 @@ export function makeThreadVmFinalSaveStore(
             FROM relay_thread_placements WHERE thread_id=${input.threadId} AND audience='repository'`;
           if (!placement) return false;
           const job = yield* lockWorkflowVmCheckpoint(sql, placement.jobId);
+          const pending = job?.pendingControl;
+          const retry =
+            pending?.response.operation === "retry_action" && pending.checkpointDispatch
+              ? { response: pending.response, dispatch: pending.checkpointDispatch }
+              : pending?.supersededCheckpoint?.response.operation === "retry_action"
+                ? pending.supersededCheckpoint
+                : null;
+          const publishing =
+            job &&
+            retry?.response.operation === "retry_action" &&
+            retry.dispatch.allocationId === input.allocationId &&
+            retry.dispatch.operationId === input.provisionOperationId &&
+            retry.dispatch.generation === input.generation
+              ? yield* readWorkflowVmPublishing(sql, job.jobId, retry.response.actionId)
+              : null;
+          const publishingDispatch =
+            publishing?.binding.threadId === input.threadId &&
+            publishing.stepId === job?.record.progress?.stepId &&
+            publishing.stepGeneration === job?.record.progress?.generation;
           if (
             !job ||
-            job.pendingControl?.checkpointDispatch ||
-            job.pendingControl?.supersededCheckpoint ||
+            (!publishingDispatch &&
+              (pending?.checkpointDispatch || pending?.supersededCheckpoint)) ||
             job.record.progress?.approvalPending ||
             job.record.progress?.resultSaving ||
             job.record.progress?.manualPause

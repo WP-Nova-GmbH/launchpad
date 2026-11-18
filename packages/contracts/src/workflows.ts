@@ -117,6 +117,99 @@ export const WorkflowVmDispatchBinding = Schema.Struct({
 export type WorkflowVmDispatchBinding = typeof WorkflowVmDispatchBinding.Type;
 export const WORKFLOW_PROTOCOL = 9;
 
+const WorkflowGitObjectId = Schema.String.check(Schema.isPattern(/^[0-9a-f]{40}$/u));
+const WorkflowPublicationId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+const WorkflowPublicationCommit = Schema.String.check(Schema.isMaxLength(174_764));
+export const WorkflowVmPublishingAction = Schema.Struct({
+  actionId: WorkflowPublicationId,
+  stepId: Label,
+  stepGeneration: Revision,
+  operation: WorkflowActionStep.fields.action,
+  resultTurnId: WorkflowPublicationId,
+  checkpointRef: WorkflowPublicationId,
+  tree: WorkflowGitObjectId,
+  parent: WorkflowGitObjectId,
+  commitSha: Schema.NullOr(WorkflowGitObjectId),
+  oldRemoteSha: Schema.NullOr(WorkflowGitObjectId),
+  pullRequestUrl: Schema.NullOr(Schema.String.check(Schema.isMaxLength(2048))),
+});
+export type WorkflowVmPublishingAction = typeof WorkflowVmPublishingAction.Type;
+export const WorkflowVmPublishingOutcome = Schema.Struct({
+  commitSha: WorkflowGitObjectId,
+  pullRequestUrl: WorkflowVmPublishingAction.fields.pullRequestUrl,
+});
+export type WorkflowVmPublishingOutcome = typeof WorkflowVmPublishingOutcome.Type;
+export const WorkflowVmPublishingRestore = Schema.Struct({
+  action: WorkflowVmPublishingAction,
+  outcome: Schema.NullOr(WorkflowVmPublishingOutcome),
+  previousPush: Schema.NullOr(
+    Schema.Struct({
+      ...WorkflowVmPublishingAction.fields,
+      outcome: WorkflowVmPublishingOutcome,
+    }),
+  ),
+  completedActions: Schema.Array(
+    Schema.Struct({
+      ...WorkflowVmPublishingAction.fields,
+      outcome: WorkflowVmPublishingOutcome,
+    }),
+  ),
+  expectedRevision: Revision,
+  latestPublicationRevision: Revision,
+  responses: Schema.Array(Schema.suspend(() => WorkflowResponseSummary)),
+});
+export type WorkflowVmPublishingRestore = typeof WorkflowVmPublishingRestore.Type;
+export const WorkflowVmPublishingRequest = Schema.Struct({
+  generation: WorkflowVmDispatchBinding.fields.generation,
+  jobId: WorkflowPublicationId,
+  action: WorkflowVmPublishingAction,
+  request: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("credential"),
+      access: Schema.Literals(["read", "push", "open_pull_request"]),
+    }),
+    Schema.Struct({ kind: Schema.Literal("retain"), commit: WorkflowPublicationCommit }),
+    Schema.Struct({ kind: Schema.Literal("recover_commit"), sha: WorkflowGitObjectId }),
+    Schema.Struct({
+      kind: Schema.Literal("arm"),
+      commandId: Schema.String.check(Schema.isUUID()),
+      pid: Schema.Int.check(Schema.isGreaterThan(0)),
+      identity: WorkflowPublicationId,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("stop"),
+      commandId: Schema.String.check(Schema.isUUID()),
+    }),
+    Schema.Struct({ kind: Schema.Literal("can_create_pull") }),
+    Schema.Struct({
+      kind: Schema.Literal("record_pull"),
+      url: Schema.String.check(Schema.isMaxLength(2048)),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("reject_pull_authorization"),
+      commandId: Schema.String.check(Schema.isUUID()),
+    }),
+    Schema.Struct({ kind: Schema.Literal("settle"), outcome: WorkflowVmPublishingOutcome }),
+  ]),
+});
+export type WorkflowVmPublishingRequest = typeof WorkflowVmPublishingRequest.Type;
+export const WorkflowVmPublishingResponse = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("ok") }),
+  Schema.Struct({ kind: Schema.Literal("waiting_progress") }),
+  Schema.Struct({
+    kind: Schema.Literal("credential"),
+    token: TrimmedNonEmptyString,
+    expiresAt: Schema.String,
+    bot: Schema.Struct({ name: TrimmedNonEmptyString, email: TrimmedNonEmptyString }),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("commit"),
+    commit: Schema.NullOr(WorkflowPublicationCommit),
+  }),
+  Schema.Struct({ kind: Schema.Literal("can_create_pull"), allowed: Schema.Boolean }),
+]);
+export type WorkflowVmPublishingResponse = typeof WorkflowVmPublishingResponse.Type;
+
 export const WORKFLOW_RESULT_MAX_BYTES = 10_000_000;
 export const WorkflowResultObject = Schema.Struct({
   artifactId: Schema.String.check(Schema.isUUID()),
@@ -421,6 +514,13 @@ export type WorkflowVmRecovery = typeof WorkflowVmRecovery.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
   issueSnapshot: Schema.optional(WorkflowIssueSnapshot),
+  publicationOutcome: Schema.optionalKey(
+    Schema.Struct({
+      state: Schema.Literals(["confirmed", "unknown"]),
+      branchUrl: Schema.NullOr(Schema.String),
+      pullRequestUrl: Schema.NullOr(Schema.String),
+    }),
+  ),
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
   vmRecovery: Schema.optionalKey(WorkflowVmRecovery),
   vmAdmission: Schema.optional(

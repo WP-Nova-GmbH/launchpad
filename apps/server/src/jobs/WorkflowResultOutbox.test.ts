@@ -85,7 +85,6 @@ it.effect(
     Effect.gen(function* () {
       const { sql, outbox } = yield* fixture;
       yield* sql.withTransaction(outbox.enqueue({ binding, recordJson: '{"cursor":0}' }));
-      const original = yield* outbox.next(binding.threadId);
       yield* outbox.enqueue({ binding, recordJson: '{"cursor":0}' });
       expect(yield* sql`SELECT 1 FROM workflow_result_outbox`).toHaveLength(1);
       yield* Effect.result(
@@ -97,6 +96,8 @@ it.effect(
         ),
       );
       expect(yield* sql`SELECT 1 FROM workflow_result_outbox`).toHaveLength(1);
+      expect((yield* outbox.next(binding.threadId))?.recordJson).toBe('{"cursor":0}');
+      const original = yield* outbox.claim(binding.threadId);
       yield* outbox.enqueue({ binding, recordJson: '{"cursor":1}' });
       expect(
         (yield* sql<{
@@ -113,7 +114,7 @@ it.effect(
     Effect.gen(function* () {
       const { sql, outbox } = yield* fixture;
       yield* outbox.enqueue({ binding, recordJson: '{"cursor":0}' });
-      const intent = (yield* outbox.next(binding.threadId))!;
+      const intent = (yield* outbox.claim(binding.threadId))!;
       for (let n = 0; n < 3; n++) yield* outbox.fail(intent, "storage offline");
       const restarted = makeWorkflowResultOutbox(sql);
       expect(yield* restarted.saving(binding.jobId)).toMatchObject({
@@ -135,32 +136,35 @@ it.effect(
     }).pipe(Effect.provide(memory)),
 );
 
-it.effect(
-  "expires missing prerequisites without an upload attempt or a restart resetting the deadline",
-  () =>
-    Effect.gen(function* () {
-      const { sql, outbox } = yield* fixture;
-      yield* outbox.enqueue({ binding, recordJson: '{"cursor":0}' });
-      const first = (yield* outbox.next(binding.threadId))!;
-      yield* TestClock.adjust(WORKFLOW_SAVE_CYCLE_MS - 1);
-      yield* makeWorkflowResultOutbox(sql).expire(binding.threadId);
-      expect((yield* outbox.next(binding.threadId))?.status).toBe("pending");
-      yield* TestClock.adjust(1);
-      yield* makeWorkflowResultOutbox(sql).expire(binding.threadId);
-      expect(yield* outbox.next(binding.threadId)).toMatchObject({
-        deadline: first.deadline,
-        status: "failed",
-        failures: 0,
-      });
-      expect(yield* outbox.saving(binding.jobId)).toMatchObject({
-        state: "failed",
-        retryable: true,
-      });
-    }).pipe(Effect.provide(memory)),
+it.effect("starts the deadline at the first claim and preserves it across a worker restart", () =>
+  Effect.gen(function* () {
+    const { sql, outbox } = yield* fixture;
+    yield* outbox.enqueue({ binding, recordJson: '{"cursor":0}' });
+    yield* TestClock.adjust(WORKFLOW_SAVE_CYCLE_MS);
+    yield* outbox.expire(binding.threadId);
+    const first = (yield* outbox.claim(binding.threadId))!;
+    expect(first.deadline - first.startedAt).toBe(WORKFLOW_SAVE_CYCLE_MS);
+    yield* TestClock.adjust(WORKFLOW_SAVE_CYCLE_MS - 1);
+    const restarted = makeWorkflowResultOutbox(sql);
+    yield* restarted.expire(binding.threadId);
+    expect((yield* outbox.next(binding.threadId))?.status).toBe("pending");
+    expect((yield* restarted.claim(binding.threadId))?.deadline).toBe(first.deadline);
+    yield* TestClock.adjust(1);
+    yield* makeWorkflowResultOutbox(sql).expire(binding.threadId);
+    expect(yield* outbox.next(binding.threadId)).toMatchObject({
+      deadline: first.deadline,
+      status: "failed",
+      failures: 0,
+    });
+    expect(yield* outbox.saving(binding.jobId)).toMatchObject({
+      state: "failed",
+      retryable: true,
+    });
+  }).pipe(Effect.provide(memory)),
 );
 
 it.effect(
-  "exports a new pause/control state without duplicating the Agent result already saving",
+  "coalesces queued state without changing the Agent result or crossing to another binding",
   () =>
     Effect.gen(function* () {
       const { sql, outbox } = yield* fixture;
@@ -182,11 +186,14 @@ it.effect(
         recordJson: '{"paused":true}',
         result: { ...captured, resultId: "22222222-2222-4222-8222-222222222222" },
       });
+      yield* sql`INSERT INTO orchestration_events VALUES (41,'thread',${binding.threadId})`;
+      yield* outbox.enqueue({ binding, recordJson: '{"paused":false,"newState":true}' });
       const rows = yield* sql<{
         revision: number;
         result_json: string | null;
         record_json: string;
-      }>`SELECT revision,result_json,record_json FROM workflow_result_outbox ORDER BY revision`;
+        source_sequence: number;
+      }>`SELECT revision,result_json,record_json,source_sequence FROM workflow_result_outbox ORDER BY revision`;
       expect(rows).toHaveLength(2);
       expect(rows[0]?.result_json).toContain(captured.resultId);
       expect(yield* outbox.saving(binding.jobId)).toMatchObject({
@@ -196,13 +203,37 @@ it.effect(
       expect(rows[1]).toMatchObject({
         revision: 2,
         result_json: null,
-        record_json: '{"paused":true}',
+        record_json: '{"paused":false,"newState":true}',
+        source_sequence: 41,
       });
-      yield* outbox.enqueue({ binding, recordJson: '{"paused":true}', result: captured });
-      expect(yield* sql`SELECT 1 FROM workflow_result_outbox`).toHaveLength(2);
+      const replacement = { ...binding, generation: 2 };
+      yield* outbox.enqueue({
+        binding: replacement,
+        recordJson: '{"paused":false,"newState":true}',
+      });
+      expect(yield* sql`SELECT 1 FROM workflow_result_outbox`).toHaveLength(3);
       yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE revision=1`;
       const stateOnly = yield* outbox.saving(binding.jobId);
       expect(stateOnly?.resultId).toBeNull();
       expect(stateOnly).not.toHaveProperty("stepId");
+      const partial = {
+        ...captured,
+        resultId: "33333333-3333-4333-8333-333333333333",
+        turnId: "partial-turn",
+        outcome: "cancelled" as const,
+      };
+      yield* outbox.enqueue({
+        binding: replacement,
+        recordJson: '{"cancelled":true}',
+        result: partial,
+      });
+      yield* outbox.enqueue({
+        binding: replacement,
+        recordJson: '{"cancelled":true,"released":true}',
+      });
+      expect(yield* outbox.result(binding.jobId, partial.turnId)).toMatchObject({
+        resultId: partial.resultId,
+        status: "pending",
+      });
     }).pipe(Effect.provide(memory)),
 );

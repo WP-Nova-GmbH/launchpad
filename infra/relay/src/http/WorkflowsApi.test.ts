@@ -955,6 +955,175 @@ it.effect("exposes the queued publication retry even after a workflow has ended"
   }).pipe(Effect.provide(NodeCrypto.layer)),
 );
 
+const savingPublicationId = "11111111-1111-4111-8111-111111111111";
+
+function savingCheckpoint(
+  row: WorkflowJobRecord,
+  operation: "approve" | "input" | "request_changes",
+  state: "saving" | "failed",
+) {
+  const status = operation === "input" ? "awaiting_input" : "awaiting_review";
+  const checkpointId = operation === "input" ? "input" : "review";
+  const response: typeof RespondToWorkflowJob.Type =
+    operation === "approve"
+      ? { operation, checkpointId, expectedRevision: 5 }
+      : { operation, checkpointId, expectedRevision: 5, text: "Keep this response" };
+  const updated: WorkflowJobRecord = {
+    ...row,
+    status,
+    record: {
+      ...row.record,
+      runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+      vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
+      status,
+      progress: {
+        ...row.record.progress!,
+        status,
+        ...(operation === "input"
+          ? {}
+          : {
+              checkpoint: {
+                kind: "review",
+                role: "maintainer",
+                checkpointId,
+                stepId: "review",
+                generation: 0,
+                turnId: "turn",
+                checkpointRef: "refs/t3/review",
+                checkpointTurnCount: 1,
+              },
+            }),
+        resultSaving: {
+          publicationId: savingPublicationId,
+          resultId: null,
+          state,
+          retryable: state === "failed",
+          detail: "Waiting for the relay acknowledgement",
+        },
+      },
+    },
+  };
+  return { updated, response };
+}
+
+it.effect.each(["approve", "input", "request_changes"] as const)(
+  "blocks VM %s while its recovery publication is being saved",
+  (operation) =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const { updated, response } = savingCheckpoint(yield* Ref.get(h.row), operation, "saving");
+      yield* Ref.set(h.row, updated);
+      assert.equal((yield* Effect.flip(h.respond(response)))._tag, "WorkflowConflictError");
+      assert.isNull((yield* Ref.get(h.row)).pendingControl);
+      assert.equal(yield* Ref.get(h.writes), 0);
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect.each(["approve", "input", "request_changes"] as const)(
+  "exposes Retry saving and replaces an undispatched VM %s only for the current failed publication",
+  (operation) =>
+    Effect.gen(function* () {
+      const h = yield* manualApiHarness;
+      const { updated, response } = savingCheckpoint(yield* Ref.get(h.row), operation, "failed");
+      const pending = { userId: "maintainer", responseId: "response", response };
+      yield* Ref.set(h.row, { ...updated, pendingControl: pending });
+      const current = yield* h.refresh();
+      assert.strictEqual(current?.responsePending, false);
+      assert.isUndefined(current?.pendingResponseOperation);
+      assert.deepEqual((yield* Ref.get(h.row)).pendingControl, pending);
+      const retry = {
+        operation: "retry_saving",
+        publicationId: savingPublicationId,
+        expectedRevision: 5,
+      } as const;
+      assert.equal(
+        (yield* Effect.flip(
+          h.respond({ ...retry, publicationId: "22222222-2222-4222-8222-222222222222" }),
+        ))._tag,
+        "WorkflowConflictError",
+      );
+      assert.deepEqual((yield* Ref.get(h.row)).pendingControl, pending);
+      assert.equal(yield* Ref.get(h.writes), 0);
+      const retried = yield* h.respond(retry);
+      assert.strictEqual(retried.resultSaveRetryPending, true);
+      assert.deepEqual((yield* Ref.get(h.row)).pendingControl, {
+        userId: "maintainer",
+        response: retry,
+      });
+      assert.equal(yield* Ref.get(h.writes), 1);
+    }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("keeps a dispatched checkpoint visible and rejects replacing it with Retry saving", () =>
+  Effect.gen(function* () {
+    const h = yield* manualApiHarness;
+    const { updated, response } = savingCheckpoint(
+      yield* Ref.get(h.row),
+      "request_changes",
+      "failed",
+    );
+    const pending = {
+      userId: "maintainer",
+      responseId: "response",
+      response,
+      checkpointDispatch: {
+        allocationId: "allocation",
+        operationId: "operation",
+        generation: 1,
+        environmentId: EnvironmentId.make("environment"),
+      },
+    };
+    yield* Ref.set(h.row, { ...updated, pendingControl: pending });
+    const current = yield* h.refresh();
+    assert.strictEqual(current?.responsePending, true);
+    assert.strictEqual(current?.pendingResponseOperation, "request_changes");
+    assert.equal(
+      (yield* Effect.flip(
+        h.respond({
+          operation: "retry_saving",
+          publicationId: savingPublicationId,
+          expectedRevision: 5,
+        }),
+      ))._tag,
+      "WorkflowConflictError",
+    );
+    assert.deepEqual((yield* Ref.get(h.row)).pendingControl, pending);
+    assert.equal(yield* Ref.get(h.writes), 0);
+  }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
+it.effect("keeps an undispatched checkpoint when its publication cannot be retried", () =>
+  Effect.gen(function* () {
+    const h = yield* manualApiHarness;
+    const { updated, response } = savingCheckpoint(yield* Ref.get(h.row), "input", "failed");
+    const pending = { userId: "maintainer", responseId: "response", response };
+    yield* Ref.set(h.row, {
+      ...updated,
+      pendingControl: pending,
+      record: {
+        ...updated.record,
+        progress: {
+          ...updated.record.progress!,
+          resultSaving: { ...updated.record.progress!.resultSaving!, retryable: false },
+        },
+      },
+    });
+    assert.strictEqual((yield* h.refresh())?.pendingResponseOperation, "input");
+    assert.equal(
+      (yield* Effect.flip(
+        h.respond({
+          operation: "retry_saving",
+          publicationId: savingPublicationId,
+          expectedRevision: 5,
+        }),
+      ))._tag,
+      "WorkflowConflictError",
+    );
+    assert.deepEqual((yield* Ref.get(h.row)).pendingControl, pending);
+    assert.equal(yield* Ref.get(h.writes), 0);
+  }).pipe(Effect.provide(NodeCrypto.layer)),
+);
+
 it.effect.each(["finishing", "awaiting_review"] as const)(
   "rejects cancel-only completion controls while allowing transient retries (%s)",
   (status) =>

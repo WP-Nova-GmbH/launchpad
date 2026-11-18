@@ -36,15 +36,18 @@ const State = Schema.Struct({
   ),
 });
 const decodeState = Schema.decodeEffect(Schema.fromJsonString(State));
+interface NativeCommandOwner {
+  readonly commandLauncher?: Effect.Effect<string, SetupProcessError>;
+  readonly host: Effect.Effect<typeof BootEvidence.Type | null, SetupProcessError>;
+  readonly inspect: (pid: number) => Effect.Effect<typeof State.Type, SetupProcessError>;
+  readonly arm: (pid: number, identity: string) => Effect.Effect<string, SetupProcessError>;
+  readonly stop: (pid: number, identity: string) => Effect.Effect<void, SetupProcessError>;
+}
 export class SetupProcessAdapter extends Context.Service<
   SetupProcessAdapter,
-  {
+  NativeCommandOwner & {
     readonly launcher: Effect.Effect<string, SetupProcessError>;
-    readonly commandLauncher?: Effect.Effect<string, SetupProcessError>;
-    readonly host: Effect.Effect<typeof BootEvidence.Type | null, SetupProcessError>;
-    readonly inspect: (pid: number) => Effect.Effect<typeof State.Type, SetupProcessError>;
-    readonly arm: (pid: number, identity: string) => Effect.Effect<string, SetupProcessError>;
-    readonly stop: (pid: number, identity: string) => Effect.Effect<void, SetupProcessError>;
+    readonly vmPublishing?: NativeCommandOwner;
   }
 >()("t3/terminal/SetupProcessAdapter") {}
 
@@ -62,14 +65,14 @@ export const layer = Layer.effect(
           )
         : undefined;
     const invoke = Effect.fn("SetupProcessAdapter.invoke")(
-      function* (args: ReadonlyArray<string>) {
+      function* (args: ReadonlyArray<string>, workloadSetup = workflowGuest) {
         if (workflowGuest && !trustedRunner)
           return yield* new SetupProcessError({
             message: "Workflow setup controls are unavailable.",
           });
         const output = yield* (trustedRunner ?? runner).run({
-          command: workflowGuest ? "/opt/launchpad/bin/launchpad-workload" : yield* binary.resolve,
-          args: [workflowGuest ? "workflow-setup-control" : "--setup-process", ...args],
+          command: workloadSetup ? "/opt/launchpad/bin/launchpad-workload" : yield* binary.resolve,
+          args: [workloadSetup ? "workflow-setup-control" : "--setup-process", ...args],
           timeout: "10 seconds",
           maxOutputBytes: 4096,
         });
@@ -81,10 +84,9 @@ export const layer = Layer.effect(
       },
       Effect.mapError((error) => new SetupProcessError({ message: error.message })),
     );
-    const host = invoke(["host"]).pipe(Effect.map((state) => state.boot));
-    return SetupProcessAdapter.of({
+    const owner = (workloadSetup: boolean): NativeCommandOwner => ({
       commandLauncher: Effect.gen(function* () {
-        const state = yield* invoke(["host"]);
+        const state = yield* invoke(["host"], workloadSetup);
         if (state.commandLaunchProtocol !== 1)
           return yield* new SetupProcessError({
             message:
@@ -94,22 +96,10 @@ export const layer = Layer.effect(
           Effect.mapError((error) => new SetupProcessError({ message: error.message })),
         );
       }),
-      // The guest broker recognizes only the packaged workflow launcher.
-      launcher: Effect.gen(function* () {
-        const state = yield* invoke(["host"]);
-        if (state.setupLaunchProtocol !== 1)
-          return yield* new SetupProcessError({
-            message: "Setup shell launch support is unavailable. Update the environment.",
-          });
-        if (workflowGuest) return "/opt/launchpad/server/resource-monitor/t3-resource-monitor";
-        return yield* binary.resolve.pipe(
-          Effect.mapError((error) => new SetupProcessError({ message: error.message })),
-        );
-      }),
-      host,
-      inspect: (pid) => invoke(["capture", String(pid)]),
+      host: invoke(["host"], workloadSetup).pipe(Effect.map((state) => state.boot)),
+      inspect: (pid) => invoke(["capture", String(pid)], workloadSetup),
       arm: (pid, identity) =>
-        invoke(["arm", String(pid), identity]).pipe(
+        invoke(["arm", String(pid), identity], workloadSetup).pipe(
           Effect.flatMap((state) =>
             state.identity === identity &&
             state.owned &&
@@ -126,7 +116,7 @@ export const layer = Layer.effect(
           ),
         ),
       stop: (pid, identity) =>
-        invoke(["stop", String(pid), identity]).pipe(
+        invoke(["stop", String(pid), identity], workloadSetup).pipe(
           Effect.flatMap((state) =>
             state.fullStop && state.owned && state.identity === null
               ? Effect.void
@@ -135,6 +125,23 @@ export const layer = Layer.effect(
                 ),
           ),
         ),
+    });
+    return SetupProcessAdapter.of({
+      ...owner(workflowGuest),
+      // Coordinator network commands run without the workflow workload UID.
+      ...(workflowGuest && trustedRunner ? { vmPublishing: owner(false) } : {}),
+      // The guest broker recognizes only the packaged workflow launcher.
+      launcher: Effect.gen(function* () {
+        const state = yield* invoke(["host"]);
+        if (state.setupLaunchProtocol !== 1)
+          return yield* new SetupProcessError({
+            message: "Setup shell launch support is unavailable. Update the environment.",
+          });
+        if (workflowGuest) return "/opt/launchpad/server/resource-monitor/t3-resource-monitor";
+        return yield* binary.resolve.pipe(
+          Effect.mapError((error) => new SetupProcessError({ message: error.message })),
+        );
+      }),
     });
   }),
 );

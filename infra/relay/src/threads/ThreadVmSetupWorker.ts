@@ -206,6 +206,7 @@ export function makeThreadVmSetupWorker(
                       organizationId: RelayOrganizationId.make(setup.organizationId),
                       installationId: snapshot.installationId,
                       baseBranch: snapshot.branch,
+                      ...(snapshot.workflowPublishing ? { workflowPublishing: true as const } : {}),
                     },
                   }
                 : {}),

@@ -5,7 +5,7 @@ import {
 } from "./ThreadVmInitialStateRecord.ts";
 import { CommandId, ProjectId } from "@t3tools/contracts";
 import { RelayThreadVmSetupInput, RelayThreadVmSetupReceipt } from "@t3tools/contracts/relay";
-import { jobBranchName } from "@t3tools/shared/workflowStorage";
+import { LAUNCHPAD_JOB_BRANCH_PREFIX, jobBranchName } from "@t3tools/shared/workflowStorage";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import type * as Redacted from "effect/Redacted";
@@ -67,7 +67,11 @@ export const prepareThreadVmInitialState = Effect.fn("ThreadVmInitialState.prepa
       input.workspace.scope.generation !== 1 ||
       (input.workflow &&
         (input.workspace.scope.threadId !== `workflow:${input.workflow.jobId}` ||
-          input.workspace.branch !== jobBranchName(input.workflow.jobId))) ||
+          input.workspace.branch !==
+            jobBranchName(
+              input.workflow.jobId,
+              input.workflow.workflowPublishing ? LAUNCHPAD_JOB_BRANCH_PREFIX : undefined,
+            ))) ||
       (!input.workflow && gitToken !== undefined)
     )
       return yield* fail("identity_changed");

@@ -24,6 +24,7 @@ export type WorkflowVmSnapshot = {
   readonly branch: string;
   readonly commitSha: string;
   readonly templateBuildId: string;
+  readonly workflowPublishing?: true;
 };
 
 export const workflowVmHasSecrets = Effect.fnUntraced(function* (sql: PgClient, jobId: string) {

@@ -55,6 +55,8 @@ import {
   readWorkflowRunReviewSecrets,
   resolveWorkflowRunAttemptConfiguration,
 } from "../jobs/WorkflowRunConfiguration.ts";
+import { handleWorkflowVmPublishing } from "../jobs/WorkflowVmPublishing.ts";
+import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
 
 type Owner = {
   readonly threadId: string;
@@ -1016,6 +1018,16 @@ export const threadEnvironmentApi = HttpApiBuilder.group(
         appendRelayCredentialResponseHeaders.pipe(
           Effect.andThen(readThreadVmReviewSecrets({ ...params, ...payload })),
         ),
+      )
+      .handle("workflowVmPublishing", ({ params, payload }) =>
+        Effect.gen(function* () {
+          yield* appendRelayCredentialResponseHeaders;
+          const handle = handleWorkflowVmPublishing({ ...params, ...payload });
+          const reply = yield* handle;
+          if (reply.kind !== "waiting_progress") return reply;
+          yield* refreshWorkflowJob(payload.jobId).pipe(Effect.ignore);
+          return yield* handle;
+        }),
       )
       .handle("mintRepositoryToken", ({ params, payload }) =>
         mintThreadVmRepositoryToken({ ...params, ...payload }),

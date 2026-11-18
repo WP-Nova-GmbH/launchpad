@@ -7,7 +7,7 @@ import {
   type RepositoryWorkflow,
   type WorkflowQueueReason,
 } from "@t3tools/contracts/workflows";
-import { jobBranchName } from "@t3tools/shared/workflowStorage";
+import { LAUNCHPAD_JOB_BRANCH_PREFIX, jobBranchName } from "@t3tools/shared/workflowStorage";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -417,8 +417,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
     const definition = yield* store.get(job.workflowId);
     if (!definition || definition.archived || definition.definition.target.kind !== "vm")
       return job;
-    if (definition.definition.steps.some((step) => step.kind === "action"))
-      return yield* block("Remove Push and Open PR before this VM workflow can start.");
+    const publishing = definition.definition.steps.some((step) => step.kind === "action");
     const modelIssue = vmWorkflowDefinitionIssue(
       definition.definition.target.baseBranch,
       definition.definition.steps,
@@ -452,6 +451,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
     const git = yield* resolveWorkflowVmGitHub({
       ...identity,
       baseBranch: definition.definition.target.baseBranch,
+      publishingSteps: definition.definition.steps,
     }).pipe(
       Effect.provideService(GithubApp, app.value),
       Effect.catchTag("WorkflowInvalidError", ({ message }) => block(message)),
@@ -485,7 +485,11 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           WHERE allocation_id=${job.jobId}`;
         yield* sql`INSERT INTO relay_thread_vm_provisions
           (allocation_id,operation_id,generation,workflow_snapshot)
-          VALUES (${job.jobId},${operationId},1,${sql.json({ ...git, templateBuildId: settings.templateBuildId })})`;
+          VALUES (${job.jobId},${operationId},1,${sql.json({
+            ...git,
+            templateBuildId: settings.templateBuildId,
+            ...(publishing ? { workflowPublishing: true } : {}),
+          })})`;
         const timestamp = DateTime.formatIso(yield* DateTime.now);
         const initialState = yield* encodeInitialThread({
           title: definition.definition.name,
@@ -493,7 +497,9 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
           modelSelection: initialModel,
         });
         yield* sql`INSERT INTO relay_thread_vm_setups (allocation_id,canonical_key,branch,revision,initial_state)
-          VALUES (${job.jobId},${git.canonicalKey},${jobBranchName(job.jobId)},${git.commitSha},${initialState})`;
+          VALUES (${job.jobId},${git.canonicalKey},
+            ${jobBranchName(job.jobId, publishing ? LAUNCHPAD_JOB_BRANCH_PREFIX : undefined)},
+            ${git.commitSha},${initialState})`;
         yield* store.updateJob(
           { ...row, repositoryCanonicalKey: git.canonicalKey },
           {

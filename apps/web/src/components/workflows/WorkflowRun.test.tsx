@@ -230,7 +230,14 @@ afterEach(async () => {
 });
 
 describe("Run receipt and navigation ownership", () => {
-  it("blocks a saved VM publishing workflow before submission and retains its instructions", async () => {
+  it("lets the relay check VM publishing readiness and keeps instructions when blocked", async () => {
+    const message = "Give the organization's GitHub App Contents write access.";
+    read.mockRejectedValueOnce(
+      new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        cause: new WorkflowInvalidError({ message }),
+      }),
+    );
     await mount({
       ...base,
       vmExecutionAvailable: true,
@@ -246,10 +253,10 @@ describe("Run receipt and navigation ownership", () => {
         },
       },
     });
-    expect(renderer!.root.findAllByType("form")).toHaveLength(0);
-    expect(JSON.stringify(renderer!.toJSON())).toContain("Publishing requires a Machine target");
+    await submit();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(alertText()).toContain(message);
     expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
-    expect(read).not.toHaveBeenCalled();
     expect(draft().instruction).toBe("Run A");
   });
   it("keeps instructions copyable after a rejected Run and a refresh to the VM target", async () => {

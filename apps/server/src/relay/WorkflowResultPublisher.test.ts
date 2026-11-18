@@ -47,7 +47,7 @@ const fixture = Effect.gen(function* () {
   let uploads = 0;
   let publishCalls = 0;
   let lostReply = false;
-  let saved: WorkflowSaveReceipt | null = null;
+  const saved = new Map<string, WorkflowSaveReceipt>();
   const bytes = new Map<string, Uint8Array>();
   const upload: ThreadCheckpointTransport["upload"] = (owner, input, body) =>
     Effect.gen(function* () {
@@ -62,12 +62,13 @@ const fixture = Effect.gen(function* () {
     publish: (_owner, input) =>
       Effect.gen(function* () {
         publishCalls++;
-        if (saved) return saved;
+        const prior = saved.get(input.publicationId);
+        if (prior) return prior;
         const raw = bytes.get(input.manifestArtifactId);
         if (!raw)
           return yield* new WorkflowResultSaveError({ detail: "Not uploaded", permanent: false });
         const manifest = yield* decodeManifest(new TextDecoder().decode(raw));
-        saved = {
+        const receipt = {
           publicationId: manifest.publicationId,
           jobId: binding.jobId,
           threadId: binding.threadId,
@@ -79,10 +80,11 @@ const fixture = Effect.gen(function* () {
             sizeBytes: raw.length,
           },
           resultId: manifest.result?.resultId ?? null,
-        };
+        } satisfies WorkflowSaveReceipt;
+        saved.set(input.publicationId, receipt);
         if (lostReply)
           return yield* new WorkflowResultSaveError({ detail: "Reply lost", permanent: false });
-        return saved;
+        return receipt;
       }).pipe(
         Effect.catchTag(
           "SchemaError",
@@ -184,6 +186,44 @@ it.effect("bounds a stalled prerequisite by the persisted whole-cycle deadline",
     Effect.provideService(
       CheckpointDiffQuery,
       query(() => Effect.die("No diff while prerequisites stall")),
+    ),
+    Effect.provide(services),
+  ),
+);
+
+it.effect("publishes the latest queued state after its predecessor uses the full save budget", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.outbox.enqueue({ binding, recordJson: '{"cursor":0}' });
+      const started = yield* Deferred.make<void>();
+      const running = yield* Effect.forkChild(
+        f
+          .publisher({
+            synchronize: () =>
+              Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+          })
+          .synchronize(binding.threadId),
+      );
+      yield* Deferred.await(started);
+      yield* f.outbox.enqueue({ binding, recordJson: '{"cursor":1}' });
+      yield* f.outbox.enqueue({ binding, recordJson: '{"cursor":2}' });
+      yield* TestClock.adjust(WORKFLOW_SAVE_CYCLE_MS);
+      yield* Fiber.join(running);
+      const first = (yield* f.outbox.next(binding.threadId))!;
+      expect(first).toMatchObject({ status: "failed", recordJson: '{"cursor":0}' });
+      expect(yield* f.outbox.retry(binding.jobId, first.publicationId)).toBe(true);
+      const publisher = f.publisher();
+      yield* publisher.synchronize(binding.threadId);
+      expect((yield* f.outbox.next(binding.threadId))?.recordJson).toBe('{"cursor":2}');
+      yield* publisher.synchronize(binding.threadId);
+      expect(yield* f.outbox.next(binding.threadId)).toBeNull();
+      expect(f.publishCount()).toBe(2);
+    }),
+  ).pipe(
+    Effect.provideService(
+      CheckpointDiffQuery,
+      query(() => Effect.die("State-only publications do not need a diff")),
     ),
     Effect.provide(services),
   ),

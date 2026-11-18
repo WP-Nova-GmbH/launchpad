@@ -571,6 +571,10 @@ export function WorkflowJob({
   );
   const failed = selectedJob.status === "failed";
   const cancelledVm = selectedJob.status === "cancelled" && selectedJob.runtime?.kind === "vm";
+  const publicationOutcome = cancelledVm ? selectedJob.publicationOutcome : undefined;
+  const publishedBranchUrl = publicationOutcome?.branchUrl;
+  const publishedPullRequestUrl =
+    publicationOutcome?.pullRequestUrl ?? selectedJob.progress?.pullRequestUrl;
   const stepId = failed
     ? selectedJob.progress?.stepId
     : (checkpoint?.stepId ?? selectedJob.progress?.stepId);
@@ -1228,7 +1232,51 @@ export function WorkflowJob({
                 <p className="wrap-anywhere">{preparationRelayDetail}</p>
               ) : null}
             </WorkflowOutcome>
-          ) : cancelledVm ? null : (
+          ) : cancelledVm ? (
+            publicationOutcome ? (
+              <WorkflowOutcome
+                title={
+                  publicationOutcome.state === "unknown"
+                    ? "Publishing outcome unknown"
+                    : "Published to GitHub"
+                }
+                tone={publicationOutcome.state === "unknown" ? "warning" : "neutral"}
+                announce={false}
+                actions={
+                  <>
+                    {publishedBranchUrl ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        render={<a href={publishedBranchUrl} target="_blank" rel="noreferrer" />}
+                      >
+                        Open published branch
+                        <ArrowUpRightIcon aria-hidden />
+                      </Button>
+                    ) : null}
+                    {publishedPullRequestUrl ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        render={
+                          <a href={publishedPullRequestUrl} target="_blank" rel="noreferrer" />
+                        }
+                      >
+                        Open pull request
+                        <ArrowUpRightIcon aria-hidden />
+                      </Button>
+                    ) : null}
+                  </>
+                }
+              >
+                {publicationOutcome.state === "unknown" ? (
+                  <p>
+                    Launchpad could not verify whether GitHub received the last publishing action.
+                  </p>
+                ) : null}
+              </WorkflowOutcome>
+            ) : null
+          ) : (
             <div
               className={
                 TaskIcon
@@ -1462,8 +1510,8 @@ export function WorkflowJob({
           steps={selectedJob.workflow?.definition.steps}
           accountId={scope.accountId}
         />
-        {!completed && selectedJob.progress?.pullRequestUrl ? (
-          <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer">
+        {!completed && !publicationOutcome && publishedPullRequestUrl ? (
+          <a href={publishedPullRequestUrl} target="_blank" rel="noreferrer">
             Open pull request
           </a>
         ) : null}

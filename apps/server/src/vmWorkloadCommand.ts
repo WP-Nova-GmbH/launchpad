@@ -153,6 +153,22 @@ const runWorkflowControl = Effect.fnUntraced(function* (
   if (code !== 0 || receipt.truncated) return yield* signalError();
   return receipt.text;
 });
+/** A publishing phase records each VM workload before the broker can launch it. */
+export const WorkflowPublishingWorkloads = Context.Reference<{
+  readonly register: (workloadId: string) => Effect.Effect<void, PlatformError.PlatformError>;
+  readonly complete: (workloadId: string) => Effect.Effect<void, PlatformError.PlatformError>;
+} | null>("t3/WorkflowPublishingWorkloads", { defaultValue: () => null });
+
+const decodePublishingStop = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ stopped: Schema.Literal(true) })),
+);
+export const stopWorkflowPublishingWorkload = Effect.fnUntraced(function* (workloadId: string) {
+  const raw = yield* VmControlSpawner;
+  if (!raw || !/^[a-f0-9]{32}$/u.test(workloadId)) return yield* signalError();
+  const receipt = yield* runWorkflowControl(raw, ["stop-workflow-publishing", workloadId]);
+  yield* decodePublishingStop(receipt);
+}, Effect.mapError(signalError));
+
 export const signalWorkflowVmWorkload = Effect.fn("VmWorkload.signalWorkflow")(function* (
   raw: ChildProcessSpawner.ChildProcessSpawner["Service"],
   workloadId: string,
@@ -367,6 +383,25 @@ export function makeVmWorkloadSpawner(
             description: "VM workload launch could not be tracked.",
           }),
       });
+      const publishing = workflow ? yield* WorkflowPublishingWorkloads : null;
+      if (publishing && ChildProcess.isStandardCommand(wrapped) && !wrapped.options.additionalFds) {
+        const [mode, id, kind] = wrapped.args;
+        const transfer = mode === "run-workflow-transfer" || mode === "run-transfer";
+        const workloadId = transfer ? wrapped.args[4] : id;
+        if ((kind === "process" || transfer) && workloadId) {
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              yield* publishing.register(workloadId);
+              yield* Effect.addFinalizer(() =>
+                stopWorkflowPublishingWorkload(workloadId).pipe(
+                  Effect.andThen(publishing.complete(workloadId)),
+                  Effect.orDie,
+                ),
+              );
+            }),
+          );
+        }
+      }
       if (
         !ChildProcess.isStandardCommand(wrapped) ||
         (wrapped.args[0] !== "run-workflow" && wrapped.args[0] !== "run-workflow-transfer")

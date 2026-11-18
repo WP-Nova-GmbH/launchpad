@@ -44,8 +44,6 @@ export function vmAutomationDefinitionIssue(
 ) {
   if (!catalog)
     return "Verify the workflow VM build and its Codex models before enabling automation.";
-  if (steps.some((step) => step.kind === "action"))
-    return "Remove Push and Open PR before enabling automatic runs on this VM workflow.";
   return vmWorkflowDefinitionIssue(target.baseBranch, steps, catalog);
 }
 

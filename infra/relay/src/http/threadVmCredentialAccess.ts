@@ -86,6 +86,9 @@ export function threadVmCredentialAllows(
     (parts[6] === "repository" && parts[7] === "binding") ||
     (parts[6] === "workflow" &&
       ["attempt", "review-secrets", "result", "result-reservation"].includes(parts[7]!)) ||
+    (parts[6] === "workflow" &&
+      parts[7] === "publishing" &&
+      input.threadVm.threadId.startsWith("workflow:")) ||
     (parts[6] === "commands" && (parts[7] === "next" || parts[7] === "ack")) ||
     (parts[6] === "work" && (parts[7] === "admit" || parts[7] === "complete"))
   );

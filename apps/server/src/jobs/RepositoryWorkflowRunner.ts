@@ -5,6 +5,7 @@ import {
   changeWorkflowAction,
   readWorkflowHead,
   readWorkflowTree,
+  workflowPublishingStopNeedsAcknowledgement,
   type WorkflowActionIO,
 } from "./WorkflowActions.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
@@ -56,6 +57,7 @@ import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
 import { ProviderService } from "../provider/Services/ProviderService.ts";
 import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolver.ts";
 import { canContinueWorkflowVmInference } from "../relay/WorkflowVmAttempts.ts";
+import { WorkflowVmPublisher, workflowVmPublishingIO } from "../relay/WorkflowVmPublishing.ts";
 import { TextGeneration } from "../textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepository } from "../persistence/Services/OrchestrationCommandReceipts.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -366,6 +368,8 @@ export const make = Effect.gen(function* () {
   const timestamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const actions = yield* WorkflowActions;
   const publishingSupported = yield* actions.available;
+  const vmPublishingSupported = yield* actions.vmAvailable ?? Effect.succeed(false);
+  const publishFromVm = yield* WorkflowVmPublisher;
   const actionWorkers = new Map<
     string,
     { fiber: Fiber.Fiber<void, never> | null; stopping: boolean }
@@ -1325,8 +1329,8 @@ export const make = Effect.gen(function* () {
       return run;
     },
   );
-  const actionIO = (jobId: string): WorkflowActionIO => ({
-    read: persistence
+  const actionIO = (jobId: string): WorkflowActionIO => {
+    const read = persistence
       .get(jobId)
       .pipe(
         Effect.flatMap((run) =>
@@ -1334,25 +1338,29 @@ export const make = Effect.gen(function* () {
             ? Effect.succeed(run)
             : Effect.fail(new WorkflowActionError({ message: "The workflow job is unavailable." })),
         ),
-      ),
-    update: (change) => {
-      const effect = Effect.gen(function* () {
-        const current = yield* persistence.get(jobId);
-        if (!current)
-          return yield* new WorkflowActionError({ message: "The workflow job is unavailable." });
-        const next = change(current);
-        return yield* store.save({
-          ...next,
-          progress: { ...next.progress, revision: current.progress.revision + 1 },
-        });
-      }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.fail(new WorkflowActionError({ message: Cause.pretty(cause) })),
-        ),
       );
-      return lock.withPermits(1)(effect);
-    },
-  });
+    return {
+      read,
+      vmPublishing: workflowVmPublishingIO(publishFromVm, read),
+      update: (change) => {
+        const effect = Effect.gen(function* () {
+          const current = yield* persistence.get(jobId);
+          if (!current)
+            return yield* new WorkflowActionError({ message: "The workflow job is unavailable." });
+          const next = change(current);
+          return yield* store.save({
+            ...next,
+            progress: { ...next.progress, revision: current.progress.revision + 1 },
+          });
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.fail(new WorkflowActionError({ message: Cause.pretty(cause) })),
+          ),
+        );
+        return lock.withPermits(1)(effect);
+      },
+    };
+  };
   const actionSettled = (jobId: string) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
@@ -1602,7 +1610,15 @@ export const make = Effect.gen(function* () {
           return run;
         }
         if (actionCleanupWorkers.has(run.jobId)) return run;
-        if (run.actions?.some((action) => action.commands.some((command) => !command.stopped))) {
+        if (
+          run.actions?.some((action) =>
+            action.commands.some(
+              (command) =>
+                !command.stopped ||
+                (run.runtime.kind === "vm" && workflowPublishingStopNeedsAcknowledgement(command)),
+            ),
+          )
+        ) {
           yield* recoverCancelledAction(run);
           return run;
         }
@@ -1892,12 +1908,11 @@ export const make = Effect.gen(function* () {
         detail: string | null = null,
       ): WorkflowControlResult => ({
         protocol: WORKFLOW_PROTOCOL,
-        actions:
-          !vm && publishingSupported
-            ? actions.canOpenPullRequest
-              ? ["push", "open_pull_request"]
-              : ["push"]
-            : [],
+        actions: (vm ? vmPublishingSupported : publishingSupported)
+          ? actions.canOpenPullRequest
+            ? ["push", "open_pull_request"]
+            : ["push"]
+          : [],
         outcome,
         detail,
         progress: run
@@ -2180,7 +2195,7 @@ export const make = Effect.gen(function* () {
         )
           return result(null, "unavailable", "Invalid workflow execution binding.");
         const publishing = workflow.definition.steps.filter((step) => step.kind === "action");
-        if (publishing.length && (vm || !publishingSupported))
+        if (publishing.length && !(vm ? vmPublishingSupported : publishingSupported))
           return result(
             null,
             "unavailable",
@@ -2225,6 +2240,7 @@ export const make = Effect.gen(function* () {
             "Publishing requires a remote URL without embedded credentials. Configure runner-held source-control credentials instead.",
           );
         if (
+          !vm &&
           publishing.some((step) => step.action === "open_pull_request") &&
           (!actions.canOpenPullRequest ||
             !identity ||
@@ -2324,7 +2340,11 @@ export const make = Effect.gen(function* () {
             Option.isNone(thread) ||
             thread.value.projectId !== vm.binding.projectId ||
             thread.value.worktreePath !== null ||
-            thread.value.branch !== jobBranchName(request.jobId) ||
+            thread.value.branch !==
+              jobBranchName(
+                request.jobId,
+                publishing.length ? LAUNCHPAD_JOB_BRANCH_PREFIX : undefined,
+              ) ||
             (yield* readWorkflowHead(git, vm.workspaceRoot, thread.value.branch)) !== vm.baseSha
           )
             return result(
@@ -2354,7 +2374,9 @@ export const make = Effect.gen(function* () {
         }
         run = {
           jobId: request.jobId,
-          ...(runtime.kind === "machine" ? { jobBranchPrefix: LAUNCHPAD_JOB_BRANCH_PREFIX } : {}),
+          ...(runtime.kind === "machine" || publishing.length
+            ? { jobBranchPrefix: LAUNCHPAD_JOB_BRANCH_PREFIX }
+            : {}),
           origin,
           userId: origin.kind === "manual" ? origin.userId : null,
           repositoryCanonicalKey: request.repositoryCanonicalKey,

@@ -44,6 +44,31 @@ export function pendingWorkflowVmCheckpoint(row: WorkflowJobRecord) {
   return { ...pending, responseId: pending.responseId, response: pending.response, checkpoint };
 }
 
+export function pendingWorkflowVmPublishingRetry(row: WorkflowJobRecord) {
+  const pending = row.pendingControl;
+  const progress = row.record.progress;
+  if (
+    !row.record.vmAdmission ||
+    row.record.runtime?.kind !== "vm" ||
+    !pending?.responseId ||
+    pending.response.operation !== "retry_action" ||
+    row.status !== "paused" ||
+    progress?.status !== "paused" ||
+    progress.manualPause ||
+    progress.revision !== pending.response.expectedRevision
+  )
+    return null;
+  const actionId = pending.response.actionId;
+  const action = progress.actions?.findLast((entry) => entry.actionId === actionId);
+  if (
+    !action?.retryable ||
+    action.generation !== progress.generation ||
+    action.stepId !== progress.stepId
+  )
+    return null;
+  return { ...pending, responseId: pending.responseId, response: pending.response, action };
+}
+
 export function restoreSupersededWorkflowCheckpoint(pending: WorkflowJobRecord["pendingControl"]) {
   const superseded = pending?.supersededCheckpoint;
   if (!superseded) return null;
@@ -80,6 +105,18 @@ export const authorizeWorkflowVmCheckpoint = Effect.fnUntraced(function* (
       ? requireWorkflowVmViewer(sql, row, pending.userId)
       : requireWorkflowVmMaintainer(sql, row, pending.userId)
   ).pipe(
+    Effect.as(pending),
+    Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
+  );
+});
+
+export const authorizeWorkflowVmPublishingRetry = Effect.fnUntraced(function* (
+  sql: PgClient,
+  row: WorkflowJobRecord,
+) {
+  const pending = pendingWorkflowVmPublishingRetry(row);
+  if (!pending) return null;
+  return yield* requireWorkflowVmMaintainer(sql, row, pending.userId).pipe(
     Effect.as(pending),
     Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
   );

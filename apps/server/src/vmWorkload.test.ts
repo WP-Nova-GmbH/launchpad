@@ -24,6 +24,7 @@ import {
   VmWorkloadTracking,
   VmWorkloadMaintenance,
   VmCoordinatorProcess,
+  WorkflowPublishingWorkloads,
   makeVmWorkloadSpawner,
   withVmWorkloads,
 } from "./vmWorkloadCommand.ts";
@@ -833,5 +834,52 @@ it.effect("reports the native provider identity deadline as a timeout", () =>
       action: "provider-identity",
       exitCode: 124,
     });
+  }),
+);
+
+it.effect("journals local publishing launches before spawn and retains unconfirmed cleanup", () =>
+  Effect.gen(function* () {
+    for (const stopConfirmed of [true, false]) {
+      const events: string[] = [];
+      let id = "";
+      const raw = ChildProcessSpawner.make((command) => {
+        if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipeline");
+        if (command.args[0] === "stop-workflow-publishing") {
+          expect(command.args[1]).toBe(id);
+          events.push("stop");
+          return respond(stopConfirmed ? '{"stopped":true}' : "invalid-stop").spawn(command);
+        }
+        expect(command.args[0]).toBe("run-workflow");
+        expect(command.args[1]).toBe(id);
+        expect(events).toEqual(["register"]);
+        events.push("spawn");
+        return respond("").spawn(command);
+      });
+      const tracked = makeVmWorkloadSpawner(raw, true);
+      const exit = yield* tracked
+        .spawn(
+          ChildProcess.make("git", ["commit", "-m", "saved result"], { cwd: "/workspace/project" }),
+        )
+        .pipe(
+          Effect.asVoid,
+          Effect.scoped,
+          Effect.provideService(VmControlSpawner, raw),
+          Effect.provideService(WorkflowPublishingWorkloads, {
+            register: (workloadId) =>
+              Effect.sync(() => {
+                id = workloadId;
+                events.push("register");
+              }),
+            complete: (workloadId) =>
+              Effect.sync(() => {
+                expect(workloadId).toBe(id);
+                events.push("complete");
+              }),
+          }),
+          Effect.exit,
+        );
+      expect(Exit.isSuccess(exit)).toBe(stopConfirmed);
+      expect(events).toEqual(["register", "spawn", "stop", ...(stopConfirmed ? ["complete"] : [])]);
+    }
   }),
 );
