@@ -8,6 +8,7 @@ import {
   ClockIcon,
   CloudIcon,
   FileDiffIcon,
+  GitBranchIcon,
   MessageSquareIcon,
   MonitorIcon,
   PauseIcon,
@@ -78,6 +79,7 @@ import {
   isTerminalWorkflowJob,
   workflowApprovalCanRetry,
   workflowIsFinishing,
+  type RepositoryWorkflowJob,
   type WorkflowControl,
 } from "@t3tools/contracts/workflows";
 import { TurnId } from "@t3tools/contracts";
@@ -148,6 +150,140 @@ function useRunActionFocus<Action extends HTMLElement = HTMLButtonElement>(
     focusedRun.current = null;
   });
   return registerAction;
+}
+
+function publishedBranchName(branchUrl: string) {
+  try {
+    const url = new URL(branchUrl);
+    if (url.origin !== "https://github.com") return undefined;
+    const ref = /^\/[^/]+\/[^/]+\/tree\/([^/]+)$/u.exec(url.pathname)?.[1];
+    return ref ? decodeURIComponent(ref) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// A publishing receipt can accompany an unrelated cancellation detail.
+const relayPublishingCancellationDetails = new Set([
+  "The branch was pushed before cancellation.",
+  "Could not verify whether the branch was pushed before cancellation.",
+  "The pull request was opened before cancellation.",
+  "Could not verify whether the pull request was opened before cancellation.",
+]);
+
+function CancelledVmPublication({
+  outcome,
+  detail,
+  progressPullRequestUrl,
+}: {
+  outcome: NonNullable<RepositoryWorkflowJob["publicationOutcome"]>;
+  detail: string | undefined;
+  progressPullRequestUrl: string | null | undefined;
+}) {
+  const { branchUrl, pullRequestUrl } = outcome;
+  const unconfirmed = outcome.state === "unknown";
+  const branchName = branchUrl ? publishedBranchName(branchUrl) : undefined;
+  const pullRequestNumber = pullRequestUrl
+    ? parseChangeRequestUrl(pullRequestUrl)?.number
+    : undefined;
+  const pullRequestLabel = pullRequestNumber === undefined ? undefined : `PR #${pullRequestNumber}`;
+  const branchInFooter = !!branchUrl && (unconfirmed || !!pullRequestUrl);
+  const summary = detail ?? (unconfirmed ? "GitHub may have received the last action." : undefined);
+  const pullRequestSummary =
+    unconfirmed && pullRequestUrl
+      ? `Previously confirmed ${pullRequestLabel ?? "pull request"}`
+      : pullRequestLabel;
+  const summaryBranch = branchInFooter ? undefined : branchName;
+  const branchAction = branchUrl ? (
+    <Button
+      size="sm"
+      variant={branchInFooter ? "outline" : "default"}
+      render={<a href={branchUrl} target="_blank" rel="noreferrer" />}
+    >
+      Open branch
+      <ArrowUpRightIcon aria-hidden />
+    </Button>
+  ) : null;
+  const primaryBranchAction = branchInFooter ? null : branchAction;
+  const recordedPullRequestUrl = pullRequestUrl ?? progressPullRequestUrl;
+  const pullRequestAction = recordedPullRequestUrl ? (
+    <Button
+      size="sm"
+      variant={pullRequestUrl && !unconfirmed ? "default" : "outline"}
+      render={<a href={recordedPullRequestUrl} target="_blank" rel="noreferrer" />}
+    >
+      {pullRequestUrl ? "Open pull request" : "Open recorded pull request"}
+      <ArrowUpRightIcon aria-hidden />
+    </Button>
+  ) : null;
+
+  return (
+    <WorkflowOutcome
+      title={
+        unconfirmed
+          ? "Last publishing action unconfirmed"
+          : pullRequestUrl
+            ? "Pull request confirmed"
+            : branchUrl
+              ? "Branch published"
+              : "Published to GitHub"
+      }
+      tone={unconfirmed ? "warning" : "neutral"}
+      icon={
+        unconfirmed
+          ? undefined
+          : pullRequestUrl
+            ? PullRequestGlyph.pullRequest
+            : branchUrl
+              ? GitBranchIcon
+              : undefined
+      }
+      announce={false}
+      actions={
+        primaryBranchAction || pullRequestAction ? (
+          <>
+            {primaryBranchAction}
+            {pullRequestAction}
+          </>
+        ) : null
+      }
+      footer={
+        branchInFooter ? (
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex min-w-0 items-start gap-2">
+              <GitBranchIcon aria-hidden className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 wrap-anywhere">
+                {unconfirmed ? (
+                  <p className="text-xs font-medium">Previously published branch</p>
+                ) : null}
+                {branchName ? (
+                  <code
+                    className={cn(
+                      "block text-xs",
+                      unconfirmed ? "text-warning-foreground" : "text-muted-foreground",
+                    )}
+                  >
+                    {branchName}
+                  </code>
+                ) : unconfirmed ? null : (
+                  <p className="text-xs text-muted-foreground">Published branch</p>
+                )}
+              </div>
+            </div>
+            {branchAction}
+          </div>
+        ) : undefined
+      }
+    >
+      {summary || pullRequestSummary || summaryBranch ? (
+        <>
+          {summary ? <p>{summary}</p> : null}
+          {pullRequestSummary ? <p>{pullRequestSummary}</p> : null}
+          {summaryBranch ? <code className="wrap-anywhere">{summaryBranch}</code> : null}
+        </>
+      ) : null}
+    </WorkflowOutcome>
+  );
 }
 
 export function WorkflowJob({
@@ -661,9 +797,13 @@ export function WorkflowJob({
   const failed = selectedJob.status === "failed";
   const cancelledVm = selectedJob.status === "cancelled" && selectedJob.runtime?.kind === "vm";
   const publicationOutcome = cancelledVm ? selectedJob.publicationOutcome : undefined;
-  const publishedBranchUrl = publicationOutcome?.branchUrl;
-  const publishedPullRequestUrl =
-    publicationOutcome?.pullRequestUrl ?? selectedJob.progress?.pullRequestUrl;
+  const cancellationDetail = selectedJob.detail ?? selectedJob.progress?.detail;
+  const publishingCancellationDetail =
+    publicationOutcome &&
+    cancellationDetail &&
+    relayPublishingCancellationDetails.has(cancellationDetail)
+      ? cancellationDetail
+      : undefined;
   const stepId = failed
     ? selectedJob.progress?.stepId
     : (checkpoint?.stepId ?? selectedJob.progress?.stepId);
@@ -1432,47 +1572,11 @@ export function WorkflowJob({
             </WorkflowOutcome>
           ) : cancelledVm ? (
             publicationOutcome ? (
-              <WorkflowOutcome
-                title={
-                  publicationOutcome.state === "unknown"
-                    ? "Publishing outcome unknown"
-                    : "Published to GitHub"
-                }
-                tone={publicationOutcome.state === "unknown" ? "warning" : "neutral"}
-                announce={false}
-                actions={
-                  <>
-                    {publishedBranchUrl ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        render={<a href={publishedBranchUrl} target="_blank" rel="noreferrer" />}
-                      >
-                        Open published branch
-                        <ArrowUpRightIcon aria-hidden />
-                      </Button>
-                    ) : null}
-                    {publishedPullRequestUrl ? (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        render={
-                          <a href={publishedPullRequestUrl} target="_blank" rel="noreferrer" />
-                        }
-                      >
-                        Open pull request
-                        <ArrowUpRightIcon aria-hidden />
-                      </Button>
-                    ) : null}
-                  </>
-                }
-              >
-                {publicationOutcome.state === "unknown" ? (
-                  <p>
-                    Launchpad could not verify whether GitHub received the last publishing action.
-                  </p>
-                ) : null}
-              </WorkflowOutcome>
+              <CancelledVmPublication
+                outcome={publicationOutcome}
+                detail={publishingCancellationDetail}
+                progressPullRequestUrl={pullRequestUrl}
+              />
             ) : null
           ) : (
             <div
@@ -1649,6 +1753,7 @@ export function WorkflowJob({
               onReviewTargetChange={setReviewingCurrentResult}
               onReviewRenderChange={onSavedReviewRenderChange}
               onResultsAvailableChange={completed ? onSavedResultsAvailableChange : undefined}
+              showCancellationDetail={publishingCancellationDetail === undefined}
               resultsRef={savedResults}
             />
           ) : null}
@@ -1742,8 +1847,8 @@ export function WorkflowJob({
           steps={selectedJob.workflow?.definition.steps}
           accountId={scope.accountId}
         />
-        {!completed && !publicationOutcome && publishedPullRequestUrl ? (
-          <a href={publishedPullRequestUrl} target="_blank" rel="noreferrer">
+        {!completed && !publicationOutcome && pullRequestUrl ? (
+          <a href={pullRequestUrl} target="_blank" rel="noreferrer">
             Open pull request
           </a>
         ) : null}

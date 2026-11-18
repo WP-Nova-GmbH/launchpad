@@ -12,6 +12,7 @@ export function WorkflowOutcome({
   title,
   children,
   actions,
+  footer,
   tone = "neutral",
   icon,
   announce = true,
@@ -19,6 +20,7 @@ export function WorkflowOutcome({
   title: string;
   children?: ReactNode;
   actions?: ReactNode;
+  footer?: ReactNode;
   tone?: "error" | "warning" | "neutral" | "success";
   icon?: LucideIcon | undefined;
   announce?: boolean;
@@ -82,6 +84,7 @@ export function WorkflowOutcome({
         </div>
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
+      {footer ? <div className="w-full border-t border-current/15 pt-3">{footer}</div> : null}
     </div>
   );
 }

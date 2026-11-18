@@ -137,6 +137,7 @@ export function SavedWorkflowResults({
   onReviewTargetChange,
   onReviewRenderChange,
   onResultsAvailableChange,
+  showCancellationDetail = true,
   resultsRef,
 }: {
   scope: WorkflowScope;
@@ -146,6 +147,7 @@ export function SavedWorkflowResults({
   onReviewTargetChange?: (current: boolean) => void;
   onReviewRenderChange?: (checkpoint: WorkflowResultCheckpoint | null) => void;
   onResultsAvailableChange?: ((available: boolean) => void) | undefined;
+  showCancellationDetail?: boolean;
   resultsRef?: RefObject<HTMLElement | null>;
 }) {
   const call = useWorkflowClient(scope);
@@ -206,7 +208,8 @@ export function SavedWorkflowResults({
   const keepThreadButton = useRef<HTMLButtonElement>(null);
   const completed = job.status === "done";
   const cancelled = job.status === "cancelled";
-  const cancellationDetail = cancelled && (job.detail ?? job.progress?.detail);
+  const cancellationDetail =
+    cancelled && showCancellationDetail && (job.detail ?? job.progress?.detail);
   const threadState = savedWorkflowThreadState(job);
   const deleted = deletion?.state === "requested" || threadState === "deleted";
   const deletionUnavailable = deletion?.state === "unavailable";

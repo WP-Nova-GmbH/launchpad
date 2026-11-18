@@ -70,11 +70,22 @@ vi.mock("./workflowState", async () => ({
   useWorkflowClient: () => fixture.call,
 }));
 vi.mock("./SavedWorkflowResults", () => ({
-  SavedWorkflowResults: ({ resultsRef }: { resultsRef?: Ref<HTMLElement> }) =>
+  SavedWorkflowResults: ({
+    job,
+    resultsRef,
+    showCancellationDetail = true,
+  }: {
+    job: RepositoryWorkflowJob;
+    resultsRef?: Ref<HTMLElement>;
+    showCancellationDetail?: boolean;
+  }) =>
     createElement(
       "section",
       { ref: resultsRef, "aria-label": "Saved workflow results" },
       "Saved results",
+      showCancellationDetail && job.status === "cancelled"
+        ? (job.detail ?? job.progress?.detail)
+        : null,
     ),
 }));
 vi.mock("../ui/tooltip", () => ({
@@ -373,33 +384,130 @@ describe("workflow result location navigation", () => {
     viewerControls: { canApprove: true, canRespond: false, canCancel: true },
   } satisfies RepositoryWorkflowJob;
 
-  it.each(["confirmed", "unknown"] as const)(
-    "shows a cancelled VM run's %s GitHub outcome without opening the VM",
-    async (state) => {
-      const branchUrl = "https://github.com/acme/project/tree/launchpad%2Fjob";
-      const pullRequestUrl = "https://github.com/acme/project/pull/17";
+  const branchUrl = "https://github.com/acme/project/tree/launchpad%2Fjob";
+  const pullRequestUrl = "https://github.com/acme/project/pull/17";
+
+  it.each([
+    {
+      title: "Branch published",
+      state: "confirmed",
+      hasPullRequest: false,
+      detail: "The branch was pushed before cancellation.",
+    },
+    {
+      title: "Pull request confirmed",
+      state: "confirmed",
+      hasPullRequest: true,
+      detail: "The pull request was opened before cancellation.",
+    },
+    {
+      title: "Last publishing action unconfirmed",
+      state: "unknown",
+      hasPullRequest: false,
+      detail: "Could not verify whether the pull request was opened before cancellation.",
+    },
+  ] as const)(
+    "shows $title with the confirmed artifacts and saved results",
+    async ({ title, state, hasPullRequest, detail }) => {
       fixture.call.mockResolvedValue({
         ...vmReview,
         status: "cancelled",
-        progress: { ...vmReview.progress, status: "cancelled", checkpoint: null },
+        detail: state === "confirmed" ? detail : null,
+        progress: { ...vmReview.progress, status: "cancelled", checkpoint: null, detail },
         publicationOutcome: {
           state,
           branchUrl,
-          pullRequestUrl: state === "confirmed" ? pullRequestUrl : null,
+          pullRequestUrl: hasPullRequest ? pullRequestUrl : null,
         },
       } satisfies RepositoryWorkflowJob);
       await mount(false);
-      const anchors = renderer!.root.findAllByType("a");
-      expect(anchors.filter((anchor) => anchor.props.href === branchUrl)).toHaveLength(1);
-      expect(anchors.filter((anchor) => anchor.props.href === pullRequestUrl)).toHaveLength(
-        state === "confirmed" ? 1 : 0,
-      );
-      expect(text(renderer!.toJSON())).toContain(
-        state === "confirmed" ? "Published to GitHub" : "Publishing outcome unknown",
+      const content = text(renderer!.toJSON());
+      expect(renderer!.root.findAllByType("h2").map(text)).toContain(title);
+      expect(text(renderer!.root.findByType(WorkflowOutcome))).toContain(detail);
+      expect(content.split(detail)).toHaveLength(2);
+      expect(content).toContain("launchpad/job");
+      expect(content).toContain("Saved results");
+      if (hasPullRequest) expect(content).toMatch(/PR #\s*17/);
+      if (state === "unknown") expect(content).toContain("Previously published branch");
+
+      const actions = renderer!.root
+        .findAllByType("a")
+        .filter(({ props }) => props.href === branchUrl || props.href === pullRequestUrl)
+        .map((link) => [link.props.href, text(link).trim()]);
+      expect(actions).toEqual(
+        hasPullRequest
+          ? [
+              [pullRequestUrl, "Open pull request"],
+              [branchUrl, "Open branch"],
+            ]
+          : [[branchUrl, "Open branch"]],
       );
       expect(fixture.open).not.toHaveBeenCalled();
     },
   );
+
+  it("keeps unrelated cancellation detail with saved results after a confirmed publication", async () => {
+    const detail = "Canceled before the Agent step completed.";
+    fixture.call.mockResolvedValue({
+      ...vmReview,
+      status: "cancelled",
+      detail,
+      progress: { ...vmReview.progress, status: "cancelled", checkpoint: null },
+      publicationOutcome: { state: "confirmed", branchUrl, pullRequestUrl: null },
+    } satisfies RepositoryWorkflowJob);
+    await mount(false);
+
+    expect(text(renderer!.root.findByType(WorkflowOutcome))).not.toContain(detail);
+    expect(text(renderer!.root.findByProps({ "aria-label": "Saved workflow results" }))).toContain(
+      detail,
+    );
+  });
+
+  it("keeps the recorded PR link while the publication receipt is unconfirmed", async () => {
+    fixture.call.mockResolvedValue({
+      ...vmReview,
+      status: "cancelled",
+      progress: {
+        ...vmReview.progress,
+        status: "cancelled",
+        checkpoint: null,
+        pullRequestUrl,
+      },
+      publicationOutcome: { state: "unknown", branchUrl, pullRequestUrl: null },
+    } satisfies RepositoryWorkflowJob);
+    await mount(false);
+
+    const content = text(renderer!.toJSON());
+    expect(content).toContain("Last publishing action unconfirmed");
+    expect(content).not.toContain("Previously confirmed PR");
+    expect(content).not.toContain("Pull request confirmed");
+    const pullRequestLinks = renderer!.root
+      .findAllByType("a")
+      .filter(({ props }) => props.href === pullRequestUrl);
+    expect(pullRequestLinks.map((link) => text(link).trim())).toEqual([
+      "Open recorded pull request",
+    ]);
+  });
+
+  it("retains a cancelled VM's progress-only pull request link", async () => {
+    fixture.call.mockResolvedValue({
+      ...vmReview,
+      status: "cancelled",
+      progress: {
+        ...vmReview.progress,
+        status: "cancelled",
+        checkpoint: null,
+        pullRequestUrl,
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount(false);
+
+    const pullRequestLinks = renderer!.root
+      .findAllByType("a")
+      .filter(({ props }) => props.href === pullRequestUrl);
+    expect(pullRequestLinks.map(text)).toEqual(["Open pull request"]);
+    expect(fixture.open).not.toHaveBeenCalled();
+  });
 
   it("inspects VM results passively without registering or opening a live environment", async () => {
     fixture.call.mockResolvedValue(vmReview);

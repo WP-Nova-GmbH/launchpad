@@ -207,7 +207,7 @@ const job: RepositoryWorkflowJob = {
   },
 };
 let renderer: ReactTestRenderer;
-const view = (currentJob = job, canConfigure = true) =>
+const view = (currentJob = job, canConfigure = true, showCancellationDetail = true) =>
   createElement(
     AppAtomRegistryProvider,
     null,
@@ -218,6 +218,7 @@ const view = (currentJob = job, canConfigure = true) =>
       canConfigure,
       onReviewTargetChange: fixture.target,
       onReviewRenderChange: fixture.renderChange,
+      showCancellationDetail,
     }),
   );
 async function mount(
@@ -1335,11 +1336,12 @@ it("keeps Input-first runs empty until an Agent creates results, rather than cal
     expect(renderer.root.findAllByType("pre")).toHaveLength(1);
   }));
 it.each([
-  [patch, "Partial changes saved", "View saved changes"],
-  ["", "Partial result saved", "View saved result"],
+  [patch, "Partial changes saved", "View saved changes", true],
+  ["", "Partial result saved", "View saved result", true],
+  ["", "Partial result saved", "View saved result", false],
 ])(
-  "discloses the confirmed partial result with the right action (%s)",
-  (savedPatch, title, label) =>
+  "discloses the confirmed partial result with the right action (%s, %s, %s, show detail: %s)",
+  (savedPatch, title, label, showCancellationDetail) =>
     withClient(async () => {
       const partial: WorkflowSavedResult = {
         ...result,
@@ -1353,16 +1355,30 @@ it.each([
         generation: 1,
       });
       fixture.read.mockResolvedValue({ result: partial, patch: savedPatch });
-      await mount({
-        ...job,
-        status: "cancelled",
-        detail: "Canceled before the Agent step completed.",
-        progress: { ...job.progress!, status: "cancelled", checkpoint: null },
+      const detail = "Canceled before the Agent step completed.";
+      await act(async () => {
+        renderer = create(
+          view(
+            {
+              ...job,
+              status: "cancelled",
+              detail,
+              progress: { ...job.progress!, status: "cancelled", checkpoint: null },
+            },
+            true,
+            showCancellationDetail,
+          ),
+        );
       });
 
       const outcome = JSON.stringify(renderer.toJSON());
       expect(outcome).toContain(title);
-      expect(outcome).toContain("Canceled before the Agent step completed.");
+      if (showCancellationDetail) {
+        expect(outcome).toContain(detail);
+      } else {
+        expect(outcome).not.toContain(detail);
+        expect(outcome).toContain("The run ended before the workflow completed.");
+      }
       const disclosure = () =>
         renderer.root
           .findAllByType("button")
