@@ -291,15 +291,17 @@ vi.mock("../ui/button", () => {
 vi.mock("../ui/input", () => ({
   Input: (props: Record<string, unknown>) => createElement("input", props),
 }));
-vi.mock("../ui/select", () => {
+vi.mock("../ui/combobox", () => {
   const component = ({ children }: PropsWithChildren) => children;
   return {
-    Select: component,
-    SelectValue: component,
-    SelectPopup: component,
-    SelectItem: component,
-    SelectTrigger: (props: Record<string, unknown>) =>
+    Combobox: component,
+    ComboboxTrigger: ({ render: _render, ...props }: Record<string, unknown>) =>
       createElement("button", { ...props, "data-focus-key": "checkout" }),
+    ComboboxPopup: () => null,
+    ComboboxSearchInput: () => null,
+    ComboboxEmpty: () => null,
+    ComboboxList: () => null,
+    ComboboxItem: () => null,
   };
 });
 vi.mock("../ui/radio-group", () => ({

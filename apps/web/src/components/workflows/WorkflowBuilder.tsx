@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts/workflows";
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
 import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTriggerInspector";
+import { WorkflowCheckoutPicker } from "./WorkflowCheckoutPicker";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { OwnerSources } from "./WorkflowOwnerSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
@@ -18,6 +19,7 @@ import type {
   RepositoryWorkflow,
   WorkflowCatalog,
   WorkflowStep,
+  WorkflowTarget,
 } from "@t3tools/contracts/workflows";
 import {
   workflowSessionKey,
@@ -49,7 +51,6 @@ import {
 } from "../ui/alert-dialog";
 import { Input } from "../ui/input";
 import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
-import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
 import { WorkflowStepEditor, useWorkflowEditorModels } from "./WorkflowStepEditor";
 import { WorkflowCanvas, workflowInsertionIndex, type WorkflowInsertion } from "./WorkflowCanvas";
 import { Sheet, SheetPopup, SheetTitle } from "../ui/sheet";
@@ -755,6 +756,7 @@ function WorkflowBuilderEditor({
       pending={pending}
       archived={archived}
       savedRevision={currentSaved?.revision}
+      latestSavedTarget={currentSaved?.definition.target}
       discardSavedRevision={discardSavedRevision}
       discardReloadStatus={discardReloadStatus}
       vmRunUnavailable={vmRunUnavailable}
@@ -805,6 +807,7 @@ function WorkflowBuilderWorkspace({
   pending,
   archived,
   savedRevision,
+  latestSavedTarget,
   discardSavedRevision,
   discardReloadStatus,
   vmRunUnavailable,
@@ -839,6 +842,7 @@ function WorkflowBuilderWorkspace({
   pending: boolean;
   archived: boolean;
   savedRevision: number | undefined;
+  latestSavedTarget: WorkflowTarget | undefined;
   discardSavedRevision: number;
   discardReloadStatus: DiscardReloadStatus;
   vmRunUnavailable: boolean;
@@ -1028,12 +1032,20 @@ function WorkflowBuilderWorkspace({
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
+  const checkoutWarning =
+    draft.targetConfirmed && machine && !target && !projectsUnavailable
+      ? latestSavedTarget?.kind === "machine" &&
+        latestSavedTarget.environmentId === machine.environmentId &&
+        latestSavedTarget.projectId === machine.projectId
+        ? "Saved checkout unavailable"
+        : "Selected checkout unavailable"
+      : null;
   const targetLabel = draft.targetConfirmed
     ? vm
       ? `VM · ${vm.baseBranch ?? "Repository default"}`
       : target
         ? `${target.machineLabel} · ${target.title}`
-        : "Saved execution target is unavailable"
+        : (checkoutWarning ?? "Machine checkouts could not be loaded")
     : "Choose an execution target";
   const restoreIssue = draft.baseline?.archived
     ? restoreCheckoutIssue(draft.baseline, projects, projectsUnavailable)
@@ -1571,64 +1583,32 @@ function WorkflowBuilderWorkspace({
             </p>
           ) : null}
           {showCheckout ? (
-            <div className={styles["workflow-settings-field"]}>
-              <label htmlFor={`${settingsId}-checkout`}>Checkout</label>
-              {draft.targetConfirmed && machine && !target ? (
-                <p className="text-warning-foreground" id={`${settingsId}-checkout-warning`}>
-                  Saved checkout unavailable. Choose another checkout.
-                </p>
-              ) : null}
-              <Select
-                disabled={pending}
-                value={
-                  draft.targetConfirmed && target
-                    ? `${target.environmentId}:${target.projectId}`
-                    : null
-                }
-                onValueChange={(value) => {
-                  const next = projects.find(
-                    (entry) => `${entry.environmentId}:${entry.projectId}` === value,
-                  );
-                  if (next)
-                    edit((current) => ({
-                      ...current,
-                      targetConfirmed: true,
-                      definition: {
-                        ...current.definition,
-                        target: {
-                          kind: "machine",
-                          environmentId: next.environmentId,
-                          projectId: next.projectId,
-                        },
-                      },
-                    }));
-                }}
-              >
-                <SelectTrigger
-                  id={`${settingsId}-checkout`}
-                  aria-describedby={
-                    draft.targetConfirmed && machine && !target
-                      ? `${settingsId}-checkout-warning`
-                      : undefined
-                  }
-                  ref={(node) => registerField("checkout", node)}
-                >
-                  <SelectValue>
-                    {draft.targetConfirmed && target ? targetLabel : "Choose a checkout"}
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectPopup>
-                  {projects.map((project) => (
-                    <SelectItem
-                      key={`${project.environmentId}:${project.projectId}`}
-                      value={`${project.environmentId}:${project.projectId}`}
-                    >
-                      {project.machineLabel} · {project.title}
-                    </SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
-            </div>
+            <WorkflowCheckoutPicker
+              id={`${settingsId}-checkout`}
+              projects={projects}
+              selected={draft.targetConfirmed ? (target ?? null) : null}
+              warning={checkoutWarning}
+              disabled={pending}
+              triggerRef={(node) => registerField("checkout", node)}
+              onChoose={(next) =>
+                edit((current) => ({
+                  ...current,
+                  targetConfirmed: true,
+                  definition: {
+                    ...current.definition,
+                    target: {
+                      kind: "machine",
+                      environmentId: next.environmentId,
+                      projectId: next.projectId,
+                    },
+                  },
+                }))
+              }
+            />
+          ) : checkoutWarning ? (
+            <WorkflowAlert variant="warning" title={checkoutWarning}>
+              Your workflow edits are kept.
+            </WorkflowAlert>
           ) : null}
           {!projects.length && projectsUnavailable ? (
             <div className="space-y-2">

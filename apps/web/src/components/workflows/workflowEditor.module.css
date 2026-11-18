@@ -555,10 +555,6 @@
   margin-top: 2px;
   font-size: 12px;
 }
-.workflow-settings-field [data-slot="select-trigger"] {
-  width: 100%;
-  min-width: 0;
-}
 .workflow-settings-row {
   flex-wrap: wrap;
   justify-content: space-between;

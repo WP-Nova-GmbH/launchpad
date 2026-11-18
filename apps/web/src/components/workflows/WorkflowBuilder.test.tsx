@@ -22,8 +22,17 @@ vi.mock("./WorkflowSources", () => ({
   RepositorySourcesButton: () => null,
 }));
 vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
-import { act, createElement, type PropsWithChildren } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import {
+  act,
+  cloneElement,
+  createContext,
+  createElement,
+  useContext,
+  type PropsWithChildren,
+  type ReactElement,
+  type ReactNode,
+} from "react";
+import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import {
@@ -91,7 +100,8 @@ vi.mock("../ui/sheet", () => ({
 }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
-  TooltipTrigger: ({ children }: PropsWithChildren) => children,
+  TooltipTrigger: ({ children, render }: PropsWithChildren<{ render?: ReactElement }>) =>
+    render ? cloneElement(render, undefined, children) : children,
   TooltipPopup: () => null,
 }));
 vi.mock("../ui/button", () => ({
@@ -100,16 +110,65 @@ vi.mock("../ui/button", () => ({
 vi.mock("../ui/input", () => ({
   Input: (props: Record<string, unknown>) => createElement("input", props),
 }));
-vi.mock("../ui/select", () => {
+vi.mock("../ui/combobox", () => {
+  type CheckoutPicker = {
+    items: ReadonlyArray<RelayOrganizationProject>;
+    value: RelayOrganizationProject | null;
+    inputValue: string;
+    onInputValueChange: (value: string, details: { reason: "input-change" }) => void;
+    onValueChange: (value: RelayOrganizationProject) => void;
+  };
+  const PickerContext = createContext<CheckoutPicker | null>(null);
   const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
-    Select: ({ children, ...props }: PropsWithChildren) =>
-      createElement("div", { ...props, "data-workflow-select": true }, children),
-    SelectTrigger: component,
-    SelectValue: component,
-    SelectPopup: component,
-    SelectItem: ({ children, ...props }: PropsWithChildren) =>
-      createElement("div", { ...props, "data-workflow-select-item": true }, children),
+    Combobox: ({ children, ...state }: PropsWithChildren<CheckoutPicker>) =>
+      createElement(
+        PickerContext.Provider,
+        { value: state },
+        createElement("div", { "data-checkout-picker": true }, children),
+      ),
+    ComboboxTrigger: ({
+      children,
+      render: _render,
+      ...props
+    }: PropsWithChildren<Record<string, unknown>>) =>
+      createElement("button", { role: "combobox", ...props }, children),
+    ComboboxPopup: component,
+    ComboboxList: ({
+      children,
+    }: {
+      children: ReactNode | ((project: RelayOrganizationProject) => ReactNode);
+    }) => {
+      const picker = useContext(PickerContext)!;
+      return typeof children === "function" ? picker.items.map(children) : children;
+    },
+    ComboboxItem: ({ children, value }: PropsWithChildren<{ value: RelayOrganizationProject }>) => {
+      const picker = useContext(PickerContext)!;
+      return createElement(
+        "button",
+        {
+          role: "option",
+          "aria-selected":
+            picker.value?.environmentId === value.environmentId &&
+            picker.value?.projectId === value.projectId,
+          onClick: () => picker.onValueChange(value),
+        },
+        children,
+      );
+    },
+    ComboboxSearchInput: (props: Record<string, unknown>) => {
+      const picker = useContext(PickerContext)!;
+      return createElement("input", {
+        ...props,
+        value: picker.inputValue,
+        onChange: (event: { target: { value: string } }) =>
+          picker.onInputValueChange(event.target.value, { reason: "input-change" }),
+      });
+    },
+    ComboboxEmpty: ({ children }: PropsWithChildren) => {
+      const picker = useContext(PickerContext)!;
+      return picker.items.length === 0 ? createElement("div", { role: "status" }, children) : null;
+    },
   };
 });
 vi.mock("../ui/radio-group", () => ({
@@ -225,7 +284,11 @@ async function click(label: string, root = renderer!.root) {
   });
 }
 async function rename(name: string) {
-  await act(() => renderer!.root.findByType("input").props.onChange({ target: { value: name } }));
+  await act(() =>
+    renderer!.root.findByProps({ "aria-label": "Workflow name" }).props.onChange({
+      target: { value: name },
+    }),
+  );
 }
 async function conflict(id: string) {
   await act(() =>
@@ -1222,6 +1285,191 @@ describe("VM authoring", () => {
         target: { value },
       }),
     );
+  const checkoutPicker = () => renderer!.root.findByProps({ "data-checkout-picker": true });
+  const checkoutOptions = () => checkoutPicker().findAllByProps({ role: "option" });
+  const searchCheckouts = (value: string) =>
+    act(() => checkoutPicker().findByType("input").props.onChange({ target: { value } }));
+  const textOf = (node: ReactTestInstance): string =>
+    node.children.map((child) => (typeof child === "string" ? child : textOf(child))).join("");
+  const update = (props: Props) =>
+    act(() =>
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <WorkflowBuilder {...props} />
+        </AppAtomRegistryProvider>,
+      ),
+    );
+
+  it("searches by checkout and machine and selects the intended same-named checkout", async () => {
+    const buildMac = { ...project, title: "launchpad", machineLabel: "Build Mac" };
+    const workstation = {
+      ...buildMac,
+      environmentId: EnvironmentId.make("workstation-environment"),
+      machineId: RelayMachineId.make("workstation"),
+      machineLabel: "Dev Workstation",
+    };
+    const releaseRunner = {
+      ...buildMac,
+      projectId: ProjectId.make("release-checkout"),
+      machineLabel: "Release Runner",
+      title: "launchpad-release",
+    };
+    const workflow = saved("same-checkout-name", 1, newWorkflowDraft([buildMac])!.definition);
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      projects: [buildMac, workstation, releaseRunner],
+    });
+
+    expect(checkoutOptions().map((option) => option.props["aria-selected"])).toEqual([
+      true,
+      false,
+      false,
+    ]);
+    await searchCheckouts("RELEASE");
+    expect(checkoutOptions()).toHaveLength(1);
+    expect(
+      checkoutOptions()[0]!.findAll((node) => node.children.includes("launchpad-release")).length,
+    ).toBeGreaterThan(0);
+
+    await searchCheckouts("unknown");
+    expect(checkoutOptions()).toHaveLength(0);
+    expect(checkoutPicker().findByProps({ role: "status" })).toBeDefined();
+
+    await searchCheckouts(" dev workstation ");
+    expect(checkoutOptions()).toHaveLength(1);
+    expect(
+      checkoutOptions()[0]!.findAll((node) => node.children.includes("Dev Workstation")).length,
+    ).toBeGreaterThan(0);
+    await act(() => checkoutOptions()[0]!.props.onClick());
+    expect(editor(workflow.workflowId).definition.target).toEqual({
+      kind: "machine",
+      environmentId: workstation.environmentId,
+      projectId: workstation.projectId,
+    });
+    expect(editor(workflow.workflowId).baseline).toEqual(workflow);
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes identical checkout and machine names in the list and selected value", async () => {
+    const first = { ...project, title: "launchpad", machineLabel: "Build Mac" };
+    const second = {
+      ...first,
+      environmentId: EnvironmentId.make("second-environment"),
+      machineId: RelayMachineId.make("second-machine"),
+    };
+    const sameMachine = { ...first, projectId: ProjectId.make("another-project") };
+    const unique = { ...first, title: "launchpad-dev", projectId: ProjectId.make("dev") };
+    const workflow = saved("identical-checkout-names", 1, newWorkflowDraft([first])!.definition);
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      projects: [first, second, sameMachine, unique],
+    });
+
+    const identifiers = (node: ReactTestInstance) =>
+      node
+        .findAllByType("span")
+        .map(textOf)
+        .filter((text) => text.startsWith("Environment "));
+    const options = checkoutOptions();
+    expect(options.map(identifiers)).toEqual([
+      ["Environment environment / Checkout project"],
+      ["Environment second-environment / Checkout project"],
+      ["Environment environment / Checkout another-project"],
+      [],
+    ]);
+    const trigger = () => checkoutPicker().findByProps({ role: "combobox" });
+    expect(identifiers(trigger())).toEqual(["Environment environment / Checkout project"]);
+    await act(() => options[1]!.props.onClick());
+    expect(identifiers(trigger())).toEqual(["Environment second-environment / Checkout project"]);
+    expect(editor(workflow.workflowId).definition.target).toEqual({
+      kind: "machine",
+      environmentId: second.environmentId,
+      projectId: second.projectId,
+    });
+  });
+
+  it("keeps other edits when replacing an unavailable checkout and saving", async () => {
+    const workflow = saved("unavailable-checkout", 1, newWorkflowDraft([project])!.definition);
+    const replacement = {
+      ...project,
+      projectId: ProjectId.make("replacement"),
+      machineLabel: "Release Runner",
+    };
+    await mount({ ...base, workflow, isNew: false, projects: [replacement] });
+    await rename("Draft name");
+    await openExecutionSettings();
+
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saved checkout unavailable");
+    expect(editor(workflow.workflowId).definition.target).toEqual(workflow.definition.target);
+    await act(() => checkoutOptions()[0]!.props.onClick());
+
+    const draft = editor(workflow.workflowId);
+    expect(draft.definition).toMatchObject({
+      name: "Draft name",
+      target: {
+        kind: "machine",
+        environmentId: replacement.environmentId,
+        projectId: replacement.projectId,
+      },
+    });
+    expect(draft.baseline).toEqual(workflow);
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain("Saved checkout unavailable");
+
+    const repair = { ...workflow, revision: 2, definition: draft.definition };
+    read.mockResolvedValueOnce(repair);
+    await submit();
+    expect(editor(workflow.workflowId).baseline).toEqual(repair);
+  });
+
+  it("describes a disappearing draft checkout as selected in the header and inspector", async () => {
+    const workflow = saved(
+      "unavailable-draft-checkout",
+      1,
+      newWorkflowDraft([project])!.definition,
+    );
+    const other = { ...project, projectId: ProjectId.make("other") };
+    const props = {
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      projects: [project, other],
+    };
+    await mount(props);
+    await act(() => checkoutOptions()[1]!.props.onClick());
+    const draft = editor(workflow.workflowId);
+    await update({ ...props, projects: [project] });
+
+    const root = renderer!.root;
+    expect(
+      root.findByProps({ "aria-label": "Execution target: Selected checkout unavailable" }),
+    ).toBeDefined();
+    expect(root.findAllByProps({ role: "alert" }).map(textOf)).toContainEqual(
+      expect.stringContaining("Selected checkout unavailable"),
+    );
+    expect(editor(workflow.workflowId)).toEqual(draft);
+  });
+
+  it("compares a missing checkout with the latest saved target while retaining the draft", async () => {
+    const workflow = saved("newer-saved-checkout", 1, newWorkflowDraft([project])!.definition);
+    const props = { ...base, workflow, isNew: false, openExecutionSettings: true };
+    await mount(props);
+    await rename("Draft name");
+    const other = { ...project, projectId: ProjectId.make("other") };
+    const newer = saved(workflow.workflowId, 2, newWorkflowDraft([other])!.definition);
+    const draft = editor(workflow.workflowId);
+    await update({ ...props, workflow: newer, projects: [other] });
+
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Selected checkout unavailable");
+    expect(JSON.stringify(renderer!.toJSON())).not.toContain("Saved checkout unavailable");
+    expect(editor(workflow.workflowId)).toEqual(draft);
+  });
 
   it("keeps the checkout repair as a draft until saved and restores with the saved replacement", async () => {
     const workflow = {
@@ -1237,20 +1485,14 @@ describe("VM authoring", () => {
       projects: [replacement],
     });
 
-    expect(JSON.stringify(renderer!.toJSON())).toContain(
-      "Saved checkout unavailable. Choose another checkout.",
-    );
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Saved checkout unavailable");
     const restore = () =>
       renderer!.root
         .findAllByType("button")
         .find((button) => button.props.children === "Restore workflow")!;
     expect(restore().props.disabled).toBe(true);
     expect(editor(workflow.workflowId).definition.target).toEqual(workflow.definition.target);
-    await act(() =>
-      renderer!.root
-        .findByProps({ "data-workflow-select": true })
-        .props.onValueChange(`${replacement.environmentId}:${replacement.projectId}`),
-    );
+    await act(() => checkoutOptions()[0]!.props.onClick());
     const repaired = editor(workflow.workflowId).definition;
     expect(repaired.target).toEqual({
       kind: "machine",
@@ -1455,25 +1697,38 @@ describe("VM authoring", () => {
     async (vmExecutionAvailable) => {
       const workflow = saved("saved-machine", 1, newWorkflowDraft([project])!.definition);
       read.mockResolvedValue({ status: "connected" });
-      await mount({
+      const props: Props = {
         ...base,
         workflow,
         isNew: false,
         projects: [],
         vmAuthoring: { models: null },
         vmExecutionAvailable,
-      });
+      };
+      await mount({ ...props, projectsUnavailable: true });
       await openExecutionSettings();
 
       const root = renderer!.root;
+      expect(button("Retry loading checkouts")).toBeDefined();
+      expect(
+        root.findByProps({
+          "aria-label": "Execution target: Machine checkouts could not be loaded",
+        }),
+      ).toBeDefined();
+      expect(JSON.stringify(renderer!.toJSON())).not.toContain("Saved checkout unavailable");
+      await update(props);
       expect(root.findByProps({ "data-workflow-target": true }).props.value).toBe("machine");
       expect(
         root.findByProps({ "data-workflow-target-option": true, value: "machine" }).props.disabled,
       ).toBe(true);
-      expect(root.findAllByProps({ "data-workflow-select": true })).toHaveLength(0);
+      expect(root.findAllByProps({ "data-checkout-picker": true })).toHaveLength(0);
       expect(editor(workflow.workflowId).definition.target).toEqual(workflow.definition.target);
 
       const content = JSON.stringify(renderer!.toJSON());
+      expect(content).toContain("Your workflow edits are kept.");
+      expect(content).toContain("Saved checkout unavailable");
+      expect(content).not.toContain("Choose another checkout.");
+      expect(button("Retry loading checkouts")).toBeUndefined();
       if (vmExecutionAvailable) {
         expect(content).toContain("Choose VM or enroll a checkout to run this workflow.");
       } else {
