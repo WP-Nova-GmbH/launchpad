@@ -145,6 +145,7 @@ vi.mock("../ui/alert-dialog", () => {
   };
 });
 import { WorkflowJob } from "./WorkflowJob";
+import { WorkflowOutcome } from "./WorkflowOutcome";
 import { SavedWorkflowResults } from "./SavedWorkflowResults";
 
 const scope = {
@@ -274,6 +275,90 @@ afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
   vi.unstubAllGlobals();
+});
+
+describe("successful run outcome", () => {
+  const outcome = () => renderer!.root.findByType(WorkflowOutcome);
+
+  it("opens the pull request from the outcome and still offers Machine result actions", async () => {
+    const pullRequestUrl = "https://github.com/example/launchpad/pull/42";
+    fixture.call.mockResolvedValue({
+      ...job,
+      progress: { ...job.progress!, pullRequestUrl },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    expect(text(outcome().findByType("h2"))).toBe("Pull request opened");
+    const link = outcome().findByType("a");
+    expect(text(link)).toContain("Open pull request");
+    expect(link.props.href).toBe(pullRequestUrl);
+    expect(findButton("Inspect result")).toBeDefined();
+    expect(conversationButton()).toBeDefined();
+  });
+
+  it.each([
+    { hasDiff: true, action: "Inspect result" },
+    { hasDiff: false, action: "Open conversation" },
+  ])("puts $action in the completed Machine outcome", async ({ hasDiff, action }) => {
+    fixture.call.mockResolvedValue({
+      ...job,
+      progress: {
+        ...job.progress!,
+        hasThread: true,
+        checkpoint: hasDiff ? job.progress!.checkpoint : null,
+      },
+    } satisfies RepositoryWorkflowJob);
+    await mount();
+
+    expect(text(outcome().findByType("h2"))).toBe("Workflow completed");
+    expect(outcome().findAllByType("button")).toContain(findButton(action));
+    if (!hasDiff) expect(findButton("Inspect result")).toBeUndefined();
+  });
+
+  it("jumps to available read-only VM results and hides the shortcut when the result goes away", async () => {
+    const vmJob = {
+      ...job,
+      runtime: { kind: "vm", threadId: job.progress!.threadId },
+      progress: { ...job.progress!, hasThread: true },
+    } satisfies RepositoryWorkflowJob;
+    const results = { scrollIntoView: vi.fn(), focus: vi.fn() };
+    fixture.call.mockResolvedValue(vmJob);
+    await mount(true, {
+      createNodeMock: ({ props }) =>
+        (props as { "aria-label"?: string })["aria-label"] === "Saved workflow results"
+          ? results
+          : null,
+    });
+    const reportAvailability = (available: boolean) =>
+      act(() =>
+        renderer!.root.findByType(SavedWorkflowResults).props.onResultsAvailableChange(available),
+      );
+
+    expect(findButton("Open saved results")).toBeUndefined();
+    await reportAvailability(true);
+    expect(outcome().findAllByType("button")).toContain(findButton("Open saved results"));
+    await press("Open saved results");
+    expect(results.scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    expect(results.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(fixture.open).not.toHaveBeenCalled();
+
+    await reportAvailability(false);
+    expect(findButton("Open saved results")).toBeUndefined();
+
+    await reportAvailability(true);
+    const otherJob = { ...vmJob, jobId: "other" };
+    fixture.call.mockResolvedValue(otherJob);
+    await act(async () => renderer!.update(view("other")));
+    expect(findButton("Open saved results")).toBeUndefined();
+
+    await reportAvailability(true);
+    fixture.call.mockResolvedValue({
+      ...otherJob,
+      progress: { ...otherJob.progress, threadDeletionRequested: true },
+    } satisfies RepositoryWorkflowJob);
+    await press("Refresh run");
+    expect(findButton("Open saved results")).toBeUndefined();
+  });
 });
 
 describe("workflow result location navigation", () => {

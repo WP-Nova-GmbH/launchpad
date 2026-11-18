@@ -34,6 +34,7 @@ import {
   beginWorkflowReview,
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
+  workflowJobAccessLost,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
@@ -51,7 +52,7 @@ import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSetti
 import { useIsMobile } from "../../hooks/useMediaQuery";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { getRenderablePatch } from "../../lib/diffRendering";
-import { randomUUID } from "../../lib/utils";
+import { cn, randomUUID } from "../../lib/utils";
 import { StyledDiffCodeView } from "../diffs/StyledDiffCodeView";
 import { SavedConversationMessage } from "../chat/SavedConversationMessage";
 import {
@@ -90,12 +91,41 @@ function sameThreadPlacement(left: DeletionTarget, right: DeletionTarget | null)
   );
 }
 
+type CachedResultRange = {
+  firstId: string;
+  lastId: string;
+  nextCursor: number | null;
+};
+
+/** A fetched page must reach the first row of a cached range before we can skip it. */
+function continueSavedResults(
+  page: { results: ReadonlyArray<WorkflowSavedResult>; nextCursor: number | null },
+  cachedRanges: ReadonlyArray<CachedResultRange>,
+) {
+  const fetched = new Set(page.results.map(({ resultId }) => resultId));
+  let nextCursor = page.nextCursor;
+  let cursorTailId = page.results.at(-1)?.resultId ?? null;
+  const remainingRanges: CachedResultRange[] = [];
+  for (const range of cachedRanges) {
+    if (!fetched.has(range.firstId)) {
+      remainingRanges.push(range);
+      continue;
+    }
+    if (nextCursor !== null && (range.nextCursor === null || range.nextCursor < nextCursor)) {
+      nextCursor = range.nextCursor;
+      cursorTailId = range.lastId;
+    }
+  }
+  return { nextCursor, cursorTailId, cachedRanges: nextCursor === null ? [] : remainingRanges };
+}
+
 export function SavedWorkflowResults({
   scope,
   job,
   refresh,
   canConfigure,
   onReviewTargetChange,
+  onResultsAvailableChange,
   resultsRef,
 }: {
   scope: WorkflowScope;
@@ -103,6 +133,7 @@ export function SavedWorkflowResults({
   refresh: () => Promise<void>;
   canConfigure: boolean;
   onReviewTargetChange?: (current: boolean) => void;
+  onResultsAvailableChange?: ((available: boolean) => void) | undefined;
   resultsRef?: RefObject<HTMLElement | null>;
 }) {
   const call = useWorkflowClient(scope);
@@ -115,6 +146,9 @@ export function SavedWorkflowResults({
     relayUrl: string;
     results: ReadonlyArray<WorkflowSavedResult>;
     nextCursor: number | null;
+    // Cached older results can appear after the last row reached by the cursor.
+    cursorTailId?: string | null;
+    cachedRanges?: ReadonlyArray<CachedResultRange>;
     threadId: ThreadId;
     generation: number;
   } | null>(null);
@@ -132,8 +166,10 @@ export function SavedWorkflowResults({
     more: boolean;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [indexError, setIndexError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [retry, setRetry] = useState(0);
+  const [indexRetry, setIndexRetry] = useState(0);
   const [deletion, setDeletion] = useState<DeletionState | null>(null);
   const deletionInFlight = useRef(false);
   const deletionIndexCheck = useRef<DeletionIntent | null>(null);
@@ -142,6 +178,7 @@ export function SavedWorkflowResults({
   const deletionStatus = useRef<HTMLDivElement>(null);
   const deleteButton = useRef<HTMLButtonElement>(null);
   const keepThreadButton = useRef<HTMLButtonElement>(null);
+  const completed = job.status === "done";
   const cancelled = job.status === "cancelled";
   const cancellationDetail = cancelled && (job.detail ?? job.progress?.detail);
   const threadState = savedWorkflowThreadState(job);
@@ -197,17 +234,19 @@ export function SavedWorkflowResults({
   useEffect(() => {
     if (deleted || waitingForThread) return;
     let current = true;
+    let requestedRelayUrl: string | undefined;
     const epoch = indexEpoch.current;
     const checkedIntent = deletionIndexCheck.current;
-    void call((client, token) =>
-      client
+    void call((client, token) => {
+      requestedRelayUrl = client.relayUrl;
+      return client
         .listSavedWorkflowResults({
           clerkToken: token,
           repositoryId: scope.repositoryId,
           jobId: job.jobId,
         })
-        .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl }))),
-    )
+        .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl })));
+    })
       .then((data) => {
         if (!current || epoch !== indexEpoch.current) return;
         setIndex((previous) => {
@@ -217,6 +256,27 @@ export function SavedWorkflowResults({
             previous.threadId !== data.threadId
           )
             return data;
+          if (completed && !checkedIntent) {
+            const cached = new Map(previous.results.map((entry) => [entry.resultId, entry]));
+            const fresh = data.results.map((entry) => {
+              const existing = cached.get(entry.resultId);
+              cached.delete(entry.resultId);
+              return existing && sameSavedResult(existing, entry) ? existing : entry;
+            });
+            const firstId = previous.results[0]?.resultId;
+            const lastId =
+              previous.cursorTailId === undefined
+                ? previous.results.at(-1)?.resultId
+                : previous.cursorTailId;
+            const cachedRanges = previous.cachedRanges ?? [];
+            const previousRange =
+              firstId && lastId ? [{ firstId, lastId, nextCursor: previous.nextCursor }] : [];
+            return {
+              ...data,
+              results: [...fresh, ...cached.values()],
+              ...continueSavedResults(data, [...previousRange, ...cachedRanges]),
+            };
+          }
           const previousResult = previous.results.find(
             (entry) => entry.resultId === selectedRef.current,
           );
@@ -224,7 +284,12 @@ export function SavedWorkflowResults({
           const freshResult = data.results.find(
             (entry) => entry.resultId === previousResult.resultId,
           );
-          if (!freshResult) return { ...data, results: [...data.results, previousResult] };
+          if (!freshResult)
+            return {
+              ...data,
+              results: [...data.results, previousResult],
+              cursorTailId: data.results.at(-1)?.resultId ?? null,
+            };
           // Re-reading the index should not reload the open diff or conversation.
           if (!sameSavedResult(previousResult, freshResult)) return data;
           return {
@@ -232,7 +297,7 @@ export function SavedWorkflowResults({
             results: data.results.map((entry) => (entry === freshResult ? previousResult : entry)),
           };
         });
-        setError(null);
+        setIndexError(null);
         setSelected((id) => id ?? data.results[0]?.resultId ?? null);
         if (checkedIntent && deletionIndexCheck.current === checkedIntent) {
           deletionIndexCheck.current = null;
@@ -246,10 +311,14 @@ export function SavedWorkflowResults({
       })
       .catch((cause) => {
         if (current && epoch === indexEpoch.current) {
-          setIndex(null);
-          setLoaded(null);
-          setConversation(null);
-          setError(cause instanceof Error ? cause.message : "Could not read saved results.");
+          if (completed && !checkedIntent && requestedRelayUrl && !workflowJobAccessLost(cause)) {
+            setIndex((previous) => (previous?.relayUrl === requestedRelayUrl ? previous : null));
+          } else {
+            setIndex(null);
+            setLoaded(null);
+            setConversation(null);
+          }
+          setIndexError(cause instanceof Error ? cause.message : "Could not read saved results.");
         }
       });
     return () => {
@@ -259,11 +328,14 @@ export function SavedWorkflowResults({
     call,
     scope.repositoryId,
     job.jobId,
+    // Completion can publish a result after the last index read.
+    completed,
     cancelled,
     job.progress?.resultSaving?.publicationId,
     job.progress?.resultSaving?.state,
     job.progress?.checkpoint?.checkpointId,
     retry,
+    indexRetry,
     deleted,
     waitingForThread,
   ]);
@@ -277,6 +349,15 @@ export function SavedWorkflowResults({
       : currentWorkflowSavedResult(job, results);
   const partialResult = cancelled && currentResult?.outcome === "cancelled" ? currentResult : null;
   const hasPartialChanges = !!partialResult && partialResult.patch.sizeBytes > 0;
+  const resultsAvailable =
+    !resultsUnavailable &&
+    !waitingForThread &&
+    results.length > 0 &&
+    (!partialResult || partialResultOpen);
+  const completedWithResults = completed && resultsAvailable;
+  useLayoutEffect(() => {
+    onResultsAvailableChange?.(resultsAvailable);
+  }, [onResultsAvailableChange, resultsAvailable]);
   const reviewingCurrent = !!result && result.resultId === currentResult?.resultId;
   useLayoutEffect(() => {
     onReviewTargetChange?.(reviewingCurrent);
@@ -311,9 +392,9 @@ export function SavedWorkflowResults({
     const request = ++generation.current;
     setLoaded(null);
     setConversation(null);
+    setError(null);
     if (!result) return;
     setBusy(true);
-    setError(null);
     void reader
       .read(result, () =>
         call((client, token) =>
@@ -487,19 +568,30 @@ export function SavedWorkflowResults({
           .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl }))),
       );
       if (active.current && request === generation.current)
-        setIndex((previous) =>
-          previous && sameThreadPlacement(index, previous) && sameThreadPlacement(index, page)
-            ? {
-                ...previous,
-                nextCursor: page.nextCursor,
-                results: [
-                  ...new Map(
-                    [...previous.results, ...page.results].map((item) => [item.resultId, item]),
-                  ).values(),
-                ],
-              }
-            : previous,
-        );
+        setIndex((previous) => {
+          if (
+            !previous ||
+            previous.nextCursor !== index.nextCursor ||
+            !sameThreadPlacement(index, previous) ||
+            !sameThreadPlacement(index, page)
+          )
+            return previous;
+          // A refresh can retain older cached results beyond the fetched page range.
+          const cursorIndex = previous.results.findIndex(
+            (entry) => entry.resultId === previous.cursorTailId,
+          );
+          const split = cursorIndex === -1 ? previous.results.length : cursorIndex + 1;
+          const results = [
+            ...previous.results.slice(0, split),
+            ...page.results,
+            ...previous.results.slice(split),
+          ];
+          return {
+            ...previous,
+            results: [...new Map(results.map((entry) => [entry.resultId, entry])).values()],
+            ...continueSavedResults(page, previous.cachedRanges ?? []),
+          };
+        });
     } catch {
       if (active.current && request === generation.current)
         setError("Could not load older Agent results.");
@@ -531,6 +623,7 @@ export function SavedWorkflowResults({
   const refreshDeletionStatus = () => {
     deletionStatus.current?.focus();
     setError(null);
+    setIndexError(null);
     refreshDeletionTarget();
   };
   const deleteThread = async () => {
@@ -619,6 +712,7 @@ export function SavedWorkflowResults({
       deletionInFlight.current = false;
     }
   };
+  const resultsError = indexError ?? error;
   const resultView = (
     <div
       id={`${tabId}-saved-results`}
@@ -784,14 +878,23 @@ export function SavedWorkflowResults({
         tabIndex={result ? 0 : undefined}
         className="space-y-3"
       >
-        {error && deletion?.state !== "checking" ? (
+        {resultsError && deletion?.state !== "checking" ? (
           <WorkflowAlert
-            title="Could not read saved results"
+            title={
+              indexError && result
+                ? "Could not refresh saved results"
+                : "Could not read saved results"
+            }
             actions={
               <Button
                 size="sm"
                 variant="outline"
                 onClick={() => {
+                  setIndexError(null);
+                  if (indexError && result) {
+                    setIndexRetry((n) => n + 1);
+                    return;
+                  }
                   setError(null);
                   setRetry((n) => n + 1);
                 }}
@@ -800,10 +903,10 @@ export function SavedWorkflowResults({
               </Button>
             }
           >
-            {error}
+            {resultsError}
           </WorkflowAlert>
         ) : null}
-        {!waitingForThread && !index && !error ? (
+        {!waitingForThread && !index && !resultsError ? (
           <p role="status" className="text-sm text-muted-foreground">
             Loading saved results…
           </p>
@@ -875,8 +978,12 @@ export function SavedWorkflowResults({
       ref={savedResults}
       tabIndex={-1}
       aria-label="Saved workflow results"
-      className="space-y-3"
+      className={cn(
+        "space-y-3",
+        completedWithResults && "rounded-lg border bg-card p-4 text-card-foreground",
+      )}
     >
+      {completedWithResults ? <h2 className="text-sm font-semibold">Saved results</h2> : null}
       {!resultsUnavailable && partialResult ? (
         <WorkflowOutcome
           title={hasPartialChanges ? "Partial changes saved" : "Partial result saved"}
@@ -944,18 +1051,20 @@ export function SavedWorkflowResults({
           ) : deletion?.state === "checking" ? (
             <WorkflowAlert
               title={
-                error ? "Could not refresh the workflow thread" : "Checking the workflow thread"
+                indexError
+                  ? "Could not refresh the workflow thread"
+                  : "Checking the workflow thread"
               }
-              variant={error ? "warning" : "info"}
+              variant={indexError ? "warning" : "info"}
               actions={
-                error ? (
+                indexError ? (
                   <Button size="sm" variant="outline" onClick={refreshDeletionStatus}>
                     Refresh saved results
                   </Button>
                 ) : undefined
               }
             >
-              {error
+              {indexError
                 ? "Refresh saved results to check whether the deletion target has changed."
                 : "Checking whether the deletion target has changed."}
             </WorkflowAlert>

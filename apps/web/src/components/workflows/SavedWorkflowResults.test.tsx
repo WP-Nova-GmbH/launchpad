@@ -280,6 +280,220 @@ it("does not replace a selected result with a late reply for an older selection"
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(next.resultId);
     expect(fixture.refresh).not.toHaveBeenCalled();
   }));
+
+const completedJob: RepositoryWorkflowJob = {
+  ...job,
+  status: "done",
+  progress: { ...job.progress!, status: "done", revision: 2 },
+};
+const completedWithCheckpoint: RepositoryWorkflowJob = {
+  ...completedJob,
+  progress: {
+    ...completedJob.progress!,
+    checkpoint: { ...job.progress!.checkpoint!, checkpointId: "completion-checkpoint" },
+  },
+};
+
+it("keeps the selected diff visible when completing with an available saved result", () =>
+  withClient(async () => {
+    await mount();
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    fixture.list.mockRejectedValue(new Error("The result index is temporarily unavailable."));
+
+    await act(() => renderer.update(view(completedWithCheckpoint)));
+
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    expect(findButton("Retry")).toBeDefined();
+
+    await press("Conversation");
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+    const historyReads = fixture.history.mock.calls.length;
+    fixture.list.mockResolvedValueOnce({
+      results: [result],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    await press("Retry");
+
+    expect(findButton("Retry")).toBeUndefined();
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+    expect(fixture.history).toHaveBeenCalledTimes(historyReads);
+  }));
+
+it("keeps the selected patch error retryable when the completion index refresh succeeds", () =>
+  withClient(async () => {
+    const patchError = "The selected patch could not be opened.";
+    fixture.read.mockRejectedValueOnce(new Error(patchError));
+    await mount();
+    expect(JSON.stringify(renderer.toJSON())).toContain(patchError);
+
+    await act(() => renderer.update(view(completedWithCheckpoint)));
+
+    expect(JSON.stringify(renderer.toJSON())).toContain(patchError);
+    await press("Retry");
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+  }));
+
+it("keeps the open conversation and loaded pages of earlier results when the run completes", () =>
+  withClient(async () => {
+    const earlier = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      stepId: "Earlier Agent",
+    };
+    const oldest = {
+      ...result,
+      resultId: "44444444-4444-4444-8444-444444444444",
+      stepId: "Oldest Agent",
+    };
+    const finalResult = {
+      ...result,
+      resultId: "55555555-5555-4555-8555-555555555555",
+      stepId: "Final Agent",
+    };
+    const firstPage = { results: [result], nextCursor: 10, threadId: "thread", generation: 1 };
+    fixture.list.mockImplementation(async ({ before }) =>
+      before === 10 ? { ...firstPage, results: [earlier, oldest], nextCursor: null } : firstPage,
+    );
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === earlier.resultId ? earlier : result,
+      patch,
+    }));
+    await mount();
+    await press("Load older results");
+    await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
+    await press("Conversation");
+
+    const content = () => JSON.stringify(renderer.toJSON());
+    expect(content()).toContain("No saved messages for this Agent result.");
+    expect(content()).toContain("Oldest Agent");
+    expect(content()).not.toContain("Final Agent");
+
+    fixture.list.mockResolvedValueOnce({
+      ...firstPage,
+      generation: 2,
+      results: [finalResult, result],
+    });
+    await act(() => renderer.update(view(completedWithCheckpoint)));
+
+    expect(renderer.root.findByType("select").props.value).toBe(earlier.resultId);
+    expect(content()).toContain("No saved messages for this Agent result.");
+    expect(content()).toContain("Final Agent");
+    expect(content()).toContain("Oldest Agent");
+    expect(findButton("Load older results")).toBeUndefined();
+  }));
+
+it.each([null, 4] as const)(
+  "skips retained results after filling the gap with cached cursor %s",
+  (cachedCursor) =>
+    withClient(async () => {
+      const oldest = {
+        ...result,
+        resultId: "33333333-3333-4333-8333-333333333333",
+        stepId: "Oldest Agent",
+      };
+      const middle = {
+        ...result,
+        resultId: "44444444-4444-4444-8444-444444444444",
+        stepId: "Middle Agent",
+      };
+      const finalResult = {
+        ...result,
+        resultId: "55555555-5555-4555-8555-555555555555",
+        stepId: "Final Agent",
+      };
+      const uncached = {
+        ...result,
+        resultId: "66666666-6666-4666-8666-666666666666",
+        stepId: "Previously unloaded Agent",
+      };
+      const firstPage = { results: [result], nextCursor: 10, threadId: "thread", generation: 1 };
+      const finalPage = { ...firstPage, results: [finalResult], nextCursor: 30 };
+      fixture.list.mockImplementation(async ({ before }) => {
+        if (before === 10) return { ...firstPage, results: [oldest], nextCursor: cachedCursor };
+        if (before === 30) return { ...firstPage, results: [middle, result], nextCursor: 10 };
+        if (before === 4) return { ...firstPage, results: [uncached], nextCursor: null };
+        return firstPage;
+      });
+      await mount();
+      await press("Load older results");
+      fixture.list.mockResolvedValueOnce(finalPage);
+      await act(() => renderer.update(view(completedWithCheckpoint)));
+      fixture.list.mockResolvedValueOnce(finalPage);
+      await act(() =>
+        renderer.update(
+          view({
+            ...completedWithCheckpoint,
+            progress: {
+              ...completedWithCheckpoint.progress!,
+              revision: 3,
+              resultSaving: {
+                publicationId: "77777777-7777-4777-8777-777777777777",
+                resultId: null,
+                state: "saved",
+                detail: null,
+                retryable: false,
+              },
+            },
+          }),
+        ),
+      );
+
+      const titles = () =>
+        renderer.root
+          .findByType("select")
+          .findAllByType("div")
+          .map((option) => option.findAllByType("p")[0]!.children.join(""));
+      expect(titles()).toEqual(["Final Agent", result.stepId, "Oldest Agent"]);
+
+      await press("Load older results");
+
+      expect(titles()).toEqual(["Final Agent", "Middle Agent", result.stepId, "Oldest Agent"]);
+      expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+      if (cachedCursor !== null) {
+        await press("Load older results");
+        expect(fixture.list).toHaveBeenLastCalledWith(
+          expect.objectContaining({ before: cachedCursor }),
+        );
+        expect(titles().at(-1)).toBe(uncached.stepId);
+      }
+      expect(findButton("Load older results")).toBeUndefined();
+    }),
+);
+
+it("hides loaded results when the completion refresh reports that the thread is gone", () =>
+  withClient(async () => {
+    await mount();
+    expect(renderer.root.findByType("pre")).toBeDefined();
+    fixture.list.mockRejectedValueOnce(
+      ManagedRelay.relayRequestError("listSavedWorkflowResults")(
+        new RelayTenancyNotFoundError({
+          code: "tenancy_not_found",
+          reason: "thread_not_found",
+          traceId: "deleted-thread",
+        }),
+      ),
+    );
+
+    await act(() => renderer.update(view(completedWithCheckpoint)));
+
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+    expect(renderer.root.findAllByType("select")).toHaveLength(0);
+  }));
+
+it("checks again for saved results when a run finishes with an empty index", () =>
+  withClient(async () => {
+    const page = { results: [result], nextCursor: null, threadId: "thread", generation: 1 };
+    fixture.list.mockResolvedValueOnce({ ...page, results: [] }).mockResolvedValue(page);
+    await mount();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+
+    await act(() => renderer.update(view(completedJob)));
+
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+  }));
+
 it("retries the exact deletion after an uncertain reply, even if the result index changes", () =>
   withClient(async () => {
     fixture.deletion.mockRejectedValueOnce(new Error("Reply lost"));

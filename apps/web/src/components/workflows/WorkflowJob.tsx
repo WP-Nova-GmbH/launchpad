@@ -77,6 +77,7 @@ import {
   type WorkflowControl,
 } from "@t3tools/contracts/workflows";
 import { TurnId } from "@t3tools/contracts";
+import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { useDiffPanelStore } from "../../diffPanelStore";
 import { useRightPanelStore } from "../../rightPanelStore";
@@ -90,6 +91,7 @@ import {
   AlertDialogTitle,
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
+import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { searchableSetting } from "../settings/settingsSearch";
@@ -161,9 +163,10 @@ export function WorkflowJob({
   const reads = useWorkflowJobReads();
   const drafts = useWorkflowDrafts();
   const key = workflowSessionKey(scope, jobId);
-  const conversationButton = useRunActionFocus(key);
-  const resumeButton = useRunActionFocus(key);
   const runHeading = useRef<HTMLHeadingElement>(null);
+  const conversationButton = useRunActionFocus(key, runHeading);
+  const inspectResultButton = useRunActionFocus(key, runHeading);
+  const resumeButton = useRunActionFocus(key);
   const reviewSection = useRef<HTMLElement>(null);
   const handledReviewReturn = useRef<string | null>(null);
   const checkpointForm = useRunActionFocus<HTMLFormElement>(key, runHeading);
@@ -182,6 +185,11 @@ export function WorkflowJob({
   const recoverySettingsLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
   const savedResultsButton = useRunActionFocus(key, runHeading);
   const savedResults = useRef<HTMLElement>(null);
+  const [availableSavedResultsKey, setAvailableSavedResultsKey] = useState<string | null>(null);
+  const onSavedResultsAvailableChange = useCallback(
+    (available: boolean) => setAvailableSavedResultsKey(available ? key : null),
+    [key],
+  );
   const resultRequest = useRef<{ key: string } | null>(null);
   useLayoutEffect(
     () => () => {
@@ -725,6 +733,10 @@ export function WorkflowJob({
   const nextStep =
     stepIndex >= 0 ? selectedJob.workflow?.definition.steps[stepIndex + 1] : undefined;
   const completed = selectedJob.status === "done";
+  const pullRequestUrl = selectedJob.progress?.pullRequestUrl;
+  const completionTitle = pullRequestUrl ? "Pull request opened" : "Workflow completed";
+  const pullRequestNumber =
+    completed && pullRequestUrl ? parseChangeRequestUrl(pullRequestUrl)?.number : undefined;
   const confirmationPending =
     approvalPending || manualState.responsePending || !!selectedJob.pendingManualControl;
   const running = selectedJob.status === "running";
@@ -874,9 +886,7 @@ export function WorkflowJob({
     : checkpointResponsePending
       ? (checkpointStep?.title ?? (input ? "Input checkpoint" : "Review checkpoint"))
       : terminal
-        ? completed
-          ? "Workflow completed"
-          : statusLabel
+        ? statusLabel
         : selectedJob.status === "queued"
           ? "Waiting for execution"
           : stepRepeatsWorkflowName
@@ -907,25 +917,23 @@ export function WorkflowJob({
       <div className="flex flex-wrap gap-2">
         {checkpoint && checkpoint.kind !== "input" ? (
           <Button
+            ref={inspectResultButton}
             variant={
-              (waiting && !input && !checkpointResponsePending) ||
-              (completed && !selectedJob.progress.pullRequestUrl)
+              (waiting && !input && !checkpointResponsePending) || (completed && !pullRequestUrl)
                 ? "default"
                 : "outline"
             }
             disabled={openingResult || checkingReturnedReview}
             onClick={() => void inspect(true)}
           >
+            {completed ? <FileDiffIcon aria-hidden /> : null}
             {completed ? "Inspect result" : "Inspect saved diff"}
           </Button>
         ) : null}
         <Button
           ref={conversationButton}
           variant={
-            failed ||
-            (completed &&
-              !selectedJob.progress.pullRequestUrl &&
-              (!checkpoint || checkpoint.kind === "input"))
+            failed || (completed && !pullRequestUrl && (!checkpoint || checkpoint.kind === "input"))
               ? "default"
               : conversationInTask
                 ? "outline"
@@ -934,12 +942,19 @@ export function WorkflowJob({
           disabled={openingResult}
           onClick={() => void inspect(false)}
         >
+          {completed ? <MessageSquareIcon aria-hidden /> : null}
           Open conversation
           {conversationInTask || failed ? <ArrowUpRightIcon aria-hidden /> : null}
         </Button>
       </div>
     ) : null;
   const draftOpen = !manualHold || collapsedDraftKey !== feedbackKey;
+  const openSavedResults = () => {
+    const results = savedResults.current;
+    if (!results) return;
+    results.scrollIntoView({ block: "start" });
+    results.focus({ preventScroll: true });
+  };
   const vmRecoveryActions =
     selectedJob.vmRecovery?.state === "waiting_codex" && organizationAdmin ? (
       <Button
@@ -959,17 +974,7 @@ export function WorkflowJob({
     ) : selectedJob.vmRecovery?.state === "recovery_error" &&
       !composingFeedback &&
       savedWorkflowThreadState(selectedJob) === "available" ? (
-      <Button
-        ref={savedResultsButton}
-        variant="outline"
-        size="sm"
-        onClick={() => {
-          const results = savedResults.current;
-          if (!results) return;
-          results.scrollIntoView({ block: "start" });
-          results.focus({ preventScroll: true });
-        }}
-      >
+      <Button ref={savedResultsButton} variant="outline" size="sm" onClick={openSavedResults}>
         <FileDiffIcon aria-hidden />
         Open saved results
       </Button>
@@ -1134,7 +1139,9 @@ export function WorkflowJob({
                     ? preparationAnnouncement
                     : recovery
                       ? `${statusLabel}. ${recovery.title}`
-                      : statusLabel}
+                      : completed
+                        ? completionTitle
+                        : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
@@ -1142,6 +1149,7 @@ export function WorkflowJob({
           </h1>
           <div className="flex flex-wrap items-center gap-3">
             {(!TaskIcon || preparationInTask) &&
+            !completed &&
             !vmCheckpointRecovery &&
             !cancelling &&
             !recoveryInTask ? (
@@ -1336,6 +1344,32 @@ export function WorkflowJob({
                 <p className="wrap-anywhere">{preparationRelayDetail}</p>
               ) : null}
             </WorkflowOutcome>
+          ) : completed ? (
+            <WorkflowOutcome
+              title={completionTitle}
+              tone="success"
+              icon={pullRequestUrl ? PullRequestGlyph.pullRequest : undefined}
+              announce={false}
+              actions={
+                pullRequestUrl ? (
+                  <Button render={<a href={pullRequestUrl} target="_blank" rel="noreferrer" />}>
+                    Open pull request
+                    <ArrowUpRightIcon aria-hidden />
+                  </Button>
+                ) : selectedJob.runtime?.kind === "vm" &&
+                  availableSavedResultsKey === key &&
+                  savedWorkflowThreadState(selectedJob) === "available" ? (
+                  <Button ref={savedResultsButton} onClick={openSavedResults}>
+                    <FileDiffIcon aria-hidden />
+                    Open saved results
+                  </Button>
+                ) : (
+                  conversationActions
+                )
+              }
+            >
+              {pullRequestNumber !== undefined ? <p>PR #{pullRequestNumber}</p> : null}
+            </WorkflowOutcome>
           ) : cancelledVm ? null : (
             <div
               className={
@@ -1501,15 +1535,6 @@ export function WorkflowJob({
                 : "Approval completes this workflow."}
             </p>
           ) : null}
-          {completed && selectedJob.progress?.pullRequestUrl ? (
-            <Button
-              render={
-                <a href={selectedJob.progress.pullRequestUrl} target="_blank" rel="noreferrer" />
-              }
-            >
-              Open pull request
-            </Button>
-          ) : null}
           {!composingFeedback && selectedJob.runtime?.kind === "vm" ? (
             <SavedWorkflowResults
               key={`${scope.accountId}:${scope.repositoryId}:${jobId}`}
@@ -1518,11 +1543,14 @@ export function WorkflowJob({
               refresh={refresh}
               canConfigure={canConfigure}
               onReviewTargetChange={setReviewingCurrentResult}
+              onResultsAvailableChange={completed ? onSavedResultsAvailableChange : undefined}
               resultsRef={savedResults}
             />
           ) : null}
           {!recoveryInTask ? recoveryCard : null}
-          {!conversationInTask && !failed && !publishingFailure ? conversationActions : null}
+          {!conversationInTask && !failed && !publishingFailure && (!completed || pullRequestUrl)
+            ? conversationActions
+            : null}
           {resultError ? (
             <WorkflowAlert
               title="Could not open the result"
