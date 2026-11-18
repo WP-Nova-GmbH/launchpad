@@ -83,7 +83,8 @@ vi.mock("../ui/alert-dialog", () => {
 });
 vi.mock("../ui/sheet", () => ({
   Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) => (open ? children : null),
-  SheetPopup: ({ children }: PropsWithChildren) => children,
+  SheetPopup: ({ children }: PropsWithChildren) =>
+    createElement("section", { role: "dialog" }, children),
   SheetTitle: ({ children }: PropsWithChildren) => children,
   SheetHeader: ({ children }: PropsWithChildren) => children,
   SheetDescription: ({ children }: PropsWithChildren) => children,
@@ -209,7 +210,7 @@ async function submit() {
     renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} });
   });
 }
-const archiveDialog = () => renderer!.root.findByProps({ role: "alertdialog" });
+const editorDialog = () => renderer!.root.findByProps({ role: "alertdialog" });
 const button = (label: string, root = renderer!.root) =>
   root.findAllByType("button").find((node) => {
     const text = node.children
@@ -601,6 +602,219 @@ describe("Reload buffer and view ownership", () => {
       } catch {}
     });
   });
+});
+
+describe("Discard workflow changes", () => {
+  it("keeps editing or resets a saved workflow in place", async () => {
+    const workflow = saved("discard-saved", 1, newWorkflowDraft([project])!.definition);
+    await mount({ ...base, workflow, isNew: false, openExecutionSettings: true });
+    await rename("Unsaved edits");
+    const draft = editor(workflow.workflowId);
+
+    await click("Discard changes");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Discard unsaved edits?");
+    expect(editor(workflow.workflowId)).toBe(draft);
+    await click("Keep editing", editorDialog());
+    expect(editor(workflow.workflowId)).toBe(draft);
+
+    await click("Discard changes");
+    await click("Discard edits", editorDialog());
+    expect(editor(workflow.workflowId).definition).toEqual(workflow.definition);
+    expect(workflowEditorDirty(editor(workflow.workflowId))).toBe(false);
+    expect(navigate).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("removes a never-saved draft and returns to Workflows after confirmation", async () => {
+    await mount({ ...base, openExecutionSettings: true });
+    await rename("New release draft");
+    const id = newId();
+
+    await click("Discard changes");
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Discard draft?");
+    expect(newId()).toBe(id);
+    expect(navigate).not.toHaveBeenCalled();
+    await click("Discard draft", editorDialog());
+
+    expect(editor(id)).toBeUndefined();
+    expect(newId()).toBeUndefined();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId: scope.repositoryId },
+      search: { tab: "workflows" },
+    });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "retained trigger",
+    "retained step",
+    "new edit",
+    "failed read",
+    "failed read in another inspector",
+  ] as const)(
+    "handles a confirmed reload after closing Workflow settings (%s)",
+    async (scenario) => {
+      const workflow = saved("discard-close-settings", 1, newWorkflowDraft([project])!.definition);
+      const props = { ...base, workflow, isNew: false };
+      await mount(props);
+      await rename("Unsaved edits to discard");
+      if (scenario === "retained trigger" || scenario === "retained step") {
+        const canvas = renderer!.root.findByProps({ "data-testid": "canvas-fixture" });
+        await act(() => {
+          if (scenario === "retained trigger") canvas.props.onTrigger();
+          else canvas.props.onSelect("review");
+        });
+      }
+      await unmount();
+      const newer = {
+        ...workflow,
+        revision: 2,
+        definition: { ...workflow.definition, name: "New saved workflow" },
+      };
+      await mount({ ...props, workflow: newer, openExecutionSettings: true });
+      if (scenario === "retained trigger")
+        expect(editor(workflow.workflowId).triggerSetup).toBe(true);
+      if (scenario === "retained step")
+        expect(editor(workflow.workflowId).selectedStepId).toBe("review");
+      const reply = deferred<{ workflows: RepositoryWorkflow[] }>();
+      read.mockReturnValueOnce(reply.promise);
+      await click("Discard changes");
+      await click("Discard edits and reload", editorDialog());
+
+      const settings = renderer!.root.findByProps({ role: "dialog" });
+      const discardProps = button("Discard changes", settings)!.props;
+      expect(discardProps["aria-disabled"]).toBe(true);
+      expect(discardProps.disabled).toBeFalsy();
+      expect(
+        settings.findByProps({ id: discardProps["aria-describedby"], role: "status" }).children,
+      ).toContain("Reloading saved version…");
+      await act(() => settings.findByProps({ "aria-label": "Close settings" }).props.onClick());
+      expect(renderer!.root.findAllByProps({ role: "dialog" })).toHaveLength(0);
+
+      if (scenario === "new edit") await rename("Typed after confirmation");
+      if (scenario === "failed read in another inspector") {
+        const canvas = renderer!.root.findByProps({ "data-testid": "canvas-fixture" });
+        await act(() => canvas.props.onSelect("review"));
+      }
+      const readFails =
+        scenario === "failed read" || scenario === "failed read in another inspector";
+      await act(async () => {
+        if (readFails) reply.reject(new Error("Catalog unavailable"));
+        else reply.resolve({ workflows: [newer] });
+        await reply.promise.catch(() => {});
+      });
+
+      const draft = editor(workflow.workflowId);
+      if (scenario === "new edit" || readFails) {
+        expect(draft.baseline).toEqual(workflow);
+        expect(draft.definition.name).toBe(
+          scenario === "new edit" ? "Typed after confirmation" : "Unsaved edits to discard",
+        );
+        const feedback =
+          scenario === "new edit"
+            ? "Your draft changed during reload. Your current edits are kept."
+            : "Could not reload the saved version. Your draft is kept.";
+        const surface =
+          scenario === "failed read in another inspector"
+            ? renderer!.root.findByProps({ role: "dialog" })
+            : renderer!.root;
+        expect(
+          surface
+            .findAllByProps({ role: "alert" })
+            .some((node) => node.children.includes(feedback)),
+        ).toBe(true);
+        await click("Open workflow settings", surface);
+        expect(
+          button("Retry reload", renderer!.root.findByProps({ role: "dialog" })),
+        ).toBeDefined();
+        expect(read).toHaveBeenCalledOnce();
+        return;
+      }
+
+      expect(draft.baseline).toEqual(newer);
+      expect(draft.definition).toEqual(newer.definition);
+      expect(workflowEditorDirty(draft)).toBe(false);
+    },
+  );
+
+  it.each(["failed", "older", "superseded"] as const)(
+    "keeps the draft after a %s reload and adopts an up-to-date saved version on retry",
+    async (outcome) => {
+      const workflow = saved("discard-stale", 1, newWorkflowDraft([project])!.definition);
+      const props = { ...base, workflow, isNew: false, openExecutionSettings: true };
+      await mount(props);
+      await rename("Unsaved edits to preserve");
+      const newer = {
+        ...workflow,
+        revision: 2,
+        definition: { ...workflow.definition, name: "New saved workflow" },
+      };
+
+      await click("Discard changes");
+      expect(button("Discard edits", editorDialog())).toBeDefined();
+      await act(() =>
+        renderer!.update(
+          <AppAtomRegistryProvider>
+            <WorkflowBuilder {...props} workflow={newer} />
+          </AppAtomRegistryProvider>,
+        ),
+      );
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Newer saved version available");
+      expect(button("Discard edits", editorDialog())?.props.disabled ?? true).toBe(true);
+      expect(read).not.toHaveBeenCalled();
+      const latest = outcome === "superseded" ? { ...newer, revision: 3 } : newer;
+      if (outcome === "superseded") {
+        const reply = deferred<{ workflows: RepositoryWorkflow[] }>();
+        read.mockReturnValueOnce(reply.promise);
+        await click("Discard edits and reload", editorDialog());
+        await act(() =>
+          renderer!.update(
+            <AppAtomRegistryProvider>
+              <WorkflowBuilder {...props} workflow={latest} />
+            </AppAtomRegistryProvider>,
+          ),
+        );
+        await act(async () => {
+          reply.resolve({ workflows: [newer] });
+          await reply.promise;
+        });
+      } else {
+        if (outcome === "failed") read.mockRejectedValueOnce(new Error("Catalog unavailable"));
+        else read.mockResolvedValueOnce({ workflows: [workflow] });
+        await click("Discard edits and reload", editorDialog());
+      }
+
+      expect(editor(workflow.workflowId).definition.name).toBe("Unsaved edits to preserve");
+      expect(editor(workflow.workflowId).baseline).toEqual(workflow);
+      expect(read).toHaveBeenCalledOnce();
+      expect(confirmation).not.toHaveBeenCalled();
+
+      if (outcome === "failed") {
+        await act(() =>
+          renderer!.update(
+            <AppAtomRegistryProvider>
+              <WorkflowBuilder {...props} workflow={undefined} workflowId={workflow.workflowId} />
+            </AppAtomRegistryProvider>,
+          ),
+        );
+      }
+      const settings = renderer!.root.findByProps({ role: "dialog" });
+      expect(
+        settings.findAll((node) =>
+          node.children.includes("Could not reload the saved version. Your draft is kept."),
+        ),
+      ).not.toHaveLength(0);
+      await click("Retry reload", settings);
+      expect(read).toHaveBeenCalledOnce();
+      read.mockResolvedValueOnce({ workflows: [latest] });
+      await click("Discard edits and reload", editorDialog());
+      expect(editor(workflow.workflowId).baseline).toEqual(latest);
+      expect(editor(workflow.workflowId).definition).toEqual(latest.definition);
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(navigate).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("Canvas editor state", () => {
@@ -1055,11 +1269,11 @@ describe("VM authoring", () => {
     expect(read).not.toHaveBeenCalled();
     expect(editor(workflow.workflowId).baseline).toEqual(workflow);
     expect(JSON.stringify(renderer!.toJSON())).toContain("Archive workflow?");
-    expect(button("Cancel", archiveDialog())).toBeDefined();
+    expect(button("Cancel", editorDialog())).toBeDefined();
 
     const archived = { ...workflow, revision: 2, archived: true };
     read.mockResolvedValueOnce(archived);
-    await click("Archive workflow", archiveDialog());
+    await click("Archive workflow", editorDialog());
     expect(read).toHaveBeenCalledTimes(1);
     expect(editor(workflow.workflowId).baseline).toEqual(archived);
   });
@@ -1088,7 +1302,7 @@ describe("VM authoring", () => {
       automation: { ...recoveryAuto, enabled: false },
     };
     read.mockResolvedValueOnce(archived);
-    await click("Archive workflow", archiveDialog());
+    await click("Archive workflow", editorDialog());
     expect(read).toHaveBeenCalledTimes(1);
     expect(editor(workflow.workflowId).baseline).toEqual(archived);
   });
@@ -1099,7 +1313,7 @@ describe("VM authoring", () => {
     await rename("Unsaved workflow name");
 
     await click("Archive workflow");
-    await click("Keep editing", archiveDialog());
+    await click("Keep editing", editorDialog());
     expect(read).not.toHaveBeenCalled();
     expect(editor(workflow.workflowId).definition.name).toBe("Unsaved workflow name");
 
@@ -1107,7 +1321,7 @@ describe("VM authoring", () => {
     expect(read).not.toHaveBeenCalled();
     const archived = { ...workflow, revision: 2, archived: true };
     read.mockResolvedValueOnce(archived);
-    await click("Discard edits and archive", archiveDialog());
+    await click("Discard edits and archive", editorDialog());
     expect(read).toHaveBeenCalledTimes(1);
     expect(editor(workflow.workflowId).baseline).toEqual(archived);
     expect(editor(workflow.workflowId).definition).toEqual(workflow.definition);
@@ -1131,7 +1345,7 @@ describe("VM authoring", () => {
       read.mockReturnValueOnce(reply.promise);
 
       await click("Archive workflow");
-      await click("Discard edits and archive", archiveDialog());
+      await click("Discard edits and archive", editorDialog());
       expect(saveWorkflow).toHaveBeenCalledExactlyOnceWith({
         clerkToken: "fixture-token",
         repositoryId: scope.repositoryId,
@@ -1179,7 +1393,7 @@ describe("VM authoring", () => {
     await mount(props);
     await rename("Unsaved archive edits");
     await click("Archive workflow");
-    expect(button("Discard edits and archive", archiveDialog())?.props.disabled).toBeFalsy();
+    expect(button("Discard edits and archive", editorDialog())?.props.disabled).toBeFalsy();
     const capturedDraft = editor(workflow.workflowId);
 
     const newer = {
@@ -1197,7 +1411,7 @@ describe("VM authoring", () => {
 
     expect(editor(workflow.workflowId)).toBe(capturedDraft);
     expect(JSON.stringify(renderer!.toJSON())).toContain("Saved version changed");
-    const dialog = archiveDialog();
+    const dialog = editorDialog();
     const discardAndArchive = button("Discard edits and archive", dialog);
     expect(!discardAndArchive || discardAndArchive.props.disabled === true).toBe(true);
     expect(button("Keep editing", dialog)).toBeDefined();
@@ -1213,7 +1427,7 @@ describe("VM authoring", () => {
 
     await click("Archive workflow");
     read.mockResolvedValueOnce({ workflows: [newer] });
-    await click("Discard edits and reload", archiveDialog());
+    await click("Discard edits and reload", editorDialog());
     expect(confirmation).not.toHaveBeenCalled();
     expect(read).toHaveBeenCalledTimes(1);
     expect(editor(workflow.workflowId).baseline).toEqual(newer);

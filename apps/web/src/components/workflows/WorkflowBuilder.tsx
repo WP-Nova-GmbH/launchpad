@@ -63,6 +63,7 @@ import {
   ChevronRightIcon,
   ChevronDownIcon,
   ToggleLeftIcon,
+  RefreshCwIcon,
 } from "lucide-react";
 
 import {
@@ -89,6 +90,24 @@ import {
 } from "./workflowOperations";
 
 const isWorkflowAutomation = Schema.is(WorkflowAutomation);
+
+type DiscardReloadStatus = "loading" | "failed" | "draft-changed" | null;
+
+function matchesDiscardedDraft(current: WorkflowEditorDraft, confirmed: WorkflowEditorDraft) {
+  // Inspector navigation only changes selectedStepId and triggerSetup.
+  return (
+    current.workflowId === confirmed.workflowId &&
+    current.baseline === confirmed.baseline &&
+    current.definition === confirmed.definition &&
+    current.automation === confirmed.automation &&
+    current.automationResolved === confirmed.automationResolved &&
+    current.targetConfirmed === confirmed.targetConfirmed &&
+    current.lastVmTarget === confirmed.lastVmTarget &&
+    current.operation === confirmed.operation &&
+    current.saveRecovery === confirmed.saveRecovery &&
+    current.error === confirmed.error
+  );
+}
 
 type WorkflowBuilderProps = {
   scope: WorkflowScope;
@@ -167,6 +186,13 @@ function WorkflowBuilderEditor({
   const state = useWorkflowDrafts();
   const key = workflowSessionKey(scope, id ?? "missing");
   const draft = id ? state.editors[key] : undefined;
+  const workflowRevision = workflow?.revision ?? 0;
+  const [latestKnownRevision, setLatestKnownRevision] = useState(workflowRevision);
+  if (workflowRevision > latestKnownRevision) setLatestKnownRevision(workflowRevision);
+  const latestSavedRevision = useRef(latestKnownRevision);
+  useLayoutEffect(() => {
+    latestSavedRevision.current = latestKnownRevision;
+  }, [latestKnownRevision]);
   const restoreCatalog = useRef({ projects, projectsUnavailable });
   useLayoutEffect(() => {
     restoreCatalog.current = { projects, projectsUnavailable };
@@ -174,6 +200,7 @@ function WorkflowBuilderEditor({
   const readRequest = useRef<{ draft: WorkflowEditorDraft } | null>(null);
   const [reading, setReading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [discardReloadStatus, setDiscardReloadStatus] = useState<DiscardReloadStatus>(null);
   const [codexNotice, setCodexNotice] = useState<string | null>(null);
   const checkCodex =
     canConfigure &&
@@ -331,6 +358,7 @@ function WorkflowBuilderEditor({
     workflow && draft.baseline && workflow.revision > draft.baseline.revision
       ? workflow
       : draft.baseline;
+  const discardSavedRevision = Math.max(currentSaved?.revision ?? 0, latestKnownRevision);
   const archived = !!currentSaved?.archived;
   const issue = workflowDraftIssue(normalizeWorkflowDefinitionForSave(draft.definition));
   const edit = (update: (draft: WorkflowEditorDraft) => WorkflowEditorDraft) =>
@@ -391,6 +419,7 @@ function WorkflowBuilderEditor({
     readRequest.current = request;
     setReading(true);
     setNotice(null);
+    setDiscardReloadStatus(null);
     return request;
   };
   const ownsRead = (request: NonNullable<typeof readRequest.current>) =>
@@ -402,7 +431,7 @@ function WorkflowBuilderEditor({
     readRequest.current = null;
     if (active.current) setReading(false);
   };
-  const reload = async (confirmedDraft?: WorkflowEditorDraft) => {
+  const reload = async (confirmedDraft?: WorkflowEditorDraft, minimumRevision?: number) => {
     const request = beginRead();
     if (!request) return;
     try {
@@ -417,6 +446,7 @@ function WorkflowBuilderEditor({
         appAtomRegistry.get(workflowDraftAtom).editors[key] !== request.draft
       )
         return;
+      if (minimumRevision !== undefined) setDiscardReloadStatus("loading");
       const catalog = await call((client, token) =>
         client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
       );
@@ -424,9 +454,22 @@ function WorkflowBuilderEditor({
       const saved = catalog.workflows.find(
         (entry) => entry.workflowId === request.draft.workflowId,
       );
+      if (
+        minimumRevision !== undefined &&
+        (!saved || saved.revision < Math.max(minimumRevision, latestSavedRevision.current))
+      ) {
+        setDiscardReloadStatus("failed");
+        return;
+      }
       let applied = false;
       updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
-        if (!ownsRead(request) || state.editors[key] !== request.draft) return state;
+        const current = state.editors[key];
+        if (!ownsRead(request) || !current) return state;
+        if (
+          current !== request.draft &&
+          (minimumRevision === undefined || !matchesDiscardedDraft(current, request.draft))
+        )
+          return state;
         applied = true;
         return {
           ...state,
@@ -436,10 +479,13 @@ function WorkflowBuilderEditor({
               ? {
                   ...savedWorkflowDraft(saved, catalog.automationSupported === true),
                   selectedStepId: saved.definition.steps.some(
-                    (step) => step.id === request.draft.selectedStepId,
+                    (step) => step.id === current.selectedStepId,
                   )
-                    ? request.draft.selectedStepId
+                    ? current.selectedStepId
                     : "",
+                  ...(minimumRevision !== undefined && current.triggerSetup === true
+                    ? { triggerSetup: true }
+                    : {}),
                 }
               : {
                   ...request.draft,
@@ -448,10 +494,17 @@ function WorkflowBuilderEditor({
           },
         };
       });
-      if (!applied)
+      if (minimumRevision !== undefined) {
+        setDiscardReloadStatus(applied ? null : "draft-changed");
+      } else if (!applied) {
         setNotice("Your draft changed while reload was loading. Your current edits were kept.");
-      else if (saved) refresh();
+      }
+      if (applied && saved) refresh();
     } catch (cause) {
+      if (minimumRevision !== undefined) {
+        if (ownsRead(request)) setDiscardReloadStatus("failed");
+        return;
+      }
       if (ownsRead(request))
         updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) =>
           state.editors[key] === request.draft
@@ -526,9 +579,16 @@ function WorkflowBuilderEditor({
       finishRead(request);
     }
   };
-  const discard = async () => {
+  const discard = async (confirmedDraft?: WorkflowEditorDraft, reloadRevision?: number) => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
-    if (!captured || captured.operation?.state === "pending") return;
+    if (
+      !active.current ||
+      readRequest.current ||
+      !captured ||
+      captured.operation?.state === "pending" ||
+      (confirmedDraft && captured !== confirmedDraft)
+    )
+      return;
     if (captured.operation) {
       await navigate({
         to: "/workflows/$repositoryId",
@@ -537,13 +597,15 @@ function WorkflowBuilderEditor({
       });
       return;
     }
-    if (
-      workflowEditorDirty(captured) &&
-      !(await confirmWorkflow("Discard this workflow's unsaved changes?"))
-    )
+    const baseline = captured.baseline;
+    if (baseline && discardSavedRevision > baseline.revision) {
+      if (confirmedDraft && reloadRevision === discardSavedRevision)
+        await reload(confirmedDraft, reloadRevision);
       return;
-    if (!active.current || appAtomRegistry.get(workflowDraftAtom).editors[key] !== captured) return;
-    if (!captured.baseline) {
+    }
+    if (!confirmedDraft && workflowEditorDirty(captured)) return;
+    setNotice(null);
+    if (!baseline) {
       onDepart();
       discardWorkflowEditor(appAtomRegistry, scope, captured.workflowId);
       await navigate({
@@ -551,8 +613,7 @@ function WorkflowBuilderEditor({
         params: { repositoryId: scope.repositoryId },
         search: { tab: "workflows" },
       });
-    } else
-      edit(() => savedWorkflowDraft(captured.baseline!, workflowDraftAutomationResolved(captured)));
+    } else edit(() => savedWorkflowDraft(baseline, workflowDraftAutomationResolved(captured)));
   };
   const archive = async (confirmedDraft?: WorkflowEditorDraft) => {
     const captured = appAtomRegistry.get(workflowDraftAtom).editors[key];
@@ -699,6 +760,8 @@ function WorkflowBuilderEditor({
       pending={pending}
       archived={archived}
       savedRevision={currentSaved?.revision}
+      discardSavedRevision={discardSavedRevision}
+      discardReloadStatus={discardReloadStatus}
       vmRunUnavailable={vmRunUnavailable}
       hasRunSubmission={hasRunSubmission}
       hasRunInstructions={!!runDraft?.instruction.trim()}
@@ -747,6 +810,8 @@ function WorkflowBuilderWorkspace({
   pending,
   archived,
   savedRevision,
+  discardSavedRevision,
+  discardReloadStatus,
   vmRunUnavailable,
   hasRunSubmission,
   hasRunInstructions,
@@ -779,6 +844,8 @@ function WorkflowBuilderWorkspace({
   pending: boolean;
   archived: boolean;
   savedRevision: number | undefined;
+  discardSavedRevision: number;
+  discardReloadStatus: DiscardReloadStatus;
   vmRunUnavailable: boolean;
   hasRunSubmission: boolean;
   hasRunInstructions: boolean;
@@ -795,7 +862,7 @@ function WorkflowBuilderWorkspace({
   save: (turnOffOnly?: boolean) => Promise<void>;
   reload: (confirmedDraft?: WorkflowEditorDraft) => Promise<void>;
   reconcile: () => Promise<void>;
-  discard: () => Promise<void>;
+  discard: (confirmedDraft?: WorkflowEditorDraft, reloadRevision?: number) => Promise<void>;
   archive: (confirmedDraft?: WorkflowEditorDraft) => Promise<void>;
   scope: WorkflowScope;
 }) {
@@ -814,7 +881,7 @@ function WorkflowBuilderWorkspace({
     updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
       const key = workflowSessionKey(scope, draft.workflowId),
         current = state.editors[key];
-      return current
+      return current && (current.triggerSetup === true) !== open
         ? { ...state, editors: { ...state.editors, [key]: { ...current, triggerSetup: open } } }
         : state;
     });
@@ -834,6 +901,45 @@ function WorkflowBuilderWorkspace({
   const executionTargetControl = useRef<HTMLButtonElement>(null);
   const saveControl = useRef<HTMLButtonElement>(null);
   const saveRecoveryControl = useRef<HTMLButtonElement>(null);
+  const discardControl = useRef<HTMLButtonElement>(null);
+  const keepEditingControl = useRef<HTMLButtonElement>(null);
+  const [discardConfirmation, setDiscardConfirmation] = useState<{
+    draft: WorkflowEditorDraft;
+    open: boolean;
+  } | null>(null);
+  const discardBaseline = discardConfirmation?.draft.baseline;
+  const newerSavedVersion = !!draft.baseline && discardSavedRevision > draft.baseline.revision;
+  const discardDialogOpen =
+    discardConfirmation?.open === true && discardConfirmation.draft === draft;
+  const discardNeedsReload = !!discardBaseline && discardSavedRevision > discardBaseline.revision;
+  const retryDiscardReload =
+    discardReloadStatus === "failed" || discardReloadStatus === "draft-changed";
+  const discardReloadFeedbackId = `${settingsId}-discard-reload`;
+  const discardReloadFeedback = discardReloadStatus ? (
+    <p
+      id={discardReloadFeedbackId}
+      role={retryDiscardReload ? "alert" : "status"}
+      className={
+        retryDiscardReload
+          ? "basis-full text-xs text-destructive-foreground"
+          : "basis-full text-xs text-muted-foreground"
+      }
+    >
+      {discardReloadStatus === "loading"
+        ? "Reloading saved version…"
+        : discardReloadStatus === "failed"
+          ? "Could not reload the saved version. Your draft is kept."
+          : "Your draft changed during reload. Your current edits are kept."}
+    </p>
+  ) : null;
+  const discardHasEdits = !!discardConfirmation && workflowEditorDirty(discardConfirmation.draft);
+  const discardName =
+    discardBaseline?.definition.name ?? discardConfirmation?.draft.definition.name.trim();
+  useLayoutEffect(() => {
+    if (discardDialogOpen && discardNeedsReload) keepEditingControl.current?.focus();
+  }, [discardDialogOpen, discardNeedsReload]);
+  const closeDiscardConfirmation = () =>
+    setDiscardConfirmation((current) => (current ? { ...current, open: false } : null));
   const archiveControl = useRef<HTMLButtonElement>(null);
   const cancelArchiveControl = useRef<HTMLButtonElement>(null);
   const [archiveConfirmation, setArchiveConfirmation] = useState<{
@@ -1283,6 +1389,28 @@ function WorkflowBuilderWorkspace({
     setFocusRequest(null);
     await save();
   };
+  const discardReloadOutsideSettings =
+    discardReloadFeedback && (triggerOpen || !settingsOpen) ? (
+      <div className="flex flex-wrap items-center gap-2">
+        {discardReloadFeedback}
+        {retryDiscardReload ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-describedby={discardReloadFeedbackId}
+            onClick={() => {
+              openSettings();
+              setFocusRequest({ field: "discard-changes", stepId: null, scrollIntoView: true });
+            }}
+          >
+            Open workflow settings
+          </Button>
+        ) : null}
+      </div>
+    ) : null;
+  const discardReloadInSheet = docked === false && panelOpen ? discardReloadOutsideSettings : null;
+  const discardReloadInEditor = discardReloadInSheet ? null : discardReloadOutsideSettings;
   const panel = triggerOpen ? (
     <WorkflowTriggerInspector
       scope={scope}
@@ -1576,9 +1704,131 @@ function WorkflowBuilderWorkspace({
               {restoreWarning}
             </p>
           ) : null}
-          <Button type="button" variant="ghost" size="sm" onClick={() => void discard()}>
-            Discard changes
+          <Button
+            ref={(node) => {
+              discardControl.current = node;
+              registerField("discard-changes", node);
+            }}
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-disabled={reading || undefined}
+            aria-describedby={discardReloadStatus ? discardReloadFeedbackId : undefined}
+            onClick={() => {
+              if (reading) return;
+              if (draft.operation || (!workflowEditorDirty(draft) && !newerSavedVersion))
+                void discard();
+              else setDiscardConfirmation({ draft, open: true });
+            }}
+          >
+            {retryDiscardReload ? "Retry reload" : "Discard changes"}
           </Button>
+          <AlertDialog
+            open={discardDialogOpen}
+            onOpenChange={(open) => {
+              if (!open) closeDiscardConfirmation();
+            }}
+            onOpenChangeComplete={(open) => {
+              if (!open) setDiscardConfirmation(null);
+            }}
+          >
+            <AlertDialogPopup
+              variant="scrollable"
+              initialFocus={keepEditingControl}
+              finalFocus={() =>
+                discardControl.current && !discardControl.current.matches(":disabled")
+                  ? discardControl.current
+                  : (fields.current.get("close-settings") ?? executionTargetControl.current)
+              }
+            >
+              <AlertDialogHeader
+                className="min-h-0 overflow-y-auto overscroll-contain"
+                tabIndex={0}
+              >
+                <AlertDialogTitle>
+                  {discardNeedsReload
+                    ? "Newer saved version available"
+                    : discardBaseline
+                      ? "Discard unsaved edits?"
+                      : "Discard draft?"}
+                </AlertDialogTitle>
+                <AlertDialogDescription
+                  render={<div />}
+                  className="space-y-3 wrap-anywhere"
+                  aria-live="polite"
+                >
+                  {discardBaseline ? (
+                    <p>
+                      {discardNeedsReload
+                        ? "Load the latest saved version of "
+                        : "Restore the saved version of "}
+                      <strong className="font-medium text-popover-foreground">{discardName}</strong>
+                      {discardNeedsReload
+                        ? discardHasEdits
+                          ? " and discard your unsaved edits."
+                          : "."
+                        : " and keep the editor open."}
+                    </p>
+                  ) : (
+                    <p>
+                      {discardName ? (
+                        <>
+                          Remove the{" "}
+                          <strong className="font-medium text-popover-foreground">
+                            {discardName}
+                          </strong>{" "}
+                          draft
+                        </>
+                      ) : (
+                        "Remove this workflow draft"
+                      )}{" "}
+                      and return to Workflows.
+                    </p>
+                  )}
+                  {discardNeedsReload && discardHasEdits ? (
+                    <Alert role={undefined} controlAlignment="first-line">
+                      <RefreshCwIcon aria-hidden />
+                      <AlertDescription>
+                        Your edits stay in the editor if reload fails.
+                      </AlertDescription>
+                    </Alert>
+                  ) : null}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter className="shrink-0">
+                <Button
+                  ref={keepEditingControl}
+                  type="button"
+                  variant="outline"
+                  onClick={closeDiscardConfirmation}
+                >
+                  Keep editing
+                </Button>
+                <Button
+                  key={discardNeedsReload ? "reload" : "discard"}
+                  type="button"
+                  variant={discardHasEdits ? "destructive" : "default"}
+                  disabled={reading}
+                  onClick={() => {
+                    if (!discardDialogOpen) return;
+                    closeDiscardConfirmation();
+                    void discard(
+                      discardConfirmation.draft,
+                      discardNeedsReload ? discardSavedRevision : undefined,
+                    );
+                  }}
+                >
+                  {discardNeedsReload
+                    ? discardHasEdits
+                      ? "Discard edits and reload"
+                      : "Reload saved version"
+                    : discardBaseline
+                      ? "Discard edits"
+                      : "Discard draft"}
+                </Button>
+              </AlertDialogFooter>
+            </AlertDialogPopup>
+          </AlertDialog>
           {draft.baseline ? (
             <Button
               type="button"
@@ -1706,6 +1956,7 @@ function WorkflowBuilderWorkspace({
               </AlertDialogFooter>
             </AlertDialogPopup>
           </AlertDialog>
+          {discardReloadFeedback}
         </footer>
       </fieldset>
     </div>
@@ -1870,6 +2121,7 @@ function WorkflowBuilderWorkspace({
       editorError ||
       showSaveRecovery ||
       notice ||
+      discardReloadInEditor ||
       editorIssue ||
       showPromptNotice ||
       models.issues.length ? (
@@ -2008,6 +2260,7 @@ function WorkflowBuilderWorkspace({
               {notice}
             </p>
           ) : null}
+          {discardReloadInEditor}
           {editorIssue && editorIssue.message !== editorError ? (
             <WorkflowAlert
               title="Check workflow settings"
@@ -2206,6 +2459,9 @@ function WorkflowBuilderWorkspace({
               <div className="min-h-0 overflow-y-auto" data-workflow-step={selected?.id}>
                 {panel}
               </div>
+              {discardReloadInSheet ? (
+                <div className="shrink-0 border-t px-3.5 py-2.5">{discardReloadInSheet}</div>
+              ) : null}
             </SheetPopup>
           </Sheet>
         ) : null}
