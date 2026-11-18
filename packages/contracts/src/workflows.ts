@@ -149,6 +149,7 @@ export type WorkflowSavedResult = typeof WorkflowSavedResult.Type;
 /** One current format. The runner payload remains opaque to the relay. */
 export const WorkflowRecoveryManifest = Schema.Struct({
   format: Schema.Literal("workflow-recovery-v1"),
+  supportsVmCheckpointRecovery: Schema.optionalKey(Schema.Literal(true)),
   publicationId: Schema.String.check(Schema.isUUID()),
   binding: WorkflowVmDispatchBinding,
   revision: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -403,9 +404,25 @@ export function workflowApprovalCanRetry(progress: WorkflowJobProgress | null | 
   );
 }
 
+/** VM power and recovery are separate from the workflow's logical checkpoint. */
+export const WorkflowVmRecovery = Schema.Struct({
+  state: Schema.Literals([
+    "paused",
+    "saved",
+    "waiting_capacity",
+    "waiting_codex",
+    "resuming",
+    "restoring",
+    "recovery_error",
+  ]),
+  detail: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type WorkflowVmRecovery = typeof WorkflowVmRecovery.Type;
+
 export const RepositoryWorkflowJob = Schema.Struct({
   issueSnapshot: Schema.optional(WorkflowIssueSnapshot),
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
+  vmRecovery: Schema.optionalKey(WorkflowVmRecovery),
   vmAdmission: Schema.optional(
     Schema.Struct({ codexConnectionId: TrimmedNonEmptyString, hasSecrets: Schema.Boolean }),
   ),
@@ -486,6 +503,7 @@ export function workflowIsFinishing(job: RepositoryWorkflowJob | null) {
 /** Lists carry a short context preview; the frozen definition/result is detail-only. */
 export const RepositoryWorkflowJobSummary = Schema.Struct({
   queueReason: Schema.optional(Schema.NullOr(WorkflowQueueReason)),
+  vmRecovery: RepositoryWorkflowJob.fields.vmRecovery,
   originSummary: Schema.optional(WorkflowOriginSummary),
   targetKind: Schema.optional(Schema.Literals(["machine", "vm"])),
   jobId: RepositoryWorkflowJob.fields.jobId,

@@ -692,6 +692,9 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 VALUES(${publicationId},${jobId},${f.threadId},1,${f.native.artifactId},${"a".repeat(64)},1,${f.sql.json({ publicationId })})`;
               yield* f.sql`INSERT INTO relay_workflow_recovery_heads(job_id,publication_id,revision) VALUES(${jobId},${publicationId},1)`;
               yield* f.sql`INSERT INTO relay_thread_artifact_pins(artifact_id,operation_id) VALUES(${f.native.artifactId},${`workflow-result:${resultId}`}) ON CONFLICT DO NOTHING`;
+              const capture = yield* addCapture(f);
+              yield* f.sql`UPDATE relay_thread_vm_backups SET source_receipt=jsonb_set(source_receipt,'{workflowCheckpoint}',${f.sql.json({ jobId, publicationId, publicationRevision: 1, checkpointId: "input", checkpointGeneration: 0 })})
+                WHERE operation_id=${capture.operationId}`;
               const jobs = yield* f.authorized(makeWorkflows);
               const stale = (yield* jobs.claim(jobId))!;
               const deleted = yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
@@ -720,13 +723,40 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                 (yield* Effect.result(f.authorized(listSavedWorkflowResults(scope))))._tag,
               ).toBe("Failure");
               yield* f.sql`DELETE FROM relay_repository_access WHERE user_id=${userId}`;
+              let ready = false;
+              const compute = nativeCompute(f);
               const worker = makeThreadDeletionWorker(
                 f.sql,
                 f.objects,
-                nativeCompute(f),
+                {
+                  ...compute,
+                  destroy: () => (ready ? compute.destroy() : Effect.die("VM must stay fenced")),
+                  deleteSnapshot: () =>
+                    ready ? compute.deleteSnapshot() : Effect.die("Snapshot must stay fenced"),
+                  restore: {
+                    resolveTerminalNamedSnapshot: (_name, options) => {
+                      expect(options?.requireReady).toBe(true);
+                      return Effect.succeed(
+                        ready
+                          ? {
+                              snapshotId: capture.snapshotId,
+                              sourceTemplateID: capture.snapshotId,
+                              sourceBuildID: capture.sourceBuildId,
+                            }
+                          : null,
+                      );
+                    },
+                  },
+                },
                 f.hostId,
                 () => Effect.succeed(true),
               );
+              expect(yield* worker.runOne()).toBe(true);
+              expect(yield* f.deletions.get(f.threadId)).toMatchObject({
+                errorCode: "snapshot_unconfirmed",
+              });
+              expect((yield* f.backup.get(capture.operationId))?.phase).toBe("creating");
+              ready = true;
               yield* drain(f, worker);
               expect((yield* f.allocations.getAny(f.allocationId))?.state).toBe("deleted");
               expect(

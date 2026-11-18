@@ -24,6 +24,10 @@ interface OrderedCapacityAdmission {
 }
 const conflict = (message: string) => new ThreadVmCapacityConflict({ message });
 
+/** SQL alias x is the original Codex connection. */
+export const workflowVmCodexConnectionReady = (sql: PgClient) => sql`x.status='connected'
+  AND (x.refresh_started_at IS NULL OR x.refresh_started_at::timestamptz>clock_timestamp()-interval '6 seconds')`;
+
 /** Internal operator/worker API. A lost create or expired claim keeps its physical capacity. */
 export function makeThreadVmCapacityStore(sql: PgClient) {
   const get = Effect.fn("relay.vm_capacity.get")(function* (operationId: string) {
@@ -124,10 +128,14 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         if ((usage?.count ?? 0) >= host.limit) return null;
         const [row] = yield* sql<{
           operationId: string;
+          allocationId: string;
+          kind: CapacityRequest["kind"];
+          position: string;
           organizationId: string;
           resourceKind: "personal" | "organization_workflow";
           requiresFreeze: boolean;
-        }>`SELECT c.operation_id AS "operationId", a.organization_id AS "organizationId",
+        }>`SELECT c.operation_id AS "operationId",a.allocation_id AS "allocationId",c.kind,
+          c.position::text AS position,a.organization_id AS "organizationId",
           a.resource_kind AS "resourceKind", ${
             ordered
               ? sql`EXISTS (
@@ -147,11 +155,11 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
               SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j
                 ON j.job_id=t.workflow_job_id AND j.organization_id=t.organization_id AND j.repository_id=t.repository_id
               JOIN relay_codex_vm_connections x ON x.organization_id=j.organization_id
-                AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND x.status='connected'
-                AND (x.refresh_started_at IS NULL OR x.refresh_started_at::timestamptz > clock_timestamp() - interval '6 seconds')
+                AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND ${workflowVmCodexConnectionReady(sql)}
               LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
-              WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND t.operation_id=c.operation_id
-                AND (c.kind<>'create' OR (j.record#>>'{origin,kind}') IS DISTINCT FROM 'automation' OR ${
+              WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND (
+              (t.operation_id=c.operation_id AND
+                (c.kind<>'create' OR (j.record#>>'{origin,kind}') IS DISTINCT FROM 'automation' OR ${
                   linear
                     ? sql`EXISTS (
                       SELECT 1 FROM relay_workflow_admissions admitted
@@ -179,7 +187,23 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
                 AND j.pending_control IS NULL AND ((j.status='queued' AND p.allocation_id IS NULL
                   AND j.record#>>'{queueReason,code}'='vm_waiting_capacity') OR
                   (j.status='preparing' AND p.phase='pending' AND p.workflow_snapshot IS NOT NULL
-                    AND p.retry_at<=clock_timestamp())))`
+                    AND p.retry_at<=clock_timestamp())))
+              OR (t.audience='repository' AND j.pending_control->>'responseId'=c.operation_id
+                AND j.pending_control->'checkpointDispatch' IS NULL
+                AND ((j.status='awaiting_review' AND j.pending_control#>>'{response,operation}' IN ('approve','request_changes'))
+                  OR (j.status='awaiting_input' AND j.pending_control#>>'{response,operation}'='input'))
+                AND j.record#>>'{progress,status}'=j.status
+                AND j.record#>>'{progress,checkpoint,checkpointId}'=j.pending_control#>>'{response,checkpointId}'
+                AND j.record#>>'{progress,revision}'=j.pending_control#>>'{response,expectedRevision}'
+                AND ((c.kind='resume' AND EXISTS (
+                  SELECT 1 FROM relay_thread_vm_resumes q WHERE q.operation_id=c.operation_id
+                    AND q.allocation_id=a.allocation_id AND q.generation=t.generation AND q.phase='waiting'
+                    AND q.retry_at<=clock_timestamp()))
+                  OR (c.kind='create' AND t.operation_id=c.operation_id AND EXISTS (
+                    SELECT 1 FROM relay_thread_vm_restores q WHERE q.operation_id=c.operation_id
+                      AND q.thread_id=t.thread_id AND q.allocation_id=a.allocation_id
+                      AND q.generation=t.generation AND q.phase IN ('pending','preparing','prepared')
+                      AND q.serving_requested))))))`
                   : sql`false`
             }
             AND (SELECT count(*) FROM relay_thread_vm_capacity occupied
@@ -208,6 +232,8 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         }
         const rows = yield* sql`UPDATE relay_thread_vm_capacity c SET state = 'reserved'
           WHERE c.operation_id = ${row.operationId} AND c.state='waiting'
+            AND c.allocation_id=${row.allocationId} AND c.kind=${row.kind} AND c.position=${row.position}::bigint
+            AND c.host_id=${hostId}
             AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a
               WHERE a.allocation_id=c.allocation_id AND a.runtime_protocol='native-v1'
                 AND a.resource_kind=${row.resourceKind} AND a.organization_id=${row.organizationId}

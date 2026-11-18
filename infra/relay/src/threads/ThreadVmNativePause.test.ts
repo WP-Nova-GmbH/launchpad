@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import { nativeRestoreSecretBoxTestLayer } from "./testUtils/nativeRestoreCatalog.ts";
 import { confirmThreadVmCleanupIdentity } from "./ThreadVmCleanupIdentity.ts";
 import {
@@ -601,6 +602,53 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               expect(
                 (yield* makeThreadVmCapacityStore(f.sql).get(requested.operationId))?.state,
               ).toBe("started");
+            }),
+          ),
+        );
+
+        it.effect("allows a slow native resume while blocking overlapping workers", () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture();
+              yield* worker(f, inspectPaused).runOne();
+              const resumes = makeThreadVmResumeStore(f.sql);
+              const requested = yield* resumes.request(f.threadId);
+              const entered = yield* Deferred.make<void>();
+              const ready = yield* Deferred.make<void>();
+              let state: "paused" | "running" = "paused";
+              let calls = 0;
+              let reopened = 0;
+              const compute = {
+                inspect: () => Effect.sync(() => ({ ...f.info, state })),
+                recoverIngress: (_id: string, _identity: unknown, timeoutMs?: number) =>
+                  Effect.gen(function* () {
+                    expect(timeoutMs).toBe(90_000);
+                    calls++;
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(ready);
+                    state = "running";
+                    return {
+                      sandboxId: f.computeRef,
+                      trafficAccessToken: Redacted.make("resumed-private-token"),
+                    };
+                  }),
+              };
+              const guest = { reopenAfterResume: () => Effect.sync(() => void reopened++) };
+              const start = makeThreadVmResumeWorker(f.sql, compute, guest, f.hostId);
+              const pending = yield* start.runOne().pipe(Effect.forkScoped);
+              yield* Deferred.await(entered);
+              const [active] = yield* f.sql<{ leaseCoversAttempt: boolean }>`
+                SELECT claim_until > clock_timestamp() + interval '7 minutes' AS "leaseCoversAttempt"
+                FROM relay_thread_vm_resumes WHERE operation_id=${requested.operationId}`;
+              expect(active?.leaseCoversAttempt).toBe(true);
+              yield* TestClock.adjust("75 seconds");
+              const overlapping = makeThreadVmResumeWorker(f.sql, compute, guest, f.hostId);
+              expect(yield* overlapping.runOne()).toBe(false);
+              yield* Deferred.succeed(ready, undefined);
+              expect(yield* Fiber.join(pending)).toBe(true);
+              expect((yield* resumes.get(f.input.allocationId))?.phase).toBe("completed");
+              expect(calls).toBe(1);
+              expect(reopened).toBe(1);
             }),
           ),
         );

@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 DB_PATH = Path("/home/user/.launchpad/userdata/state.sqlite")
@@ -65,7 +66,11 @@ def projection_activity(db_path=DB_PATH):
 
 
 def main():
-    inventory = subprocess.run(["/opt/launchpad/bin/launchpad-workload", "inspect"], check=True, capture_output=True, text=True, timeout=5)
+    args = sys.argv[1:]
+    if args not in ([], ["--workflow"]):
+        raise ValueError("Invalid activity scope")
+    action = "workflow-recovery-state" if args else "inspect"
+    inventory = subprocess.run(["/opt/launchpad/bin/launchpad-workload", action], check=True, capture_output=True, text=True, timeout=5)
     print(json.dumps({"workloads": json.loads(inventory.stdout), "projection": projection_activity()}, separators=(",", ":")))
 
 

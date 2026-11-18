@@ -35,9 +35,14 @@ export const ThreadVmRestoreBoot = Schema.Struct({
 });
 export type ThreadVmRestoreBoot = typeof ThreadVmRestoreBoot.Type;
 
+const ThreadVmRestoreSourceId = Schema.Union([
+  ThreadVmRestoreBoot.fields.allocationId,
+  Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+]);
+
 export const ThreadVmWarmRestoreSource = Schema.Struct({
-  allocationId: ThreadVmRestoreBoot.fields.allocationId,
-  operationId: ThreadVmRestoreBoot.fields.operationId,
+  allocationId: ThreadVmRestoreSourceId,
+  operationId: ThreadVmRestoreSourceId,
   threadId: ThreadVmRestoreBoot.fields.threadId,
   generation: PositiveInt,
   bootId: Schema.String.check(

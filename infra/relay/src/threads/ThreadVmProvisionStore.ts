@@ -471,8 +471,14 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         LEFT JOIN relay_thread_vm_enrollments e ON e.allocation_id = p.allocation_id
         WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (${includeWorkflow}
           AND a.resource_kind='organization_workflow' AND p.workflow_snapshot IS NOT NULL
-          AND EXISTS (SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
-            WHERE t.thread_id=a.thread_id AND t.operation_id=p.operation_id AND j.status='preparing' AND j.pending_control IS NULL)))
+          AND (EXISTS (SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+            WHERE t.thread_id=a.thread_id AND t.operation_id=p.operation_id AND j.status='preparing' AND j.pending_control IS NULL)
+          OR EXISTS (SELECT 1 FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
+            WHERE r.operation_id=p.operation_id AND r.allocation_id=a.allocation_id AND r.thread_id=a.thread_id
+              AND r.phase='booted' AND r.serving_requested AND r.target_generation=p.generation
+              AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL
+              AND t.operation_id=r.operation_id AND t.generation=r.target_generation
+              AND t.audience='repository' AND t.workflow_job_id IS NOT NULL))))
           AND c.host_id = ${hostId} AND p.phase = 'created' AND a.state = 'running' AND a.deleted_at IS NULL AND e.installed_at IS NULL
           AND p.retry_at <= clock_timestamp() AND (p.claim_until IS NULL OR p.claim_until <= clock_timestamp())
         ORDER BY p.position FOR UPDATE OF p SKIP LOCKED LIMIT 1`;

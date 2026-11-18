@@ -10,6 +10,7 @@ import {
   ThreadVmRestoreBoot,
   RelayThreadVmRestoreRecovery,
   RelayThreadVmRestoreImportReceipt,
+  type ThreadVmWarmRestoreBootstrapReceipt,
   THREAD_ATTACHMENT_CHECKPOINT_MAX_FILES,
   THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES,
 } from "@t3tools/contracts/relay";
@@ -32,6 +33,7 @@ import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { downloadThreadArtifactChunks } from "./ThreadArtifactDownload.ts";
 import { materializeNativeCheckpoint } from "./ThreadNativeCheckpointTransfer.ts";
+import { makeThreadNativeCheckpoint } from "./ThreadNativeCheckpoint.ts";
 import { materializeAttachmentCheckpoint } from "./ThreadAttachmentCheckpointTransfer.ts";
 import { collectThreadAttachmentReferences } from "./ThreadAttachmentReferences.ts";
 import { installThreadAttachments } from "./ThreadAttachmentTransfer.ts";
@@ -45,12 +47,22 @@ import { prepareThreadVmWorkspace } from "./ThreadVmWorkspace.ts";
 import { downloadThreadVmRepositoryUpload } from "./ThreadVmRepositoryUpload.ts";
 import { adoptThreadVmRestoreCheckout } from "./ThreadVmRestoreCheckout.ts";
 import { ThreadHistoryBaselineImporter } from "./ThreadHistoryBaseline.ts";
+import { make as makeWorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
+import { requireThreadVmWarmRestoreBootstrap } from "./ThreadVmRestoreIdentity.ts";
+import {
+  readWorkflowVmRecoveryCapsule,
+  recoverWorkflowReviewGit,
+  verifyRestoredWorkflowNativeHome,
+} from "./ThreadVmWorkflowRestore.ts";
 
 export const THREAD_VM_RESTORE_STATE_SECRET = "thread-vm-restore-state";
 export const ThreadVmRestoreState = Schema.Struct({
   recovery: RelayThreadVmRestoreRecovery,
   receipt: RelayThreadVmRestoreImportReceipt,
   phase: Schema.Literals(["installed", "ready", "activated"]),
+  workflowBase: Schema.optionalKey(
+    Schema.Struct({ branch: Schema.NonEmptyString, sha: Schema.NonEmptyString }),
+  ),
 });
 export type ThreadVmRestoreState = typeof ThreadVmRestoreState.Type;
 const decodeRecovery = Schema.decodeEffect(RelayThreadVmRestoreRecovery);
@@ -85,6 +97,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
     recovery: RelayThreadVmRestoreRecovery;
     readArtifact: (id: string) => Effect.Effect<Stream.Stream<Uint8Array, E, R>, E, R>;
     workspaceRoot?: string;
+    warmBootstrap?: ThreadVmWarmRestoreBootstrapReceipt;
   }) {
     const recovery = yield* decodeRecovery(input.recovery),
       vm = yield* readInstalledThreadVm();
@@ -96,6 +109,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
     const point = recovery.native,
       chat = recovery.attachments;
     const independent = recovery.independentHistory;
+    const workflow = recovery.workflow;
     if (
       !vm ||
       vm.environmentId !== environmentId ||
@@ -104,23 +118,29 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
       vm.scope.allocationId !== recovery.scope.allocationId ||
       vm.scope.threadId !== recovery.scope.threadId ||
       vm.scope.repositoryId !== recovery.scope.repositoryId ||
-      vm.scope.generation !== recovery.scope.generation ||
-      point.threadId !== vm.scope.threadId ||
-      chat.threadId !== point.threadId ||
-      point.generation >= vm.scope.generation ||
-      chat.generation !== point.generation ||
-      chat.sourceEnvironmentId !== point.sourceEnvironmentId ||
-      point.sourceEnvironmentId === environmentId ||
-      chat.sourceSequence !== point.sourceSequence ||
-      chat.nativeArchiveSha256 !== point.archiveSha256 ||
-      (!independent && !point.captureOperationId) ||
-      chat.captureOperationId !== point.captureOperationId ||
-      chat.turnId !== point.turnId
+      vm.scope.generation !== recovery.scope.generation
+    )
+      return yield* fail();
+    if (
+      point &&
+      chat &&
+      (point.threadId !== vm.scope.threadId ||
+        chat.threadId !== point.threadId ||
+        point.generation >= vm.scope.generation ||
+        chat.generation !== point.generation ||
+        chat.sourceEnvironmentId !== point.sourceEnvironmentId ||
+        point.sourceEnvironmentId === environmentId ||
+        chat.sourceSequence !== point.sourceSequence ||
+        chat.nativeArchiveSha256 !== point.archiveSha256 ||
+        (!independent && !point.captureOperationId) ||
+        chat.captureOperationId !== point.captureOperationId ||
+        chat.turnId !== point.turnId)
     )
       return yield* fail();
     if (
       independent &&
-      (independent.nativeBoundary.checkpointOperationId !== point.operationId ||
+      (!point ||
+        independent.nativeBoundary.checkpointOperationId !== point.operationId ||
         independent.nativeBoundary.sourceEnvironmentId !== point.sourceEnvironmentId ||
         independent.nativeBoundary.generation !== point.generation ||
         independent.nativeBoundary.sourceSequence !== point.sourceSequence)
@@ -128,6 +148,45 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
       return yield* fail();
     const workspaceRoot = input.workspaceRoot ?? "/workspace/project",
       projectId = ProjectId.make(`vm:${vm.scope.threadId}`);
+    const boot = {
+      version: 1 as const,
+      operationId: vm.operationId,
+      allocationId: vm.scope.allocationId,
+      threadId: vm.scope.threadId,
+      generation: vm.scope.generation,
+    };
+    const savedSource = input.warmBootstrap?.source;
+    if (workflow) {
+      const { binding, manifest } = workflow;
+      const savedBoot = input.warmBootstrap?.boot;
+      if (
+        !savedBoot ||
+        !savedSource ||
+        recovery.reset ||
+        independent ||
+        savedBoot.threadId !== boot.threadId ||
+        savedBoot.operationId !== boot.operationId ||
+        savedBoot.generation !== boot.generation ||
+        savedBoot.allocationId !== boot.allocationId ||
+        savedSource.threadId !== boot.threadId ||
+        savedSource.generation !== manifest.binding.generation ||
+        savedSource.allocationId !== manifest.binding.allocationId ||
+        savedSource.operationId !== manifest.binding.operationId ||
+        binding.environmentId !== environmentId ||
+        binding.operationId !== vm.operationId ||
+        binding.generation !== vm.scope.generation ||
+        binding.allocationId !== vm.scope.allocationId ||
+        binding.repositoryId !== vm.scope.repositoryId ||
+        binding.threadId !== vm.scope.threadId ||
+        binding.projectId !== projectId ||
+        (point &&
+          (point.sourceSequence !== workflow.sourceSequence ||
+            point.generation !== savedSource.generation ||
+            point.sourceEnvironmentId !== manifest.binding.environmentId ||
+            point.captureOperationId !== savedSource.captureOperationId))
+      )
+        return yield* fail();
+    } else if (!point || !chat) return yield* fail();
     const owner = {
       threadId: vm.scope.threadId,
       operationId: vm.operationId,
@@ -160,6 +219,21 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
       yield* assertFrozen;
       return prior.receipt;
     }
+    const capsule = workflow
+      ? yield* readWorkflowVmRecoveryCapsule(
+          workflow,
+          yield* input.readArtifact(workflow.manifest.state.artifactId),
+        )
+      : null;
+    if (
+      capsule &&
+      (capsule.run.worktreePath !== workspaceRoot ||
+        capsule.run.providerContinuation?.driver !== "codex" ||
+        (!point &&
+          (capsule.run.progress.checkpoint?.kind !== "input" ||
+            capsule.run.sequence?.completed.every((step) => step.checkpoint === null) !== true)))
+    )
+      return yield* fail();
     const unrelated = yield* sql`SELECT 1 FROM projection_projects WHERE project_id!=${projectId}
       UNION ALL SELECT 1 FROM projection_threads WHERE thread_id!=${owner.threadId}
       UNION ALL SELECT 1 FROM thread_execution_work WHERE completed=0 OR relay_completed=0 LIMIT 1`;
@@ -167,7 +241,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
     if (recovery.reset) {
       const reset = recovery.reset;
       if (
-        !point.recoveryHistory ||
+        !point?.recoveryHistory ||
         !reset.repositoryUpload ||
         reset.repositoryUpload.threadId !== vm.scope.threadId ||
         reset.repositoryUpload.revision !== reset.revision ||
@@ -210,19 +284,36 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
           recovery.reset || independent
             ? null
             : yield* exportThreadVmRestoreHistory({
-                boot: {
-                  version: 1,
-                  operationId: vm.operationId,
-                  allocationId: vm.scope.allocationId,
-                  threadId: vm.scope.threadId,
-                  generation: vm.scope.generation,
-                },
-                native: point,
+                boot,
+                ...(point
+                  ? { native: point }
+                  : {
+                      source: {
+                        threadId: savedSource!.threadId,
+                        sourceEnvironmentId: workflow!.manifest.binding.environmentId,
+                        generation: savedSource!.generation,
+                        captureOperationId: savedSource!.captureOperationId,
+                        sourceSequence: workflow!.sourceSequence,
+                      },
+                    }),
+                ...(point && capsule
+                  ? {
+                      workflow: {
+                        jobId: capsule.run.jobId,
+                        nativeThreadId: point.nativeThreadId,
+                        continuationKey: capsule.run.providerContinuation!.continuationKey,
+                      },
+                    }
+                  : {}),
                 baseDir: config.baseDir,
                 workspaceRoot,
                 artifactRoot: scratch,
               });
-        const index = (receipt: typeof point | typeof chat, maxFiles: number, maxBytes: number) =>
+        const index = (
+          receipt: NonNullable<typeof point | typeof chat>,
+          maxFiles: number,
+          maxBytes: number,
+        ) =>
           downloadThreadArtifactChunks({
             ...receipt,
             indexArtifactId: receipt.manifestArtifactId,
@@ -232,39 +323,51 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
             maxBytes,
             readArtifact: input.readArtifact,
           });
-        const nativeChunks = yield* index(point, 1029, 770 * 1024 * 1024);
-        const native = yield* materializeNativeCheckpoint({
-          ...nativeChunks,
-          destinationRoot: scratch,
-          threadId: point.threadId,
-          operationId: point.operationId,
-          transferManifestSha256: nativeChunks.manifest.transferManifestSha256,
-          expected: point,
-        });
+        const nativeChunks = point ? yield* index(point, 1029, 770 * 1024 * 1024) : null;
+        const native =
+          point && nativeChunks
+            ? yield* materializeNativeCheckpoint({
+                ...nativeChunks,
+                destinationRoot: scratch,
+                threadId: point.threadId,
+                operationId: point.operationId,
+                transferManifestSha256: nativeChunks.manifest.transferManifestSha256,
+                expected: point,
+              })
+            : null;
         if (
-          native.header.archiveSha256 !== point.archiveSha256 ||
-          native.header.nativeManifestSha256 !== point.nativeManifestSha256 ||
-          native.header.native.threadId !== point.nativeThreadId
+          native &&
+          point &&
+          (native.header.archiveSha256 !== point.archiveSha256 ||
+            native.header.nativeManifestSha256 !== point.nativeManifestSha256 ||
+            native.header.native.threadId !== point.nativeThreadId)
         )
           return yield* fail();
-        const chatChunks = yield* index(
-          chat,
-          THREAD_ATTACHMENT_CHECKPOINT_MAX_FILES + 2,
-          THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES + 64 * 1024 * 1024,
-        );
-        const attachments = yield* materializeAttachmentCheckpoint({
-          ...chatChunks,
-          destinationRoot: scratch,
-          threadId: chat.threadId,
-          operationId: chat.operationId,
-          transferManifestSha256: chatChunks.manifest.transferManifestSha256,
-          expected: chat,
-        });
-        const retained = native.recoveryHistory;
+        if (workflow && native)
+          yield* verifyRestoredWorkflowNativeHome(native.header.native, scratch);
+        const chatChunks = chat
+          ? yield* index(
+              chat,
+              THREAD_ATTACHMENT_CHECKPOINT_MAX_FILES + 2,
+              THREAD_ATTACHMENT_CHECKPOINT_MAX_BYTES + 64 * 1024 * 1024,
+            )
+          : null;
+        const attachments =
+          chat && chatChunks
+            ? yield* materializeAttachmentCheckpoint({
+                ...chatChunks,
+                destinationRoot: scratch,
+                threadId: chat.threadId,
+                operationId: chat.operationId,
+                transferManifestSha256: chatChunks.manifest.transferManifestSha256,
+                expected: chat,
+              })
+            : null;
+        const retained = native?.recoveryHistory;
         if (
           recovery.reset &&
           (!retained ||
-            !point.recoveryHistory ||
+            !point?.recoveryHistory ||
             retained.manifest.operationId !== point.captureOperationId)
         )
           return yield* fail();
@@ -339,39 +442,46 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
             workspaceRoot,
             createdAt: DateTime.formatIso(yield* DateTime.now),
           });
-        yield* fences.prepare(owner);
+        if (!workflow || !(yield* fences.get(owner.threadId))) yield* fences.prepare(owner);
         yield* assertFrozen;
         const checkout = yield* adoptThreadVmRestoreCheckout({
           ...owner,
           ...saved.workspace,
           manifestSha256,
           worktreesRoot: config.worktreesDir,
+          ...(workflow ? { retainedWorkflow: true as const } : {}),
         });
         if (
           recovery.reset &&
           (checkout.branch !== recovery.reset.branch || checkout.head !== recovery.reset.revision)
         )
           return yield* fail();
-        const portable = yield* installPortableCodexHome({
-          stateDir: config.stateDir,
-          threadId: owner.threadId,
-          operationId: owner.operationId,
-          providerInstanceId: provider,
-          transferSha256: manifestSha256,
-          manifest: native.header.native,
-          rolloutPath: path.join(native.nativeDirectory, "rollout.jsonl"),
-          codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
-        });
-        yield* installThreadAttachments({
-          threadId: owner.threadId,
-          attachments: yield* collectThreadAttachmentReferences(
-            owner.threadId,
-            Stream.fromIterable(events),
-          ),
-          manifest: attachments.header.attachments,
-          artifactDirectory: attachments.attachmentsDirectory,
-          attachmentsDir: config.attachmentsDir,
-        });
+        const portable =
+          !workflow && native
+            ? yield* installPortableCodexHome({
+                stateDir: config.stateDir,
+                threadId: owner.threadId,
+                operationId: owner.operationId,
+                providerInstanceId: provider,
+                transferSha256: manifestSha256,
+                manifest: native.header.native,
+                rolloutPath: path.join(native.nativeDirectory, "rollout.jsonl"),
+                codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
+              })
+            : null;
+        const references = yield* collectThreadAttachmentReferences(
+          owner.threadId,
+          Stream.fromIterable(events),
+        );
+        if (attachments)
+          yield* installThreadAttachments({
+            threadId: owner.threadId,
+            attachments: references,
+            manifest: attachments.header.attachments,
+            artifactDirectory: attachments.attachmentsDirectory,
+            attachmentsDir: config.attachmentsDir,
+          });
+        else if (references.length > 0) return yield* fail();
         const baseline = yield* (yield* ThreadHistoryBaselineImporter).install({
           version: 1,
           manifestSha256,
@@ -386,9 +496,66 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
           importedAt: DateTime.formatIso(yield* DateTime.now),
           ...(recovery.reset ? { resetVm: true } : {}),
           ...(independent ? { backupRecovery: true } : {}),
-          nativeRuntime: { ...portable.resumeCursor, providerInstanceId: provider },
+          nativeRuntime: portable
+            ? { ...portable.resumeCursor, providerInstanceId: provider }
+            : null,
         });
         yield* assertFrozen;
+        if (workflow && capsule) {
+          yield* recoverWorkflowReviewGit({
+            baseDir: config.baseDir,
+            stateDir: config.stateDir,
+            allocationId: boot.allocationId,
+            capsule,
+          });
+          const writer = savedDisk?.workflowWriter;
+          if (point && !writer) return yield* fail();
+          if (point && native) {
+            const restored = yield* makeThreadNativeCheckpoint(sql).capture(
+              {
+                threadId: owner.threadId,
+                turnId: point.turnId,
+                artifactRoot: path.join(config.stateDir, "native-checkpoints"),
+                restoreWorkflowOperationId: owner.operationId,
+              },
+              Effect.fnUntraced(function* (artifactRoot) {
+                const directory = path.join(artifactRoot, "conversation");
+                yield* fs.copy(native.nativeDirectory, directory);
+                return { directory, nativeThreadId: point.nativeThreadId };
+              }),
+            );
+            if (
+              !restored ||
+              restored.nativeThreadId !== point.nativeThreadId ||
+              restored.archiveSha256 !== point.archiveSha256 ||
+              restored.manifestSha256 !== point.nativeManifestSha256
+            )
+              return yield* fail();
+          }
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              if (point && writer)
+                yield* sql`INSERT INTO provider_session_runtime
+                (thread_id,provider_name,provider_instance_id,adapter_key,runtime_mode,status,last_seen_at,resume_cursor_json,runtime_payload_json)
+                SELECT ${owner.threadId},'codex','codex','codex',runtime_mode,'stopped',
+                  ${DateTime.formatIso(yield* DateTime.now)},
+                  ${yield* encodeIdentity({ threadId: point.nativeThreadId, resumePolicy: "require-existing" })},
+                  ${yield* encodeIdentity(writer)}
+                FROM projection_threads WHERE thread_id=${owner.threadId}
+                ON CONFLICT(thread_id) DO NOTHING`;
+              if (
+                !(yield* (yield* makeWorkflowRunStore).restoreRecovery({
+                  capsule,
+                  binding: workflow.binding,
+                  manifest: workflow.manifest,
+                  manifestArtifactId: workflow.manifestArtifactId,
+                  sourceSequence: baseline.sequence,
+                }))
+              )
+                return yield* fail();
+            }),
+          );
+        }
         const receipt: RelayThreadVmRestoreImportReceipt = {
           version: 1,
           operationId: owner.operationId,
@@ -400,10 +567,18 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
           branch: checkout.branch,
           revision: checkout.head,
           manifestSha256,
-          sourceEnvironmentId: EnvironmentId.make(point.sourceEnvironmentId),
-          sourceSequence: point.sourceSequence,
-          nativeManifestArtifactId: point.manifestArtifactId,
-          attachmentManifestArtifactId: chat.manifestArtifactId,
+          sourceEnvironmentId: EnvironmentId.make(
+            point?.sourceEnvironmentId ?? saved.manifest.environmentId,
+          ),
+          sourceSequence: point?.sourceSequence ?? saved.manifest.sourceSequence,
+          nativeManifestArtifactId: point?.manifestArtifactId ?? null,
+          attachmentManifestArtifactId: chat?.manifestArtifactId ?? null,
+          ...(workflow
+            ? {
+                workflowPublicationId: workflow.checkpoint.publicationId,
+                workflowStateSha256: workflow.manifest.state.sha256,
+              }
+            : {}),
           ...(recovery.reset
             ? { repositoryBundleSha256: recovery.reset.repositoryUpload!.bundle.sha256 }
             : {}),
@@ -413,7 +588,14 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
         yield* (yield* ServerSecretStore).create(
           THREAD_VM_RESTORE_STATE_SECRET,
           new TextEncoder().encode(
-            yield* encodeThreadVmRestoreState({ recovery, receipt, phase: "installed" }),
+            yield* encodeThreadVmRestoreState({
+              recovery,
+              receipt,
+              phase: "installed",
+              ...(capsule
+                ? { workflowBase: { branch: capsule.run.baseBranch, sha: capsule.run.baseSha } }
+                : {}),
+            }),
           ),
         );
         return receipt;
@@ -425,7 +607,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
 
 /** Relay-selected recovery only; the guest cannot choose a different disk or checkpoint. */
 export const importInstalledThreadVmRestore = Effect.fn("ThreadVmRestoreInstall.from_relay")(
-  function* (boot: ThreadVmRestoreBoot) {
+  function* (boot: ThreadVmRestoreBoot, workflow = false) {
     const vm = yield* readInstalledThreadVm();
     if (
       !vm ||
@@ -444,9 +626,22 @@ export const importInstalledThreadVmRestore = Effect.fn("ThreadVmRestoreInstall.
     const recovery = yield* client.threadEnvironment
       .getRestoreRecovery({ params, payload: { generation: vm.scope.generation } })
       .pipe(Effect.timeout("30 seconds"));
-    if (!recovery || recovery.operationId !== boot.operationId) return yield* fail();
+    if (
+      !recovery ||
+      recovery.operationId !== boot.operationId ||
+      workflow !== Boolean(recovery.workflow)
+    )
+      return yield* fail();
     return yield* installThreadVmRestoreRecovery({
       recovery,
+      ...(workflow
+        ? {
+            warmBootstrap: yield* Effect.tryPromise({
+              try: () => requireThreadVmWarmRestoreBootstrap(boot),
+              catch: fail,
+            }),
+          }
+        : {}),
       readArtifact: (id) =>
         client.threadEnvironment
           .restoreArtifact({

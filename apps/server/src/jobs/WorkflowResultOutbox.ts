@@ -1,5 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 import {
+  type WorkflowRecoveryManifest,
   WorkflowVmDispatchBinding,
   WorkflowSavedResult,
   WorkflowResultSaving,
@@ -58,6 +59,7 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
     binding: WorkflowVmDispatchBinding;
     recordJson: string;
     result?: WorkflowResultCapture;
+    afterRestoredRevision?: number;
   }) {
     const { binding } = input;
     const [previous] = yield* sql<{
@@ -70,7 +72,9 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
         .length
         ? input.result
         : undefined;
-    if (previous?.recordJson === input.recordJson && !captured) return;
+    if (input.afterRestoredRevision !== undefined) {
+      if (previous?.revision !== input.afterRestoredRevision) return;
+    } else if (previous?.recordJson === input.recordJson && !captured) return;
     const now = yield* Clock.currentTimeMillis;
     const [sequence] = yield* sql<{
       value: number;
@@ -92,6 +96,39 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
       deadline: now + WORKFLOW_SAVE_CYCLE_MS,
       retry_at: now,
     })}`;
+  });
+  const restore = Effect.fn("WorkflowResultOutbox.restore")(function* (input: {
+    binding: WorkflowVmDispatchBinding;
+    manifest: WorkflowRecoveryManifest;
+    manifestArtifactId: string;
+    recordJson: string;
+    sourceSequence: number;
+  }) {
+    const { binding, manifest } = input;
+    const bindingJson = yield* Schema.encodeEffect(bindingCodec)(binding);
+    yield* sql`INSERT INTO workflow_result_outbox ${sql.insert({
+      publication_id: manifest.publicationId,
+      job_id: binding.jobId,
+      thread_id: binding.threadId,
+      revision: manifest.revision,
+      binding_json: bindingJson,
+      record_json: input.recordJson,
+      source_sequence: input.sourceSequence,
+      state_artifact_id: manifest.state.artifactId,
+      patch_artifact_id: manifest.result?.patch.artifactId ?? NodeCrypto.randomUUID(),
+      manifest_artifact_id: input.manifestArtifactId,
+      status: "acknowledged",
+      started_at: 0,
+      deadline: 0,
+      retry_at: 0,
+    })} ON CONFLICT DO NOTHING`;
+    const [installed] = yield* sql`SELECT 1 FROM workflow_result_outbox
+      WHERE publication_id=${manifest.publicationId} AND job_id=${binding.jobId}
+        AND thread_id=${binding.threadId} AND revision=${manifest.revision}
+        AND binding_json=${bindingJson} AND record_json=${input.recordJson}
+        AND source_sequence=${input.sourceSequence} AND state_artifact_id=${manifest.state.artifactId}
+        AND manifest_artifact_id=${input.manifestArtifactId} AND status='acknowledged'`;
+    return installed !== undefined;
   });
   const result = (jobId: string, turnId: string) =>
     sql<{
@@ -150,5 +187,5 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
         .length > 0
     );
   });
-  return { next, enqueue, result, saving, fail, expire, retry };
+  return { next, enqueue, restore, result, saving, fail, expire, retry };
 }

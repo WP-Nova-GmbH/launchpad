@@ -17,6 +17,8 @@ import {
 import { inspectVmWorkloads, withSealedVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { configureThreadVmRepository } from "./ThreadVmRepositoryBinding.ts";
+import { assertWorkflowVmRestoreReady } from "./ThreadVmWorkflowRestore.ts";
+import { make as makeWorkflowRunStore } from "../jobs/WorkflowRunStore.ts";
 import {
   readThreadVmRestoreState,
   encodeThreadVmRestoreState,
@@ -40,8 +42,10 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
     const state = yield* readThreadVmRestoreState();
     if (!state) return false;
     const receipt = state.receipt,
-      fences = makeThreadExecutionFence(yield* SqlClient.SqlClient),
+      sql = yield* SqlClient.SqlClient,
+      fences = makeThreadExecutionFence(sql),
       owner = yield* fences.get(threadId);
+    const workflow = state.recovery.workflow;
     if (
       !owner ||
       !["active", "frozen"].includes(owner.phase) ||
@@ -63,6 +67,7 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
     )
       return yield* new ThreadVmRestoreActivationError();
     const warm = !state.recovery.reset && (yield* VmWorkloadTracking);
+    if (workflow && !warm) return yield* new ThreadVmRestoreActivationError();
     const reopen = Effect.gen(function* () {
       if (!warm) return;
       const inventory = yield* inspectVmWorkloads({ type: "inspect" });
@@ -93,22 +98,32 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
     const { stateDir } = yield* ServerConfig;
     if (state.phase === "installed") {
       if (owner.phase !== "frozen") return yield* new ThreadVmRestoreActivationError();
-      const readiness = prepareThreadTransfer({
-        threadId: ThreadId.make(threadId),
-        operationId: vm.operationId,
-        generation: vm.scope.generation,
-        manifestSha256: receipt.manifestSha256,
-        stateDir,
-      });
-      yield* warm ? withSealedVmWorkloads(vm.operationId, readiness) : readiness;
+      if (workflow) {
+        yield* withSealedVmWorkloads(
+          vm.operationId,
+          assertWorkflowVmRestoreReady(state.recovery, receipt.manifestSha256),
+        );
+      } else {
+        const readiness = prepareThreadTransfer({
+          threadId: ThreadId.make(threadId),
+          operationId: vm.operationId,
+          generation: vm.scope.generation,
+          manifestSha256: receipt.manifestSha256,
+          stateDir,
+        });
+        yield* warm ? withSealedVmWorkloads(vm.operationId, readiness) : readiness;
+      }
       yield* secrets.set(
         THREAD_VM_RESTORE_STATE_SECRET,
         new TextEncoder().encode(yield* encodeThreadVmRestoreState({ ...state, phase: "ready" })),
       );
     }
     if (owner.phase === "frozen") {
-      yield* assertThreadTransferRuntime(yield* SqlClient.SqlClient, vm.operationId);
-      yield* assertThreadTransferProbeCheckpoint({ operationId: vm.operationId, stateDir });
+      if (workflow) yield* assertWorkflowVmRestoreReady(state.recovery, receipt.manifestSha256);
+      else {
+        yield* assertThreadTransferRuntime(sql, vm.operationId);
+        yield* assertThreadTransferProbeCheckpoint({ operationId: vm.operationId, stateDir });
+      }
     }
     const client = yield* makeExecutorRelayApiClient({
       url: vm.relayUrl,
@@ -130,11 +145,21 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
     );
     yield* reopen;
     if (owner.phase === "frozen")
-      yield* fences.activate({
-        threadId,
-        generation: vm.scope.generation,
-        operationId: vm.operationId,
-      });
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* fences.activate({
+            threadId,
+            generation: vm.scope.generation,
+            operationId: vm.operationId,
+            ...(workflow ? { workflowCheckpoint: workflow.checkpoint } : {}),
+          });
+          if (workflow)
+            yield* (yield* makeWorkflowRunStore).republishRestoredCheckpoint(
+              workflow.binding,
+              workflow.checkpoint.publicationRevision,
+            );
+        }),
+      );
     return true;
   },
   Effect.mapError(() => new ThreadVmRestoreActivationError()),

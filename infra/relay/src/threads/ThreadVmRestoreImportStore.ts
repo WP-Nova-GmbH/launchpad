@@ -1,3 +1,4 @@
+import { readWorkflowRestorePublication } from "./WorkflowVmWorkspace.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import { ThreadId } from "@t3tools/contracts";
 import { RelayThreadVmRestoreImportReceipt } from "@t3tools/contracts/relay";
@@ -37,7 +38,7 @@ export function makeThreadVmRestoreImportStore(
           operationId: string;
         }>`SELECT r.operation_id AS "operationId" FROM relay_thread_vm_restores r
         JOIN relay_thread_placements t USING(thread_id) JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
-        WHERE r.host_id=${hostId} AND r.serving_requested AND r.phase IN ('importing','completed') AND a.state='running' AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
+        WHERE r.host_id=${hostId} AND r.serving_requested AND r.phase IN ('importing','completed') AND a.state='running' AND a.deleted_at IS NULL AND a.runtime_protocol='native-v1' AND a.resource_kind IN ('personal','organization_workflow')
           AND r.boot_ingress_recovery_claim_id IS NULL AND r.boot_recovery_started_at IS NULL
           AND t.generation=r.target_generation AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))
           AND r.retry_at<=clock_timestamp() AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp())
@@ -59,51 +60,54 @@ export function makeThreadVmRestoreImportStore(
       !["importing", "completed"].includes(row.phase)
     )
       return yield* fail();
-    return yield* withPrivateThreadOwnerAccess(
-      ThreadId.make(row.threadId),
-      "write",
-      row.actorUserId,
-      () =>
-        Effect.gen(function* () {
-          const [binding] = yield* sql<{
-            environmentId: string;
-            repositoryId: string;
-            canonicalKey: string;
-            templateId: string;
-          }>`SELECT b.environment_id AS "environmentId",b.repository_id AS "repositoryId",alias.canonical_key AS "canonicalKey",a.template_id AS "templateId"
+    const read = Effect.gen(function* () {
+      const [binding] = yield* sql<{
+        environmentId: string;
+        repositoryId: string;
+        canonicalKey: string;
+        templateId: string;
+      }>`SELECT b.environment_id AS "environmentId",b.repository_id AS "repositoryId",alias.canonical_key AS "canonicalKey",a.template_id AS "templateId"
         FROM relay_thread_placements t JOIN relay_thread_vm_bindings b ON b.thread_id=t.thread_id
         JOIN relay_thread_vm_enrollments e ON e.allocation_id=b.allocation_id JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id
         JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
         JOIN relay_thread_vm_capacity c ON c.operation_id=p.operation_id
         JOIN LATERAL (SELECT canonical_key FROM relay_repository_aliases WHERE repository_id=t.repository_id AND organization_id=t.organization_id AND canonical_key LIKE 'github.com/%' ORDER BY canonical_key LIMIT 1) alias ON true
-        WHERE t.thread_id=${row.threadId} AND t.generation=${row.targetGeneration!} AND t.owner_user_id=${row.actorUserId}
+        WHERE t.thread_id=${row.threadId} AND t.generation=${row.targetGeneration!} AND ((t.owner_user_id=${row.actorUserId} AND ${row.workflowCheckpoint === null})
+            OR (t.audience='repository' AND t.workflow_job_id=${row.workflowCheckpoint?.jobId ?? null} AND t.owner_user_id IS NULL))
           AND (t.operation_id=${row.operationId} OR (${row.phase === "completed"} AND t.operation_id IS NULL))
           AND b.allocation_id=${row.allocationId} AND b.environment_id=t.environment_id AND b.generation=t.generation AND b.repository_id=t.repository_id
           AND b.revoked_at IS NULL AND e.operation_id=${row.operationId} AND e.installed_at IS NOT NULL AND e.environment_id=b.environment_id
           AND e.credential_id=b.credential_id AND e.environment_public_key=b.environment_public_key AND k.revoked_at IS NULL
-          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${row.bootReceipt?.sandboxId ?? ""} AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
+          AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${row.bootReceipt?.sandboxId ?? ""} AND a.runtime_protocol='native-v1' AND a.resource_kind=${row.workflowCheckpoint ? "organization_workflow" : "personal"}
           AND p.operation_id=${row.operationId} AND p.phase='created' AND p.generation=t.generation
           AND c.state='started' AND c.compute_ref=a.compute_ref FOR SHARE OF b,e,a,p,k,c`;
-          if (!binding) return yield* fail();
-          if (row.phase !== "completed") yield* restores.requireRecovery(row);
-          const [stored] = yield* sql<{
-            receipt: unknown;
-            identityCleaned: boolean;
-          }>`SELECT import_receipt AS receipt, identity_cleaned_at IS NOT NULL AS "identityCleaned" FROM relay_thread_vm_restores WHERE operation_id=${row.operationId}`;
-          return {
-            ...row,
-            ...binding,
-            receipt: stored?.receipt ? yield* decodeReceipt(stored.receipt) : null,
-            identityCleaned: stored?.identityCleaned ?? false,
-            scope: {
-              allocationId: row.allocationId,
-              threadId: ThreadId.make(row.threadId),
-              repositoryId: binding.repositoryId,
-              generation: row.targetGeneration!,
-            },
-          };
-        }),
-    );
+      if (!binding) return yield* fail();
+      if (row.phase !== "completed") yield* restores.requireRecovery(row);
+      const [stored] = yield* sql<{
+        receipt: unknown;
+        identityCleaned: boolean;
+      }>`SELECT import_receipt AS receipt, identity_cleaned_at IS NOT NULL AS "identityCleaned" FROM relay_thread_vm_restores WHERE operation_id=${row.operationId}`;
+      return {
+        ...row,
+        ...binding,
+        receipt: stored?.receipt ? yield* decodeReceipt(stored.receipt) : null,
+        identityCleaned: stored?.identityCleaned ?? false,
+        scope: {
+          allocationId: row.allocationId,
+          threadId: ThreadId.make(row.threadId),
+          repositoryId: binding.repositoryId,
+          generation: row.targetGeneration!,
+        },
+      };
+    });
+    return yield* row.workflowCheckpoint
+      ? read
+      : withPrivateThreadOwnerAccess(
+          ThreadId.make(row.threadId),
+          "write",
+          row.actorUserId,
+          () => read,
+        );
   });
   const authorize = Effect.fn("relay.thread_vm.restore.authorize_import")(function* (
     claim: ThreadVmRestoreClaim,
@@ -125,10 +129,14 @@ export function makeThreadVmRestoreImportStore(
           decoded = yield* decodeReceipt(receipt);
         const native = yield* makeThreadNativeCheckpointStore(sql, objects).getForOperation(row),
           chat = yield* makeThreadAttachmentCheckpointStore(sql, objects).getForOperation(row);
+        const checkpoint = row.workflowCheckpoint;
+        const publication = checkpoint
+          ? yield* readWorkflowRestorePublication(sql, row.threadId, checkpoint)
+          : null;
+        const source = yield* restores.requireRecovery(row);
         if (
           row.phase !== "importing" ||
-          !native ||
-          !chat ||
+          (checkpoint ? !publication : !native || !chat) ||
           decoded.operationId !== row.operationId ||
           decoded.environmentId !== row.environmentId ||
           decoded.scope.allocationId !== row.allocationId ||
@@ -139,10 +147,13 @@ export function makeThreadVmRestoreImportStore(
           decoded.workspaceRoot !== "/workspace/project" ||
           (decoded.checkoutPath !== decoded.workspaceRoot &&
             !decoded.checkoutPath.startsWith("/home/user/.launchpad/worktrees/")) ||
-          decoded.sourceEnvironmentId !== native.sourceEnvironmentId ||
-          decoded.sourceSequence !== native.sourceSequence ||
-          decoded.nativeManifestArtifactId !== native.manifestArtifactId ||
-          decoded.attachmentManifestArtifactId !== chat.manifestArtifactId
+          decoded.sourceEnvironmentId !==
+            (native?.sourceEnvironmentId ?? source.source.environmentId) ||
+          decoded.sourceSequence !== (native?.sourceSequence ?? source.source.sourceSequence) ||
+          decoded.nativeManifestArtifactId !== (native?.manifestArtifactId ?? null) ||
+          decoded.attachmentManifestArtifactId !== (chat?.manifestArtifactId ?? null) ||
+          decoded.workflowPublicationId !== checkpoint?.publicationId ||
+          decoded.workflowStateSha256 !== publication?.manifest.state.sha256
         )
           return yield* fail();
         const encoded = yield* encodeReceipt(decoded);
@@ -162,6 +173,16 @@ export function makeThreadVmRestoreImportStore(
         if (!row.receipt || (yield* encodeReceipt(row.receipt)) !== (yield* encodeReceipt(decoded)))
           return yield* fail();
         if (row.phase === "completed") return { ready: true };
+        if (row.workflowCheckpoint) {
+          const [codex] =
+            yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth a JOIN relay_workflow_jobs j
+            ON j.job_id=${row.workflowCheckpoint.jobId}
+            WHERE a.allocation_id=${row.allocationId} AND a.environment_id=${row.environmentId}
+              AND a.generation=${row.targetGeneration!} AND a.mode='organization'
+              AND a.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
+              AND a.acknowledged_connection_id=a.connection_id`;
+          if (!codex) return yield* fail();
+        }
         const digest = yield* (yield* Crypto.Crypto).digest(
           "SHA-256",
           new TextEncoder().encode(yield* encodeReceipt(decoded)),
@@ -192,7 +213,8 @@ export function makeThreadVmRestoreImportStore(
           });
           yield* makeThreadVmRecoveryHistory(sql, objects).release(row);
         }
-        yield* makeThreadNativeCheckpointStore(sql, objects).releaseOperation(row);
+        if (row.nativeCheckpointOperationId)
+          yield* makeThreadNativeCheckpointStore(sql, objects).releaseOperation(row);
         yield* sql`UPDATE relay_thread_vm_restores SET phase='completed',claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp()+interval '1 minute' WHERE operation_id=${row.operationId}`;
         return { ready: true };
       }),

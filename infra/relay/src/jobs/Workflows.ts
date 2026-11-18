@@ -511,8 +511,14 @@ export const make = Effect.gen(function* () {
       const jobs = relayWorkflowJobs;
       const history = query.view === "history";
       const limit = query.limit ?? 50;
-      const needsAttention = sql<boolean>`(${jobs.summary}->>'needsAttention' IS NOT DISTINCT FROM 'true'
-        AND ${jobs.summary}#>>'{queueReason,code}' IS DISTINCT FROM 'vm_waiting_capacity')`;
+      const needsAttention = sql<boolean>`(
+        (${jobs.summary}->>'needsAttention' IS NOT DISTINCT FROM 'true'
+          AND ${jobs.summary}#>>'{queueReason,code}' IS DISTINCT FROM 'vm_waiting_capacity')
+        OR (${jobs.record}#>>'{runtime,kind}'='vm'
+          AND ${jobs.record}#>>'{vmRecovery,state}'='recovery_error'
+          AND (${jobs.status} IN ('awaiting_review','awaiting_input')
+            OR (${jobs.status}='cancelling'
+              AND ${jobs.record}#>>'{progress,status}' IN ('awaiting_review','awaiting_input')))) IS TRUE)`;
       const rows = yield* persist(
         db
           .select({

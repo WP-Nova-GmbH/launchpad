@@ -184,6 +184,7 @@ export function WorkflowJob({
   const read = reads.jobs[key] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
   const manualState = workflowManualControlState(selectedJob);
+  const vmRecovery = manualState.recovery;
   const actionState = workflowActionState(selectedJob);
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
   const [reviewingCurrentResult, setReviewingCurrentResult] = useState(true);
@@ -342,7 +343,8 @@ export function WorkflowJob({
         selectedJob.status !== "paused" ||
         selectedJob.progress?.status !== "paused" ||
         !selectedJob.progress.retryablePreparation ||
-        manualState.checkpointBlocked)
+        manualState.checkpointBlocked ||
+        vmRecovery)
     )
       return;
     const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId, randomUUID());
@@ -598,7 +600,7 @@ export function WorkflowJob({
     checkpointResponsePending && ownSend && (sendingCheckpoint || ownSend.acceptedPending)
       ? ownSend.text
       : null;
-  const checkpointConfirmationTitle = "Waiting for confirmation";
+  const checkpointConfirmationTitle = vmRecovery?.title ?? "Waiting for confirmation";
   const composingFeedback =
     waiting &&
     !checkpointResponsePending &&
@@ -768,6 +770,7 @@ export function WorkflowJob({
   const preparationInTask =
     !queuedTask &&
     !publishingFailure &&
+    !vmRecovery &&
     !selectedJob.progress?.manualPause &&
     !selectedJob.pendingManualControl &&
     (preparationFailed ||
@@ -880,12 +883,17 @@ export function WorkflowJob({
       {checkpoint?.kind === "input" ? (
         <p className="text-sm font-medium">{checkpoint.question}</p>
       ) : null}
-      <WorkflowAlert title={checkpointConfirmationTitle} variant="info" announce={false}>
-        {unknownCheckpointResponse
-          ? "The run will update when the environment confirms the response."
-          : input
-            ? "The workflow continues once the environment confirms the answer."
-            : "Rework starts once the environment confirms the feedback."}
+      <WorkflowAlert
+        title={checkpointConfirmationTitle}
+        variant={vmRecovery?.warning ? "warning" : "info"}
+        announce={false}
+      >
+        {vmRecovery?.message ??
+          (unknownCheckpointResponse
+            ? "The run will update when the environment confirms the response."
+            : input
+              ? "The workflow continues once the environment confirms the answer."
+              : "Rework starts once the environment confirms the feedback.")}
       </WorkflowAlert>
       {submittedResponse !== null ? (
         <div className="space-y-1 rounded-md border bg-muted/25 px-3 py-2.5">
@@ -1286,13 +1294,20 @@ export function WorkflowJob({
               Waiting for an execution target. No steps have started.
             </p>
           ) : null}
-          {!cancelling &&
-          !checkpointResponsePending &&
-          (!recoveryInTask || selectedJob.pendingManualControl) &&
-          !(preparationInTask && preparationRetryRequested) &&
-          !selectedJob.resultSaveRetryPending &&
-          manualState.message &&
-          !showPauseDetail ? (
+          {vmRecovery && !checkpointResponsePending && (!cancelling || vmRecovery.warning) ? (
+            <WorkflowAlert
+              title={vmRecovery.title}
+              variant={vmRecovery.warning ? "warning" : "info"}
+            >
+              {vmRecovery.message}
+            </WorkflowAlert>
+          ) : !cancelling &&
+            !checkpointResponsePending &&
+            (!recoveryInTask || selectedJob.pendingManualControl) &&
+            !(preparationInTask && preparationRetryRequested) &&
+            !selectedJob.resultSaveRetryPending &&
+            manualState.message &&
+            !showPauseDetail ? (
             <WorkflowAlert
               title={confirmationPending ? "Waiting for confirmation" : "Run needs attention"}
               variant={confirmationPending ? "info" : "warning"}
@@ -1311,6 +1326,7 @@ export function WorkflowJob({
           !(
             checkpointResponsePending && detail === "Response saved; waiting for the environment."
           ) &&
+          detail !== vmRecovery?.message &&
           !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}

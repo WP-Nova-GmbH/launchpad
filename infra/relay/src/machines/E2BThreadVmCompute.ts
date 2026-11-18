@@ -297,6 +297,7 @@ export const makeE2BThreadVmCompute = (
     recoverIngress: Effect.fn("E2BThreadVmCompute.recoverIngress")(function* (
       sandboxId: string,
       identity: ThreadVmKnownIdentity,
+      requestTimeoutMs = 420_000,
     ) {
       if (configurationError !== null)
         return yield* new ThreadVmComputeError({
@@ -331,7 +332,7 @@ export const makeE2BThreadVmCompute = (
             ...options,
             signal,
             timeoutMs: settings.timeoutMs,
-            requestTimeoutMs: 420_000,
+            requestTimeoutMs,
           });
           if (sandbox.sandboxId !== sandboxId)
             throw new Error("VM ingress recovery returned another identity");
@@ -388,6 +389,8 @@ export const makeE2BThreadVmCompute = (
       request("snapshot", (signal) =>
         client.createSnapshot(sandboxId, {
           ...options,
+          // Full snapshots stop, capture, and resume the VM before replying.
+          requestTimeoutMs: 120_000,
           signal,
           mode: "full",
           ...(name ? { name } : {}),

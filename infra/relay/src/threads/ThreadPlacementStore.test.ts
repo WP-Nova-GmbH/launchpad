@@ -3032,7 +3032,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
               "launchpad.generation": "1",
             },
             startedAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
-            endAt: DateTime.toDateUtc(DateTime.makeUnsafe(0)),
+            endAt: DateTime.toDateUtc(DateTime.makeUnsafe("2099-01-01T00:00:00Z")),
             state,
             cpuCount: 2,
             memoryMB: 4096,

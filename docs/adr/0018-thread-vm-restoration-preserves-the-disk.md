@@ -52,6 +52,16 @@ VM-backed workflow jobs retain a recoverable workspace while workflow ownership 
 including long Review and Input waits or a failure with unresolved cleanup. Automatic pause and
 saving may reclaim compute, but saved-disk expiry must neither remove that workspace nor prevent
 its restoration until completion, cancellation or failure has safely released ownership.
+A managed workflow pause first verifies a backup of the run's current checkpoint. The existing
+idle-deletion schedule reuses that backup without waking the VM, provided the checkpoint still
+matches. If no backup matches when restoration is needed, show a recovery error and keep saved
+results readable.
+An authorized Review or Input response requests resume or restore when the VM is offline and
+waits for capacity. The response stays bound to the same run and checkpoint across VM
+replacement. Reconcile uncertain delivery before releasing workflow ownership. Report VM
+recovery separately from the run's Review or Input status. Reading saved results stays
+independent of VM power.
+The first workflow restore rollout covers unfinished runs at Review and Input checkpoints.
 
 After a workflow releases ownership and confirms cleanup, an already-running VM stays warm for
 follow-up work; a paused or saved VM is not woken solely to provide that window.

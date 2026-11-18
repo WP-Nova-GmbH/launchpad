@@ -1,6 +1,11 @@
+import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import {
+  authorizeWorkflowVmCheckpoint,
+  lockWorkflowVmCheckpoint,
+} from "../jobs/WorkflowVmCheckpoint.ts";
 import { wakeQueuedThreadVm } from "./ThreadVmWakeAdmission.ts";
 
 export interface PauseClaim {
@@ -35,8 +40,12 @@ export function makeThreadVmPauseStore(sql: PgClient) {
   const reserveIdle = Effect.fn("relay.thread_vm.pause.reserve_idle")(function* (hostId: string) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const [candidate] = yield* sql<{ allocationId: string; generation: number }>`
-          SELECT a.allocation_id AS "allocationId", t.generation
+        const [candidate] = yield* sql<{
+          allocationId: string;
+          generation: number;
+          workflowJobId: string | null;
+        }>`
+          SELECT a.allocation_id AS "allocationId", t.generation,t.workflow_job_id AS "workflowJobId"
           FROM relay_thread_vm_allocations a
           JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
           JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id AND c.state = 'started'
@@ -45,7 +54,11 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           JOIN relay_thread_vm_ready s ON s.allocation_id = a.allocation_id
           JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
           JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND c.state = 'started'
+          WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow'
+              AND EXISTS(SELECT 1 FROM relay_workflow_jobs j JOIN relay_workflow_recovery_heads h USING(job_id)
+                JOIN relay_workflow_recovery_records r ON r.publication_id=h.publication_id
+                WHERE r.manifest->>'supportsVmCheckpointRecovery'='true' AND j.job_id=t.workflow_job_id AND j.status IN ('awaiting_review','awaiting_input')
+                  AND j.pending_control IS NULL AND j.record#>>'{progress,checkpoint,checkpointId}' IS NOT NULL))) AND c.host_id = ${hostId} AND c.state = 'started'
             AND a.state = 'running' AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
             AND p.phase = 'created' AND s.phase = 'ready' AND b.revoked_at IS NULL
             AND b.generation = p.generation AND t.environment_id = b.environment_id
@@ -69,12 +82,30 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           ORDER BY v.idle_since, a.allocation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
         if (!candidate) return null;
         // The candidate query owns the placement lock, shared with new commands and moves.
+        const [workflowCheckpoint] = candidate.workflowJobId
+          ? yield* sql<RelayThreadVmWorkflowCheckpoint>`
+              SELECT j.job_id AS "jobId",j.record#>>'{progress,checkpoint,checkpointId}' AS "checkpointId",
+                COALESCE((j.record#>>'{progress,checkpoint,generation}')::int,0) AS "checkpointGeneration",
+                h.publication_id AS "publicationId",h.revision AS "publicationRevision"
+              FROM relay_workflow_jobs j JOIN relay_workflow_recovery_heads h USING(job_id)
+              JOIN relay_workflow_recovery_records r ON r.publication_id=h.publication_id AND r.job_id=j.job_id
+              JOIN relay_thread_vm_bindings b ON b.allocation_id=${candidate.allocationId} AND b.generation=${candidate.generation}
+              WHERE j.job_id=${candidate.workflowJobId} AND j.status IN ('awaiting_review','awaiting_input')
+                AND j.pending_control IS NULL AND j.record#>>'{progress,checkpoint,checkpointId}' IS NOT NULL
+                AND r.manifest->>'supportsVmCheckpointRecovery'='true'
+                AND COALESCE(j.record#>'{progress,resultSaving}','null'::jsonb)='null'::jsonb
+                AND COALESCE(j.record#>'{progress,manualPause}','null'::jsonb)='null'::jsonb
+                AND r.manifest#>>'{binding,environmentId}'=b.environment_id
+                AND (r.manifest#>>'{binding,generation}')::int=b.generation`
+          : [];
+        if (candidate.workflowJobId && !workflowCheckpoint) return null;
         yield* acknowledgeThreadVmPauseBackup(sql, candidate.allocationId);
         const operationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
-        yield* sql`INSERT INTO relay_thread_vm_pauses (allocation_id, operation_id, generation, phase)
-          VALUES (${candidate.allocationId}, ${operationId}, ${candidate.generation}, 'pending')
+        yield* sql`INSERT INTO relay_thread_vm_pauses (allocation_id, operation_id, generation, phase, workflow_checkpoint)
+          VALUES (${candidate.allocationId}, ${operationId}, ${candidate.generation}, 'pending',
+            ${workflowCheckpoint ? sql.json(workflowCheckpoint) : null})
           ON CONFLICT (allocation_id) DO UPDATE SET operation_id = excluded.operation_id,
-            generation = excluded.generation, phase = 'pending', boot_id = NULL,
+            generation = excluded.generation, phase = 'pending', boot_id = NULL, workflow_checkpoint=excluded.workflow_checkpoint,
             native_checkpoint_operation_id = NULL, source_receipt=NULL,backup_operation_id=NULL,source_sequence = NULL, source_frozen_at = NULL, source_reopened_at = NULL,
             pause_dispatch_claim_id=NULL,pause_dispatched_at=NULL,pause_acknowledged_at=NULL,
             claim_id = NULL, claim_until = NULL, retry_at = clock_timestamp()
@@ -102,7 +133,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
             allocationId: string;
           }>`SELECT a.allocation_id AS "allocationId" FROM relay_thread_vm_allocations a
         JOIN relay_thread_vm_bindings b USING(allocation_id)
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND EXISTS(SELECT 1 FROM relay_thread_vm_pauses x WHERE x.allocation_id=a.allocation_id AND x.operation_id=${input.operationId} AND x.workflow_checkpoint IS NOT NULL))) AND a.thread_id=${input.threadId} AND a.state='running' AND a.deleted_at IS NULL
           AND b.environment_id=${input.environmentId} AND b.generation=${input.generation} AND b.revoked_at IS NULL FOR UPDATE OF a`;
           if (!allocation) return false;
           const rows =
@@ -135,16 +166,17 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           JOIN relay_thread_vm_bindings b ON b.allocation_id = x.allocation_id
             AND b.generation = x.generation AND b.revoked_at IS NULL
           JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND x.phase IN ('pending','sealed')
+          WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.workflow_checkpoint IS NOT NULL)) AND c.host_id = ${hostId} AND x.phase IN ('pending','sealed')
             AND a.state = 'running' AND a.deleted_at IS NULL
             AND t.generation = x.generation AND t.environment_id = b.environment_id
             AND t.operation_id IS NULL
-            AND x.native_checkpoint_operation_id IS NOT NULL AND x.source_sequence IS NOT NULL
+            AND x.source_sequence IS NOT NULL
             AND x.source_frozen_at IS NOT NULL AND x.boot_id IS NOT NULL
             AND EXISTS(SELECT 1 FROM relay_thread_vm_backups z WHERE z.operation_id=x.backup_operation_id
               AND z.phase='verified' AND z.native_capture_receipt IS NOT NULL AND z.source_receipt=x.source_receipt)
-            AND EXISTS (SELECT 1 FROM relay_thread_native_checkpoint_operations n
-              WHERE n.operation_id=x.operation_id AND n.checkpoint_operation_id=x.native_checkpoint_operation_id AND n.phase='active')
+            AND ((x.native_checkpoint_operation_id IS NULL AND x.workflow_checkpoint IS NOT NULL)
+              OR EXISTS (SELECT 1 FROM relay_thread_native_checkpoint_operations n
+                WHERE n.operation_id=x.operation_id AND n.checkpoint_operation_id=x.native_checkpoint_operation_id AND n.phase='active'))
             AND x.pause_dispatch_claim_id IS NULL
             AND (x.pause_dispatched_at IS NULL OR x.pause_acknowledged_at IS NOT NULL)
             AND x.retry_at <= clock_timestamp()
@@ -168,7 +200,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
       WHERE allocation_id = ${claim.allocationId} AND operation_id = ${claim.operationId}
         AND claim_id = ${claim.claimId} AND claim_until > clock_timestamp()
         AND phase IN ('pending','sealed') AND boot_id=${bootId}
-        AND native_checkpoint_operation_id IS NOT NULL AND source_frozen_at IS NOT NULL
+        AND (native_checkpoint_operation_id IS NOT NULL OR workflow_checkpoint IS NOT NULL) AND source_frozen_at IS NOT NULL
         AND EXISTS(SELECT 1 FROM relay_thread_vm_backups z WHERE z.operation_id=relay_thread_vm_pauses.backup_operation_id
           AND z.phase='verified' AND z.native_capture_receipt IS NOT NULL AND z.source_receipt=relay_thread_vm_pauses.source_receipt)
       RETURNING allocation_id`;
@@ -190,7 +222,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
           AND x.pause_dispatched_at IS NULL AND x.pause_dispatch_claim_id IS NULL
           AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a JOIN relay_thread_placements t USING(thread_id)
             JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_vm_provisions p USING(allocation_id)
-            WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=x.allocation_id AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${claim.computeRef}
+            WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.workflow_checkpoint IS NOT NULL)) AND a.allocation_id=x.allocation_id AND a.state='running' AND a.deleted_at IS NULL AND a.compute_ref=${claim.computeRef}
               AND t.thread_id=${claim.threadId} AND t.generation=x.generation AND t.operation_id IS NULL
               AND b.generation=x.generation AND b.environment_id=t.environment_id AND b.revoked_at IS NULL
               AND p.phase='created' AND p.operation_id=${claim.provisionOperationId})
@@ -207,7 +239,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
       yield* sql`UPDATE relay_thread_vm_pauses x SET pause_dispatch_claim_id=NULL,pause_acknowledged_at=clock_timestamp()
       WHERE x.allocation_id=${claim.allocationId} AND x.operation_id=${claim.operationId} AND x.generation=${claim.generation}
         AND x.pause_dispatch_claim_id=${claim.claimId} AND x.pause_dispatched_at IS NOT NULL
-        AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
+        AND EXISTS(SELECT 1 FROM relay_thread_vm_allocations a WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.workflow_checkpoint IS NOT NULL)) AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId} AND a.compute_ref=${claim.computeRef})
       RETURNING x.allocation_id`;
     return rows.length === 1;
   });
@@ -289,3 +321,36 @@ export function makeThreadVmPauseStore(sql: PgClient) {
     defer,
   };
 }
+
+export const supersedeUnissuedWorkflowPause = Effect.fn("relay.thread_vm.pause.supersede_workflow")(
+  function* (sql: PgClient, threadId: string, jobId: string) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const job = yield* lockWorkflowVmCheckpoint(sql, jobId);
+        if (!job || job.record.runtime?.kind !== "vm" || job.record.runtime.threadId !== threadId)
+          return false;
+        const response = yield* authorizeWorkflowVmCheckpoint(sql, job);
+        if (
+          (!response || response.checkpointDispatch) &&
+          job.pendingControl?.response.operation !== "cancel"
+        )
+          return false;
+        const [pause] = yield* sql<{
+          operationId: string;
+          generation: number;
+          environmentId: string;
+        }>`
+          SELECT x.operation_id AS "operationId",x.generation,t.environment_id AS "environmentId"
+          FROM relay_thread_vm_pauses x JOIN relay_thread_vm_allocations a USING(allocation_id)
+          JOIN relay_thread_placements t ON t.thread_id=a.thread_id AND t.generation=x.generation
+          WHERE t.thread_id=${threadId} AND t.workflow_job_id=${jobId} AND a.resource_kind='organization_workflow'
+            AND x.workflow_checkpoint->>'jobId'=${jobId} AND x.phase='pending'
+            AND x.pause_dispatched_at IS NULL AND x.pause_dispatch_claim_id IS NULL
+            AND x.source_frozen_at IS NULL AND x.source_receipt IS NULL AND x.claim_id IS NULL`;
+        return pause
+          ? yield* makeThreadVmPauseStore(sql).cancelBeforeFreeze({ ...pause, threadId })
+          : false;
+      }),
+    );
+  },
+);

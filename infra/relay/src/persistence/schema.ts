@@ -838,6 +838,13 @@ export const relayRepositoryWorkflows = pgTable(
   ],
 );
 
+type WorkflowCheckpointDispatch = {
+  allocationId: string;
+  environmentId: string;
+  generation: number;
+  operationId: string;
+};
+
 export const relayWorkflowJobs = pgTable(
   "relay_workflow_jobs",
   {
@@ -872,6 +879,14 @@ export const relayWorkflowJobs = pgTable(
     pendingControl: jsonb("pending_control").$type<{
       userId: string;
       response: typeof RespondToWorkflowJob.Type;
+      responseId?: string;
+      checkpointDispatch?: WorkflowCheckpointDispatch;
+      supersededCheckpoint?: {
+        responseId: string;
+        userId: string;
+        response: typeof RespondToWorkflowJob.Type;
+        dispatch: WorkflowCheckpointDispatch;
+      };
     }>(),
     revision: integer("revision").notNull(),
     leaseUntil: varchar("lease_until", { length: 64 }),
@@ -1267,6 +1282,17 @@ export const relayThreadVmAllocations = pgTable(
           captureAdmissionSealed: boolean;
         }
       | {
+          kind: "native-workflow-source-lost";
+          allocationId: string;
+          computeRef: string;
+          sourceOperationId: string;
+          generation: number;
+          jobId: string;
+          checkpointId: string | null;
+          checkpointGeneration: number;
+          confirmedAbsent: true;
+        }
+      | {
           kind: "native-delete-acknowledgement";
           operationId: string;
           allocationId: string;
@@ -1433,6 +1459,10 @@ export const relayThreadVmPauses = pgTable(
       .$type<"pending" | "sealed" | "completed" | "cancelled">(),
     bootId: varchar("boot_id", { length: 64 }),
     nativeCheckpointOperationId: varchar("native_checkpoint_operation_id", { length: 64 }),
+    workflowCheckpoint:
+      jsonb("workflow_checkpoint").$type<
+        import("@t3tools/contracts/relay").RelayThreadVmWorkflowCheckpoint
+      >(),
     backupOperationId: varchar("backup_operation_id", { length: 64 }).references(
       () => relayThreadVmBackups.operationId,
     ),
@@ -1464,7 +1494,7 @@ export const relayThreadVmPauses = pgTable(
       "relay_thread_vm_pauses_source_certificate",
       sql`
       (${table.nativeCheckpointOperationId} IS NULL AND ${table.sourceSequence} IS NULL AND ${table.sourceFrozenAt} IS NULL)
-      OR (${table.nativeCheckpointOperationId} IS NOT NULL AND ${table.sourceSequence} IS NOT NULL AND ${table.sourceSequence} >= 0 AND ${table.sourceFrozenAt} IS NOT NULL AND ${table.bootId} IS NOT NULL)`,
+      OR ((${table.nativeCheckpointOperationId} IS NOT NULL OR ${table.workflowCheckpoint} IS NOT NULL) AND ${table.sourceSequence} IS NOT NULL AND ${table.sourceSequence} >= 0 AND ${table.sourceFrozenAt} IS NOT NULL AND ${table.bootId} IS NOT NULL)`,
     ),
     index("idx_relay_thread_vm_pauses_retry").on(table.phase, table.retryAt),
   ],
@@ -2109,7 +2139,7 @@ export const relayThreadVmFinalSaves = pgTable(
     allocationId: varchar("allocation_id", { length: 64 })
       .notNull()
       .references(() => relayThreadVmAllocations.allocationId),
-    actorUserId: varchar("actor_user_id", { length: 191 }).notNull(),
+    actorUserId: varchar("actor_user_id", { length: 191 }),
     environmentId: varchar("environment_id", { length: 191 }).notNull(),
     generation: integer("generation").notNull(),
     hostId: varchar("host_id", { length: 191 }).notNull(),
@@ -2117,9 +2147,11 @@ export const relayThreadVmFinalSaves = pgTable(
     originalState: varchar("original_state", { length: 16 })
       .notNull()
       .$type<"running" | "paused">(),
-    reason: varchar("reason", { length: 16 }).notNull().$type<"idle" | "replacement">(),
+    reason: varchar("reason", { length: 16 })
+      .notNull()
+      .$type<"idle" | "replacement" | "source_loss">(),
     activityRevision: integer("activity_revision").notNull(),
-    idleSince: timestamp("idle_since", { withTimezone: true }).notNull(),
+    idleSince: timestamp("idle_since", { withTimezone: true }),
     sourceSequence: integer("source_sequence"),
     sourceReceipt:
       jsonb("source_receipt").$type<
@@ -2156,10 +2188,17 @@ export const relayThreadVmFinalSaves = pgTable(
       "relay_thread_vm_final_saves_original_state",
       sql`${table.originalState} IN ('running','paused')`,
     ),
-    check("relay_thread_vm_final_saves_reason", sql`${table.reason} IN ('idle','replacement')`),
+    check(
+      "relay_thread_vm_final_saves_reason",
+      sql`${table.reason} IN ('idle','replacement','source_loss')`,
+    ),
+    check(
+      "relay_thread_vm_final_saves_idle_since",
+      sql`${table.reason} = 'source_loss' OR ${table.idleSince} IS NOT NULL`,
+    ),
     check(
       "relay_thread_vm_final_saves_frozen",
-      sql`${table.phase} NOT IN ('frozen','saving','deleting','completed') OR (${table.sourceSequence} IS NOT NULL AND ${table.sourceSequence} >= 0 AND ${table.nativeCheckpointOperationId} IS NOT NULL AND ${table.frozenAt} IS NOT NULL)`,
+      sql`${table.phase} NOT IN ('frozen','saving','deleting','completed') OR (${table.sourceSequence} IS NOT NULL AND ${table.sourceSequence} >= 0 AND (${table.nativeCheckpointOperationId} IS NOT NULL OR ${table.sourceReceipt}->'workflowCheckpoint' IS NOT NULL) AND ${table.frozenAt} IS NOT NULL)`,
     ),
     check(
       "relay_thread_vm_final_saves_backup",
@@ -2300,9 +2339,9 @@ export const relayThreadVmRestores = pgTable(
     sourceGeneration: integer("source_generation"),
     targetGeneration: integer("target_generation"),
     hostId: varchar("host_id", { length: 191 }).notNull(),
-    nativeCheckpointOperationId: varchar("native_checkpoint_operation_id", { length: 64 })
-      .notNull()
-      .references(() => relayThreadNativeCheckpoints.operationId),
+    nativeCheckpointOperationId: varchar("native_checkpoint_operation_id", {
+      length: 64,
+    }).references(() => relayThreadNativeCheckpoints.operationId),
     sourceTemplateId: varchar("source_template_id", { length: 191 }).notNull(),
     sourceBuildId: varchar("source_build_id", { length: 64 }).notNull(),
     phase: varchar("phase", { length: 16 })

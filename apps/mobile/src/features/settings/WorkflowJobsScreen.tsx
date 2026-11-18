@@ -47,6 +47,7 @@ import {
   workflowManualSubmission,
   workflowViewerControls,
   workflowApprovalPending,
+  workflowVmRecoveryDisplay,
 } from "@t3tools/client-runtime/relay/workflow-responses";
 import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
 import type {
@@ -238,6 +239,7 @@ function WorkflowJobsContent(props: Props) {
   const checkingReturnedReview = reviewApproval === "checking";
   const selectedJob = read.job;
   const manualState = workflowManualControlState(selectedJob);
+  const vmRecovery = manualState.recovery;
   const approvalPending = workflowApprovalPending(selectedJob);
   const actionState = workflowActionState(selectedJob);
   const detail = selectedJob?.detail ?? selectedJob?.progress?.detail ?? actionState.action?.detail;
@@ -614,7 +616,11 @@ function WorkflowJobsContent(props: Props) {
           !viewerControls.canCancel)
       )
         return;
-      if (["approve", "input", "request_changes"].includes(operation) && !checkpoint) return;
+      if (
+        ["approve", "input", "request_changes"].includes(operation) &&
+        (!checkpoint || manualState.checkpointBlocked)
+      )
+        return;
       const request = beginWorkflowJobRequest(appAtomRegistry, scope, selectedJob.jobId, uuidv4());
       if (!request) return;
       let intent = appAtomRegistry.get(workflowDraftAtom).manual[jobKey];
@@ -892,7 +898,22 @@ function WorkflowJobsContent(props: Props) {
                   Waiting for an execution target. No steps have started.
                 </Text>
               ) : null}
-              {manualHold && !confirmationPending ? (
+              {vmRecovery && (!cancelling || vmRecovery.warning) ? (
+                vmRecovery.warning ? (
+                  <ErrorBanner
+                    title={vmRecovery.title}
+                    message={vmRecovery.message}
+                    tone="warning"
+                  />
+                ) : (
+                  <View accessibilityLiveRegion="polite" className="gap-1">
+                    <Text className="font-t3-medium text-sm text-foreground">
+                      {vmRecovery.title}
+                    </Text>
+                    <Text className="text-sm text-foreground-muted">{vmRecovery.message}</Text>
+                  </View>
+                )
+              ) : manualHold && !confirmationPending ? (
                 <Text className="text-sm text-foreground-muted">
                   Setup and previews remain running.
                 </Text>
@@ -913,7 +934,9 @@ function WorkflowJobsContent(props: Props) {
                     "This run stopped before completing. Inspect the agent result for details."
                   }
                 />
-              ) : detail && !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
+              ) : detail &&
+                detail !== vmRecovery?.message &&
+                !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
                 <Text className="text-foreground-muted">{detail}</Text>
               ) : null}
               {canResume ? (
@@ -1497,18 +1520,29 @@ function WorkflowJobsContent(props: Props) {
                 No runs in this view. Create and run workflows from Workflows on web or desktop.
               </Text>
             ) : (
-              jobs.map((job) => (
-                <SettingsRow
-                  key={job.jobId}
-                  icon="arrow.triangle.branch"
-                  label={job.instruction}
-                  subtitle={`${job.originSummary?.workflowName ?? "Workflow run"}${job.originSummary?.kind === "automation" ? "\nStarted by workflow" : ""}${(job.targetKind ?? job.runtime?.kind) === "vm" ? "\nWorkflow VM" : ""}\nSubmitted ${new Date(job.createdAt).toLocaleString()}`}
-                  value={workflowStatusLabel(job.status)}
-                  valuePosition="trailing"
-                  disabled={busy}
-                  onPress={() => setSelectedJobId(job.jobId)}
-                />
-              ))
+              jobs.map((job) => {
+                const subtitle = [
+                  job.originSummary?.workflowName ?? "Workflow run",
+                  job.originSummary?.kind === "automation" && "Started by workflow",
+                  (job.targetKind ?? job.runtime?.kind) === "vm" && "Workflow VM",
+                  workflowVmRecoveryDisplay(job.vmRecovery)?.title,
+                  `Submitted ${new Date(job.createdAt).toLocaleString()}`,
+                ]
+                  .filter(Boolean)
+                  .join("\n");
+                return (
+                  <SettingsRow
+                    key={job.jobId}
+                    icon="arrow.triangle.branch"
+                    label={job.instruction}
+                    subtitle={subtitle}
+                    value={workflowStatusLabel(job.status)}
+                    valuePosition="trailing"
+                    disabled={busy}
+                    onPress={() => setSelectedJobId(job.jobId)}
+                  />
+                );
+              })
             )}
             {recent.key === listKey && recent.nextCursor ? (
               <SettingsActionRow

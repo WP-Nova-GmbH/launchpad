@@ -7,6 +7,7 @@ import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import { makeThreadVmBackupStore, type BackupClaim } from "./ThreadVmBackupStore.ts";
 import { makeThreadVmResumeStore } from "./ThreadVmResumeStore.ts";
 import { wakeQueuedThreadVm } from "./ThreadVmWakeAdmission.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 
 interface BackupCompute {
   readonly inspect: (id: string) => Effect.Effect<SandboxInfo | null, ThreadVmComputeError>;
@@ -67,6 +68,7 @@ export function makeThreadVmBackupWorker(
         const info = yield* compute.inspect(claim.computeRef);
         if (!matches(info, claim)) return;
         if (info?.state === "paused") {
+          const workflowJobId = claim.sourceReceipt.workflowCheckpoint?.jobId;
           yield* sql.withTransaction(
             Effect.gen(function* () {
               if (
@@ -74,9 +76,12 @@ export function makeThreadVmBackupWorker(
                   ...claim,
                   operationId: claim.provisionOperationId,
                   hostId,
+                  ...(workflowJobId ? { workflowJobId } : {}),
                 })
-              )
-                yield* wakeQueuedThreadVm(sql, claim.threadId);
+              ) {
+                if (workflowJobId) yield* wakeWorkflows();
+                else yield* wakeQueuedThreadVm(sql, claim.threadId);
+              }
             }),
           );
           return;
@@ -88,12 +93,21 @@ export function makeThreadVmBackupWorker(
       if (!snapshot) {
         if (claim.phase !== "creating") return;
         const failed = yield* compute.restore.resolveFailedNamedSnapshot(claim.snapshotName);
-        if (failed)
-          yield* store.recordFailure(claim, {
-            snapshotId: failed.snapshotId,
-            sourceTemplateId: failed.sourceTemplateID,
-            sourceBuildId: failed.sourceBuildID,
-          });
+        if (!failed) return;
+        if (claim.sourceReceipt.workflowCheckpoint) {
+          // Stock E2B can fail the catalog build while a detached upload is
+          // still running. Even source absence cannot settle that upload.
+          if ((yield* compute.inspect(claim.computeRef)) === null)
+            yield* Effect.logDebug(
+              "Source VM not found during workflow snapshot reconciliation.",
+            ).pipe(Effect.annotateLogs({ backupOperationId: claim.operationId }));
+          return;
+        }
+        yield* store.recordFailure(claim, {
+          snapshotId: failed.snapshotId,
+          sourceTemplateId: failed.sourceTemplateID,
+          sourceBuildId: failed.sourceBuildID,
+        });
         return;
       }
       const source = yield* compute.restore.resolveNamedSnapshot(claim.snapshotName);

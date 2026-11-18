@@ -3,6 +3,10 @@ import { ThreadVmWarmRestoreBootstrapReceipt } from "@t3tools/contracts/relay";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import {
+  authorizeWorkflowVmCheckpoint,
+  lockWorkflowVmCheckpoint,
+} from "../jobs/WorkflowVmCheckpoint.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
@@ -18,6 +22,7 @@ import {
   type ThreadVmRestore,
   type ThreadVmRestoreClaim,
 } from "./ThreadVmRestoreStore.ts";
+import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
 
 const conflict = (message: string) => new ThreadVmRestoreConflict({ message });
 
@@ -55,12 +60,15 @@ export function makeThreadVmRestoreServingStore(
       Effect.gen(function* () {
         const [candidate] = yield* sql<{
           operationId: string;
-        }>`SELECT r.operation_id AS "operationId"
+          workflowJobId: string | null;
+          phase: ThreadVmRestore["phase"];
+        }>`SELECT r.operation_id AS "operationId",t.workflow_job_id AS "workflowJobId",r.phase
         FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
         JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         WHERE r.host_id=${hostId} AND r.serving_requested AND r.prepared_receipt->>'kind'='native-restore-catalog-v1'
-          AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
+          AND a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR
+            (a.resource_kind='organization_workflow' AND t.audience='repository' AND t.workflow_job_id IS NOT NULL))
           AND (r.phase IN ('prepared','committed','creating','bootstrapping') OR
             (r.phase='aborting' AND r.committed_at IS NOT NULL) OR
             (r.phase='booted' AND (r.boot_recovery_started_at IS NOT NULL OR r.error_code IS NOT NULL OR
@@ -70,11 +78,32 @@ export function makeThreadVmRestoreServingStore(
           AND (${allowStart} OR r.phase='aborting')
           AND r.boot_ingress_recovery_claim_id IS NULL AND r.retry_at<=clock_timestamp()
           AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()) AND c.state IN ('reserved','started')
-        ORDER BY r.retry_at,r.created_at,r.operation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
+        ORDER BY r.retry_at,r.created_at,r.operation_id LIMIT 1`;
         if (!candidate) return null;
-        const row = yield* restores.lock(candidate.operationId),
-          claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
-        yield* sql`UPDATE relay_thread_vm_restores SET claim_id=${claimId},claim_until=clock_timestamp()+interval '3 minutes' WHERE operation_id=${row.operationId}`;
+        if (
+          candidate.workflowJobId &&
+          !(yield* lockWorkflowVmCheckpoint(sql, candidate.workflowJobId))
+        )
+          return null;
+        const row = yield* restores
+          .lock(candidate.operationId)
+          .pipe(Effect.catchTag("ThreadVmRestoreConflict", () => Effect.succeed(null)));
+        if (
+          !row ||
+          row.phase !== candidate.phase ||
+          (row.workflowCheckpoint?.jobId ?? null) !== candidate.workflowJobId
+        )
+          return null;
+        const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
+        const [claimed] =
+          yield* sql`UPDATE relay_thread_vm_restores SET claim_id=${claimId},claim_until=clock_timestamp()+interval '3 minutes'
+          WHERE operation_id=${row.operationId} AND retry_at<=clock_timestamp()
+            AND (claim_until IS NULL OR claim_until<=clock_timestamp())
+            AND boot_ingress_recovery_claim_id IS NULL
+            AND EXISTS(SELECT 1 FROM relay_thread_vm_capacity c WHERE c.operation_id=${row.operationId}
+              AND c.allocation_id=${row.allocationId} AND c.state IN ('reserved','started'))
+          RETURNING operation_id`;
+        if (!claimed) return null;
         return { ...row, claimId };
       }),
     );
@@ -84,9 +113,17 @@ export function makeThreadVmRestoreServingStore(
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        const row = yield* restores.requireClaim(claim),
-          owner = yield* requireOwner(row);
+        const prior = yield* restores.get(claim.operationId);
+        const workflowJob = prior?.workflowCheckpoint
+          ? yield* lockWorkflowVmCheckpoint(sql, prior.workflowCheckpoint.jobId)
+          : null;
+        const row = yield* restores.requireClaim(claim);
+        const owner = row.workflowCheckpoint ? workflowJob : yield* requireOwner(row);
         if (
+          !owner ||
+          (row.workflowCheckpoint &&
+            (workflowJob?.record.runtime?.kind !== "vm" ||
+              workflowJob.record.runtime.threadId !== row.threadId)) ||
           !row.servingRequested ||
           !["prepared", "committed", "creating", "bootstrapping", "booted", "importing"].includes(
             row.phase,
@@ -95,9 +132,27 @@ export function makeThreadVmRestoreServingStore(
         )
           return yield* conflict("Restore does not admit this serving step.");
         yield* restores.requireRecovery(row);
-        return { ...row, repositoryId: owner.repositoryId };
+        return { ...row, repositoryId: owner.repositoryId, workflowJob };
       }),
     );
+  });
+  const startAuthorized = Effect.fnUntraced(function* (
+    row: Effect.Success<ReturnType<typeof authorize>>,
+  ) {
+    if (!row.workflowCheckpoint) return true;
+    const response = row.workflowJob
+      ? yield* authorizeWorkflowVmCheckpoint(sql, row.workflowJob)
+      : null;
+    if (
+      response?.responseId === row.operationId &&
+      response.userId === row.actorUserId &&
+      response.checkpoint.checkpointId === row.workflowCheckpoint.checkpointId &&
+      (response.checkpoint.generation ?? 0) === row.workflowCheckpoint.checkpointGeneration &&
+      (yield* readCurrentWorkflowCheckpoint(sql, row.workflowCheckpoint))
+    )
+      return true;
+    yield* restores.requestAbort(row.operationId);
+    return false;
   });
   const commit = Effect.fn("relay.thread_vm.restore.commit_boot")(function* (
     claim: ThreadVmRestoreClaim,
@@ -108,13 +163,20 @@ export function makeThreadVmRestoreServingStore(
         if (row.servingCommitted) return row;
         if (row.phase !== "prepared" || row.preparedReceipt?.kind !== "native-restore-catalog-v1")
           return yield* conflict("Only a validated native snapshot can commit.");
+        if (!(yield* startAuthorized(row))) return null;
         yield* restores.requireSourceAbsent(row);
         yield* capacity.beginExecution(row.operationId);
         const [changed] = yield* sql<{
           generation: number;
         }>`UPDATE relay_thread_placements SET generation=generation+1,
         environment_id=${`pending-restore:${row.allocationId}`},project_id=${`vm:${row.threadId}`}
-        WHERE thread_id=${row.threadId} AND generation=${row.generation} AND operation_id=${row.operationId} AND owner_user_id=${row.actorUserId} RETURNING generation`;
+        WHERE thread_id=${row.threadId} AND generation=${row.generation} AND operation_id=${row.operationId}
+          AND ${
+            row.workflowCheckpoint
+              ? sql`audience='repository' AND owner_user_id IS NULL AND workflow_job_id=${row.workflowCheckpoint.jobId}`
+              : sql`owner_user_id=${row.actorUserId}`
+          }
+        RETURNING generation`;
         if (!changed) return yield* conflict("Restore ownership changed before commit.");
         yield* sql`UPDATE relay_thread_vm_allocations SET template_id=${row.sourceTemplateId} WHERE allocation_id=${row.allocationId}`;
         yield* sql`UPDATE relay_thread_vm_restores SET phase='committed',target_generation=${changed.generation},committed_at=clock_timestamp(),claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
@@ -145,6 +207,7 @@ export function makeThreadVmRestoreServingStore(
           reservation.computeRef !== null
         )
           return yield* conflict("Restore execution capacity changed.");
+        if (!(yield* startAuthorized(row))) return null;
         yield* sql`UPDATE relay_thread_vm_restores SET phase='creating',boot_create_started_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
         return (yield* restores.get(row.operationId))!;
       }),
@@ -183,6 +246,7 @@ export function makeThreadVmRestoreServingStore(
         yield* allocations.recordCreated({
           allocationId: row.allocationId,
           computeRef: sandboxId,
+          resourceKind: row.workflowCheckpoint ? "organization_workflow" : "personal",
           ...(sealedTrafficAccessToken ? { sealedTrafficAccessToken } : {}),
         });
         yield* sql`UPDATE relay_thread_vm_restores SET boot_receipt=${sql.json(receipt)},phase=${row.phase === "aborting" ? "aborting" : ["booted", "importing"].includes(row.phase) ? row.phase : "bootstrapping"} WHERE operation_id=${row.operationId}`;
@@ -273,7 +337,20 @@ export function makeThreadVmRestoreServingStore(
         const [token] =
           yield* sql`SELECT 1 FROM relay_thread_vm_allocations WHERE allocation_id=${row.allocationId} AND compute_ref=${row.bootReceipt.sandboxId} AND state='running' AND deleted_at IS NULL AND sealed_traffic_access_token IS NOT NULL FOR UPDATE`;
         if (!token) return yield* conflict("Native boot has no private ingress credential.");
-        yield* sql`INSERT INTO relay_thread_vm_provisions(allocation_id,operation_id,generation,phase) VALUES(${row.allocationId},${row.operationId},${row.targetGeneration},'created')`;
+        if (row.workflowCheckpoint) {
+          const [provision] =
+            yield* sql`INSERT INTO relay_thread_vm_provisions(allocation_id,operation_id,generation,phase,workflow_snapshot)
+            SELECT ${row.allocationId},${row.operationId},${row.targetGeneration},'created',p.workflow_snapshot
+            FROM relay_thread_vm_provisions p JOIN relay_thread_vm_allocations a USING(allocation_id)
+            WHERE p.allocation_id=${source.allocationId} AND p.operation_id=${source.source.provisionOperationId}
+              AND p.generation=${source.generation} AND p.workflow_snapshot IS NOT NULL
+              AND a.thread_id=${row.threadId} AND a.resource_kind='organization_workflow'
+            RETURNING allocation_id`;
+          if (!provision)
+            return yield* conflict("The frozen workflow provision snapshot is missing.");
+        } else {
+          yield* sql`INSERT INTO relay_thread_vm_provisions(allocation_id,operation_id,generation,phase) VALUES(${row.allocationId},${row.operationId},${row.targetGeneration},'created')`;
+        }
         yield* sql`UPDATE relay_thread_vm_restores SET phase='booted',bootstrap_receipt=${sql.json(receipt)},claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
         return (yield* restores.get(row.operationId))!;
       }),
@@ -373,16 +450,22 @@ export function makeThreadVmRestoreServingStore(
             !row.savedDiskOperationId
           )
             return yield* conflict("The committed cancellation still has an unsettled target.");
-          yield* allocations.requestDeletion(row.allocationId);
+          const resourceKind = row.workflowCheckpoint ? "organization_workflow" : "personal";
+          yield* allocations.requestDeletion(row.allocationId, resourceKind);
           yield* sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE operation_id=${row.operationId} AND state='started' AND compute_ref IS NULL`;
-          yield* allocations.confirmDeleted({ allocationId: row.allocationId, computeRef: null });
+          yield* allocations.confirmDeleted({
+            allocationId: row.allocationId,
+            computeRef: null,
+            resourceKind,
+          });
           yield* makeThreadVmSavedDiskStore(sql).cancelCommittedRestore({
             threadId: row.threadId,
             savedDiskOperationId: row.savedDiskOperationId,
             operationId: row.operationId,
             targetGeneration: row.targetGeneration,
           });
-          yield* makeThreadNativeCheckpointStore(sql, objects).releaseOperation(row);
+          if (row.nativeCheckpointOperationId)
+            yield* makeThreadNativeCheckpointStore(sql, objects).releaseOperation(row);
           yield* sql`UPDATE relay_thread_vm_restores SET phase='aborted',claim_id=NULL,claim_until=NULL,error_code=NULL WHERE operation_id=${row.operationId}`;
         }),
       );

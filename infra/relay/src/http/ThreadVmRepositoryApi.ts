@@ -59,14 +59,38 @@ export const getThreadVmRepositoryBinding = Effect.fn("relay.api.thread_vm.repos
     const principal = yield* RelayEnvironmentPrincipal,
       sql = (yield* RelayDb).$client;
     if (yield* isWorkflowVmThread(sql, input.threadId)) {
-      const first = yield* authorizeWorkflowVmGuest(input);
+      const authorize = authorizeWorkflowVmGuest(input).pipe(
+        Effect.catchTag("RelayTenancyNotFoundError", () =>
+          sql.withTransaction(
+            Effect.gen(function* () {
+              const enrolled = yield* authorizeWorkflowVmGuest(input, "enrolled");
+              if (enrolled.active) return yield* tenancyNotFound("thread_not_found");
+              const { binding } = enrolled;
+              // Restore setup needs its repository identity before the new
+              // generation can serve. Only this metadata read permits the hold.
+              const [restore] = yield* sql`SELECT 1 FROM relay_thread_vm_restores r
+                JOIN relay_thread_placements t USING(thread_id)
+                WHERE r.operation_id=${binding.operationId} AND r.thread_id=${binding.threadId}
+                  AND r.allocation_id=${binding.allocationId} AND r.target_generation=${binding.generation}
+                  AND r.phase='importing' AND r.serving_requested AND r.import_receipt IS NOT NULL
+                  AND r.boot_recovery_started_at IS NULL AND r.boot_ingress_recovery_claim_id IS NULL
+                  AND t.operation_id=r.operation_id AND t.generation=r.target_generation
+                  AND t.environment_id=${binding.environmentId} AND t.workflow_job_id=${binding.jobId}
+                FOR SHARE OF r,t`;
+              if (!restore) return yield* tenancyNotFound("thread_not_found");
+              return enrolled;
+            }),
+          ),
+        ),
+      );
+      const first = yield* authorize;
       const git = yield* (yield* GithubApp).gitMetadata.pipe(
         Effect.timeoutOrElse({
           duration: "7 seconds",
           orElse: () => Effect.succeed({ status: "unknown" as const }),
         }),
       );
-      const current = yield* authorizeWorkflowVmGuest(input);
+      const current = yield* authorize;
       if (
         current.binding.operationId !== first.binding.operationId ||
         current.snapshot.canonicalKey !== first.snapshot.canonicalKey ||

@@ -13,6 +13,7 @@ import {
   reconcileThreadVmLeases,
   reconcileThreadVmBackups,
   reconcileThreadArtifacts,
+  THREAD_VM_BACKUP_SWEEP_TIMEOUT,
 } from "./threads/ThreadVmRuntime.ts";
 import {
   makeThreadArtifactObjects,
@@ -563,11 +564,10 @@ export const ApiLive = Api.make(
       );
       yield* Cloudflare.Workers.cron("* * * * *", () =>
         reconcileThreadVmResumes(threadVmSettings).pipe(
-          Effect.timeout("45 seconds"),
           Effect.catchCause((cause) =>
             Cause.hasInterrupts(cause)
               ? Effect.interrupt
-              : Effect.logWarning("Thread VM resume reconciliation will retry."),
+              : Effect.logWarning("Thread VM resume reconciliation failed."),
           ),
           Effect.provide(Layer.merge(runtimeLayer, relayTraceLayer)),
         ),
@@ -585,7 +585,7 @@ export const ApiLive = Api.make(
       );
       yield* Cloudflare.Workers.cron("* * * * *", () =>
         reconcileThreadVmBackups(threadVmSettings).pipe(
-          Effect.timeout("2 minutes"),
+          Effect.timeout(THREAD_VM_BACKUP_SWEEP_TIMEOUT),
           Effect.catchCause((cause) =>
             Cause.hasInterrupts(cause)
               ? Effect.interrupt

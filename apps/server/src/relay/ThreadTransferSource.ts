@@ -1,5 +1,6 @@
 import { assertWorkflowThreadReleased } from "../persistence/WorkflowThreadOwnership.ts";
 import { ThreadId, TurnId, ThreadPromptQueue } from "@t3tools/contracts";
+import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -39,12 +40,14 @@ export function makeThreadTransferSource(
     readonly generation: number;
     readonly operationId: string;
     readonly requireIdleQueue?: boolean;
+    readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
   }) {
     const fail = (detail: string) =>
       new ThreadExecutionFenceError({ threadId: input.threadId, detail });
-    yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
-      Effect.mapError((error) => fail(error.message)),
-    );
+    if (!input.workflowCheckpoint)
+      yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+        Effect.mapError((error) => fail(error.message)),
+      );
     const fence = yield* fences.get(input.threadId);
     if (
       !fence ||
@@ -121,6 +124,7 @@ export function makeThreadTransferSource(
       threadId: ThreadId.make(input.threadId),
       turnId: TurnId.make(turnId),
       captureOperationId: input.operationId,
+      ...(input.workflowCheckpoint ? { workflowCheckpoint: input.workflowCheckpoint } : {}),
     });
     const key = threadCheckpointId(turnId, input.operationId);
     const point = yield* native.get(input.threadId, input.generation, key),

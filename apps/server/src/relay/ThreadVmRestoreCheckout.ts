@@ -24,6 +24,7 @@ export const adoptThreadVmRestoreCheckout = Effect.fn("ThreadVmRestoreCheckout.a
     checkoutPath: string;
     branch: string | null;
     worktreesRoot: string;
+    retainedWorkflow?: true;
   }) {
     const sql = yield* SqlClient.SqlClient,
       fs = yield* FileSystem.FileSystem,
@@ -107,7 +108,11 @@ export const adoptThreadVmRestoreCheckout = Effect.fn("ThreadVmRestoreCheckout.a
       head,
       branch: input.branch,
       index: yield* workspaceFileHash(path.join(gitDir, "index")),
-      files: (yield* scanWorkspaceFiles(input.checkoutPath)).files,
+      // A root-certified workflow disk already retains the complete worktree.
+      // File-by-file move restrictions would reject otherwise valid VM content.
+      ...(!input.retainedWorkflow
+        ? { files: (yield* scanWorkspaceFiles(input.checkoutPath)).files }
+        : {}),
     });
     const workspaceSha256 = NodeCrypto.createHash("sha256").update(inspection).digest("hex");
     const claims = makeThreadCheckoutClaims(sql);

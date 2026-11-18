@@ -114,6 +114,31 @@ describe("non-waking E2B enrollment delivery", () => {
       }
     }),
   );
+  it.effect("checks a restored workflow's original runner marker on its snapshot sandbox", () =>
+    Effect.gen(function* () {
+      const restored = {
+        ...info,
+        templateID: "snapshot",
+        metadata: { ...info.metadata, "launchpad.restore": "v1" },
+      };
+      const input = { ...bootstrap, restore: true as const, templateId: "snapshot" };
+      const f = fixture();
+      f.transport.mockResolvedValueOnce(Response.json(restored));
+      sdk.run.mockReset().mockResolvedValueOnce({ exitCode: 0, stdout: `${buildTag}\n` });
+      expect(yield* f.enroll("sandbox", input, true, workflowBootstrap.templateId)).toEqual(
+        receipt,
+      );
+      const [, payload] = f.guest.mock.calls[0]!;
+      expect(decode(Redacted.value(payload))).toEqual({ ...bootstrap, restore: true });
+      expect(Redacted.value(payload)).not.toContain(buildTag);
+      f.guest.mockClear();
+      f.transport.mockResolvedValueOnce(Response.json(restored));
+      expect(yield* Effect.flip(f.enroll("sandbox", input, true))).toMatchObject({
+        operation: "verify runner",
+      });
+      expect(f.guest).not.toHaveBeenCalled();
+    }),
+  );
   it.effect(
     "delivers a restored enrollment only to the user CLI after separate trusted bootstrap",
     () =>

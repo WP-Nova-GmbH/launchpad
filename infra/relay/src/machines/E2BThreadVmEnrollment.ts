@@ -64,6 +64,7 @@ export function makeE2BThreadVmEnrollment(
     sandboxId: string,
     bootstrap: RelayThreadVmBootstrap & E2BThreadVmIdentity,
     workflow?: boolean,
+    workflowRunnerTemplateRef?: string,
   ) {
     const payload = yield* encodeBootstrap(bootstrap).pipe(
       Effect.map(Redacted.make),
@@ -86,7 +87,11 @@ export function makeE2BThreadVmEnrollment(
         );
         if (
           workflow &&
-          !(await matchesWorkflowRunnerBuild(new Sandbox(connection), bootstrap.templateId, signal))
+          !(await matchesWorkflowRunnerBuild(
+            new Sandbox(connection),
+            workflowRunnerTemplateRef ?? bootstrap.templateId,
+            signal,
+          ))
         )
           return null;
         const output = await guest(connection, payload, workflow);

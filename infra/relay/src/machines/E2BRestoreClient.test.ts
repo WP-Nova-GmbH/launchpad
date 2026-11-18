@@ -150,6 +150,11 @@ describe("native E2B snapshot catalog", () => {
         yield* fixture(template("error")).client.resolveFailedNamedSnapshot("capture"),
       ).toEqual({ snapshotId: "snapshot", sourceTemplateID: "snapshot", sourceBuildID: buildId });
       expect(
+        yield* fixture(template("error")).client.resolveTerminalNamedSnapshot("capture", {
+          requireReady: true,
+        }),
+      ).toBeNull();
+      expect(
         yield* fixture(template("ready")).client.resolveFailedNamedSnapshot("capture"),
       ).toBeNull();
       expect(

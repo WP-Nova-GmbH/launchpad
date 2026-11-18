@@ -1,3 +1,4 @@
+import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -29,6 +30,7 @@ export interface ThreadVmPauseRecovery extends Owner {
   readonly nativeCheckpointOperationId: string | null;
   readonly canActivate: boolean;
   readonly sourceReopened: boolean;
+  readonly workflowCheckpoint: RelayThreadVmWorkflowCheckpoint | null;
 }
 
 /** A pause retains its exact stopped conversation, independently of the VM's disk and memory. */
@@ -44,14 +46,14 @@ export function makeThreadVmPauseRecoveryStore(
         const [row] =
           yield* sql<ThreadVmPauseRecovery>`SELECT x.allocation_id AS "allocationId",x.operation_id AS "operationId",
         a.thread_id AS "threadId",b.environment_id AS "environmentId",x.generation,x.phase,x.boot_id AS "bootId",x.source_receipt AS "sourceReceipt",x.backup_operation_id AS "backupOperationId",
-        (x.source_reopened_at IS NOT NULL) AS "sourceReopened",x.source_sequence AS "sourceSequence",x.native_checkpoint_operation_id AS "nativeCheckpointOperationId",
+        x.workflow_checkpoint AS "workflowCheckpoint",(x.source_reopened_at IS NOT NULL) AS "sourceReopened",x.source_sequence AS "sourceSequence",x.native_checkpoint_operation_id AS "nativeCheckpointOperationId",
         (a.state='running' AND t.operation_id IS NULL AND x.pause_dispatch_claim_id IS NULL AND (x.phase='cancelled' OR (x.phase='completed' AND EXISTS
           (SELECT 1 FROM relay_thread_vm_resumes r JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
            WHERE r.allocation_id=a.allocation_id AND r.generation=x.generation AND r.phase='completed'
              AND c.state='started' AND c.compute_ref=a.compute_ref)))) AS "canActivate"
         FROM relay_thread_vm_pauses x JOIN relay_thread_vm_allocations a USING(allocation_id)
         JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_placements t ON t.thread_id=a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id=${owner.threadId} AND b.environment_id=${owner.environmentId}
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.workflow_checkpoint IS NOT NULL)) AND a.thread_id=${owner.threadId} AND b.environment_id=${owner.environmentId}
           AND x.generation=${owner.generation} AND t.environment_id=b.environment_id AND t.generation=x.generation
           AND b.generation=x.generation AND b.revoked_at IS NULL AND a.deleted_at IS NULL`;
         if (!row) return null;
@@ -62,7 +64,9 @@ export function makeThreadVmPauseRecoveryStore(
   const sourceFrozen = Effect.fn("relay.thread_vm.pause.recovery.source_frozen")(function* (
     input: Owner & {
       readonly operationId: string;
-      readonly nativeCheckpointOperationId: string;
+      readonly nativeCheckpointOperationId: string | null;
+      readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
+      readonly sourceSequence?: number;
       readonly bootId: string;
       readonly sealEpoch: number;
     },
@@ -72,53 +76,93 @@ export function makeThreadVmPauseRecoveryStore(
         const pause = yield* get(input);
         if (!pause || pause.operationId !== input.operationId || pause.phase === "cancelled")
           return yield* conflict("The source no longer owns this pause operation.");
-        if (pause.nativeCheckpointOperationId) {
+        if (pause.sourceReceipt) {
           if (
             pause.nativeCheckpointOperationId !== input.nativeCheckpointOperationId ||
             pause.bootId !== input.bootId ||
-            pause.sourceReceipt?.sealEpoch !== input.sealEpoch
+            pause.sourceReceipt.sealEpoch !== input.sealEpoch ||
+            (input.sourceSequence !== undefined && pause.sourceSequence !== input.sourceSequence)
           )
             return yield* conflict("Pause recovery identity changed.");
           return pause;
         }
         const [owned] =
           yield* sql`SELECT 1 FROM relay_thread_placements t JOIN relay_thread_vm_allocations a USING(thread_id)
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND t.thread_id=${input.threadId} AND t.generation=${input.generation} AND t.operation_id IS NULL
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND
+          t.workflow_job_id=${pause.workflowCheckpoint?.jobId ?? null})) AND t.thread_id=${input.threadId} AND t.generation=${input.generation} AND t.operation_id IS NULL
           AND a.allocation_id=${pause.allocationId} AND a.state='running' AND a.deleted_at IS NULL FOR UPDATE OF a`;
         if (!owned || pause.phase !== "pending")
           return yield* conflict("Pause cannot accept a source acknowledgement.");
-        const point = yield* natives.get(input.nativeCheckpointOperationId);
+        const workflow = pause.workflowCheckpoint;
+        if (workflow) {
+          const [current] = yield* sql<{ sequence: number; nativeOperationId: string | null }>`
+            SELECT (r.manifest->>'sourceSequence')::int AS sequence,
+              r.manifest->>'nativeCheckpointOperationId' AS "nativeOperationId"
+            FROM relay_thread_vm_pauses x
+            JOIN relay_workflow_jobs j ON j.job_id=x.workflow_checkpoint->>'jobId'
+            JOIN relay_workflow_recovery_heads h USING(job_id)
+            JOIN relay_workflow_recovery_records r ON r.publication_id=h.publication_id AND r.job_id=j.job_id
+            WHERE x.operation_id=${input.operationId}
+              AND x.workflow_checkpoint=${sql.json(input.workflowCheckpoint ?? null)}
+              AND h.publication_id=${workflow.publicationId} AND h.revision=${workflow.publicationRevision}
+              AND (j.status IN ('awaiting_review','awaiting_input') OR
+                (j.status='cancelling' AND j.pending_control->'supersededCheckpoint' IS NULL))
+              AND j.record#>>'{progress,status}' IN ('awaiting_review','awaiting_input')
+              AND j.record#>>'{progress,checkpoint,checkpointId}'=${workflow.checkpointId}
+              AND COALESCE((j.record#>>'{progress,checkpoint,generation}')::int,0)=${workflow.checkpointGeneration}
+              AND r.manifest#>>'{binding,environmentId}'=${input.environmentId}
+              AND (r.manifest#>>'{binding,generation}')::int=${input.generation}`;
+          if (
+            !current ||
+            (input.nativeCheckpointOperationId === null &&
+              (current.nativeOperationId !== null ||
+                input.sourceSequence === undefined ||
+                input.sourceSequence < current.sequence))
+          )
+            return yield* conflict(
+              "The workflow recovery publication no longer matches the checkpoint.",
+            );
+        } else if (input.workflowCheckpoint || input.nativeCheckpointOperationId === null) {
+          return yield* conflict("Pause requires its complete frozen conversation.");
+        }
+        const point = input.nativeCheckpointOperationId
+          ? yield* natives.get(input.nativeCheckpointOperationId)
+          : null;
         if (
-          !point ||
-          !point.recoveryHistory ||
-          point.threadId !== input.threadId ||
-          point.sourceEnvironmentId !== input.environmentId ||
-          point.generation !== input.generation ||
-          point.captureOperationId !== input.operationId
+          input.nativeCheckpointOperationId &&
+          (!point ||
+            !point.recoveryHistory ||
+            point.threadId !== input.threadId ||
+            point.sourceEnvironmentId !== input.environmentId ||
+            point.generation !== input.generation ||
+            point.captureOperationId !== input.operationId)
         )
           return yield* conflict("Pause requires its exact complete frozen recovery point.");
+        const sequence = point?.sourceSequence ?? input.sourceSequence;
+        if (sequence === undefined) return yield* conflict("Pause source sequence is missing.");
         const [mirrored] =
           yield* sql`SELECT 1 FROM relay_thread_history_watermarks WHERE thread_id=${input.threadId}
-        AND environment_id=${input.environmentId} AND generation=${input.generation} AND source_sequence>=${point.sourceSequence}`;
+        AND environment_id=${input.environmentId} AND generation=${input.generation} AND source_sequence>=${sequence}`;
         const unsettled =
           yield* sql`SELECT 1 FROM relay_thread_history WHERE thread_id=${input.threadId}
-        AND environment_id=${input.environmentId} AND source_sequence>${point.sourceSequence}
+        AND environment_id=${input.environmentId} AND source_sequence>${sequence}
         UNION ALL SELECT 1 FROM relay_thread_execution_admissions WHERE thread_id=${input.threadId} AND NOT completed
         UNION ALL SELECT 1 FROM relay_thread_commands WHERE thread_id=${input.threadId} AND receipt_json IS NULL LIMIT 1`;
-        if (!mirrored || unsettled.length)
+        if ((!mirrored && sequence !== 0) || unsettled.length)
           return yield* conflict("Pause source history and work must settle first.");
-        yield* natives.pinCompleteForOperation({
-          threadId: input.threadId,
-          operationId: input.operationId,
-          checkpointOperationId: point.operationId,
-          expected: point,
-        });
+        if (point)
+          yield* natives.pinCompleteForOperation({
+            threadId: input.threadId,
+            operationId: input.operationId,
+            checkpointOperationId: point.operationId,
+            expected: point,
+          });
         const [allocation] = yield* sql<{
           computeRef: string;
           provisionOperationId: string;
         }>`SELECT a.compute_ref AS "computeRef",p.operation_id AS "provisionOperationId"
           FROM relay_thread_vm_allocations a JOIN relay_thread_vm_provisions p USING(allocation_id)
-          WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=${pause.allocationId} AND p.phase='created'`;
+          WHERE a.runtime_protocol='native-v1' AND a.resource_kind IN ('personal','organization_workflow') AND a.allocation_id=${pause.allocationId} AND p.phase='created'`;
         const sourceReceipt = yield* decodeSource({
           allocationId: pause.allocationId,
           computeRef: allocation?.computeRef,
@@ -129,20 +173,22 @@ export function makeThreadVmPauseRecoveryStore(
           captureOperationId: input.operationId,
           bootId: input.bootId,
           sealEpoch: input.sealEpoch,
-          sourceSequence: point.sourceSequence,
-          nativeCheckpointOperationId: point.operationId,
+          sourceSequence: sequence,
+          nativeCheckpointOperationId: point?.operationId ?? null,
+          ...(workflow ? { workflowCheckpoint: workflow } : {}),
         }).pipe(Effect.mapError(() => conflict("Pause requires the exact native source seal.")));
         const backupOperationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
-        yield* natives.pinCompleteForOperation({
-          threadId: input.threadId,
-          operationId: backupOperationId,
-          checkpointOperationId: point.operationId,
-          expected: point,
-        });
+        if (point)
+          yield* natives.pinCompleteForOperation({
+            threadId: input.threadId,
+            operationId: backupOperationId,
+            checkpointOperationId: point.operationId,
+            expected: point,
+          });
         yield* sql`INSERT INTO relay_thread_vm_backups(operation_id,allocation_id,generation,compute_ref,snapshot_name,phase,source_receipt)
           VALUES(${backupOperationId},${pause.allocationId},${input.generation},${sourceReceipt.computeRef},${`launchpad-pause-${backupOperationId}`},'pending',${sql.json(sourceReceipt)})`;
-        yield* sql`UPDATE relay_thread_vm_pauses SET boot_id=${input.bootId},source_receipt=${sql.json(sourceReceipt)},backup_operation_id=${backupOperationId},source_sequence=${point.sourceSequence},
-        native_checkpoint_operation_id=${point.operationId},source_frozen_at=clock_timestamp()
+        yield* sql`UPDATE relay_thread_vm_pauses SET boot_id=${input.bootId},source_receipt=${sql.json(sourceReceipt)},backup_operation_id=${backupOperationId},source_sequence=${sequence},
+        native_checkpoint_operation_id=${point?.operationId ?? null},source_frozen_at=clock_timestamp()
         WHERE allocation_id=${pause.allocationId} AND operation_id=${input.operationId} AND phase='pending'`;
         return (yield* get(input))!;
       }),

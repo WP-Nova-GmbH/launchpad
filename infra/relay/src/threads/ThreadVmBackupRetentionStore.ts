@@ -23,7 +23,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         WHERE thread_id = ${input.threadId} FOR UPDATE`;
         const [backup] = yield* sql`SELECT x.operation_id FROM relay_thread_vm_backups x
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.thread_id = ${input.threadId} AND x.operation_id = ${input.backupOperationId}
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.source_receipt->'workflowCheckpoint' IS NOT NULL)) AND a.thread_id = ${input.threadId} AND x.operation_id = ${input.backupOperationId}
           AND x.phase = 'verified' AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
         FOR UPDATE OF x`;
         if (!backup)
@@ -54,9 +54,11 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         FROM relay_thread_vm_backups x
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND x.phase IN ('verified','retiring') AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.source_receipt->'workflowCheckpoint' IS NOT NULL)) AND x.phase IN ('verified','retiring') AND x.snapshot_id IS NOT NULL AND x.native_capture_receipt IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_saved_disks s
             WHERE s.backup_operation_id=x.operation_id AND s.phase='expiring')
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses p WHERE p.backup_operation_id=x.operation_id
+            AND p.phase IN ('pending','sealed','completed') AND p.source_reopened_at IS NULL AND a.deleted_at IS NULL)
           AND x.retry_at <= clock_timestamp()
           AND (x.claim_until IS NULL OR x.claim_until <= clock_timestamp())
           AND EXISTS (SELECT 1 FROM relay_thread_vm_capacity c
@@ -112,7 +114,7 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
     );
   });
 
-  /** Only a positive native terminal-error identity permits failed-root cleanup. */
+  /** Workflow error aliases may still have an unsettled detached upload. */
   const claimFailed = Effect.fn("relay.thread_vm.backup.failed_retirement_claim")(function* (
     hostId: string,
   ) {
@@ -154,19 +156,19 @@ export function makeThreadVmBackupRetentionStore(sql: PgClient) {
         const [owner] = yield* sql<{
           threadId: string;
         }>`SELECT a.thread_id AS "threadId" FROM relay_thread_vm_backups x
-        JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND x.operation_id=${input.operationId}`;
+        JOIN relay_thread_vm_allocations a USING(allocation_id) WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.source_receipt->'workflowCheckpoint' IS NOT NULL)) AND x.operation_id=${input.operationId}`;
         if (!owner) return false;
         yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${owner.threadId} FOR UPDATE`;
         const [row] = yield* sql<{
           operationId: string;
           allocationId: string;
-          sourceReceipt: unknown;
+          nativeCheckpointOperationId: string | null;
         }>`UPDATE relay_thread_vm_backups SET phase='retired',claim_id=NULL,claim_until=NULL
         WHERE operation_id=${input.operationId} AND snapshot_id=${input.snapshotId} AND phase='retiring'
           AND claim_id=${input.claimId} AND claim_until>clock_timestamp()
-        RETURNING operation_id AS "operationId",allocation_id AS "allocationId",source_receipt AS "sourceReceipt"`;
+        RETURNING operation_id AS "operationId",allocation_id AS "allocationId",source_receipt->>'nativeCheckpointOperationId' AS "nativeCheckpointOperationId"`;
         if (!row) return false;
-        if (row.sourceReceipt)
+        if (row.nativeCheckpointOperationId)
           yield* releaseThreadNativeCheckpointOperation(sql, {
             threadId: owner.threadId,
             operationId: row.operationId,

@@ -4,6 +4,7 @@ import { WorkflowAlert } from "./WorkflowAlert";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { RepositoryWorkflow, WorkflowJobListView } from "@t3tools/contracts/workflows";
+import { workflowVmRecoveryDisplay } from "@t3tools/client-runtime/relay/workflow-responses";
 import {
   workflowJobAccessLost,
   emptyWorkflowJobPageRead,
@@ -188,8 +189,13 @@ export function WorkflowJobs({
                 workflows.find((workflow) => workflow.workflowId === job.workflowId)?.definition
                   .name ??
                 "Workflow run";
-              const needsAttention =
+              const vmRecovery = workflowVmRecoveryDisplay(job.vmRecovery);
+              const atCheckpoint =
                 job.status === "awaiting_review" || job.status === "awaiting_input";
+              const needsAttention = vmRecovery
+                ? (job.needsAttention ??
+                  (vmRecovery.warning || (!vmRecovery.pending && atCheckpoint)))
+                : atCheckpoint;
               const actionLabel = job.status === "awaiting_review" ? "Open review" : "View run";
 
               return (
@@ -210,7 +216,11 @@ export function WorkflowJobs({
                     <p className="line-clamp-2 text-xs wrap-anywhere text-muted-foreground">
                       {job.instruction}
                     </p>
-                    {job.detail ? (
+                    {vmRecovery ? (
+                      <p className="text-xs wrap-anywhere text-muted-foreground">
+                        {vmRecovery.title}
+                      </p>
+                    ) : job.detail ? (
                       <p className="text-xs wrap-anywhere text-muted-foreground">{job.detail}</p>
                     ) : null}
                   </div>

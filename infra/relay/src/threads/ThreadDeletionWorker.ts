@@ -57,10 +57,11 @@ export function makeThreadDeletionWorker(
         sourceBuildId: string | null;
         sourceReceipt: unknown;
         phase: string;
+        resourceKind: string;
         captureStarted: boolean;
       }>`
         SELECT b.operation_id AS "operationId",b.allocation_id AS "allocationId",b.generation,b.compute_ref AS "computeRef",p.operation_id AS "sourceOperationId",
-          b.snapshot_name AS "snapshotName",b.snapshot_id AS "snapshotId",b.source_template_id AS "sourceTemplateId",b.source_build_id AS "sourceBuildId",b.source_receipt AS "sourceReceipt",b.phase,b.capture_started_at IS NOT NULL AS "captureStarted"
+          b.snapshot_name AS "snapshotName",b.snapshot_id AS "snapshotId",b.source_template_id AS "sourceTemplateId",b.source_build_id AS "sourceBuildId",b.source_receipt AS "sourceReceipt",b.phase,a.resource_kind AS "resourceKind",b.capture_started_at IS NOT NULL AS "captureStarted"
         FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id) JOIN relay_thread_vm_provisions p USING(allocation_id)
         WHERE a.thread_id=${claim.threadId} AND (b.phase='creating' OR (b.phase='failed' AND (b.capture_started_at IS NOT NULL OR b.snapshot_id IS NOT NULL OR b.source_template_id IS NOT NULL OR b.source_build_id IS NOT NULL))) AND b.source_receipt IS NOT NULL AND b.native_capture_receipt IS NULL ORDER BY b.created_at,b.operation_id LIMIT 1`;
       if (capture) {
@@ -79,8 +80,9 @@ export function makeThreadDeletionWorker(
           return;
         }
         yield* sql.withTransaction(store.authorize(claim));
+        const requireReady = capture.resourceKind === "organization_workflow";
         const terminal =
-          capture.phase === "failed"
+          capture.phase === "failed" && !requireReady
             ? capture.captureStarted &&
               capture.snapshotId &&
               capture.sourceTemplateId &&
@@ -91,8 +93,11 @@ export function makeThreadDeletionWorker(
                   sourceBuildID: capture.sourceBuildId,
                 }
               : null
-            : yield* compute.restore.resolveTerminalNamedSnapshot(capture.snapshotName);
-        // A 404 is not an upload fence. A delayed writer may still publish this unique alias.
+            : yield* compute.restore.resolveTerminalNamedSnapshot(capture.snapshotName, {
+                requireReady,
+              });
+        // A missing alias or a failed workflow build can still have a native
+        // writer. Wait for exact ready evidence before deleting either resource.
         if (
           !terminal ||
           (capture.snapshotId !== null && capture.snapshotId !== terminal.snapshotId) ||

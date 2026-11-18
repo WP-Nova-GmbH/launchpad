@@ -103,6 +103,7 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
       readonly turnId: string;
       readonly artifactRoot: string;
       readonly captureOperationId?: string;
+      readonly restoreWorkflowOperationId?: string;
       readonly authorize?: Effect.Effect<void, ThreadNativeCheckpointError>;
     },
     exportConversation: (artifactRoot: string) => Effect.Effect<NativeConversationArchive, E, R>,
@@ -112,7 +113,7 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
     if (input.authorize) yield* input.authorize;
     const fence = yield* fences.get(input.threadId);
     if (!fence) {
-      if (input.captureOperationId !== undefined)
+      if (input.captureOperationId !== undefined || input.restoreWorkflowOperationId !== undefined)
         return yield* new ThreadNativeCheckpointError({
           message: "A final checkpoint requires enrolled frozen ownership.",
         });
@@ -120,6 +121,11 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
     }
     const checkpointId = threadCheckpointId(input.turnId, input.captureOperationId);
     const frozen = input.captureOperationId !== undefined;
+    const restored = input.restoreWorkflowOperationId !== undefined;
+    if (frozen && restored)
+      return yield* new ThreadNativeCheckpointError({
+        message: "A restored native checkpoint cannot be a pause receipt.",
+      });
     const assertOwner = Effect.fnUntraced(function* () {
       if (input.authorize) yield* input.authorize;
       const owner = yield* fences.get(input.threadId);
@@ -132,7 +138,9 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
             owner.operationId !== input.captureOperationId ||
             owner.frozenSequence === null ||
             owner.frozenSequence !== fence.frozenSequence
-          : owner.phase !== "active" && owner.phase !== "draining")
+          : restored
+            ? owner.phase !== "frozen" || owner.operationId !== input.restoreWorkflowOperationId
+            : owner.phase !== "active" && owner.phase !== "draining")
       )
         return yield* new ThreadNativeCheckpointError({
           message: "Thread ownership changed during native checkpoint capture.",
@@ -156,7 +164,8 @@ export function makeThreadNativeCheckpoint(sql: SqlClient.SqlClient) {
       yield* Schema.decodeEffect(Schema.String.check(Schema.isUUID()))(input.captureOperationId);
       yield* assertOwner();
     }
-    if (!frozen && fence.phase !== "active" && fence.phase !== "draining")
+    if (restored) yield* assertOwner();
+    if (!frozen && !restored && fence.phase !== "active" && fence.phase !== "draining")
       return yield* new ThreadNativeCheckpointError({
         message: "This thread no longer owns native checkpoint capture.",
       });

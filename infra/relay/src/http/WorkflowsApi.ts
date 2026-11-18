@@ -1,3 +1,4 @@
+import { readWorkflowVmRecoveries } from "../threads/WorkflowVmRecovery.ts";
 import { RelayApi, RelayClientPrincipal } from "@t3tools/contracts/relay";
 import {
   WorkflowDefinition,
@@ -5,10 +6,10 @@ import {
   WorkflowInvalidError,
   WorkflowManualControl,
   WorkflowSubmissionPendingError,
+  RespondToWorkflowJob,
   isTerminalWorkflowJob,
   workflowApprovalCanRetry,
   workflowIsFinishing,
-  type RespondToWorkflowJob,
   type RunRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
 import * as Crypto from "effect/Crypto";
@@ -25,6 +26,10 @@ import { prepare as prepareAutomationSave } from "../workflowEvents/Preparation.
 import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
+import {
+  isWorkflowCheckpointResponse,
+  lockWorkflowVmCheckpoint,
+} from "../jobs/WorkflowVmCheckpoint.ts";
 import {
   validateWorkflowTarget,
   vmWorkflowDefinitionIssue,
@@ -48,6 +53,8 @@ import {
 } from "./TenancyApi.ts";
 import { tenancyNotFound } from "./tenancyErrors.ts";
 import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
+
+const sameWorkflowResponse = Schema.toEquivalence(RespondToWorkflowJob);
 
 const jobForClient = (row: WorkflowJobRecord) => {
   const pending = row.pendingControl?.response;
@@ -85,6 +92,14 @@ const mayCancelOwnVm = Effect.fnUntraced(function* (row: WorkflowJobRecord, user
   return job.runtime === null && job.workflow === null && !job.vmAdmission.hasSecrets;
 });
 
+const vmRecoveries = Effect.fnUntraced(function* (jobIds: ReadonlyArray<string>) {
+  const db = yield* Effect.serviceOption(RelayDb);
+  if (Option.isNone(db)) return new Map();
+  return yield* readWorkflowVmRecoveries(db.value.$client, jobIds).pipe(
+    Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+  );
+});
+
 const withViewerControls = Effect.fnUntraced(function* (
   row: WorkflowJobRecord,
   membership: Effect.Success<ReturnType<typeof authorizeWorkflowRepository>>,
@@ -98,8 +113,14 @@ const withViewerControls = Effect.fnUntraced(function* (
       userId: membership.userId,
     })) === "maintainer";
   const memberCheckpoint = job.progress?.checkpoint?.role === "member";
+  const vmRecovery =
+    job.progress?.status === "awaiting_input" || job.progress?.status === "awaiting_review"
+      ? (yield* vmRecoveries([row.jobId])).get(row.jobId)
+      : undefined;
+  const { vmRecovery: _storedRecovery, ...current } = job;
   return {
-    ...job,
+    ...current,
+    ...(vmRecovery ? { vmRecovery, detail: null } : {}),
     viewerControls: {
       canCancel: canManage || (yield* mayCancelOwnVm(row, membership.userId)),
       canApprove: !job.progress?.resultSaving && (canManage || memberCheckpoint),
@@ -150,10 +171,11 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     row.organizationId !== membership.organization.organizationId
   )
     return yield* tenancyNotFound("repository_not_found");
-  const checkpointResponse =
-    payload.operation === "approve" ||
-    payload.operation === "input" ||
-    payload.operation === "request_changes";
+  const checkpointResponse = isWorkflowCheckpointResponse(payload);
+  const vmCheckpoint =
+    checkpointResponse &&
+    row.record.runtime?.kind === "vm" &&
+    (row.status === "awaiting_review" || row.status === "awaiting_input");
   const ownCancel =
     (payload.operation === "cancel" || payload.operation === "retry_cancellation") &&
     (yield* mayCancelOwnVm(row, membership.userId));
@@ -174,6 +196,13 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
       return yield* tenancyNotFound("repository_not_found");
     return yield* withViewerControls(latestRow, latestMembership);
   });
+  if (
+    vmCheckpoint &&
+    row.pendingControl?.responseId &&
+    row.pendingControl.userId === membership.userId &&
+    sameWorkflowResponse(row.pendingControl.response, payload)
+  )
+    return yield* refreshForViewer;
   if (payload.operation === "retry_action") {
     const pending = row.pendingControl;
     if (
@@ -322,7 +351,29 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
       message: "This review changed. Refresh before approving.",
     });
   const requiredProtocol = row.record.requiredProtocol ?? 2;
-  yield* store.updateJob(
+  const previous = row.pendingControl;
+  const supersededCheckpoint =
+    payload.operation === "cancel" && previous?.responseId && previous.checkpointDispatch
+      ? {
+          responseId: previous.responseId,
+          userId: previous.userId,
+          response: previous.response,
+          dispatch: previous.checkpointDispatch,
+        }
+      : undefined;
+  const pendingControl = {
+    userId: membership.userId,
+    response: payload,
+    ...(vmCheckpoint
+      ? {
+          responseId: yield* (yield* Crypto.Crypto).randomUUIDv4.pipe(
+            Effect.catch(() => relayInternalErrorResponse("internal_error")),
+          ),
+        }
+      : {}),
+    ...(supersededCheckpoint ? { supersededCheckpoint } : {}),
+  };
+  const save = store.updateJob(
     row,
     {
       ...row.record,
@@ -354,8 +405,38 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
           }),
       updatedAt: DateTime.formatIso(yield* DateTime.now),
     },
-    { userId: membership.userId, response: payload },
+    pendingControl,
+    row.record.runtime?.kind !== "vm",
   );
+  const db = yield* Effect.serviceOption(RelayDb);
+  if (row.record.runtime?.kind === "vm" && Option.isSome(db)) {
+    const sql = db.value.$client;
+    yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const current = yield* lockWorkflowVmCheckpoint(sql, row.jobId);
+          if (current?.revision !== row.revision)
+            return yield* new WorkflowConflictError({
+              message: "The job changed. Refresh its current state.",
+            });
+          if (manual) {
+            const [recovering] = yield* sql`SELECT 1 FROM relay_thread_placements t
+              LEFT JOIN relay_thread_vm_allocations a ON a.thread_id=t.thread_id AND a.deleted_at IS NULL
+              LEFT JOIN relay_thread_vm_pauses p ON p.allocation_id=a.allocation_id AND p.generation=t.generation
+              WHERE t.workflow_job_id=${row.jobId} AND t.audience='repository' AND
+                (t.operation_id IS NOT NULL OR a.state IS DISTINCT FROM 'running'
+                  OR p.phase IN ('pending','sealed')
+                  OR (p.phase IN ('completed','cancelled') AND p.source_reopened_at IS NULL))`;
+            if (recovering)
+              return yield* new WorkflowConflictError({
+                message: "The workflow VM is recovering. Respond to the checkpoint to continue.",
+              });
+          }
+          return yield* save;
+        }),
+      )
+      .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+  } else yield* save;
   return yield* refreshForViewer;
 });
 const errors = mapRelayCommonApiErrors("not_authorized");
@@ -635,8 +716,13 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
     .handle("listJobs", ({ params }) =>
       Effect.gen(function* () {
         yield* authorizeWorkflowRepository(params.repositoryId);
+        const rows = yield* (yield* Workflows).listJobs(params.repositoryId);
+        const recovery = yield* vmRecoveries(
+          rows.filter(({ record }) => record.vmAdmission).map(({ jobId }) => jobId),
+        );
         return {
-          jobs: (yield* (yield* Workflows).listJobs(params.repositoryId)).map(({ record }) => ({
+          jobs: rows.map(({ record }) => ({
+            ...(recovery.has(record.jobId) ? { vmRecovery: recovery.get(record.jobId)! } : {}),
             jobId: record.jobId,
             repositoryId: record.repositoryId,
             workflowId: record.workflowId,
@@ -654,7 +740,27 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
     .handle("pageJobs", ({ params, query }) =>
       Effect.gen(function* () {
         yield* authorizeWorkflowRepository(params.repositoryId);
-        return yield* (yield* Workflows).pageJobs(params.repositoryId, query);
+        const page = yield* (yield* Workflows).pageJobs(params.repositoryId, query);
+        const recovery = yield* vmRecoveries(
+          page.jobs.filter((job) => job.targetKind === "vm").map((job) => job.jobId),
+        );
+        return {
+          ...page,
+          jobs: page.jobs.map((job) => {
+            const vmRecovery = recovery.get(job.jobId);
+            return vmRecovery
+              ? {
+                  ...job,
+                  vmRecovery,
+                  detail: null,
+                  needsAttention:
+                    vmRecovery.state === "recovery_error" ||
+                    ((vmRecovery.state === "paused" || vmRecovery.state === "saved") &&
+                      job.needsAttention),
+                }
+              : job;
+          }),
+        };
       }).pipe(errors),
     )
     .handle("run", ({ params, payload }) =>

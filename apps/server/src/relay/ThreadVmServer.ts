@@ -1,4 +1,5 @@
 import { readThreadVmRestoreState } from "./ThreadVmRestoreInstall.ts";
+import { assertWorkflowVmRestoreReady } from "./ThreadVmWorkflowRestore.ts";
 import { RelayThreadVmRestoreImportReceipt } from "@t3tools/contracts/relay";
 import { assertThreadTransferRuntime } from "../persistence/ThreadTransferRuntime.ts";
 import { threadVmMoveServerDigest } from "@t3tools/shared/threadVmServerStart";
@@ -125,10 +126,16 @@ const encodeRestoreReceipt = Schema.encodeEffect(
 /** A restored VM starts its coordinator only after complete frozen installation.
  * Provider readiness and current relay acknowledgement still precede activation. */
 export const requireThreadVmRestoreServerStart = Effect.fn("ThreadVmServer.require_restore_start")(
-  function* (receiptSha256: string, workspaceRoot = "/workspace/project") {
+  function* (receiptSha256: string, workspaceRoot = "/workspace/project", workflow = false) {
     const vm = yield* readInstalledThreadVm(),
       state = yield* readThreadVmRestoreState();
-    if (!vm || !state || vm.scope.generation <= 1 || (yield* readThreadVmInitialState()) !== null)
+    if (
+      !vm ||
+      !state ||
+      workflow !== Boolean(state.recovery.workflow && state.workflowBase) ||
+      vm.scope.generation <= 1 ||
+      (yield* readThreadVmInitialState()) !== null
+    )
       return yield* new ThreadVmServerStartError();
     const receipt = state.receipt,
       sql = yield* SqlClient.SqlClient;
@@ -161,8 +168,10 @@ export const requireThreadVmRestoreServerStart = Effect.fn("ThreadVmServer.requi
     if (
       state.phase !== "activated" ||
       (owner.phase === "frozen" && owner.operationId === vm.operationId)
-    )
-      yield* assertThreadTransferRuntime(sql, vm.operationId);
+    ) {
+      if (workflow) yield* assertWorkflowVmRestoreReady(state.recovery, receipt.manifestSha256);
+      else yield* assertThreadTransferRuntime(sql, vm.operationId);
+    }
     const bytes = yield* (yield* Crypto.Crypto).digest(
       "SHA-256",
       new TextEncoder().encode(yield* encodeRestoreReceipt(receipt)),

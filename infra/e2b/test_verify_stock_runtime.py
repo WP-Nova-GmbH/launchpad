@@ -57,6 +57,7 @@ class StockStartupTests(unittest.TestCase):
             "environment": {"ORCHESTRATOR_SERVICES": "orchestrator,template-manager", "TEMPLATE_STORAGE_URL": "file:///var/lib/e2b/storage/templates", "BUILD_CACHE_STORAGE_URL": "file:///var/lib/e2b/storage/build-cache"}})
         self.pg = {"Id": "a" * 64, "State": {"Running": True}, "Config": {"Labels": {
             "com.docker.compose.project": self.receipt["composeProject"], "com.docker.compose.service": "postgres"}}}
+        self.orchestrator = None
         self.calls = []
         self.limits = {"diskMb": 32768, "maxLengthHours": 48}
         for name, replacement in (("maintenance_lock", contextlib.nullcontext), ("verify_kernel", Mock()), ("verify_maintenance", Mock())):
@@ -66,6 +67,16 @@ class StockStartupTests(unittest.TestCase):
 
     def write_receipt(self):
         (self.root / "build.json").write_text(json.dumps(self.receipt))
+
+    def running_orchestrator(self, timeout=None, container_id="b" * 64):
+        environment = ["ORCHESTRATOR_SERVICES=orchestrator,template-manager"]
+        if timeout is not None:
+            environment.append(f"ENVD_TIMEOUT={timeout}")
+        return {"Id": container_id, "Image": self.receipt["images"]["tools"]["id"],
+                "State": {"Running": True},
+                "Config": {"Labels": {"com.docker.compose.project": self.receipt["composeProject"]},
+                           "Cmd": ["/bin/bash", "/opt/e2b/scripts/orchestrator-launch.sh"], "Env": environment},
+                "HostConfig": {"NetworkMode": "host", "PidMode": "host", "CgroupnsMode": "host", "Privileged": True}}
 
     def docker_run(self, *args, input=None):
         self.calls.append((args, input))
@@ -78,7 +89,11 @@ class StockStartupTests(unittest.TestCase):
             return json.dumps(configuration)
         if args[-3:] == ("ps", "--quiet", "postgres"):
             return self.pg["Id"]
+        if args[:2] == ("docker", "ps"):
+            return self.orchestrator["Id"] if self.orchestrator else ""
         if args[:2] == ("docker", "inspect"):
+            if self.orchestrator and args[2:] == (self.orchestrator["Id"],):
+                return json.dumps([self.orchestrator])
             return json.dumps([self.pg])
         if args[:2] == ("docker", "exec"):
             return json.dumps(self.limits) if self.limits else ""
@@ -144,7 +159,7 @@ class StockStartupTests(unittest.TestCase):
 
     def test_missing_limits_configures_exact_seed_project_before_api_start(self):
         self.limits = None
-        with patch.object(verify, "load", return_value=(self.root, self.receipt)), patch.object(verify, "run", side_effect=self.docker_run), patch.object(verify, "verify_exclusive_host", return_value=False), patch.object(verify, "verify_host"):
+        with patch.object(verify, "load", return_value=(self.root, self.receipt)), patch.object(verify, "run", side_effect=self.docker_run), patch.object(verify, "verify_exclusive_host", side_effect=[None, None, "b" * 64]), patch.object(verify, "verify_host"):
             verify.verify(self.root, "b" * 64, True)
         commands = [args for args, _ in self.calls]
         seed = next(i for i, args in enumerate(commands) if args[-4:] == ("run", "--rm", "--no-deps", "seed"))
@@ -240,23 +255,79 @@ class StockStartupTests(unittest.TestCase):
         self.assertFalse(any(args[-3:] == ("api", "client-proxy", "dashboard-api") for args, _ in self.calls))
 
     def test_foreign_or_mismatched_running_orchestrator_is_never_restarted(self):
-        container = {"Id": "b" * 64, "Image": self.receipt["images"]["tools"]["id"],
-            "Config": {"Labels": {"com.docker.compose.project": self.receipt["composeProject"]},
-                       "Cmd": ["/bin/bash", "/opt/e2b/scripts/orchestrator-launch.sh"],
-                       "Env": ["ORCHESTRATOR_SERVICES=orchestrator,template-manager"]},
-            "HostConfig": {"NetworkMode": "host", "PidMode": "host", "CgroupnsMode": "host", "Privileged": True}}
-        def inspect(*args, input=None):
-            self.calls.append((args, input))
-            return container["Id"] if args[1] == "ps" else json.dumps([container])
-        with patch.object(verify, "run", side_effect=inspect):
-            self.assertTrue(verify.verify_exclusive_host(self.receipt))
-            container["HostConfig"]["CgroupnsMode"] = "private"
+        self.orchestrator = self.running_orchestrator()
+        with patch.object(verify, "run", side_effect=self.docker_run):
+            self.assertEqual(verify.verify_exclusive_host(self.receipt, self.configuration), self.orchestrator["Id"])
+            self.orchestrator["HostConfig"]["CgroupnsMode"] = "private"
             with self.assertRaisesRegex(ValueError, "running deployment differs"):
-                verify.verify_exclusive_host(self.receipt)
-            container["Config"]["Labels"]["com.docker.compose.project"] = "another-runtime"
+                verify.verify_exclusive_host(self.receipt, self.configuration)
+            self.orchestrator["Config"]["Labels"]["com.docker.compose.project"] = "another-runtime"
             with self.assertRaisesRegex(ValueError, "Another E2B deployment"):
-                verify.verify_exclusive_host(self.receipt)
+                verify.verify_exclusive_host(self.receipt, self.configuration)
         self.assertTrue(all(args[:2] in (("docker", "ps"), ("docker", "inspect")) for args, _ in self.calls))
+
+    def test_matching_envd_timeout_preserves_the_running_orchestrator(self):
+        environment = self.configuration["services"]["orchestrator"]["environment"]
+        for resolved, live in ((None, "10s"), ("10s", None), ("10s", ""), ("", "10s"), ("30s", "30s")):
+            self.calls = []
+            if resolved is None:
+                environment.pop("ENVD_TIMEOUT", None)
+            else:
+                environment["ENVD_TIMEOUT"] = resolved
+            self.orchestrator = self.running_orchestrator(live)
+            with self.subTest(resolved=resolved, live=live), patch.object(verify, "load", return_value=(self.root, self.receipt)), patch.object(verify, "run", side_effect=self.docker_run), patch.object(verify, "verify_host"):
+                verify.verify(self.root, "b" * 64, True)
+                commands = [args for args, _ in self.calls]
+                orchestrator_up = next(i for i, args in enumerate(commands) if "up" in args and args[-1] == "orchestrator")
+                api_up = next(i for i, args in enumerate(commands) if args[-3:] == ("api", "client-proxy", "dashboard-api"))
+                self.assertIn("--wait", commands[orchestrator_up])
+                self.assertIn("--no-recreate", commands[orchestrator_up])
+                self.assertIn(("docker", "inspect", self.orchestrator["Id"]), commands[orchestrator_up + 1:api_up])
+
+    def test_envd_timeout_mismatch_fails_before_changing_services(self):
+        environment = self.configuration["services"]["orchestrator"]["environment"]
+        for resolved, live in (("10s", "30s"), ("30s", "10s")):
+            for start in (False, True):
+                self.calls = []
+                environment["ENVD_TIMEOUT"] = resolved
+                self.orchestrator = self.running_orchestrator(live)
+                with self.subTest(resolved=resolved, live=live, start=start), patch.object(verify, "load", return_value=(self.root, self.receipt)), patch.object(verify, "run", side_effect=self.docker_run), patch.object(verify, "verify_host"), self.assertRaisesRegex(ValueError, "ENVD_TIMEOUT differs"):
+                    verify.verify(self.root, "b" * 64, start)
+                self.assertFalse(any("run" in args or "up" in args for args, _ in self.calls))
+
+    def test_envd_timeout_is_rechecked_under_the_startup_lock(self):
+        self.orchestrator = self.running_orchestrator()
+
+        @contextlib.contextmanager
+        def locked():
+            self.orchestrator = self.running_orchestrator("30s")
+            yield
+
+        with patch.object(verify, "load", return_value=(self.root, self.receipt)), patch.object(verify, "run", side_effect=self.docker_run), patch.object(verify, "verify_host"), patch.object(verify, "maintenance_lock", locked), self.assertRaisesRegex(ValueError, "ENVD_TIMEOUT differs"):
+            verify.verify(self.root, "b" * 64, True)
+        self.assertFalse(any("run" in args or "up" in args for args, _ in self.calls))
+
+    def test_api_start_requires_the_expected_orchestrator_after_compose_up(self):
+        for existing, after_up, error in (
+            (False, None, "expected stock orchestrator"),
+            (False, self.running_orchestrator("30s"), "ENVD_TIMEOUT differs"),
+            (True, self.running_orchestrator("30s"), "ENVD_TIMEOUT differs"),
+            (True, self.running_orchestrator(container_id="c" * 64), "expected stock orchestrator"),
+        ):
+            self.calls = []
+            self.orchestrator = self.running_orchestrator() if existing else None
+
+            def compose_up(*args, input=None):
+                if "up" in args and args[-1] == "orchestrator":
+                    self.orchestrator = after_up
+                return self.docker_run(*args, input=input)
+
+            with self.subTest(existing=existing, error=error), patch.object(verify, "load", return_value=(self.root, self.receipt)), patch.object(verify, "run", side_effect=compose_up), patch.object(verify, "verify_host"), self.assertRaisesRegex(ValueError, error):
+                verify.verify(self.root, "b" * 64, True)
+            commands = [args for args, _ in self.calls]
+            orchestrator_up = next(args for args in commands if "up" in args and args[-1] == "orchestrator")
+            self.assertEqual("--no-recreate" in orchestrator_up, existing)
+            self.assertFalse(any("up" in args and "api" in args for args in commands))
 
     def test_installed_owner_and_firewall_must_match_and_orphans_block_start(self):
         for name in ("var/lib/e2b/launchpad-stock-runtime-owner", "var/lib/e2b/bin/orchestrator", "etc/launchpad/host-firewall.nft", "usr/local/libexec/launchpad-host-firewall"):

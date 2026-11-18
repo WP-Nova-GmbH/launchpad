@@ -1,3 +1,4 @@
+import { workflowOwnsWorkspace } from "./WorkflowVmWorkspace.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -59,7 +60,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
       FROM relay_thread_vm_backups b JOIN relay_thread_vm_allocations a USING(allocation_id)
       WHERE b.operation_id=${backupOperationId} AND b.generation=${generation}
         AND (b.phase='verified' OR (${retiring} AND b.phase IN ('retiring','retired')))
-        AND a.thread_id=${threadId} AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'`;
+        AND a.thread_id=${threadId} AND a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND b.source_receipt->'workflowCheckpoint' IS NOT NULL))`;
     const receipt = yield* decodeNativeCapture(backup?.receipt).pipe(
       Effect.mapError(() => conflict("Saved disk has no completed native snapshot.")),
     );
@@ -167,28 +168,42 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
     readonly actorUserId: string;
     readonly expectedGeneration: number;
     readonly replacementRequestId?: string;
+    readonly workflowJobId?: string;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         // Allocation reserve takes this lock before placement. Keep that order.
-        yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.actorUserId},721864))`;
+        if (!input.workflowJobId)
+          yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.actorUserId},721864))`;
         const [placement] = yield* sql<{
           generation: number;
           operationId: string | null;
-          ownerUserId: string;
+          ownerUserId: string | null;
+          workflowJobId: string | null;
           organizationId: string;
         }>`SELECT generation,
         operation_id AS "operationId", owner_user_id AS "ownerUserId",
-        organization_id AS "organizationId" FROM relay_thread_placements
+        organization_id AS "organizationId",workflow_job_id AS "workflowJobId" FROM relay_thread_placements
         WHERE thread_id=${input.threadId} FOR UPDATE`;
-        if (!placement || placement.ownerUserId !== input.actorUserId)
+        if (
+          !placement ||
+          (input.workflowJobId
+            ? placement.workflowJobId !== input.workflowJobId || placement.ownerUserId !== null
+            : placement.ownerUserId !== input.actorUserId)
+        )
           return yield* conflict("Only the private thread owner can restore its VM");
         yield* sql`SELECT operation_id FROM relay_thread_vm_saved_disks
         WHERE operation_id=${input.savedDiskOperationId} FOR UPDATE`;
         const save = yield* get(input.savedDiskOperationId);
         if (!save || save.threadId !== input.threadId || save.generation > input.expectedGeneration)
           return yield* conflict("Saved disk does not belong to this thread generation");
-        yield* requireCapture(input.threadId, save.backupOperationId, save.generation);
+        const capture = yield* requireCapture(
+          input.threadId,
+          save.backupOperationId,
+          save.generation,
+        );
+        if ((capture.source.workflowCheckpoint?.jobId ?? undefined) !== input.workflowJobId)
+          return yield* conflict("Saved disk belongs to another workspace owner");
         if (save.phase === "restoring" && save.restoreOperationId === input.operationId) {
           if (
             save.restoreAllocationId !== input.allocationId ||
@@ -205,9 +220,10 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         JOIN relay_thread_vm_policies p ON p.organization_id=${placement.organizationId}
         WHERE s.operation_id=${save.operationId} AND s.phase='available' AND t.generation=${input.expectedGeneration}
           AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))
-          AND ((s.saved_at AT TIME ZONE p.calendar_time_zone
-            + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)
-            > clock_timestamp() FOR SHARE OF p`;
+          AND ((${input.workflowJobId !== undefined} AND ${workflowOwnsWorkspace(sql)}) OR
+            ((s.saved_at AT TIME ZONE p.calendar_time_zone
+              + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)
+              > clock_timestamp()) FOR SHARE OF p`;
         if (
           !valid ||
           placement.operationId !== null ||
@@ -228,17 +244,23 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         restore_operation_id=${input.operationId} WHERE operation_id=${save.operationId}`;
         yield* sql`UPDATE relay_thread_placements SET operation_id=${input.operationId}
         WHERE thread_id=${input.threadId}`;
-        yield* makeThreadVmAllocationStore(sql).reserve({
-          allocationId: input.allocationId,
-          threadId: input.threadId,
-          organizationId: placement.organizationId,
-          ownerUserId: input.actorUserId,
-          templateId: source.templateId,
-          savedDiskRestoreOperationId: input.operationId,
-          ...(input.replacementRequestId
-            ? { replacementRequestId: input.replacementRequestId }
-            : {}),
-        });
+        if (input.workflowJobId) {
+          yield* sql`INSERT INTO relay_thread_vm_allocations
+            (allocation_id,thread_id,organization_id,owner_user_id,resource_kind,template_id,state,runtime_protocol)
+            VALUES (${input.allocationId},${input.threadId},${placement.organizationId},NULL,
+              'organization_workflow',${source.templateId},'creating','native-v1')`;
+        } else
+          yield* makeThreadVmAllocationStore(sql).reserve({
+            allocationId: input.allocationId,
+            threadId: input.threadId,
+            organizationId: placement.organizationId,
+            ownerUserId: input.actorUserId,
+            templateId: source.templateId,
+            savedDiskRestoreOperationId: input.operationId,
+            ...(input.replacementRequestId
+              ? { replacementRequestId: input.replacementRequestId }
+              : {}),
+          });
         yield* makeThreadVmCapacityStore(sql).request({
           operationId: input.operationId,
           allocationId: input.allocationId,
@@ -397,10 +419,10 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         JOIN relay_thread_vm_backups b ON b.operation_id=s.backup_operation_id
         JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id
         WHERE s.host_id=${hostId} AND s.phase IN ('available','expiring')
-          AND b.native_capture_receipt IS NOT NULL AND a.runtime_protocol='native-v1' AND a.resource_kind='personal'
+          AND b.native_capture_receipt IS NOT NULL AND a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND b.source_receipt->'workflowCheckpoint' IS NOT NULL))
           AND s.retry_at <= clock_timestamp()
           AND (s.claim_until IS NULL OR s.claim_until <= clock_timestamp())
-          AND (s.phase='expiring' OR (t.operation_id IS NULL AND
+          AND (s.phase='expiring' OR (t.operation_id IS NULL AND NOT ${workflowOwnsWorkspace(sql)} AND
             ((s.saved_at AT TIME ZONE p.calendar_time_zone
               + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)
               <= clock_timestamp()))
@@ -420,7 +442,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
           JOIN relay_thread_placements t ON t.thread_id=s.thread_id
           JOIN relay_thread_vm_policies p ON p.organization_id=t.organization_id
           WHERE s.operation_id=${save.operationId} AND s.phase='available' AND t.operation_id IS NULL
-            AND ((s.saved_at AT TIME ZONE p.calendar_time_zone
+            AND NOT ${workflowOwnsWorkspace(sql)} AND ((s.saved_at AT TIME ZONE p.calendar_time_zone
               + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)
               <= clock_timestamp() FOR SHARE OF p`;
           const pins = yield* sql`SELECT 1 FROM relay_thread_vm_backup_pins

@@ -7,6 +7,8 @@ import * as Effect from "effect/Effect";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import type { PauseClaim } from "./ThreadVmPauseStore.ts";
 import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
+import type { MissingWorkflowVmSourceReconciler } from "./ThreadVmFinalSaveStore.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 
 type Identity = {
   readonly operationId: string;
@@ -53,6 +55,7 @@ export function makeThreadVmPauseWorker(
   guest: PauseGuest,
   hostId: string,
   enqueueIdle = true,
+  reconcileMissingSource?: MissingWorkflowVmSourceReconciler,
 ) {
   const store = makeThreadVmPauseStore(sql);
   const runOne = Effect.fn("relay.thread_vm.pause.run_one")(function* () {
@@ -69,9 +72,14 @@ export function makeThreadVmPauseWorker(
         generation: claim.generation,
       },
     };
+    const reconcileMissing = reconcileMissingSource?.({ ...claim, hostId, pauseClaim: claim });
     const attempt = Effect.gen(function* () {
       const before = yield* compute.inspect(claim.computeRef);
-      if (!before || !matches(before, claim)) return;
+      if (!before) {
+        if (reconcileMissing && (yield* reconcileMissing)) yield* wakeWorkflows();
+        return;
+      }
+      if (!matches(before, claim)) return;
       if (before.state === "paused") {
         // Timeout may stop the exact VM after its source checkpoint was
         // retained but before this worker records the guest seal.
@@ -96,6 +104,7 @@ export function makeThreadVmPauseWorker(
       yield* compute.pause(claim.computeRef);
       if (!(yield* store.acknowledgePause(claim))) return;
       const after = yield* compute.inspect(claim.computeRef);
+      if (!after && reconcileMissing && (yield* reconcileMissing)) yield* wakeWorkflows();
       if (after && matches(after, claim) && after.state === "paused") yield* store.finish(claim);
     });
     yield* attempt.pipe(

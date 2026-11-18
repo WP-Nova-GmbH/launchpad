@@ -3,15 +3,21 @@ import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import { ThreadId } from "@t3tools/contracts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { SandboxInfo } from "e2b";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import type * as SqlError from "effect/unstable/sql/SqlError";
 import type { LinearWorkflowConfiguration } from "../Config.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import type {
   ThreadVmComputeError,
   makeE2BThreadVmCompute,
 } from "../machines/E2BThreadVmCompute.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import type { ResumeClaim } from "./ThreadVmResumeStore.ts";
-import { makeThreadVmResumeStore } from "./ThreadVmResumeStore.ts";
+import {
+  makeThreadVmResumeStore,
+  THREAD_VM_RESUME_ATTEMPT_TIMEOUT_MS,
+} from "./ThreadVmResumeStore.ts";
 import {
   readThreadVmTrafficAccessToken,
   sealThreadVmTrafficAccessToken,
@@ -46,6 +52,12 @@ const matches = (info: SandboxInfo | null, claim: ResumeClaim) =>
   info.metadata["launchpad.thread_id"] === claim.threadId &&
   info.metadata["launchpad.generation"] === String(claim.generation);
 
+// The stock API's 70s request and 75s write deadlines fit inside this client budget.
+const CONNECT_TIMEOUT_MS = 90_000;
+const GUEST_REOPEN_TIMEOUT_MS = 60_000;
+const hasGuestLease = (info: SandboxInfo, now: number) =>
+  info.endAt.getTime() - now >= GUEST_REOPEN_TIMEOUT_MS + 5_000;
+
 /** Resume a paused VM only after FIFO physical capacity admission. */
 export function makeThreadVmResumeWorker(
   sql: PgClient,
@@ -54,6 +66,7 @@ export function makeThreadVmResumeWorker(
   hostId: string,
   workflowEnabled?: boolean,
   linearWorkflow?: LinearWorkflowConfiguration,
+  reconcileMissingWorkflowVm?: (claim: ResumeClaim) => Effect.Effect<boolean, SqlError.SqlError>,
 ) {
   const store = makeThreadVmResumeStore(sql);
   const runOne = Effect.fn("relay.thread_vm.resume.run_one")(function* () {
@@ -76,9 +89,24 @@ export function makeThreadVmResumeWorker(
       },
     };
     const attempt = Effect.gen(function* () {
-      yield* store.begin(claim);
+      const startWorkflowExecution = !!claim.workflowJobId && claim.capacityState === "reserved";
+      if (startWorkflowExecution && workflowEnabled !== true) return;
+      if (!startWorkflowExecution) yield* store.begin(claim);
       let info = yield* compute.inspect(claim.computeRef);
-      if (!info || !matches(info, claim)) return;
+      if (!info) {
+        if (
+          claim.workflowJobId &&
+          reconcileMissingWorkflowVm &&
+          (yield* reconcileMissingWorkflowVm(claim))
+        )
+          yield* wakeWorkflows();
+        return;
+      }
+      if (!matches(info, claim)) return;
+      if (info.state === "paused" && (yield* store.releaseInactiveWorkflowWake(claim))) {
+        yield* wakeWorkflows();
+        return;
+      }
       const tokenIdentity = {
         allocationId: claim.allocationId,
         computeRef: claim.computeRef,
@@ -87,18 +115,23 @@ export function makeThreadVmResumeWorker(
         generation: claim.generation,
       };
       let token =
-        info.state === "running"
-          ? yield* readThreadVmTrafficAccessToken(sql, tokenIdentity).pipe(
+        info.state === "running" && hasGuestLease(info, yield* Clock.currentTimeMillis)
+          ? yield* readThreadVmTrafficAccessToken(
+              sql,
+              tokenIdentity,
+              claim.workflowJobId ? "organization_workflow" : "personal",
+            ).pipe(
               Effect.catchTag("ThreadVmIngressTokenUnavailable", () => Effect.succeed(undefined)),
             )
           : undefined;
       if (!token) {
-        yield* store.beginConnect(claim);
+        yield* store.beginConnect(claim, startWorkflowExecution);
         const connected = yield* compute
-          .recoverIngress(claim.computeRef, {
-            ...tokenIdentity,
-            templateId: claim.templateId,
-          })
+          .recoverIngress(
+            claim.computeRef,
+            { ...tokenIdentity, templateId: claim.templateId },
+            CONNECT_TIMEOUT_MS,
+          )
           .pipe(
             Effect.tapError((error) =>
               error.connectUncertain === false ? store.settleConnect(claim) : Effect.void,
@@ -108,24 +141,34 @@ export function makeThreadVmResumeWorker(
         if (connected.sandboxId !== claim.computeRef || !connected.trafficAccessToken) return;
         token = connected.trafficAccessToken;
         info = yield* compute.inspect(claim.computeRef);
-      }
-      if (!info || !matches(info, claim) || info.state !== "running") return;
+      } else if (startWorkflowExecution) yield* store.begin(claim);
+      if (
+        !info ||
+        !matches(info, claim) ||
+        info.state !== "running" ||
+        !hasGuestLease(info, yield* Clock.currentTimeMillis)
+      )
+        return;
       const sealed = yield* sealThreadVmTrafficAccessToken(tokenIdentity, token);
       if (!(yield* store.finishPower(claim, sealed))) return;
-      yield* guest.reopenAfterResume(
-        claim.computeRef,
-        identity,
-        claim.finalSaveOperationId ?? claim.pauseOperationId,
-      );
-      yield* store.complete(claim);
+      yield* guest
+        .reopenAfterResume(
+          claim.computeRef,
+          identity,
+          claim.finalSaveOperationId ?? claim.pauseOperationId,
+        )
+        .pipe(Effect.timeout(GUEST_REOPEN_TIMEOUT_MS));
+      if ((yield* store.complete(claim)) && claim.workflowJobId) yield* wakeWorkflows();
     });
     yield* attempt.pipe(
+      Effect.timeout(THREAD_VM_RESUME_ATTEMPT_TIMEOUT_MS),
       Effect.catchTags({
         ThreadVmComputeError: () => Effect.void,
         ThreadVmResumeConflict: () => Effect.void,
         ThreadVmIngressTokenUnavailable: () => Effect.void,
+        TimeoutError: () => Effect.logWarning("Thread VM resume attempt exceeded its deadline."),
       }),
-      Effect.andThen(store.defer(claim)),
+      Effect.andThen(store.defer(claim, workflowEnabled === true)),
     );
     return true;
   });

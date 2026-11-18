@@ -1,5 +1,8 @@
 import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
 import { readThreadVmInitialState } from "../relay/ThreadVmInitialStateRecord.ts";
+import { readThreadVmRestoreState } from "../relay/ThreadVmRestoreInstall.ts";
+import { readThreadVmRepositoryBinding } from "../relay/ThreadVmRepositoryBinding.ts";
+import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
 import { applyRepositoryPolicyProof } from "./repositoryPolicy.ts";
 import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import * as NodeCrypto from "node:crypto";
@@ -1954,33 +1957,65 @@ export const cloudDispatchJobHandler = Effect.fn("environment.cloud.dispatchJob"
             control.workflow.definition.target.kind !== "vm"))
       )
         return yield* invalidWorkflow();
-      const state = yield* readThreadVmInitialState().pipe(
-        Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
-        Effect.mapError(invalidWorkflow),
-      );
-      const receipt = state?.receipt;
-      if (
-        !state?.input.workflow ||
-        !receipt ||
-        state.input.workflow.jobId !== binding.jobId ||
-        state.input.workflow.organizationId !== binding.organizationId ||
-        state.input.workspace.canonicalKey !== proof.repositoryCanonicalKey ||
-        receipt.projectId !== binding.projectId ||
-        receipt.environmentId !== binding.environmentId ||
-        receipt.operationId !== binding.operationId ||
-        receipt.scope.generation !== binding.generation ||
-        receipt.scope.threadId !== binding.threadId ||
-        receipt.scope.repositoryId !== binding.repositoryId ||
-        receipt.scope.allocationId !== binding.allocationId ||
-        receipt.workspaceRoot !== state.workspaceRoot
-      )
-        return yield* invalidWorkflow();
-      workflowVm = {
-        binding,
-        workspaceRoot: state.workspaceRoot,
-        baseBranch: state.input.workflow.baseBranch,
-        baseSha: receipt.revision,
-      };
+      if (binding.generation > 1) {
+        const restored = yield* readThreadVmRestoreState().pipe(
+          Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+          Effect.mapError(invalidWorkflow),
+        );
+        const repository = yield* readThreadVmRepositoryBinding().pipe(
+          Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+          Effect.mapError(invalidWorkflow),
+        );
+        const restoredBinding = restored?.recovery.workflow?.binding;
+        if (
+          restored?.phase !== "activated" ||
+          !restored.workflowBase ||
+          !restoredBinding ||
+          !Schema.toEquivalence(WorkflowVmDispatchBinding)(restoredBinding, binding) ||
+          repository?.canonicalKey !== proof.repositoryCanonicalKey ||
+          repository.operationId !== binding.operationId ||
+          repository.environmentId !== binding.environmentId ||
+          repository.scope.threadId !== binding.threadId ||
+          repository.scope.allocationId !== binding.allocationId ||
+          repository.scope.generation !== binding.generation ||
+          repository.scope.repositoryId !== binding.repositoryId
+        )
+          return yield* invalidWorkflow();
+        workflowVm = {
+          binding,
+          workspaceRoot: restored.receipt.workspaceRoot,
+          baseBranch: restored.workflowBase.branch,
+          baseSha: restored.workflowBase.sha,
+        };
+      } else {
+        const state = yield* readThreadVmInitialState().pipe(
+          Effect.provideService(ServerSecretStore.ServerSecretStore, dependencies.secrets),
+          Effect.mapError(invalidWorkflow),
+        );
+        const receipt = state?.receipt;
+        if (
+          !state?.input.workflow ||
+          !receipt ||
+          state.input.workflow.jobId !== binding.jobId ||
+          state.input.workflow.organizationId !== binding.organizationId ||
+          state.input.workspace.canonicalKey !== proof.repositoryCanonicalKey ||
+          receipt.projectId !== binding.projectId ||
+          receipt.environmentId !== binding.environmentId ||
+          receipt.operationId !== binding.operationId ||
+          receipt.scope.generation !== binding.generation ||
+          receipt.scope.threadId !== binding.threadId ||
+          receipt.scope.repositoryId !== binding.repositoryId ||
+          receipt.scope.allocationId !== binding.allocationId ||
+          receipt.workspaceRoot !== state.workspaceRoot
+        )
+          return yield* invalidWorkflow();
+        workflowVm = {
+          binding,
+          workspaceRoot: state.workspaceRoot,
+          baseBranch: state.input.workflow.baseBranch,
+          baseSha: receipt.revision,
+        };
+      }
     }
     if (
       (origin === undefined && proof.sub.startsWith("workflow:")) ||

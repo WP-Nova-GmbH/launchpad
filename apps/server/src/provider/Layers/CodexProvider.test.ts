@@ -3,7 +3,10 @@ import { CodexSettings } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { ThreadVmCodexAuthSourceError } from "../../relay/ThreadVmCodexAuthSource.ts";
@@ -65,6 +68,7 @@ for (const mode of ["ordinary", "personal", "workflow"] as const) {
       );
       if (mode === "workflow") {
         assert.equal(command.args[0], "run-workflow");
+        assert.equal(command.args[2], "probe");
         assert.equal(command.args[3], "/home/launchpad-workflow");
         assert.equal(command.options.cwd, "/");
         assert.equal(command.options.extendEnv, false);
@@ -78,6 +82,108 @@ for (const mode of ["ordinary", "personal", "workflow"] as const) {
     }),
   );
 }
+
+const decodeProbeRequest = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({ id: Schema.optionalKey(Schema.Number), method: Schema.String }),
+  ),
+);
+const encodeProbeResponse = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Struct({ id: Schema.Number, result: Schema.Unknown })),
+);
+
+it.effect("a managed workflow Codex probe reads the catalog before stopping its cgroup", () =>
+  Effect.gen(function* () {
+    const responses = yield* Queue.unbounded<Uint8Array>();
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const model = "gpt-6.1-sol";
+    const results: Record<string, unknown> = {
+      initialize: {
+        userAgent: "codex/0.159.3",
+        codexHome: "/home/launchpad-workflow/.codex",
+        platformFamily: "unix",
+        platformOs: "linux",
+      },
+      "skills/list": { data: [] },
+      "model/list": {
+        data: [
+          {
+            id: model,
+            model,
+            displayName: "Sol",
+            description: "Test",
+            defaultReasoningEffort: "high",
+            hidden: false,
+            isDefault: true,
+            supportedReasoningEfforts: [],
+          },
+        ],
+      },
+    };
+    let stopped = false;
+    let workloadId: string;
+    const raw = ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipe");
+        const isProbe = command.args[0] === "run-workflow";
+        if (isProbe) {
+          assert.equal(command.args[2], "probe");
+          workloadId = command.args[1]!;
+        } else {
+          assert.deepEqual(command.args, ["stop-workflow-probe", workloadId, "42"]);
+          stopped = true;
+        }
+        return ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(isProbe ? 42 : 77),
+          exitCode: isProbe ? Effect.never : Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          isRunning: Effect.succeed(isProbe),
+          kill: () => Effect.die("Unexpected raw kill"),
+          unref: Effect.succeed(Effect.void),
+          stdin: Sink.forEach((chunk: Uint8Array) => {
+            assert.isFalse(stopped);
+            const { id, method } = decodeProbeRequest(decoder.decode(chunk));
+            if (id === undefined) return Effect.void;
+            assert.ok(results[method]);
+            return Queue.offer(
+              responses,
+              encoder.encode(`${encodeProbeResponse({ id, result: results[method] })}\n`),
+            );
+          }),
+          stdout: isProbe
+            ? Stream.fromQueue(responses)
+            : Stream.make(encoder.encode('{"status":"stopped"}')),
+          stderr: Stream.empty,
+          all: Stream.empty,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+        });
+      }),
+    );
+    const status = yield* withVmWorkloads(
+      checkCodexProviderStatus(
+        decodeManagedSettings({ binaryPath: "/opt/launchpad/node/bin/codex" }),
+        undefined,
+        {},
+        {
+          connectionId: "selected-connection",
+          label: "Organization account",
+          status: Effect.succeed(managedConnection),
+          preflight: Effect.void,
+        },
+      ),
+      true,
+    ).pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw),
+      Effect.provideService(HostProcessPlatform, "linux"),
+    );
+    assert.deepEqual(
+      status.models.map(({ slug }) => slug),
+      [model],
+    );
+    assert.isTrue(stopped);
+  }),
+);
 
 it("maps current Codex model capability fields", () => {
   const capabilities = mapCodexModelCapabilities({

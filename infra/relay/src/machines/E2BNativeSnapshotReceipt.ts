@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 
 const Identifier = Schema.NonEmptyString;
 const UUID = Schema.String.check(Schema.isUUID());
@@ -12,12 +13,16 @@ const SourceIdentity = {
 };
 const SourceSeal = {
   environmentId: Identifier,
-  provisionOperationId: UUID,
+  provisionOperationId: Schema.Union([
+    UUID,
+    Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
+  ]),
   captureOperationId: UUID,
   bootId: UUID,
   sealEpoch: PositiveInt,
   sourceSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  nativeCheckpointOperationId: UUID,
+  nativeCheckpointOperationId: Schema.NullOr(UUID),
+  workflowCheckpoint: Schema.optionalKey(RelayThreadVmWorkflowCheckpoint),
 };
 
 /** The exact independently published source point held closed during capture. */

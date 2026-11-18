@@ -1,5 +1,5 @@
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import type { RelayThreadVmPause } from "@t3tools/contracts/relay";
+import type { RelayThreadVmPause, RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
@@ -9,6 +9,14 @@ export class ThreadPauseError extends Schema.TaggedError<ThreadPauseError>()("Th
   threadId: Schema.String,
   detail: Schema.String,
 }) {}
+interface PauseFreezeReceipt {
+  operationId: string;
+  nativeCheckpointOperationId: string | null;
+  workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
+  sourceSequence?: number;
+  bootId: string;
+  sealEpoch: number;
+}
 export interface ThreadPauseTransport {
   readonly cancel: (
     owner: ThreadHistoryOwner,
@@ -23,12 +31,7 @@ export interface ThreadPauseTransport {
   ) => Effect.Effect<RelayThreadVmPause | null, ThreadPauseError>;
   readonly freeze: (
     owner: ThreadHistoryOwner,
-    input: {
-      operationId: string;
-      nativeCheckpointOperationId: string;
-      bootId: string;
-      sealEpoch: number;
-    },
+    input: PauseFreezeReceipt,
   ) => Effect.Effect<RelayThreadVmPause, ThreadPauseError>;
 }
 export function makeThreadPauseTransport<E, R>(
@@ -59,15 +62,7 @@ export function makeThreadPauseTransport<E, R>(
       ),
   );
   const freeze = Effect.fn("ThreadPauseTransport.freeze")(
-    function* (
-      owner: ThreadHistoryOwner,
-      input: {
-        operationId: string;
-        nativeCheckpointOperationId: string;
-        bootId: string;
-        sealEpoch: number;
-      },
-    ) {
+    function* (owner: ThreadHistoryOwner, input: PauseFreezeReceipt) {
       const client = yield* clientFor(owner);
       return yield* client.threadEnvironment.freezePause({
         params: {

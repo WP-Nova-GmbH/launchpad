@@ -1,0 +1,7 @@
+ALTER TABLE "relay_thread_vm_pauses" ADD COLUMN "workflow_checkpoint" jsonb;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ALTER COLUMN "actor_user_id" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_restores" ALTER COLUMN "native_checkpoint_operation_id" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" DROP CONSTRAINT "relay_thread_vm_final_saves_frozen", ADD CONSTRAINT "relay_thread_vm_final_saves_frozen" CHECK ("phase" NOT IN ('frozen','saving','deleting','completed') OR ("source_sequence" IS NOT NULL AND "source_sequence" >= 0 AND ("native_checkpoint_operation_id" IS NOT NULL OR "source_receipt"->'workflowCheckpoint' IS NOT NULL) AND "frozen_at" IS NOT NULL));--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_pauses" DROP CONSTRAINT "relay_thread_vm_pauses_source_certificate", ADD CONSTRAINT "relay_thread_vm_pauses_source_certificate" CHECK (
+      ("native_checkpoint_operation_id" IS NULL AND "source_sequence" IS NULL AND "source_frozen_at" IS NULL)
+      OR (("native_checkpoint_operation_id" IS NOT NULL OR "workflow_checkpoint" IS NOT NULL) AND "source_sequence" IS NOT NULL AND "source_sequence" >= 0 AND "source_frozen_at" IS NOT NULL AND "boot_id" IS NOT NULL));

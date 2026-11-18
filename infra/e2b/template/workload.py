@@ -89,9 +89,15 @@ def initialize():
 
 
 @contextlib.contextmanager
-def locked():
+def locked(*, blocking=True):
     with (STATE / "lock").open("r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if blocking:
+                raise
+            yield None
+            return
         gate = read_json(STATE / "gate.json")
         if gate["bootId"] != BOOT.read_text().strip():
             raise RuntimeError("Workload boot identity changed")
@@ -154,11 +160,30 @@ def require_workflow_executable(info):
         raise RuntimeError('Workflow executable is not execute-only for workloads')
 
 
-def native_identity(gate, work_id, pid):
+def native_executable_fingerprint(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def verify_native_executable():
     import hashlib
     native, executable, info = pinned_native()
-    if (not os.path.samestat(info, Path(f'/proc/{pid}/exe').stat())
-            or hashlib.sha256(executable.read_bytes()).hexdigest() != native['sha256']):
+    fingerprint = native_executable_fingerprint(info)
+    digest = hashlib.sha256()
+    with os.fdopen(os.open(executable, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as source:
+        if native_executable_fingerprint(os.fstat(source.fileno())) != fingerprint:
+            raise RuntimeError('Native executable identity changed')
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+        if native_executable_fingerprint(os.fstat(source.fileno())) != fingerprint:
+            raise RuntimeError('Native executable identity changed')
+    if digest.hexdigest() != native['sha256']:
+        raise RuntimeError('Native executable identity changed')
+    return (native['sha256'], executable, fingerprint)
+
+
+def native_process_identity(gate, work_id, pid, pinned):
+    native, _, info = pinned
+    if not os.path.samestat(info, Path(f'/proc/{pid}/exe').stat()):
         raise RuntimeError('Native executable identity changed')
     record = read_json(STATE / (work_id + '.json'))
     stat = process_identity(pid)
@@ -169,6 +194,14 @@ def native_identity(gate, work_id, pid):
         raise RuntimeError('Native leader identity changed')
     return {'bootId': gate['bootId'], 'groupId': work_id, 'pid': pid,
             'startTicks': stat['startTicks'], 'executableSha256': native['sha256']}
+
+
+def native_identity(gate, work_id, pid, verified):
+    pinned = pinned_native()
+    native, executable, info = pinned
+    if (native['sha256'], executable, native_executable_fingerprint(info)) != verified:
+        raise RuntimeError('Native executable identity changed')
+    return native_process_identity(gate, work_id, pid, pinned)
 
 
 def wait_cgroup_event(group, key, value, seconds=2):
@@ -241,8 +274,10 @@ def stop_idle_provider(gate, expected, operation):
     current = inventory(gate)
     if len(current['groups']) != 1 or current['groups'][0]['id'] != work_id:
         return {'admitted': False}
-    if native_identity(gate, work_id, expected['pid']) != expected:
+    # Reject a stale leader before reading the entire binary with admission locked.
+    if native_process_identity(gate, work_id, expected['pid'], pinned_native()) != expected:
         return {'admitted': False}
+    verified = verify_native_executable()
     group = ROOT / work_id
     pidfd = os.pidfd_open(expected['pid'])
     frozen = False
@@ -250,7 +285,7 @@ def stop_idle_provider(gate, expected, operation):
         (group / 'cgroup.freeze').write_text('1')
         frozen = True
         wait_cgroup_event(group, 'frozen', '1')
-        if (native_identity(gate, work_id, expected['pid']) != expected
+        if (native_identity(gate, work_id, expected['pid'], verified) != expected
                 or not exclusive_provider(group, expected)):
             return {'admitted': False}
         # Admission and any managed launch share this lock. No other group was
@@ -303,6 +338,22 @@ def signal_workflow(gate, work_id, pid, signal_name):
         return False
     finally:
         os.close(pidfd)
+
+
+def stop_workflow_probe(gate, work_id, pid):
+    group = ROOT / identifier(work_id)
+    if pid <= 1:
+        raise ValueError('Invalid workflow probe leader')
+    if not group.exists():
+        return False
+    record = read_json(STATE / (work_id + '.json'))
+    if (record['id'] != work_id or record['bootId'] != gate['bootId'] or record['leaderPid'] != pid
+            or record.get('workflow') is not True or record['kind'] != 'probe'):
+        raise RuntimeError('Workflow probe identity changed')
+    if populated(group):
+        (group / 'cgroup.kill').write_text('1')
+        wait_cgroup_event(group, 'populated', '0')
+    return True
 
 
 def require_workflow_dump_policy(configure=False):
@@ -586,12 +637,14 @@ def coordinator_record(scope, boot_id):
     return group, record
 
 
-def coordinator_admission(scope):
+def coordinator_admission(scope, require_restore_binding=False):
     binding = COORDINATOR_STATE / 'restore-binding.json'
     if binding.exists():
         immutable(binding)
         if coordinator_scope(read_json(binding)['boot']) != coordinator_scope(scope):
             raise RuntimeError('A newer restore owns coordinator admission')
+    elif require_restore_binding:
+        raise RuntimeError('Workflow restore has no native coordinator binding')
 
 
 def workflow_guest():
@@ -664,11 +717,11 @@ def run_coordinator(receipt, mode):
     if not re.fullmatch(r'[a-f0-9]{64}', receipt) or mode not in {'initial', 'move', 'restore'}:
         raise ValueError('Invalid coordinator launch')
     workflow = workflow_guest()
-    if workflow and mode != 'initial':
+    if workflow and mode == 'move':
         raise ValueError('Invalid workflow coordinator launch')
     scope = coordinator_scope(json.loads(os.environ['LAUNCHPAD_COORDINATOR_SCOPE']))
     with coordinator_locked():
-        coordinator_admission(scope)
+        coordinator_admission(scope, require_restore_binding=workflow and mode == 'restore')
         immutable(SERVER)
         group_id = coordinator_id(scope)
         group = COORDINATORS / group_id
@@ -787,12 +840,32 @@ def main(args):
     if action == 'prepare-warm-restore' and len(args) == 1:
         print(json.dumps(prepare_warm_restore(json.load(sys.stdin))))
         return
-    if action in {"run", "run-transfer", "run-workflow"}:
-        transfer = action == "run-transfer"
-        workflow = action == "run-workflow"
+    if action in {"run", "run-transfer", "run-workflow", "run-workflow-transfer"}:
+        transfer = action in {"run-transfer", "run-workflow-transfer"}
+        workflow = action in {"run-workflow", "run-workflow-transfer"}
         if workflow and (os.getuid() != COORDINATOR_UID or not workflow_guest()):
             raise RuntimeError('Workflow workload admission is unavailable')
-        if transfer:
+        if transfer and workflow:
+            _, boot_id, operation_id, epoch, work_id, kind, cwd, separator, *command = args
+            identifier(operation_id)
+            git_prefix = ["-c", "credential.helper=", "-c", "core.hooksPath=/dev/null",
+                          "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]
+            git_queries = {
+                ("rev-parse", "--show-toplevel"),
+                ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+                ("rev-parse", "--absolute-git-dir"),
+                ("rev-parse", "HEAD^{commit}"),
+                ("symbolic-ref", "--quiet", "--short", "HEAD"),
+            }
+            sealed_git = (cwd == "/workspace/project" and command and
+                          command[0] in ("git", "/usr/bin/git") and
+                          command[1:len(git_prefix) + 1] == git_prefix and
+                          tuple(command[len(git_prefix) + 1:]) in git_queries)
+            codex_recovery = (cwd == "/home/launchpad-workflow/.codex" and
+                              command == ["/usr/bin/python3", "-IS", str(CHECKPOINT_READER), "capture"])
+            if kind != "process" or not os.path.isabs(cwd) or not (sealed_git or codex_recovery):
+                raise ValueError("Invalid sealed workflow maintenance command")
+        elif transfer:
             _, boot_id, operation_id, epoch, work_id, separator, *command = args
             identifier(operation_id)
             kind = "transfer"
@@ -803,7 +876,8 @@ def main(args):
         else:
             _, work_id, kind, separator, *command = args
         identifier(work_id)
-        if (not transfer and kind not in KINDS) or separator != "--" or not command:
+        if ((not transfer and kind not in KINDS and not (workflow and kind == 'probe'))
+                or separator != "--" or not command):
             raise ValueError("Invalid workload command")
         setup_owner = (workflow and kind == 'terminal'
                        and command[:3] == [str(RESOURCE_MONITOR), '--setup-owner-v4', '--script-file-v1'])
@@ -823,7 +897,7 @@ def main(args):
             group = ROOT / work_id
             group.mkdir()  # An existing ID is never a retry invitation.
             write_json(STATE / (work_id + ".json"), {
-                "id": work_id, "kind": kind, "leaderPid": os.getpid(),
+                "id": work_id, "kind": "transfer" if transfer else kind, "leaderPid": os.getpid(),
                 "bootId": gate["bootId"],
                 "startTicks": process_identity(os.getpid())["startTicks"],
                 **({"workflow": True} if workflow else {}),
@@ -847,7 +921,7 @@ def main(args):
                 require_workflow_executable(immutable(CHECKPOINT_PYTHON))
                 immutable(CHECKPOINT_READER)
                 os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-checkpoint-reader', cwd, command[3]])
-            if kind == 'provider':
+            if kind in {'provider', 'probe'}:
                 require_workflow_dump_policy()
                 _, executable, _ = workflow_native()
                 if command[0] not in {'codex', '/usr/bin/codex', '/opt/launchpad/node/bin/codex', str(executable)}:
@@ -857,12 +931,45 @@ def main(args):
                 os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-provider', cwd, '--', str(executable), *command[1:]])
             os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec', cwd, '--', *command])
         os.execvpe(command[0], command, os.environ)
-    if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'verify-workflow-provider-peer', 'workflow-setup-control'} and os.getuid() == COORDINATOR_UID and workflow_guest():
+    if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'stop-workflow-probe', 'verify-workflow-provider-peer', 'workflow-setup-control'} and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, *args])
     if action == 'workflow-recovery-state' and len(args) == 1 and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, action])
     if action == 'workflow-setup-control':
         print(json.dumps(workflow_setup_control(args[1:])))
+        return
+    if action == 'stop-workflow-probe' and len(args) == 3:
+        if os.getuid() != 0 or not workflow_guest():
+            raise RuntimeError('Workflow probe cleanup is unavailable')
+        # Bound the helper independently. The caller cannot signal it as root.
+        import signal
+        signal.alarm(4)
+        with locked(blocking=False) as gate:
+            if gate is None:
+                status = 'busy'
+            else:
+                status = 'stopped' if stop_workflow_probe(gate, args[1], int(args[2])) else 'missing'
+            print(json.dumps({'status': status}))
+        return
+    if action == 'provider-identity' and len(args) == 3:
+        # This helper can run as root, so bound its own lifetime. Hash outside
+        # the shared lock and recheck the exact file and process under the lock.
+        import signal
+        _, work_id, pid = args
+        work_id, pid = identifier(work_id), int(pid)
+
+        def identity_timeout(_signum, _frame):
+            raise SystemExit(124)
+
+        previous = signal.signal(signal.SIGALRM, identity_timeout)
+        try:
+            signal.alarm(55)
+            verified = verify_native_executable()
+            with locked() as gate:
+                print(json.dumps(native_identity(gate, work_id, pid, verified)))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
         return
     with locked() as gate:
         if action == 'workflow-recovery-state' and len(args) == 1:
@@ -880,10 +987,6 @@ def main(args):
                 raise RuntimeError('Workflow signaling is unavailable')
             _, work_id, pid, signal_name = args
             print(json.dumps({'signalled': signal_workflow(gate, work_id, int(pid), signal_name)}))
-            return
-        if action == 'provider-identity' and len(args) == 3:
-            _, work_id, pid = args
-            print(json.dumps(native_identity(gate, identifier(work_id), int(pid))))
             return
         if action == 'stop-idle-provider' and len(args) == 4:
             _, operation, work_id, raw = args

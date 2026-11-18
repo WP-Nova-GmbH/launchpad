@@ -1,7 +1,11 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodePath from "node:path";
 import type { OrchestrationCommand } from "@t3tools/contracts";
-import { assertWorkflowThreadReleased } from "./WorkflowThreadOwnership.ts";
+import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
+import {
+  assertWorkflowThreadReleased,
+  requireWorkflowVmLifecycleCheckpoint,
+} from "./WorkflowThreadOwnership.ts";
 import { assertThreadTransferRuntime } from "./ThreadTransferRuntime.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -35,6 +39,9 @@ interface Fence {
 }
 type Identity = Pick<Fence, "threadId" | "generation">;
 type Operation = Identity & Pick<Fence, "operationId">;
+type LifecycleOperation = Operation & {
+  readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
+};
 type Enrollment = Omit<Fence, "phase" | "frozenSequence">;
 type Work = Identity & {
   readonly workId: string;
@@ -97,6 +104,28 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
       WHERE thread_id = ${threadId} AND completed = 0 LIMIT 1`;
     if (pending.length) return yield* fail(threadId, "Thread work has not been confirmed stopped.");
   });
+  const requireLifecycle = Effect.fnUntraced(function* (input: LifecycleOperation) {
+    if (!input.workflowCheckpoint) {
+      yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
+        Effect.mapError((error) => fail(input.threadId, error.message)),
+      );
+      return null;
+    }
+    const lifecycle = yield* requireWorkflowVmLifecycleCheckpoint(sql, {
+      ...input,
+      workflowCheckpoint: input.workflowCheckpoint,
+    }).pipe(Effect.mapError((error) => fail(input.threadId, error.message)));
+    const row = yield* current(input);
+    if (
+      row.environmentId !== lifecycle.binding.environmentId ||
+      row.projectId !== lifecycle.binding.projectId
+    )
+      return yield* fail(
+        input.threadId,
+        "Workflow VM ownership changed during lifecycle recovery.",
+      );
+    return lifecycle;
+  });
   const prepare = Effect.fn("ThreadExecutionFence.prepare")(function* (input: Enrollment) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -149,12 +178,18 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   });
   // Activation is called only after the relay confirms this exact operation's owner.
   // For cancellation, that confirmation includes removal of the partial destination.
-  const activate = Effect.fn("ThreadExecutionFence.activate")(function* (input: Operation) {
+  const activate = Effect.fn("ThreadExecutionFence.activate")(function* (
+    input: LifecycleOperation,
+  ) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
-          Effect.mapError((error) => fail(input.threadId, error.message)),
-        );
+        const lifecycle = yield* requireLifecycle(input);
+        const binding = lifecycle?.binding;
+        if (binding) {
+          const currentFence = yield* current(input);
+          if (currentFence.phase === "active" && currentFence.operationId === binding.operationId)
+            return;
+        }
         const row = yield* operation(input);
         if (row.phase === "active") return;
         if (row.phase !== "frozen" && row.phase !== "draining")
@@ -172,7 +207,21 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
             input.threadId,
             "Checkout and history installation must finish before activation.",
           );
-        if (checkout) {
+        if (checkout && binding) {
+          const [ready] = yield* sql`SELECT 1 FROM thread_transfer_baselines b
+            JOIN repository_workflow_jobs j USING(thread_id)
+            LEFT JOIN provider_session_runtime p USING(thread_id)
+            WHERE b.operation_id=${input.operationId} AND b.generation=${input.generation}
+              AND j.job_id=${binding.jobId} AND (
+                (${lifecycle?.beforeAgent === true} AND p.thread_id IS NULL)
+                OR (p.status='stopped' AND p.provider_name='codex' AND p.provider_instance_id='codex'
+                  AND json_extract(p.resume_cursor_json,'$.resumePolicy')='require-existing'
+                  AND json_extract(p.runtime_payload_json,'$.providerContinuation.workflowJobId')=j.job_id
+                  AND json_extract(p.runtime_payload_json,'$.stoppedRuntimeEventsDrained')=1)
+              )`;
+          if (binding.operationId !== input.operationId || !ready)
+            return yield* fail(input.threadId, "The restored workflow runtime is not ready.");
+        } else if (checkout) {
           const ready = yield* sql`SELECT 1 FROM thread_transfer_readiness r
             JOIN thread_transfer_baselines b USING(operation_id)
             WHERE r.operation_id = ${input.operationId} AND r.phase = 'ready'
@@ -189,19 +238,18 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
         }
         yield* sql`UPDATE thread_checkout_claims SET phase = 'released', release_reason = 'activated'
           WHERE operation_id = ${input.operationId} AND phase = 'installed'`;
-        yield* sql`UPDATE thread_execution_fences SET phase = 'active', frozen_sequence = NULL
+        yield* sql`UPDATE thread_execution_fences SET phase = 'active', frozen_sequence = NULL,
+          operation_id = ${binding?.operationId ?? input.operationId}
         WHERE thread_id = ${input.threadId}`;
       }),
     );
   });
   const beginDrain = Effect.fn("ThreadExecutionFence.beginDrain")(function* (
-    input: Operation & { readonly previousOperationId: string },
+    input: LifecycleOperation & { readonly previousOperationId: string },
   ) {
     yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
-          Effect.mapError((error) => fail(input.threadId, error.message)),
-        );
+        const binding = (yield* requireLifecycle(input))?.binding;
         const row = yield* current(input);
         if (row.phase !== "active") {
           if (
@@ -211,7 +259,11 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
             return;
           return yield* fail(input.threadId, "Thread ownership is already held.");
         }
-        if (row.operationId === input.operationId || row.operationId !== input.previousOperationId)
+        if (
+          row.operationId === input.operationId ||
+          row.operationId !== input.previousOperationId ||
+          (binding !== undefined && row.operationId !== binding.operationId)
+        )
           return yield* fail(
             input.threadId,
             "The drain no longer matches the current ownership operation.",
@@ -221,12 +273,10 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
       }),
     );
   });
-  const freeze = Effect.fn("ThreadExecutionFence.freeze")(function* (input: Operation) {
+  const freeze = Effect.fn("ThreadExecutionFence.freeze")(function* (input: LifecycleOperation) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* assertWorkflowThreadReleased(sql, input.threadId).pipe(
-          Effect.mapError((error) => fail(input.threadId, error.message)),
-        );
+        yield* requireLifecycle(input);
         const row = yield* operation(input);
         if (row.phase === "frozen" && row.frozenSequence !== null) return row.frozenSequence;
         if (row.phase !== "draining")

@@ -13,16 +13,13 @@ type Activity = "busy" | "idle" | "unknown";
 
 /** Inspection revisions prevent a delayed idle reply from erasing newer work. */
 export function makeThreadVmActivityStore(sql: PgClient) {
-  const requireRunning = Effect.fnUntraced(function* (
-    allocationId: string,
-    purpose: "work" | "inspection",
-  ) {
+  const requireRunning = Effect.fnUntraced(function* (allocationId: string, allowWorkflow = false) {
     const [allocation] = yield* sql<{
       state: string;
       organizationId: string;
     }>`SELECT state,organization_id AS "organizationId" FROM relay_thread_vm_allocations
       WHERE allocation_id = ${allocationId} AND runtime_protocol='native-v1'
-        AND (resource_kind='personal' OR (${purpose === "work"} AND resource_kind='organization_workflow'))
+        AND (resource_kind='personal' OR (${allowWorkflow} AND resource_kind='organization_workflow'))
         AND deleted_at IS NULL FOR SHARE`;
     if (allocation?.state !== "running")
       return yield* new ThreadVmActivityConflict({ message: "VM is not running" });
@@ -37,7 +34,7 @@ export function makeThreadVmActivityStore(sql: PgClient) {
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* requireRunning(allocationId, "work");
+        yield* requireRunning(allocationId, true);
         yield* ensure(allocationId);
         yield* sql`UPDATE relay_thread_vm_activity SET revision = revision + 1,
           activity = 'unknown', observed_at = NULL, idle_since = NULL, inactive_work_ids='[]'::jsonb,
@@ -48,10 +45,11 @@ export function makeThreadVmActivityStore(sql: PgClient) {
   });
   const beginInspection = Effect.fn("relay.thread_vm.activity.begin_inspection")(function* (
     allocationId: string,
+    workflowCheckpoint = false,
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
-        yield* requireRunning(allocationId, "inspection");
+        yield* requireRunning(allocationId, workflowCheckpoint);
         yield* ensure(allocationId);
         const [row] = yield* sql<{ revision: number }>`UPDATE relay_thread_vm_activity
           SET revision = revision + 1,
@@ -73,10 +71,14 @@ export function makeThreadVmActivityStore(sql: PgClient) {
       readonly revision: number;
       readonly activity: Activity;
       readonly inactiveWorkIds?: ReadonlyArray<string>;
+      readonly workflowCheckpoint?: boolean;
     }) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
-          const organizationId = yield* requireRunning(input.allocationId, "inspection");
+          const organizationId = yield* requireRunning(
+            input.allocationId,
+            input.workflowCheckpoint,
+          );
           const policy = yield* lockThreadVmPolicy(sql, organizationId);
           const rows = yield* sql`UPDATE relay_thread_vm_activity
           SET activity = ${input.activity}, observed_at = clock_timestamp(),

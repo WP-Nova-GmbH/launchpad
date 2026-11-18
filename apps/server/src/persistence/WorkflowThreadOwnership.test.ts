@@ -1,4 +1,4 @@
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
 import { makeWorkflowResultOutbox } from "../jobs/WorkflowResultOutbox.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -10,6 +10,7 @@ import { initial } from "../jobs/WorkflowActions.test-fixture.ts";
 import { WorkflowRun, make as makeStore } from "../jobs/WorkflowRunStore.ts";
 import { SqlitePersistenceMemory } from "./Layers/Sqlite.ts";
 import { makeThreadExecutionFence } from "./ThreadExecutionFence.ts";
+import { requireWorkflowVmLifecycleCheckpoint } from "./WorkflowThreadOwnership.ts";
 
 const encode = Schema.encodeSync(Schema.fromJsonString(WorkflowRun));
 const enrollment = {
@@ -157,6 +158,89 @@ it.effect("fails closed for a malformed terminal workflow record", () =>
       "workflow",
     );
   }).pipe(Effect.provide(SqlitePersistenceMemory)),
+);
+
+it.effect("pauses and reopens the original placement at an acknowledged first Input", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const fences = makeThreadExecutionFence(sql);
+    yield* fences.prepare(enrollment);
+    yield* fences.activate(enrollment);
+    const initialRun = released();
+    const binding = {
+      jobId: initialRun.jobId,
+      organizationId: initialRun.workflow.organizationId,
+      repositoryId: initialRun.workflow.repositoryId,
+      threadId: ThreadId.make(enrollment.threadId),
+      projectId: ProjectId.make(enrollment.projectId),
+      environmentId: EnvironmentId.make(enrollment.environmentId),
+      generation: enrollment.generation,
+      operationId: enrollment.operationId,
+      allocationId: "allocation",
+    };
+    const checkpoint = {
+      checkpointId: "first-input",
+      kind: "input" as const,
+      stepId: "input",
+      generation: 0,
+      role: "maintainer" as const,
+      question: "What should the Agent do?",
+    };
+    const store = yield* makeStore;
+    yield* store.save({
+      ...initialRun,
+      runtime: { kind: "vm", ...binding },
+      providerContinuation: {
+        driver: ProviderDriverKind.make("codex"),
+        continuationKey: "codex:managed",
+      },
+      workflow: {
+        ...initialRun.workflow,
+        definition: {
+          ...initialRun.workflow.definition,
+          target: { kind: "vm", baseBranch: null },
+          steps: [
+            {
+              id: "input",
+              kind: "input",
+              title: "Input",
+              role: checkpoint.role,
+              question: checkpoint.question,
+            },
+            ...initialRun.workflow.definition.steps,
+          ],
+        },
+      },
+      sequence: { ...initialRun.sequence!, cursor: 0, completed: [], started: false },
+      progress: { ...initialRun.progress, checkpoint, status: "awaiting_input", stepId: "input" },
+    });
+    const intent = yield* makeWorkflowResultOutbox(sql).next(binding.threadId);
+    assert.isNotNull(intent);
+    const descriptor = {
+      jobId: binding.jobId,
+      checkpointId: checkpoint.checkpointId,
+      checkpointGeneration: 0,
+      publicationId: intent!.publicationId,
+      publicationRevision: intent!.revision,
+    };
+    yield* Effect.flip(fences.beginDrain({ ...move, workflowCheckpoint: descriptor }));
+    yield* sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE publication_id=${descriptor.publicationId}`;
+    const proof = yield* requireWorkflowVmLifecycleCheckpoint(sql, {
+      ...move,
+      workflowCheckpoint: descriptor,
+    });
+    assert.isTrue(proof.beforeAgent);
+    yield* Effect.flip(
+      fences.beginDrain({
+        ...move,
+        workflowCheckpoint: { ...descriptor, checkpointGeneration: 1 },
+      }),
+    );
+    yield* fences.beginDrain({ ...move, workflowCheckpoint: descriptor });
+    assert.equal(yield* fences.freeze({ ...move, workflowCheckpoint: descriptor }), 0);
+    yield* fences.activate({ ...move, workflowCheckpoint: descriptor });
+    assert.isTrue(yield* store.isVmFenceActive(binding));
+  }).pipe(Effect.provide(Layer.mergeAll(SqlitePersistenceMemory, NodeServices.layer))),
 );
 
 it.effect(

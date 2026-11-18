@@ -329,13 +329,23 @@ describe("workflow result location navigation", () => {
     expect(approval.props.disabled).toBe(true);
   });
 
-  it("shows a queued VM approval as pending before the guest acknowledges it", async () => {
+  it.each([
+    ["paused", "Workflow VM paused"],
+    ["waiting_capacity", "Waiting for a VM slot"],
+  ] as const)("shows a queued VM approval as pending while %s", async (state, title) => {
     fixture.call.mockResolvedValue({
       ...vmReview,
       responsePending: true,
       pendingResponseOperation: "approve",
+      vmRecovery: { state },
     });
     await mount(false);
+    const content = text(renderer!.toJSON());
+    expect(content).toContain(title);
+    expect(content).toContain("The response is queued");
+    expect(content).toContain("Saved results");
+    expect(content).not.toContain("waiting for the environment");
+    expect(fixture.open).not.toHaveBeenCalled();
     const approval = renderer!.root
       .findAllByType("button")
       .find((button) => button.props.children === "Approval pending")!;
@@ -343,8 +353,10 @@ describe("workflow result location navigation", () => {
   });
 
   it("refreshes a matching saved checkpoint before enabling approval", async () => {
-    fixture.call.mockResolvedValue(vmReview);
+    const sleepingReview = { ...vmReview, vmRecovery: { state: "paused" as const } };
+    fixture.call.mockResolvedValue(sleepingReview);
     await mount(false);
+    expect(text(renderer!.toJSON())).toContain("Workflow VM paused");
     await act(() => {
       beginWorkflowReview(appAtomRegistry, scope, "job", "saved-visit", {
         checkpointId: "checkpoint",
@@ -383,10 +395,11 @@ describe("workflow result location navigation", () => {
     expect(approval().props.disabled).toBe(true);
     expect(text(renderer!.toJSON())).toContain("Checking the current review");
     await act(async () => {
-      reply.resolve(vmReview);
+      reply.resolve(sleepingReview);
       await reply.promise;
     });
     expect(approval().props.disabled).toBe(false);
+    expect(fixture.open).not.toHaveBeenCalled();
   });
 
   it("opens conversation and the original saved turn at the current destination", async () => {
@@ -1999,6 +2012,10 @@ describe("workflow run outcomes", () => {
     ],
     ["Saving step result", savingAgentResult("saving"), "Agent"],
     ["Couldn’t save step result", savingAgentResult("failed"), "Agent"],
+    [
+      "Workflow VM recovery needs attention",
+      { ...vmAwaitingReview, vmRecovery: { state: "recovery_error" } },
+    ],
     ["Finishing", finishing(false)],
     ["Completion blocked", finishing(true)],
     [
@@ -2239,6 +2256,23 @@ describe("workflow cancellation", () => {
       retryableCancellation: true,
     },
   };
+
+  it("keeps the unresolved VM recovery warning visible during cancellation", async () => {
+    const recoveryDetail =
+      "Launchpad couldn’t confirm the VM resume. Saved results are still available.";
+    fixture.call.mockResolvedValue({
+      ...running,
+      status: "cancelling",
+      progress: { ...running.progress!, status: "cancelling" },
+      vmRecovery: { state: "recovery_error", detail: recoveryDetail },
+    });
+    await mount(false);
+
+    const rendered = text(renderer!.toJSON());
+    expect(rendered).toContain("Canceling run");
+    expect(rendered).toContain(recoveryDetail);
+    expect(findButton("Retry cancellation")).toBeUndefined();
+  });
 
   it("closes confirmation when the viewer loses permission while it is open", async () => {
     fixture.call.mockResolvedValue(running);

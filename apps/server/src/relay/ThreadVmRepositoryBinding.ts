@@ -13,6 +13,7 @@ import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
 import { ServerEnvironmentIdentity } from "../environment/ServerEnvironment.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { make as makeCheckoutAccess } from "../workspace/CheckoutAccess.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
@@ -207,6 +208,8 @@ export const configureThreadVmRepository = Effect.fn("ThreadVmRepositoryBinding.
         THREAD_VM_REPOSITORY_BINDING_SECRET,
         new TextEncoder().encode(encode(record)),
       );
+    // Workflow Git credentials stay in the isolated runner's broker.
+    if (yield* WorkflowVmGuest) return { metadataPending: remote?.git?.status !== "ready" };
     const metadata: RelayThreadVmGitMetadata | undefined = remote?.git,
       metadataKey = encodeMetadata(metadata ?? null),
       rawSetup = yield* secrets.get(THREAD_VM_GIT_SETUP_SECRET),

@@ -31,6 +31,7 @@ import type {
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import type { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
@@ -174,6 +175,7 @@ export interface ProviderServiceShape {
     readonly threadId: ThreadId;
     readonly turnId: TurnId;
     readonly captureOperationId?: string;
+    readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
   }) => Effect.Effect<void, ProviderServiceError>;
 
   /**

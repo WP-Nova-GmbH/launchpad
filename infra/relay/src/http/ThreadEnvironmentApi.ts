@@ -32,6 +32,7 @@ import {
   RelayApi,
   RelayEnvironmentPrincipal,
   type RelayThreadPersistedReceipt,
+  type RelayThreadPlacement,
 } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
@@ -65,7 +66,7 @@ type Owner = {
  * Move destinations can hold the next generation before they become the owner. */
 export const authorizeThreadEnvironment = Effect.fnUntraced(function* (
   input: Owner,
-  placement: import("@t3tools/contracts/relay").RelayPortableThreadPlacement,
+  placement: Pick<RelayThreadPlacement, "organizationId" | "repositoryId" | "ownerUserId">,
   requireCurrentAccess: boolean,
 ) {
   const principal = yield* RelayEnvironmentPrincipal;
@@ -77,6 +78,8 @@ export const authorizeThreadEnvironment = Effect.fnUntraced(function* (
         WHERE credential_id = ${principal.credentialId} AND environment_id = ${principal.environmentId} AND environment_public_key = ${principal.environmentPublicKey}
         AND revoked_at IS NULL FOR SHARE`;
   if (!keys.length) return yield* tenancyNotFound("thread_not_found");
+  const workflow = placement.ownerUserId === null;
+  const allowDeleting = !requireCurrentAccess && !workflow;
   if (principal.threadVm) {
     if (
       principal.threadVm.threadId !== input.threadId ||
@@ -87,7 +90,11 @@ export const authorizeThreadEnvironment = Effect.fnUntraced(function* (
     // Match the binding writer's allocation-before-binding lock order.
     const allocations = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
               WHERE allocation_id = ${principal.threadVm.allocationId} AND thread_id = ${input.threadId}
-              AND deleted_at IS NULL AND (${!requireCurrentAccess} OR state <> 'deleting') FOR SHARE`;
+              AND deleted_at IS NULL AND (${allowDeleting} OR state <> 'deleting')
+              AND (${!workflow} OR (resource_kind='organization_workflow'
+                AND organization_id=${placement.organizationId}
+                AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions WHERE thread_id=${input.threadId})))
+              FOR SHARE`;
     if (!allocations.length) return yield* tenancyNotFound("thread_not_found");
     const bindings = yield* sql`SELECT b.environment_id FROM relay_thread_vm_bindings b
               JOIN relay_thread_vm_allocations a ON a.allocation_id = b.allocation_id
@@ -95,9 +102,10 @@ export const authorizeThreadEnvironment = Effect.fnUntraced(function* (
               AND b.credential_id = ${principal.credentialId} AND b.allocation_id = ${principal.threadVm.allocationId}
               AND b.thread_id = ${input.threadId} AND a.thread_id = ${input.threadId} AND b.repository_id = ${placement.repositoryId}
               AND b.generation = ${input.generation} AND b.revoked_at IS NULL AND a.deleted_at IS NULL
-              AND (${!requireCurrentAccess} OR a.state <> 'deleting') FOR SHARE OF b`;
+              AND (${allowDeleting} OR a.state <> 'deleting') FOR SHARE OF b`;
     if (!bindings.length) return yield* tenancyNotFound("thread_not_found");
   } else {
+    if (workflow) return yield* tenancyNotFound("thread_not_found");
     const links = yield* sql`SELECT user_id FROM relay_environment_links
         WHERE environment_id = ${principal.environmentId} AND environment_public_key = ${principal.environmentPublicKey}
         AND user_id = ${placement.ownerUserId} AND revoked_at IS NULL FOR SHARE`;
@@ -110,10 +118,10 @@ export const authorizeThreadEnvironment = Effect.fnUntraced(function* (
   }
 });
 
-/** Acknowledgements may drain after access removal; new work always requires current owner access. */
+/** Workflow lifecycle callers check the exact pause or restore operation after authenticating the guest. */
 export const withEnvironmentThread = <A, E, R>(
   input: Owner,
-  requireCurrentAccess: boolean,
+  access: boolean | "workflow-lifecycle",
   action: Effect.Effect<A, E, R>,
 ) =>
   Effect.gen(function* () {
@@ -127,18 +135,23 @@ export const withEnvironmentThread = <A, E, R>(
           const rows = yield* sql`SELECT thread_id FROM relay_thread_placements
         WHERE thread_id = ${input.threadId} AND environment_id = ${principal.environmentId} FOR UPDATE`;
           if (!rows.length) return yield* tenancyNotFound("thread_not_found");
-          const placement = yield* makeThreadPlacementStore(sql).get(input.threadId);
+          const store = makeThreadPlacementStore(sql);
+          const placement = yield* access === "workflow-lifecycle"
+            ? store.getAny(input.threadId)
+            : store.get(input.threadId);
           if (!placement || placement.generation !== input.generation)
             return yield* tenancyConflict("thread_placement_changed");
-          yield* authorizeThreadEnvironment(input, placement, requireCurrentAccess);
-          return yield* requireCurrentAccess
-            ? withPrivateThreadOwnerAccess(
-                input.threadId,
-                "write",
-                placement.ownerUserId,
-                () => action,
-              )
-            : action;
+          yield* authorizeThreadEnvironment(input, placement, access === true);
+          if (access === true) {
+            if (placement.ownerUserId === null) return yield* tenancyNotFound("thread_not_found");
+            return yield* withPrivateThreadOwnerAccess(
+              input.threadId,
+              "write",
+              placement.ownerUserId,
+              () => action,
+            );
+          }
+          return yield* action;
         }),
       )
       .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
@@ -480,7 +493,7 @@ export const completePortableThreadWork = Effect.fn("relay.api.thread_environmen
     const sql = (yield* RelayDb).$client;
     yield* Effect.gen(function* () {
       if (yield* isWorkflowVmThread(sql, input.threadId))
-        return yield* withWorkflowVmGuest(input, "active", ({ binding }) =>
+        return yield* withWorkflowVmGuest(input, "enrolled", ({ binding }) =>
           makeThreadPlacementStore(sql).completeWork(input, binding.jobId),
         );
       return yield* withEnvironmentThread(
@@ -641,13 +654,14 @@ const serializePause = (pause: ThreadVmPauseRecovery) => ({
   nativeCheckpointOperationId: pause.nativeCheckpointOperationId,
   canActivate: pause.canActivate,
   sourceReopened: pause.sourceReopened,
+  ...(pause.workflowCheckpoint ? { workflowCheckpoint: pause.workflowCheckpoint } : {}),
 });
 export const getThreadVmPause = Effect.fn("relay.api.thread_vm.pause.get")(function* (
   input: Owner,
 ) {
   return yield* withEnvironmentThread(
     input,
-    false,
+    "workflow-lifecycle",
     Effect.gen(function* () {
       const principal = yield* RelayEnvironmentPrincipal;
       if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");
@@ -665,14 +679,16 @@ export const freezeThreadVmPause = Effect.fn("relay.api.thread_vm.pause.freeze")
   function* (
     input: Owner & {
       operationId: string;
-      nativeCheckpointOperationId: string;
+      nativeCheckpointOperationId: string | null;
+      workflowCheckpoint?: import("@t3tools/contracts/relay").RelayThreadVmWorkflowCheckpoint;
+      sourceSequence?: number;
       bootId: string;
       sealEpoch: number;
     },
   ) {
     return yield* withEnvironmentThread(
       input,
-      false,
+      "workflow-lifecycle",
       Effect.gen(function* () {
         const principal = yield* RelayEnvironmentPrincipal;
         if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");
@@ -702,7 +718,7 @@ export const confirmThreadVmPauseActivation = Effect.fn("relay.api.thread_vm.pau
   function* (input: Owner & { operationId: string }) {
     return yield* withEnvironmentThread(
       input,
-      false,
+      "workflow-lifecycle",
       Effect.gen(function* () {
         const principal = yield* RelayEnvironmentPrincipal;
         if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");
@@ -730,7 +746,7 @@ export const cancelThreadVmPause = Effect.fn("relay.api.thread_vm.pause.cancel")
   function* (input: Owner & { operationId: string }) {
     return yield* withEnvironmentThread(
       input,
-      false,
+      "workflow-lifecycle",
       Effect.gen(function* () {
         const principal = yield* RelayEnvironmentPrincipal;
         if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");

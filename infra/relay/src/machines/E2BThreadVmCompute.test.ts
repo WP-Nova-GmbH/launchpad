@@ -341,6 +341,7 @@ describe("E2B thread VM compute", () => {
         expect.objectContaining({
           mode: "full",
           name: "capture-1",
+          requestTimeoutMs: 120_000,
           retries: 0,
         }),
       );
@@ -358,6 +359,7 @@ describe("E2B thread VM compute", () => {
         "sandbox-1",
         expect.objectContaining({
           mode: "full",
+          requestTimeoutMs: 60_000,
           retries: 0,
         }),
       );

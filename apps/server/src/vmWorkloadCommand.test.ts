@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
@@ -13,6 +14,7 @@ import {
   makeVmWorkloadSpawner,
   VmControlSpawner,
   VmCoordinatorProcess,
+  vmWorkloadCommand,
   withVmWorkloads,
 } from "./vmWorkloadCommand.ts";
 
@@ -113,6 +115,95 @@ it.effect("keeps detached workloads when the isolated command leader already exi
       .spawn(ChildProcess.make("/bin/true"))
       .pipe(Effect.scoped);
     assert.equal(spawns, 1);
+  }),
+);
+
+const codexProbe = () => {
+  const launch = vmWorkloadCommand("codex", ["app-server"], "probe");
+  return { ...launch, command: ChildProcess.make(launch.command, launch.args) };
+};
+
+it.effect("a timed-out Codex probe waits for the exact cgroup after the launcher exits", () =>
+  Effect.gen(function* () {
+    const { command, workloadId } = codexProbe();
+    const started = yield* Deferred.make<void>();
+    const exit = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
+    let stops = 0;
+    const raw = ChildProcessSpawner.make(
+      Effect.fnUntraced(function* (command) {
+        if (!ChildProcess.isStandardCommand(command)) return yield* Effect.die("Unexpected pipe");
+        if (command.args[0] === "run-workflow") {
+          return handle(
+            42,
+            Deferred.await(exit),
+            Deferred.isDone(exit).pipe(Effect.map((done) => !done)),
+          );
+        }
+        assert.deepEqual(command.args, ["stop-workflow-probe", workloadId, "42"]);
+        const status = ["missing", "busy", "stopped"][stops++];
+        assert.isDefined(status);
+        if (status === "missing") yield* Deferred.succeed(exit, ChildProcessSpawner.ExitCode(0));
+        return handle(
+          77,
+          Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          Effect.succeed(false),
+          Stream.make(new TextEncoder().encode(`{"status":"${status}"}`)),
+        );
+      }),
+    );
+    const probe = yield* makeVmWorkloadSpawner(raw, true)
+      .spawn(command)
+      .pipe(
+        Effect.andThen(Deferred.succeed(started, undefined)),
+        Effect.andThen(Effect.never),
+        Effect.scoped,
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild,
+      );
+    yield* Deferred.await(started);
+    yield* TestClock.adjust("1 second");
+    yield* TestClock.adjust("200 millis");
+    assert.isTrue(Option.isNone(yield* Fiber.join(probe)));
+    assert.equal(stops, 3);
+  }),
+);
+
+it.effect("interruption after spawning a Codex probe still installs its cgroup cleanup", () =>
+  Effect.gen(function* () {
+    const { command, workloadId } = codexProbe();
+    const started = yield* Deferred.make<void>();
+    const releaseHandle = yield* Deferred.make<void>();
+    let stopped = false;
+    const raw = ChildProcessSpawner.make(
+      Effect.fnUntraced(function* (command) {
+        if (!ChildProcess.isStandardCommand(command)) return yield* Effect.die("Unexpected pipe");
+        if (command.args[0] === "run-workflow") {
+          yield* Deferred.succeed(started, undefined);
+          yield* Deferred.await(releaseHandle);
+          return handle(42, Effect.never, Effect.succeed(true));
+        }
+        assert.deepEqual(command.args, ["stop-workflow-probe", workloadId, "42"]);
+        stopped = true;
+        return handle(
+          77,
+          Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+          Effect.succeed(false),
+          Stream.make(new TextEncoder().encode('{"status":"stopped"}')),
+        );
+      }),
+    );
+    const probe = yield* makeVmWorkloadSpawner(raw, true)
+      .spawn(command)
+      .pipe(
+        Effect.andThen(Effect.die("Interrupted probe must not initialize")),
+        Effect.scoped,
+        Effect.forkChild,
+      );
+    yield* Deferred.await(started);
+    probe.interruptUnsafe();
+    yield* Deferred.succeed(releaseHandle, undefined);
+    yield* Fiber.await(probe);
+    assert.isTrue(stopped);
   }),
 );
 

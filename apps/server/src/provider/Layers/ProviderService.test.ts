@@ -10768,6 +10768,121 @@ const makeWorkflowCaptureFixture = Effect.fnUntraced(function* (
 });
 const workflowCaptureFixture = makeWorkflowCaptureFixture();
 
+it.effect("only copies a stopped workflow's native checkpoint for its exact frozen Review", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* workflowCaptureFixture;
+      const path = yield* Path.Path;
+      const turnId = asTurnId("turn-1");
+      yield* makeThreadNativeCheckpoint(f.sql).capture(
+        { threadId: f.binding.threadId, turnId, artifactRoot: path.join(f.root, "checkpoints") },
+        Effect.fnUntraced(function* (stage) {
+          const directory = path.join(stage, "conversation");
+          yield* f.fs.makeDirectory(directory);
+          yield* f.fs.writeFileString(path.join(directory, "manifest.json"), "{}");
+          yield* f.fs.copyFile(f.rollout, path.join(directory, "rollout.jsonl"));
+          return { directory, nativeThreadId: nativeIdForCheckpoint };
+        }),
+      );
+      yield* f.sql`INSERT INTO provider_session_runtime (
+        thread_id, provider_name, provider_instance_id, adapter_key, runtime_mode, status, last_seen_at,
+        resume_cursor_json, runtime_payload_json
+      ) VALUES (${f.binding.threadId},'codex','codex','codex','full-access','stopped',
+        ${f.run.createdAt},${encodeJson({ threadId: nativeIdForCheckpoint, resumePolicy: "require-existing" })},
+        ${encodeJson({
+          stoppedRuntimeEventsDrained: true,
+          providerContinuation: {
+            ...f.run.providerContinuation,
+            workflowJobId: f.binding.jobId,
+            runtimeEpisode: "previous-episode",
+          },
+        })}
+      )`;
+      const checkpoint = {
+        checkpointId: "review-checkpoint",
+        kind: "review" as const,
+        stepId: "review",
+        generation: 0,
+        role: "maintainer" as const,
+        turnId,
+        checkpointRef: "refs/t3/review",
+        checkpointTurnCount: 1,
+      };
+      yield* f.store.save({
+        ...f.run,
+        workflow: {
+          ...f.run.workflow,
+          definition: {
+            ...f.run.workflow.definition,
+            steps: [
+              f.run.workflow.definition.steps[0]!,
+              { kind: "review", id: "review", title: "Review", role: "maintainer" },
+            ],
+          },
+        },
+        sequence: {
+          cursor: 1,
+          generation: 0,
+          started: true,
+          stepStartedAt: f.run.createdAt,
+          completed: [
+            {
+              stepId: f.run.workflow.definition.steps[0]!.id,
+              generation: 0,
+              checkpoint,
+              head: null,
+            },
+          ],
+          responses: [],
+          feedback: null,
+        },
+        executionReserved: false,
+        progress: {
+          ...f.run.progress,
+          revision: f.run.progress.revision + 1,
+          status: "awaiting_review",
+          checkpoint,
+        },
+      });
+      yield* f.sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${f.binding.jobId}`;
+      const [publication] = yield* f.sql<{ id: string; revision: number; sourceSequence: number }>`
+        SELECT publication_id AS id,revision,source_sequence AS "sourceSequence"
+        FROM workflow_result_outbox WHERE job_id=${f.binding.jobId} ORDER BY revision DESC LIMIT 1`;
+      assert.isDefined(publication);
+      const operationId = NodeCrypto.randomUUID();
+      yield* f.sql`UPDATE thread_execution_fences SET operation_id=${operationId},phase='frozen',
+        frozen_sequence=${publication!.sourceSequence} WHERE thread_id=${f.binding.threadId}`;
+      const input = { threadId: f.binding.threadId, turnId, captureOperationId: operationId };
+      const descriptor = {
+        jobId: f.binding.jobId,
+        checkpointId: checkpoint.checkpointId,
+        checkpointGeneration: 0,
+        publicationId: publication!.id,
+        publicationRevision: publication!.revision,
+      };
+      yield* Effect.flip(f.provider.checkpointConversation!(input));
+      yield* Effect.flip(
+        f.provider.checkpointConversation!({
+          ...input,
+          workflowCheckpoint: { ...descriptor, checkpointId: "stale" },
+        }),
+      );
+      yield* f.provider.checkpointConversation!({ ...input, workflowCheckpoint: descriptor });
+      assert.lengthOf(
+        yield* f.sql`SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${input.threadId}
+        AND capture_operation_id=${operationId}`,
+        1,
+      );
+      assert.lengthOf(
+        yield* f.sql`SELECT 1 FROM thread_attachment_checkpoints WHERE thread_id=${input.threadId}
+        AND checkpoint_id=${`frozen:${operationId}`}`,
+        1,
+      );
+      assert.deepEqual(f.counts(), { opens: 0, sends: 0, closes: 0 });
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "captures native and attachment prerequisites through the real workflow VM provider path",
   () =>
@@ -11107,6 +11222,7 @@ import { makeThreadJournalStore } from "../../../../../infra/relay/src/threads/T
 import { makeLocalThreadArtifactObjects } from "../../../../../infra/relay/src/threads/ThreadArtifactLocalObjects.ts";
 import { makeThreadArtifactTransfer } from "../../../../../infra/relay/src/threads/ThreadArtifactTransfer.ts";
 import { makeThreadNativeCheckpointStore } from "../../../../../infra/relay/src/threads/ThreadNativeCheckpointStore.ts";
+import { makeThreadNativeCheckpoint } from "../../relay/ThreadNativeCheckpoint.ts";
 import { makeThreadAttachmentCheckpointStore } from "../../../../../infra/relay/src/threads/ThreadAttachmentCheckpointStore.ts";
 import { makeWorkflowResults } from "../../../../../infra/relay/src/jobs/WorkflowResults.ts";
 import {

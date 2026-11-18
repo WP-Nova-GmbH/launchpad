@@ -29,7 +29,7 @@ import {
 } from "../threads/ThreadVmEnrollmentStore.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { withPrivateThreadOwnerAccess } from "./privateThreadAccess.ts";
-import { withPreparingWorkflowVm } from "../threads/ThreadVmWorkflowAccess.ts";
+import { makeThreadVmRestoreEnrollmentStore } from "../threads/ThreadVmRestoreEnrollmentStore.ts";
 
 const invalid = () => new ThreadVmEnrollmentInvalid();
 const decodeProof = Schema.decodeUnknownEffect(RelayThreadVmEnrollProofPayload);
@@ -99,7 +99,9 @@ export const enrollThreadVm = Effect.fn("relay.api.thread_vm.enroll")(
         }),
       );
     const response = yield* allocation.resourceKind === "organization_workflow"
-      ? withPreparingWorkflowVm(sql, input, (scope) => exchange(scope.codexConnectionId))
+      ? makeThreadVmRestoreEnrollmentStore(sql).withWorkflowEnrollment(input, (scope) =>
+          exchange(scope.codexConnectionId),
+        )
       : withPrivateThreadOwnerAccess(allocation.threadId, "read", allocation.ownerUserId, () =>
           exchange(),
         );

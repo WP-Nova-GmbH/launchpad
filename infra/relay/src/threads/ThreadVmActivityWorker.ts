@@ -11,6 +11,7 @@ type Inspect = (
     readonly operationId: string;
     readonly templateId: string;
     readonly environmentId: string;
+    readonly workflowCheckpoint?: boolean;
     readonly scope: {
       readonly allocationId: string;
       readonly threadId: ReturnType<typeof ThreadId.make>;
@@ -35,6 +36,7 @@ interface Candidate {
   readonly threadId: string;
   readonly repositoryId: string;
   readonly generation: number;
+  readonly workflowCheckpoint: boolean;
 }
 
 /** Only a current running binding can supply a fresh idle report. Failed reads remain unknown. */
@@ -52,10 +54,10 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
         JOIN relay_thread_vm_allocations a USING(allocation_id)
         JOIN relay_thread_placements t ON t.thread_id=a.thread_id
         JOIN relay_thread_vm_bindings b USING(allocation_id)
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.state='paused' AND a.deleted_at IS NULL AND v.idle_since IS NULL
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.workflow_checkpoint IS NOT NULL)) AND a.state='paused' AND a.deleted_at IS NULL AND v.idle_since IS NULL
           AND x.phase='completed' AND x.generation=t.generation AND b.generation=t.generation
           AND b.environment_id=t.environment_id AND b.revoked_at IS NULL AND t.operation_id IS NULL
-          AND x.native_checkpoint_operation_id IS NOT NULL AND x.source_frozen_at IS NOT NULL
+          AND x.source_frozen_at IS NOT NULL
           AND x.source_reopened_at IS NULL AND EXISTS (SELECT 1 FROM relay_thread_vm_capacity c
             WHERE c.allocation_id=a.allocation_id AND c.host_id=${hostId} AND c.state='released')
         ORDER BY a.allocation_id LIMIT 1 FOR UPDATE OF t SKIP LOCKED`;
@@ -74,7 +76,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
     if (repaired) return true;
     const [row] = yield* sql<Candidate>`SELECT a.allocation_id AS "allocationId",
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
-      b.environment_id AS "environmentId", a.thread_id AS "threadId", b.repository_id AS "repositoryId", p.generation
+      b.environment_id AS "environmentId", a.thread_id AS "threadId", b.repository_id AS "repositoryId", p.generation, (a.resource_kind='organization_workflow') AS "workflowCheckpoint"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id AND c.state = 'started'
@@ -82,7 +84,9 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
       LEFT JOIN relay_thread_vm_activity v ON v.allocation_id = a.allocation_id
-      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
+      WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow'
+        AND EXISTS(SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id
+          AND j.status IN ('awaiting_review','awaiting_input')))) AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
         AND a.deleted_at IS NULL AND p.phase = 'created' AND s.phase = 'ready'
         AND b.revoked_at IS NULL AND b.generation = p.generation
         AND t.environment_id = b.environment_id AND t.generation = p.generation
@@ -93,13 +97,14 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       ORDER BY v.observed_at ASC NULLS FIRST, a.allocation_id LIMIT 1`;
     if (!row) return false;
     const revision = yield* activity
-      .beginInspection(row.allocationId)
+      .beginInspection(row.allocationId, row.workflowCheckpoint)
       .pipe(Effect.catchTag("ThreadVmActivityConflict", () => Effect.succeed(null)));
     if (revision === null) return true;
     const inspected = yield* inspect(row.computeRef, {
       operationId: row.operationId,
       templateId: row.templateId,
       environmentId: row.environmentId,
+      ...(row.workflowCheckpoint ? { workflowCheckpoint: true } : {}),
       scope: {
         allocationId: row.allocationId,
         threadId: ThreadId.make(row.threadId),
@@ -130,7 +135,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
-      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
+      WHERE a.runtime_protocol='native-v1' AND a.resource_kind IN ('personal','organization_workflow') AND a.allocation_id = ${row.allocationId} AND a.compute_ref = ${row.computeRef}
         AND a.state = 'running' AND a.deleted_at IS NULL AND p.operation_id = ${row.operationId}
         AND p.generation = ${row.generation} AND b.generation = p.generation
         AND b.revoked_at IS NULL AND t.environment_id = b.environment_id
@@ -140,6 +145,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
         .finishInspection({
           allocationId: row.allocationId,
           revision,
+          workflowCheckpoint: row.workflowCheckpoint,
           activity: result,
           inactiveWorkIds: result === "idle" ? [...inactive] : [],
         })

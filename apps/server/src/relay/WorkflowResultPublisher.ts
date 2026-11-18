@@ -215,6 +215,7 @@ export function makeWorkflowResultPublisher(
         sourceSequence,
         nativeCheckpointOperationId: nativeOperationId,
         result,
+        supportsVmCheckpointRecovery: true,
       };
       const encoded = encodeManifest(manifest);
       yield* materialize(intent.manifestArtifactId, encoded);

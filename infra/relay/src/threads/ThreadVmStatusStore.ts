@@ -42,7 +42,7 @@ export function makeThreadVmStatusStore(sql: PgClient) {
       lastVerifiedBackupAt: string | null;
       finalSaveOperationId: string | null;
       finalSavePhase: "draining" | "frozen" | "saving" | "deleting" | "aborting" | null;
-      finalSaveReason: "idle" | "replacement" | null;
+      finalSaveReason: "idle" | "replacement" | "source_loss" | null;
       finalSaveErrorCode: string | null;
       restoreOperationId: string | null;
       restorePhase: RelayThreadVmRestorePhase | null;

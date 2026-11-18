@@ -1,5 +1,8 @@
 import { isTerminalWorkflowJob, type RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
-import { workflowApprovalPending } from "@t3tools/client-runtime/relay/workflow-responses";
+import {
+  workflowApprovalPending,
+  workflowVmRecoveryDisplay,
+} from "@t3tools/client-runtime/relay/workflow-responses";
 import {
   workflowStatusLabel,
   workflowStepState,
@@ -39,6 +42,10 @@ function workflowProgressStatus(job: RepositoryWorkflowJob, recovery?: WorkflowR
       label: pendingManualControl.operation === "pause" ? "Pause requested" : "Resume requested",
     };
   }
+
+  const vmRecovery = workflowVmRecoveryDisplay(job.vmRecovery);
+  if (vmRecovery?.warning) return { ...attentionStep, label: vmRecovery.title };
+  if (vmRecovery?.pending) return { ...waitingStep, label: vmRecovery.title };
 
   if (recovery && status !== "paused") {
     return { ...(recovery.blocked ? attentionStep : activeStep), label: recovery.title };

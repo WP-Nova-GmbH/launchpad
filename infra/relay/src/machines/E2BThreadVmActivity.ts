@@ -10,11 +10,12 @@ const Inventory = Schema.Struct({
   bootId: Schema.String,
   sealedBy: Schema.NullOr(Schema.String),
   stopped: Schema.Boolean,
+  recoverable: Schema.optionalKey(Schema.Literal(true)),
   groups: Schema.Array(
     Schema.Struct({
       id: Schema.String,
       bootId: Schema.String,
-      kind: Schema.Literals(["process", "provider", "terminal", "transfer"]),
+      kind: Schema.Literals(["process", "provider", "terminal", "transfer", "probe"]),
     }),
   ),
 });
@@ -59,7 +60,7 @@ const Activity = Schema.Struct({
 const decodeActivity = Schema.decodeUnknownSync(Schema.fromJsonString(Activity));
 
 /** An idle terminal shell needs a separate process/PTY signal; do not guess from its cgroup. */
-export function classifyThreadVmActivity(inventory: Inventory) {
+export function classifyThreadVmActivity(inventory: Inventory, workflowCheckpoint = false) {
   if (
     inventory.stopped !== (inventory.groups.length === 0) ||
     inventory.groups.some((group) => group.bootId !== inventory.bootId) ||
@@ -67,17 +68,31 @@ export function classifyThreadVmActivity(inventory: Inventory) {
     inventory.sealedBy !== null
   )
     return "unknown" as const;
+  if (workflowCheckpoint)
+    return inventory.recoverable === true &&
+      inventory.groups.length <= 1 &&
+      inventory.groups.every((group) => group.kind === "terminal")
+      ? ("idle" as const)
+      : ("unknown" as const);
   if (inventory.groups.some((group) => group.kind !== "terminal")) return "busy" as const;
   return inventory.groups.length === 0 ? ("idle" as const) : ("unknown" as const);
 }
 
-type InspectGuest = (connection: ConstructorParameters<typeof Sandbox>[0]) => Promise<string>;
-const inspectGuest: InspectGuest = async (connection) => {
+type InspectGuest = (
+  connection: ConstructorParameters<typeof Sandbox>[0],
+  workflowCheckpoint: boolean,
+) => Promise<string>;
+const inspectGuest: InspectGuest = async (connection, workflowCheckpoint) => {
   const vm = new Sandbox(connection);
-  const result = await vm.commands.run("/opt/launchpad/bin/launchpad-activity", {
-    user: "user",
-    timeoutMs: 10_000,
-  });
+  const result = await vm.commands.run(
+    workflowCheckpoint
+      ? "/opt/launchpad/bin/launchpad-activity --workflow"
+      : "/opt/launchpad/bin/launchpad-activity",
+    {
+      user: "user",
+      timeoutMs: 10_000,
+    },
+  );
   if (result.exitCode !== 0) throw new Error("VM workload inventory is unavailable");
   return result.stdout;
 };
@@ -92,6 +107,7 @@ export function makeE2BThreadVmActivity(
     sandboxId: string,
     identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId"> & {
       readonly environmentId: string;
+      readonly workflowCheckpoint?: boolean;
     },
   ) {
     return yield* Effect.tryPromise({
@@ -103,7 +119,9 @@ export function makeE2BThreadVmActivity(
           transport,
           signal,
         );
-        const { workloads, projection } = decodeActivity(await guest(connection));
+        const { workloads, projection } = decodeActivity(
+          await guest(connection, identity.workflowCheckpoint === true),
+        );
         if (
           projection.environmentId !== identity.environmentId ||
           projection.threadId !== identity.scope.threadId ||
@@ -111,7 +129,7 @@ export function makeE2BThreadVmActivity(
           projection.phase !== "active"
         )
           return "unknown" as const;
-        const processActivity = classifyThreadVmActivity(workloads);
+        const processActivity = classifyThreadVmActivity(workloads, identity.workflowCheckpoint);
         if (processActivity === "unknown") return processActivity;
         if (
           projection.unfinished ||

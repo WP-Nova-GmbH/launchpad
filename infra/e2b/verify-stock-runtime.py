@@ -200,15 +200,16 @@ def verify_host(receipt, policy_sha256, running, host_root=Path("/")):
                 raise ValueError("Native workloads remain without their orchestrator; recover the owning deployment before startup")
 
 
-def verify_exclusive_host(receipt):
+def verify_exclusive_host(receipt, configuration):
     ids = run("docker", "ps", "--no-trunc", "--quiet", "--filter", "label=com.docker.compose.service=orchestrator").split()
     if any(not re.fullmatch(r"[a-f0-9]{64}", value) for value in ids):
         raise ValueError("Native host inventory is unconfirmed")
     if not ids:
-        return False
+        return None
     containers = json.loads(run("docker", "inspect", *ids))
     if len(containers) != len(ids) or {item["Id"] for item in containers} != set(ids):
         raise ValueError("Native host inventory changed")
+    expected_timeout = configuration["services"]["orchestrator"].get("environment", {}).get("ENVD_TIMEOUT") or "10s"
     for item in containers:
         config = item["Config"]
         namespace = item.get("HostConfig", {})
@@ -216,6 +217,8 @@ def verify_exclusive_host(receipt):
         labels = config.get("Labels") or {}
         if labels.get("com.docker.compose.project") != receipt["composeProject"]:
             raise ValueError("Another E2B deployment is running; no containers were stopped or modified")
+        if item.get("State", {}).get("Running") is not True:
+            raise ValueError("Native host inventory changed")
         if (item["Image"] != receipt["images"]["tools"]["id"]
                 or config.get("Cmd") != ["/bin/bash", "/opt/e2b/scripts/orchestrator-launch.sh"]
                 or config.get("Entrypoint") not in (None, [])
@@ -225,7 +228,11 @@ def verify_exclusive_host(receipt):
                 or environment.get("OL_CGROUP_ROOT", "/sys/fs/cgroup/e2b") != "/sys/fs/cgroup/e2b"
                 or environment.get("ORCHESTRATOR_SERVICES") != "orchestrator,template-manager"):
             raise ValueError("The running deployment differs from this stock receipt; stop it explicitly before changing runtimes")
-    return True
+        if (environment.get("ENVD_TIMEOUT") or "10s") != expected_timeout:
+            raise ValueError("The running orchestrator's ENVD_TIMEOUT differs from the verified Compose configuration")
+    if len(ids) != 1:
+        raise ValueError("Expected exactly one running stock orchestrator")
+    return ids[0]
 
 
 def verify_kernel(configuration, host_root=Path("/")):
@@ -281,8 +288,8 @@ def verify(directory, policy_sha256, start=False):
     configuration = json.loads(run(*command, "--profile", "*", "config", "--format", "json"))
     verify_configuration(receipt, configuration)
     verify_maintenance(directory, receipt)
-    running = verify_exclusive_host(receipt)
-    verify_host(receipt, policy_sha256, running)
+    running = verify_exclusive_host(receipt, configuration)
+    verify_host(receipt, policy_sha256, bool(running))
     if running or not start:
         verify_kernel(configuration)
     elif start:
@@ -297,8 +304,8 @@ def verify(directory, policy_sha256, start=False):
         configuration = json.loads(run(*command, "--profile", "*", "config", "--format", "json"))
         verify_configuration(receipt, configuration)
         verify_maintenance(directory, receipt)
-        running = verify_exclusive_host(receipt)
-        verify_host(receipt, policy_sha256, running)
+        running = verify_exclusive_host(receipt, configuration)
+        verify_host(receipt, policy_sha256, bool(running))
         verify_kernel(configuration)
         if start:
             print("[vm-host] Starting the selected native database and seed…", flush=True)
@@ -315,7 +322,11 @@ def verify(directory, policy_sha256, start=False):
             # Setup/fetch above have their own lock; never recurse into them
             # through dependencies while holding the physical collector lock.
             run(*command, "up", "--no-build", "--no-deps", "-d", "--wait", "vector")
-            run(*command, "up", "--no-build", "--no-deps", "-d", "--wait", "orchestrator")
+            preserve_running = ("--no-recreate",) if running else ()
+            run(*command, "up", "--no-build", "--no-deps", "-d", "--wait", *preserve_running, "orchestrator")
+            started = verify_exclusive_host(receipt, configuration)
+            if not started or (running and started != running):
+                raise ValueError("The expected stock orchestrator is not running after Compose startup")
             run(*command, "up", "--no-build", "--no-deps", "-d", "--wait", "api", "client-proxy", "dashboard-api")
 
 

@@ -17,18 +17,17 @@ const Identifier = Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u));
 const BootId = Schema.String.check(
   Schema.isPattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u),
 );
+const VmWorkloadGroup = Schema.Struct({
+  id: Identifier,
+  bootId: BootId,
+  kind: Schema.Literals(["process", "provider", "terminal", "transfer", "probe"]),
+  leaderPid: Schema.Int.check(Schema.isGreaterThan(0)),
+});
 export const VmWorkloadInventory = Schema.Struct({
   bootId: BootId,
   epoch: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   sealedBy: Schema.NullOr(Identifier),
-  groups: Schema.Array(
-    Schema.Struct({
-      id: Identifier,
-      bootId: BootId,
-      kind: Schema.Literals(["process", "provider", "terminal", "transfer"]),
-      leaderPid: Schema.Int.check(Schema.isGreaterThan(0)),
-    }),
-  ),
+  groups: Schema.Array(VmWorkloadGroup),
   stopped: Schema.Boolean,
 });
 export class VmWorkloadError extends Schema.TaggedError<VmWorkloadError>()("VmWorkloadError", {
@@ -69,7 +68,25 @@ const decodeHarnessPeer = Schema.decodeEffect(
 );
 const decodeWorkflowRecovery = Schema.decodeEffect(
   Schema.fromJsonString(
-    Schema.Struct({ ...VmWorkloadInventory.fields, recoverable: Schema.Literal(true) }),
+    Schema.Struct({
+      ...VmWorkloadInventory.fields,
+      groups: Schema.Array(
+        Schema.Struct({
+          ...VmWorkloadGroup.fields,
+          startTicks: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9]{1,20}$/u))),
+        }),
+      ),
+      recoverable: Schema.Literal(true),
+    }),
+  ),
+);
+const decodeWorkflowSetupStop = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      owned: Schema.Literal(true),
+      fullStop: Schema.Literal(true),
+      identity: Schema.Null,
+    }),
   ),
 );
 export type VmHarnessStop = typeof VmHarnessStop.Type;
@@ -94,8 +111,8 @@ const harnessCommand = Effect.fn("VmWorkload.owned_harness")(function* (
     .run({
       command: "/opt/launchpad/bin/launchpad-workload",
       args,
-      // The identity helper hashes the pinned Codex executable on cold VM storage.
-      timeout: action === "provider-identity" ? "30 seconds" : "10 seconds",
+      // Leave time for the native identity helper's 55-second self-deadline.
+      timeout: action === "provider-identity" ? "60 seconds" : "10 seconds",
       maxOutputBytes: 4096,
     })
     .pipe(
@@ -116,7 +133,7 @@ const harnessCommand = Effect.fn("VmWorkload.owned_harness")(function* (
     );
   if (result.code !== 0)
     return yield* new VmWorkloadError({
-      reason: "command_exit",
+      reason: action === "provider-identity" && result.code === 124 ? "timeout" : "command_exit",
       action,
       ...(result.code !== null ? { exitCode: result.code } : {}),
     });
@@ -180,6 +197,25 @@ export const inspectWorkflowVmRecovery = Effect.fn("VmWorkload.inspect_workflow_
         action: "workflow-recovery-state",
       });
     return state;
+  },
+  Effect.mapError(harnessFailure),
+);
+
+/** Only the exact passive setup owner from the closed-script proof may be stopped. */
+export const stopPassiveWorkflowVmSetup = Effect.fn("VmWorkload.stop_passive_workflow_setup")(
+  function* () {
+    const state = yield* inspectWorkflowVmRecovery();
+    const group = state.groups[0];
+    if (state.groups.length > 1 || (group && !group.startTicks))
+      return yield* new VmWorkloadError({
+        reason: "identity_mismatch",
+        action: "workflow-setup-control",
+      });
+    if (!group) return;
+    const identity = `workflow-vm:${group.id}:${state.bootId}:${group.startTicks}`;
+    yield* decodeWorkflowSetupStop(
+      yield* harnessCommand(["workflow-setup-control", "stop", String(group.leaderPid), identity]),
+    );
   },
   Effect.mapError(harnessFailure),
 );
@@ -248,6 +284,7 @@ export const withSealedVmWorkloads = <A, E, R>(
   operationId: string,
   effect: Effect.Effect<A, E, R>,
   expected?: { readonly bootId: string; readonly epoch: number },
+  workflow = false,
 ) =>
   withVmWorkloadMaintenance(
     Effect.gen(function* () {
@@ -265,7 +302,7 @@ export const withSealedVmWorkloads = <A, E, R>(
         (expected && (before.bootId !== expected.bootId || before.epoch !== expected.epoch))
       )
         return yield* new VmWorkloadError();
-      const spawner = makeVmWorkloadSpawner(control);
+      const spawner = makeVmWorkloadSpawner(control, workflow);
       const runner = yield* ProcessRunner.make().pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
       );

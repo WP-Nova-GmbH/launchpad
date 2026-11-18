@@ -91,6 +91,7 @@ export const wakeQueuedThreadVm = Effect.fn("relay.thread_vm.wake_queued")(funct
       JOIN relay_thread_placements t USING(thread_id)
       JOIN relay_thread_vm_bindings b USING(allocation_id) LEFT JOIN relay_thread_vm_pauses x USING(allocation_id)
       WHERE a.thread_id=${threadId} AND a.state='paused' AND a.deleted_at IS NULL
+        AND a.resource_kind='personal' AND t.audience='private'
         AND b.environment_id=${placement.environmentId} AND b.generation=${placement.generation} AND b.revoked_at IS NULL
         AND ${threadVmResumePlacement(sql)}
         AND (a.native_paused_generation=${placement.generation} OR (x.phase='completed' AND x.generation=${placement.generation}))`;

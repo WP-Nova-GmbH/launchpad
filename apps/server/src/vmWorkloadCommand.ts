@@ -92,7 +92,7 @@ const absoluteWorkflowCwd = (cwd: string) =>
 export function vmWorkloadCommand(
   command: string,
   args: ReadonlyArray<string>,
-  kind: "process" | "provider" | "terminal",
+  kind: "process" | "provider" | "terminal" | "probe",
   workflowCwd?: string,
 ) {
   const workloadId = NodeCrypto.randomBytes(16).toString("hex");
@@ -129,16 +129,16 @@ const signalError = () =>
 const decodeSignalReceipt = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Struct({ signalled: Schema.Boolean })),
 );
-export const signalWorkflowVmWorkload = Effect.fn("VmWorkload.signalWorkflow")(function* (
+const decodeProbeStopReceipt = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ status: Schema.Literals(["stopped", "missing", "busy"]) })),
+);
+const runWorkflowControl = Effect.fnUntraced(function* (
   raw: ChildProcessSpawner.ChildProcessSpawner["Service"],
-  workloadId: string,
-  pid: number,
-  signal: string,
+  args: ReadonlyArray<string>,
 ) {
-  if (!["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP"].includes(signal)) return yield* signalError();
   const [receipt, code] = yield* Effect.gen(function* () {
     const child = yield* raw.spawn(
-      ChildProcess.make(helper, ["signal-workflow", workloadId, String(pid), signal.slice(3)], {
+      ChildProcess.make(helper, args, {
         env: workflowVmBaseEnvironment,
         extendEnv: false,
         stdin: "ignore",
@@ -151,7 +151,22 @@ export const signalWorkflowVmWorkload = Effect.fn("VmWorkload.signalWorkflow")(f
     );
   }).pipe(Effect.scoped, Effect.interruptible, Effect.timeout("5 seconds"));
   if (code !== 0 || receipt.truncated) return yield* signalError();
-  return (yield* decodeSignalReceipt(receipt.text)).signalled;
+  return receipt.text;
+});
+export const signalWorkflowVmWorkload = Effect.fn("VmWorkload.signalWorkflow")(function* (
+  raw: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  workloadId: string,
+  pid: number,
+  signal: string,
+) {
+  if (!["SIGTERM", "SIGKILL", "SIGINT", "SIGHUP"].includes(signal)) return yield* signalError();
+  const receipt = yield* runWorkflowControl(raw, [
+    "signal-workflow",
+    workloadId,
+    String(pid),
+    signal.slice(3),
+  ]);
+  return (yield* decodeSignalReceipt(receipt)).signalled;
 }, Effect.mapError(signalError));
 
 export const signalRunningWorkflowVmWorkload = (
@@ -172,12 +187,42 @@ export const signalRunningWorkflowVmWorkload = (
     Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.fail(signalError()) }),
   );
 
+const withWorkflowProbeCleanup = Effect.fnUntraced(function* (
+  raw: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  workloadId: string,
+  child: ChildProcessSpawner.ChildProcessHandle,
+) {
+  const stop = Effect.gen(function* () {
+    while (true) {
+      // Check exit before inspecting the group. A still-running launcher may
+      // register immediately after an absent receipt.
+      const running = yield* child.isRunning;
+      const receipt = yield* runWorkflowControl(raw, [
+        "stop-workflow-probe",
+        workloadId,
+        String(child.pid),
+      ]);
+      const { status } = yield* decodeProbeStopReceipt(receipt);
+      if (status === "stopped" || (status === "missing" && !running)) return;
+      yield* Effect.sleep("100 millis");
+    }
+  }).pipe(Effect.interruptible, Effect.timeout("12 seconds"), Effect.mapError(signalError));
+  yield* Effect.addFinalizer(() =>
+    stop.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Could not confirm Codex probe cleanup", { cause, workloadId }),
+      ),
+    ),
+  );
+  return ChildProcessSpawner.makeHandle({ ...child, kill: () => stop });
+});
+
 const withWorkflowSignals = Effect.fnUntraced(function* (
   raw: ChildProcessSpawner.ChildProcessSpawner["Service"],
   command: ChildProcess.StandardCommand,
   child: ChildProcessSpawner.ChildProcessHandle,
 ) {
-  const workloadId = command.args[1]!;
+  const workloadId = command.args[command.args[0] === "run-workflow-transfer" ? 4 : 1]!;
   const awaitExit = child.exitCode.pipe(Effect.ignore, Effect.interruptible);
   const signal = (value: ChildProcess.Signal) =>
     signalRunningWorkflowVmWorkload(raw, workloadId, child.pid, value, child.isRunning);
@@ -237,7 +282,6 @@ export function makeVmWorkloadSpawner(
         : vmWorkloadCommand(command.command, command.args, "process");
     const [action, workloadId, kind] = launch.args;
     if ((workflow && !trusted) || action === "run-workflow") {
-      if (admission) throw new Error("Workflow VM workload admission is sealed");
       const explicitWorkflowLaunch = action === "run-workflow";
       const cwd = explicitWorkflowLaunch
         ? launch.args[3]
@@ -254,10 +298,26 @@ export function makeVmWorkloadSpawner(
       )
         throw new Error("Unsupported workflow workload launch");
       const git = executable === "git" || executable === "/usr/bin/git";
+      const codexRecoveryRead =
+        cwd === workflowVmBaseEnvironment.CODEX_HOME &&
+        executable === "/usr/bin/python3" &&
+        args.length === 3 &&
+        args[0] === "-IS" &&
+        args[1] === "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py" &&
+        args[2] === "capture";
+      if (admission && (!workflow || !(git || codexRecoveryRead) || kind !== "process"))
+        throw new Error("Workflow VM workload admission is sealed");
       return ChildProcess.make(
         helper,
         [
-          "run-workflow",
+          ...(admission
+            ? [
+                "run-workflow-transfer",
+                admission.bootId,
+                admission.operationId,
+                String(admission.epoch),
+              ]
+            : ["run-workflow"]),
           workloadId!,
           kind!,
           cwd,
@@ -307,8 +367,20 @@ export function makeVmWorkloadSpawner(
             description: "VM workload launch could not be tracked.",
           }),
       });
-      if (!ChildProcess.isStandardCommand(wrapped) || wrapped.args[0] !== "run-workflow")
+      if (
+        !ChildProcess.isStandardCommand(wrapped) ||
+        (wrapped.args[0] !== "run-workflow" && wrapped.args[0] !== "run-workflow-transfer")
+      )
         return yield* raw.spawn(wrapped);
+      if (wrapped.args[0] === "run-workflow" && wrapped.args[2] === "probe") {
+        // The platform scope can only signal the original UID. Install the
+        // cgroup finalizer before cancellation can abandon the spawned probe.
+        return yield* raw.spawn(wrapped).pipe(
+          Effect.provideService(ProcessOnlyCleanup, true),
+          Effect.flatMap((child) => withWorkflowProbeCleanup(raw, wrapped.args[1]!, child)),
+          Effect.uninterruptible,
+        );
+      }
       const child = yield* raw.spawn(wrapped).pipe(Effect.provideService(ProcessOnlyCleanup, true));
       return yield* withWorkflowSignals(raw, wrapped, child);
     }),

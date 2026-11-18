@@ -148,6 +148,40 @@ class StockRuntimeBuildTests(unittest.TestCase):
                 builder.build(self.output, "arm64", self.lock)
             command.assert_not_called()
 
+    def test_custom_hugepage_reservation_is_in_the_hashed_compose_environment(self):
+        with patch.object(builder, "run", side_effect=self.fake_run):
+            builder.build(self.output, "arm64", self.lock, hugepages=5120)
+        defaults = self.output / ".env"
+        self.assertEqual([line for line in defaults.read_text().splitlines() if line.startswith("HUGEPAGES=")],
+                         ["HUGEPAGES=5120"])
+        receipt = json.loads((self.output / "build.json").read_text())
+        self.assertEqual(receipt["configurationSha256"][".env"], builder.sha256(defaults))
+
+    def test_rejects_hugepage_reservations_below_the_default_before_building(self):
+        with patch.object(builder, "run") as command:
+            with self.assertRaisesRegex(ValueError, "at least 4096 hugepages"):
+                builder.build(self.output, "arm64", self.lock, hugepages=4095)
+            command.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_envd_timeout_override_is_hashed_and_scoped_to_the_orchestrator(self):
+        with patch.object(builder, "run", side_effect=self.fake_run):
+            builder.build(self.output, "arm64", self.lock, envd_timeout_seconds=30)
+        override = self.output / "runtime.override.json"
+        services = json.loads(override.read_text())["services"]
+        self.assertEqual({role: service["environment"]["ENVD_TIMEOUT"] for role, service in services.items()
+                          if "ENVD_TIMEOUT" in service["environment"]}, {"orchestrator": "30s"})
+        receipt = json.loads((self.output / "build.json").read_text())
+        self.assertEqual(receipt["configurationSha256"][override.name], builder.sha256(override))
+
+    def test_rejects_envd_timeouts_outside_the_native_api_budget_before_building(self):
+        for timeout in (0, -1, 70, 90, True, 30.5):
+            with self.subTest(timeout=timeout), patch.object(builder, "run") as command:
+                with self.assertRaisesRegex(ValueError, "from 1 to 69 seconds"):
+                    builder.build(self.output, "arm64", self.lock, envd_timeout_seconds=timeout)
+                command.assert_not_called()
+                self.assertFalse(self.output.exists())
+
     def test_bad_source_checksum_never_builds_images_or_publishes_a_receipt(self):
         self.lock["source"]["archiveSha256"] = "0" * 64
         with patch.object(builder, "run", side_effect=self.fake_run):

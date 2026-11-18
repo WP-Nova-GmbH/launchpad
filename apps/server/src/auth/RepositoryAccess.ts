@@ -1,6 +1,7 @@
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { readInstalledThreadVm } from "../relay/ThreadVmEnrollment.ts";
 import { readThreadVmInitialState } from "../relay/ThreadVmInitialStateRecord.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import { makeThreadVmRepositoryAccess } from "./ThreadVmRepositoryAccess.ts";
 import { authSessionAuthor } from "@t3tools/contracts";
 import { normalizeGitRemoteUrl } from "@t3tools/shared/git";
@@ -135,7 +136,7 @@ export const make = Effect.gen(function* () {
     return yield* makeThreadVmRepositoryAccess(
       vm,
       initial?.receipt ?? null,
-      Boolean(initial?.input.workflow),
+      Boolean(initial?.input.workflow) || (vm.scope.generation > 1 && (yield* WorkflowVmGuest)),
     ).pipe(Effect.orDie);
   }
   const sql = yield* SqlClient.SqlClient;

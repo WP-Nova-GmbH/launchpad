@@ -37,6 +37,9 @@ export function makeThreadVmFinalSaveDeletionWorker(
           operationId: provision.operationId,
           generation: current.generation,
           computeRef: current.computeRef,
+          resourceKind: current.sourceReceipt?.workflowCheckpoint
+            ? "organization_workflow"
+            : "personal",
         }))
       ) {
         yield* store.deferDeletion(claim, "identity_conflict");
@@ -45,6 +48,10 @@ export function makeThreadVmFinalSaveDeletionWorker(
       // A catalog 404 still requires native DELETE of the exact saved sandbox ID.
       yield* store.beginDeletion(claim);
       yield* compute.destroy(current.computeRef);
+      if ((yield* compute.inspect(current.computeRef)) !== null) {
+        yield* store.deferDeletion(claim, "stop_unconfirmed");
+        return;
+      }
       yield* store.confirmDeleted(claim);
     }).pipe(
       Effect.catchTags({

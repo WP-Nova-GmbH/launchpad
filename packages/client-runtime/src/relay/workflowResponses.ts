@@ -5,6 +5,7 @@ import {
   type WorkflowJobProgress,
   type RepositoryWorkflowJob,
   type WorkflowManualControl,
+  type WorkflowVmRecovery,
 } from "@t3tools/contracts/workflows";
 
 export interface WorkflowDraftSubmission {
@@ -28,6 +29,59 @@ export function workflowViewerControls(job: RepositoryWorkflowJob | null, canCon
 
 export function workflowApprovalPending(job: RepositoryWorkflowJob | null): boolean {
   return job?.pendingResponseOperation === "approve" || job?.progress?.approvalPending === true;
+}
+
+const workflowVmRecoveryCopy = {
+  paused: {
+    title: "Workflow VM paused",
+    message: "The VM resumes when an authorized response is submitted.",
+  },
+  saved: {
+    title: "Workflow VM saved",
+    message: "The VM restores its saved workspace when an authorized response is submitted.",
+  },
+  waiting_capacity: {
+    title: "Waiting for a VM slot",
+    message: "The response is queued. The workflow continues when a slot is available.",
+  },
+  waiting_codex: {
+    title: "Waiting for a Codex connection",
+    message: "Reconnect this run’s original Codex account to continue.",
+  },
+  resuming: {
+    title: "Resuming workflow VM",
+    message: "The response will be applied when the VM is ready.",
+  },
+  restoring: {
+    title: "Restoring workflow VM",
+    message: "The response will be applied when the workspace is ready.",
+  },
+  recovery_error: {
+    title: "Workflow VM recovery needs attention",
+    message: "The run needs a recoverable workspace before it can continue.",
+  },
+} satisfies Record<WorkflowVmRecovery["state"], { title: string; message: string }>;
+
+export function workflowVmRecoveryDisplay(
+  recovery: WorkflowVmRecovery | undefined,
+  responsePending = false,
+) {
+  if (!recovery) return null;
+  const copy = workflowVmRecoveryCopy[recovery.state];
+  const sleeping = recovery.state === "paused" || recovery.state === "saved";
+  return {
+    title: copy.title,
+    message:
+      sleeping && responsePending
+        ? "The response is queued. It will be applied when the VM is ready."
+        : (recovery.detail ?? copy.message),
+    pending:
+      recovery.state === "waiting_capacity" ||
+      recovery.state === "waiting_codex" ||
+      recovery.state === "resuming" ||
+      recovery.state === "restoring",
+    warning: recovery.state === "recovery_error",
+  };
 }
 
 /** Clear only the submitted draft, after exact durable evidence; edits made during delivery survive. */
@@ -67,6 +121,7 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
   const hold = progress?.manualPause;
   const pending = job?.pendingManualControl;
   const responsePending = job?.responsePending === true && !isTerminalWorkflowJob(job.status);
+  const recovery = workflowVmRecoveryDisplay(job?.vmRecovery, responsePending);
   const approvalPending =
     !!job && !isTerminalWorkflowJob(job.status) && workflowApprovalPending(job);
   const status = progress?.underlyingStatus ?? progress?.status;
@@ -79,6 +134,7 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
   return {
     canPause:
       eligible &&
+      !recovery &&
       !pending &&
       !responsePending &&
       !hold &&
@@ -86,9 +142,12 @@ export function workflowManualControlState(job: RepositoryWorkflowJob | null) {
       ["preparing", "running", "awaiting_review", "awaiting_input", "waiting_capacity"].includes(
         status!,
       ),
-    canResume: eligible && !pending && !responsePending && Boolean(hold),
-    checkpointBlocked: Boolean(pending || hold || responsePending),
+    canResume: eligible && !recovery && !pending && !responsePending && Boolean(hold),
+    checkpointBlocked: Boolean(
+      pending || hold || responsePending || recovery?.pending || recovery?.warning,
+    ),
     responsePending,
+    recovery,
     status,
     message: pending
       ? `${pending.operation === "pause" ? "Pause" : "Resume"} requested; waiting for the environment.`

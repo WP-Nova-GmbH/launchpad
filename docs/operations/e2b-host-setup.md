@@ -88,6 +88,19 @@ images, and exports the native orchestrator binary. It writes `build.json`, immu
 image IDs, artifact checksums and a generated Compose configuration. It starts no
 services and refuses an existing output directory.
 
+Warm Review and cold Input acceptance passed with 5120 hugepages on a dedicated
+16 GiB host. Use `--hugepages 5120` to reproduce that reservation on a new
+deployment. It reserves 10 GiB for native guests and leaves roughly 6 GiB for
+Linux, Docker and host services. The extra 2 GiB reduces ordinary RAM available
+for builds. Size the pool and concurrent guest count for the host's memory.
+
+Both workflow tests used the stock 10-second envd readiness timeout. In a
+separate native test with an induced readiness delay, the stock timeout expired
+and the same sandbox resumed in about 12.5 seconds with a 30-second timeout.
+Use `--envd-timeout-seconds 30` to reproduce that setting on a new deployment.
+Measure snapshot load and reply time too when choosing a longer readiness
+timeout. The pinned E2B API allows 70 seconds for the entire Connect request.
+
 Keep the generated directory in place: its Compose files bind the verified artifacts.
 The default is `/var/lib/launchpad-e2b`. For another location, set `E2B_RUNTIME_DIR`
 in the relay's `.env` to that absolute **Linux** path. Choosing another directory

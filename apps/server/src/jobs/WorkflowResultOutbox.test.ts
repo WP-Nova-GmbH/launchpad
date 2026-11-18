@@ -28,6 +28,58 @@ const fixture = Effect.gen(function* () {
 const memory = NodeSqliteClient.layer({ filename: ":memory:" });
 
 it.effect(
+  "keeps the acknowledged publication revision when a replacement VM advances a workflow",
+  () =>
+    Effect.gen(function* () {
+      const { outbox } = yield* fixture;
+      const replacement = {
+        ...binding,
+        generation: 2,
+        allocationId: "new-vm",
+        operationId: "new-operation",
+        environmentId: EnvironmentId.make("new-environment"),
+      };
+      const input = {
+        binding: replacement,
+        manifest: {
+          format: "workflow-recovery-v1" as const,
+          binding,
+          publicationId: "11111111-1111-4111-8111-111111111111",
+          revision: 9,
+          state: {
+            artifactId: "22222222-2222-4222-8222-222222222222",
+            sha256: "0".repeat(64),
+            sizeBytes: 16,
+          },
+          sourceSequence: 41,
+          nativeCheckpointOperationId: null,
+          result: null,
+        },
+        manifestArtifactId: "33333333-3333-4333-8333-333333333333",
+        recordJson: '{"cursor":2}',
+        sourceSequence: 64,
+      };
+      expect(yield* outbox.restore(input)).toBe(true);
+      expect(yield* outbox.restore(input)).toBe(true);
+      expect(yield* outbox.restore({ ...input, recordJson: '{"cursor":3}' })).toBe(false);
+      yield* outbox.enqueue({ binding: replacement, recordJson: input.recordJson });
+      expect(yield* outbox.next(binding.threadId)).toBeNull();
+      const publish = {
+        binding: replacement,
+        recordJson: input.recordJson,
+        afterRestoredRevision: 9,
+      };
+      yield* outbox.enqueue(publish);
+      yield* outbox.enqueue(publish);
+      yield* outbox.enqueue({ binding: replacement, recordJson: '{"cursor":3}' });
+      expect(yield* outbox.next(binding.threadId)).toMatchObject({
+        revision: 10,
+        status: "pending",
+      });
+    }).pipe(Effect.provide(memory)),
+);
+
+it.effect(
   "rolls an export intent back with its job transaction and deduplicates unchanged state",
   () =>
     Effect.gen(function* () {

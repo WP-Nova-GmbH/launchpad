@@ -2,7 +2,7 @@ import { act, cloneElement, createElement, type PropsWithChildren, type ReactEle
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import type { WorkflowJobPage } from "@t3tools/contracts/workflows";
-import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 
 const fixture = vi.hoisted(() => ({
@@ -143,6 +143,33 @@ it("keeps the frozen automatic workflow name when catalog metadata is unavailabl
   });
   expect(content()).toContain("Frozen workflow");
   expect(content()).toContain("Started by workflow");
+});
+
+it("shows a workflow VM recovery error alongside the current checkpoint in Needs attention", async () => {
+  fixture.call.mockResolvedValueOnce({ jobs: [], nextCursor: null }).mockResolvedValueOnce({
+    jobs: [
+      {
+        ...row("Answer before preparing"),
+        targetKind: "vm",
+        runtime: { kind: "vm", threadId: ThreadId.make("workflow:input") },
+        status: "awaiting_input",
+        vmRecovery: { state: "recovery_error" },
+      },
+    ],
+    nextCursor: null,
+  });
+  await act(async () => {
+    renderer = create(
+      <WorkflowJobs scope={scope} workflows={[]} refreshWorkflows={refreshWorkflows} />,
+    );
+  });
+  await press("Needs attention");
+  expect(content()).toContain("Workflow VM recovery needs attention");
+  expect(content()).toContain("Needs input");
+  await press("View run for Workflow run: Answer before preparing");
+  expect(fixture.navigate).toHaveBeenCalledWith(
+    expect.objectContaining({ params: { repositoryId: "repo", jobId: "Answer before preparing" } }),
+  );
 });
 
 it("lets viewers distinguish runs awaiting input and open the intended run", async () => {

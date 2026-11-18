@@ -47,7 +47,11 @@ import {
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
-import { WorkflowVmGuest, workflowVmBaseEnvironment } from "../../vmWorkloadCommand.ts";
+import {
+  vmWorkloadCommand,
+  WorkflowVmGuest,
+  workflowVmBaseEnvironment,
+} from "../../vmWorkloadCommand.ts";
 import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
 import {
   codexRateLimitsFailureMessage,
@@ -398,14 +402,18 @@ export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(fu
     codexAppServerArgs(input.launchArgs, input.managedConnectionId),
     { env: environment, extendEnv: !input.managedConnectionId },
   );
+  const launch =
+    (yield* WorkflowVmGuest) && !spawnCommand.shell
+      ? vmWorkloadCommand(spawnCommand.command, spawnCommand.args, "probe")
+      : spawnCommand;
   const child = yield* spawner
     .spawn(
-      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+      ChildProcess.make(launch.command, launch.args, {
         cwd: input.cwd,
         env: environment,
         extendEnv: !input.managedConnectionId,
         forceKillAfter: CODEX_APP_SERVER_PROBE_FORCE_KILL_AFTER,
-        shell: spawnCommand.shell,
+        shell: launch.shell,
       }),
     )
     .pipe(

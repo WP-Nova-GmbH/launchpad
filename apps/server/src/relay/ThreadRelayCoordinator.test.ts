@@ -9,7 +9,8 @@ import * as Schedule from "effect/Schedule";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
-import { makeThreadMoveSweep } from "./ThreadRelayCoordinator.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
+import { makeThreadMoveSweep, synchronizeThreadVmLifecycle } from "./ThreadRelayCoordinator.ts";
 
 const testLayer = SqlitePersistenceMemory.pipe(Layer.provideMerge(NodeServices.layer));
 const discovery = {
@@ -24,6 +25,40 @@ const authority = {
 };
 const enrollment = { synchronize: () => Effect.succeed(true) };
 const unexpected = () => Effect.die("Unexpected move worker");
+
+it.effect("reconciles a workflow pause without contacting the personal VM backup endpoints", () =>
+  Effect.gen(function* () {
+    const pauses: string[] = [];
+    const personal = { synchronize: () => Effect.die("Unexpected personal VM request") };
+    yield* synchronizeThreadVmLifecycle("workflow-thread", {
+      backup: personal,
+      pause: { synchronize: (threadId) => Effect.sync(() => void pauses.push(threadId)) },
+      finalSave: personal,
+    }).pipe(Effect.provideService(WorkflowVmGuest, true));
+    expect(pauses).toEqual(["workflow-thread"]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reconciles personal VM lifecycle operations in order", () =>
+  Effect.gen(function* () {
+    const calls: string[] = [];
+    const worker = (operation: string) => ({
+      synchronize: (threadId: string) =>
+        Effect.sync(() => void calls.push(`${operation}:${threadId}`)),
+    });
+    yield* synchronizeThreadVmLifecycle("personal-thread", {
+      backup: worker("backup"),
+      pause: worker("pause"),
+      finalSave: worker("final-save"),
+    });
+    expect(calls).toEqual([
+      "backup:personal-thread",
+      "pause:personal-thread",
+      "final-save:personal-thread",
+    ]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 const frozenMove = Effect.fnUntraced(function* (threadId: string, destination = false) {
   const sql = yield* SqlClient.SqlClient;
   const fences = makeThreadExecutionFence(sql);

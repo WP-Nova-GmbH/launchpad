@@ -84,7 +84,12 @@ const decodeNativeCursor = Schema.decodeEffect(
   ),
 );
 const decodeEvent = Schema.decodeUnknownSync(OrchestrationEvent);
-const decodeRecovery = Schema.decodeUnknownSync(RelayThreadVmRestoreRecovery);
+const decodeAnyRecovery = Schema.decodeUnknownSync(RelayThreadVmRestoreRecovery);
+const decodeRecovery = (input: unknown) => {
+  const recovery = decodeAnyRecovery(input);
+  if (!recovery.native || !recovery.attachments) throw new Error("Missing fixture recovery point.");
+  return { ...recovery, native: recovery.native, attachments: recovery.attachments };
+};
 const isRecovery = Schema.is(RelayThreadVmRestoreRecovery);
 const at = "2026-10-07T00:00:00.000Z",
   nativeId = "01900000-0000-7000-8000-000000000001";

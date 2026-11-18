@@ -18,6 +18,24 @@ import { flushThreadArtifactTree } from "./ThreadArtifactDurability.ts";
 const decodeBoot = Schema.decodeUnknownEffect(ThreadVmRestoreBoot);
 const decodePoint = Schema.decodeUnknownEffect(ThreadNativeCheckpointPublicationReceipt);
 const encodeManifest = Schema.encodeEffect(Schema.fromJsonString(ThreadHistoryArchiveManifest));
+const decodeWorkflowCursor = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ threadId: Schema.NonEmptyString })),
+);
+const decodeWorkflowWriter = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      providerContinuation: Schema.Struct({
+        continuationKey: Schema.NonEmptyString,
+        workflowJobId: Schema.NonEmptyString,
+        runtimeEpisode: Schema.NonEmptyString,
+        shutdownConfirmed: Schema.optionalKey(Schema.Boolean),
+        shutdownEvidenceVersion: Schema.optionalKey(Schema.Number),
+      }),
+      stoppedRuntimeEventsDrained: Schema.Literal(true),
+      workflowVmCancellation: Schema.optionalKey(Schema.Unknown),
+    }),
+  ),
+);
 export class ThreadVmRestoreHistoryError extends Schema.TaggedError<ThreadVmRestoreHistoryError>()(
   "ThreadVmRestoreHistoryError",
   { message: Schema.String, stage: Schema.optionalKey(Schema.String) },
@@ -83,15 +101,28 @@ export const readThreadVmRestoreWorkspace = Effect.fn("ThreadVmRestoreHistory.wo
  * Rebind the verified archive header to the new restore; original event IDs/authors
  * and source watermarks remain unchanged for destination-local baseline import. */
 export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.export")(
-  function* (input: {
-    boot: ThreadVmRestoreBoot;
-    native: ThreadNativeCheckpointPublicationReceipt;
-    artifactRoot: string;
-    baseDir?: string;
-    workspaceRoot?: string;
-  }) {
+  function* (
+    input: {
+      boot: ThreadVmRestoreBoot;
+      artifactRoot: string;
+      baseDir?: string;
+      workspaceRoot?: string;
+      workflow?: { jobId: string; nativeThreadId: string; continuationKey: string };
+    } & (
+      | { native: ThreadNativeCheckpointPublicationReceipt }
+      | {
+          source: {
+            threadId: string;
+            sourceEnvironmentId: string;
+            generation: number;
+            captureOperationId: string;
+            sourceSequence: number;
+          };
+        }
+    ),
+  ) {
     const boot = yield* decodeBoot(input.boot),
-      point = yield* decodePoint(input.native);
+      point = "native" in input ? yield* decodePoint(input.native) : input.source;
     if (
       boot.threadId !== point.threadId ||
       boot.generation <= point.generation ||
@@ -163,7 +194,37 @@ export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.ex
         ...owner,
         artifactRoot: scratch,
       });
-      return { ...archive, workspace: { repositoryRoot, checkoutPath, branch: workspace.branch } };
+      let workflowWriter:
+        | Omit<Effect.Success<ReturnType<typeof decodeWorkflowWriter>>, "workflowVmCancellation">
+        | undefined;
+      if (input.workflow) {
+        const [runtime] = yield* sql<{ cursor: string; payload: string }>`SELECT
+          resume_cursor_json AS cursor,runtime_payload_json AS payload
+          FROM provider_session_runtime WHERE thread_id=${point.threadId}
+            AND provider_name='codex' AND provider_instance_id='codex'
+            AND adapter_key='codex' AND status='stopped'`;
+        if (!runtime || !runtime.cursor || !runtime.payload) return yield* fail("workflow-runtime");
+        const cursor = yield* decodeWorkflowCursor(runtime.cursor);
+        const writer = yield* decodeWorkflowWriter(runtime.payload);
+        if (
+          cursor.threadId !== input.workflow.nativeThreadId ||
+          writer.providerContinuation.workflowJobId !== input.workflow.jobId ||
+          writer.providerContinuation.continuationKey !== input.workflow.continuationKey ||
+          writer.workflowVmCancellation !== undefined
+        )
+          return yield* fail("workflow-runtime");
+        const { workflowVmCancellation: _, ...proof } = writer;
+        workflowWriter = proof;
+      } else if ("source" in input) {
+        const [runtime] =
+          yield* sql`SELECT 1 FROM provider_session_runtime WHERE thread_id=${point.threadId}`;
+        if (runtime) return yield* fail("workflow-runtime");
+      }
+      return {
+        ...archive,
+        workspace: { repositoryRoot, checkoutPath, branch: workspace.branch },
+        workflowWriter,
+      };
     }).pipe(
       Effect.provide(
         // The serving engine has its own event-store layer. A fresh build binds
@@ -185,7 +246,12 @@ export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.ex
       { mode: 0o600 },
     );
     yield* flushThreadArtifactTree(archive.directory);
-    return { directory: archive.directory, manifest, workspace: archive.workspace };
+    return {
+      directory: archive.directory,
+      manifest,
+      workspace: archive.workspace,
+      ...(archive.workflowWriter ? { workflowWriter: archive.workflowWriter } : {}),
+    };
   },
   Effect.mapError((error) => (isRestoreHistoryError(error) ? error : fail())),
 );

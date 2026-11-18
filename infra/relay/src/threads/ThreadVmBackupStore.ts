@@ -116,7 +116,7 @@ export function makeThreadVmBackupStore(sql: PgClient) {
         JOIN relay_thread_vm_allocations a ON a.allocation_id = x.allocation_id
         JOIN relay_thread_vm_provisions p ON p.allocation_id = x.allocation_id
         LEFT JOIN relay_thread_vm_final_saves f ON f.backup_operation_id=x.operation_id AND f.phase IN ('saving','aborting')
-        JOIN LATERAL (SELECT * FROM relay_thread_vm_capacity WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND allocation_id=x.allocation_id ORDER BY position DESC LIMIT 1) c ON (c.state='started' OR (x.phase='creating' AND c.state='released'))
+        JOIN LATERAL (SELECT * FROM relay_thread_vm_capacity WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.source_receipt->'workflowCheckpoint' IS NOT NULL)) AND allocation_id=x.allocation_id ORDER BY position DESC LIMIT 1) c ON (c.state='started' OR (x.phase='creating' AND c.state='released'))
         JOIN relay_thread_vm_bindings b ON b.allocation_id = x.allocation_id
         JOIN relay_thread_placements t ON t.thread_id = a.thread_id
         WHERE c.host_id = ${hostId} AND a.deleted_at IS NULL
@@ -133,8 +133,12 @@ export function makeThreadVmBackupStore(sql: PgClient) {
         ORDER BY x.retry_at,x.created_at LIMIT 1 FOR UPDATE OF x SKIP LOCKED`;
         if (!row) return null;
         const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
+        // Keep the claim past the six-minute backup sweep deadline.
+        // Record read-only reconciliation before starting it so its warning survives a crash.
         yield* sql`UPDATE relay_thread_vm_backups SET claim_id = ${claimId},
-        claim_until = clock_timestamp() + interval '3 minutes'
+        claim_until = clock_timestamp() + interval '7 minutes',
+        retry_at = CASE WHEN phase='creating' AND source_receipt ? 'workflowCheckpoint'
+          THEN clock_timestamp() + interval '1 minute' ELSE retry_at END
         WHERE operation_id = ${row.operationId}`;
         return { ...row, claimId } satisfies BackupClaim;
       }),
@@ -162,7 +166,7 @@ export function makeThreadVmBackupStore(sql: PgClient) {
             JOIN relay_thread_placements t ON t.thread_id=a.thread_id
             JOIN relay_thread_vm_bindings b ON b.allocation_id=a.allocation_id
             JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
-            WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId}
+            WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND x.source_receipt->'workflowCheckpoint' IS NOT NULL)) AND a.allocation_id=x.allocation_id AND a.thread_id=${claim.threadId}
               AND a.deleted_at IS NULL AND a.compute_ref=x.compute_ref
               AND a.state='running'
               AND p.phase='created' AND p.operation_id=${claim.provisionOperationId} AND p.generation=x.generation
@@ -215,11 +219,12 @@ export function makeThreadVmBackupStore(sql: PgClient) {
     return rows.length === 1;
   });
 
-  /** Native terminal-error alias evidence settles capture without claiming a usable backup. */
+  /** A failed catalog alias alone cannot settle a workflow capture. */
   const recordFailure = Effect.fn("relay.thread_vm.backup.record_failure")(function* (
     claim: BackupClaim,
     input: { snapshotId: string; sourceTemplateId: string; sourceBuildId: string },
   ) {
+    if (claim.sourceReceipt.workflowCheckpoint) return false;
     const identity = yield* decodeSnapshotIdentity(input).pipe(
       Effect.mapError(() => conflict("Failed native snapshot identity is invalid.")),
     );

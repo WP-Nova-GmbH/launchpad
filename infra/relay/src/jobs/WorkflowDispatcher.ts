@@ -8,24 +8,40 @@ import {
   type WorkflowControl,
   type WorkflowControlResult,
   type RepositoryWorkflowJob,
+  type WorkflowVmDispatchBinding,
 } from "@t3tools/contracts/workflows";
 import * as DateTime from "effect/DateTime";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import { RelayDb } from "../db.ts";
 import { readWorkflowVmBinding, workflowVmHasSecrets } from "./WorkflowVmBinding.ts";
+import {
+  authorizeWorkflowVmCheckpoint,
+  isWorkflowCheckpointResponse,
+  lockWorkflowVmCheckpoint,
+  restoreSupersededWorkflowCheckpoint,
+} from "./WorkflowVmCheckpoint.ts";
 import { WorkflowVmPreparation } from "./WorkflowVmPreparation.ts";
 import * as Semaphore from "effect/Semaphore";
 import { AutomaticOffers } from "../workflowEvents/AutomaticOffer.ts";
 import { blocked, originalAuthority, WorkflowQueued } from "../workflowEvents/OriginalAuthority.ts";
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
+import { ThreadArtifactObjectStorage } from "../threads/ThreadArtifactObjects.ts";
+import { hasReboundWorkflowCheckpoint } from "../threads/WorkflowVmWorkspace.ts";
+import { makeWorkflowVmRecovery } from "../threads/WorkflowVmRecovery.ts";
 import { queueReasonText } from "../workflowSources/IssueContext.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { Repositories } from "../tenancy/Repositories.ts";
-import { Workflows, type WorkflowJobRecord, type WorkflowDispatchScope } from "./Workflows.ts";
+import {
+  Workflows,
+  WorkflowPersistenceError,
+  type WorkflowJobRecord,
+  type WorkflowDispatchScope,
+} from "./Workflows.ts";
 import { validateWorkflowTarget, vmWorkflowExecutionUnavailable } from "./WorkflowTarget.ts";
 export { validateWorkflowTarget } from "./WorkflowTarget.ts";
 
@@ -34,6 +50,15 @@ const decodeOrigin = Schema.decodeUnknownEffect(WorkflowOrigin);
 const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 const isWorkflowQueued = Schema.is(WorkflowQueued);
+
+type CheckpointDispatch = NonNullable<
+  NonNullable<WorkflowJobRecord["pendingControl"]>["checkpointDispatch"]
+>;
+const sameWorkflowVmDispatch = (attempt: CheckpointDispatch, binding: WorkflowVmDispatchBinding) =>
+  attempt.allocationId === binding.allocationId &&
+  attempt.operationId === binding.operationId &&
+  attempt.environmentId === binding.environmentId &&
+  attempt.generation === binding.generation;
 
 const clearUnacceptedOffer = (job: RepositoryWorkflowJob): RepositoryWorkflowJob => ({
   ...job,
@@ -179,10 +204,35 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         !vm ||
         (row!.pendingControl?.response.operation === "cancel" && job.startAttempted === false)
       ) {
+        const objects = yield* Effect.serviceOption(ThreadArtifactObjectStorage);
+        const crypto = yield* Effect.serviceOption(Crypto.Crypto);
+        if (!vm && Option.isSome(db) && Option.isSome(objects) && Option.isSome(crypto)) {
+          const recovered = yield* makeWorkflowVmRecovery(db.value.$client, objects.value)
+            .advance(row!, leaseUntil)
+            .pipe(
+              Effect.provideService(Crypto.Crypto, crypto.value),
+              Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+            );
+          if (recovered) return recovered;
+        }
+        if (row!.pendingControl?.supersededCheckpoint || row!.pendingControl?.checkpointDispatch)
+          return job;
         if (!isTerminalWorkflowJob(job.status) && Option.isSome(preparation))
           return yield* preparation.value.advance(row!, leaseUntil);
         return job;
       }
+      if (
+        Option.isSome(db) &&
+        !(yield* hasReboundWorkflowCheckpoint(db.value.$client, vm.binding).pipe(
+          Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+        ))
+      )
+        return job;
+      const attemptedCheckpoint =
+        row!.pendingControl?.checkpointDispatch ??
+        row!.pendingControl?.supersededCheckpoint?.dispatch;
+      if (attemptedCheckpoint && !sameWorkflowVmDispatch(attemptedCheckpoint, vm.binding))
+        return job;
       if (automaticVm && job.startAttempted === false && !row!.pendingControl) {
         if ((job.queueReason?.retryAt ?? 0) > Date.parse(now)) return job;
         if (!vmExecutionEnabled) return yield* blocked("vm_execution_disabled");
@@ -375,19 +425,19 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           pendingManualControl: null,
           updatedAt: now,
         },
-        null,
+        pendingOperation === "cancel"
+          ? restoreSupersededWorkflowCheckpoint(previous.pendingControl)
+          : null,
         false,
       );
     let control: WorkflowControl = { ...binding, operation: "status" };
     let memberCanDeliver = false;
+    let reconcilingCheckpoint = false;
     if (row!.pendingControl) {
       // A saved response is only deliverable while its author still has the checkpoint's role.
       const pending = row!.pendingControl;
       const response = pending.response;
-      const checkpointResponse =
-        response.operation === "approve" ||
-        response.operation === "input" ||
-        response.operation === "request_changes";
+      const checkpointResponse = isWorkflowCheckpointResponse(response);
       const ownVmCancellation =
         vm &&
         origin.kind === "manual" &&
@@ -400,10 +450,14 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           Option.isSome(db) &&
           !(yield* workflowVmHasSecrets(db.value.$client, jobId)));
       if (!(yield* canDeliverControl(row!, pending.userId, memberCanDeliver))) {
-        row = yield* withdrawControl(row!, response.operation);
-        return row.record;
-      }
-      control = { ...binding, ...response };
+        if (!pending.checkpointDispatch || !checkpointResponse) {
+          row = yield* withdrawControl(row!, response.operation);
+          return row.record;
+        }
+        // An earlier send can still be in flight. Poll without sending it again
+        // or dropping the proof needed to safely cancel it.
+        reconcilingCheckpoint = true;
+      } else control = { ...binding, ...response };
     } else if (job.progress === null)
       control = { ...binding, operation: "start", workflow, runtime };
     if (control.operation === "start" && (job.requiredProtocol ?? 2) < WORKFLOW_PROTOCOL) {
@@ -472,7 +526,53 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         if (!current || current.revision !== row!.revision || current.leaseUntil !== leaseUntil)
           return current?.record ?? job;
         if (!(yield* canDeliverControl(row!, row!.pendingControl.userId, memberCanDeliver)))
-          return (yield* withdrawControl(row!, control.operation)).record;
+          return row!.pendingControl.checkpointDispatch
+            ? job
+            : (yield* withdrawControl(row!, control.operation)).record;
+      }
+      if (
+        vm &&
+        Option.isSome(db) &&
+        row!.pendingControl?.responseId &&
+        isWorkflowCheckpointResponse(control)
+      ) {
+        const sql = db.value.$client;
+        const binding = vm.binding;
+        const expectedRevision = row!.revision;
+        const claimed = yield* sql.withTransaction(
+          Effect.gen(function* () {
+            const current = yield* lockWorkflowVmCheckpoint(sql, jobId);
+            if (current?.revision !== expectedRevision || current.leaseUntil !== leaseUntil)
+              return null;
+            const pending = yield* authorizeWorkflowVmCheckpoint(sql, current);
+            if (!pending) return null;
+            const active = yield* readWorkflowVmBinding(sql, binding, "active", true).pipe(
+              Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
+            );
+            if (
+              !active ||
+              active.binding.operationId !== binding.operationId ||
+              active.binding.allocationId !== binding.allocationId
+            )
+              return null;
+            const checkpointDispatch = {
+              allocationId: binding.allocationId,
+              operationId: binding.operationId,
+              environmentId: binding.environmentId,
+              generation: binding.generation,
+            };
+            const previous = pending.checkpointDispatch;
+            if (previous && !sameWorkflowVmDispatch(previous, binding)) return null;
+            // The job revision CAS makes this the durable send winner over Cancel.
+            return yield* update(current, current.record, {
+              ...current.pendingControl!,
+              checkpointDispatch,
+            });
+          }),
+        );
+        if (!claimed) return (yield* store.getJob(jobId))?.record ?? job;
+        row = claimed;
+        job = claimed.record;
       }
     }
     const mayRetireOffer = !vm && job.startAttempted === false;
@@ -555,7 +655,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         manualControl && receipt && sameManualControl(receipt, manualControl);
       const keepPending =
         outcome.outcome === "busy" ||
-        (manual && !manualAcknowledged && outcome.outcome !== "conflict");
+        (manual && !manualAcknowledged && outcome.outcome !== "conflict") ||
+        (reconcilingCheckpoint &&
+          outcome.progress.revision === job.progress?.revision &&
+          outcome.progress.checkpoint?.checkpointId === job.progress?.checkpoint?.checkpointId);
       const next: RepositoryWorkflowJob = {
         ...job,
         progress: outcome.progress,

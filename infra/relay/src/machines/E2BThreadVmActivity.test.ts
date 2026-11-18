@@ -6,13 +6,30 @@ import * as Redacted from "effect/Redacted";
 import { classifyThreadVmActivity, makeE2BThreadVmActivity } from "./E2BThreadVmActivity.ts";
 
 const empty = { bootId: "boot", sealedBy: null, stopped: true, groups: [] } as const;
-const group = (kind: "provider" | "terminal" | "process" | "transfer") => ({
+const group = (kind: "provider" | "terminal" | "process" | "transfer" | "probe") => ({
   id: kind,
   bootId: "boot",
   kind,
 });
 
 describe("thread VM workload activity", () => {
+  it("accepts only the privileged passive setup observation for workflow idleness", () => {
+    const passive = { ...empty, stopped: false, groups: [group("terminal")] };
+    expect(classifyThreadVmActivity(passive, true)).toBe("unknown");
+    expect(classifyThreadVmActivity({ ...passive, recoverable: true }, true)).toBe("idle");
+    expect(
+      classifyThreadVmActivity({ ...passive, recoverable: true, sealedBy: "pause" }, true),
+    ).toBe("unknown");
+    expect(
+      classifyThreadVmActivity(
+        { ...passive, recoverable: true, groups: [group("provider")] },
+        true,
+      ),
+    ).toBe("unknown");
+    expect(
+      classifyThreadVmActivity({ ...passive, recoverable: true, groups: [group("probe")] }, true),
+    ).toBe("unknown");
+  });
   it("treats active work as busy and unclassified terminal or inconsistent reports as unknown", () => {
     expect(classifyThreadVmActivity(empty)).toBe("idle");
     expect(
@@ -39,6 +56,7 @@ describe("thread VM workload activity", () => {
     "old-helper",
     "stopped-processes",
     "live-process",
+    "live-probe",
   ] as const)
     it.effect(`reads current durable VM activity without waking it (${situation})`, () =>
       Effect.gen(function* () {
@@ -70,7 +88,7 @@ describe("thread VM workload activity", () => {
           phase: situation === "held" ? "draining" : "active",
           archived: situation === "archived",
           unfinished: situation === "unfinished",
-          processWorkIds: ["stopped-processes", "live-process"].includes(situation)
+          processWorkIds: ["stopped-processes", "live-process", "live-probe"].includes(situation)
             ? ["provider:idle", "terminal:closed", "setup:ready"]
             : [],
           queue: {
@@ -85,6 +103,7 @@ describe("thread VM workload activity", () => {
               "old-generation",
               "stopped-processes",
               "live-process",
+              "live-probe",
             ].includes(situation)
               ? []
               : [{ state: situation === "delivery-unknown" ? "unknown" : "pending" }],
@@ -96,8 +115,12 @@ describe("thread VM workload activity", () => {
               ? empty
               : {
                   workloads:
-                    situation === "live-process"
-                      ? { ...empty, stopped: false, groups: [group("process")] }
+                    situation === "live-process" || situation === "live-probe"
+                      ? {
+                          ...empty,
+                          stopped: false,
+                          groups: [group(situation === "live-probe" ? "probe" : "process")],
+                        }
                       : empty,
                   projection,
                 },
@@ -145,6 +168,7 @@ describe("thread VM workload activity", () => {
                       "delivery-unknown",
                       "unfinished",
                       "live-process",
+                      "live-probe",
                     ].includes(situation)
                   ? "busy"
                   : "idle",

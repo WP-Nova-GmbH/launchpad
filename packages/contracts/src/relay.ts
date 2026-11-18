@@ -53,6 +53,7 @@ import {
   WorkflowInvalidError,
   WorkflowSubmissionPendingError,
   WorkflowVmDispatchBinding,
+  WorkflowRecoveryManifest,
   WorkflowSavedResult,
   WorkflowSaveReceipt,
 } from "./workflows.ts";
@@ -2391,7 +2392,7 @@ export const RelayThreadVmStatus = Schema.Struct({
       Schema.Struct({
         operationId: Schema.String,
         phase: Schema.Literals(["draining", "frozen", "saving", "deleting", "aborting"]),
-        reason: Schema.Literals(["idle", "replacement"]),
+        reason: Schema.Literals(["idle", "replacement", "source_loss"]),
         errorCode: Schema.NullOr(Schema.String),
       }),
     ),
@@ -3190,6 +3191,15 @@ export const RelayThreadLocalEnrollmentAbortResponse = Schema.Struct({
   environmentId: EnvironmentId,
   outcome: Schema.Literals(["aborted", "continue"]),
 });
+export const RelayThreadVmWorkflowCheckpoint = Schema.Struct({
+  jobId: TrimmedNonEmptyString,
+  checkpointId: TrimmedNonEmptyString,
+  checkpointGeneration: NonNegativeInt,
+  publicationId: RelayThreadArtifactId,
+  publicationRevision: Schema.Int.check(Schema.isGreaterThan(0)),
+});
+export type RelayThreadVmWorkflowCheckpoint = typeof RelayThreadVmWorkflowCheckpoint.Type;
+
 export const RelayThreadVmPause = Schema.Struct({
   threadId: ThreadId,
   environmentId: EnvironmentId,
@@ -3203,6 +3213,7 @@ export const RelayThreadVmPause = Schema.Struct({
   nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
   canActivate: Schema.Boolean,
   sourceReopened: Schema.Boolean,
+  workflowCheckpoint: Schema.optionalKey(RelayThreadVmWorkflowCheckpoint),
 });
 export type RelayThreadVmPause = typeof RelayThreadVmPause.Type;
 export const RelayThreadVmBackupSource = Schema.Struct({
@@ -3319,13 +3330,29 @@ export const RelayThreadVmRestoreRecovery = Schema.Struct({
   independentHistory: Schema.optionalKey(RelayThreadVmIndependentHistory),
   environmentId: EnvironmentId,
   scope: RelayThreadVmCredentialScope,
-  native: ThreadNativeCheckpointPublicationReceipt,
-  attachments: ThreadAttachmentCheckpointPublicationReceipt,
+  native: Schema.NullOr(ThreadNativeCheckpointPublicationReceipt),
+  attachments: Schema.NullOr(ThreadAttachmentCheckpointPublicationReceipt),
+  workflow: Schema.optionalKey(
+    Schema.Struct({
+      checkpoint: RelayThreadVmWorkflowCheckpoint,
+      manifest: WorkflowRecoveryManifest,
+      manifestArtifactId: RelayThreadArtifactId,
+      binding: WorkflowVmDispatchBinding,
+      sourceSequence: NonNegativeInt,
+    }),
+  ),
 }).check(
   Schema.makeFilter(
     (value) =>
       (value.savedDiskOperationId !== undefined) !== (value.independentHistory !== undefined) &&
-      (!value.reset || value.independentHistory === undefined),
+      (!value.reset || value.independentHistory === undefined) &&
+      ((value.native !== null && value.attachments !== null) ||
+        (value.workflow !== undefined &&
+          value.native === null &&
+          value.attachments === null &&
+          value.workflow.manifest.nativeCheckpointOperationId === null &&
+          value.savedDiskOperationId !== undefined &&
+          value.reset === undefined)),
     { message: "Recovery must select one saved disk or independent conversation source." },
   ),
 );
@@ -3345,8 +3372,10 @@ export const RelayThreadVmRestoreImportReceipt = Schema.Struct({
   manifestSha256: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
   sourceEnvironmentId: EnvironmentId,
   sourceSequence: NonNegativeInt,
-  nativeManifestArtifactId: RelayThreadArtifactId,
-  attachmentManifestArtifactId: RelayThreadArtifactId,
+  nativeManifestArtifactId: Schema.NullOr(RelayThreadArtifactId),
+  attachmentManifestArtifactId: Schema.NullOr(RelayThreadArtifactId),
+  workflowPublicationId: Schema.optionalKey(RelayThreadArtifactId),
+  workflowStateSha256: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u))),
   repositoryBundleSha256: Schema.optionalKey(
     Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/u)),
   ),
@@ -3487,7 +3516,9 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
         payload: Schema.Struct({
           ...RelayThreadGeneration,
           operationId: RelayThreadArtifactId,
-          nativeCheckpointOperationId: RelayThreadArtifactId,
+          nativeCheckpointOperationId: Schema.NullOr(RelayThreadArtifactId),
+          workflowCheckpoint: Schema.optionalKey(RelayThreadVmWorkflowCheckpoint),
+          sourceSequence: Schema.optionalKey(NonNegativeInt),
           bootId: Schema.String.check(Schema.isUUID()),
           sealEpoch: Schema.Int.check(Schema.isGreaterThan(0)),
         }),

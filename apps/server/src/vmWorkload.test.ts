@@ -66,6 +66,37 @@ describe("VM workload inventory", () => {
       expect(result.groups).toEqual([group]);
     }),
   );
+  it.effect("seals and stops a live Codex probe during cancellation", () =>
+    Effect.gen(function* () {
+      const operationId = "cancel-workflow";
+      const sealedBy = NodeCrypto.createHash("sha256")
+        .update(operationId)
+        .digest("hex")
+        .slice(0, 32);
+      const probe = { ...group, kind: "probe" };
+      const reports = [
+        json({ ...empty, groups: [probe], stopped: false }),
+        json({ ...empty, sealedBy, epoch: 1, groups: [probe], stopped: false }),
+        json({ ...empty, sealedBy, epoch: 1 }),
+      ];
+      yield* Effect.gen(function* () {
+        const before = yield* inspectVmWorkloads({ type: "inspect" });
+        const sealed = yield* inspectVmWorkloads({
+          type: "seal",
+          bootId: before.bootId,
+          operationId,
+        });
+        expect(sealed.groups).toEqual([probe]);
+        expect(sealed.stopped).toBe(false);
+        const after = yield* inspectVmWorkloads({
+          type: "stop",
+          bootId: sealed.bootId,
+          operationId,
+        });
+        expect(after.stopped).toBe(true);
+      }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, respond(reports)));
+    }),
+  );
   it.effect("never treats malformed, mixed-boot or contradictory reports as stopped", () =>
     Effect.gen(function* () {
       for (const report of [
@@ -763,7 +794,7 @@ it.effect("accepts a valid provider identity after the usual control deadline", 
       Effect.forkChild,
     );
     yield* Deferred.await(spawned);
-    yield* TestClock.adjust("15 seconds");
+    yield* TestClock.adjust("35 seconds");
     yield* Deferred.succeed(receipt, undefined);
     expect(yield* Fiber.join(pending)).toEqual(identity);
   }),
@@ -781,11 +812,26 @@ it.effect("retains the underlying timeout instead of disguising it as a decode e
       Effect.forkChild,
     );
     yield* Deferred.await(spawned);
-    yield* TestClock.adjust("30 seconds");
+    yield* TestClock.adjust("60 seconds");
     expect(yield* Fiber.join(pending)).toMatchObject({
       reason: "timeout",
       action: "provider-identity",
-      cause: { _tag: "ProcessTimeoutError", timeoutMs: 30_000 },
+      cause: { _tag: "ProcessTimeoutError", timeoutMs: 60_000 },
+    });
+  }),
+);
+
+it.effect("reports the native provider identity deadline as a timeout", () =>
+  Effect.gen(function* () {
+    const failure = yield* Effect.flip(
+      readVmHarnessIdentity(group.id, 123).pipe(
+        Effect.provideService(VmControlSpawner, respond("", 124)),
+      ),
+    );
+    expect(failure).toMatchObject({
+      reason: "timeout",
+      action: "provider-identity",
+      exitCode: 124,
     });
   }),
 );

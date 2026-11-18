@@ -19,6 +19,7 @@ import {
   WorkflowResponseSummary,
   WorkflowManualControl,
   WorkflowManualPause,
+  type WorkflowRecoveryManifest,
 } from "@t3tools/contracts/workflows";
 import {
   LAUNCHPAD_JOB_BRANCH_PREFIX,
@@ -276,7 +277,12 @@ export const WorkflowRunRecovery = Schema.Struct({
   ),
   workflowIgnoreRulesBase64: Schema.NullOr(Schema.String),
 });
+export type WorkflowRunRecovery = typeof WorkflowRunRecovery.Type;
 const encodeRecovery = Schema.encodeSync(Schema.fromJsonString(WorkflowRunRecovery));
+class WorkflowRunRecoveryError extends Schema.TaggedError<WorkflowRunRecoveryError>()(
+  "WorkflowRunRecoveryError",
+  { message: Schema.String },
+) {}
 
 export type LegacyWorkflowTurnOutcome = "completed" | "failed" | "checkpoint-error";
 
@@ -350,6 +356,62 @@ export const make = Effect.gen(function* () {
       Effect.orDie,
       Effect.map((rows) => (rows[0] ? decode(rows[0].record_json) : null)),
     );
+  const restoreRecovery = Effect.fn("WorkflowRunStore.restoreRecovery")(function* (input: {
+    capsule: WorkflowRunRecovery;
+    binding: WorkflowVmDispatchBinding;
+    manifest: WorkflowRecoveryManifest;
+    manifestArtifactId: string;
+    sourceSequence: number;
+  }) {
+    const { capsule, binding } = input;
+    const run: WorkflowRun = { ...capsule.run, runtime: { kind: "vm", ...binding } };
+    const record = encode(run);
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [fence] =
+          yield* sql`SELECT 1 FROM thread_execution_fences WHERE thread_id=${binding.threadId}
+        AND environment_id=${binding.environmentId} AND generation=${binding.generation}
+        AND operation_id=${binding.operationId} AND project_id=${binding.projectId} AND phase='frozen'`;
+        if (!fence) return false;
+        const [prior] = yield* sql<{
+          record: string;
+        }>`SELECT record_json AS record FROM repository_workflow_jobs
+        WHERE job_id=${binding.jobId} OR thread_id=${binding.threadId}`;
+        if (prior && prior.record !== record) return false;
+        if (!prior) {
+          yield* sql`INSERT INTO repository_workflow_jobs (job_id,thread_id,status,execution_reserved,record_json)
+          VALUES (${binding.jobId},${binding.threadId},${run.progress.status},0,${record})`;
+          for (const pin of capsule.checkpointPins) {
+            yield* sql`INSERT INTO workflow_vm_checkpoint_pins (
+            job_id, thread_id, allocation_id, operation_id, environment_id, generation,
+            turn_id, turn_count, checkpoint_ref, commit_id, tree_id, baseline_commit_id, workflow_ignore_rules
+          ) VALUES (${binding.jobId},${binding.threadId},${binding.allocationId},${binding.operationId},
+            ${binding.environmentId},${binding.generation},${pin.turnId},${pin.turnCount},
+            ${pin.checkpointRef},${pin.commitId},${pin.treeId},${pin.baselineCommitId},
+            ${
+              pin.turnId === "" && capsule.workflowIgnoreRulesBase64 !== null
+                ? Buffer.from(capsule.workflowIgnoreRulesBase64, "base64")
+                : null
+            })`;
+          }
+        }
+        const rebound = yield* recoveryRecord(run);
+        if (rebound !== encodeRecovery({ ...capsule, run }))
+          return yield* new WorkflowRunRecoveryError({
+            message: "Restored workflow checkpoint pins differ.",
+          });
+        const installed = yield* makeWorkflowResultOutbox(sql).restore({
+          ...input,
+          recordJson: rebound,
+        });
+        if (!installed)
+          return yield* new WorkflowRunRecoveryError({
+            message: "Restored workflow publication differs.",
+          });
+        return true;
+      }),
+    );
+  });
   const getCancellation = (jobId: string) =>
     sql<{
       record_json: string;
@@ -357,6 +419,26 @@ export const make = Effect.gen(function* () {
       Effect.orDie,
       Effect.map((rows) => (rows[0] ? decodeCancellation(rows[0].record_json) : null)),
     );
+  const republishRestoredCheckpoint = Effect.fn("WorkflowRunStore.republishRestoredCheckpoint")(
+    function* (binding: WorkflowVmDispatchBinding, afterRestoredRevision: number) {
+      const [fence] = yield* sql`SELECT 1 WHERE ${activeVmFence(binding)}`;
+      const run = yield* get(binding.jobId);
+      if (
+        !fence ||
+        !run ||
+        run.runtime.kind !== "vm" ||
+        !Schema.toEquivalence(WorkflowVmDispatchBinding)(run.runtime, binding)
+      )
+        return yield* new WorkflowRunRecoveryError({
+          message: "The restored workflow no longer owns this VM.",
+        });
+      yield* makeWorkflowResultOutbox(sql).enqueue({
+        binding,
+        recordJson: yield* recoveryRecord(run),
+        afterRestoredRevision,
+      });
+    },
+  );
   const active = (status?: "waiting_capacity") =>
     (status
       ? sql<{
@@ -408,6 +490,8 @@ export const make = Effect.gen(function* () {
   });
   return {
     get,
+    restoreRecovery,
+    republishRestoredCheckpoint,
     getSaveResult: (jobId: string, turnId: string) =>
       makeWorkflowResultOutbox(sql).result(jobId, turnId).pipe(Effect.orDie),
     getResultSaving: (jobId: string) =>
@@ -785,6 +869,8 @@ export class WorkflowRunStore extends Context.Reference<WorkflowRunStoreShape>(
   {
     defaultValue: () => ({
       get: () => Effect.succeed(null),
+      restoreRecovery: () => Effect.succeed(false),
+      republishRestoredCheckpoint: () => Effect.succeed(undefined),
       getSaveResult: () => Effect.succeed(null),
       getResultSaving: () => Effect.succeed(undefined),
       retryResultSaving: () => Effect.succeed(false),

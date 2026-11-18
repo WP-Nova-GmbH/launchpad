@@ -53,6 +53,7 @@ export function makeThreadVmRestoreServingWorker(
     const claim = yield* serving.claim(hostId, allowStart);
     if (!claim) return false;
     yield* Effect.gen(function* () {
+      const resourceKind = claim.workflowCheckpoint ? "organization_workflow" : "personal";
       const discover = Effect.fnUntraced(function* (row: ThreadVmRestore) {
         const found = yield* compute.findOperation(
           restoreBootOperationId(row.operationId, row.bootAttempt),
@@ -95,13 +96,16 @@ export function makeThreadVmRestoreServingWorker(
         yield* serving.completeCommittedAbort(claim);
         return;
       }
+      // Native create can outlive checkpoint authority. Record the issued attempt
+      // before considering whether to prepare it for serving.
+      if (claim.phase === "creating" && !(yield* discover(claim))) return;
+      if (claim.bootRecoveryStarted) {
+        yield* retire(claim);
+        return;
+      }
       let row: ThreadVmRestore = yield* serving.authorize(claim);
       if (row.phase === "prepared") {
         yield* serving.commit(claim);
-        return;
-      }
-      if (row.bootRecoveryStarted) {
-        yield* retire(row);
         return;
       }
       if (row.phase === "booted" || row.phase === "importing") {
@@ -121,10 +125,14 @@ export function makeThreadVmRestoreServingWorker(
         };
         const knownToken =
           current.state === "running"
-            ? yield* readThreadVmTrafficAccessToken(sql, {
-                ...identity,
-                computeRef: current.sandboxId,
-              }).pipe(
+            ? yield* readThreadVmTrafficAccessToken(
+                sql,
+                {
+                  ...identity,
+                  computeRef: current.sandboxId,
+                },
+                resourceKind,
+              ).pipe(
                 Effect.catchTag("ThreadVmIngressTokenUnavailable", () => Effect.succeed(undefined)),
               )
             : undefined;
@@ -157,7 +165,9 @@ export function makeThreadVmRestoreServingWorker(
       }
       let created: ThreadVmCreated | undefined;
       if (row.phase === "committed") {
-        row = yield* serving.beginCreate(claim);
+        const creating = yield* serving.beginCreate(claim);
+        if (!creating) return;
+        row = creating;
         created = yield* compute.createFromSnapshot({
           allocationId: row.allocationId,
           operationId: restoreBootOperationId(row.operationId, row.bootAttempt),
@@ -170,10 +180,6 @@ export function makeThreadVmRestoreServingWorker(
           bootAttempt: row.bootAttempt,
         });
         row = yield* serving.recordObserved(claim, created.sandboxId);
-      } else if (row.phase === "creating") {
-        const found = yield* discover(row);
-        if (!found) return;
-        row = yield* serving.authorize(claim);
       }
       const boot = row.bootReceipt!;
       const identity = {
@@ -192,10 +198,14 @@ export function makeThreadVmRestoreServingWorker(
         return yield* new ThreadVmRestoreConflict({ message: "Native restored identity changed." });
       const stored =
         current.state === "running"
-          ? yield* readThreadVmTrafficAccessToken(sql, {
-              ...identity,
-              computeRef: boot.sandboxId,
-            }).pipe(
+          ? yield* readThreadVmTrafficAccessToken(
+              sql,
+              {
+                ...identity,
+                computeRef: boot.sandboxId,
+              },
+              resourceKind,
+            ).pipe(
               Effect.catchTag("ThreadVmIngressTokenUnavailable", () => Effect.succeed(undefined)),
             )
           : undefined;

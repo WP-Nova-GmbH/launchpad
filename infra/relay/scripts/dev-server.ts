@@ -23,6 +23,7 @@ import {
   reconcileThreadVmLeases,
   reconcileThreadVmBackups,
   reconcileThreadArtifacts,
+  THREAD_VM_BACKUP_SWEEP_TIMEOUT,
 } from "../src/threads/ThreadVmRuntime.ts";
 import { ThreadArtifactObjectStorage } from "../src/threads/ThreadArtifactObjects.ts";
 import {
@@ -646,11 +647,10 @@ const main = Effect.gen(function* () {
       threadVmSettings
         ? Layer.effectDiscard(
             reconcileThreadVmResumes(threadVmSettings).pipe(
-              Effect.timeout("45 seconds"),
               Effect.catchCause((cause) =>
                 Cause.hasInterrupts(cause)
                   ? Effect.interrupt
-                  : Effect.logWarning("Thread VM resume reconciliation will retry."),
+                  : Effect.logWarning("Thread VM resume reconciliation failed."),
               ),
               Effect.repeat(Schedule.spaced("1 minute")),
               Effect.forkScoped,
@@ -674,7 +674,7 @@ const main = Effect.gen(function* () {
       threadVmSettings
         ? Layer.effectDiscard(
             reconcileThreadVmBackups(threadVmSettings).pipe(
-              Effect.timeout("2 minutes"),
+              Effect.timeout(THREAD_VM_BACKUP_SWEEP_TIMEOUT),
               Effect.catchCause((cause) =>
                 Cause.hasInterrupts(cause)
                   ? Effect.interrupt

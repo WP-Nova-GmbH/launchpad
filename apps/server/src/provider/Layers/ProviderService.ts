@@ -44,6 +44,7 @@ import { collectThreadAttachmentReferences } from "../../relay/ThreadAttachmentR
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeThreadExecutionFence } from "../../persistence/ThreadExecutionFence.ts";
+import { requireWorkflowVmLifecycleCheckpoint } from "../../persistence/WorkflowThreadOwnership.ts";
 import { ThreadExecution } from "../../relay/ThreadExecution.ts";
 import { CheckoutAdmission } from "../../persistence/CheckoutCapture.ts";
 import { makeProviderExecution } from "../ProviderExecution.ts";
@@ -4203,11 +4204,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         },
         (artifactRoot) =>
           Effect.gen(function* () {
-            const routed = yield* resolveRoutableSession({
-              threadId: input.threadId,
-              operation: "checkpointConversation",
-              allowRecovery: false,
-            });
+            // Workflow pause only copies the already settled archive. Routing a
+            // provider here would require open execution on the sealed source.
+            const routed =
+              workflow && input.captureOperationId !== undefined
+                ? null
+                : yield* resolveRoutableSession({
+                    threadId: input.threadId,
+                    operation: "checkpointConversation",
+                    allowRecovery: false,
+                  });
             if (
               pendingCompactions.has(input.threadId) ||
               timedOutNativeCompactions.has(input.threadId)
@@ -4223,8 +4229,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 ? yield* nativeCheckpoints.get(input.threadId, fence.generation, input.turnId)
                 : null;
               if (
-                routed.isActive ||
-                routed.adapter.provider !== "codex" ||
+                routed?.isActive ||
+                (routed && routed.adapter.provider !== "codex") ||
                 Option.isNone(binding) ||
                 binding.value.status !== "stopped" ||
                 !fence ||
@@ -4238,7 +4244,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   "Final recovery requires a stopped Codex binding and its settled native checkpoint.",
                 );
               const cursor = yield* decodeCheckpointCursor(binding.value.resumeCursor);
+              if (workflow && (!point || cursor.threadId !== workflow.nativeThreadId))
+                return yield* toValidationError(
+                  "checkpointConversation",
+                  "The workflow's settled native checkpoint is unavailable.",
+                );
               if (!point) {
+                if (!routed)
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "The workflow's settled native checkpoint is unavailable.",
+                  );
                 const cwd = readPersistedCwd(binding.value.runtimePayload);
                 const [local] = yield* checkpointSql`SELECT 1 FROM thread_local_enrollments
                     WHERE thread_id=${input.threadId} AND phase='active'
@@ -4366,6 +4382,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 );
               return { directory: archiveDirectory, nativeThreadId: point.nativeThreadId };
             }
+            if (!routed)
+              return yield* toValidationError(
+                "checkpointConversation",
+                "Native checkpoint authority is unavailable.",
+              );
             const capture = routed.adapter.checkpointConversation;
             if (!capture || (!routed.isActive && !workflow) || Option.isNone(checkpointEvents))
               return yield* toValidationError(
@@ -4504,11 +4525,83 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     Effect.fn("ProviderService.checkpointConversation")(function* (input) {
       if (yield* workflows.isWorkflowVmThread(input.threadId)) {
         if (input.captureOperationId === undefined) return;
+        const checkpoint = input.workflowCheckpoint;
+        const invalid = () =>
+          toValidationError(
+            "checkpointConversation",
+            "Native provider history can only be saved at this workflow VM's verified pause.",
+          );
+        if (!checkpoint)
+          return yield* toValidationError(
+            "checkpointConversation",
+            "Native provider history cannot leave a workflow VM.",
+          );
+        if (!workflowGuest || !vmWorkloads || Option.isNone(secretStore)) return yield* invalid();
+        const vm = yield* readInstalledThreadVm().pipe(
+          Effect.provideService(ServerSecretStore, secretStore.value),
+          Effect.mapError(invalid),
+        );
+        if (!vm || vm.scope.threadId !== input.threadId) return yield* invalid();
+        const verify = Effect.fnUntraced(function* () {
+          const { binding } = yield* requireWorkflowVmLifecycleCheckpoint(checkpointSql, {
+            threadId: input.threadId,
+            generation: vm.scope.generation,
+            workflowCheckpoint: checkpoint,
+          });
+          const owner = yield* makeThreadExecutionFence(checkpointSql).get(input.threadId);
+          const runtime = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
+          const metadata = readContinuation(runtime?.runtimePayload);
+          const run = yield* workflows.get(binding.jobId);
+          if (
+            !owner ||
+            owner.phase !== "frozen" ||
+            owner.frozenSequence === null ||
+            owner.operationId !== input.captureOperationId ||
+            owner.relayUrl !== vm.relayUrl ||
+            owner.generation !== binding.generation ||
+            owner.projectId !== binding.projectId ||
+            owner.environmentId !== binding.environmentId ||
+            vm.environmentId !== binding.environmentId ||
+            vm.operationId !== binding.operationId ||
+            vm.scope.allocationId !== binding.allocationId ||
+            vm.scope.repositoryId !== binding.repositoryId ||
+            !run ||
+            !run.worktreePath ||
+            run.providerContinuation?.driver !== "codex" ||
+            (run.progress.checkpoint?.kind === "review" &&
+              run.progress.checkpoint.turnId !== input.turnId) ||
+            !runtime ||
+            !hasDrainedWorkflowWriter(runtime) ||
+            runtime.provider !== "codex" ||
+            runtime.providerInstanceId !== run.modelSelection.instanceId ||
+            metadata?.workflowJobId !== binding.jobId ||
+            metadata.continuationKey !== run.providerContinuation.continuationKey ||
+            Predicate.hasProperty(runtime.runtimePayload, "workflowVmCancellation")
+          )
+            return yield* invalid();
+          const cursor = yield* decodeCheckpointCursor(runtime.resumeCursor);
+          if (!cursor.threadId || cursor.resumePolicy !== "require-existing")
+            return yield* invalid();
+          return { cwd: run.worktreePath, nativeThreadId: cursor.threadId };
+        }, Effect.mapError(invalid));
+        const native = yield* verify();
+        yield* captureConversation(input, {
+          ...native,
+          authorize: verify().pipe(
+            Effect.flatMap((current) =>
+              current.nativeThreadId === native.nativeThreadId && current.cwd === native.cwd
+                ? Effect.void
+                : invalid(),
+            ),
+          ),
+        });
+        return;
+      }
+      if (input.workflowCheckpoint)
         return yield* toValidationError(
           "checkpointConversation",
-          "Native provider history cannot leave a workflow VM.",
+          "This thread has no workflow VM checkpoint authority.",
         );
-      }
       yield* captureConversation(input);
     });
 

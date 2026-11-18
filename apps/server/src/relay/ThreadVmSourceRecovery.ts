@@ -1,4 +1,5 @@
 import { CommandId, OrchestrationSession, ThreadId } from "@t3tools/contracts";
+import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -14,13 +15,15 @@ import { makeThreadAttachmentCheckpoint } from "./ThreadAttachmentCheckpoint.ts"
 import type { makeThreadCheckpointPublisher } from "./ThreadCheckpointPublisher.ts";
 import type { makeThreadHistorySync, ThreadHistoryOwner } from "./ThreadHistorySync.ts";
 import { ThreadExecutionFenceError } from "../persistence/ThreadExecutionFence.ts";
+import { requireWorkflowVmLifecycleCheckpoint } from "../persistence/WorkflowThreadOwnership.ts";
 import { makeThreadTransferSource } from "./ThreadTransferSource.ts";
 
 import { assertThreadVmQueueIdle } from "./ThreadVmQueueActivity.ts";
 import { ThreadExecution } from "./ThreadExecution.ts";
-import { inspectVmWorkloads } from "../vmWorkload.ts";
+import { inspectVmWorkloads, stopPassiveWorkflowVmSetup } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { adoptWorkflowVmCancellationSeal } from "./WorkflowVmCancellation.ts";
+import { collectThreadAttachmentReferences } from "./ThreadAttachmentReferences.ts";
 
 const decodeSession = Schema.decodeUnknownEffect(OrchestrationSession);
 
@@ -45,11 +48,18 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     input: ThreadHistoryOwner & {
       readonly operationId: string;
       readonly previousOperationId: string;
+      readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
     },
   ) {
     const threadId = input.threadId;
     const fail = (threadId: string, detail: string) =>
       new ThreadExecutionFenceError({ threadId, detail });
+    const workflow = input.workflowCheckpoint
+      ? yield* requireWorkflowVmLifecycleCheckpoint(sql, {
+          ...input,
+          workflowCheckpoint: input.workflowCheckpoint,
+        }).pipe(Effect.mapError((error) => fail(threadId, error.message)))
+      : null;
     let owner = yield* fences.get(threadId);
     if (
       !owner ||
@@ -76,7 +86,8 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     }
     if (owner.operationId !== input.operationId || !["draining", "frozen"].includes(owner.phase))
       return yield* fail(threadId, "Another operation holds this source.");
-    if (tracked && owner.phase === "draining") yield* adoptWorkflowVmCancellationSeal(sql, input);
+    if (!workflow && tracked && owner.phase === "draining")
+      yield* adoptWorkflowVmCancellationSeal(sql, input);
     yield* assertThreadVmQueueIdle(sql, threadId);
     const unsettled = yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${threadId}
       AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending')
@@ -87,7 +98,11 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     // Routine recovery must not close a shell or interrupt detached work that
     // raced the relay idle report. No live guest workload is evidence of idleness.
     if (tracked && !(yield* inspectVmWorkloads({ type: "inspect" })).stopped) {
-      if (
+      if (workflow) {
+        // Only the authenticated passive setup supervisor may be closed here.
+        // Any recipe, terminal, provider or detached work still blocks capture.
+        if (yield* Effect.isFailure(stopPassiveWorkflowVmSetup())) return;
+      } else if (
         !provider.stopIdleVmSession ||
         !(yield* provider.stopIdleVmSession({
           threadId: ThreadId.make(threadId),
@@ -102,22 +117,30 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     const [runtime] = yield* sql<{
       status: string;
     }>`SELECT status FROM provider_session_runtime WHERE thread_id=${threadId}`;
-    if (!runtime)
+    if (!runtime && !workflow?.beforeAgent)
       return yield* fail(threadId, "Saving VM recovery needs a retained Codex conversation.");
+    if (
+      !runtime &&
+      (yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${threadId} LIMIT 1`).length
+    )
+      return yield* fail(threadId, "The workflow already has a conversation to retain.");
     const providerWork = yield* sql`SELECT 1 FROM thread_execution_work WHERE thread_id=${threadId}
       AND generation=${owner.generation} AND kind='provider' AND completed=0 LIMIT 1`;
     if (
-      providerWork.length ||
-      runtime.status !== "stopped" ||
-      (yield* provider.listSessions()).some((s) => s.threadId === threadId)
+      runtime &&
+      (providerWork.length ||
+        runtime.status !== "stopped" ||
+        (yield* provider.listSessions()).some((s) => s.threadId === threadId))
     )
       yield* provider.stopSession({ threadId: ThreadId.make(threadId) });
-    if (!provider.flushRuntimeEvents)
-      return yield* fail(threadId, "Stopped provider output has not been confirmed.");
-    yield* provider.flushRuntimeEvents(ThreadId.make(threadId));
+    if (runtime) {
+      if (!provider.flushRuntimeEvents)
+        return yield* fail(threadId, "Stopped provider output has not been confirmed.");
+      yield* provider.flushRuntimeEvents(ThreadId.make(threadId));
+    }
     const [session] =
       yield* sql`SELECT thread_id AS "threadId",status,provider_name AS "providerName",provider_instance_id AS "providerInstanceId",runtime_mode AS "runtimeMode",active_turn_id AS "activeTurnId",last_error AS "lastError",updated_at AS "updatedAt" FROM projection_thread_sessions WHERE thread_id=${threadId}`;
-    if (session && session.status !== "stopped") {
+    if (runtime && session && session.status !== "stopped") {
       const at = DateTime.formatIso(yield* DateTime.now);
       yield* engine.dispatch({
         type: "thread.session.set",
@@ -139,21 +162,43 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     const frozen = yield* source
       .freeze({ ...input, requireIdleQueue: true })
       .pipe(Effect.provideContext(context));
-    if (!frozen.nativeCheckpointTurnId)
-      return yield* fail(threadId, "Frozen native recovery is unavailable.");
+    if (workflow && workflow.sourceSequence > frozen.sourceSequence)
+      return yield* fail(threadId, "The saved workflow is newer than the frozen source.");
+    if (!frozen.nativeCheckpointTurnId) {
+      if (!workflow?.beforeAgent)
+        return yield* fail(threadId, "Frozen native recovery is unavailable.");
+      const references = yield* collectThreadAttachmentReferences(
+        threadId,
+        events.readAggregateRange({
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          fromSequenceExclusive: 0,
+          toSequenceInclusive: frozen.sourceSequence,
+          limit: Number.MAX_SAFE_INTEGER,
+        }),
+      );
+      if (references.length)
+        return yield* fail(
+          threadId,
+          "The pre-Agent workflow has attachments without a recovery archive.",
+        );
+    }
     yield* history.synchronize(threadId);
-    yield* checkpoints.synchronize(threadId, input.operationId);
-    const key = threadCheckpointId(frozen.nativeCheckpointTurnId, input.operationId);
-    const point = yield* native.get(threadId, owner.generation, key),
-      chat = yield* attachments.get(threadId, owner.generation, key);
-    if (!point?.publishedArtifactId || !chat?.publishedArtifactId) return;
-    const nativeCheckpointOperationId = checkpointPublicationOperationId(
-      "launchpad-native-checkpoint-v1",
-      threadId,
-      owner.generation,
-      frozen.nativeCheckpointTurnId,
-      point,
-    );
+    let nativeCheckpointOperationId: string | null = null;
+    if (frozen.nativeCheckpointTurnId) {
+      yield* checkpoints.synchronize(threadId, input.operationId);
+      const key = threadCheckpointId(frozen.nativeCheckpointTurnId, input.operationId);
+      const point = yield* native.get(threadId, owner.generation, key),
+        chat = yield* attachments.get(threadId, owner.generation, key);
+      if (!point?.publishedArtifactId || !chat?.publishedArtifactId) return;
+      nativeCheckpointOperationId = checkpointPublicationOperationId(
+        "launchpad-native-checkpoint-v1",
+        threadId,
+        owner.generation,
+        frozen.nativeCheckpointTurnId,
+        point,
+      );
+    }
     if (!tracked) return yield* fail(threadId, "Native VM snapshots require tracked workloads.");
     const inventory = yield* inspectVmWorkloads({ type: "inspect" });
     if (!inventory.stopped) return yield* fail(threadId, "VM workloads did not remain stopped.");
@@ -169,5 +214,20 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
       sealEpoch: seal.epoch,
     };
   });
-  return { capture };
+  const captureNative = Effect.fn("ThreadVmSourceRecovery.captureNative")(function* (
+    input: ThreadHistoryOwner & {
+      readonly operationId: string;
+      readonly previousOperationId: string;
+    },
+  ) {
+    const point = yield* capture(input);
+    if (!point) return;
+    if (!point.nativeCheckpointOperationId)
+      return yield* new ThreadExecutionFenceError({
+        threadId: input.threadId,
+        detail: "Frozen native recovery is unavailable.",
+      });
+    return { ...point, nativeCheckpointOperationId: point.nativeCheckpointOperationId };
+  });
+  return { capture: captureNative, captureForPause: capture };
 });

@@ -2,6 +2,7 @@ import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import signal
 import types
 import tempfile
@@ -17,6 +18,105 @@ from unittest import mock
 spec = importlib.util.spec_from_file_location('launchpad_workload', Path(__file__).with_name('workload.py'))
 workload = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(workload)
+
+
+class ProviderIdentityTest(unittest.TestCase):
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        self.state = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.executable = self.state / 'codex'
+        self.executable.write_bytes(b'pinned Codex executable')
+        self.sha256 = hashlib.sha256(self.executable.read_bytes()).hexdigest()
+        self.work_id = 'a' * 32
+        self.pid = 42
+        self.gate = {'bootId': 'test-boot'}
+        (self.state / (self.work_id + '.json')).write_text(json.dumps({
+            'id': self.work_id, 'kind': 'provider', 'leaderPid': self.pid,
+            'bootId': 'test-boot', 'startTicks': '123', 'workflow': True,
+        }))
+        stack.enter_context(mock.patch.object(workload, 'STATE', self.state))
+        stack.enter_context(mock.patch.object(workload, 'workflow_guest', return_value=True))
+        stack.enter_context(mock.patch.object(os, 'getuid', return_value=0))
+        stack.enter_context(mock.patch.object(signal, 'alarm'))
+        stack.enter_context(mock.patch.object(workload, 'pinned_native', side_effect=lambda: (
+            {'sha256': self.sha256}, self.executable, self.executable.lstat(),
+        )))
+        stack.enter_context(mock.patch.object(workload, 'process_identity', return_value={
+            'startTicks': '123', 'processGroup': self.pid, 'state': 'S',
+        }))
+        self.locked = False
+        self.on_lock = lambda: None
+
+        @contextlib.contextmanager
+        def lock():
+            self.locked = True
+            try:
+                self.on_lock()
+                yield self.gate
+            finally:
+                self.locked = False
+
+        stack.enter_context(mock.patch.object(workload, 'locked', lock))
+        stat = Path.stat
+        stack.enter_context(mock.patch.object(Path, 'stat', lambda path, *args, **kwargs:
+            self.executable.lstat() if path == Path(f'/proc/{self.pid}/exe')
+            else stat(path, *args, **kwargs)))
+
+    def read_identity(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            workload.main(['provider-identity', self.work_id, str(self.pid)])
+        return json.loads(output.getvalue())
+
+    def test_streams_the_digest_before_locking_and_verifies_the_registered_process(self):
+        sha256 = hashlib.sha256
+
+        def digest(*args):
+            self.assertFalse(self.locked)
+            self.assertEqual(args, ())
+            return sha256()
+
+        with mock.patch.object(hashlib, 'sha256', side_effect=digest) as hashed:
+            identity = self.read_identity()
+        hashed.assert_called_once()
+        self.assertEqual(identity, {'bootId': 'test-boot', 'groupId': self.work_id, 'pid': 42,
+                                    'startTicks': '123', 'executableSha256': self.sha256})
+
+    def test_rejects_replacement_after_hashing_even_if_process_points_to_replacement(self):
+        replacement = self.state / 'other-codex'
+        replacement.write_bytes(b'pinned Codex executable')
+        self.on_lock = lambda: replacement.replace(self.executable)
+        with self.assertRaisesRegex(RuntimeError, 'Native executable identity changed'):
+            self.read_identity()
+
+    def test_rejects_an_incorrect_digest(self):
+        self.sha256 = '0' * 64
+        with self.assertRaisesRegex(RuntimeError, 'Native executable identity changed'):
+            self.read_identity()
+
+    def test_native_deadline_exits_without_an_identity_receipt(self):
+        def deliver_alarm():
+            signal.getsignal(signal.SIGALRM)(signal.SIGALRM, None)
+
+        output = io.StringIO()
+        with mock.patch.object(workload, 'verify_native_executable', side_effect=deliver_alarm), \
+                contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            workload.main(['provider-identity', self.work_id, str(self.pid)])
+        self.assertEqual(caught.exception.code, 124)
+        self.assertEqual(output.getvalue(), '')
+
+    def test_idle_stop_rejects_a_stale_leader_before_reading_the_binary(self):
+        self.gate['sealedBy'] = None
+        expected = {'bootId': 'test-boot', 'groupId': self.work_id, 'pid': self.pid,
+                    'startTicks': '123', 'executableSha256': self.sha256}
+        with mock.patch.object(workload, 'inventory', return_value={'groups': [{'id': self.work_id}]}), \
+                mock.patch.object(workload, 'process_identity', return_value={
+                    'startTicks': 'stale', 'processGroup': self.pid, 'state': 'S',
+                }), mock.patch.object(workload, 'verify_native_executable') as verify:
+            with self.assertRaisesRegex(RuntimeError, 'Native leader identity changed'):
+                workload.stop_idle_provider(self.gate, expected, 'b' * 32)
+        verify.assert_not_called()
 
 
 class KernelStopReceiptTest(unittest.TestCase):
@@ -100,6 +200,21 @@ class KernelStopReceiptTest(unittest.TestCase):
             self.notification = notify
             with self.assertRaisesRegex(RuntimeError, 'shutdown ownership changed'):
                 workload.stop_workloads(self.gate)
+
+    def test_probe_cleanup_reports_lock_contention_without_signaling(self):
+        (workload.ROOT / 'lock').touch()
+        output = io.StringIO()
+        with mock.patch.object(workload, 'STATE', workload.ROOT), \
+                mock.patch.object(workload, 'workflow_guest', return_value=True), \
+                mock.patch.object(os, 'getuid', return_value=0), \
+                mock.patch.object(signal, 'alarm'), \
+                mock.patch.object(workload.fcntl, 'flock', side_effect=BlockingIOError) as lock, \
+                mock.patch.object(workload, 'stop_workflow_probe') as stop, \
+                contextlib.redirect_stdout(output):
+            workload.main(['stop-workflow-probe', self.groups[0].name, '42'])
+        lock.assert_called_once_with(mock.ANY, workload.fcntl.LOCK_EX | workload.fcntl.LOCK_NB)
+        stop.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), {'status': 'busy'})
 
 
 class WarmRestoreGateTest(unittest.TestCase):
@@ -236,11 +351,20 @@ class CoordinatorLaunchTest(unittest.TestCase):
     def test_workflow_launcher_only_exports_guest_mode_to_coordinator(self):
         self.launch('initial', True)
 
+    def test_restored_workflow_launcher_requires_the_bound_coordinator_and_retains_guest_mode(self):
+        self.launch('restore', True)
+        with tempfile.TemporaryDirectory(prefix='launchpad-workflow-restore-') as temporary:
+            with mock.patch.object(workload, 'COORDINATOR_STATE', Path(temporary)):
+                with self.assertRaisesRegex(RuntimeError, 'no native coordinator binding'):
+                    workload.coordinator_admission({}, require_restore_binding=True)
+
     def launch(self, mode, workflow):
         with tempfile.TemporaryDirectory(prefix='launchpad-coordinator-') as temporary, contextlib.ExitStack() as stack:
             root=Path(temporary);groups=root/'groups';state=root/'state'
             groups.mkdir();state.mkdir();server=root/'t3';server.write_bytes(b'immutable-server')
             scope={'allocationId':'allocation','operationId':'operation','threadId':'thread','generation':2}
+            if workflow and mode == 'restore':
+                (state/'restore-binding.json').write_text(json.dumps({'boot':scope}))
             stack.enter_context(mock.patch.object(workload,'COORDINATORS',groups))
             stack.enter_context(mock.patch.object(workload,'COORDINATOR_STATE',state))
             stack.enter_context(mock.patch.object(workload,'SERVER',server))
@@ -263,7 +387,7 @@ class CoordinatorLaunchTest(unittest.TestCase):
             self.assertEqual(os.environ['USER'],'user')
             self.assertNotIn('LAUNCHPAD_COORDINATOR_SCOPE',os.environ)
             self.assertEqual(os.environ.get('LAUNCHPAD_WORKFLOW_GUEST'), '1' if workflow else None)
-            record=json.loads(next(state.glob('*.json')).read_text())
+            record=json.loads((state / (workload.coordinator_id(scope) + '.json')).read_text())
             self.assertEqual(record['scope'],scope);self.assertEqual(record['startTicks'],'123')
             self.assertEqual(record['pid'],os.getpid())
             self.assertEqual(execute.call_args.args[0],'/usr/bin/flock')
@@ -527,6 +651,61 @@ class WorkflowWorkloadTest(unittest.TestCase):
             workload.main(self.launch)
         self.assertFalse(self.group.exists())
 
+    def test_sealed_workflow_transfer_only_launches_git_as_the_workflow_user(self):
+        self.gate['sealedBy'] = 'b' * 32
+        self.gate['epoch'] = 2
+        cwd = '/workspace/project'
+        command = ['run-workflow-transfer', self.gate['bootId'], 'b' * 32,
+                   str(self.gate['epoch']), self.work_id, 'process', cwd, '--']
+        git_args = ['-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null',
+                    '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false']
+        for invalid in (['sh'], ['git', 'rev-parse', 'HEAD^{commit}'],
+                        ['git', *git_args, 'update-ref', 'refs/heads/new', 'HEAD'],
+                        ['git', *git_args, 'symbolic-ref', 'HEAD', 'refs/heads/new']):
+            with self.assertRaisesRegex(ValueError, 'Invalid sealed workflow maintenance command'):
+                workload.main([*command, *invalid])
+        self.assertFalse(self.group.exists())
+        with (
+            mock.patch.object(workload, 'require_workflow_dump_policy'),
+            mock.patch.object(workload, 'require_workflow_executable'),
+            mock.patch.object(workload, 'immutable'),
+            mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                workload.main([*command, 'git', *git_args, 'rev-parse', 'HEAD^{commit}'])
+        record = json.loads(self.record.read_text())
+        self.assertTrue(record['workflow'])
+        self.assertEqual(record['kind'], 'transfer')
+        execute.assert_called_once_with(
+            workload.WORKFLOW_EXEC,
+            [workload.WORKFLOW_EXEC, 'exec-git', cwd, '--', *git_args, 'rev-parse', 'HEAD^{commit}'],
+        )
+
+    def test_sealed_workflow_codex_proof_only_launches_the_fixed_reader_at_the_native_home(self):
+        self.gate['sealedBy'] = 'b' * 32
+        self.gate['epoch'] = 2
+        prefix = ['run-workflow-transfer', self.gate['bootId'], 'b' * 32,
+                  '2', self.work_id, 'process']
+        home = '/home/launchpad-workflow/.codex'
+        reader = ['--', '/usr/bin/python3', '-IS', str(workload.CHECKPOINT_READER)]
+        for command in ([*prefix, self.cwd, *reader, 'capture'],
+                        [*prefix, home, *reader, 'exclude']):
+            with self.assertRaisesRegex(ValueError, 'Invalid sealed workflow maintenance command'):
+                workload.main(command)
+        self.assertFalse(self.group.exists())
+        with (
+            mock.patch.object(workload, 'require_workflow_dump_policy'),
+            mock.patch.object(workload, 'require_workflow_executable'),
+            mock.patch.object(workload, 'immutable'),
+            mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'exec captured'):
+                workload.main([*prefix, home, *reader, 'capture'])
+        execute.assert_called_once_with(
+            workload.WORKFLOW_EXEC,
+            [workload.WORKFLOW_EXEC, 'exec-checkpoint-reader', home, 'capture'],
+        )
+
     def test_signal_matches_current_group_and_leader_or_kills_only_owned_descendants(self):
         self.group.mkdir()
         (self.group / 'cgroup.events').write_text('populated 1\n')
@@ -548,6 +727,28 @@ class WorkflowWorkloadTest(unittest.TestCase):
         self.assertFalse((self.group / 'cgroup.kill').exists())
         self.assertTrue(workload.signal_workflow(self.gate, self.work_id, 42, 'KILL'))
         self.assertEqual((self.group / 'cgroup.kill').read_text(), '1')
+
+    def test_stops_owned_probe_descendants_and_waits_for_empty_cgroup(self):
+        self.assertFalse(workload.stop_workflow_probe(self.gate, self.work_id, 42))
+        self.group.mkdir()
+        events = self.group / 'cgroup.events'
+        events.write_text('populated 1\n')
+        (self.group / 'cgroup.procs').write_text('43\n')
+        record = {'id': self.work_id, 'bootId': 'current-boot', 'workflow': True,
+                  'leaderPid': 42, 'kind': 'provider'}
+        self.record.write_text(json.dumps(record))
+        with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+            workload.stop_workflow_probe(self.gate, self.work_id, 42)
+        self.assertFalse((self.group / 'cgroup.kill').exists())
+        self.record.write_text(json.dumps({**record, 'kind': 'probe'}))
+        with mock.patch.object(workload, 'wait_cgroup_event', side_effect=RuntimeError('still populated')):
+            with self.assertRaisesRegex(RuntimeError, 'still populated'):
+                workload.stop_workflow_probe(self.gate, self.work_id, 42)
+        self.assertEqual((self.group / 'cgroup.kill').read_text(), '1')
+        with mock.patch.object(workload, 'wait_cgroup_event', side_effect=lambda *_: events.write_text('populated 0\n')) as wait:
+            self.assertTrue(workload.stop_workflow_probe(self.gate, self.work_id, 42))
+        wait.assert_called_once_with(self.group, 'populated', '0')
+        self.assertFalse(workload.populated(self.group))
 
     def test_configures_guest_dump_policy_and_rejects_weaker_runtime_policy(self):
         scope = self.state / 'suid_dumpable'

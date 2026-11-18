@@ -18,7 +18,7 @@ import {
   completeThreadVmWarmRestoreBootstrap,
   requireThreadVmWarmRestoreBootstrap,
 } from "../relay/ThreadVmRestoreIdentity.ts";
-import { inspectVmWorkloads } from "../vmWorkload.ts";
+import { inspectVmWorkloads, withSealedVmWorkloads } from "../vmWorkload.ts";
 import { isWorkflowVmGuest, withVmWorkloads } from "../vmWorkloadCommand.ts";
 import { WorkflowReviewGitDirectory } from "../vcs/WorkflowReviewGitDirectory.ts";
 import { mintThreadVmCodexToken, ThreadVmCodexTokenError } from "../relay/ThreadVmCodexToken.ts";
@@ -245,7 +245,16 @@ export const threadVmRestoreImportCommand = Command.make("__thread-vm-restore-im
         !(yield* inspectVmWorkloads({ type: "inspect" })).stopped
       )
         return yield* new ThreadVmRestoreInstallError();
-      const receipt = yield* importInstalledThreadVmRestore(input.value).pipe(
+      const workflow = yield* isWorkflowVmGuest;
+      const install = importInstalledThreadVmRestore(input.value, workflow);
+      const receipt = yield* (
+        workflow
+          ? withVmWorkloads(
+              withSealedVmWorkloads(input.value.operationId, install, undefined, true),
+              true,
+            )
+          : install
+      ).pipe(
         Effect.provide(
           Layer.mergeAll(
             OrchestrationLayerLive.pipe(Layer.provide(RepositoryIdentityResolver.layer)),
@@ -404,7 +413,7 @@ export const threadVmServeCommand = Command.make("__thread-vm-serve", {
     Effect.fn("ThreadVmServer.command")(function* ({ receiptSha256, move, restore }) {
       if (move && restore) return yield* new ThreadVmRestoreInstallError();
       const workflow = yield* isWorkflowVmGuest;
-      if (workflow && (move || restore)) return yield* new ThreadVmRestoreInstallError();
+      if (workflow && move) return yield* new ThreadVmRestoreInstallError();
       const path = yield* Path.Path;
       // Dedicated guests do not inherit desktop bootstrap descriptors, dev origins or public listeners.
       const config = yield* resolveServerConfig(
@@ -426,7 +435,7 @@ export const threadVmServeCommand = Command.make("__thread-vm-serve", {
       ).pipe(Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown({})));
       yield* (
         restore
-          ? requireThreadVmRestoreServerStart(receiptSha256)
+          ? requireThreadVmRestoreServerStart(receiptSha256, undefined, workflow)
           : move
             ? requireThreadVmMoveServerStart(receiptSha256)
             : requireThreadVmServerStart(receiptSha256)

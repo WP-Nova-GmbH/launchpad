@@ -1,13 +1,17 @@
+import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as NodeCrypto from "node:crypto";
+import type { SqlError } from "effect/unstable/sql/SqlError";
 import {
   E2BNativeSnapshotReceipt,
   ThreadVmCaptureSourceReceipt,
 } from "../machines/E2BNativeSnapshotReceipt.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
+import { lockWorkflowVmCheckpoint } from "../jobs/WorkflowVmCheckpoint.ts";
 import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
@@ -27,15 +31,15 @@ export interface FinalSave {
   readonly operationId: string;
   readonly threadId: string;
   readonly allocationId: string;
-  readonly actorUserId: string;
+  readonly actorUserId: string | null;
   readonly environmentId: string;
   readonly generation: number;
   readonly hostId: string;
   readonly computeRef: string;
   readonly originalState: "running" | "paused";
-  readonly reason: "idle" | "replacement";
+  readonly reason: "idle" | "replacement" | "source_loss";
   readonly activityRevision: number;
-  readonly idleSince: string;
+  readonly idleSince: string | null;
   readonly sourceSequence: number | null;
   readonly nativeCheckpointOperationId: string | null;
   readonly backupOperationId: string | null;
@@ -53,6 +57,21 @@ export interface FinalSave {
     | "aborting"
     | "aborted";
 }
+
+export interface MissingWorkflowVmSource {
+  readonly allocationId: string;
+  readonly computeRef: string;
+  readonly generation: number;
+  readonly hostId: string;
+  readonly provisionOperationId: string;
+  readonly threadId: string;
+  readonly pauseClaim?: { readonly operationId: string; readonly claimId: string };
+  readonly resumeClaim?: { readonly operationId: string; readonly claimId: string };
+}
+
+export type MissingWorkflowVmSourceReconciler = (
+  input: MissingWorkflowVmSource,
+) => Effect.Effect<boolean, SqlError>;
 
 /** Internal protocol: a source acknowledgement and independent checkpoints must precede a new final disk capture. */
 export function makeThreadVmFinalSaveStore(
@@ -91,7 +110,7 @@ export function makeThreadVmFinalSaveStore(
       const [owned] = yield* sql`SELECT 1 FROM relay_thread_placements t
         JOIN relay_thread_vm_allocations a ON a.thread_id=t.thread_id
         JOIN relay_thread_vm_bindings b ON b.allocation_id=a.allocation_id
-        WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND t.thread_id=${current.threadId} AND t.operation_id=${operationId}
+        WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND t.audience='repository' AND ${current.sourceReceipt?.workflowCheckpoint?.jobId ?? null}=t.workflow_job_id)) AND t.thread_id=${current.threadId} AND t.operation_id=${operationId}
           AND t.environment_id=${current.environmentId} AND t.generation=${current.generation}
           AND a.allocation_id=${current.allocationId} AND a.compute_ref=${current.computeRef}
           AND a.deleted_at IS NULL AND b.environment_id=t.environment_id AND b.generation=t.generation
@@ -104,6 +123,7 @@ export function makeThreadVmFinalSaveStore(
     operation: Pick<FinalSave, "threadId" | "reason" | "idleSince">,
   ) {
     if (operation.reason !== "idle") return;
+    if (!operation.idleSince) return yield* conflict("The idle deadline is unavailable.");
     const [placement] = yield* sql<{
       organizationId: string;
     }>`SELECT organization_id AS "organizationId" FROM relay_thread_placements WHERE thread_id=${operation.threadId}`;
@@ -127,7 +147,7 @@ export function makeThreadVmFinalSaveStore(
   const requireStillIdle = Effect.fnUntraced(function* (operation: FinalSave) {
     const [idle] =
       yield* sql`SELECT 1 FROM relay_thread_vm_allocations a JOIN relay_thread_vm_activity v USING(allocation_id)
-      WHERE a.runtime_protocol='native-v1' AND a.resource_kind='personal' AND a.allocation_id=${operation.allocationId} AND a.state=${operation.originalState}
+      WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND ${operation.sourceReceipt?.workflowCheckpoint !== undefined})) AND a.allocation_id=${operation.allocationId} AND a.state=${operation.originalState}
         AND date_trunc('milliseconds',v.idle_since)=${operation.idleSince}::timestamptz
         AND (a.state='paused' OR v.activity='idle')`;
     if (!idle) return yield* conflict("New source activity changed the final-save idle boundary.");
@@ -234,6 +254,297 @@ export function makeThreadVmFinalSaveStore(
       }),
     );
   });
+  /** The workflow source is already frozen and verified. Never wake it to save. */
+  const beginWorkflow = Effect.fn("relay.thread_vm.final_save.begin_workflow")(function* (input: {
+    operationId: string;
+    threadId: string;
+    allocationId: string;
+    generation: number;
+  }) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [placement] = yield* sql<{ jobId: string; environmentId: string }>`
+        SELECT workflow_job_id AS "jobId", environment_id AS "environmentId"
+        FROM relay_thread_placements WHERE thread_id=${input.threadId}
+          AND audience='repository' AND generation=${input.generation} AND operation_id IS NULL FOR UPDATE`;
+        if (!placement) return false;
+        const [source] = yield* sql<{
+          sourceReceipt: ThreadVmCaptureSourceReceipt;
+          hostId: string;
+          idleSince: string;
+          activityRevision: number;
+        }>`SELECT x.source_receipt AS "sourceReceipt",c.host_id AS "hostId",
+        to_char(v.idle_since AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "idleSince",
+        v.revision AS "activityRevision"
+        FROM relay_thread_vm_allocations a JOIN relay_thread_vm_pauses x USING(allocation_id)
+        JOIN relay_thread_vm_activity v USING(allocation_id)
+        JOIN relay_thread_vm_bindings b USING(allocation_id)
+        JOIN relay_thread_vm_backups z ON z.operation_id=x.backup_operation_id
+        JOIN LATERAL (SELECT host_id,state FROM relay_thread_vm_capacity
+          WHERE allocation_id=a.allocation_id ORDER BY position DESC LIMIT 1) c ON c.state='released'
+        WHERE a.allocation_id=${input.allocationId} AND a.thread_id=${input.threadId}
+          AND a.resource_kind='organization_workflow' AND a.runtime_protocol='native-v1'
+          AND a.state='paused' AND a.deleted_at IS NULL AND v.idle_since IS NOT NULL
+          AND b.generation=${input.generation} AND b.environment_id=${placement.environmentId} AND b.revoked_at IS NULL
+          AND x.generation=b.generation AND x.phase='completed' AND x.source_reopened_at IS NULL
+          AND x.workflow_checkpoint->>'jobId'=${placement.jobId} AND x.source_frozen_at IS NOT NULL
+          AND z.phase='verified' AND z.source_receipt=x.source_receipt AND z.native_capture_receipt IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_resumes r
+            WHERE r.allocation_id=a.allocation_id AND r.phase IN ('waiting','resuming'))
+        FOR UPDATE OF a,x`;
+        if (!source?.sourceReceipt.workflowCheckpoint) return false;
+        const checkpoint = yield* readCurrentWorkflowCheckpoint(
+          sql,
+          source.sourceReceipt.workflowCheckpoint,
+        );
+        if (!checkpoint || checkpoint.pending) return false;
+        yield* checkDeadline({ ...input, reason: "idle", idleSince: source.idleSince });
+        const receipt = source.sourceReceipt;
+        yield* sql`INSERT INTO relay_thread_vm_final_saves
+        (operation_id,thread_id,allocation_id,actor_user_id,environment_id,generation,host_id,compute_ref,
+          original_state,reason,activity_revision,idle_since,phase,source_receipt,source_sequence,
+          native_checkpoint_operation_id,frozen_at)
+        VALUES (${input.operationId},${input.threadId},${input.allocationId},NULL,${placement.environmentId},
+          ${input.generation},${source.hostId},${receipt.computeRef},'paused','idle',${source.activityRevision},
+          ${source.idleSince}::timestamptz,'frozen',${sql.json(receipt)},${receipt.sourceSequence},
+          ${receipt.nativeCheckpointOperationId},clock_timestamp())`;
+        yield* sql`UPDATE relay_thread_placements SET operation_id=${input.operationId} WHERE thread_id=${input.threadId}`;
+        return true;
+      }),
+    );
+  });
+
+  /** Transfers recovery ownership after a non-waking native lookup confirms absence. */
+  const reconcileMissingWorkflowSource = Effect.fn("relay.thread_vm.final_save.source_loss")(
+    function* (input: MissingWorkflowVmSource) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const [placement] = yield* sql<{ jobId: string }>`SELECT workflow_job_id AS "jobId"
+            FROM relay_thread_placements WHERE thread_id=${input.threadId} AND audience='repository'`;
+          if (!placement) return false;
+          const job = yield* lockWorkflowVmCheckpoint(sql, placement.jobId);
+          if (
+            !job ||
+            job.pendingControl?.checkpointDispatch ||
+            job.pendingControl?.supersededCheckpoint ||
+            job.record.progress?.approvalPending ||
+            job.record.progress?.resultSaving ||
+            job.record.progress?.manualPause
+          )
+            return false;
+          const [source] = yield* sql<{
+            environmentId: string;
+            state: "paused" | "running";
+            placementOperationId: string | null;
+          }>`
+            SELECT t.environment_id AS "environmentId",a.state,t.operation_id AS "placementOperationId"
+            FROM relay_thread_placements t
+            JOIN relay_thread_vm_allocations a USING(thread_id)
+            JOIN relay_thread_vm_provisions p USING(allocation_id)
+            WHERE t.thread_id=${input.threadId} AND t.workflow_job_id=${job.jobId} AND t.audience='repository'
+              AND t.generation=${input.generation} AND (t.operation_id IS NULL OR t.operation_id=p.operation_id)
+              AND a.allocation_id=${input.allocationId} AND a.compute_ref=${input.computeRef}
+              AND a.state IN ('running','paused') AND a.deleted_at IS NULL
+              AND a.resource_kind='organization_workflow' AND a.runtime_protocol='native-v1'
+              AND a.organization_id=t.organization_id AND p.operation_id=${input.provisionOperationId}
+              AND p.generation=t.generation AND p.phase='created' AND p.workflow_snapshot IS NOT NULL
+              AND p.claim_id IS NULL AND p.ingress_recovery_claim_id IS NULL
+              AND (t.operation_id=p.operation_id OR EXISTS (SELECT 1 FROM relay_thread_vm_bindings b
+                WHERE b.allocation_id=a.allocation_id AND b.environment_id=t.environment_id
+                  AND b.generation=t.generation AND b.revoked_at IS NULL))
+              AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_restores r WHERE r.allocation_id=a.allocation_id
+                AND (r.phase NOT IN ('completed','aborted') OR r.boot_ingress_recovery_claim_id IS NOT NULL
+                  OR (r.boot_create_started_at IS NOT NULL AND
+                    (r.boot_receipt IS NULL OR r.boot_receipt->>'kind' IS DISTINCT FROM 'native-restore-boot-v1'))))
+              AND EXISTS(SELECT 1 FROM relay_thread_vm_capacity c WHERE c.allocation_id=a.allocation_id
+                AND c.host_id=${input.hostId} AND c.compute_ref=a.compute_ref)
+            FOR UPDATE OF a,p`;
+          if (!source) return false;
+
+          const [pause] = yield* sql<{
+            operationId: string;
+            claimId: string | null;
+            nativeCheckpointOperationId: string | null;
+            blocked: boolean;
+          }>`SELECT operation_id AS "operationId",claim_id AS "claimId",
+              native_checkpoint_operation_id AS "nativeCheckpointOperationId",
+              (pause_dispatch_claim_id IS NOT NULL OR (pause_dispatched_at IS NOT NULL AND pause_acknowledged_at IS NULL)
+                OR COALESCE(claim_until>clock_timestamp() AND claim_id IS DISTINCT FROM ${input.pauseClaim?.claimId ?? null},false)) AS blocked
+            FROM relay_thread_vm_pauses WHERE allocation_id=${input.allocationId} AND generation=${input.generation} FOR UPDATE`;
+          if (
+            pause?.blocked ||
+            (input.pauseClaim &&
+              (pause?.operationId !== input.pauseClaim.operationId ||
+                pause.claimId !== input.pauseClaim.claimId))
+          )
+            return false;
+          const [resume] = yield* sql<{
+            operationId: string;
+            claimId: string | null;
+            blocked: boolean;
+          }>`SELECT r.operation_id AS "operationId",r.claim_id AS "claimId",
+              (r.connect_claim_id IS NOT NULL OR (r.phase='resuming' AND r.claim_id IS DISTINCT FROM ${input.resumeClaim?.claimId ?? null})
+                OR COALESCE(r.claim_until>clock_timestamp() AND r.claim_id IS DISTINCT FROM ${input.resumeClaim?.claimId ?? null},false)) AS blocked
+            FROM relay_thread_vm_resumes r JOIN relay_thread_vm_capacity c ON c.operation_id=r.operation_id
+            WHERE r.allocation_id=${input.allocationId} AND r.generation=${input.generation}
+              AND c.allocation_id=r.allocation_id AND c.kind='resume' AND c.host_id=${input.hostId} FOR UPDATE OF r,c`;
+          if (
+            resume?.blocked ||
+            (input.resumeClaim &&
+              (resume?.operationId !== input.resumeClaim.operationId ||
+                resume.claimId !== input.resumeClaim.claimId))
+          )
+            return false;
+          const unresolved = yield* sql`SELECT 1 FROM relay_thread_vm_backups
+            WHERE allocation_id=${input.allocationId} AND phase IN ('pending','creating','captured','verifying','cleanup')`;
+          if (unresolved.length) return false;
+
+          const [backup] = yield* sql<{
+            operationId: string;
+            sourceReceipt: ThreadVmCaptureSourceReceipt;
+          }>`
+            SELECT b.operation_id AS "operationId",b.source_receipt AS "sourceReceipt"
+            FROM relay_thread_vm_backups b JOIN relay_workflow_recovery_heads h ON h.job_id=${job.jobId}
+            WHERE b.allocation_id=${input.allocationId} AND b.compute_ref=${input.computeRef} AND b.generation=${input.generation}
+              AND b.phase='verified' AND b.snapshot_id IS NOT NULL AND b.native_capture_receipt IS NOT NULL
+              AND b.source_receipt#>>'{workflowCheckpoint,jobId}'=${job.jobId}
+              AND b.source_receipt#>>'{workflowCheckpoint,checkpointId}'=${job.record.progress?.checkpoint?.checkpointId ?? null}
+              AND b.source_receipt#>>'{workflowCheckpoint,checkpointGeneration}'=${String(job.record.progress?.checkpoint?.generation ?? 0)}
+              AND b.source_receipt#>>'{workflowCheckpoint,publicationId}'=h.publication_id
+              AND b.source_receipt#>>'{workflowCheckpoint,publicationRevision}'=h.revision::text
+            ORDER BY b.verified_at DESC,b.operation_id DESC LIMIT 1 FOR UPDATE OF b`;
+          const receipt = backup?.sourceReceipt;
+          const checkpoint = receipt?.workflowCheckpoint;
+          const verified =
+            source.placementOperationId === null &&
+            receipt &&
+            checkpoint &&
+            receipt.allocationId === input.allocationId &&
+            receipt.computeRef === input.computeRef &&
+            receipt.generation === input.generation &&
+            receipt.threadId === input.threadId &&
+            receipt.environmentId === source.environmentId &&
+            receipt.provisionOperationId === input.provisionOperationId &&
+            (yield* readCurrentWorkflowCheckpoint(sql, checkpoint, true));
+          const point =
+            verified && receipt.nativeCheckpointOperationId
+              ? yield* natives.get(receipt.nativeCheckpointOperationId)
+              : null;
+          const save =
+            backup && verified && (!receipt.nativeCheckpointOperationId || point?.recoveryHistory)
+              ? {
+                  backupOperationId: backup.operationId,
+                  receipt,
+                  operationId: NodeCrypto.randomUUID(),
+                }
+              : null;
+          if (save) {
+            if (point)
+              yield* natives.pinCompleteForOperation({
+                threadId: input.threadId,
+                operationId: save.operationId,
+                checkpointOperationId: point.operationId,
+                expected: point,
+              });
+            yield* backups.pin({
+              threadId: input.threadId,
+              backupOperationId: save.backupOperationId,
+              operationId: `saved-${save.operationId}`,
+            });
+          }
+
+          if (pause) {
+            yield* sql`UPDATE relay_thread_vm_pauses SET phase='cancelled',claim_id=NULL,claim_until=NULL
+              WHERE operation_id=${pause.operationId} AND phase IN ('pending','sealed','completed')`;
+            if (pause.nativeCheckpointOperationId)
+              yield* natives.releaseOperation({
+                threadId: input.threadId,
+                operationId: pause.operationId,
+              });
+          }
+          if (resume)
+            yield* sql`DELETE FROM relay_thread_vm_resumes WHERE operation_id=${resume.operationId}`;
+          const allocations = makeThreadVmAllocationStore(sql);
+          yield* allocations.requestDeletion(input.allocationId, "organization_workflow");
+          if (!save) {
+            yield* allocations.confirmDeleted({ ...input, resourceKind: "organization_workflow" });
+            yield* sql`UPDATE relay_thread_vm_allocations SET deletion_stop_receipt=${sql.json({
+              kind: "native-workflow-source-lost",
+              allocationId: input.allocationId,
+              computeRef: input.computeRef,
+              sourceOperationId: input.provisionOperationId,
+              generation: input.generation,
+              jobId: job.jobId,
+              checkpointId: job.record.progress?.checkpoint?.checkpointId ?? null,
+              checkpointGeneration: job.record.progress?.checkpoint?.generation ?? 0,
+              confirmedAbsent: true,
+            })} WHERE allocation_id=${input.allocationId}`;
+            yield* retireWorkflowSource(input.allocationId, input.generation);
+            return true;
+          }
+
+          yield* sql`INSERT INTO relay_thread_vm_final_saves
+            (operation_id,thread_id,allocation_id,actor_user_id,environment_id,generation,host_id,compute_ref,
+              original_state,reason,activity_revision,idle_since,phase,source_receipt,source_sequence,
+              native_checkpoint_operation_id,frozen_at,backup_operation_id)
+            VALUES (${save.operationId},${input.threadId},${input.allocationId},NULL,${source.environmentId},${input.generation},
+              ${input.hostId},${input.computeRef},${source.state},'source_loss',0,NULL,'deleting',${sql.json(save.receipt)},
+              ${save.receipt.sourceSequence},${save.receipt.nativeCheckpointOperationId},clock_timestamp(),${save.backupOperationId})`;
+          yield* sql`INSERT INTO relay_thread_vm_saved_disks(operation_id,thread_id,backup_operation_id,generation,host_id,phase)
+            VALUES(${save.operationId},${input.threadId},${save.backupOperationId},${input.generation},${input.hostId},'available')`;
+          yield* sql`UPDATE relay_thread_placements SET operation_id=${save.operationId} WHERE thread_id=${input.threadId}`;
+          return true;
+        }),
+      );
+    },
+  );
+
+  const retireWorkflowSource = Effect.fnUntraced(function* (
+    allocationId: string,
+    generation: number,
+  ) {
+    yield* sql`UPDATE relay_environment_credentials SET revoked_at=COALESCE(revoked_at,
+        to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+      WHERE credential_id IN (SELECT credential_id FROM relay_thread_vm_bindings
+        WHERE allocation_id=${allocationId} AND generation=${generation})`;
+    yield* sql`UPDATE relay_thread_vm_bindings SET revoked_at=COALESCE(revoked_at,clock_timestamp())
+      WHERE allocation_id=${allocationId} AND generation=${generation}`;
+    // The retained response will reuse its operation ID for cold creation.
+    yield* sql`DELETE FROM relay_thread_vm_capacity WHERE allocation_id=${allocationId} AND kind='resume' AND state='released'`;
+  });
+
+  /** A response that wins before the native DELETE keeps the same paused VM. */
+  const abandonUnissuedWorkflowSave = Effect.fnUntraced(function* (operationId: string) {
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const row = yield* lock(operationId);
+        if (
+          !row.sourceReceipt?.workflowCheckpoint ||
+          row.reason === "source_loss" ||
+          row.physicalDeleteStartedAt ||
+          !["frozen", "saving", "deleting"].includes(row.phase)
+        )
+          return false;
+        if (row.phase === "deleting" && row.backupOperationId) {
+          yield* sql`DELETE FROM relay_thread_vm_saved_disks WHERE operation_id=${operationId} AND phase='available'`;
+          yield* backups.releasePin({
+            operationId: `saved-${operationId}`,
+            backupOperationId: row.backupOperationId,
+          });
+          yield* sql`UPDATE relay_thread_vm_allocations SET state='paused'
+          WHERE allocation_id=${row.allocationId} AND state='deleting' AND deleted_at IS NULL`;
+        }
+        if (row.phase === "deleting" && row.nativeCheckpointOperationId)
+          yield* natives.releaseOperation(row);
+        yield* sql`UPDATE relay_thread_vm_final_saves SET phase='aborted',claim_id=NULL,claim_until=NULL
+        WHERE operation_id=${operationId}`;
+        yield* sql`UPDATE relay_thread_placements SET operation_id=NULL
+        WHERE thread_id=${row.threadId} AND operation_id=${operationId}`;
+        return true;
+      }),
+    );
+  });
+
   const sourceFrozen = Effect.fn("relay.thread_vm.final_save.source_frozen")(function* (input: {
     readonly operationId: string;
     readonly environmentId: string;
@@ -352,6 +663,8 @@ export function makeThreadVmFinalSaveStore(
           if (!pause) return yield* conflict("Paused source has no completed native backup.");
           backupOperationId = pause.backupOperationId;
         } else {
+          if (!operation.sourceReceipt.nativeCheckpointOperationId)
+            return yield* conflict("The native source conversation is missing.");
           backupOperationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
           yield* natives.pinCompleteForOperation({
             threadId: operation.threadId,
@@ -377,22 +690,31 @@ export function makeThreadVmFinalSaveStore(
         if (
           operation.phase !== "saving" ||
           !operation.backupOperationId ||
-          !operation.nativeCheckpointOperationId
+          (!operation.nativeCheckpointOperationId && !operation.sourceReceipt?.workflowCheckpoint)
         )
           return yield* conflict("The final disk capture is incomplete.");
         yield* checkDeadline(operation);
         yield* requireStillIdle(operation);
-        const point = yield* natives.get(operation.nativeCheckpointOperationId);
-        if (!point?.recoveryHistory)
+        const workflow = operation.sourceReceipt?.workflowCheckpoint;
+        if (workflow) {
+          const current = yield* readCurrentWorkflowCheckpoint(sql, workflow);
+          if (!current || current.pending)
+            return yield* conflict("The workflow checkpoint is no longer idle.");
+        }
+        const point = operation.nativeCheckpointOperationId
+          ? yield* natives.get(operation.nativeCheckpointOperationId)
+          : null;
+        if (operation.nativeCheckpointOperationId && !point?.recoveryHistory)
           return yield* conflict(
             "The independent conversation and history checkpoint is unavailable.",
           );
-        yield* natives.pinCompleteForOperation({
-          threadId: operation.threadId,
-          operationId,
-          checkpointOperationId: point.operationId,
-          expected: point,
-        });
+        if (point)
+          yield* natives.pinCompleteForOperation({
+            threadId: operation.threadId,
+            operationId,
+            checkpointOperationId: point.operationId,
+            expected: point,
+          });
         const [verified] = yield* sql<{
           receipt: unknown;
         }>`SELECT x.native_capture_receipt AS receipt
@@ -411,7 +733,7 @@ export function makeThreadVmFinalSaveStore(
           receipt.computeRef !== operation.computeRef ||
           receipt.threadId !== operation.threadId ||
           receipt.generation !== operation.generation ||
-          receipt.source.nativeCheckpointOperationId !== point.operationId ||
+          receipt.source.nativeCheckpointOperationId !== (point?.operationId ?? null) ||
           receipt.source.captureOperationId !== operation.sourceReceipt?.captureOperationId
         )
           return yield* conflict("The native snapshot belongs to another frozen source.");
@@ -422,7 +744,10 @@ export function makeThreadVmFinalSaveStore(
         });
         yield* sql`INSERT INTO relay_thread_vm_saved_disks(operation_id,thread_id,backup_operation_id,generation,host_id,phase)
         VALUES(${operationId},${operation.threadId},${operation.backupOperationId},${operation.generation},${operation.hostId},'available')`;
-        yield* makeThreadVmAllocationStore(sql).requestDeletion(operation.allocationId);
+        yield* makeThreadVmAllocationStore(sql).requestDeletion(
+          operation.allocationId,
+          workflow ? "organization_workflow" : "personal",
+        );
         yield* sql`UPDATE relay_thread_vm_final_saves SET phase='deleting' WHERE operation_id=${operationId}`;
         return (yield* get(operationId))!;
       }),
@@ -437,7 +762,10 @@ export function makeThreadVmFinalSaveStore(
         const [candidate] = yield* sql<{
           operationId: string;
         }>`SELECT f.operation_id AS "operationId" FROM relay_thread_vm_final_saves f
-        JOIN relay_thread_placements t USING(thread_id) WHERE t.audience='private' AND f.host_id=${hostId} AND (( ${step}='delete' AND f.phase='deleting') OR (${step}='save' AND f.phase IN ('frozen','saving')) OR (${step}='abort' AND f.phase='aborting'))
+        JOIN relay_thread_placements t USING(thread_id) WHERE
+          (t.audience='private' OR (t.audience='repository' AND
+            f.source_receipt#>>'{workflowCheckpoint,jobId}'=t.workflow_job_id AND ${step}!='abort'))
+          AND f.host_id=${hostId} AND (( ${step}='delete' AND f.phase='deleting') OR (${step}='save' AND f.phase IN ('frozen','saving')) OR (${step}='abort' AND f.phase='aborting'))
           AND t.operation_id=f.operation_id AND f.retry_at<=clock_timestamp()
           AND (${step}!='abort' OR NOT EXISTS(SELECT 1 FROM relay_thread_vm_backups x WHERE x.operation_id=f.backup_operation_id AND x.claim_until>clock_timestamp()))
           AND (f.claim_until IS NULL OR f.claim_until<=clock_timestamp())
@@ -497,19 +825,30 @@ export function makeThreadVmFinalSaveStore(
           if (!operation.physicalDeleteStartedAt) yield* checkDeadline(operation);
           if (
             operation.phase !== "deleting" ||
-            !operation.nativeCheckpointOperationId ||
+            (!operation.nativeCheckpointOperationId &&
+              !operation.sourceReceipt?.workflowCheckpoint) ||
             !operation.backupOperationId
           )
             return yield* conflict("Final save has not authorized physical deletion.");
-          const point = yield* natives.get(operation.nativeCheckpointOperationId);
-          if (!point)
+          const workflow = operation.sourceReceipt?.workflowCheckpoint;
+          if (workflow && !operation.physicalDeleteStartedAt) {
+            const missingSource = operation.reason === "source_loss";
+            const current = yield* readCurrentWorkflowCheckpoint(sql, workflow, missingSource);
+            if (!current || (!missingSource && current.pending))
+              return yield* conflict("The workflow checkpoint is no longer idle.");
+          }
+          const point = operation.nativeCheckpointOperationId
+            ? yield* natives.get(operation.nativeCheckpointOperationId)
+            : null;
+          if (operation.nativeCheckpointOperationId && !point)
             return yield* conflict("The independent conversation checkpoint is unavailable.");
-          yield* natives.pinCompleteForOperation({
-            threadId: operation.threadId,
-            operationId,
-            checkpointOperationId: point.operationId,
-            expected: point,
-          });
+          if (point)
+            yield* natives.pinCompleteForOperation({
+              threadId: operation.threadId,
+              operationId,
+              checkpointOperationId: point.operationId,
+              expected: point,
+            });
           const [saved] = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks s
         JOIN relay_thread_vm_backups b ON b.operation_id=s.backup_operation_id
         JOIN relay_thread_vm_backup_pins p ON p.backup_operation_id=b.operation_id
@@ -556,25 +895,34 @@ export function makeThreadVmFinalSaveStore(
         yield* makeThreadVmAllocationStore(sql).confirmDeleted({
           allocationId: operation.allocationId,
           computeRef: operation.computeRef,
+          resourceKind: operation.sourceReceipt?.workflowCheckpoint
+            ? "organization_workflow"
+            : "personal",
         });
-        yield* sql`UPDATE relay_environment_credentials SET revoked_at=COALESCE(revoked_at,to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) WHERE credential_id IN(SELECT credential_id FROM relay_thread_vm_bindings WHERE allocation_id=${operation.allocationId})`;
-        yield* sql`UPDATE relay_thread_vm_bindings SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE allocation_id=${operation.allocationId}`;
+        if (operation.reason === "source_loss") {
+          yield* retireWorkflowSource(operation.allocationId, operation.generation);
+        } else {
+          yield* sql`UPDATE relay_environment_credentials SET revoked_at=COALESCE(revoked_at,to_char(clock_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')) WHERE credential_id IN(SELECT credential_id FROM relay_thread_vm_bindings WHERE allocation_id=${operation.allocationId})`;
+          yield* sql`UPDATE relay_thread_vm_bindings SET revoked_at=COALESCE(revoked_at,clock_timestamp()) WHERE allocation_id=${operation.allocationId}`;
+        }
         // Start retention once, at confirmed compute absence, never on a read or retry.
         yield* sql`UPDATE relay_thread_vm_saved_disks SET saved_at=clock_timestamp() WHERE operation_id=${operationId}`;
         yield* sql`UPDATE relay_thread_vm_final_saves SET phase='completed',completed_at=clock_timestamp(),claim_id=NULL,claim_until=NULL,error_code=NULL WHERE operation_id=${operationId}`;
         yield* sql`UPDATE relay_thread_vm_replacements SET checked_at=NULL WHERE final_save_operation_id=${operationId} AND phase='waiting'`;
         yield* sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${operation.threadId}`;
-        yield* natives.releaseOperation({ threadId: operation.threadId, operationId });
-        if (operation.originalState === "paused") {
+        if (operation.nativeCheckpointOperationId)
+          yield* natives.releaseOperation({ threadId: operation.threadId, operationId });
+        if (operation.reason !== "source_loss" && operation.originalState === "paused") {
           const [pause] = yield* sql<{ operationId: string }>`SELECT operation_id AS "operationId"
             FROM relay_thread_vm_pauses WHERE allocation_id=${operation.allocationId} AND generation=${operation.generation}
-              AND native_checkpoint_operation_id=${operation.nativeCheckpointOperationId} AND phase='completed'`;
+              AND native_checkpoint_operation_id IS NOT DISTINCT FROM ${operation.nativeCheckpointOperationId} AND phase='completed'`;
           if (!pause)
             return yield* conflict("The deleted paused source lost its recovery identity.");
-          yield* natives.releaseOperation({
-            threadId: operation.threadId,
-            operationId: pause.operationId,
-          });
+          if (operation.nativeCheckpointOperationId)
+            yield* natives.releaseOperation({
+              threadId: operation.threadId,
+              operationId: pause.operationId,
+            });
         }
         return (yield* get(operationId))!;
       }),
@@ -810,6 +1158,14 @@ export function makeThreadVmFinalSaveStore(
   return {
     get,
     begin,
+    beginWorkflow,
+    reconcileMissingWorkflowSource: (input: MissingWorkflowVmSource) =>
+      reconcileMissingWorkflowSource(input).pipe(
+        Effect.catch((error) =>
+          error._tag === "SqlError" ? Effect.fail(error) : Effect.succeed(false),
+        ),
+      ),
+    abandonUnissuedWorkflowSave,
     sourceFrozen,
     reserveBackup,
     recordSaved,

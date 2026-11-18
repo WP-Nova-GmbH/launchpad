@@ -46,6 +46,9 @@ const importedFixture = Effect.fnUntraced(function* () {
     threadId: ThreadId.make(f.threadId),
     generation: 2,
   });
+  yield* f.sql`INSERT INTO relay_thread_vm_codex_auth
+    (allocation_id,environment_id,generation,thread_id,organization_id,mode)
+    VALUES(${f.input.allocationId},${environment},2,${f.threadId},'org','personal')`;
   const db = yield* PgDrizzle.makeWithDefaults(),
     store = makeThreadVmRestoreImportStore(f.sql, f.objects);
   const principal = {
@@ -78,10 +81,10 @@ const importedFixture = Effect.fnUntraced(function* () {
     branch: "main",
     revision: "a".repeat(40),
     manifestSha256: "b".repeat(64),
-    sourceEnvironmentId: EnvironmentId.make(recovery.native.sourceEnvironmentId),
-    sourceSequence: recovery.native.sourceSequence,
-    nativeManifestArtifactId: recovery.native.manifestArtifactId,
-    attachmentManifestArtifactId: recovery.attachments.manifestArtifactId,
+    sourceEnvironmentId: EnvironmentId.make(recovery.native!.sourceEnvironmentId),
+    sourceSequence: recovery.native!.sourceSequence,
+    nativeManifestArtifactId: recovery.native!.manifestArtifactId,
+    attachmentManifestArtifactId: recovery.attachments!.manifestArtifactId,
     sequence: 10,
     execution: "frozen",
   };

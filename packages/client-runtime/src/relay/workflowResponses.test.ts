@@ -6,6 +6,7 @@ import {
   workflowActionState,
   workflowManualControlState,
   workflowManualSubmission,
+  workflowVmRecoveryDisplay,
   type WorkflowDraftSubmission,
 } from "./workflowResponses.ts";
 
@@ -158,6 +159,40 @@ describe("pending workflow responses", () => {
     expect(workflowManualControlState({ ...job, responsePending: false }).canPause).toBe(true);
     expect(workflowManualControlState(job).canPause).toBe(true);
     expect(workflowManualControlState({ ...pending, status: "done" }).message).toBeNull();
+  });
+});
+
+it.each([
+  ["paused", false],
+  ["saved", false],
+  ["waiting_capacity", true],
+  ["waiting_codex", true],
+  ["resuming", true],
+  ["restoring", true],
+  ["recovery_error", true],
+] as const)("keeps an Input checkpoint visible when VM recovery is %s", (state, blocked) => {
+  const job = manualJob();
+  expect(
+    workflowManualControlState({
+      ...job,
+      runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+      status: "awaiting_input",
+      progress: { ...job.progress!, status: "awaiting_input" },
+      vmRecovery: { state },
+    }),
+  ).toMatchObject({
+    status: "awaiting_input",
+    canPause: false,
+    canResume: false,
+    checkpointBlocked: blocked,
+  });
+});
+
+it("identifies which Codex connection is required to apply a queued response", () => {
+  expect(workflowVmRecoveryDisplay({ state: "waiting_codex" }, true)).toMatchObject({
+    title: "Waiting for a Codex connection",
+    message: "Reconnect this run’s original Codex account to continue.",
+    pending: true,
   });
 });
 

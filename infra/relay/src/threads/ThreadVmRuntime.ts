@@ -47,6 +47,7 @@ import { makeThreadVmLeaseWorker } from "./ThreadVmLeaseWorker.ts";
 import { makeThreadVmFinalSaveAbortWorker } from "./ThreadVmFinalSaveAbortWorker.ts";
 import { makeThreadVmFinalSaveWorker } from "./ThreadVmFinalSaveWorker.ts";
 import { makeThreadVmFinalSaveDeletionWorker } from "./ThreadVmFinalSaveDeletionWorker.ts";
+import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
 import { makeThreadVmBackupWorker } from "./ThreadVmBackupWorker.ts";
 import { makeThreadVmBackupRetentionWorker } from "./ThreadVmBackupRetentionWorker.ts";
 import { makeThreadVmSavedDiskWorker } from "./ThreadVmSavedDiskWorker.ts";
@@ -484,12 +485,14 @@ export const reconcileThreadVmPauses = Effect.fn("relay.thread_vm.reconcile_paus
 ) {
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
+  const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
   const worker = makeThreadVmPauseWorker(
     sql,
     makeE2BThreadVmCompute(settings.compute),
     makeE2BThreadVmPause(settings.compute),
     settings.hostId,
     settings.autoPauseEnabled,
+    saves.reconcileMissingWorkflowSource,
   );
   for (let index = 0; index < 4; index++) if (!(yield* worker.runOne())) return;
 });
@@ -501,6 +504,7 @@ export const reconcileThreadVmResumes = Effect.fn("relay.thread_vm.reconcile_res
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
   const relay = yield* RelayConfiguration;
+  const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
   const worker = makeThreadVmResumeWorker(
     sql,
     makeE2BThreadVmCompute(settings.compute),
@@ -508,8 +512,9 @@ export const reconcileThreadVmResumes = Effect.fn("relay.thread_vm.reconcile_res
     settings.hostId,
     settings.workflowExecutionEnabled === true,
     relay.linearWorkflow,
+    (claim) => saves.reconcileMissingWorkflowSource({ ...claim, resumeClaim: claim }),
   );
-  for (let index = 0; index < 4; index++) if (!(yield* worker.runOne())) return;
+  yield* worker.runOne();
 });
 
 /** Keep the infrastructure lease ahead of E2B's default pause while this relay is healthy. */
@@ -518,11 +523,13 @@ export const reconcileThreadVmLeases = Effect.fn("relay.thread_vm.reconcile_leas
 ) {
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
+  const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
   const worker = makeThreadVmLeaseWorker(
     sql,
     makeE2BThreadVmLease(settings.compute),
     settings.hostId,
     makeE2BThreadVmCompute(settings.compute),
+    saves.reconcileMissingWorkflowSource,
   );
   for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) break;
   // A backlog of saved workflow VMs must not consume the running lease budget.
@@ -539,6 +546,9 @@ export const reconcileThreadVmIdleDeletion = Effect.fn("relay.thread_vm.reconcil
     for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) return;
   },
 );
+
+// Allow 60s to inspect, 120s to capture, and 60s for each of two catalog reads.
+export const THREAD_VM_BACKUP_SWEEP_TIMEOUT = "6 minutes";
 
 /** Native captures keep their independent source checkpoint pinned through retention. */
 export const reconcileThreadVmBackups = Effect.fn("relay.thread_vm.reconcile_backups")(function* (

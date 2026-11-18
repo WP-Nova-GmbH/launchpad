@@ -91,10 +91,6 @@ export const readWorkflowVmBinding = Effect.fnUntraced(function* (
     WHERE t.audience='repository' AND t.owner_user_id IS NULL AND t.project_id='vm:' || t.thread_id
       AND a.compute_ref IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)
-      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_pauses x
-        WHERE x.allocation_id=a.allocation_id AND x.phase IN ('pending','sealed'))
-      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_resumes x
-        WHERE x.allocation_id=a.allocation_id AND x.phase IN ('waiting','resuming'))
       ${expected.jobId === undefined ? sql`` : sql`AND j.job_id=${expected.jobId}`}
       ${expected.threadId === undefined ? sql`` : sql`AND t.thread_id=${expected.threadId}`}
       ${expected.organizationId === undefined ? sql`` : sql`AND t.organization_id=${expected.organizationId}`}
@@ -106,6 +102,13 @@ export const readWorkflowVmBinding = Effect.fnUntraced(function* (
           ? sql`AND (t.operation_id IS NULL OR t.operation_id=p.operation_id)`
           : sql`
         AND t.operation_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_pauses x
+        WHERE x.allocation_id=a.allocation_id AND x.phase IN ('pending','sealed'))
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_resumes x
+        WHERE x.allocation_id=a.allocation_id AND x.phase IN ('waiting','resuming'))
+        AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_pauses x WHERE x.allocation_id=a.allocation_id
+          AND x.generation=t.generation AND x.workflow_checkpoint IS NOT NULL
+          AND x.phase IN ('cancelled','completed') AND x.source_reopened_at IS NULL)
         AND EXISTS (SELECT 1 FROM relay_thread_vm_ready s WHERE s.allocation_id=a.allocation_id
           AND s.environment_id=b.environment_id AND s.generation=b.generation AND s.phase='ready')
         AND EXISTS (SELECT 1 FROM relay_thread_vm_codex_auth x WHERE x.allocation_id=a.allocation_id

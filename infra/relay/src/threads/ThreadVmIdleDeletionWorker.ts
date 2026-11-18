@@ -19,22 +19,25 @@ export function makeThreadVmIdleDeletionWorker(
         const [row] = yield* sql<{
           allocationId: string;
           threadId: string;
-          ownerUserId: string;
+          ownerUserId: string | null;
+          workflowJobId: string | null;
           organizationId: string;
           generation: number;
         }>`SELECT a.allocation_id AS "allocationId",a.thread_id AS "threadId",a.owner_user_id AS "ownerUserId",
-        a.organization_id AS "organizationId",t.generation
+        a.organization_id AS "organizationId",t.generation,t.workflow_job_id AS "workflowJobId"
         FROM relay_thread_vm_allocations a JOIN relay_thread_placements t USING(thread_id)
         JOIN relay_thread_vm_bindings b USING(allocation_id) JOIN relay_thread_vm_provisions p USING(allocation_id)
         JOIN relay_thread_vm_ready s USING(allocation_id) JOIN relay_thread_vm_activity v USING(allocation_id)
         JOIN relay_thread_vm_policies policy ON policy.organization_id=a.organization_id
         JOIN LATERAL (SELECT host_id,state FROM relay_thread_vm_capacity WHERE allocation_id=a.allocation_id ORDER BY position DESC LIMIT 1) c ON true
-        WHERE a.resource_kind='personal' AND c.host_id=${hostId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND t.operation_id IS NULL
-          AND a.owner_user_id=t.owner_user_id AND b.revoked_at IS NULL AND b.environment_id=t.environment_id AND b.generation=t.generation
+        WHERE (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND a.state='paused'
+          AND EXISTS (SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id
+            AND j.pending_control IS NULL AND j.status IN ('awaiting_review','awaiting_input')))) AND c.host_id=${hostId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND t.operation_id IS NULL
+          AND a.owner_user_id IS NOT DISTINCT FROM t.owner_user_id AND b.revoked_at IS NULL AND b.environment_id=t.environment_id AND b.generation=t.generation
           AND p.phase='created' AND p.generation=t.generation AND s.phase='ready' AND v.idle_since IS NOT NULL
           AND ((a.state='running' AND c.state='started' AND v.activity='idle' AND v.observed_at>=clock_timestamp()-interval '2 minutes')
             OR (a.state='paused' AND c.state='released' AND EXISTS (SELECT 1 FROM relay_thread_vm_pauses x
-              WHERE x.allocation_id=a.allocation_id AND x.generation=t.generation AND x.phase='completed' AND x.source_frozen_at IS NOT NULL AND x.native_checkpoint_operation_id IS NOT NULL)))
+              WHERE x.allocation_id=a.allocation_id AND x.generation=t.generation AND x.phase='completed' AND x.source_frozen_at IS NOT NULL AND (x.native_checkpoint_operation_id IS NOT NULL OR x.workflow_checkpoint IS NOT NULL))))
           AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_pauses x WHERE x.allocation_id=a.allocation_id AND
             (x.phase IN ('pending','sealed') OR (x.phase='cancelled' AND x.source_reopened_at IS NULL)))
           AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_resumes x WHERE x.allocation_id=a.allocation_id AND x.phase IN ('waiting','resuming'))
@@ -63,6 +66,13 @@ export function makeThreadVmIdleDeletionWorker(
         )
           return true;
         const operationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
+        if (row.workflowJobId) {
+          yield* saves
+            .beginWorkflow({ ...row, operationId })
+            .pipe(Effect.catchTag("ThreadVmFinalSaveConflict", () => Effect.void));
+          return true;
+        }
+        if (!row.ownerUserId) return true;
         yield* saves
           .begin({
             operationId,

@@ -1,5 +1,7 @@
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import { inspectVmWorkloads } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
@@ -7,6 +9,10 @@ import type { makeThreadCheckpointPublisher } from "./ThreadCheckpointPublisher.
 import type { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import { ThreadPauseError, type ThreadPauseTransport } from "./ThreadPauseTransport.ts";
 import { makeThreadVmSourceRecovery } from "./ThreadVmSourceRecovery.ts";
+
+const sameWorkflowCheckpoint = Schema.toEquivalence(
+  Schema.UndefinedOr(RelayThreadVmWorkflowCheckpoint),
+);
 
 export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(function* (
   transport: ThreadPauseTransport,
@@ -29,30 +35,38 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
       pause.generation !== owner.generation
     )
       return yield* fail("Pause belongs to another VM source.");
-    const input = { ...owner, operationId: pause.operationId };
+    const input = {
+      ...owner,
+      operationId: pause.operationId,
+      ...(pause.workflowCheckpoint ? { workflowCheckpoint: pause.workflowCheckpoint } : {}),
+    };
     // After a reopened pause, a later relay operation makes canActivate false.
     // Its historical receipt must let final saving install the next local drain.
     if (
       pause.phase === "completed" &&
-      (owner.operationId !== pause.operationId ||
+      ((owner.operationId !== pause.operationId &&
+        (!pause.workflowCheckpoint || !pause.canActivate)) ||
         (pause.sourceReopened && owner.phase === "active"))
     )
       return;
     if (pause.canActivate) {
-      if (owner.operationId !== pause.operationId) {
+      if (owner.operationId !== pause.operationId && !pause.workflowCheckpoint) {
         // A Send may cancel the relay reservation before this server sees it.
         // Install that exact operation locally before acknowledging reopening;
         // a delayed pending receipt then cannot start the same drain again.
         if (
           pause.phase !== "cancelled" ||
           pause.sourceReopened ||
-          pause.nativeCheckpointOperationId ||
+          pause.sourceSequence !== null ||
           owner.phase !== "active"
         )
           return;
         yield* fences.beginDrain({ ...input, previousOperationId: owner.operationId });
       }
-      if (owner.phase !== "active" || owner.operationId !== pause.operationId) {
+      if (
+        owner.phase !== "active" ||
+        (!pause.workflowCheckpoint && owner.operationId !== pause.operationId)
+      ) {
         if (!["active", "draining", "frozen"].includes(owner.phase)) return;
         if (tracked) {
           const inventory = yield* inspectVmWorkloads({ type: "inspect" });
@@ -64,7 +78,7 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
             });
         }
         yield* fences.activate(input);
-      }
+      } else if (pause.workflowCheckpoint) yield* fences.activate(input);
       // Persist the local active fence first. A lost relay read/ack must not let
       // a subsequent pause overwrite the only operation that can reopen it.
       if (!pause.sourceReopened) {
@@ -74,6 +88,7 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
           receipt.threadId !== threadId ||
           receipt.environmentId !== owner.environmentId ||
           receipt.generation !== owner.generation ||
+          !sameWorkflowCheckpoint(receipt.workflowCheckpoint, pause.workflowCheckpoint) ||
           !receipt.canActivate ||
           !receipt.sourceReopened
         )
@@ -82,14 +97,18 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
       return;
     }
     if (pause.phase === "cancelled") return;
-    if (pause.nativeCheckpointOperationId || pause.phase !== "pending") {
+    if (
+      pause.nativeCheckpointOperationId !== null ||
+      pause.sourceSequence !== null ||
+      pause.phase !== "pending"
+    ) {
       if (owner.operationId !== pause.operationId || owner.phase !== "frozen")
         return yield* fail("Pause has no matching frozen source.");
       return;
     }
     if (!tracked) return yield* fail("Pause requires a tracked VM workload boundary.");
     const point = yield* recovery
-      .capture({ ...input, previousOperationId: owner.operationId })
+      .captureForPause({ ...input, previousOperationId: owner.operationId })
       .pipe(
         Effect.catchTag("ThreadVmQueuedWork", () =>
           transport.cancel(input, { operationId: pause.operationId }).pipe(
@@ -113,6 +132,12 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
     const receipt = yield* transport.freeze(input, {
       operationId: pause.operationId,
       nativeCheckpointOperationId: point.nativeCheckpointOperationId,
+      ...(pause.workflowCheckpoint
+        ? {
+            workflowCheckpoint: pause.workflowCheckpoint,
+            sourceSequence: point.sourceSequence,
+          }
+        : {}),
       bootId: point.bootId,
       sealEpoch: point.sealEpoch,
     });
@@ -122,6 +147,8 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
       receipt.generation !== owner.generation ||
       receipt.operationId !== pause.operationId ||
       receipt.nativeCheckpointOperationId !== point.nativeCheckpointOperationId ||
+      (pause.workflowCheckpoint !== undefined && receipt.sourceSequence !== point.sourceSequence) ||
+      !sameWorkflowCheckpoint(receipt.workflowCheckpoint, pause.workflowCheckpoint) ||
       receipt.bootId !== point.bootId ||
       !["pending", "sealed", "completed"].includes(receipt.phase)
     )

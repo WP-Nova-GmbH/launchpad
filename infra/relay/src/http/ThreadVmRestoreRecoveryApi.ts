@@ -1,3 +1,7 @@
+import { readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
+import { readWorkflowRestorePublication } from "../threads/WorkflowVmWorkspace.ts";
+import { makeThreadArtifactStore } from "../threads/ThreadArtifactStore.ts";
+import { makeThreadArtifactTransfer } from "../threads/ThreadArtifactTransfer.ts";
 import { makeThreadVmResetImportStore } from "../threads/ThreadVmResetImportStore.ts";
 import {
   RelayThreadVmRestoreRecovery,
@@ -31,14 +35,29 @@ const failures = {
   ThreadNativeCheckpointConflict: () => tenancyConflict("thread_checkpoint_conflict"),
   SchemaError: () => tenancyConflict("thread_checkpoint_conflict"),
 };
+// The restore endpoints additionally require the exact fresh allocation and
+// generation. Repository VM credentials have no personal owner to authorize.
+const withRestoreEnvironment = <A, E, R>(input: Owner, action: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const principal = yield* RelayEnvironmentPrincipal;
+    const sql = (yield* RelayDb).$client;
+    const [workflow] = yield* sql`SELECT 1 FROM relay_thread_placements t
+      JOIN relay_thread_vm_restores r ON r.thread_id=t.thread_id
+      JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
+      WHERE t.thread_id=${input.threadId} AND t.audience='repository'
+        AND a.allocation_id=${principal.threadVm?.allocationId ?? null} AND a.resource_kind='organization_workflow'
+        AND t.generation=${input.generation} AND r.target_generation=t.generation
+        AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))`;
+    return yield* withEnvironmentThread(input, workflow ? "workflow-lifecycle" : true, action);
+  }).pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
+
 const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string) {
   const principal = yield* RelayEnvironmentPrincipal;
   if (!principal.threadVm) return yield* tenancyNotFound("thread_not_found");
   const sql = (yield* RelayDb).$client,
     objects = yield* ThreadArtifactObjectStorage;
-  return yield* withEnvironmentThread(
+  return yield* withRestoreEnvironment(
     input,
-    true,
     Effect.gen(function* () {
       const [intent] = yield* sql<{ operationId: string }>`SELECT r.operation_id AS "operationId"
       FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
@@ -62,16 +81,34 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
       }
       const restores = makeThreadVmRestoreStore(sql, objects),
         row = yield* restores.lock(intent.operationId);
-      yield* restores.requireRecovery(row);
+      const source = yield* restores.requireRecovery(row);
       const native = yield* makeThreadNativeCheckpointStore(sql, objects).getForOperation(row);
       const attachments = yield* makeThreadAttachmentCheckpointStore(sql, objects).getForOperation(
         row,
       );
+      const checkpoint = row.workflowCheckpoint;
+      const publication = checkpoint
+        ? yield* readWorkflowRestorePublication(sql, row.threadId, checkpoint)
+        : null;
+      const target = checkpoint
+        ? yield* readWorkflowVmBinding(
+            sql,
+            {
+              jobId: checkpoint.jobId,
+              threadId: row.threadId,
+              environmentId: input.environmentId,
+              generation: input.generation,
+            },
+            "enrolled",
+          )
+        : null;
       if (
-        !native ||
-        !attachments ||
-        native.sourceSequence !== attachments.sourceSequence ||
-        native.archiveSha256 !== attachments.nativeArchiveSha256
+        (checkpoint && (!publication || !target || target.allocationId !== row.allocationId)) ||
+        (native &&
+          (!attachments ||
+            native.sourceSequence !== attachments.sourceSequence ||
+            native.archiveSha256 !== attachments.nativeArchiveSha256)) ||
+        (!native && (!checkpoint || row.nativeCheckpointOperationId !== null || attachments))
       )
         return yield* tenancyConflict("thread_checkpoint_conflict");
       return {
@@ -83,6 +120,16 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
         scope: principal.threadVm!,
         native,
         attachments,
+        ...(checkpoint && publication && target
+          ? {
+              workflow: {
+                checkpoint,
+                ...publication,
+                binding: target.binding,
+                sourceSequence: source.source.sourceSequence,
+              },
+            }
+          : {}),
       };
     }),
   );
@@ -109,9 +156,8 @@ export const readThreadVmRestoreArtifact = Effect.fn("relay.api.restore.artifact
     );
     // Eagerly verify the exact operation pin and object before HTTP headers. The
     // existing bounded read lease survives operation completion until this read ends.
-    const body = yield* withEnvironmentThread(
+    const body = yield* withRestoreEnvironment(
       input,
-      true,
       Effect.gen(function* () {
         if (uploaded && repository)
           return yield* makeThreadMoveCheckpointStore(sql, objects).openRepositoryUpload({
@@ -119,6 +165,24 @@ export const readThreadVmRestoreArtifact = Effect.fn("relay.api.restore.artifact
             operationId: repository.operationId,
             artifactId: input.artifactId,
           });
+        if (decoded.workflow?.manifest.state.artifactId === input.artifactId) {
+          const state = decoded.workflow.manifest.state;
+          const artifacts = makeThreadArtifactStore(sql);
+          const artifact = yield* artifacts.get(input.artifactId);
+          if (
+            !artifact ||
+            artifact.threadId !== input.threadId ||
+            artifact.state !== "complete" ||
+            artifact.sha256 !== state.sha256 ||
+            artifact.sizeBytes !== state.sizeBytes
+          )
+            return yield* tenancyConflict("thread_artifact_conflict");
+          const operationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
+          const lease = { threadId: input.threadId, artifactId: input.artifactId, operationId };
+          return (yield* makeThreadArtifactTransfer(sql, objects).readPinned(lease)).pipe(
+            Stream.ensuring(artifacts.releasePin(lease).pipe(Effect.ignore)),
+          );
+        }
         if (decoded.independentHistory) {
           const history = makeThreadVmRecoveryHistory(sql, objects);
           if (yield* history.ownsArtifact(input)) return yield* history.openForOperation(input);
@@ -152,12 +216,11 @@ export const confirmThreadVmRestoreActivation = Effect.fn("relay.api.restore.act
       return yield* tenancyConflict("thread_checkpoint_conflict");
     const sql = (yield* RelayDb).$client,
       objects = yield* ThreadArtifactObjectStorage;
-    return yield* withEnvironmentThread(
+    return yield* withRestoreEnvironment(
       input,
-      true,
       Effect.gen(function* () {
         const principal = yield* RelayEnvironmentPrincipal;
-        const placement = yield* makeThreadPlacementStore(sql).get(input.threadId);
+        const placement = yield* makeThreadPlacementStore(sql).getAny(input.threadId);
         if (!principal.threadVm || !placement) return yield* tenancyNotFound("thread_not_found");
         yield* makeThreadVmCodexAuthStore(sql).requireAcknowledged({
           ...input,

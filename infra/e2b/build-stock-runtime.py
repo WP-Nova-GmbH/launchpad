@@ -14,6 +14,10 @@ import tarfile
 from pathlib import Path
 
 
+DEFAULT_HUGEPAGES = 4096
+NATIVE_API_REQUEST_TIMEOUT_SECONDS = 70
+
+
 INSTALLER = r'''#!/usr/bin/env bash
 set -euo pipefail
 fail() { echo "stock-runtime: $*" >&2; exit 1; }
@@ -255,9 +259,16 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def build(output, arch, lock=None):
+def build(output, arch, lock=None, *, hugepages=DEFAULT_HUGEPAGES, envd_timeout_seconds=None):
     if arch not in ("arm64", "amd64"):
         raise ValueError("Stock runtime target must be Linux arm64 or amd64")
+    if not isinstance(hugepages, int) or hugepages < DEFAULT_HUGEPAGES:
+        raise ValueError(f"Stock runtime requires at least {DEFAULT_HUGEPAGES} hugepages")
+    if envd_timeout_seconds is not None and (
+        type(envd_timeout_seconds) is not int
+        or not 0 < envd_timeout_seconds < NATIVE_API_REQUEST_TIMEOUT_SECONDS
+    ):
+        raise ValueError(f"Native envd timeout must be an integer from 1 to {NATIVE_API_REQUEST_TIMEOUT_SECONDS - 1} seconds")
     lock = lock or json.loads(Path(__file__).with_name("stock-runtime.lock.json").read_text())
     if lock["schemaVersion"] != 1:
         raise ValueError("Unsupported stock runtime lock")
@@ -329,15 +340,19 @@ def build(output, arch, lock=None):
         if count != 1:
             raise ValueError("Stock Compose " + role + " image setting is missing")
     # Native layer uploads can overlap the next 4 GiB runner VM's restore.
-    defaults, hugepage_settings = re.subn(r"^HUGEPAGES=.*$", "HUGEPAGES=4096", defaults, flags=re.M)
+    hugepage_setting = f"HUGEPAGES={hugepages}"
+    defaults, hugepage_settings = re.subn(r"^HUGEPAGES=.*$", hugepage_setting, defaults, flags=re.M)
     if hugepage_settings > 1:
         raise ValueError("Stock Compose hugepage setting is ambiguous")
     if not hugepage_settings:
-        defaults = defaults.rstrip() + "\nHUGEPAGES=4096\n"
+        defaults = defaults.rstrip() + f"\n{hugepage_setting}\n"
     (output / ".env").write_text(defaults)
     services = {role: {"image": image["id"], "pull_policy": "never", "environment": {"LAUNCH_DARKLY_API_KEY": ""}}
                 for role, image in images.items() if role not in ("tools", "node-e2b")}
-    services["orchestrator"] = {"environment": {"LAUNCH_DARKLY_API_KEY": ""}}
+    orchestrator_environment = {"LAUNCH_DARKLY_API_KEY": ""}
+    if envd_timeout_seconds is not None:
+        orchestrator_environment["ENVD_TIMEOUT"] = f"{envd_timeout_seconds}s"
+    services["orchestrator"] = {"environment": orchestrator_environment}
     write_json(output / "runtime.override.json", {"name": project, "services": services})
     artifact_mount = {"type": "bind", "source": compose_path(artifacts), "target": "/stock", "read_only": True}
     staging_environment = {"STOCK_ORCHESTRATOR_SHA256": digest, "STOCK_RUNTIME_OWNER": project + ":" + commit + ":" + digest,
@@ -388,12 +403,17 @@ def main():
     parser.add_argument("output", type=Path, help="New directory on a fresh, dedicated Linux host")
     parser.add_argument("--arch", choices=["arm64", "amd64"],
                         default={"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64"}.get(platform.machine()))
+    parser.add_argument("--hugepages", type=int, default=DEFAULT_HUGEPAGES,
+                        help="Number of native 2 MiB hugepages to reserve (default and minimum: %(default)s)")
+    parser.add_argument("--envd-timeout-seconds", type=int,
+                        help="Guest readiness timeout for the orchestrator (stock default: 10 seconds)")
     args = parser.parse_args()
     if sys.version_info < (3, 12):
         parser.error("Python 3.12 or newer is required for safe source archive extraction")
     if platform.system() != "Linux":
         parser.error("Run inside the dedicated Linux host; on macOS this is inside Lima")
-    result = build(args.output, args.arch)
+    result = build(args.output, args.arch, hugepages=args.hugepages,
+                   envd_timeout_seconds=args.envd_timeout_seconds)
     print(f"Prepared stock runtime: {result / 'build.json'}")
     print("No services were started and no existing deployment was changed.")
 

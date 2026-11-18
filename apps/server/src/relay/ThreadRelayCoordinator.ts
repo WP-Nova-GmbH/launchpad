@@ -29,6 +29,7 @@ import * as Schedule from "effect/Schedule";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { forkParked } from "../serverActivation.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import { makeThreadExecutionAuthority } from "./ThreadExecutionAuthority.ts";
 import { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import {
@@ -162,6 +163,25 @@ export const makeThreadMoveSweep = Effect.fn("ThreadRelayCoordinator.makeMoveSwe
     ),
   );
 });
+
+export const synchronizeThreadVmLifecycle = Effect.fn("ThreadRelayCoordinator.vmLifecycle")(
+  function* (
+    threadId: string,
+    workers: {
+      readonly backup: Effect.Success<ReturnType<typeof makeThreadBackupSourceWorker>>;
+      readonly pause: Effect.Success<ReturnType<typeof makeThreadPauseWorker>>;
+      readonly finalSave: Effect.Success<ReturnType<typeof makeThreadFinalSaveWorker>>;
+    },
+  ) {
+    if (yield* WorkflowVmGuest) {
+      // Workflow final save is relay-owned and reuses the verified pause backup.
+      return yield* workers.pause.synchronize(threadId);
+    }
+    yield* workers.backup.synchronize(threadId);
+    yield* workers.pause.synchronize(threadId);
+    yield* workers.finalSave.synchronize(threadId);
+  },
+);
 
 export const layer = Layer.effect(
   ThreadRelayCoordinator,
@@ -320,9 +340,11 @@ export const layer = Layer.effect(
       yield* Effect.forEach(
         owners,
         ({ threadId }) =>
-          backups.synchronize(threadId).pipe(
-            Effect.andThen(pauses.synchronize(threadId)),
-            Effect.andThen(finalSaves.synchronize(threadId)),
+          synchronizeThreadVmLifecycle(threadId, {
+            backup: backups,
+            pause: pauses,
+            finalSave: finalSaves,
+          }).pipe(
             Effect.provideContext(checkpointContext),
             Effect.catch(() =>
               Effect.logDebug("Final VM save awaiting stopped source and retained recovery", {

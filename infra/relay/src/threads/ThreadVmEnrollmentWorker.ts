@@ -19,12 +19,12 @@ import {
 import { makeThreadVmMoveDestinationStore } from "./ThreadVmMoveDestinationStore.ts";
 import { makeThreadVmProvisionStore } from "./ThreadVmProvisionStore.ts";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
-import { withPreparingWorkflowVm } from "./ThreadVmWorkflowAccess.ts";
 
 type Deliver = (
   sandboxId: string,
   input: RelayThreadVmBootstrap,
   workflow?: boolean,
+  workflowRunnerTemplateRef?: string,
 ) => Effect.Effect<RelayThreadVmEnrollmentReceipt, ThreadVmComputeError>;
 /** Retries only the immutable enrollment, never VM creation or execution activation. */
 export function makeThreadVmEnrollmentWorker(
@@ -36,6 +36,7 @@ export function makeThreadVmEnrollmentWorker(
 ) {
   const provisions = makeThreadVmProvisionStore(sql);
   const enrollments = makeThreadVmEnrollmentStore(sql);
+  const restores = makeThreadVmRestoreEnrollmentStore(sql);
   const runOne = Effect.fn("relay.thread_vm_enrollment.run_one")(function* () {
     const claimId = yield* (yield* Crypto.Crypto).randomUUIDv4;
     const row = yield* provisions.claimEnrollment(claimId, hostId, includeWorkflow);
@@ -46,33 +47,44 @@ export function makeThreadVmEnrollmentWorker(
       if (!allocation || allocation.resourceKind !== row.resourceKind || !row.computeRef)
         return yield* new ThreadVmEnrollmentInvalid();
       if (allocation.resourceKind === "organization_workflow") {
-        const bootstrap = yield* withPreparingWorkflowVm(sql, row, (scope) =>
-          Effect.gen(function* () {
-            return {
-              version: 1 as const,
-              operationId: row.operationId,
-              templateId: row.templateId,
-              scope: {
-                allocationId: row.allocationId,
-                threadId: ThreadId.make(row.threadId),
-                repositoryId: RelayRepositoryId.make(scope.repositoryId),
-                generation: row.generation,
-              },
-              relayUrl: relay.url,
-              relayIssuer: relay.issuer,
-              seed: yield* enrollments.prepare(row),
-            };
-          }),
+        const { bootstrap, runnerTemplateRef } = yield* restores.withWorkflowEnrollment(
+          row,
+          (scope) =>
+            Effect.gen(function* () {
+              return {
+                runnerTemplateRef: scope.runnerTemplateRef,
+                bootstrap: {
+                  version: 1 as const,
+                  ...(scope.restore ? { restore: scope.restore } : {}),
+                  operationId: row.operationId,
+                  templateId: row.templateId,
+                  scope: {
+                    allocationId: row.allocationId,
+                    threadId: ThreadId.make(row.threadId),
+                    repositoryId: RelayRepositoryId.make(scope.repositoryId),
+                    generation: row.generation,
+                  },
+                  relayUrl: relay.url,
+                  relayIssuer: relay.issuer,
+                  seed: yield* enrollments.prepare(row),
+                },
+              };
+            }),
         );
-        const receipt = yield* deliver(row.computeRef, bootstrap, true);
-        yield* withPreparingWorkflowVm(sql, row, (scope) =>
+        const receipt = yield* deliver(row.computeRef, bootstrap, true, runnerTemplateRef);
+        yield* restores.withWorkflowEnrollment(row, (scope) =>
           Effect.gen(function* () {
             yield* provisions.finishEnrollment({ ...claim, receipt });
-            yield* makeThreadPlacementStore(sql).assignWorkflow({
-              ...row,
-              workflowJobId: scope.workflowJobId,
-              environmentId: receipt.environmentId,
-            });
+            if (scope.restore) {
+              if (!(yield* restores.assigned(receipt)))
+                return yield* new ThreadVmEnrollmentInvalid();
+            } else {
+              yield* makeThreadPlacementStore(sql).assignWorkflow({
+                ...row,
+                workflowJobId: scope.workflowJobId,
+                environmentId: receipt.environmentId,
+              });
+            }
           }),
         );
         return;
@@ -84,7 +96,7 @@ export function makeThreadVmEnrollmentWorker(
         (placement) =>
           Effect.gen(function* () {
             const seed = yield* enrollments.prepare(row);
-            const restoring = yield* makeThreadVmRestoreEnrollmentStore(sql).requested(row);
+            const restoring = yield* restores.requested(row);
             return {
               version: 1 as const,
               ...(restoring ? { restore: true as const } : {}),
@@ -110,7 +122,7 @@ export function makeThreadVmEnrollmentWorker(
           .finishEnrollment({ ...claim, receipt })
           .pipe(
             Effect.andThen(makeThreadVmMoveDestinationStore(sql).assigned(receipt)),
-            Effect.andThen(makeThreadVmRestoreEnrollmentStore(sql).assigned(receipt)),
+            Effect.andThen(restores.assigned(receipt)),
             Effect.andThen(makeThreadVmResetEnrollmentStore(sql).assigned(receipt)),
           ),
       );

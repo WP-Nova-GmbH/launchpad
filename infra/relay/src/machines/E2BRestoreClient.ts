@@ -135,7 +135,7 @@ export function makeE2BRestoreClient(
     }),
     /** A missing alias is an unknown upload outcome, never a cleanup fence. */
     resolveTerminalNamedSnapshot: Effect.fn("E2BRestoreClient.resolveTerminalNamedSnapshot")(
-      function* (name: string) {
+      function* (name: string, options?: { readonly requireReady: boolean }) {
         const template = yield* named(name).pipe(
           Effect.catchTag("E2BRestoreError", (error) =>
             error.operation === "snapshot alias" && error.reason === "http" && error.status === 404
@@ -146,6 +146,7 @@ export function makeE2BRestoreClient(
         if (!template) return null;
         if (!["ready", "error"].includes(template.builds[0]!.status))
           return yield* new E2BRestoreError({ operation: "snapshot", reason: "identity" });
+        if (options?.requireReady && template.builds[0]!.status !== "ready") return null;
         return identity(template);
       },
     ),

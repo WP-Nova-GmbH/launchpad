@@ -61,13 +61,15 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                             message: "Native GET unavailable",
                           }),
                         )
-                      : Effect.succeed({
-                          ...f.info,
-                          metadata: {
-                            ...f.info.metadata,
-                            ...(problem === "foreign" ? { "launchpad.generation": "2" } : {}),
-                          },
-                        }),
+                      : stops > (problem === "lost-stop" ? 1 : 0)
+                        ? Effect.succeed(null)
+                        : Effect.succeed({
+                            ...f.info,
+                            metadata: {
+                              ...f.info.metadata,
+                              ...(problem === "foreign" ? { "launchpad.generation": "2" } : {}),
+                            },
+                          }),
                   destroy: (id) =>
                     Effect.gen(function* () {
                       expect(id).toBe(f.computeRef);
@@ -99,6 +101,58 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
           ),
         );
       }
+      it.effect(
+        "keeps a deleted-requested source pinned until a fresh worker observes absence",
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture("paused");
+              yield* f.store.begin(f.input);
+              yield* f.freeze;
+              yield* f.verifyBackup;
+              yield* f.store.recordSaved(f.input.operationId);
+              for (const outcome of ["present", "unavailable", "absent"] as const) {
+                let stopped = false;
+                const worker = makeThreadVmFinalSaveDeletionWorker(
+                  f.sql,
+                  f.objects,
+                  {
+                    destroy: (id) =>
+                      Effect.sync(() => {
+                        expect(id).toBe(f.computeRef);
+                        stopped = true;
+                      }),
+                    inspect: (id) => {
+                      expect(id).toBe(f.computeRef);
+                      if (!stopped || outcome === "present") return Effect.succeed(f.info);
+                      if (outcome === "absent") return Effect.succeed(null);
+                      return Effect.fail(
+                        new ThreadVmComputeError({ operation: "inspect", message: "Unavailable" }),
+                      );
+                    },
+                  },
+                  f.hostId,
+                );
+                expect(yield* worker.runOne()).toBe(true);
+                const save = yield* f.store.get(f.input.operationId);
+                if (outcome === "absent") {
+                  expect(save?.phase).toBe("completed");
+                  expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("deleted");
+                } else {
+                  expect(save).toMatchObject({ phase: "deleting", errorCode: "stop_unconfirmed" });
+                  expect((yield* f.allocations.get(f.input.allocationId))?.state).toBe("deleting");
+                  expect(
+                    (yield* makeThreadPlacementStore(f.sql).get(f.threadId))?.operationId,
+                  ).toBe(f.input.operationId);
+                  expect(
+                    yield* f.sql`SELECT 1 FROM relay_thread_vm_backup_pins WHERE operation_id=${`saved-${f.input.operationId}`}`,
+                  ).toHaveLength(1);
+                  yield* f.sql`UPDATE relay_thread_vm_final_saves SET retry_at=clock_timestamp() WHERE operation_id=${f.input.operationId}`;
+                }
+              }
+            }),
+          ),
+      );
       it.effect("reports final-save blockage while retaining the original VM and ownership", () =>
         Effect.scoped(
           Effect.gen(function* () {
@@ -708,7 +762,7 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                               "launchpad.allocation_id": "someone-else",
                             },
                           }
-                        : problem === "stale-catalog"
+                        : problem === "stale-catalog" && stops === 0
                           ? f.info
                           : null,
                     ),

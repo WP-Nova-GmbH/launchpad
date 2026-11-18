@@ -266,6 +266,30 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
                   .pipe(Effect.flip),
               ).toBeInstanceOf(WorkflowInvalidError);
 
+              for (const status of ["awaiting_input", "cancelling", "running"] as const) {
+                const recovery = job(`recovery-${status}`, status, "recovery-repo");
+                const threadId = ThreadId.make(`thread-${status}`);
+                recovery.record = {
+                  ...recovery.record,
+                  runtime: { kind: "vm", threadId },
+                  queueReason: { code: "vm_waiting_capacity", retryAt: null },
+                  vmRecovery: { state: "recovery_error" },
+                  progress: {
+                    revision: 1,
+                    status: status === "cancelling" ? "awaiting_input" : status,
+                    threadId,
+                    detail: null,
+                    checkpoint: null,
+                  },
+                };
+                yield* store.createJob(recovery);
+              }
+              expect(
+                (yield* store.pageJobs("recovery-repo", { view: "attention" })).jobs.map(
+                  (item) => item.jobId,
+                ),
+              ).toEqual(["recovery-awaiting_input", "recovery-cancelling"]);
+
               return yield* Effect.fail("rollback-pages" as const);
             }),
           )
