@@ -1,5 +1,5 @@
 import { act, createElement, useLayoutEffect, useState, type PropsWithChildren } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
 import type {
@@ -71,6 +71,15 @@ const original: WorkflowDefinition = {
     },
   ],
 };
+const vmPublishing: WorkflowDefinition = {
+  ...original,
+  target: { kind: "vm", baseBranch: "release/2.x" },
+  steps: [
+    ...original.steps,
+    { id: "push", kind: "action", title: "Push the release", action: "push" },
+    { id: "pr", kind: "action", title: "Open PR", action: "open_pull_request" },
+  ],
+};
 let renderer: ReactTestRenderer | undefined;
 let definition: WorkflowDefinition = original;
 let selectedId = "";
@@ -125,6 +134,18 @@ async function click(label: string) {
       .props.onClick(),
   );
 }
+const visibleText = (node: ReactTestInstance): string =>
+  node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join(" ");
+const publishingDetails = () =>
+  Object.fromEntries(
+    renderer!.root
+      .findByType("dl")
+      .findAllByType("dt")
+      .map((term) => [
+        visibleText(term),
+        visibleText(term.parent!.findByType("dd")).replace(/\s+/g, " ").trim(),
+      ]),
+  );
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -254,9 +275,71 @@ describe("Workflow step editing", () => {
     await act(() => renderer!.update(<Harness {...fixture} machineCheckoutAvailable />));
 
     expect(selectedId).toBe("push");
-    expect(JSON.stringify(renderer!.toJSON())).toContain("Ready");
-    expect(JSON.stringify(renderer!.toJSON())).not.toContain("Machine checkout unavailable");
+    const readyInspector = visibleText(renderer!.root);
+    expect(readyInspector).toContain("Ready");
+    expect(publishingDetails()["Execution target"]).toBe("Machine");
+    expect(readyInspector).not.toContain("Machine checkout unavailable");
+    expect(readyInspector).not.toContain("GitHub access pending verification");
   });
+
+  it.each([
+    {
+      workflow: "only pushes a branch",
+      steps: vmPublishing.steps.slice(0, -1),
+      access: "Contents write",
+    },
+    {
+      workflow: "also opens a pull request",
+      steps: vmPublishing.steps,
+      access: "Contents write Pull requests write",
+    },
+  ])(
+    "shows the VM Push branch prerequisite and run access when the workflow $workflow",
+    async ({ steps, access }) => {
+      await mount({
+        initial: { ...vmPublishing, steps },
+        selection: "push",
+        machineCheckoutAvailable: false,
+      });
+
+      expect(publishingDetails()).toEqual({
+        "Execution target": "VM",
+        "Saved result": "Implement",
+        "GitHub App access for the run": access,
+      });
+      const inspector = visibleText(renderer!.root);
+      expect(inspector).toContain("Step configured");
+      expect(inspector).toContain("GitHub access pending verification");
+      expect(inspector).toContain("GitHub access is checked when the run starts.");
+      expect(inspector).not.toContain("Ready");
+    },
+  );
+
+  it.each([
+    ["release/2.x", "release/2.x"],
+    [null, "Repository default"],
+    ["   ", "Repository default"],
+  ])(
+    "shows the VM Open PR destination when the base branch is %s",
+    async (baseBranch, expected) => {
+      await mount({
+        initial: { ...vmPublishing, target: { kind: "vm", baseBranch } },
+        selection: "pr",
+        machineCheckoutAvailable: false,
+      });
+
+      expect(publishingDetails()).toEqual({
+        "Execution target": "VM",
+        "Publishes after": "Push the release",
+        "Base branch": expected,
+        "GitHub App access for the run": "Contents write Pull requests write",
+      });
+      const inspector = visibleText(renderer!.root);
+      expect(inspector).toContain("Step configured");
+      expect(inspector).toContain("GitHub access pending verification");
+      expect(inspector).toContain("GitHub access is checked when the run starts.");
+    },
+  );
 
   it("offers to repair an Open PR step on a VM without a Machine checkout", async () => {
     await mount({
@@ -271,7 +354,10 @@ describe("Workflow step editing", () => {
       selection: "pr",
       machineCheckoutAvailable: false,
     });
-    expect(JSON.stringify(renderer!.toJSON())).toContain("Push branch step required");
+    const blockedInspector = visibleText(renderer!.root);
+    expect(blockedInspector).toContain("Push branch step required");
+    expect(blockedInspector).not.toContain("Step configured");
+    expect(blockedInspector).not.toContain("GitHub access pending verification");
     expect(
       renderer!.root
         .findAllByType("button")

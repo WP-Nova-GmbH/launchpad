@@ -100,7 +100,9 @@ function PublishingStepSettings({
     );
   };
 
-  const checkoutUnavailable = definition.target.kind === "machine" && !machineCheckoutAvailable;
+  const target = definition.target;
+  const vm = target.kind === "vm";
+  const checkoutUnavailable = !vm && !machineCheckoutAvailable;
   if (!targetConfirmed || checkoutUnavailable) {
     return warning(
       targetConfirmed ? "Machine checkout unavailable" : "Execution target required",
@@ -131,21 +133,29 @@ function PublishingStepSettings({
     );
   }
 
+  const needsPullRequestsWrite =
+    vm &&
+    definition.steps.some(
+      (candidate) => candidate.kind === "action" && candidate.action === "open_pull_request",
+    );
+
   return (
     <div className="space-y-2 text-sm">
       <p className="flex items-center gap-2 font-medium text-success-foreground">
         <CircleCheckIcon size={15} aria-hidden />
-        Ready
+        {vm ? "Step configured" : "Ready"}
       </p>
       <p className="text-muted-foreground">
         {opensPullRequest
           ? "Opens or reuses a pull request for the run branch."
-          : "Commits the saved result and pushes the run branch."}
+          : vm
+            ? "Commits the saved Agent result and pushes the run branch to GitHub."
+            : "Commits the saved result and pushes the run branch."}
       </p>
       <dl className="space-y-2 border-t border-border pt-3">
         <div className="flex items-baseline justify-between gap-3">
           <dt className="shrink-0 text-xs text-muted-foreground">Execution target</dt>
-          <dd>Machine</dd>
+          <dd>{vm ? "VM" : "Machine"}</dd>
         </div>
         <div className="flex items-baseline justify-between gap-3">
           <dt className="shrink-0 text-xs text-muted-foreground">
@@ -155,7 +165,29 @@ function PublishingStepSettings({
             {opensPullRequest ? push?.title : agent.title}
           </dd>
         </div>
+        {vm && opensPullRequest ? (
+          <div className="flex items-baseline justify-between gap-3">
+            <dt className="shrink-0 text-xs text-muted-foreground">Base branch</dt>
+            <dd className="min-w-0 text-right wrap-anywhere">
+              {target.baseBranch?.trim() || "Repository default"}
+            </dd>
+          </div>
+        ) : null}
+        {vm ? (
+          <div className="flex items-baseline justify-between gap-3">
+            <dt className="min-w-0 text-xs text-muted-foreground">GitHub App access for the run</dt>
+            <dd className="shrink-0 text-right">
+              Contents write
+              {needsPullRequestsWrite ? <span className="block">Pull requests write</span> : null}
+            </dd>
+          </div>
+        ) : null}
       </dl>
+      {vm ? (
+        <WorkflowAlert variant="info" announce={false} title="GitHub access pending verification">
+          GitHub access is checked when the run starts.
+        </WorkflowAlert>
+      ) : null}
     </div>
   );
 }
