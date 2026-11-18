@@ -3947,6 +3947,15 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
                 expect((yield* admit())?.operationId).toBe(competitor.operationId);
                 yield* f.capacity.cancelUnstarted(competitor.operationId);
                 yield* replaceConnection("connected", NodeCrypto.randomUUID());
+                expect(
+                  (yield* readWorkflowVmRecoveries(f.sql, [f.workflowJobId])).get(f.workflowJobId),
+                ).toMatchObject({
+                  state: "recovery_error",
+                  reason: "codex_connection_replaced",
+                  detail: expect.stringContaining(
+                    "original Codex connection is no longer available",
+                  ),
+                });
                 expect(yield* admit()).toBeNull();
                 expect(yield* worker.runOne()).toBe(false);
                 expect((yield* work())?.pendingControl).toEqual(restoreResponse);

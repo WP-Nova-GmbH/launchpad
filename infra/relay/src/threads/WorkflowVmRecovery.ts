@@ -30,6 +30,8 @@ const unconfirmedBootDeletion =
   "Launchpad could not confirm deletion of the previous workflow VM. Cleanup will retry automatically. Saved results are still available.";
 const lostSourceReconciliation =
   "The workflow VM is missing. Launchpad is confirming its removal before recovery.";
+const codexConnectionUnavailable =
+  "The run’s original Codex connection is no longer available. Start a new run with a connected account.";
 
 /** Project physical lifecycle for workflow lists without waking or reading the guest. */
 export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
@@ -46,6 +48,7 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
       | "snapshot_unconfirmed"
       | "boot_deletion_unconfirmed"
       | "source_loss_reconciling"
+      | "codex_connection_replaced"
       | null;
   }>`
     SELECT j.job_id AS "jobId",
@@ -57,21 +60,19 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
         AND r.boot_receipt IS NOT NULL THEN 'boot_deletion_unconfirmed'
       WHEN r.phase='aborted' OR (r.error_code IS NOT NULL AND r.phase IN ('pending','preparing','prepared'))
         THEN 'recovery_error'
-      WHEN c.state='waiting' AND (r.phase IN ('pending','preparing','prepared','committed') OR x.phase='waiting')
-        AND NOT EXISTS (
-          SELECT 1 FROM relay_codex_vm_connections x WHERE x.organization_id=j.organization_id
-            AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
-            AND ${workflowVmCodexConnectionReady(sql)}) THEN 'waiting_codex'
+      WHEN c.state='waiting' AND (r.phase IN ('pending','preparing','prepared','committed') OR resume.phase='waiting')
+        AND (x.connection_id IS NULL OR NOT (${workflowVmCodexConnectionReady(sql)}))
+        THEN CASE WHEN x.connection_id IS NULL THEN 'codex_connection_replaced' ELSE 'waiting_codex' END
       WHEN r.phase IN ('pending','preparing','prepared','committed') AND c.state IN ('waiting','reserved')
         THEN 'waiting_capacity'
       WHEN r.phase IS NOT NULL OR (ready.phase='completed'
         AND (publication.manifest#>>'{binding,allocationId}' IS DISTINCT FROM a.allocation_id
           OR (publication.manifest#>>'{binding,generation}')::int IS DISTINCT FROM t.generation)) THEN 'restoring'
-      WHEN x.phase='resuming' AND x.connect_claim_id IS NOT NULL
-        AND (x.claim_until IS NULL OR x.claim_until<=clock_timestamp()) THEN 'resume_unconfirmed'
-      WHEN x.phase='waiting' AND c.state IN ('waiting','reserved') THEN 'waiting_capacity'
-      WHEN x.phase IN ('waiting','resuming') OR
-        (x.phase='completed' AND p.phase IN ('cancelled','completed') AND p.source_reopened_at IS NULL AND a.state='running')
+      WHEN resume.phase='resuming' AND resume.connect_claim_id IS NOT NULL
+        AND (resume.claim_until IS NULL OR resume.claim_until<=clock_timestamp()) THEN 'resume_unconfirmed'
+      WHEN resume.phase='waiting' AND c.state IN ('waiting','reserved') THEN 'waiting_capacity'
+      WHEN resume.phase IN ('waiting','resuming') OR
+        (resume.phase='completed' AND p.phase IN ('cancelled','completed') AND p.source_reopened_at IS NULL AND a.state='running')
         THEN 'resuming'
       WHEN p.phase IN ('pending','sealed') AND b.phase='creating' AND b.capture_started_at IS NOT NULL
         AND p.workflow_checkpoint->>'jobId'=j.job_id
@@ -100,15 +101,17 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
       ELSE NULL END AS state
     FROM relay_workflow_jobs j
     JOIN relay_thread_placements t ON t.workflow_job_id=j.job_id AND t.audience='repository'
+    LEFT JOIN relay_codex_vm_connections x ON x.organization_id=j.organization_id
+      AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
     LEFT JOIN relay_thread_vm_allocations a ON a.thread_id=t.thread_id AND a.deleted_at IS NULL
     LEFT JOIN relay_thread_vm_pauses p ON p.allocation_id=a.allocation_id AND p.generation=t.generation
     LEFT JOIN relay_thread_vm_backups b ON b.operation_id=p.backup_operation_id
       AND b.allocation_id=a.allocation_id AND b.generation=t.generation AND b.source_receipt=p.source_receipt
-    LEFT JOIN relay_thread_vm_resumes x ON x.allocation_id=a.allocation_id AND x.generation=t.generation
+    LEFT JOIN relay_thread_vm_resumes resume ON resume.allocation_id=a.allocation_id AND resume.generation=t.generation
     LEFT JOIN relay_thread_vm_restores r ON r.thread_id=t.thread_id
       AND r.operation_id=COALESCE(t.operation_id,j.pending_control->>'responseId') AND r.phase<>'completed'
     LEFT JOIN relay_thread_vm_restores ready ON ready.allocation_id=a.allocation_id AND ready.phase='completed'
-    LEFT JOIN relay_thread_vm_capacity c ON c.operation_id=COALESCE(r.operation_id,x.operation_id)
+    LEFT JOIN relay_thread_vm_capacity c ON c.operation_id=COALESCE(r.operation_id,resume.operation_id)
     LEFT JOIN LATERAL (
       SELECT s.operation_id,s.phase FROM relay_thread_vm_saved_disks s
       WHERE s.thread_id=t.thread_id AND s.phase='available'
@@ -137,6 +140,10 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
           return [[jobId, { state: "recovery_error", detail: unconfirmedBootDeletion }]];
         if (state === "source_loss_reconciling")
           return [[jobId, { state: "recovery_error", detail: lostSourceReconciliation }]];
+        if (state === "codex_connection_replaced")
+          return [
+            [jobId, { state: "recovery_error", reason: state, detail: codexConnectionUnavailable }],
+          ];
         if (state === "saved" && storedRecoveryError)
           return [[jobId, { state: "recovery_error", detail: storedRecoveryError }]];
         if (state === "recovery_error") return [[jobId, { state, detail: recoveryUnavailable }]];

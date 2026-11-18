@@ -101,6 +101,7 @@ export interface WorkflowRunDraft {
 interface WorkflowSessionSubmission extends WorkflowDraftSubmission {
   readonly requestEpoch?: number;
   readonly acceptedPending?: true;
+  readonly acceptedPendingResponseId?: string;
 }
 
 export interface WorkflowDraftState {
@@ -680,14 +681,19 @@ export function settleWorkflowJobRequest(
         ? result.progress?.checkpoint?.checkpointId
         : undefined;
       const submission = pendingId ? submissions?.[pendingId] : undefined;
+      const receipt =
+        result.runtime?.kind === "vm"
+          ? result.pendingResponseId && { acceptedPendingResponseId: result.pendingResponseId }
+          : { acceptedPending: true as const };
       // Only the reply to this send can attribute the queued response to this viewer.
       const acceptedPending =
+        receipt &&
         pendingId &&
         previous.mutation &&
         submission?.requestEpoch === request.epoch &&
         submission.operation === result.pendingResponseOperation
-          ? { ...submissions, [pendingId]: { ...submission, acceptedPending: true as const } }
-          : null;
+          ? { ...submissions, [pendingId]: { ...submission, ...receipt } }
+          : undefined;
       if (responses === previousResponses && !acceptedPending) return drafts;
       return {
         ...drafts,

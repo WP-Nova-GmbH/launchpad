@@ -7,12 +7,14 @@ import {
   ClipboardCheckIcon,
   ClockIcon,
   CloudIcon,
+  FileDiffIcon,
   MessageSquareIcon,
   MonitorIcon,
   PauseIcon,
   PlayIcon,
   RefreshCwIcon,
   RotateCwIcon,
+  Settings2Icon,
   SquareIcon,
 } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
@@ -31,9 +33,10 @@ import {
   type RetainedCheckpointDraft,
 } from "./WorkflowCheckpoints";
 import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
+import { WorkflowVmRecoveryStatus, workflowVmRecoveryTask } from "./WorkflowVmRecovery";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { useCallback, useEffect, useState, useRef, useLayoutEffect, type RefObject } from "react";
-import { useLocation, useNavigate } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openPortableThreadChat } from "../../state/threads";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -47,6 +50,7 @@ import {
   workflowApprovalPending,
 } from "@t3tools/client-runtime/relay/workflow-responses";
 import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
+import { savedWorkflowThreadState } from "@t3tools/client-runtime/relay/workflow-saved-results";
 import {
   workflowDraftAtom,
   workflowJobReadAtom,
@@ -88,6 +92,7 @@ import {
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
+import { searchableSetting } from "../settings/settingsSearch";
 import { WorkflowProgress } from "./WorkflowProgress";
 import {
   WORKFLOW_REVIEW_ANCHOR,
@@ -174,7 +179,9 @@ export function WorkflowJob({
   const retryPreparationButton = useRunActionFocus(key, runHeading);
   const runControlsTrigger = useRef<HTMLButtonElement>(null);
   const [cancelDialogKey, setCancelDialogKey] = useState<string | null>(null);
-  const queuedRecoveryLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
+  const recoverySettingsLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
+  const savedResultsButton = useRunActionFocus(key, runHeading);
+  const savedResults = useRef<HTMLElement>(null);
   const resultRequest = useRef<{ key: string } | null>(null);
   useLayoutEffect(
     () => () => {
@@ -617,11 +624,45 @@ export function WorkflowJob({
       unknownCheckpointResponse ||
       (manualState.responsePending &&
         selectedJob.pendingResponseOperation === checkpointOperation));
+  const pendingOperation = selectedJob.pendingResponseOperation;
+  const acknowledgedResponse =
+    manualState.responsePending &&
+    (pendingOperation === checkpointOperation || (!input && pendingOperation === "approve"));
+  const vmCheckpointRecovery =
+    waiting && selectedJob.runtime?.kind === "vm" && selectedJob.vmRecovery
+      ? workflowVmRecoveryTask(selectedJob.vmRecovery, acknowledgedResponse)
+      : null;
+  const showingCheckpointConfirmation =
+    checkpointResponsePending &&
+    (!vmCheckpointRecovery ||
+      (!acknowledgedResponse && !vmRecovery?.pending && !vmRecovery?.warning));
+  const checkpointConfirmationTitle = vmCheckpointRecovery
+    ? "Waiting for confirmation"
+    : (vmRecovery?.title ?? "Waiting for confirmation");
+  const responseKind = input ? "answer" : "feedback";
+  const matchesPendingResponse =
+    selectedJob.pendingResponseId !== undefined &&
+    selectedJob.pendingResponseId === ownSend?.acceptedPendingResponseId;
   const submittedResponse =
-    checkpointResponsePending && ownSend && (sendingCheckpoint || ownSend.acceptedPending)
+    checkpointResponsePending &&
+    ownSend &&
+    (sendingCheckpoint ||
+      (selectedJob.runtime?.kind === "vm" ? matchesPendingResponse : ownSend.acceptedPending))
       ? ownSend.text
       : null;
-  const checkpointConfirmationTitle = vmRecovery?.title ?? "Waiting for confirmation";
+  const responseReceipt =
+    submittedResponse === null
+      ? undefined
+      : {
+          text: submittedResponse,
+          label: sendingCheckpoint
+            ? input
+              ? "Answer being sent"
+              : "Feedback being sent"
+            : vmCheckpointRecovery && matchesPendingResponse
+              ? `Saved ${responseKind}`
+              : `Your last submitted ${responseKind}`,
+        };
   const composingFeedback =
     waiting &&
     !checkpointResponsePending &&
@@ -899,38 +940,66 @@ export function WorkflowJob({
       </div>
     ) : null;
   const draftOpen = !manualHold || collapsedDraftKey !== feedbackKey;
+  const vmRecoveryActions =
+    selectedJob.vmRecovery?.state === "waiting_codex" && organizationAdmin ? (
+      <Button
+        variant="outline"
+        size="sm"
+        render={
+          <Link
+            ref={recoverySettingsLink}
+            to="/settings/organization"
+            hash={searchableSetting("organization-codex-vms").id}
+          />
+        }
+      >
+        <Settings2Icon aria-hidden />
+        Open Codex for VMs
+      </Button>
+    ) : selectedJob.vmRecovery?.state === "recovery_error" &&
+      !composingFeedback &&
+      savedWorkflowThreadState(selectedJob) === "available" ? (
+      <Button
+        ref={savedResultsButton}
+        variant="outline"
+        size="sm"
+        onClick={() => {
+          const results = savedResults.current;
+          if (!results) return;
+          results.scrollIntoView({ block: "start" });
+          results.focus({ preventScroll: true });
+        }}
+      >
+        <FileDiffIcon aria-hidden />
+        Open saved results
+      </Button>
+    ) : undefined;
   const checkpointResponse = checkpointResponsePending ? (
-    <div className="space-y-3">
+    <>
       {checkpoint?.kind === "input" ? (
         <p className="text-sm font-medium">{checkpoint.question}</p>
       ) : null}
-      <WorkflowAlert
-        title={checkpointConfirmationTitle}
-        variant={vmRecovery?.warning ? "warning" : "info"}
-        announce={false}
-      >
-        {vmRecovery?.message ??
-          (unknownCheckpointResponse
-            ? "The run will update when the environment confirms the response."
-            : input
-              ? "The workflow continues once the environment confirms the answer."
-              : "Rework starts once the environment confirms the feedback.")}
-      </WorkflowAlert>
-      {submittedResponse !== null ? (
-        <div className="space-y-1 rounded-md border bg-muted/25 px-3 py-2.5">
-          <h3 className="text-xs font-medium text-muted-foreground">
-            {sendingCheckpoint
-              ? input
-                ? "Answer being sent"
-                : "Feedback being sent"
+      {showingCheckpointConfirmation ? (
+        <WorkflowAlert
+          title={checkpointConfirmationTitle}
+          variant={vmRecovery?.warning ? "warning" : "info"}
+          announce={false}
+        >
+          {(!vmCheckpointRecovery && vmRecovery?.message) ||
+            (unknownCheckpointResponse
+              ? "The run will update when the environment confirms the response."
               : input
-                ? "Your last submitted answer"
-                : "Your last submitted feedback"}
-          </h3>
-          <p className="whitespace-pre-wrap text-sm">{submittedResponse}</p>
+                ? "The workflow continues once the environment confirms the answer."
+                : "Rework starts once the environment confirms the feedback.")}
+        </WorkflowAlert>
+      ) : null}
+      {responseReceipt && !vmCheckpointRecovery ? (
+        <div className="space-y-1 rounded-md border bg-muted/25 px-3 py-2.5">
+          <h3 className="text-xs font-medium text-muted-foreground">{responseReceipt.label}</h3>
+          <p className="whitespace-pre-wrap text-sm">{responseReceipt.text}</p>
         </div>
       ) : null}
-    </div>
+    </>
   ) : waiting &&
     checkpoint &&
     viewerControls.canRespond &&
@@ -1051,22 +1120,31 @@ export function WorkflowJob({
         <span role="status" className="sr-only">
           {recoveryInTask
             ? recovery.title
-            : checkpointResponsePending
-              ? checkpointConfirmationTitle
-              : queuedTask
-                ? `${statusLabel}. ${queuedTask.title}`
-                : preparationInTask
-                  ? preparationAnnouncement
-                  : recovery
-                    ? `${statusLabel}. ${recovery.title}`
-                    : statusLabel}
+            : vmCheckpointRecovery
+              ? [
+                  ...(showingCheckpointConfirmation ? [checkpointConfirmationTitle] : []),
+                  vmCheckpointRecovery.title,
+                  vmCheckpointRecovery.message,
+                ].join(". ")
+              : showingCheckpointConfirmation
+                ? checkpointConfirmationTitle
+                : queuedTask
+                  ? `${statusLabel}. ${queuedTask.title}`
+                  : preparationInTask
+                    ? preparationAnnouncement
+                    : recovery
+                      ? `${statusLabel}. ${recovery.title}`
+                      : statusLabel}
         </span>
         <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
           <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
             {runName}
           </h1>
           <div className="flex flex-wrap items-center gap-3">
-            {(!TaskIcon || preparationInTask) && !cancelling && !recoveryInTask ? (
+            {(!TaskIcon || preparationInTask) &&
+            !vmCheckpointRecovery &&
+            !cancelling &&
+            !recoveryInTask ? (
               <span aria-hidden className="text-sm font-medium">
                 {statusLabel}
               </span>
@@ -1147,7 +1225,10 @@ export function WorkflowJob({
           ref={showingReview ? reviewSection : undefined}
           id={showingReview ? WORKFLOW_REVIEW_ANCHOR : undefined}
           tabIndex={showingReview ? -1 : undefined}
-          className="space-y-4"
+          className={cn(
+            "space-y-4",
+            vmCheckpointRecovery && "rounded-lg border bg-card p-4 text-card-foreground",
+          )}
           aria-label="Current workflow task"
         >
           {cancelling ? (
@@ -1179,7 +1260,7 @@ export function WorkflowJob({
             <WorkflowQueuedTask
               task={queuedTask}
               organizationAdmin={organizationAdmin}
-              recoveryLinkRef={queuedRecoveryLink}
+              recoveryLinkRef={recoverySettingsLink}
             />
           ) : failed ? (
             <WorkflowOutcome
@@ -1258,12 +1339,39 @@ export function WorkflowJob({
           ) : cancelledVm ? null : (
             <div
               className={
-                TaskIcon
-                  ? "space-y-3 rounded-lg border bg-card p-4 text-card-foreground"
-                  : "space-y-3 border-t pt-5"
+                vmCheckpointRecovery
+                  ? "space-y-3"
+                  : TaskIcon
+                    ? "space-y-3 rounded-lg border bg-card p-4 text-card-foreground"
+                    : "space-y-3 border-t pt-5"
               }
             >
-              {TaskIcon || (!terminal && stepIndex >= 0) ? (
+              {vmCheckpointRecovery ? (
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b pb-3">
+                  <h2 className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                    {input ? (
+                      <MessageSquareIcon
+                        aria-hidden
+                        className="size-4 shrink-0 text-muted-foreground"
+                      />
+                    ) : (
+                      <ClipboardCheckIcon
+                        aria-hidden
+                        className="size-4 shrink-0 text-muted-foreground"
+                      />
+                    )}
+                    {composingFeedback
+                      ? "Request changes"
+                      : (checkpointStep?.title ??
+                        (input ? "Input checkpoint" : "Review checkpoint"))}
+                  </h2>
+                  {stepIndex >= 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      Step {stepIndex + 1} of {selectedJob.workflow!.definition.steps.length}
+                    </p>
+                  ) : null}
+                </div>
+              ) : TaskIcon || (!terminal && stepIndex >= 0) ? (
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   {TaskIcon ? (
                     <span
@@ -1294,25 +1402,33 @@ export function WorkflowJob({
                   ) : null}
                 </div>
               ) : null}
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="min-w-0 space-y-1">
-                  {taskTitle ? (
-                    <h2 className={TaskIcon ? "text-base font-semibold" : "text-sm font-medium"}>
-                      {taskTitle}
-                    </h2>
-                  ) : null}
-                  {conversationInTask && nextStep ? (
-                    <p className="text-xs text-muted-foreground">Up next is {nextStep.title}.</p>
-                  ) : null}
-                  {showPauseDetail ? (
-                    <p className="text-xs text-muted-foreground">
-                      Setup and previews remain running.
-                    </p>
-                  ) : null}
+              {vmCheckpointRecovery ? (
+                <WorkflowVmRecoveryStatus
+                  task={vmCheckpointRecovery}
+                  receipt={responseReceipt}
+                  actions={vmRecoveryActions}
+                />
+              ) : (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0 space-y-1">
+                    {taskTitle ? (
+                      <h2 className={TaskIcon ? "text-base font-semibold" : "text-sm font-medium"}>
+                        {taskTitle}
+                      </h2>
+                    ) : null}
+                    {conversationInTask && nextStep ? (
+                      <p className="text-xs text-muted-foreground">Up next is {nextStep.title}.</p>
+                    ) : null}
+                    {showPauseDetail ? (
+                      <p className="text-xs text-muted-foreground">
+                        Setup and previews remain running.
+                      </p>
+                    ) : null}
+                  </div>
+                  {conversationInTask ? conversationActions : null}
+                  {paused ? resumeAction : null}
                 </div>
-                {conversationInTask ? conversationActions : null}
-                {paused ? resumeAction : null}
-              </div>
+              )}
               {checkpointResponse}
             </div>
           )}
@@ -1321,7 +1437,9 @@ export function WorkflowJob({
               Waiting for an execution target. No steps have started.
             </p>
           ) : null}
-          {vmRecovery && !checkpointResponsePending && (!cancelling || vmRecovery.warning) ? (
+          {vmCheckpointRecovery ? null : vmRecovery &&
+            !checkpointResponsePending &&
+            (!cancelling || vmRecovery.warning) ? (
             <WorkflowAlert
               title={vmRecovery.title}
               variant={vmRecovery.warning ? "warning" : "info"}
@@ -1400,6 +1518,7 @@ export function WorkflowJob({
               refresh={refresh}
               canConfigure={canConfigure}
               onReviewTargetChange={setReviewingCurrentResult}
+              resultsRef={savedResults}
             />
           ) : null}
           {!recoveryInTask ? recoveryCard : null}

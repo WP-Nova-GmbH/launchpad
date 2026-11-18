@@ -416,6 +416,7 @@ export const WorkflowVmRecovery = Schema.Struct({
     "recovery_error",
   ]),
   detail: Schema.optionalKey(TrimmedNonEmptyString),
+  reason: Schema.optionalKey(Schema.Literal("codex_connection_replaced")),
 });
 export type WorkflowVmRecovery = typeof WorkflowVmRecovery.Type;
 
@@ -468,6 +469,8 @@ export const RepositoryWorkflowJob = Schema.Struct({
   pendingResponseOperation: Schema.optional(
     Schema.Literals(["approve", "input", "request_changes"]),
   ),
+  /** Current VM checkpoint response identity, visible only to its author. */
+  pendingResponseId: Schema.optionalKey(TrimmedNonEmptyString),
   viewerControls: Schema.optional(
     Schema.Struct({
       canCancel: Schema.Boolean,

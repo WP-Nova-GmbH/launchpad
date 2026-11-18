@@ -67,7 +67,12 @@ vi.mock("./workflowState", async () => ({
   useWorkflowClient: () => fixture.call,
 }));
 vi.mock("./SavedWorkflowResults", () => ({
-  SavedWorkflowResults: () => createElement("section", {}, "Saved results"),
+  SavedWorkflowResults: ({ resultsRef }: { resultsRef?: Ref<HTMLElement> }) =>
+    createElement(
+      "section",
+      { ref: resultsRef, "aria-label": "Saved workflow results" },
+      "Saved results",
+    ),
 }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
@@ -334,9 +339,9 @@ describe("workflow result location navigation", () => {
   });
 
   it.each([
-    ["paused", "Workflow VM paused"],
-    ["waiting_capacity", "Waiting for a VM slot"],
-  ] as const)("shows a queued VM approval as pending while %s", async (state, title) => {
+    ["paused", /applied when the VM is ready/i],
+    ["waiting_capacity", /waiting for a VM slot/i],
+  ] as const)("shows a queued VM approval as pending while %s", async (state, waitingText) => {
     fixture.call.mockResolvedValue({
       ...vmReview,
       responsePending: true,
@@ -345,8 +350,8 @@ describe("workflow result location navigation", () => {
     });
     await mount(false);
     const content = text(renderer!.toJSON());
-    expect(content).toContain(title);
-    expect(content).toContain("The response is queued");
+    expect(content).toContain("Response queued");
+    expect(content).toMatch(waitingText);
     expect(content).toContain("Saved results");
     expect(content).not.toContain("waiting for the environment");
     expect(fixture.open).not.toHaveBeenCalled();
@@ -354,6 +359,222 @@ describe("workflow result location navigation", () => {
       .findAllByType("button")
       .find((button) => button.props.children === "Approval pending")!;
     expect(approval.props.disabled).toBe(true);
+  });
+
+  it("keeps acknowledged review feedback visible while the saved VM waits and recovers", async () => {
+    const saved = {
+      ...vmReview,
+      progress: { ...vmReview.progress, hasThread: true },
+      viewerControls: { ...vmReview.viewerControls, canRespond: true },
+      vmRecovery: { state: "saved" },
+    } satisfies RepositoryWorkflowJob;
+    const queued = {
+      ...saved,
+      responsePending: true,
+      pendingResponseOperation: "request_changes",
+      pendingResponseId: "accepted-feedback",
+    } satisfies RepositoryWorkflowJob;
+    const feedback = "Add rollback verification before publishing.";
+    const task = () => text(renderer!.root.findByProps({ "aria-label": "Current workflow task" }));
+    const announcement = () =>
+      text(renderer!.root.findByProps({ role: "status", className: "sr-only" }));
+    const results = { scrollIntoView: vi.fn(), focus: vi.fn() };
+    fixture.call.mockResolvedValue(saved);
+    await mount(true, {
+      createNodeMock: ({ props }) =>
+        (props as { "aria-label"?: string })["aria-label"] === "Saved workflow results"
+          ? results
+          : null,
+    });
+
+    expect(task()).toContain("Workspace saved");
+    expect(task()).not.toContain("Response queued");
+    expect(findButton("Request changes").props.disabled).toBe(false);
+    await press("Request changes");
+    await act(() =>
+      renderer!.root.findByType("textarea").props.onChange({ target: { value: feedback } }),
+    );
+
+    const receipt = deferred();
+    const send = vi.fn().mockReturnValue(receipt.promise);
+    fixture.call
+      .mockResolvedValue(queued)
+      .mockImplementationOnce((request) => request({ respondToWorkflowJob: send }, "token"));
+    await act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault: vi.fn() }));
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: {
+          operation: "request_changes",
+          checkpointId: "checkpoint",
+          expectedRevision: vmReview.progress.revision,
+          text: feedback,
+        },
+      }),
+    );
+    expect(task()).toContain("Feedback being sent");
+    expect(task()).not.toContain("Saved feedback");
+    await act(async () => receipt.resolve(queued));
+
+    expect(task()).toContain("Response queued");
+    expect(announcement()).toMatch(/Response queued.*applied when the VM is ready/i);
+    expect(task()).toContain("Saved feedback");
+    expect(task()).toContain(feedback);
+    expect(findButton("Request changes")).toBeUndefined();
+    expect(findButton("Approve result")).toBeUndefined();
+
+    const waitingForSlot = {
+      ...queued,
+      vmRecovery: { state: "waiting_capacity" },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(waitingForSlot);
+    await pollRun();
+    expect(task()).toContain("Response queued");
+    expect(announcement()).toMatch(/Response queued.*waiting for a VM slot/i);
+    expect(task()).toContain("Saved feedback");
+
+    const blocker = "There is no verified VM backup for this workflow checkpoint.";
+    const failedRecovery = {
+      ...queued,
+      vmRecovery: { state: "recovery_error", detail: blocker },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(failedRecovery);
+    await pollRun();
+
+    expect(task()).toContain("Recovery needs attention");
+    expect(task()).toContain(blocker);
+    expect(announcement()).toContain(blocker);
+    expect(task()).toContain("Saved feedback");
+    expect(task()).toContain(feedback);
+    expect(task()).toContain("Saved results");
+    expect(task()).toContain("Open saved results");
+    await press("Open saved results");
+    expect(results.scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    expect(results.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(findButton("Retry recovery")).toBeUndefined();
+    expect(fixture.open).not.toHaveBeenCalled();
+
+    fixture.call.mockResolvedValue({
+      ...failedRecovery,
+      progress: { ...failedRecovery.progress, threadDeletionRequested: true },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(task()).not.toContain("Open saved results");
+
+    // The original feedback was withdrawn and another maintainer responded before our next poll.
+    const { pendingResponseId: _previousResponse, ...otherMaintainerResponse } = waitingForSlot;
+    fixture.call.mockResolvedValue(otherMaintainerResponse);
+    await pollRun();
+    expect(task()).toContain("Response queued");
+    expect(task()).not.toContain("Saved feedback");
+    expect(task()).not.toContain(feedback);
+  });
+
+  it("keeps the Input question and the acknowledged answer in the recovery card", async () => {
+    const question = "Which environment should get the migration first?";
+    const answer = "Start with staging.";
+    const saved = {
+      ...vmReview,
+      status: "awaiting_input",
+      progress: {
+        ...vmReview.progress,
+        status: "awaiting_input",
+        hasThread: true,
+        checkpoint: {
+          kind: "input",
+          checkpointId: "checkpoint",
+          stepId: "rollout",
+          generation: 0,
+          role: "member",
+          question,
+        },
+      },
+      viewerControls: { canApprove: false, canRespond: true, canCancel: true },
+      vmRecovery: { state: "saved" },
+    } satisfies RepositoryWorkflowJob;
+    const task = () => text(renderer!.root.findByProps({ "aria-label": "Current workflow task" }));
+    fixture.call.mockResolvedValue(saved);
+    await mount();
+
+    expect(task()).toContain("Workspace saved");
+    expect(task()).toContain(question);
+    await act(() =>
+      renderer!.root.findByType("textarea").props.onChange({ target: { value: answer } }),
+    );
+    fixture.call.mockResolvedValue({
+      ...saved,
+      responsePending: true,
+      pendingResponseOperation: "input",
+      pendingResponseId: "accepted-answer",
+      vmRecovery: { state: "waiting_capacity" },
+    } satisfies RepositoryWorkflowJob);
+    await act(async () =>
+      renderer!.root.findByType("form").props.onSubmit({ preventDefault: vi.fn() }),
+    );
+
+    expect(task()).toContain("Response queued");
+    expect(task()).toContain(question);
+    expect(task()).toContain("Saved answer");
+    expect(task()).toContain(answer);
+    expect(findButton("Submit answer")).toBeUndefined();
+  });
+
+  it("directs organization admins to the original Codex connection while keeping another viewer’s feedback private", async () => {
+    const otherFeedback = "Feedback from another maintainer.";
+    const key = workflowSessionKey(scope, job.jobId);
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (drafts) => ({
+      ...drafts,
+      submitted: {
+        ...drafts.submitted,
+        [key]: {
+          checkpoint: {
+            checkpointId: "checkpoint",
+            operation: "request_changes",
+            userId: "other-maintainer",
+            text: otherFeedback,
+            requestEpoch: 1,
+            acceptedPending: true,
+          },
+        },
+      },
+    }));
+    const reconnectable = {
+      ...vmReview,
+      progress: { ...vmReview.progress, hasThread: true },
+      responsePending: true,
+      pendingResponseOperation: "request_changes",
+      vmRecovery: { state: "waiting_codex" },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(reconnectable);
+    const links = () =>
+      renderer!.root
+        .findAllByType("a")
+        .filter((link) => link.props.href === "/settings/organization#organization-codex-vms");
+    const content = () => text(renderer!.toJSON());
+    await mount(true);
+
+    expect(content()).toContain("Reconnect Codex to continue");
+    expect(content()).toMatch(/organization admin/i);
+    expect(content()).toMatch(/original.*account|original.*connection/i);
+    expect(content()).not.toContain("Saved feedback");
+    expect(content()).not.toContain(otherFeedback);
+    expect(links()).toHaveLength(0);
+
+    await act(() => renderer!.update(view("job", true, true)));
+    expect(links()).toHaveLength(1);
+    expect(text(links()[0]!)).toMatch(/Codex for VMs/i);
+    expect(content()).not.toContain("Saved feedback");
+    expect(content()).not.toContain(otherFeedback);
+    expect(fixture.open).not.toHaveBeenCalled();
+
+    fixture.call.mockResolvedValue({
+      ...reconnectable,
+      vmRecovery: { state: "recovery_error", reason: "codex_connection_replaced" },
+    } satisfies RepositoryWorkflowJob);
+    await pollRun();
+    expect(content()).toContain("Original Codex connection unavailable");
+    expect(content()).not.toContain("Recovery continues automatically");
+    expect(links()).toHaveLength(0);
+    expect(findButton("Open saved results")).toBeDefined();
   });
 
   it("refreshes a matching saved checkpoint before enabling approval", async () => {

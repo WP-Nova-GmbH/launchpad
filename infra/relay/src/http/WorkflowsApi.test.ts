@@ -1,7 +1,7 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { RelayClientPrincipal } from "@t3tools/contracts/relay";
 import type { RespondToWorkflowJob } from "@t3tools/contracts/workflows";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { ThreadId } from "@t3tools/contracts";
 import { Workflows, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { Machines } from "../machines/Machines.ts";
@@ -480,6 +480,7 @@ const manualApiHarness = Effect.gen(function* () {
     },
   });
   const writes = yield* Ref.make(0);
+  const duringRefresh = yield* Ref.make(Effect.void);
   const services = Layer.mergeAll(
     Layer.mock(EnvironmentConnector)({}),
     Layer.mock(Machines)({}),
@@ -506,7 +507,7 @@ const manualApiHarness = Effect.gen(function* () {
     }),
     Layer.mock(Workflows)({
       getJob: () => Ref.get(row),
-      claim: () => Effect.succeed(null),
+      claim: () => Ref.get(duringRefresh).pipe(Effect.flatten, Effect.as(null)),
       updateJob: (previous, record, pendingControl) =>
         Effect.gen(function* () {
           yield* Ref.update(writes, (n) => n + 1);
@@ -524,6 +525,7 @@ const manualApiHarness = Effect.gen(function* () {
     row,
     role,
     writes,
+    duringRefresh,
     refresh: () => refreshWorkflowJobForClient("manual-job").pipe(Effect.provide(services)),
     respond: (payload: typeof RespondToWorkflowJob.Type) =>
       respondToWorkflowJob({ repositoryId: "repo", jobId: "manual-job" }, payload).pipe(
@@ -532,6 +534,54 @@ const manualApiHarness = Effect.gen(function* () {
       ),
   };
 });
+
+it.effect("acknowledges only the exact VM response accepted by the mutation", () =>
+  Effect.gen(function* () {
+    const h = yield* manualApiHarness;
+    yield* Ref.update(h.row, (row) => ({
+      ...row,
+      record: {
+        ...row.record,
+        runtime: { kind: "vm" as const, threadId: ThreadId.make("thread") },
+        vmAdmission: { codexConnectionId: "connection", hasSecrets: false },
+      },
+    }));
+    const answer = {
+      operation: "input",
+      checkpointId: "input",
+      expectedRevision: 5,
+      text: "Answer",
+    } as const;
+    const accepted = yield* h.respond(answer);
+    const pending = (yield* Ref.get(h.row)).pendingControl!;
+    assert.isString(accepted.pendingResponseId);
+    assert.strictEqual(accepted.pendingResponseId, pending.responseId);
+    assert.strictEqual((yield* h.respond(answer)).pendingResponseId, pending.responseId);
+    assert.strictEqual(yield* Ref.get(h.writes), 1);
+    assert.isUndefined((yield* h.refresh())?.pendingResponseId);
+
+    // An idempotent retry can race a second tab's replacement by the same user.
+    const replace = Ref.update(h.row, (row) => ({
+      ...row,
+      pendingControl: {
+        ...row.pendingControl!,
+        responseId: "replacement",
+        response: { ...answer, text: "Different answer" },
+      },
+    }));
+    yield* Ref.set(h.duringRefresh, replace);
+    const replay = yield* h.respond(answer);
+    assert.isTrue(replay.responsePending);
+    assert.isUndefined(replay.pendingResponseId);
+
+    // A fresh send can race the same replacement between the write and the refetch.
+    yield* Ref.update(h.row, (row) => ({ ...row, pendingControl: null }));
+    const replaced = yield* h.respond(answer);
+    assert.strictEqual(yield* Ref.get(h.writes), 2);
+    assert.isTrue(replaced.responsePending);
+    assert.isUndefined(replaced.pendingResponseId);
+  }).pipe(Effect.provide(NodeCrypto.layer)),
+);
 
 it.effect(
   "manual API requests bind the original revision, retry HTTP idempotently and let Cancel supersede them",

@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useLayoutEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { useAtomValue } from "@effect/atom-react";
@@ -87,12 +96,14 @@ export function SavedWorkflowResults({
   refresh,
   canConfigure,
   onReviewTargetChange,
+  resultsRef,
 }: {
   scope: WorkflowScope;
   job: RepositoryWorkflowJob;
   refresh: () => Promise<void>;
   canConfigure: boolean;
   onReviewTargetChange?: (current: boolean) => void;
+  resultsRef?: RefObject<HTMLElement | null>;
 }) {
   const call = useWorkflowClient(scope);
   const narrow = useIsMobile();
@@ -126,7 +137,8 @@ export function SavedWorkflowResults({
   const [deletion, setDeletion] = useState<DeletionState | null>(null);
   const deletionInFlight = useRef(false);
   const deletionIndexCheck = useRef<DeletionIntent | null>(null);
-  const savedResults = useRef<HTMLElement>(null);
+  const localResultsRef = useRef<HTMLElement>(null);
+  const savedResults = resultsRef ?? localResultsRef;
   const deletionStatus = useRef<HTMLDivElement>(null);
   const deleteButton = useRef<HTMLButtonElement>(null);
   const keepThreadButton = useRef<HTMLButtonElement>(null);

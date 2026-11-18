@@ -10,6 +10,7 @@ import {
   isTerminalWorkflowJob,
   workflowApprovalCanRetry,
   workflowIsFinishing,
+  type RepositoryWorkflowJob,
   type RunRepositoryWorkflow,
 } from "@t3tools/contracts/workflows";
 import * as Crypto from "effect/Crypto";
@@ -29,6 +30,7 @@ import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
 import {
   isWorkflowCheckpointResponse,
   lockWorkflowVmCheckpoint,
+  pendingWorkflowVmCheckpoint,
 } from "../jobs/WorkflowVmCheckpoint.ts";
 import {
   validateWorkflowTarget,
@@ -56,12 +58,13 @@ import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
 
 const sameWorkflowResponse = Schema.toEquivalence(RespondToWorkflowJob);
 
-const jobForClient = (row: WorkflowJobRecord) => {
+const jobForClient = (row: WorkflowJobRecord): RepositoryWorkflowJob => {
   const pending = row.pendingControl?.response;
   const operation = pending?.operation;
-  const progress = row.record.progress;
+  const { pendingResponseId: _storedResponseId, ...record } = row.record;
+  const { progress } = record;
   return {
-    ...row.record,
+    ...record,
     ...(progress?.retryableApproval && !workflowApprovalCanRetry(progress)
       ? { progress: { ...progress, retryableApproval: false } }
       : {}),
@@ -103,6 +106,7 @@ const vmRecoveries = Effect.fnUntraced(function* (jobIds: ReadonlyArray<string>)
 const withViewerControls = Effect.fnUntraced(function* (
   row: WorkflowJobRecord,
   membership: Effect.Success<ReturnType<typeof authorizeWorkflowRepository>>,
+  acceptedResponseId?: string,
 ) {
   const job = jobForClient(row);
   if (!job.vmAdmission) return job;
@@ -117,10 +121,15 @@ const withViewerControls = Effect.fnUntraced(function* (
     job.progress?.status === "awaiting_input" || job.progress?.status === "awaiting_review"
       ? (yield* vmRecoveries([row.jobId])).get(row.jobId)
       : undefined;
+  const pending = pendingWorkflowVmCheckpoint(row);
   const { vmRecovery: _storedRecovery, ...current } = job;
   return {
     ...current,
     ...(vmRecovery ? { vmRecovery, detail: null } : {}),
+    ...(pending?.userId === membership.userId &&
+    (acceptedResponseId === undefined || pending.responseId === acceptedResponseId)
+      ? { pendingResponseId: pending.responseId }
+      : {}),
     viewerControls: {
       canCancel: canManage || (yield* mayCancelOwnVm(row, membership.userId)),
       canApprove: !job.progress?.resultSaving && (canManage || memberCheckpoint),
@@ -187,22 +196,24 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
       !(yield* hasFrozenVmSecrets(row.jobId)));
   if (!ownCancel && !memberResponse)
     yield* requireMaintainableRepository({ membership, repositoryId: params.repositoryId });
-  const refreshForViewer = Effect.gen(function* () {
-    const job = (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
-    if (!job.vmAdmission) return job;
-    const latestMembership = yield* authorizeWorkflowRepository(params.repositoryId);
-    const latestRow = (yield* store.getJob(params.jobId)) ?? row;
-    if (latestRow.organizationId !== latestMembership.organization.organizationId)
-      return yield* tenancyNotFound("repository_not_found");
-    return yield* withViewerControls(latestRow, latestMembership);
-  });
+  const refreshForViewer = (acceptedResponseId?: string) =>
+    Effect.gen(function* () {
+      const job = (yield* refreshWorkflowJobForClient(params.jobId)) ?? jobForClient(row);
+      if (!job.vmAdmission) return job;
+      const latestMembership = yield* authorizeWorkflowRepository(params.repositoryId);
+      const latestRow = (yield* store.getJob(params.jobId)) ?? row;
+      if (latestRow.organizationId !== latestMembership.organization.organizationId)
+        return yield* tenancyNotFound("repository_not_found");
+      // The refresh can observe a replacement for the response accepted by this request.
+      return yield* withViewerControls(latestRow, latestMembership, acceptedResponseId);
+    });
   if (
     vmCheckpoint &&
     row.pendingControl?.responseId &&
     row.pendingControl.userId === membership.userId &&
     sameWorkflowResponse(row.pendingControl.response, payload)
   )
-    return yield* refreshForViewer;
+    return yield* refreshForViewer(row.pendingControl.responseId);
   if (payload.operation === "retry_action") {
     const pending = row.pendingControl;
     if (
@@ -437,7 +448,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
       )
       .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
   } else yield* save;
-  return yield* refreshForViewer;
+  return yield* refreshForViewer(pendingControl.responseId);
 });
 const errors = mapRelayCommonApiErrors("not_authorized");
 const sameDefinition = Schema.toEquivalence(WorkflowDefinition);
