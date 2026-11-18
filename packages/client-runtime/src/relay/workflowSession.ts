@@ -84,6 +84,16 @@ export interface WorkflowRunDraft {
     /** VM requests replay the captured payload. Machine submissions retain their existing retry flow. */
     readonly targetKind?: "vm";
   } | null;
+  /** Submission context retained while leaving and reopening the Run view. */
+  readonly recovery?:
+    | {
+        readonly kind: "retry";
+        readonly previous: NonNullable<WorkflowRunDraft["operation"]>;
+        readonly replayOnly: boolean;
+      }
+    | { readonly kind: "additional"; readonly previous: NonNullable<WorkflowRunDraft["operation"]> }
+    | { readonly kind: "additional-rejected" }
+    | undefined;
   readonly startedJobId: string | null;
   readonly error: string | null;
 }

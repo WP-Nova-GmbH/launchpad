@@ -11,6 +11,7 @@ import {
   workflowSessionKey,
   type WorkflowScope,
   type WorkflowEditorDraft,
+  type WorkflowRunDraft,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import {
   WorkflowConflictError,
@@ -338,11 +339,14 @@ export async function runWorkflowDraft(
   const previous = draft.operation;
   const previousVm = previous?.targetKind === "vm" ? previous : null;
   let operation: NonNullable<typeof draft.operation>;
+  let recovery: WorkflowRunDraft["recovery"];
   if (intent.kind === "recover") {
     if (!previousVm) return null;
     operation = { ...previousVm, state: "pending" };
+    recovery = { kind: "retry", previous: previousVm, replayOnly: intent.replayOnly };
   } else {
     if ((previousVm && !intent.replaceUncertain) || !draft.instruction.trim()) return null;
+    if (previous && intent.replaceUncertain) recovery = { kind: "additional", previous };
     operation = {
       requestId: randomUUID(),
       state: "pending",
@@ -353,7 +357,10 @@ export async function runWorkflowDraft(
   if (
     !updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
       ...state,
-      runs: { ...state.runs, [key]: { ...draft, operation, error: null, startedJobId: null } },
+      runs: {
+        ...state.runs,
+        [key]: { ...draft, operation, recovery, error: null, startedJobId: null },
+      },
     }))
   )
     return null;
@@ -378,6 +385,7 @@ export async function runWorkflowDraft(
             ...current,
             instruction: current.instruction === operation.instruction ? "" : current.instruction,
             operation: null,
+            recovery: undefined,
             startedJobId: job.jobId,
             error: null,
           },
@@ -399,6 +407,10 @@ export async function runWorkflowDraft(
           [key]: {
             ...current,
             operation: rejected ? previous : { ...operation, state: "uncertain" },
+            recovery:
+              rejected && recovery?.kind === "additional"
+                ? { kind: "additional-rejected" }
+                : undefined,
             startedJobId: rejected ? draft.startedJobId : current.startedJobId,
             error: workflowError(cause),
           },

@@ -1,6 +1,18 @@
-import { act, createElement, startTransition, useEffect, useLayoutEffect } from "react";
+import {
+  act,
+  createElement,
+  isValidElement,
+  startTransition,
+  useEffect,
+  useLayoutEffect,
+  type PropsWithChildren,
+  type ReactNode,
+} from "react";
 import { create, type ReactTestRenderer, type ReactTestInstance } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import * as Effect from "effect/Effect";
+import * as Queue from "effect/Queue";
+import { it as effectTest } from "@effect/vitest";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import {
@@ -9,7 +21,7 @@ import {
   type RepositoryWorkflow,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
-import { ManagedRelay, type ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
+import { ManagedRelay, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import {
   clearWorkflowScope,
   setWorkflowSessionAccount,
@@ -20,16 +32,26 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 
-const { navigate, confirmation, getToken, runPromiseExit } = vi.hoisted(() => ({
+const { navigate, getToken, runPromiseExit } = vi.hoisted(() => ({
   navigate: vi.fn(),
-  confirmation: vi.fn<() => Promise<boolean>>(),
   getToken: vi.fn<() => Promise<string | null>>(),
   runPromiseExit: vi.fn(),
 }));
 vi.mock("@clerk/react", () => ({ useAuth: () => ({ getToken }) }));
 vi.mock("@tanstack/react-router", () => ({ useNavigate: () => navigate }));
 vi.mock("../../lib/runtime", () => ({ runtime: { runPromiseExit } }));
-vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: confirmation }));
+vi.mock("../ui/alert-dialog", () => {
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "alertdialog" }, children) : null,
+    AlertDialogPopup: part,
+    AlertDialogHeader: part,
+    AlertDialogTitle: part,
+    AlertDialogDescription: part,
+    AlertDialogFooter: part,
+  };
+});
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
@@ -93,11 +115,35 @@ const draft = () => appAtomRegistry.get(workflowDraftAtom).runs[key]!;
 let renderer: ReactTestRenderer | undefined;
 const visibleText = (node: ReactTestInstance): string =>
   node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join(" ");
-const alertText = () =>
+const messages = (role: string) =>
+  renderer!.root.findAll((node) => typeof node.type === "string" && node.props.role === role);
+const alertText = () => messages("alert").map(visibleText).join(" ");
+const dialog = () => renderer!.root.findByProps({ role: "alertdialog" });
+const button = (label: string, container = renderer!.root) =>
+  container
+    .findAllByType("button")
+    .find((node) => visibleText(node).replace(/\s+/g, " ").trim() === label)!;
+const press = (label: string, container = renderer!.root) =>
+  act(async () => {
+    button(label, container).props.onClick();
+  });
+const separateRunDraft = () =>
   renderer!.root
-    .findAll((node) => typeof node.type === "string" && node.props.role === "alert")
-    .map(visibleText)
-    .join(" ");
+    .findAllByType("details")
+    .find((node) =>
+      node
+        .findAllByType("summary")
+        .some((summary) => visibleText(summary).trim() === "New run draft"),
+    )!;
+async function openSeparateRunConfirmation() {
+  await press("Start an additional run", separateRunDraft());
+  expect(visibleText(dialog())).toContain("Start a separate run?");
+}
+const confirmSeparateRun = () => press("Start an additional run", dialog());
+async function startSeparateRun() {
+  await openSeparateRunConfirmation();
+  await confirmSeparateRun();
+}
 
 function deferred<A>() {
   let resolve!: (value: A) => void;
@@ -115,17 +161,14 @@ function AuthenticatedWorkflowRun(props: Props) {
   const call = useWorkflowClient(props.scope);
   return <WorkflowRun {...props} call={call} />;
 }
-async function mount(props = base, withAuth = false) {
+const authenticatedView = (props: Props) => (
+  <AppAtomRegistryProvider>
+    <AuthenticatedWorkflowRun {...props} />
+  </AppAtomRegistryProvider>
+);
+async function mount(props = base, withAuth = false, options?: Parameters<typeof create>[1]) {
   await act(() => {
-    renderer = create(
-      withAuth ? (
-        <AppAtomRegistryProvider>
-          <AuthenticatedWorkflowRun {...props} />
-        </AppAtomRegistryProvider>
-      ) : (
-        view(props)
-      ),
-    );
+    renderer = create(withAuth ? authenticatedView(props) : view(props), options);
   });
 }
 async function update(props: Props) {
@@ -167,7 +210,6 @@ function uncertain() {
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   navigate.mockReset();
-  confirmation.mockReset().mockResolvedValue(true);
   getToken.mockReset().mockResolvedValue("fixture-token");
   runPromiseExit.mockReset();
   read.mockReset().mockResolvedValue(job);
@@ -345,13 +387,6 @@ describe("VM Run submission recovery", () => {
     };
     return { runWorkflow, call };
   };
-  const press = (label: string) =>
-    act(async () => {
-      renderer!.root
-        .findAllByType("button")
-        .find((node) => visibleText(node).replace(/\s+/g, " ").trim() === label)!
-        .props.onClick();
-    });
 
   it.each([
     ["VM", "missing"],
@@ -378,8 +413,7 @@ describe("VM Run submission recovery", () => {
       if (failure === "missing") getToken.mockResolvedValueOnce(null);
       else getToken.mockRejectedValueOnce(new Error("Could not load the token"));
 
-      await submit();
-      expect(confirmation).toHaveBeenCalledOnce();
+      await startSeparateRun();
       expect(getToken).toHaveBeenCalledOnce();
       expect(runPromiseExit).not.toHaveBeenCalled();
       expect(runWorkflow).toHaveBeenCalledOnce();
@@ -403,6 +437,97 @@ describe("VM Run submission recovery", () => {
     },
   );
 
+  effectTest.effect.each(["vm", "machine"] as const)(
+    "does not send an additional %s run after the saved target changes during authentication",
+    (targetKind) =>
+      Effect.gen(function* () {
+        const requests = yield* Queue.unbounded<Effect.Effect<void>>();
+        yield* Effect.forever(Queue.take(requests).pipe(Effect.flatMap((request) => request))).pipe(
+          Effect.forkScoped,
+        );
+        yield* Effect.promise(async () => {
+          const saved = targetKind === "vm" ? vmWorkflow : workflow;
+          const initial = { ...base, workflow: saved, vmExecutionAvailable: true };
+          const updated: RepositoryWorkflow = {
+            ...saved,
+            revision: saved.revision + 1,
+            definition: {
+              ...saved.definition,
+              target:
+                targetKind === "vm"
+                  ? { kind: "vm", baseBranch: "release/2.x" }
+                  : {
+                      kind: "machine",
+                      environmentId: EnvironmentId.make("new-environment"),
+                      projectId: ProjectId.make("new-checkout"),
+                    },
+            },
+          };
+          vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "workflow-test");
+          read.mockRejectedValueOnce(new Error("Reply lost"));
+          await mount(initial);
+          await submit();
+          await edit("A different run");
+          const original = draft().operation;
+          await unmount();
+          await mount(initial, true);
+
+          type Client = ManagedRelayTenancy.ManagedRelayTenancyClient["Service"];
+          const runWorkflow = vi.fn<Client["runWorkflow"]>(() => Effect.succeed(job));
+          const client = { runWorkflow } as unknown as Client;
+          const delivered = deferred<void>();
+          runPromiseExit.mockImplementation(
+            (
+              effect: Effect.Effect<
+                RepositoryWorkflowJob,
+                ManagedRelay.ManagedRelayClientError,
+                ManagedRelayTenancy.ManagedRelayTenancyClient
+              >,
+            ) =>
+              new Promise((resolve) => {
+                Queue.offerUnsafe(
+                  requests,
+                  effect.pipe(
+                    Effect.provideService(ManagedRelayTenancy.ManagedRelayTenancyClient, client),
+                    Effect.exit,
+                    Effect.map((exit) => {
+                      resolve(exit);
+                      delivered.resolve();
+                    }),
+                  ),
+                );
+              }),
+          );
+          const auth = deferred<string>();
+          getToken.mockReturnValueOnce(auth.promise);
+          await startSeparateRun();
+          expect(getToken).toHaveBeenCalledOnce();
+          expect(draft().operation?.state).toBe("pending");
+
+          const current = { ...initial, workflow: updated };
+          if (targetKind === "machine") {
+            await unmount();
+            await mount(current, true);
+          } else {
+            await act(() => renderer!.update(authenticatedView(current)));
+          }
+
+          await act(async () => {
+            auth.resolve("fixture-token");
+            await delivered.promise;
+          });
+
+          expect(runWorkflow).not.toHaveBeenCalled();
+          expect(navigate).not.toHaveBeenCalled();
+          expect(draft().error).toBe(
+            "The saved workflow changed before the run was sent. Review the execution target and try again.",
+          );
+          expect(draft()).toMatchObject({ operation: original, instruction: "A different run" });
+          expect(alertText()).toContain("Could not start the additional run");
+        });
+      }),
+  );
+
   it("retries the replacement ID when the replacement's reply is lost after sending", async () => {
     const { call, runWorkflow } = captureSubmissions();
     const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
@@ -416,10 +541,12 @@ describe("VM Run submission recovery", () => {
     await mount(initial);
     await submit();
     await edit("A different run");
-    await submit();
+    await startSeparateRun();
     const original = runWorkflow.mock.calls[0]![0].payload;
     const replacement = runWorkflow.mock.calls[1]![0].payload;
     expect(replacement.requestId).not.toBe(original.requestId);
+    expect(alertText()).toContain("A different run");
+    expect(alertText()).not.toContain("Run A");
 
     await press("Retry previous submission");
     expect(runWorkflow.mock.calls[2]![0].payload).toEqual(replacement);
@@ -518,7 +645,7 @@ describe("VM Run submission recovery", () => {
         operation: null,
         startedJobId: job.jobId,
       });
-      expect(confirmation).not.toHaveBeenCalled();
+      expect(messages("alertdialog")).toHaveLength(0);
       expect(navigate).not.toHaveBeenCalled();
       expect(renderer!.root.findByType("textarea").props.value).toBe(
         "Instructions for a separate run",
@@ -549,13 +676,12 @@ describe("VM Run submission recovery", () => {
       await edit("A different run");
       if (targetKind === "machine") await update({ ...initial, workflow });
       const retained = draft();
-      confirmation.mockResolvedValueOnce(false);
-      await submit();
+      await openSeparateRunConfirmation();
+      await press("Keep editing", dialog());
       expect(runWorkflow).toHaveBeenCalledTimes(1);
       expect(draft()).toBe(retained);
 
-      await submit();
-      expect(confirmation).toHaveBeenCalledTimes(2);
+      await startSeparateRun();
       const replacement = runWorkflow.mock.calls[1]![0].payload;
       expect(replacement).toEqual({
         workflowId: workflow.workflowId,
@@ -569,6 +695,10 @@ describe("VM Run submission recovery", () => {
         operation: retained.operation,
         error: message,
       });
+      expect(visibleText(renderer!.root)).toContain("Run A");
+      expect(alertText()).toContain("Could not start the additional run");
+      expect(alertText()).not.toContain("Previous submission not confirmed");
+      expect(renderer!.root.findByType("textarea").props.value).toBe("A different run");
 
       await press(targetKind === "vm" ? "Retry previous submission" : "Check previous submission");
       expect(runWorkflow.mock.calls[2]![0].payload).toEqual({
@@ -579,7 +709,7 @@ describe("VM Run submission recovery", () => {
     },
   );
 
-  it.each(["target", "gate", "archive"] as const)(
+  it.each(["target kind", "base branch", "gate", "archive"] as const)(
     "does not start a separate run when the %s changes during confirmation",
     async (change) => {
       const { call, runWorkflow } = captureSubmissions();
@@ -587,23 +717,178 @@ describe("VM Run submission recovery", () => {
       read.mockRejectedValueOnce(new Error("Reply lost"));
       await mount(initial);
       await submit();
-      const answer = deferred<boolean>();
-      confirmation.mockReturnValueOnce(answer.promise);
-      await submit();
-      expect(confirmation).toHaveBeenCalledOnce();
-      await update(
-        change === "target"
-          ? { ...initial, workflow }
-          : change === "gate"
-            ? { ...initial, vmExecutionAvailable: false }
-            : { ...initial, workflow: { ...vmWorkflow, archived: true } },
-      );
+      await openSeparateRunConfirmation();
+      const confirm = button("Start an additional run", dialog()).props.onClick;
+      const changedBranch: RepositoryWorkflow = {
+        ...vmWorkflow,
+        definition: {
+          ...vmWorkflow.definition,
+          target: { kind: "vm", baseBranch: "release/2.x" },
+        },
+      };
+      const changed: Record<typeof change, Props> = {
+        "target kind": { ...initial, workflow },
+        "base branch": { ...initial, workflow: changedBranch },
+        gate: { ...initial, vmExecutionAvailable: false },
+        archive: { ...initial, workflow: { ...vmWorkflow, archived: true } },
+      };
+      await update(changed[change]);
       const retained = draft();
-      await accept(answer, true);
+      await act(() => confirm());
+      expect(messages("alertdialog")).toHaveLength(0);
       expect(runWorkflow).toHaveBeenCalledTimes(1);
       expect(draft()).toBe(retained);
     },
   );
+
+  it.each(["Run A", "A different run"])(
+    "keeps the recovery and new draft visible during a VM retry with instructions %s",
+    async (instruction) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const reply = deferred<RepositoryWorkflowJob>();
+      read.mockRejectedValueOnce(new Error("Reply lost")).mockReturnValueOnce(reply.promise);
+      await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call });
+      await submit();
+      await edit(instruction);
+      const disclosure = separateRunDraft();
+      const retry = button("Retry previous submission");
+      await press("Retry previous submission");
+      expect(draft().operation?.state).toBe("pending");
+      expect(runWorkflow.mock.calls[1]![0].payload).toEqual(runWorkflow.mock.calls[0]![0].payload);
+      const submissionStatus = messages("status");
+      expect(submissionStatus).toHaveLength(1);
+      expect(visibleText(submissionStatus[0]!)).toContain(
+        "Waiting for confirmation of the previous submission.",
+      );
+      expect(visibleText(renderer!.root)).toContain("Previously submitted instructions");
+      expect(renderer!.root.findByType("textarea").props.value).toBe(instruction);
+      expect(separateRunDraft()).toBe(disclosure);
+      expect(button("Retry previous submission")).toBe(retry);
+
+      await accept(reply, job);
+      if (instruction === "Run A") {
+        expect(navigate).toHaveBeenCalledTimes(1);
+      } else {
+        expect(navigate).not.toHaveBeenCalled();
+        expect(renderer!.root.findByType("textarea").props.value).toBe(instruction);
+        expect(button("View started run")).toBeDefined();
+      }
+    },
+  );
+
+  it.each(["Previously submitted instructions", "New run draft", "outside recovery"])(
+    "handles focus on %s when a retry resolves with a new draft retained",
+    async (focusedLabel) => {
+      const { call } = captureSubmissions();
+      const reply = deferred<RepositoryWorkflowJob>();
+      read.mockRejectedValueOnce(new Error("Reply lost")).mockReturnValueOnce(reply.promise);
+      const body = {};
+      const ownerDocument: { activeElement: object; body: object } = { activeElement: body, body };
+      const focusedNode = { ownerDocument };
+      const startedRun = {
+        ownerDocument,
+        focus() {
+          ownerDocument.activeElement = startedRun;
+        },
+      };
+      function containsFocusedSummary(node: ReactNode): boolean {
+        if (Array.isArray(node)) return node.some(containsFocusedSummary);
+        if (!isValidElement<PropsWithChildren>(node)) return false;
+        return (
+          (node.type === "summary" && node.props.children === focusedLabel) ||
+          containsFocusedSummary(node.props.children)
+        );
+      }
+      const insideRecovery = focusedLabel !== "outside recovery";
+      await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call }, false, {
+        createNodeMock(element) {
+          const { children } = element.props as PropsWithChildren;
+          if (element.type === "button" && children === "View started run") {
+            // Removing a focused disclosure returns DOM focus to the body.
+            if (insideRecovery && ownerDocument.activeElement === focusedNode)
+              ownerDocument.activeElement = body;
+            return startedRun;
+          }
+          if (element.type === "div" || element.type === "details") {
+            return {
+              ownerDocument,
+              contains: (node: object) => node === focusedNode && containsFocusedSummary(children),
+            };
+          }
+          return null;
+        },
+      });
+      await submit();
+      await edit("A different run");
+      await press("Retry previous submission");
+      ownerDocument.activeElement = focusedNode;
+
+      await accept(reply, job);
+
+      expect(navigate).not.toHaveBeenCalled();
+      expect(ownerDocument.activeElement).toBe(insideRecovery ? startedRun : focusedNode);
+    },
+  );
+
+  it("shows the same VM retry while its receipt is pending after reopening", async () => {
+    const { call, runWorkflow } = captureSubmissions();
+    const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+    const reply = deferred<RepositoryWorkflowJob>();
+    read.mockRejectedValueOnce(new Error("Reply lost")).mockReturnValueOnce(reply.promise);
+    await mount(initial);
+    await submit();
+    await press("Retry previous submission");
+    await unmount();
+    await mount(initial);
+
+    expect(messages("status").map(visibleText)).toContain(
+      "Waiting for confirmation of the previous submission.",
+    );
+    expect(button("Retry previous submission").props["aria-disabled"]).toBe(true);
+    expect(visibleText(renderer!.root)).toContain("Previously submitted instructions");
+    expect(separateRunDraft().findByType("textarea").props.value).toBe("Run A");
+    expect(runWorkflow).toHaveBeenCalledTimes(2);
+    await accept(reply, job);
+    expect(button("View started run")).toBeDefined();
+  });
+
+  it("keeps the additional-run rejection separate from the original request after reopening", async () => {
+    const { call } = captureSubmissions();
+    const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+    const reply = deferred<void>();
+    const message = "The additional run needs a usable checkout.";
+    read.mockRejectedValueOnce(new Error("Reply lost")).mockReturnValueOnce(
+      reply.promise.then(() => {
+        throw new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: new WorkflowInvalidError({ message }),
+        });
+      }),
+    );
+    await mount(initial);
+    await submit();
+    const original = draft().operation;
+    await edit("A different run");
+    await startSeparateRun();
+    await unmount();
+    await mount(initial);
+
+    expect(messages("status").map(visibleText)).toContain(
+      "Waiting for confirmation of the additional run.",
+    );
+    expect(visibleText(renderer!.root)).toContain("Run A");
+    expect(separateRunDraft().findByType("textarea").props.value).toBe("A different run");
+
+    await unmount();
+    await accept(reply, undefined);
+    await mount(initial);
+
+    expect(draft()).toMatchObject({ operation: original, instruction: "A different run" });
+    expect(alertText()).toContain("Could not start the additional run");
+    expect(alertText()).toContain(message);
+    expect(visibleText(renderer!.root)).toContain("Run A");
+    expect(separateRunDraft().findByType("textarea").props.value).toBe("A different run");
+  });
 
   it.each([false, true])(
     "keeps an unresolved VM request after a retry error (gate closed: %s)",
@@ -657,18 +942,32 @@ describe("VM Run submission recovery", () => {
 });
 
 describe("Uncertain Run confirmation ownership", () => {
-  it.each(["unmount", "workflow", "repository", "organization", "account", "archive"])(
+  it.each(["unmount", "workflow", "repository", "organization", "account", "archive", "checkout"])(
     "does not start after changing %s during confirmation",
     async (change) => {
       uncertain();
-      const answer = deferred<boolean>();
-      confirmation.mockReturnValue(answer.promise);
       await mount();
-      await submit();
+      await openSeparateRunConfirmation();
+      const confirm = button("Start an additional run", dialog()).props.onClick;
       if (change === "unmount") await unmount();
       else if (change === "workflow") await update({ ...base, workflow: otherWorkflow });
       else if (change === "archive")
         await update({ ...base, workflow: { ...workflow, archived: true } });
+      else if (change === "checkout")
+        await update({
+          ...base,
+          workflow: {
+            ...workflow,
+            definition: {
+              ...workflow.definition,
+              target: {
+                kind: "machine",
+                environmentId: EnvironmentId.make("different-environment"),
+                projectId: ProjectId.make("different-project"),
+              },
+            },
+          },
+        });
       else if (change === "account") {
         await act(() => setWorkflowSessionAccount(appAtomRegistry, "another-account"));
         await update({ ...base, scope: { ...scope, accountId: "another-account" } });
@@ -681,35 +980,34 @@ describe("Uncertain Run confirmation ownership", () => {
               : { ...scope, organizationId: "another-organization" },
         });
       const retained = appAtomRegistry.get(workflowDraftAtom);
-      await accept(answer, true);
+      await act(() => confirm());
       expect(read).not.toHaveBeenCalled();
       expect(navigate).not.toHaveBeenCalled();
       expect(appAtomRegistry.get(workflowDraftAtom)).toBe(retained);
+      if (renderer) expect(messages("alertdialog")).toHaveLength(0);
     },
   );
   it("keeps edited instructions instead of running them under an older confirmation", async () => {
     uncertain();
-    const answer = deferred<boolean>();
-    confirmation.mockReturnValueOnce(answer.promise);
     await mount();
-    await submit();
+    await openSeparateRunConfirmation();
+    const confirm = button("Start an additional run", dialog()).props.onClick;
     await edit("Replacement instructions");
-    await accept(answer, true);
+    await act(() => confirm());
     expect(read).not.toHaveBeenCalled();
     expect(draft().instruction).toBe("Replacement instructions");
     const reply = deferred<RepositoryWorkflowJob>();
     read.mockReturnValue(reply.promise);
-    await submit();
+    await startSeparateRun();
     expect(read).toHaveBeenCalledTimes(1);
     expect(draft().operation?.instruction).toBe("Replacement instructions");
     await accept(reply, { ...job, instruction: "Replacement instructions" });
   });
   it.each(["replace", "clear scope"])("ignores confirmation after %s", async (change) => {
     uncertain();
-    const answer = deferred<boolean>();
-    confirmation.mockReturnValue(answer.promise);
     await mount();
-    await submit();
+    await openSeparateRunConfirmation();
+    const confirm = button("Start an additional run", dialog()).props.onClick;
     await act(() => {
       if (change === "clear scope") clearWorkflowScope(appAtomRegistry, scope);
       else
@@ -719,36 +1017,59 @@ describe("Uncertain Run confirmation ownership", () => {
         }));
     });
     const retained = appAtomRegistry.get(workflowDraftAtom);
-    await accept(answer, true);
+    await act(() => confirm());
     expect(read).not.toHaveBeenCalled();
     expect(appAtomRegistry.get(workflowDraftAtom)).toBe(retained);
   });
-  it("uses the current registry record even before its render catches up", async () => {
-    const answer = deferred<boolean>();
-    confirmation.mockReturnValue(answer.promise);
+  it("requires a separate confirmation when the usual Run form is stale", async () => {
     await mount();
     await act(() => {
       uncertain();
       renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} });
     });
-    expect(confirmation).toHaveBeenCalledTimes(1);
     expect(read).not.toHaveBeenCalled();
-    await accept(answer, true);
+    expect(messages("alertdialog")).toHaveLength(0);
+    expect(separateRunDraft().props.open).toBeFalsy();
+    await openSeparateRunConfirmation();
+    expect(read).not.toHaveBeenCalled();
+    await confirmSeparateRun();
     expect(read).toHaveBeenCalledTimes(1);
+  });
+  it("can reopen confirmation after the draft changes in the same update", async () => {
+    uncertain();
+    await mount();
+    const open = button("Start an additional run", separateRunDraft()).props.onClick;
+    const editInstructions = renderer!.root.findByType("textarea").props.onChange;
+
+    await act(() => {
+      open();
+      editInstructions({ target: { value: "Replacement instructions" } });
+    });
+
+    expect(messages("alertdialog")).toHaveLength(0);
+    expect(read).not.toHaveBeenCalled();
+    expect(draft().instruction).toBe("Replacement instructions");
+    const reply = deferred<RepositoryWorkflowJob>();
+    read.mockReturnValue(reply.promise);
+    await startSeparateRun();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(draft().operation?.instruction).toBe("Replacement instructions");
+    await accept(reply, { ...job, instruction: "Replacement instructions" });
   });
   it("deduplicates submissions through confirmation and request delivery", async () => {
     uncertain();
-    const answer = deferred<boolean>();
     const reply = deferred<RepositoryWorkflowJob>();
-    confirmation.mockReturnValue(answer.promise);
     read.mockReturnValue(reply.promise);
     await mount();
-    await submit();
-    await submit();
-    expect(confirmation).toHaveBeenCalledTimes(1);
+    await openSeparateRunConfirmation();
+    await press("Start an additional run", separateRunDraft());
+    expect(messages("alertdialog")).toHaveLength(1);
     expect(read).not.toHaveBeenCalled();
-    await accept(answer, true);
-    await submit();
+    const confirm = button("Start an additional run", dialog()).props.onClick;
+    await act(() => {
+      confirm();
+      confirm();
+    });
     expect(read).toHaveBeenCalledTimes(1);
     expect(draft().operation?.instruction).toBe("Run A");
     await accept(reply, job);
@@ -756,14 +1077,14 @@ describe("Uncertain Run confirmation ownership", () => {
   });
   it("keeps the uncertain draft on cancellation and allows a later explicit submit", async () => {
     uncertain();
-    confirmation.mockResolvedValueOnce(false);
     await mount();
     const retained = draft();
-    await submit();
+    await openSeparateRunConfirmation();
+    await press("Keep editing", dialog());
+    expect(messages("alertdialog")).toHaveLength(0);
     expect(read).not.toHaveBeenCalled();
     expect(draft()).toBe(retained);
-    await submit();
-    expect(confirmation).toHaveBeenCalledTimes(2);
+    await startSeparateRun();
     expect(read).toHaveBeenCalledTimes(1);
   });
 });
@@ -788,13 +1109,14 @@ function CommitReceipt({
 describe("Ownership invalidation before passive cleanup", () => {
   it.each(["run receipt", "confirmation"])("rejects old %s after B commits", async (kind) => {
     const reply = deferred<RepositoryWorkflowJob>();
-    const answer = deferred<boolean>();
     const passive = deferred<void>();
-    if (kind === "confirmation") {
-      uncertain();
-      confirmation.mockReturnValue(answer.promise);
-    } else read.mockReturnValue(reply.promise);
-    const release = () => (kind === "confirmation" ? answer.resolve(true) : reply.resolve(job));
+    let confirm: (() => void) | undefined;
+    if (kind === "confirmation") uncertain();
+    else read.mockReturnValue(reply.promise);
+    const release = () => {
+      if (confirm) confirm();
+      else reply.resolve(job);
+    };
     const onPassive = () => passive.resolve();
     const frame = (definition: RepositoryWorkflow) => (
       <>
@@ -805,7 +1127,10 @@ describe("Ownership invalidation before passive cleanup", () => {
     await act(() => {
       renderer = create(frame(workflow));
     });
-    await submit();
+    if (kind === "confirmation") {
+      await openSeparateRunConfirmation();
+      confirm = button("Start an additional run", dialog()).props.onClick;
+    } else await submit();
     // act flushes passive cleanup before queued continuations. Keep the transition's
     // real commit interval and wait on B's passive receipt instead of a timer.
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", false);
@@ -856,9 +1181,19 @@ describe("saved workflow run context", () => {
       (node) => typeof node.type === "string" && node.props.role === "alert",
     );
     expect(alerts).toHaveLength(1);
+    expect(separateRunDraft().props.open).toBeFalsy();
+    expect(separateRunDraft().findByType("textarea").props.required).toBeFalsy();
     expect(visibleText(alerts[0]!)).toContain("Previously submitted instructions");
     expect(visibleText(alerts[0]!)).toContain("Run A");
     expect(renderer!.root.findByType("textarea").props.value).toBe("Newer draft");
     expect(draft().operation?.instruction).toBe("Run A");
+    await press("Check runs");
+    expect(read).toHaveBeenCalledOnce();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId: scope.repositoryId },
+      search: { tab: "runs" },
+    });
+    expect(draft().instruction).toBe("Newer draft");
   });
 });
