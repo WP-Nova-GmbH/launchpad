@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 
 export const WORKFLOW_SAVE_CYCLE_MS = 10 * 60_000;
+const waitingForStorage = "waiting for storage";
 const bindingCodec = Schema.fromJsonString(WorkflowVmDispatchBinding);
 const resultCodec = Schema.fromJsonString(
   Schema.Struct({
@@ -48,6 +49,8 @@ export const decodeWorkflowResultCapture = Schema.decodeUnknownEffect(resultCode
 
 /** Durable retry metadata is separate from immutable run/result bytes. */
 export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
+  const unstarted = sql`stage=${waitingForStorage} AND failures=0 AND detail IS NULL
+    AND manifest_json IS NULL AND native_operation_id IS NULL`;
   const next = (threadId: string) =>
     sql
       .unsafe<WorkflowSaveIntent>(
@@ -55,36 +58,68 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
         [threadId],
       )
       .pipe(Effect.map(([row]) => row ?? null));
+  const claim = Effect.fn("WorkflowResultOutbox.claim")(function* (threadId: string) {
+    const now = yield* Clock.currentTimeMillis;
+    const [claimed] = yield* sql<WorkflowSaveIntent>`UPDATE workflow_result_outbox SET
+      started_at=CASE WHEN ${unstarted} THEN ${now} ELSE started_at END,
+      deadline=CASE WHEN ${unstarted} THEN ${now + WORKFLOW_SAVE_CYCLE_MS} ELSE deadline END,
+      stage=CASE WHEN ${unstarted} THEN 'starting save' ELSE stage END
+      WHERE publication_id=(SELECT publication_id FROM workflow_result_outbox
+        WHERE thread_id=${threadId} AND status!='acknowledged' ORDER BY revision LIMIT 1)
+        AND status='pending' AND retry_at<=${now} AND ((${unstarted}) OR deadline>${now})
+      RETURNING ${sql.literal(columns)}`;
+    return claimed ?? null;
+  });
   const enqueue = Effect.fn("WorkflowResultOutbox.enqueue")(function* (input: {
     binding: WorkflowVmDispatchBinding;
     recordJson: string;
     result?: WorkflowResultCapture;
     afterRestoredRevision?: number;
+    latestRelayRevision?: number;
   }) {
     const { binding } = input;
     const [previous] = yield* sql<{
       recordJson: string;
+      bindingJson: string;
       revision: number;
-    }>`SELECT record_json AS "recordJson",revision FROM workflow_result_outbox WHERE job_id=${binding.jobId} ORDER BY revision DESC LIMIT 1`;
+    }>`SELECT record_json AS "recordJson",binding_json AS "bindingJson",revision
+      FROM workflow_result_outbox WHERE job_id=${binding.jobId} ORDER BY revision DESC LIMIT 1`;
     const captured =
       input.result &&
       !(yield* sql`SELECT 1 FROM workflow_result_outbox WHERE job_id=${binding.jobId} AND json_extract(result_json,'$.turnId')=${input.result.turnId}`)
         .length
         ? input.result
         : undefined;
+    const bindingJson = yield* Schema.encodeEffect(bindingCodec)(binding);
     if (input.afterRestoredRevision !== undefined) {
       if (previous?.revision !== input.afterRestoredRevision) return;
-    } else if (previous?.recordJson === input.recordJson && !captured) return;
+    } else if (
+      previous?.bindingJson === bindingJson &&
+      previous.recordJson === input.recordJson &&
+      !captured
+    )
+      return;
     const now = yield* Clock.currentTimeMillis;
     const [sequence] = yield* sql<{
       value: number;
     }>`SELECT COALESCE(MAX(sequence),0) AS value FROM orchestration_events WHERE aggregate_kind='thread' AND stream_id=${binding.threadId}`;
+    if (!captured && input.afterRestoredRevision === undefined && previous) {
+      // Once the publisher claims the head, its state and artifacts stay immutable.
+      const [coalesced] = yield* sql`UPDATE workflow_result_outbox SET
+        record_json=${input.recordJson},source_sequence=${sequence?.value ?? 0}
+        WHERE job_id=${binding.jobId} AND binding_json=${bindingJson}
+          AND revision=${previous.revision} AND revision=(SELECT MAX(revision)
+            FROM workflow_result_outbox WHERE job_id=${binding.jobId})
+          AND status='pending' AND result_json IS NULL AND ${unstarted}
+        RETURNING publication_id`;
+      if (coalesced) return;
+    }
     yield* sql`INSERT INTO workflow_result_outbox ${sql.insert({
       publication_id: NodeCrypto.randomUUID(),
       job_id: binding.jobId,
       thread_id: binding.threadId,
-      revision: (previous?.revision ?? 0) + 1,
-      binding_json: yield* Schema.encodeEffect(bindingCodec)(binding),
+      revision: Math.max(previous?.revision ?? 0, input.latestRelayRevision ?? 0) + 1,
+      binding_json: bindingJson,
       record_json: input.recordJson,
       result_json: captured ? yield* Schema.encodeEffect(resultCodec)(captured) : null,
       source_sequence: sequence?.value ?? 0,
@@ -92,8 +127,9 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
       patch_artifact_id: NodeCrypto.randomUUID(),
       manifest_artifact_id: NodeCrypto.randomUUID(),
       status: "pending",
-      started_at: now,
-      deadline: now + WORKFLOW_SAVE_CYCLE_MS,
+      stage: waitingForStorage,
+      started_at: 0,
+      deadline: 0,
       retry_at: now,
     })}`;
   });
@@ -175,7 +211,8 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
   });
   const expire = Effect.fn("WorkflowResultOutbox.expire")(function* (threadId: string) {
     const now = yield* Clock.currentTimeMillis;
-    yield* sql`UPDATE workflow_result_outbox SET status='failed',detail='Saving timed out while '||stage||'. Retry saving to continue.' WHERE thread_id=${threadId} AND status='pending' AND deadline<=${now}`;
+    yield* sql`UPDATE workflow_result_outbox SET status='failed',detail='Saving timed out while '||stage||'. Retry saving to continue.'
+      WHERE thread_id=${threadId} AND status='pending' AND NOT (${unstarted}) AND deadline<=${now}`;
   });
   const retry = Effect.fn("WorkflowResultOutbox.retry")(function* (
     jobId: string,
@@ -187,5 +224,5 @@ export function makeWorkflowResultOutbox(sql: SqlClient.SqlClient) {
         .length > 0
     );
   });
-  return { next, enqueue, restore, result, saving, fail, expire, retry };
+  return { next, claim, enqueue, restore, result, saving, fail, expire, retry };
 }

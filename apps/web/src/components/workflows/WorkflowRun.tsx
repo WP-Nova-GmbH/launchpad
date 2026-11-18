@@ -66,17 +66,14 @@ export function WorkflowRun(props: WorkflowRunProps) {
   const { workflow, vmExecutionAvailable } = props;
   const kind = workflow.definition.target.kind;
   const vmUnavailable = kind === "vm" && !vmExecutionAvailable;
-  const publishingUnavailable =
-    kind === "vm" && workflow.definition.steps.some((step) => step.kind === "action");
   return (
     <WorkflowRunForm
       key={workflowSessionKey(
         props.scope,
-        `${workflow.workflowId}:${kind}:${workflow.archived}:${vmUnavailable}:${publishingUnavailable}`,
+        `${workflow.workflowId}:${kind}:${workflow.archived}:${vmUnavailable}`,
       )}
       {...props}
       vmUnavailable={vmUnavailable}
-      publishingUnavailable={publishingUnavailable}
     />
   );
 }
@@ -87,9 +84,8 @@ function WorkflowRunForm({
   projects,
   call,
   vmUnavailable,
-  publishingUnavailable,
   canConfigure = false,
-}: WorkflowRunProps & { vmUnavailable: boolean; publishingUnavailable: boolean }) {
+}: WorkflowRunProps & { vmUnavailable: boolean }) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
   const submission = useRef<{ draft: WorkflowRunDraft } | null>(null);
@@ -156,7 +152,7 @@ function WorkflowRunForm({
   );
   const pending = draft.operation?.state === "pending";
   const uncertain = draft.operation?.state === "uncertain";
-  const runBlocked = vmUnavailable || workflow.archived || publishingUnavailable;
+  const runBlocked = vmUnavailable || workflow.archived;
   const replayOnly = runBlocked || savedTarget.kind !== "vm";
   const pendingRecovery =
     pending && draft.recovery?.kind !== "additional-rejected" ? draft.recovery : undefined;
@@ -399,13 +395,7 @@ function WorkflowRunForm({
           Run {workflow.definition.name}
         </h1>
         <WorkflowAlert
-          title={
-            workflow.archived
-              ? "Workflow archived"
-              : publishingUnavailable
-                ? "Publishing requires a Machine"
-                : "VM execution unavailable"
-          }
+          title={workflow.archived ? "Workflow archived" : "VM execution unavailable"}
           variant="warning"
           actions={
             <>
@@ -422,9 +412,7 @@ function WorkflowRunForm({
         >
           {workflow.archived
             ? "Restore this workflow before running it."
-            : publishingUnavailable
-              ? "Publishing requires a Machine target. Remove Push branch and Open PR steps to use VM."
-              : "Running VM workflows is not available yet."}
+            : "Running VM workflows is not available yet."}
         </WorkflowAlert>
         {recovery}
         {additionalRunError}

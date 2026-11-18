@@ -706,12 +706,7 @@ function WorkflowBuilderEditor({
     edit((draft) => {
       const steps = draft.definition.steps;
       const index = workflowInsertionIndex(steps, anchor);
-      if (
-        index === null ||
-        steps.length >= WORKFLOW_MAX_STEPS ||
-        (draft.definition.target.kind === "vm" && step.kind === "action")
-      )
-        return draft;
+      if (index === null || steps.length >= WORKFLOW_MAX_STEPS) return draft;
       if (repairOpenPrId) {
         const openPr = steps[index];
         if (
@@ -998,7 +993,7 @@ function WorkflowBuilderWorkspace({
     !triggerOpen &&
     !settingsOpen &&
     selected?.kind === "action" &&
-    (issue.stepId === selected.id || !!vm);
+    issue.stepId === selected.id;
   const missingName = !draft.definition.name.trim();
   const invalidStep = draft.definition.steps.find((step) => step.id === issue?.stepId);
   const missingStepPrompt =
@@ -1058,11 +1053,8 @@ function WorkflowBuilderWorkspace({
       : projectsUnavailable
         ? "refresh-checkouts"
         : "close-settings";
-  const hasPublishingSteps = draft.definition.steps.some((step) => step.kind === "action");
   const recoveryField =
-    !projectsUnavailable && !projects.length && canChooseVm && !hasPublishingSteps
-      ? "target:vm"
-      : machineSettingsField;
+    !projectsUnavailable && !projects.length && canChooseVm ? "target:vm" : machineSettingsField;
   const entryFocus = useRef<WorkflowFieldFocus | null>(
     openExecutionSettings
       ? { field: pending ? "close-settings" : recoveryField, stepId: null }
@@ -1075,11 +1067,9 @@ function WorkflowBuilderWorkspace({
       : "No enrolled checkout for this repository.";
   const vmDescription = !canChooseVm
     ? "Turn off automatic triggering before choosing VM."
-    : hasPublishingSteps
-      ? "Publishing requires Machine. Remove publishing steps to use VM."
-      : !vmExecutionAvailable
-        ? "VM runs are unavailable."
-        : "Run in a managed workspace.";
+    : !vmExecutionAvailable
+      ? "VM runs are unavailable."
+      : "Run in a managed workspace.";
   const registerField = useCallback((field: string, node: HTMLElement | null) => {
     if (node) fields.current.set(field, node);
     else fields.current.delete(field);
@@ -1658,7 +1648,7 @@ function WorkflowBuilderWorkspace({
           ) : !projects.length && (machine || (!vmAuthoring && !vm)) ? (
             <p className="text-xs text-muted-foreground">
               {!vmAuthoring ? `${machineDescription} ` : null}
-              {canChooseVm && vmExecutionAvailable && !hasPublishingSteps
+              {canChooseVm && vmExecutionAvailable
                 ? "Choose VM or enroll a checkout to run this workflow."
                 : "Enroll a checkout to run this workflow."}
             </p>

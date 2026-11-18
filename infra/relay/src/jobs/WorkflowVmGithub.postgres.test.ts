@@ -1,3 +1,4 @@
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -8,7 +9,16 @@ import { RelayDb } from "../db.ts";
 import { GithubApp, GithubRequestFailed } from "../tenancy/GithubApp.ts";
 import { Repositories, layer as repositoriesLayer } from "../tenancy/Repositories.ts";
 import { databaseUrl, withDatabase } from "../workflowSources/test-fixture.ts";
-import { recheckWorkflowVmGitHub, resolveWorkflowVmGitHub } from "./WorkflowVmGithub.ts";
+import {
+  type WorkflowVmPublication,
+  observeWorkflowVmPublishing,
+  observeWorkflowVmPublishingCancellation,
+} from "./WorkflowVmPublishing.ts";
+import {
+  observeWorkflowVmGitHub,
+  recheckWorkflowVmGitHub,
+  resolveWorkflowVmGitHub,
+} from "./WorkflowVmGithub.ts";
 
 if (!databaseUrl)
   throw new Error("Workflow VM GitHub tests require WORKFLOW_SOURCES_TEST_DATABASE_URL.");
@@ -217,6 +227,175 @@ describe("Workflow VM GitHub admission (PostgreSQL)", () => {
           }),
         ),
       ),
+    ),
+  );
+
+  it.live("blocks publication preflight for a denied grant and distinguishes a throttle", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* prepare;
+        yield* sql`INSERT INTO relay_github_installations VALUES
+          ('org','42','acme','Organization','admin','now','now')`;
+        const resolve = resolveWorkflowVmGitHub({
+          ...scope,
+          baseBranch: null,
+          publishingSteps: [
+            { id: "push", kind: "action", title: "Push", action: "push" },
+            { id: "pr", kind: "action", title: "Open PR", action: "open_pull_request" },
+          ],
+        });
+        for (const [reason, message] of [
+          [
+            { permissionDenied: true },
+            "Give the organization's GitHub App Contents and Pull requests write access for this workflow, then retry.",
+          ],
+          [{ rateLimited: true }, "Could not verify this repository with GitHub. Try again."],
+        ] as const) {
+          const result = yield* resolve.pipe(
+            Effect.provide(
+              Layer.mock(GithubApp)({
+                resolveRepositoryBranch: () => Effect.succeed({ branch, commitSha }),
+                mintRepositoryToken: (request) => {
+                  expect(request).toEqual({
+                    canonicalKey,
+                    installationId: "42",
+                    access: "workflow-publish",
+                  });
+                  return Effect.fail(
+                    new GithubRequestFailed({
+                      operation: "mint-token",
+                      status: 403,
+                      cause: "GitHub responded 403",
+                      ...reason,
+                    }),
+                  );
+                },
+              }),
+            ),
+            Effect.flip,
+          );
+          expect(result).toMatchObject({ _tag: "WorkflowInvalidError", message });
+        }
+      }),
+    ),
+  );
+
+  it.live("rechecks the pinned installation after a relay-only observation", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* prepare;
+        yield* sql`INSERT INTO relay_github_installations VALUES
+          ('org','42','acme','Organization','admin','now','now')`;
+        const input = {
+          ...scope,
+          installationId: "42",
+          canonicalKey,
+          target: { kind: "branch", branch: "launchpad/job" },
+        } as const;
+        const observed = yield* observeWorkflowVmGitHub(input).pipe(
+          Effect.provide(
+            Layer.mock(GithubApp)({
+              observeWorkflowPublication: (request) => {
+                expect(request).toEqual({
+                  installationId: input.installationId,
+                  canonicalKey,
+                  target: input.target,
+                });
+                return sql`UPDATE relay_github_installations SET installation_id='43'
+                  WHERE organization_id='org'`.pipe(
+                  Effect.orDie,
+                  Effect.as({ kind: "branch" as const, sha: commitSha }),
+                );
+              },
+            }),
+          ),
+          Effect.flip,
+        );
+        expect(observed).toMatchObject({
+          _tag: "WorkflowInvalidError",
+          message: "This repository's GitHub connection changed. Try again.",
+        });
+      }),
+    ),
+  );
+});
+
+describe("workflow VM publishing cancellation", () => {
+  it.live("confirms an existing closed PR with a moved head only for cancellation", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* prepare;
+        yield* sql`INSERT INTO relay_github_installations VALUES
+        ('org','42','acme','Organization','admin','now','now')`;
+        const publication: WorkflowVmPublication = {
+          binding: {
+            ...scope,
+            jobId: "job",
+            threadId: ThreadId.make("workflow:job"),
+            environmentId: EnvironmentId.make("vm"),
+            projectId: ProjectId.make("project"),
+            allocationId: "allocation",
+            operationId: "operation",
+            generation: 1,
+          },
+          canonicalKey,
+          installationId: "42",
+          baseBranch: branch,
+          branch: "launchpad/job",
+          actionId: "pr",
+          stepId: "pr",
+          stepGeneration: 0,
+          operation: "open_pull_request",
+          resultTurnId: "turn",
+          checkpointRef: "refs/t3/result",
+          tree: "a".repeat(40),
+          parent: "b".repeat(40),
+          commitSha,
+          oldRemoteSha: commitSha,
+          outcome: null,
+          pullRequestUrl: null,
+          recoverySource: null,
+        };
+        const url = `https://${canonicalKey}/pull/17`;
+        let calls = 0;
+        const verify = Layer.mock(GithubApp)({
+          observeWorkflowPublication: (input) =>
+            Effect.sync(() => {
+              calls++;
+              expect(input.target).toEqual({ kind: "pull_request", branch: publication.branch });
+              return {
+                kind: "pull_request" as const,
+                pullRequests: [
+                  {
+                    number: 17,
+                    url,
+                    headBranch: publication.branch,
+                    headRepository: "acme/project",
+                    headSha: "c".repeat(40),
+                    baseBranch: branch,
+                    baseRepository: "acme/project",
+                    state: "closed" as const,
+                    body: "<!-- launchpad-workflow-job:job -->",
+                  },
+                ],
+              };
+            }),
+        });
+        expect(
+          yield* observeWorkflowVmPublishing(publication).pipe(Effect.provide(verify)),
+        ).toBeNull();
+        expect(
+          yield* observeWorkflowVmPublishingCancellation(publication).pipe(Effect.provide(verify)),
+        ).toEqual({ commitSha, pullRequestUrl: url });
+        // A recorded identity should survive without read access to the current remote.
+        expect(
+          yield* observeWorkflowVmPublishingCancellation({
+            ...publication,
+            pullRequestUrl: url,
+          }).pipe(Effect.provide(verify)),
+        ).toEqual({ commitSha, pullRequestUrl: url });
+        expect(calls).toBe(2);
+      }),
     ),
   );
 });

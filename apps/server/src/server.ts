@@ -11,6 +11,7 @@ import * as ThreadPreparationReactor from "./orchestration/ThreadPreparationReac
 import * as WorkflowActions from "./jobs/WorkflowActions.ts";
 import * as RepositoryWorkflowRunner from "./jobs/RepositoryWorkflowRunner.ts";
 import { WorkflowVmAttempts } from "./relay/WorkflowVmAttempts.ts";
+import { WorkflowVmPublisher } from "./relay/WorkflowVmPublishing.ts";
 import * as WorkflowRunStore from "./jobs/WorkflowRunStore.ts";
 import * as SetupProcessJournal from "./terminal/SetupProcessJournal.ts";
 import * as SetupProcessAdapter from "./terminal/SetupProcessAdapter.ts";
@@ -459,7 +460,7 @@ const VcsLayerLive = Layer.empty.pipe(
 const CheckpointingLayerLive = Layer.empty.pipe(
   Layer.provideMerge(
     CheckpointDiffQuery.layer.pipe(
-      Layer.provide([WorkflowRunStore.layer, WorkflowVmAttempts.layer]),
+      Layer.provide([WorkflowRunStore.layer, WorkflowVmAttempts.layer, WorkflowVmPublisher.layer]),
     ),
   ),
   Layer.provideMerge(CheckpointStore.layer.pipe(Layer.provide(VcsDriverRegistryLayerLive))),
@@ -578,6 +579,7 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(
     ),
     Layer.provideMerge(WorkflowRunStore.layer),
     Layer.provideMerge(WorkflowVmAttempts.layer),
+    Layer.provideMerge(WorkflowVmPublisher.layer),
     Layer.provideMerge(AntigravityInstallationRefreshLive),
     Layer.provideMerge(ProviderAuthServiceLive),
     Layer.provideMerge(ThreadVmProviderAuth.layer),

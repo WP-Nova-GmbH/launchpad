@@ -23,6 +23,7 @@ import {
   type ThreadVmRestoreClaim,
 } from "./ThreadVmRestoreStore.ts";
 import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
+import { authorizeWorkflowPublishingRestore } from "./WorkflowVmPublishingRecovery.ts";
 
 const conflict = (message: string) => new ThreadVmRestoreConflict({ message });
 
@@ -146,6 +147,14 @@ export function makeThreadVmRestoreServingStore(
     row: Effect.Success<ReturnType<typeof authorize>>,
   ) {
     if (!row.workflowCheckpoint) return true;
+    if (
+      row.workflowJob &&
+      (yield* authorizeWorkflowPublishingRestore(sql, row.workflowJob, {
+        ...row,
+        workflowCheckpoint: row.workflowCheckpoint,
+      }))
+    )
+      return true;
     const response = row.workflowJob
       ? yield* authorizeWorkflowVmCheckpoint(sql, row.workflowJob)
       : null;

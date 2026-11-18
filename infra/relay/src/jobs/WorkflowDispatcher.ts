@@ -4,6 +4,7 @@ import {
   WORKFLOW_PROTOCOL,
   WorkflowInvalidError,
   WorkflowManualControl,
+  WorkflowResultSaving,
   isTerminalWorkflowJob,
   type WorkflowControl,
   type WorkflowControlResult,
@@ -19,6 +20,7 @@ import { RelayDb } from "../db.ts";
 import { readWorkflowVmBinding, workflowVmHasSecrets } from "./WorkflowVmBinding.ts";
 import {
   authorizeWorkflowVmCheckpoint,
+  authorizeWorkflowVmPublishingRetry,
   isWorkflowCheckpointResponse,
   lockWorkflowVmCheckpoint,
   restoreSupersededWorkflowCheckpoint,
@@ -30,11 +32,19 @@ import { blocked, originalAuthority, WorkflowQueued } from "../workflowEvents/Or
 import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntimeConfiguration.ts";
 import { ThreadArtifactObjectStorage } from "../threads/ThreadArtifactObjects.ts";
 import { hasReboundWorkflowCheckpoint } from "../threads/WorkflowVmWorkspace.ts";
-import { makeWorkflowVmRecovery } from "../threads/WorkflowVmRecovery.ts";
+import {
+  makeWorkflowVmRecovery,
+  workflowPublishingCancellationDetail,
+} from "../threads/WorkflowVmRecovery.ts";
+import {
+  releaseWorkflowPublishingRecovery,
+  workflowPublishingCancellationOutcome,
+} from "../threads/WorkflowVmPublishingRecovery.ts";
 import { queueReasonText } from "../workflowSources/IssueContext.ts";
 import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
+import { GithubApp } from "../tenancy/GithubApp.ts";
 import { Repositories } from "../tenancy/Repositories.ts";
 import {
   Workflows,
@@ -43,11 +53,19 @@ import {
   type WorkflowDispatchScope,
 } from "./Workflows.ts";
 import { validateWorkflowTarget, vmWorkflowExecutionUnavailable } from "./WorkflowTarget.ts";
+import {
+  knownWorkflowVmPublishingCancellation,
+  observeWorkflowVmPublishingCancellation,
+  readWorkflowVmPublishCommands,
+  readWorkflowVmPublishing,
+  type WorkflowVmPublication,
+} from "./WorkflowVmPublishing.ts";
 export { validateWorkflowTarget } from "./WorkflowTarget.ts";
 
 const decodeOrigin = Schema.decodeUnknownEffect(WorkflowOrigin);
 
 const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
+const sameResultSaving = Schema.toEquivalence(Schema.UndefinedOr(WorkflowResultSaving));
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 const isWorkflowQueued = Schema.is(WorkflowQueued);
 
@@ -187,6 +205,14 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     }
     let vm: Effect.Success<ReturnType<typeof readWorkflowVmBinding>> | null = null;
     const db = vmRuntime ? yield* Effect.serviceOption(RelayDb) : Option.none();
+    const github = vmRuntime ? yield* Effect.serviceOption(GithubApp) : Option.none();
+    const observePublication = (publication: WorkflowVmPublication) =>
+      Option.isSome(db) && Option.isSome(github)
+        ? observeWorkflowVmPublishingCancellation(publication).pipe(
+            Effect.provideService(RelayDb, db.value),
+            Effect.provideService(GithubApp, github.value),
+          )
+        : Effect.succeed(null);
     if (vmRuntime) {
       if (job.status === "cancelling" && job.vmCancellationConfirmed === true)
         return Option.isSome(preparation)
@@ -208,7 +234,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         const crypto = yield* Effect.serviceOption(Crypto.Crypto);
         if (!vm && Option.isSome(db) && Option.isSome(objects) && Option.isSome(crypto)) {
           const recovered = yield* makeWorkflowVmRecovery(db.value.$client, objects.value)
-            .advance(row!, leaseUntil)
+            .advance(row!, leaseUntil, observePublication)
             .pipe(
               Effect.provideService(Crypto.Crypto, crypto.value),
               Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
@@ -450,7 +476,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           Option.isSome(db) &&
           !(yield* workflowVmHasSecrets(db.value.$client, jobId)));
       if (!(yield* canDeliverControl(row!, pending.userId, memberCanDeliver))) {
-        if (!pending.checkpointDispatch || !checkpointResponse) {
+        if (
+          !pending.checkpointDispatch ||
+          (!checkpointResponse && response.operation !== "retry_action")
+        ) {
           row = yield* withdrawControl(row!, response.operation);
           return row.record;
         }
@@ -530,11 +559,38 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             ? job
             : (yield* withdrawControl(row!, control.operation)).record;
       }
+      if (vm && row!.pendingControl?.responseId && isWorkflowCheckpointResponse(control)) {
+        const progress = job.progress;
+        const reported = capability.workflowResult.progress;
+        const status = control.operation === "input" ? "awaiting_input" : "awaiting_review";
+        if (
+          capability.workflowResult.outcome === "accepted" &&
+          row!.status === status &&
+          progress?.status === status &&
+          reported?.status === status &&
+          progress.revision === control.expectedRevision &&
+          reported.revision === progress.revision &&
+          reported.generation === progress.generation &&
+          progress.checkpoint?.checkpointId === control.checkpointId &&
+          reported.checkpoint?.checkpointId === control.checkpointId
+        ) {
+          // The outbox may change independently of the executor's progress revision.
+          if (!sameResultSaving(progress.resultSaving, reported.resultSaving)) {
+            row = yield* update(row!, {
+              ...job,
+              progress: { ...progress, resultSaving: reported.resultSaving },
+              updatedAt: now,
+            });
+            job = row.record;
+          }
+          if (reported.resultSaving) return job;
+        }
+      }
       if (
         vm &&
         Option.isSome(db) &&
         row!.pendingControl?.responseId &&
-        isWorkflowCheckpointResponse(control)
+        (isWorkflowCheckpointResponse(control) || control.operation === "retry_action")
       ) {
         const sql = db.value.$client;
         const binding = vm.binding;
@@ -544,7 +600,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             const current = yield* lockWorkflowVmCheckpoint(sql, jobId);
             if (current?.revision !== expectedRevision || current.leaseUntil !== leaseUntil)
               return null;
-            const pending = yield* authorizeWorkflowVmCheckpoint(sql, current);
+            const pending =
+              control.operation === "retry_action"
+                ? yield* authorizeWorkflowVmPublishingRetry(sql, current)
+                : yield* authorizeWorkflowVmCheckpoint(sql, current);
             if (!pending) return null;
             const active = yield* readWorkflowVmBinding(sql, binding, "active", true).pipe(
               Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null)),
@@ -659,16 +718,81 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         (reconcilingCheckpoint &&
           outcome.progress.revision === job.progress?.revision &&
           outcome.progress.checkpoint?.checkpointId === job.progress?.checkpoint?.checkpointId);
+      let progress = outcome.progress;
+      let detail = outcome.detail ?? progress.detail;
+      let publicationOutcome = job.publicationOutcome;
+      const activeStep = job.workflow?.definition.steps.find(
+        (step) => step.id === job.progress?.stepId,
+      );
+      if (vm && Option.isSome(db) && progress.status === "cancelled") {
+        const sql = db.value.$client;
+        const actionId =
+          activeStep?.kind === "action"
+            ? `workflow:${jobId}:action:${activeStep.id}:${job.progress?.generation ?? 0}`
+            : undefined;
+        const [running] = yield* sql`SELECT 1 FROM relay_workflow_vm_publish_commands
+          WHERE job_id=${jobId} AND stopped_at IS NULL`.pipe(
+          Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+        );
+        if (running) return job;
+        const publication = yield* readWorkflowVmPublishing(sql, jobId, actionId).pipe(
+          Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+        );
+        if (publication) {
+          const commands = actionId
+            ? yield* readWorkflowVmPublishCommands(sql, jobId, actionId).pipe(
+                Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+              )
+            : [];
+          const possiblyDelivered = commands.some((command) => !command.rejected);
+          const observed =
+            knownWorkflowVmPublishingCancellation(publication) ??
+            (possiblyDelivered ? yield* observePublication(publication) : null);
+          if (observed && !publication.outcome && publication.operation === "push")
+            yield* sql`UPDATE relay_workflow_vm_publications SET record=record || ${sql.json({ outcome: observed })}
+              WHERE job_id=${jobId} AND action_id=${publication.actionId} AND record->'outcome'='null'::jsonb`.pipe(
+              Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+            );
+          detail =
+            workflowPublishingCancellationDetail(
+              publication.operation,
+              observed,
+              possiblyDelivered,
+            ) ?? detail;
+          publicationOutcome = yield* workflowPublishingCancellationOutcome(
+            sql,
+            jobId,
+            publication,
+            observed,
+            possiblyDelivered,
+          ).pipe(Effect.mapError((cause) => new WorkflowPersistenceError({ cause })));
+          progress = {
+            ...progress,
+            detail,
+            pullRequestUrl: observed?.pullRequestUrl ?? progress.pullRequestUrl ?? null,
+          };
+        }
+      }
       const next: RepositoryWorkflowJob = {
         ...job,
-        progress: outcome.progress,
+        progress,
         ...(vm ? { queueReason: null } : {}),
         pendingManualControl: keepPending ? job.pendingManualControl : null,
-        status: outcome.progress.status,
-        detail: outcome.detail ?? outcome.progress.detail,
+        status: progress.status,
+        detail,
+        ...(publicationOutcome ? { publicationOutcome } : {}),
         updatedAt: now,
       };
       row = yield* update(row!, next, keepPending ? row!.pendingControl : null, false);
+      if (
+        vm &&
+        Option.isSome(db) &&
+        isTerminalWorkflowJob(row.record.status) &&
+        row.record.progress?.executionReleased
+      )
+        yield* releaseWorkflowPublishingRecovery(db.value.$client, row.jobId).pipe(
+          Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+        );
       return row.record;
     }
     if (outcome.protocol >= 2 && outcome.outcome === "cancelled") {

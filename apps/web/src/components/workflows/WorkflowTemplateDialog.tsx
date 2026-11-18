@@ -11,7 +11,7 @@ import {
   DialogTitle,
 } from "../ui/dialog";
 import { WorkflowAlert } from "./WorkflowAlert";
-import { workflowTemplateNeedsCheckout, type WorkflowTemplate } from "./workflowState";
+import type { WorkflowTemplate } from "./workflowState";
 
 const templates = [
   { id: "review", title: "Agent and review", steps: "Agent → Review changes" },
@@ -79,8 +79,7 @@ export function WorkflowTemplateDialog({
   const [selected, setSelected] = useState<WorkflowTemplate>("review");
   const groupId = useId();
   const checkoutHintId = useId();
-  const canUse = (template: WorkflowTemplate) =>
-    hasMachineCheckout || !workflowTemplateNeedsCheckout(template, vmAuthoring);
+  const canUse = hasMachineCheckout || vmAuthoring;
 
   return (
     <Dialog
@@ -109,8 +108,8 @@ export function WorkflowTemplateDialog({
                   name={groupId}
                   value={id}
                   checked={selected === id}
-                  disabled={!canUse(id)}
-                  aria-describedby={!canUse(id) ? checkoutHintId : undefined}
+                  disabled={!canUse}
+                  aria-describedby={!canUse ? checkoutHintId : undefined}
                   className="mt-1 size-3.5 shrink-0 accent-primary"
                   onChange={() => setSelected(id)}
                 />
@@ -121,7 +120,7 @@ export function WorkflowTemplateDialog({
               </label>
             ))}
           </fieldset>
-          {!hasMachineCheckout ? (
+          {!canUse ? (
             <div id={checkoutHintId}>
               <WorkflowAlert
                 title={
@@ -166,7 +165,7 @@ export function WorkflowTemplateDialog({
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button disabled={busy || !canUse(selected)} onClick={() => onCreate(selected)}>
+          <Button disabled={busy || !canUse} onClick={() => onCreate(selected)}>
             Create draft
           </Button>
         </DialogFooter>

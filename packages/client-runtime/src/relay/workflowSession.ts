@@ -509,18 +509,6 @@ export function hasUnsavedWorkflowWork(state: WorkflowDraftState) {
 
 /** Validate unmounted steps too; the selected inspector's DOM is not the definition. */
 export function workflowDraftIssue(definition: WorkflowDefinition) {
-  const publishing =
-    definition.target.kind === "vm"
-      ? definition.steps.find((step) => step.kind === "action")
-      : undefined;
-  if (publishing)
-    return {
-      message:
-        "Publishing requires a Machine target. Remove Push branch and Open PR steps to use VM.",
-      stepId: publishing.id,
-      field: "title",
-      publishing: true,
-    };
   if (Exit.isSuccess(decodeWorkflowDefinition(definition))) return null;
   if (!definition.name.trim())
     return { message: "Give this workflow a name.", stepId: null, field: "name" };

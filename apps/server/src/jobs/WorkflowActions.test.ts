@@ -4,14 +4,37 @@ import { CheckpointRef, GitCommandError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
+import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
+import { GitManager } from "../git/GitManager.ts";
+import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
+import { WorkflowReviewGitDirectory } from "../vcs/WorkflowReviewGitDirectory.ts";
+import { VmCoordinatorProcess } from "../vmWorkloadCommand.ts";
 
 import * as ServerConfig from "../config.ts";
-import { CurrentWorkflowCommand } from "../processRunner.ts";
+import {
+  CurrentWorkflowCommand,
+  make as makeProcessRunner,
+  ProcessRunner,
+  ProcessSpawnError,
+  type ProcessRunOutput,
+} from "../processRunner.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
-import { readWorkflowHead, readWorkflowTree } from "./WorkflowActions.ts";
-import { baseCommit, commitAt, harness, id } from "./WorkflowActions.test-fixture.ts";
-import { WorkflowRunStore } from "./WorkflowRunStore.ts";
+import {
+  make as makeActions,
+  readWorkflowHead,
+  readWorkflowTree,
+  WorkflowActionError,
+  type WorkflowActionIO,
+} from "./WorkflowActions.ts";
+import { baseCommit, commitAt, harness, id, initial } from "./WorkflowActions.test-fixture.ts";
+import { type WorkflowRun, WorkflowRunStore } from "./WorkflowRunStore.ts";
+
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const realGitLayer = GitVcsDriver.layer.pipe(
   Layer.provide(
@@ -366,21 +389,44 @@ it.effect("resumes VM publishing only with a matching saved checkpoint object", 
       "no-rules",
       "ready",
     ] as const) {
-      const h = yield* harness("none", undefined, (input) =>
-        mode === "missing-object" && input.args.at(-1) === "saved-commit^{tree}"
-          ? Effect.fail(
-              new GitCommandError({
-                operation: input.operation,
-                command: "git",
-                cwd: input.cwd,
-                exitCode: 128,
-                detail: "Missing checkpoint object",
-              }),
-            )
-          : undefined,
+      let protectedCalls = 0;
+      const h = yield* harness(
+        "none",
+        undefined,
+        (input) =>
+          mode === "missing-object" && input.args.at(-1) === "saved-commit^{tree}"
+            ? Effect.fail(
+                new GitCommandError({
+                  operation: input.operation,
+                  command: "git",
+                  cwd: input.cwd,
+                  exitCode: 128,
+                  detail: "Missing checkpoint object",
+                }),
+              )
+            : undefined,
+        undefined,
+        true,
       ).pipe(
+        Effect.provideService(ProcessRunner, {
+          run: () =>
+            Effect.flatMap(
+              Effect.sync(() => {
+                protectedCalls++;
+              }),
+              () =>
+                Effect.fail(
+                  new ProcessSpawnError({
+                    command: "git",
+                    argumentCount: 0,
+                    cause: "Protected worker offline",
+                  }),
+                ),
+            ),
+        }),
         Effect.provideService(WorkflowRunStore, {
           ...store,
+          isVmFenceActive: () => Effect.succeed(true),
           getWorkflowIgnoreRules: () =>
             Effect.succeed(mode === "no-rules" ? null : new Uint8Array()),
           getCheckpointPinForRun: (binding, turnId, checkpointRef) =>
@@ -418,19 +464,35 @@ it.effect("resumes VM publishing only with a matching saved checkpoint object", 
           ...(mode === "legacy" ? {} : { checkpointTurnId: "turn" }),
         })),
       }));
-      if (mode === "ready") {
-        yield* h.actions.execute(id, h.io);
-        assert.deepEqual(h.counts(), { commits: 1, pushes: 1 });
-      } else {
-        const result = yield* Effect.flip(h.actions.execute(id, h.io));
-        assert.match(
-          result.message,
-          mode === "no-rules"
+      const io: WorkflowActionIO = {
+        ...h.io,
+        vmPublishing: {
+          credential: () =>
+            Effect.succeed({
+              token: Redacted.make("synthetic-read"),
+              bot: { name: "App", email: "app@example.test" },
+            }),
+          retain: () => Effect.die("unused"),
+          recoverCommit: () => Effect.die("unused"),
+          arm: () => Effect.die("unused"),
+          stop: () => Effect.die("unused"),
+          settle: () => Effect.die("unused"),
+        },
+      };
+      const result = yield* Effect.flip(
+        h.actions
+          .execute(id, io)
+          .pipe(Effect.provideService(WorkflowReviewGitDirectory, "/protected")),
+      );
+      const expected =
+        mode === "ready"
+          ? /Failed to spawn process/
+          : mode === "no-rules"
             ? /saved workflow Git ignore rules are unavailable/
-            : /saved workflow VM result is unavailable/,
-        );
-        assert.deepEqual(h.counts(), { commits: 0, pushes: 0 });
-      }
+            : /saved workflow VM result is unavailable/;
+      assert.match(result.message, expected);
+      assert.equal(protectedCalls, mode === "ready" ? 1 : 0);
+      assert.deepEqual(h.counts(), { commits: 0, pushes: 0 });
     }
   }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -492,6 +554,72 @@ it.effect("blocks unconfirmed ownership until recovery proves stopping", () =>
     assert.isFalse((yield* h.io.read).actions![0]!.commands[0]!.stopped);
     h.recoverAfterBoot();
     assert.isTrue(yield* h.actions.recover(h.io));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+it.effect("retries a lost VM stop acknowledgement without stopping the command again", () =>
+  Effect.gen(function* () {
+    const h = yield* harness("ownership");
+    const commandId = "remote-push";
+    yield* h.io.update((run) => ({
+      ...run,
+      runtime: {
+        ...run.runtime,
+        kind: "vm",
+        jobId: run.jobId,
+        threadId: run.progress.threadId,
+        organizationId: run.workflow.organizationId,
+        repositoryId: run.workflow.repositoryId,
+        allocationId: "vm",
+        operationId: "operation",
+        generation: 1,
+      },
+      actions: [
+        {
+          ...run.actions![0]!,
+          state: "uncertain",
+          phase: "push",
+          commands: [
+            {
+              id: commandId,
+              phase: "push",
+              pid: 42,
+              identity: "birth",
+              boot: null,
+              stopped: true,
+              code: 0,
+            },
+          ],
+        },
+      ],
+    }));
+    let deliveries = 0;
+    const io: WorkflowActionIO = {
+      ...h.io,
+      vmPublishing: {
+        credential: () => Effect.die("unused"),
+        retain: () => Effect.die("unused"),
+        recoverCommit: () => Effect.die("unused"),
+        arm: () => Effect.die("unused"),
+        stop: (action, command) =>
+          Effect.suspend(() => {
+            assert.deepEqual([action, command], [id, commandId]);
+            return ++deliveries === 1
+              ? Effect.fail(new WorkflowActionError({ message: "Stop acknowledgement lost" }))
+              : Effect.void;
+          }),
+        settle: () => Effect.die("unused"),
+      },
+    };
+    const readStop = io.read.pipe(Effect.map((run) => run.actions![0]!.commands[0]!));
+
+    assert.match((yield* Effect.flip(h.actions.recover(io))).message, /acknowledgement lost/);
+    const stopped = yield* readStop;
+    assert.isTrue(stopped.stopped);
+    assert.isUndefined(stopped.relayStopAcknowledged);
+    assert.isTrue(yield* h.actions.recover(io));
+    assert.isTrue((yield* readStop).relayStopAcknowledged);
+    assert.isTrue(yield* h.actions.recover(io));
+    assert.equal(deliveries, 2);
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 it.effect("does not begin Push when Cancel arrives during commit", () =>
@@ -618,3 +746,395 @@ for (const fault of ["commit-reply", "push-reply", "pr-reply"] as const)
       );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+it.effect(
+  "recovers a lost VM Push and recognizes the recorded GitHub PR without creating it twice",
+  () =>
+    Effect.gen(function* () {
+      const { base, cwd, fs, driver, git } = yield* makeRealGit();
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "workflow-vm-publish-" });
+      const protectedDir = `${root}/review.git`;
+      const restoredDir = `${root}/restored.git`;
+      const repeatedPushDir = `${root}/repeat-restored.git`;
+      const process = yield* makeProcessRunner();
+      const branch = "launchpad/job";
+      const ref = `refs/heads/${branch}`;
+      const checkedGit = (workdir: string, args: ReadonlyArray<string>) =>
+        process.run({ cwd: workdir, command: "git", args }).pipe(
+          Effect.map((output) => {
+            assert.equal(output.code, 0, output.stderr);
+            return output.stdout.trim();
+          }),
+        );
+      yield* git(["checkout", "-b", branch]);
+      yield* checkedGit(root, ["clone", "--bare", cwd, protectedDir]);
+      yield* fs.writeFileString(`${cwd}/history-only.txt`, "synthetic intermediate data\n");
+      yield* git(["add", "."]);
+      yield* git(["commit", "-m", "agent intermediate commit"]);
+      const agentHead = yield* git(["rev-parse", "HEAD"]);
+      yield* fs.remove(`${cwd}/history-only.txt`);
+      yield* fs.writeFileString(`${cwd}/result.txt`, "saved result\n");
+      yield* git(["add", "."]);
+      const tree = yield* git(["write-tree"]);
+      const checkpoint = yield* git(["commit-tree", tree, "-p", base, "-m", "private checkpoint"]);
+      yield* git(["update-ref", "refs/t3/checkpoint", checkpoint]);
+      yield* checkedGit(protectedDir, ["fetch", cwd, "refs/t3/checkpoint:refs/t3/checkpoint"]);
+      yield* checkedGit(root, ["clone", "--bare", protectedDir, restoredDir]);
+      yield* checkedGit(restoredDir, [
+        "fetch",
+        protectedDir,
+        "refs/t3/checkpoint:refs/t3/checkpoint",
+      ]);
+      yield* checkedGit(root, ["clone", "--bare", restoredDir, repeatedPushDir]);
+      const hook = `${cwd}/.git/hooks/pre-commit`;
+      yield* fs.writeFileString(
+        hook,
+        '#!/bin/sh\ntest -z "${GIT_CONFIG_VALUE_0:-}${GH_TOKEN:-}" || exit 73\nprintf called >> .git/hook-calls\n',
+      );
+      yield* fs.chmod(hook, 0o755);
+
+      const original = initial();
+      const vmRuntime = {
+        ...original.runtime,
+        kind: "vm" as const,
+        jobId: original.jobId,
+        threadId: original.progress.threadId,
+        organizationId: original.workflow.organizationId,
+        repositoryId: original.workflow.repositoryId,
+        allocationId: "allocation",
+        operationId: "operation",
+        generation: 1,
+      };
+      let state: WorkflowRun = {
+        ...original,
+        runtime: vmRuntime,
+        baseSha: base,
+        jobBranchPrefix: "launchpad",
+        worktreePath: cwd,
+        preparedHead: agentHead,
+        userId: null,
+        origin: {
+          kind: "automation",
+          organizationId: original.workflow.organizationId,
+          repositoryId: original.workflow.repositoryId,
+          workflowId: original.workflow.workflowId,
+          occurrenceId: "linear-event",
+          source: {
+            provider: "linear",
+            applicationId: "linear-app",
+            workspaceId: "workspace",
+            connectionId: "linear",
+            grantId: "repository-grant",
+          },
+        },
+        actions: [{ ...original.actions![0]!, parent: agentHead, tree, checkpointTurnId: "turn" }],
+      };
+      let remote: string | null = null;
+      let retained: { readonly sha: string; readonly object: Uint8Array } | null = null;
+      let pullCreated = false;
+      let prHead!: string;
+      let pushCount = 0;
+      let prCount = 0;
+      let prAttempts = 0;
+      let prTokens = 0;
+      const rejected = new Set<string>();
+      const recoveredActions: string[] = [];
+      const events: string[] = [];
+      const prUrl = "https://github.com/Acme/Repo/pull/1";
+      const bot = { name: "app[bot]", email: "123+app[bot]@users.noreply.github.com" };
+      const io: WorkflowActionIO = {
+        read: Effect.sync(() => state),
+        update: (change) => Effect.sync(() => (state = change(state))),
+        vmPublishing: {
+          credential: (_, scope) =>
+            Effect.sync(() => ({
+              bot,
+              token: Redacted.make(
+                scope === "open_pull_request"
+                  ? `synthetic-${scope}-${++prTokens}`
+                  : `synthetic-${scope}`,
+              ),
+            })),
+          canCreatePull: (actionId) =>
+            Effect.sync(
+              () =>
+                state.actions
+                  ?.find((action) => action.actionId === actionId)
+                  ?.commands.every((command) => command.pid === null || rejected.has(command.id)) ??
+                false,
+            ),
+          rejectPullAuthorization: (actionId, commandId) =>
+            Effect.sync(() => {
+              const command = state.actions
+                ?.find((action) => action.actionId === actionId)
+                ?.commands.find((command) => command.id === commandId);
+              assert.isTrue(command?.stopped);
+              assert.equal(command?.code, 0);
+              rejected.add(commandId);
+              events.push("rejected-credential");
+            }),
+          recordPull: (_, url) =>
+            Effect.sync(() => {
+              assert.equal(url, prUrl);
+              events.push("record-pr");
+            }),
+          retain: (_, commit) =>
+            Effect.sync(() => {
+              events.push("retain");
+              retained = commit;
+            }),
+          recoverCommit: (actionId, sha) =>
+            Effect.sync(() => {
+              recoveredActions.push(actionId);
+              return retained?.sha === sha ? retained.object : null;
+            }),
+          arm: (_, command) =>
+            Effect.sync(() => {
+              assert.equal(command.pid, 84);
+              assert.equal(command.identity, "native-identity");
+              events.push("arm");
+            }),
+          stop: () =>
+            Effect.sync(() => {
+              events.push("stop");
+            }),
+          settle: (_, result) =>
+            Effect.sync(() => {
+              assert.equal(result.commitSha, remote);
+              events.push(result.pullRequestUrl ? "settle-pr" : "settle-push");
+            }),
+        },
+      };
+      const result = (stdout: string): ProcessRunOutput => ({
+        stdout,
+        stderr: "",
+        code: ChildProcessSpawner.ExitCode(0),
+        timedOut: false,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        stdoutInvalidUtf8: false,
+        stderrInvalidUtf8: false,
+      });
+      const network: ProcessRunner["Service"] = {
+        run: (input) =>
+          Effect.gen(function* () {
+            assert.isTrue(yield* VmCoordinatorProcess);
+            if (input.args.includes("ls-remote"))
+              return result(remote ? `${remote}\t${ref}\n` : "");
+            const isPush = input.args.includes("push");
+            if (isPush || input.command === "/usr/bin/curl") {
+              assert.isFalse(input.args.join(" ").includes("synthetic-"));
+              const isPost = input.args.includes("POST");
+              if (isPush || isPost) {
+                assert.exists(input.owner);
+                yield* input.owner!.capture(84);
+                yield* input.owner!.arm;
+              }
+              if (isPush) {
+                assert.ok(retained);
+                assert.include(input.args, `--force-with-lease=${ref}:`);
+                assert.equal(input.args.at(-1), `${retained.sha}:${ref}`);
+                assert.equal(input.cwd, protectedDir);
+                events.push("remote-push");
+                pushCount++;
+                remote = retained.sha;
+                yield* input.owner!.completed(0);
+                yield* input.owner!.stop;
+                return yield* new ProcessSpawnError({
+                  command: "git",
+                  argumentCount: 0,
+                  cause: "Lost response",
+                });
+              }
+              const receipt = {
+                number: 1,
+                html_url: prUrl,
+                state: "open",
+                merged_at: null,
+                body: "<!-- launchpad-workflow-job:job -->",
+                base: { ref: "main", repo: { full_name: "acme/repo" } },
+                head: { ref: branch, sha: prHead, repo: { full_name: "acme/repo" } },
+              };
+              if (isPost) {
+                prAttempts++;
+                assert.include(input.stdin ?? "", `synthetic-open_pull_request-${prAttempts}`);
+                yield* input.owner!.completed(0);
+                yield* input.owner!.stop;
+                if (prAttempts === 1) return result("{}\n401");
+                assert.equal(rejected.size, 1);
+                prCount++;
+                pullCreated = true;
+                return result(`${encodeJson(receipt)}\n201`);
+              }
+              const list = input.args.at(-1)?.includes("?");
+              return result(`${encodeJson(list ? (pullCreated ? [receipt] : []) : receipt)}\n200`);
+            }
+            return yield* process.run(input);
+          }),
+      };
+      const store = yield* WorkflowRunStore;
+      const owner = {
+        commandLauncher: Effect.succeed("native-coordinator"),
+        host: Effect.succeed(null),
+        inspect: () =>
+          Effect.succeed({
+            protocol: 4 as const,
+            identity: "native-identity",
+            owned: true,
+            fullStop: false,
+            boot: null,
+          }),
+        arm: () => Effect.succeed("git"),
+        stop: () => Effect.void,
+      };
+      const actions = yield* makeActions.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(GitVcsDriver.GitVcsDriver, driver),
+            Layer.succeed(ProcessRunner, network),
+            Layer.succeed(WorkflowRunStore, {
+              ...store,
+              isVmFenceActive: () => Effect.succeed(true),
+              getWorkflowIgnoreRules: () => Effect.succeed(new Uint8Array()),
+              getCheckpointPinForRun: () =>
+                Effect.succeed({
+                  checkpointRef: "refs/review",
+                  commitId: checkpoint,
+                  treeId: tree,
+                  baselineCommitId: base,
+                }),
+            }),
+            Layer.mock(RepositoryAccess)({
+              withFence: (effect) => effect,
+              requireWorkflowProject: () => Effect.die("VM publishing must use its runtime fence"),
+            }),
+            Layer.mock(SetupProcessAdapter)({ ...owner, vmPublishing: owner }),
+            Layer.mock(CheckpointStore)({
+              captureCheckpoint: () => Effect.succeed({ commitId: checkpoint, treeId: tree }),
+              resolvePinnedTree: () => Effect.succeed(tree),
+              deleteCheckpointRefs: () => Effect.void,
+            }),
+            Layer.mock(GitManager)({
+              prepareWorkflowCommit: () => Effect.succeed({ subject: "Save result", body: "" }),
+              prepareWorkflowPullRequest: () =>
+                Effect.succeed({ title: "Save result", body: "Details" }),
+            }),
+          ),
+        ),
+      );
+      const execute = (actionId: string, directory = protectedDir) =>
+        actions
+          .execute(actionId, io)
+          .pipe(Effect.provideService(WorkflowReviewGitDirectory, directory));
+      yield* Effect.flip(execute(id));
+      const published = retained!.sha;
+      assert.equal(remote, published);
+      assert.deepEqual(events.slice(0, 4), ["retain", "arm", "remote-push", "stop"]);
+      assert.equal(yield* fs.readFileString(`${cwd}/.git/hook-calls`), "called");
+      // Restore the checkout from before the hook and use a protected repository whose object store lacks the Push commit.
+      yield* git(["update-ref", ref, agentHead]);
+      yield* execute(id, restoredDir);
+      assert.equal(pushCount, 1);
+      assert.deepEqual(recoveredActions, [id]);
+      assert.equal(yield* git(["rev-parse", "HEAD"]), published);
+      assert.equal(yield* git(["show", "-s", "--format=%P", "HEAD"]), base);
+      assert.equal(yield* fs.readFileString(`${cwd}/.git/hook-calls`), "called");
+      assert.equal(state.actions![0]!.state, "completed");
+      assert.include(events, "settle-push");
+
+      state = {
+        ...state,
+        actions: [
+          ...state.actions!,
+          {
+            ...state.actions![0]!,
+            actionId: "pr",
+            stepId: "pr",
+            operation: "open_pull_request",
+            state: "running",
+            phase: "prepare",
+            parent: published,
+            commitSha: null,
+            commands: [],
+          },
+        ],
+      };
+      prHead = "3".repeat(40);
+      const mismatch = yield* Effect.flip(execute("pr", restoredDir));
+      assert.match(mismatch.message, /pull request head changed/i);
+      assert.equal(state.publication!.pullRequestUrl, prUrl);
+      assert.notEqual(state.actions![1]!.state, "completed");
+
+      const setSavedPull = (pullRequestUrl: string) =>
+        io.update((run) => ({ ...run, publication: { ...run.publication!, pullRequestUrl } }));
+      prHead = published;
+      for (const invalid of [
+        "https://github.com/other/repo/pull/1",
+        "https://github.com/acme/repo/PULL/1",
+      ]) {
+        yield* setSavedPull(invalid);
+        const invalidReceipt = yield* Effect.flip(execute("pr", restoredDir));
+        assert.match(invalidReceipt.message, /recorded PR no longer matches/i);
+      }
+
+      yield* setSavedPull(prUrl.toLowerCase());
+      prHead = "3".repeat(40);
+      const changedHead = yield* Effect.flip(execute("pr", restoredDir));
+      assert.match(changedHead.message, /pull request head changed/i);
+      assert.notInclude(events, "settle-pr");
+
+      yield* setSavedPull(prUrl.toLowerCase());
+      prHead = published;
+      yield* execute("pr", restoredDir);
+      assert.equal(prCount, 1);
+      assert.equal(prAttempts, 2);
+      assert.equal(prTokens, 2);
+      assert.include(events, "rejected-credential");
+      assert.include(events, "record-pr");
+      assert.equal(state.actions![1]!.state, "completed");
+      assert.include(events, "settle-pr");
+
+      const beginNoopPush = (actionId: string, parent: string, checkpointTurnId: string) => {
+        state = {
+          ...state,
+          actions: [
+            ...state.actions!,
+            {
+              ...state.actions![0]!,
+              actionId,
+              checkpointTurnId,
+              parent,
+              oldRemoteSha: published,
+              state: "running",
+              phase: "prepare",
+              commitSha: null,
+              commands: [],
+            },
+          ],
+        };
+      };
+
+      // The next Push of the same result restores the disk from before the first Push.
+      yield* git(["update-ref", ref, agentHead]);
+      beginNoopPush("repeat-push", published, "turn");
+      yield* execute("repeat-push", repeatedPushDir);
+      assert.deepEqual(recoveredActions, [id, id]);
+      assert.equal(pushCount, 1);
+      assert.equal(yield* git(["rev-parse", "HEAD"]), published);
+      assert.equal(yield* fs.readFileString(`${cwd}/result.txt`), "saved result\n");
+      assert.equal(yield* fs.readFileString(`${cwd}/.git/hook-calls`), "called");
+      assert.equal(state.actions!.at(-1)?.state, "completed");
+
+      // A new Agent can yield the same tree with a different checkpoint and local commit.
+      // It must use its own local parent, even when the previous Push committed that tree.
+      const nextAgentHead = yield* git(["commit-tree", tree, "-p", published, "-m", "new Agent"]);
+      yield* git(["update-ref", ref, nextAgentHead]);
+      beginNoopPush("next-agent-push", nextAgentHead, "new-turn");
+      yield* execute("next-agent-push", restoredDir);
+      assert.deepEqual(recoveredActions, [id, id]);
+      assert.equal(pushCount, 1);
+      assert.equal(yield* git(["rev-parse", "HEAD"]), published);
+      assert.equal(yield* fs.readFileString(`${cwd}/result.txt`), "saved result\n");
+      assert.equal(state.actions!.at(-1)?.state, "completed");
+    }).pipe(Effect.provide(realGitLayer)),
+);

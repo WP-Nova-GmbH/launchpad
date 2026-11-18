@@ -56,6 +56,9 @@ import {
   WorkflowRecoveryManifest,
   WorkflowSavedResult,
   WorkflowSaveReceipt,
+  WorkflowVmPublishingRequest,
+  WorkflowVmPublishingResponse,
+  WorkflowVmPublishingRestore,
 } from "./workflows.ts";
 import {
   RepositoryPolicyProof,
@@ -2087,6 +2090,7 @@ export const RelayThreadVmSetupInput = Schema.Struct({
       organizationId: RelayOrganizationId,
       installationId: TrimmedNonEmptyString,
       baseBranch: TrimmedNonEmptyString.check(Schema.isMaxLength(255)),
+      workflowPublishing: Schema.optionalKey(Schema.Literal(true)),
     }),
   ),
 });
@@ -3339,6 +3343,7 @@ export const RelayThreadVmRestoreRecovery = Schema.Struct({
       manifestArtifactId: RelayThreadArtifactId,
       binding: WorkflowVmDispatchBinding,
       sourceSequence: NonNegativeInt,
+      publishing: Schema.optionalKey(WorkflowVmPublishingRestore),
     }),
   ),
 }).check(
@@ -3708,6 +3713,16 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
         params: RelayThreadOwnerParams,
         payload: Schema.Struct(RelayThreadGeneration),
         success: RelayThreadVmRepositoryBinding,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "workflowVmPublishing",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/publishing",
+      {
+        params: RelayThreadOwnerParams,
+        payload: WorkflowVmPublishingRequest,
+        success: WorkflowVmPublishingResponse,
         error: RelayTenancyErrors,
       },
     ),

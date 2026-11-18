@@ -13,7 +13,7 @@ const principal = {
 };
 const path = "/v1/environments/vm-env/threads/private-thread";
 describe("thread VM credential HTTP boundary", () => {
-  it.each(["attempt", "review-secrets"])(
+  it.each(["attempt", "review-secrets", "publishing"])(
     "permits workflow %s only for the assigned thread",
     (action) => {
       const workflowThreadId = ThreadId.make(`workflow:${"a".repeat(64)}`);
@@ -38,6 +38,7 @@ describe("thread VM credential HTTP boundary", () => {
   );
 
   it("permits only the assigned thread's command/history/work protocol", () => {
+    expect(threadVmCredentialAllows(principal, "POST", path + "/workflow/publishing")).toBe(false);
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/github")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/codex")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/provider-auth/source")).toBe(true);

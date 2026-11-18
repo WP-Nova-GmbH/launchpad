@@ -1,8 +1,12 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
-import { WorkflowInvalidError } from "@t3tools/contracts/workflows";
+import { WorkflowInvalidError, type WorkflowStep } from "@t3tools/contracts/workflows";
 import * as Effect from "effect/Effect";
 import { RelayDb } from "../db.ts";
-import { GithubApp, type GithubRequestFailed } from "../tenancy/GithubApp.ts";
+import {
+  GithubApp,
+  type GithubRequestFailed,
+  type GithubWorkflowPublicationTarget,
+} from "../tenancy/GithubApp.ts";
 
 type RepositoryScope = { readonly organizationId: string; readonly repositoryId: string };
 
@@ -19,6 +23,7 @@ const bindingChanged = () => invalid("This repository's GitHub connection change
 const githubRepositoryKey = "^github[.]com/[a-zA-Z0-9-]+/[a-zA-Z0-9_.-]+$";
 
 function gitHubReadFailure(error: GithubRequestFailed) {
+  if (error.rateLimited) return tryAgain();
   const { status } = error;
   if (error.operation === "read-branch" && (status === 404 || status === 409 || status === 422))
     return invalid("Choose an existing GitHub base branch with at least one commit.");
@@ -60,7 +65,10 @@ export const selectWorkflowVmGitHubBinding = Effect.fnUntraced(function* (
 });
 
 export const resolveWorkflowVmGitHub = Effect.fn("WorkflowVmGitHub.resolve")(function* (
-  input: RepositoryScope & { readonly baseBranch: string | null },
+  input: RepositoryScope & {
+    readonly baseBranch: string | null;
+    readonly publishingSteps?: readonly WorkflowStep[];
+  },
 ) {
   const sql = (yield* RelayDb).$client;
   const binding = yield* selectWorkflowVmGitHubBinding(sql, input, false);
@@ -80,6 +88,34 @@ export const resolveWorkflowVmGitHub = Effect.fn("WorkflowVmGitHub.resolve")(fun
       }),
       Effect.timeoutOrElse({ duration: "6 seconds", orElse: tryAgain }),
     );
+  const openPr = input.publishingSteps?.some(
+    (step) => step.kind === "action" && step.action === "open_pull_request",
+  );
+  const push = input.publishingSteps?.some(
+    (step) => step.kind === "action" && step.action === "push",
+  );
+  if (openPr || push) {
+    const access = openPr ? (push ? "workflow-publish" : "workflow-pr") : "workflow-push";
+    yield* github.mintRepositoryToken({ ...binding, access }).pipe(
+      Effect.catchTags({
+        GithubAppNotConfigured: () => invalid("Configure the GitHub App in Organization settings."),
+        GithubRequestFailed: (error) => {
+          if (error.permissionDenied)
+            return invalid(
+              openPr
+                ? "Give the organization's GitHub App Contents and Pull requests write access for this workflow, then retry."
+                : "Give the organization's GitHub App Contents write access for this workflow, then retry.",
+            );
+          if (!error.rateLimited && error.status === 404)
+            return invalid(
+              "Give the organization's GitHub App access to this repository, then retry.",
+            );
+          return tryAgain();
+        },
+      }),
+      Effect.timeoutOrElse({ duration: "6 seconds", orElse: tryAgain }),
+    );
+  }
   return {
     ...binding,
     ...resolved,
@@ -105,4 +141,23 @@ export const recheckWorkflowVmGitHub = Effect.fnUntraced(function* (
     binding.installationId !== expected.installationId
   )
     return yield* bindingChanged();
+});
+
+/** Reconciliation uses the pinned App binding even after the guest is gone. */
+export const observeWorkflowVmGitHub = Effect.fn("WorkflowVmGitHub.observePublication")(function* (
+  input: RepositoryScope &
+    Pick<WorkflowVmGitHubResolution, "canonicalKey" | "installationId"> & {
+      readonly target: GithubWorkflowPublicationTarget;
+    },
+) {
+  const sql = (yield* RelayDb).$client;
+  const recheck = sql.withTransaction(recheckWorkflowVmGitHub(sql, input, input));
+  yield* recheck;
+  const observed = yield* (yield* GithubApp).observeWorkflowPublication({
+    installationId: input.installationId,
+    canonicalKey: input.canonicalKey,
+    target: input.target,
+  });
+  yield* recheck;
+  return observed;
 });

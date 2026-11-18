@@ -258,6 +258,27 @@ describe("Workflow step editing", () => {
     expect(JSON.stringify(renderer!.toJSON())).not.toContain("Machine checkout unavailable");
   });
 
+  it("offers to repair an Open PR step on a VM without a Machine checkout", async () => {
+    await mount({
+      initial: {
+        ...original,
+        target: { kind: "vm", baseBranch: null },
+        steps: [
+          original.steps[0]!,
+          { id: "pr", kind: "action", title: "Open PR", action: "open_pull_request" },
+        ],
+      },
+      selection: "pr",
+      machineCheckoutAvailable: false,
+    });
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Push branch step required");
+    expect(
+      renderer!.root
+        .findAllByType("button")
+        .some((button) => button.children.includes("Add Push branch")),
+    ).toBe(true);
+  });
+
   it("keeps an unavailable VM model visible and allows returning to the managed default", async () => {
     const current = original.steps[1]!;
     if (current.kind !== "agent") throw new Error("Expected the Agent step fixture.");

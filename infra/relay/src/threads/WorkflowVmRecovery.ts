@@ -1,13 +1,24 @@
 import type { PgClient } from "@effect/sql-pg/PgClient";
-import type { RepositoryWorkflowJob, WorkflowVmRecovery } from "@t3tools/contracts/workflows";
+import type {
+  RepositoryWorkflowJob,
+  WorkflowVmPublishingOutcome,
+  WorkflowVmRecovery,
+} from "@t3tools/contracts/workflows";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import {
   authorizeWorkflowVmCheckpoint,
+  authorizeWorkflowVmPublishingRetry,
   lockWorkflowVmCheckpoint,
   pendingWorkflowVmCheckpoint,
   restoreSupersededWorkflowCheckpoint,
 } from "../jobs/WorkflowVmCheckpoint.ts";
+import {
+  knownWorkflowVmPublishingCancellation,
+  readWorkflowVmPublishCommands,
+  readWorkflowVmPublishing,
+  type WorkflowVmPublication,
+} from "../jobs/WorkflowVmPublishing.ts";
 import { WorkflowPersistenceError, Workflows, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
@@ -16,12 +27,21 @@ import { makeThreadVmRestoreStore } from "./ThreadVmRestoreStore.ts";
 import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
 import { supersedeUnissuedWorkflowPause } from "./ThreadVmPauseStore.ts";
 import {
+  ensureWorkflowPublishingSavedDisk,
+  releaseWorkflowPublishingRecovery,
+  workflowPublishingCancellationOutcome,
+} from "./WorkflowVmPublishingRecovery.ts";
+import {
   makeThreadVmResumeStore,
   workflowVmHasResumableNativePause,
 } from "./ThreadVmResumeStore.ts";
 
 const recoveryUnavailable =
   "There is no verified VM backup for this workflow checkpoint. Saved results are still available.";
+const publishingRecoveryUnavailable =
+  "There is no verified VM backup for the result this action was publishing. Saved results are still available.";
+const publishingStopUnconfirmed =
+  "The VM paused before Launchpad could confirm that publishing stopped. Saved results are still available.";
 const unconfirmedResume =
   "Launchpad could not confirm that the workflow VM resumed. Saved results are still available.";
 const unconfirmedSnapshot =
@@ -32,6 +52,38 @@ const lostSourceReconciliation =
   "The workflow VM is missing. Launchpad is confirming its removal before recovery.";
 const codexConnectionUnavailable =
   "The run’s original Codex connection is no longer available. Start a new run with a connected account.";
+
+const publishingSourceStopped = (sql: PgClient, jobId: string) => sql`(
+  a.state='deleted' AND a.deleted_at IS NOT NULL AND (
+    (a.deletion_stop_receipt->>'kind'='native-workflow-source-lost'
+      AND a.deletion_stop_receipt->>'allocationId'=a.allocation_id
+      AND a.deletion_stop_receipt->>'sourceOperationId'=p.operation_id
+      AND a.deletion_stop_receipt->>'computeRef'=a.compute_ref
+      AND a.deletion_stop_receipt->>'generation'=p.generation::text
+      AND a.deletion_stop_receipt->>'jobId'=${jobId}
+      AND a.deletion_stop_receipt->>'confirmedAbsent'='true')
+    OR EXISTS (SELECT 1 FROM relay_thread_vm_final_saves f
+      WHERE f.allocation_id=a.allocation_id AND f.thread_id=a.thread_id
+        AND f.generation=p.generation AND f.compute_ref=a.compute_ref
+        AND f.reason='source_loss' AND f.phase='completed' AND f.physical_delete_started_at IS NOT NULL)))`;
+
+export function workflowPublishingCancellationDetail(
+  operation: WorkflowVmPublication["operation"],
+  outcome: WorkflowVmPublishingOutcome | null,
+  possiblyDelivered: boolean,
+) {
+  if (operation === "push")
+    return outcome
+      ? "The branch was pushed before cancellation."
+      : possiblyDelivered
+        ? "Could not verify whether the branch was pushed before cancellation."
+        : null;
+  return outcome
+    ? "The pull request was opened before cancellation."
+    : possiblyDelivered
+      ? "Could not verify whether the pull request was opened before cancellation."
+      : null;
+}
 
 /** Project physical lifecycle for workflow lists without waking or reading the guest. */
 export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
@@ -123,6 +175,8 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
     LEFT JOIN relay_workflow_recovery_heads h ON h.job_id=j.job_id
     LEFT JOIN relay_workflow_recovery_records publication ON publication.publication_id=h.publication_id AND publication.job_id=j.job_id
     WHERE j.job_id IN ${sql.in(jobIds)} AND (j.status IN ('awaiting_review','awaiting_input') OR
+      (j.status='paused' AND j.pending_control#>>'{response,operation}'='retry_action') OR
+      (j.status IN ('running','paused','cancelling') AND j.record#>>'{vmRecovery,state}'='recovery_error') OR
       (j.status='cancelling' AND j.record#>>'{progress,status}' IN ('awaiting_review','awaiting_input')))`;
   return new Map(
     rows.flatMap(
@@ -146,7 +200,8 @@ export const readWorkflowVmRecoveries = Effect.fnUntraced(function* (
           ];
         if (state === "saved" && storedRecoveryError)
           return [[jobId, { state: "recovery_error", detail: storedRecoveryError }]];
-        if (state === "recovery_error") return [[jobId, { state, detail: recoveryUnavailable }]];
+        if (state === "recovery_error")
+          return [[jobId, { state, detail: storedRecoveryError ?? recoveryUnavailable }]];
         return [[jobId, { state }]];
       },
     ),
@@ -161,17 +216,298 @@ export function makeWorkflowVmRecovery(
   const restores = makeThreadVmRestoreStore(sql, objects);
   const saves = makeThreadVmFinalSaveStore(sql, objects);
 
+  const publishingPlacement = Effect.fnUntraced(function* (jobId: string, threadId: string) {
+    const [row] = yield* sql<{
+      operationId: string | null;
+      generation: number;
+      live: boolean;
+      publishingPaused: boolean;
+      sourceStopped: boolean;
+    }>`SELECT t.operation_id AS "operationId",t.generation,
+          EXISTS (SELECT 1 FROM relay_thread_vm_allocations a WHERE a.thread_id=t.thread_id
+            AND a.deleted_at IS NULL) AS live,
+          EXISTS (SELECT 1 FROM relay_thread_vm_allocations a
+            JOIN relay_workflow_vm_publish_commands command ON command.allocation_id=a.allocation_id
+            WHERE a.thread_id=t.thread_id AND a.organization_id=t.organization_id
+              AND a.resource_kind='organization_workflow' AND a.state='paused' AND a.deleted_at IS NULL
+              AND a.native_paused_generation=t.generation AND command.generation=t.generation
+              AND command.job_id=${jobId} AND command.stopped_at IS NULL) AS "publishingPaused",
+          (EXISTS (SELECT 1 FROM relay_thread_vm_allocations a
+            JOIN relay_thread_vm_provisions p USING(allocation_id)
+            WHERE a.thread_id=t.thread_id AND a.organization_id=t.organization_id
+              AND a.resource_kind='organization_workflow' AND p.generation=t.generation
+              AND ${publishingSourceStopped(sql, jobId)})
+            OR EXISTS(SELECT 1 FROM relay_thread_vm_restores r
+              JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
+              WHERE r.thread_id=t.thread_id AND r.target_generation=t.generation
+                AND r.publishing_action_id IS NOT NULL AND r.phase='aborted'
+                AND a.state='deleted' AND a.deleted_at IS NOT NULL)) AS "sourceStopped"
+        FROM relay_thread_placements t WHERE t.thread_id=${threadId} AND t.workflow_job_id=${jobId}
+          AND t.audience='repository'`;
+    return row ?? null;
+  });
+
+  const advancePublishing = Effect.fnUntraced(function* (
+    row: WorkflowJobRecord,
+    leaseUntil: string,
+    observed: {
+      publication: WorkflowVmPublication;
+      outcome: WorkflowVmPublishingOutcome | null;
+    } | null,
+  ) {
+    const job = row.record;
+    const progress = job.progress;
+    if (job.runtime?.kind !== "vm" || !progress || !job.workflow || !job.vmAdmission) return null;
+    const threadId = job.runtime.threadId;
+    const step = job.workflow.definition.steps.find((entry) => entry.id === progress.stepId);
+    if (step?.kind !== "action") return null;
+    const actionId = `workflow:${row.jobId}:action:${step.id}:${progress.generation ?? 0}`;
+    const publication = yield* readWorkflowVmPublishing(sql, row.jobId, actionId);
+    if (!publication || publication.binding.threadId !== threadId) return null;
+    const placement = yield* publishingPlacement(row.jobId, threadId);
+    if (!placement) return null;
+    const operation = row.pendingControl?.response.operation;
+    const cancelling = operation === "cancel" || operation === "retry_cancellation";
+    if (placement.operationId) {
+      if (cancelling) {
+        const restoring = yield* restores.get(placement.operationId);
+        if (restoring && restoring.phase !== "completed" && restoring.phase !== "aborted")
+          yield* restores
+            .requestAbort(placement.operationId)
+            .pipe(Effect.catchTag("ThreadVmRestoreConflict", () => Effect.void));
+      }
+      return job;
+    }
+    const store = yield* Workflows;
+    const change = (record: RepositoryWorkflowJob, pending = row.pendingControl) =>
+      store
+        .updateJob(row, record, pending, false, leaseUntil)
+        .pipe(Effect.map(({ record }) => record));
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    if (placement.publishingPaused) {
+      const retry = operation === "retry_action";
+      if (!retry && job.vmRecovery?.detail === publishingStopUnconfirmed) return job;
+      return yield* change(
+        {
+          ...job,
+          updatedAt,
+          detail: publishingStopUnconfirmed,
+          vmRecovery: { state: "recovery_error", detail: publishingStopUnconfirmed },
+        },
+        retry ? null : row.pendingControl,
+      );
+    }
+    if (placement.live || !placement.sourceStopped) return null;
+    // Deletion proves old command processes stopped. It says nothing about GitHub.
+    yield* sql`UPDATE relay_workflow_vm_publish_commands command SET stopped_at=clock_timestamp()
+      FROM relay_thread_vm_allocations a, relay_thread_vm_provisions p
+      WHERE command.job_id=${row.jobId} AND command.stopped_at IS NULL
+        AND command.allocation_id=a.allocation_id AND a.thread_id=${threadId}
+        AND p.allocation_id=a.allocation_id AND p.generation=command.generation
+        AND ${publishingSourceStopped(sql, row.jobId)}`;
+    if (cancelling) {
+      if (!(yield* store.canSettleVmCancellation(row)))
+        return yield* change({ ...job, status: progress.status, updatedAt }, null);
+      const [running] = yield* sql`SELECT 1 FROM relay_workflow_vm_publish_commands
+        WHERE job_id=${row.jobId} AND stopped_at IS NULL`;
+      if (running) return job;
+      const outcome =
+        knownWorkflowVmPublishingCancellation(publication) ??
+        (observed?.publication.actionId === actionId ? observed.outcome : null);
+      const commands = yield* readWorkflowVmPublishCommands(sql, row.jobId, actionId);
+      const possiblyDelivered = commands.some((command) => !command.rejected);
+      const detail = workflowPublishingCancellationDetail(
+        publication.operation,
+        outcome,
+        possiblyDelivered,
+      );
+      if (outcome && !publication.outcome && publication.operation === "push")
+        yield* sql`UPDATE relay_workflow_vm_publications SET record=record || ${sql.json({ outcome })}
+          WHERE job_id=${row.jobId} AND action_id=${actionId}`;
+      const publicationOutcome = yield* workflowPublishingCancellationOutcome(
+        sql,
+        row.jobId,
+        publication,
+        outcome,
+        possiblyDelivered,
+      );
+      yield* releaseWorkflowPublishingRecovery(sql, row.jobId);
+      return yield* change(
+        {
+          ...job,
+          updatedAt,
+          status: "cancelled",
+          detail,
+          queueReason: null,
+          pendingManualControl: null,
+          ...(publicationOutcome ? { publicationOutcome } : {}),
+          progress: {
+            ...progress,
+            revision: progress.revision + 1,
+            status: "cancelled",
+            underlyingStatus: "cancelled",
+            executionReleased: true,
+            manualPause: null,
+            retryableCancellation: false,
+            detail,
+            pullRequestUrl: outcome?.pullRequestUrl ?? progress.pullRequestUrl ?? null,
+          },
+        },
+        null,
+      );
+    }
+    const priorRestore =
+      operation === "retry_action" && row.pendingControl?.responseId
+        ? yield* restores.get(row.pendingControl.responseId)
+        : null;
+    const interruptedRetry =
+      operation === "retry_action" &&
+      (!!row.pendingControl?.checkpointDispatch ||
+        priorRestore?.phase === "completed" ||
+        priorRestore?.phase === "aborted");
+    if (operation === "retry_action" && !interruptedRetry) {
+      const retry = yield* authorizeWorkflowVmPublishingRetry(sql, row);
+      if (!retry)
+        return yield* change(
+          { ...job, updatedAt, detail: "The publishing retry is no longer authorized." },
+          null,
+        );
+      const disk = publication.recoverySource
+        ? yield* ensureWorkflowPublishingSavedDisk(sql, threadId, publication.recoverySource)
+        : null;
+      if (disk && publication.recoverySource) {
+        const restored = yield* restores
+          .begin({
+            operationId: retry.responseId,
+            allocationId: retry.responseId,
+            threadId,
+            savedDiskOperationId: disk,
+            actorUserId: retry.userId,
+            expectedGeneration: placement.generation,
+            workflowJobId: row.jobId,
+            publishingRecovery: publication.recoverySource,
+            publishingAction: { actionId, expectedRevision: retry.response.expectedRevision },
+            serving: true,
+          })
+          .pipe(
+            Effect.as(true),
+            Effect.catchTags({
+              ThreadVmRestoreConflict: () => Effect.succeed(false),
+              ThreadVmSavedDiskConflict: () => Effect.succeed(false),
+              ThreadNativeCheckpointConflict: () => Effect.succeed(false),
+              ThreadVmBackupConflict: () => Effect.succeed(false),
+              SchemaError: () => Effect.succeed(false),
+            }),
+          );
+        if (restored) {
+          const { vmRecovery: _previous, ...record } = job;
+          return yield* change({ ...record, updatedAt });
+        }
+      }
+      return yield* change(
+        {
+          ...job,
+          updatedAt,
+          detail: publishingRecoveryUnavailable,
+          vmRecovery: { state: "recovery_error", detail: publishingRecoveryUnavailable },
+        },
+        null,
+      );
+    }
+    const current = progress.actions?.find((entry) => entry.actionId === actionId);
+    if (
+      !interruptedRetry &&
+      progress.status === "paused" &&
+      current?.retryable &&
+      job.vmRecovery?.detail !== publishingStopUnconfirmed
+    )
+      return job;
+    const detail = "The workflow VM stopped during publishing. Retry to recover the saved result.";
+    const { vmRecovery: _previousRecovery, ...record } = job;
+    return yield* change(
+      {
+        ...record,
+        updatedAt,
+        status: "paused",
+        detail,
+        progress: {
+          ...progress,
+          revision: progress.revision + 1,
+          status: "paused",
+          underlyingStatus: "paused",
+          detail,
+          actions: [
+            ...(progress.actions ?? []).filter((entry) => entry.actionId !== actionId),
+            {
+              actionId,
+              stepId: step.id,
+              generation: publication.stepGeneration,
+              operation: publication.operation,
+              state: "uncertain",
+              detail,
+              commitSha: publication.commitSha,
+              pullRequestUrl: publication.outcome?.pullRequestUrl ?? null,
+              retryable: true,
+            },
+          ],
+        },
+      },
+      interruptedRetry ? null : row.pendingControl,
+    );
+  });
+
   const advance = Effect.fn("relay.workflow_vm.recovery.advance")(function* (
     prior: WorkflowJobRecord,
     leaseUntil: string,
+    observe: (
+      publication: WorkflowVmPublication,
+    ) => Effect.Effect<WorkflowVmPublishingOutcome | null> = () => Effect.succeed(null),
   ) {
     const store = yield* Workflows;
+    let observed: {
+      publication: WorkflowVmPublication;
+      outcome: WorkflowVmPublishingOutcome | null;
+    } | null = null;
+    const pending = prior.pendingControl?.response.operation;
+    const jobProgress = prior.record.progress;
+    if (
+      (pending === "cancel" || pending === "retry_cancellation") &&
+      prior.record.runtime?.kind === "vm" &&
+      jobProgress?.stepId &&
+      prior.record.workflow?.definition.steps.some(
+        (step) => step.id === jobProgress.stepId && step.kind === "action",
+      )
+    ) {
+      const publication = yield* readWorkflowVmPublishing(
+        sql,
+        prior.jobId,
+        `workflow:${prior.jobId}:action:${jobProgress.stepId}:${jobProgress.generation ?? 0}`,
+      ).pipe(Effect.mapError((cause) => new WorkflowPersistenceError({ cause })));
+      const placement = yield* publishingPlacement(prior.jobId, prior.record.runtime.threadId).pipe(
+        Effect.mapError((cause) => new WorkflowPersistenceError({ cause })),
+      );
+      if (publication && !placement?.live && placement?.sourceStopped) {
+        const commands = yield* readWorkflowVmPublishCommands(
+          sql,
+          prior.jobId,
+          publication.actionId,
+        ).pipe(Effect.mapError((cause) => new WorkflowPersistenceError({ cause })));
+        const known = knownWorkflowVmPublishingCancellation(publication);
+        const shouldRead = !known && commands.some((command) => !command.rejected);
+        observed = {
+          publication,
+          outcome: known ?? (shouldRead ? yield* observe(publication) : null),
+        };
+      }
+    }
     return yield* sql
       .withTransaction(
         Effect.gen(function* () {
           const row = yield* lockWorkflowVmCheckpoint(sql, prior.jobId);
           if (!row || row.leaseUntil !== leaseUntil || row.revision !== prior.revision)
             return prior.record;
+          const publishing = yield* advancePublishing(row, leaseUntil, observed);
+          if (publishing) return publishing;
           const job = row.record;
           const progress = job.progress;
           const threadId = job.runtime?.kind === "vm" ? job.runtime.threadId : null;
@@ -402,6 +738,7 @@ export function makeWorkflowVmRecovery(
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(new WorkflowPersistenceError({ cause })),
           ThreadVmFinalSaveConflict: () => Effect.succeed(prior.record),
+          ThreadVmBackupConflict: () => Effect.succeed(prior.record),
           ThreadNativeCheckpointConflict: () => Effect.succeed(prior.record),
         }),
       );

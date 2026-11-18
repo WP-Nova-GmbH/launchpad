@@ -284,6 +284,7 @@ int main(int argc, char **argv) {
             exec_workload(argv[2], command, setup_owner);
         }
         if ((argc == 2 && strcmp(argv[1], "workflow-recovery-state") == 0) ||
+            (argc == 3 && strcmp(argv[1], "stop-workflow-publishing") == 0) ||
             (argc == 4 && (strcmp(argv[1], "provider-identity") == 0 ||
                            strcmp(argv[1], "stop-workflow-probe") == 0)) ||
             (argc == 5 && (strcmp(argv[1], "stop-idle-provider") == 0 ||

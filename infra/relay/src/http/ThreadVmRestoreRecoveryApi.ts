@@ -1,4 +1,14 @@
 import { readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
+import {
+  readWorkflowVmPublishing,
+  type WorkflowVmPublication,
+} from "../jobs/WorkflowVmPublishing.ts";
+import { readHeldPublishingBackup } from "../threads/WorkflowVmPublishingRecovery.ts";
+import {
+  WorkflowVmPublishingAction,
+  type RepositoryWorkflowJob,
+  type WorkflowVmPublishingRestore,
+} from "@t3tools/contracts/workflows";
 import { readWorkflowRestorePublication } from "../threads/WorkflowVmWorkspace.ts";
 import { makeThreadArtifactStore } from "../threads/ThreadArtifactStore.ts";
 import { makeThreadArtifactTransfer } from "../threads/ThreadArtifactTransfer.ts";
@@ -29,6 +39,7 @@ import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 
 type Owner = { threadId: string; environmentId: string; generation: number };
 const decodeRecovery = Schema.decodeEffect(RelayThreadVmRestoreRecovery);
+const decodePublishingAction = Schema.decodeUnknownEffect(WorkflowVmPublishingAction);
 const failures = {
   ThreadVmResetConflict: () => tenancyConflict("thread_checkpoint_conflict"),
   ThreadVmRestoreConflict: () => tenancyConflict("thread_checkpoint_conflict"),
@@ -111,6 +122,53 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
         (!native && (!checkpoint || row.nativeCheckpointOperationId !== null || attachments))
       )
         return yield* tenancyConflict("thread_checkpoint_conflict");
+      let publishing: WorkflowVmPublishingRestore | undefined;
+      if (row.publishingActionId) {
+        if (!checkpoint || row.publishingExpectedRevision == null)
+          return yield* tenancyConflict("thread_checkpoint_conflict");
+        const current = yield* readWorkflowVmPublishing(
+          sql,
+          checkpoint.jobId,
+          row.publishingActionId,
+        );
+        const held = current?.recoverySource
+          ? yield* readHeldPublishingBackup(sql, row.threadId, current.recoverySource)
+          : null;
+        if (
+          !current ||
+          held?.savedDiskOperationId !== row.savedDiskOperationId ||
+          held?.checkpoint.publicationId !== checkpoint.publicationId
+        )
+          return yield* tenancyConflict("thread_checkpoint_conflict");
+        const [projection] = yield* sql<{ record: RepositoryWorkflowJob; revision: number }>`
+          SELECT j.record,h.revision FROM relay_workflow_jobs j
+          JOIN relay_workflow_recovery_heads h USING(job_id) WHERE j.job_id=${checkpoint.jobId}`;
+        if (!projection || projection.revision < checkpoint.publicationRevision)
+          return yield* tenancyConflict("thread_checkpoint_conflict");
+        const previous = yield* sql<{ record: WorkflowVmPublication }>`SELECT previous.record
+          FROM relay_workflow_vm_publications previous
+          JOIN relay_workflow_vm_publications current ON current.job_id=previous.job_id
+          WHERE current.job_id=${checkpoint.jobId} AND current.action_id=${row.publishingActionId}
+            AND previous.ordinal<current.ordinal AND previous.record#>>'{outcome,commitSha}' IS NOT NULL
+            AND (previous.record->>'resultTurnId'=${current.resultTurnId} OR previous.record->>'operation'='push')
+          ORDER BY previous.ordinal DESC`;
+        const completed = yield* Effect.forEach(previous, ({ record }) =>
+          Effect.gen(function* () {
+            if (!record.outcome) return null;
+            return { ...(yield* decodePublishingAction(record)), outcome: record.outcome };
+          }),
+        );
+        const actions = completed.filter((entry) => entry !== null);
+        publishing = {
+          action: yield* decodePublishingAction(current),
+          outcome: current.outcome,
+          previousPush: actions.find((entry) => entry.operation === "push") ?? null,
+          completedActions: actions.filter((entry) => entry.resultTurnId === current.resultTurnId),
+          expectedRevision: row.publishingExpectedRevision,
+          latestPublicationRevision: projection.revision,
+          responses: projection.record.progress?.responses ?? [],
+        };
+      }
       return {
         operationId: row.operationId,
         ...(row.savedDiskOperationId
@@ -127,6 +185,7 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
                 ...publication,
                 binding: target.binding,
                 sourceSequence: source.source.sourceSequence,
+                ...(publishing ? { publishing } : {}),
               },
             }
           : {}),

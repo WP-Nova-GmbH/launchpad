@@ -284,7 +284,12 @@ const scopedTokenResponse = {
   repositories: [{ full_name: "acme/project" }],
 };
 const decodeRepositoryTokenRequest = Schema.decodeUnknownSync(
-  Schema.fromJsonString(Schema.Struct({ repositories: Schema.Array(Schema.String) })),
+  Schema.fromJsonString(
+    Schema.Struct({
+      repositories: Schema.Array(Schema.String),
+      permissions: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+    }),
+  ),
 );
 
 describe("GithubApp.mintRepositoryToken", () => {
@@ -353,6 +358,70 @@ describe("GithubApp.mintRepositoryToken", () => {
     }),
   );
 
+  it.effect("requests and verifies only the permissions for the workflow operation", () =>
+    Effect.gen(function* () {
+      const input = { installationId: "42", canonicalKey: "github.com/acme/project" };
+      const cases = [
+        ["workflow-push", { contents: "write" }],
+        ["workflow-pr", { contents: "read", pull_requests: "write" }],
+        ["workflow-publish", { contents: "write", pull_requests: "write" }],
+        ["workflow-read-pr", { contents: "read", pull_requests: "read" }],
+      ] as const;
+      for (const [access, permissions] of cases) {
+        const { app, requests } = makeApp(() =>
+          Response.json({
+            ...scopedTokenResponse,
+            permissions: { ...permissions, metadata: "read" },
+          }),
+        );
+        const github = yield* app;
+        const token = yield* github.mintRepositoryToken({ ...input, access });
+        expect(token.token).toBe(scopedTokenResponse.token);
+        const body = requests[0]!.body;
+        if (body._tag !== "Uint8Array") throw new Error("Expected JSON request body");
+        expect(decodeRepositoryTokenRequest(new TextDecoder().decode(body.body))).toEqual({
+          repositories: ["project"],
+          permissions,
+        });
+      }
+      for (const [permissions, permissionDenied] of [
+        [{ contents: "read" }, true],
+        [{ contents: "write", pull_requests: "read" }, undefined],
+      ] as const) {
+        const { app } = makeApp(() => Response.json({ ...scopedTokenResponse, permissions }));
+        const github = yield* app;
+        const error = yield* Effect.flip(
+          github.mintRepositoryToken({ ...input, access: "workflow-push" }),
+        );
+        expect(error._tag).toBe("GithubRequestFailed");
+        if (error._tag === "GithubRequestFailed")
+          expect(error.permissionDenied).toBe(permissionDenied);
+      }
+    }),
+  );
+
+  it.effect("distinguishes a denied publication grant from a rate limit", () =>
+    Effect.gen(function* () {
+      const input = {
+        installationId: "42",
+        canonicalKey: "github.com/acme/project",
+        access: "workflow-publish",
+      } as const;
+      const message = "The permissions requested are not granted to this installation.";
+      const denied = yield* makeApp(() => Response.json({ message }, { status: 422 })).app;
+      expect(yield* Effect.flip(denied.mintRepositoryToken(input))).toMatchObject({
+        _tag: "GithubRequestFailed",
+        permissionDenied: true,
+      });
+      const limited = yield* makeApp(() =>
+        Response.json({ message }, { status: 403, headers: { "retry-after": "60" } }),
+      ).app;
+      const error = yield* Effect.flip(limited.mintRepositoryToken(input));
+      expect(error).toMatchObject({ _tag: "GithubRequestFailed", rateLimited: true });
+      if (error._tag === "GithubRequestFailed") expect(error.permissionDenied).toBeUndefined();
+    }),
+  );
+
   it.effect(
     "accepts Contents-only and older installation permissions without requiring PR grants",
     () =>
@@ -392,6 +461,15 @@ describe("GithubApp.mintRepositoryToken", () => {
           yield* Effect.flip(github.mintRepositoryToken({ installationId: "42", canonicalKey })),
         ).toMatchObject({ _tag: "GithubRequestFailed" });
       }
+      expect(
+        yield* Effect.flip(
+          github.mintRepositoryToken({
+            installationId: "42",
+            canonicalKey: "github.com/acme/project",
+            access: "unknown-access" as never,
+          }),
+        ),
+      ).toMatchObject({ _tag: "GithubRequestFailed" });
       expect(requests).toHaveLength(0);
     }),
   );
@@ -521,6 +599,101 @@ describe("GithubApp.resolveRepositoryBranch", () => {
         expect(
           yield* Effect.flip(github.resolveRepositoryBranch({ ...input, baseBranch: "main" })),
         ).toMatchObject({ _tag: "GithubRequestFailed", operation: "read-branch" });
+      }
+    }),
+  );
+});
+
+describe("GithubApp.observeWorkflowPublication", () => {
+  const input = { installationId: "42", canonicalKey: "github.com/acme/project" };
+  const branch = "launchpad/job";
+  const sha = "aa218f56b14c9653891f9e74264a383fa43fefbd";
+  const repository = { full_name: "acme/project" };
+  const pull = {
+    number: 17,
+    state: "open",
+    merged_at: null,
+    body: "<!-- launchpad-workflow-job:job -->",
+    head: { sha, ref: branch, repo: repository },
+    base: { ref: "main", repo: repository },
+  };
+  const repoUrl = "https://api.github.com/repos/acme/project";
+
+  it.effect("observes the exact branch and PR head with repository-scoped reads", () =>
+    Effect.gen(function* () {
+      const { app, requests } = makeApp((request) => {
+        if (request.method === "POST") {
+          const body = request.body;
+          if (body._tag !== "Uint8Array") throw new Error("Expected JSON request body");
+          const { permissions } = decodeRepositoryTokenRequest(new TextDecoder().decode(body.body));
+          return Response.json({ ...scopedTokenResponse, permissions });
+        }
+        if (request.url === `${repoUrl}/git/ref/heads/${branch}`)
+          return Response.json({ ref: `refs/heads/${branch}`, object: { type: "commit", sha } });
+        if (request.url === `${repoUrl}/pulls/17`) return Response.json(pull);
+        return Response.json([pull]);
+      });
+      const github = yield* app;
+      expect(
+        yield* github.observeWorkflowPublication({
+          ...input,
+          target: { kind: "branch", branch },
+        }),
+      ).toEqual({ kind: "branch", sha });
+      for (const number of [undefined, 17]) {
+        expect(
+          yield* github.observeWorkflowPublication({
+            ...input,
+            target: { kind: "pull_request", branch, ...(number === undefined ? {} : { number }) },
+          }),
+        ).toMatchObject({
+          kind: "pull_request",
+          pullRequests: [
+            {
+              number: 17,
+              url: "https://github.com/acme/project/pull/17",
+              headBranch: branch,
+              headSha: sha,
+              headRepository: "acme/project",
+              baseBranch: "main",
+              body: pull.body,
+            },
+          ],
+        });
+      }
+      expect(requests.filter(({ method }) => method === "GET").map(({ url }) => url)).toEqual([
+        `${repoUrl}/git/ref/heads/${branch}`,
+        `${repoUrl}/pulls?head=acme%3Alaunchpad%2Fjob&state=all&per_page=20`,
+        `${repoUrl}/pulls/17`,
+      ]);
+    }),
+  );
+
+  it.effect("rejects incomplete or unbounded evidence and answers for a different PR", () =>
+    Effect.gen(function* () {
+      for (const [number, response] of [
+        [17, Response.json({ ...pull, number: 18 })],
+        [17, Response.json({ ...pull, head: { ...pull.head, sha: undefined } })],
+        [undefined, Response.json(Array.from({ length: 20 }, () => pull))],
+        [undefined, new Response(null, { status: 404 })],
+      ] as const) {
+        const { app } = makeApp((request) =>
+          request.method === "POST"
+            ? Response.json({
+                ...scopedTokenResponse,
+                permissions: { contents: "read", pull_requests: "read" },
+              })
+            : response,
+        );
+        const github = yield* app;
+        expect(
+          yield* Effect.flip(
+            github.observeWorkflowPublication({
+              ...input,
+              target: { kind: "pull_request", branch, ...(number === undefined ? {} : { number }) },
+            }),
+          ),
+        ).toMatchObject({ _tag: "GithubRequestFailed", operation: "read-pull-request" });
       }
     }),
   );

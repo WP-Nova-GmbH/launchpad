@@ -41,6 +41,8 @@ export interface ThreadVmRestore {
   readonly operationId: string;
   readonly savedDiskOperationId: string | null;
   readonly backupRecoveryOperationId: string | null;
+  readonly publishingActionId?: string | null;
+  readonly publishingExpectedRevision?: number | null;
   readonly independentHistory: RelayThreadVmIndependentHistory | null;
   readonly probeAttempt: number;
   readonly threadId: string;
@@ -87,6 +89,7 @@ export function makeThreadVmRestoreStore(
   const get = Effect.fn("relay.thread_vm.restore.get")(function* (operationId: string) {
     const [row] = yield* sql<ThreadVmRestore>`SELECT operation_id AS "operationId",
       saved_disk_operation_id AS "savedDiskOperationId",thread_id AS "threadId",
+      publishing_action_id AS "publishingActionId",publishing_expected_revision AS "publishingExpectedRevision",
       backup_recovery_operation_id AS "backupRecoveryOperationId",probe_attempt AS "probeAttempt",
       (SELECT independent_history FROM relay_thread_vm_backup_recoveries r WHERE r.operation_id=backup_recovery_operation_id) AS "independentHistory",
       allocation_id AS "allocationId",actor_user_id AS "actorUserId",generation,
@@ -243,7 +246,10 @@ export function makeThreadVmRestoreStore(
     return receipt;
   });
   const begin = Effect.fn("relay.thread_vm.restore.begin")(function* (
-    input: Parameters<typeof saved.beginRestore>[0] & { readonly serving?: boolean },
+    input: Parameters<typeof saved.beginRestore>[0] & {
+      readonly serving?: boolean;
+      readonly publishingAction?: { readonly actionId: string; readonly expectedRevision: number };
+    },
   ) {
     yield* decodeId(input.operationId);
     yield* decodeId(input.allocationId);
@@ -258,6 +264,9 @@ export function makeThreadVmRestoreStore(
           if (
             prior.threadId !== input.threadId ||
             prior.savedDiskOperationId !== input.savedDiskOperationId ||
+            (prior.publishingActionId ?? null) !== (input.publishingAction?.actionId ?? null) ||
+            (prior.publishingExpectedRevision ?? null) !==
+              (input.publishingAction?.expectedRevision ?? null) ||
             prior.actorUserId !== input.actorUserId ||
             prior.allocationId !== input.allocationId ||
             prior.generation !== input.expectedGeneration ||
@@ -293,6 +302,8 @@ export function makeThreadVmRestoreStore(
         const point = source?.nativeCheckpointOperationId
           ? yield* natives.get(source.nativeCheckpointOperationId)
           : null;
+        if (!!input.publishingAction !== !!input.publishingRecovery)
+          return yield* conflict("The publishing recovery action is missing.");
         if (
           !source?.captureOperationId ||
           (input.workflowJobId
@@ -311,6 +322,7 @@ export function makeThreadVmRestoreStore(
           );
         if (
           source.workflowCheckpoint &&
+          !input.publishingRecovery &&
           !(yield* readCurrentWorkflowCheckpoint(sql, source.workflowCheckpoint))
         )
           return yield* conflict("The saved disk does not match the current workflow checkpoint.");
@@ -326,10 +338,12 @@ export function makeThreadVmRestoreStore(
           });
         yield* sql`INSERT INTO relay_thread_vm_restores
         (operation_id,saved_disk_operation_id,thread_id,allocation_id,actor_user_id,generation,source_generation,host_id,
-          native_checkpoint_operation_id,source_template_id,source_build_id,phase,serving_requested)
+          native_checkpoint_operation_id,source_template_id,source_build_id,phase,serving_requested,
+          publishing_action_id,publishing_expected_revision)
         VALUES (${input.operationId},${disk.operationId},${input.threadId},${input.allocationId},
           ${input.actorUserId},${input.expectedGeneration},${source.sourceGeneration},${disk.hostId},${point?.operationId ?? null},
-          ${source.sourceTemplateId},${source.sourceBuildId},'pending',${input.serving ?? false})`;
+          ${source.sourceTemplateId},${source.sourceBuildId},'pending',${input.serving ?? false},
+          ${input.publishingAction?.actionId ?? null},${input.publishingAction?.expectedRevision ?? null})`;
         const row = (yield* get(input.operationId))!;
         yield* requireRecovery(row);
         return row;

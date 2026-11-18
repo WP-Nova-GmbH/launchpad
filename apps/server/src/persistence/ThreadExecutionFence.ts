@@ -2,6 +2,7 @@
 import * as NodePath from "node:path";
 import type { OrchestrationCommand } from "@t3tools/contracts";
 import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
+import type { WorkflowVmPublishingRestore } from "@t3tools/contracts/workflows";
 import {
   assertWorkflowThreadReleased,
   requireWorkflowVmLifecycleCheckpoint,
@@ -41,6 +42,7 @@ type Identity = Pick<Fence, "threadId" | "generation">;
 type Operation = Identity & Pick<Fence, "operationId">;
 type LifecycleOperation = Operation & {
   readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
+  readonly publishing?: WorkflowVmPublishingRestore;
 };
 type Enrollment = Omit<Fence, "phase" | "frozenSequence">;
 type Work = Identity & {

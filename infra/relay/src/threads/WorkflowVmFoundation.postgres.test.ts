@@ -29,6 +29,8 @@ import { makeThreadVmActivityWorker } from "./ThreadVmActivityWorker.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
 import { makeThreadVmBackupStore } from "./ThreadVmBackupStore.ts";
+import { makeThreadVmBackupRetentionStore } from "./ThreadVmBackupRetentionStore.ts";
+import { makeThreadNativeCheckpointStore } from "./ThreadNativeCheckpointStore.ts";
 import { makeThreadVmFinalSaveDeletionWorker } from "./ThreadVmFinalSaveDeletionWorker.ts";
 import { makeThreadVmFinalSaveWorker } from "./ThreadVmFinalSaveWorker.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
@@ -64,16 +66,22 @@ import {
 import type {
   RepositoryWorkflowJob,
   WorkflowResultSaving,
+  WorkflowSavedResult,
   WorkflowVmDispatchBinding,
+  WorkflowVmPublishingRequest,
 } from "@t3tools/contracts/workflows";
+import {
+  handleWorkflowVmPublishing,
+  readWorkflowVmPublishing,
+} from "../jobs/WorkflowVmPublishing.ts";
 import {
   EnvironmentConnector,
   EnvironmentMintRequestTimedOut,
 } from "../environments/EnvironmentConnector.ts";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { RelayConfiguration } from "../Config.ts";
-import { Organizations } from "../tenancy/Organizations.ts";
-import { Repositories } from "../tenancy/Repositories.ts";
+import { Organizations, layer as organizations } from "../tenancy/Organizations.ts";
+import { Repositories, layer as repositories } from "../tenancy/Repositories.ts";
 import { Machines } from "../machines/Machines.ts";
 import { OrganizationProjectCatalog } from "../projects/OrganizationProjectCatalog.ts";
 import { WorkflowVmPreparation } from "../jobs/WorkflowVmPreparation.ts";
@@ -466,6 +474,392 @@ const pausedSandbox = (
 
 describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Postgres)", () => {
   it.layer(services)((it) => {
+    it.effect(
+      "keeps provider-paused publishing owned and requires a matching backup after source loss",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const { sql, workflowJobId, organizationId, ownerUserId, threadId, allocationId } = f;
+          const fs = yield* FileSystem.FileSystem;
+          const objects = makeLocalThreadArtifactObjects(fs, yield* fs.makeTempDirectoryScoped());
+          const workflowStore = yield* Workflows;
+          const job = (yield* workflowStore.getJob(workflowJobId))!.record;
+          const push = {
+            kind: "action",
+            id: "push",
+            title: "Push branch",
+            action: "push",
+          } as const;
+          const actionId = `workflow:${workflowJobId}:action:push:0`;
+          const action = {
+            actionId,
+            stepId: push.id,
+            generation: 0,
+            operation: "push",
+            state: "uncertain",
+            detail: null,
+            commitSha: "a".repeat(40),
+            pullRequestUrl: null,
+            retryable: true,
+          } as const;
+          const record: RepositoryWorkflowJob = {
+            ...job,
+            status: "paused",
+            workflow: {
+              ...job.workflow!,
+              definition: {
+                ...job.workflow!.definition,
+                steps: [...job.workflow!.definition.steps, push],
+              },
+            },
+            progress: {
+              revision: 5,
+              status: "paused",
+              threadId: ThreadId.make(threadId),
+              checkpoint: null,
+              detail: null,
+              stepId: push.id,
+              generation: 0,
+              actions: [action],
+            },
+          };
+          yield* sql`INSERT INTO relay_organizations VALUES(${organizationId},'Organization','2026','2026')`;
+          yield* sql`INSERT INTO relay_organization_members VALUES(${organizationId},${ownerUserId},'admin','2026','2026')`;
+          const retry = () =>
+            sql.json({
+              userId: ownerUserId,
+              responseId: NodeCrypto.randomUUID(),
+              response: { operation: "retry_action", actionId, expectedRevision: 5 },
+            });
+          yield* sql`UPDATE relay_workflow_jobs SET status='paused',record=${sql.json(record)},pending_control=${retry()}
+            WHERE job_id=${workflowJobId}`;
+          yield* sql`INSERT INTO relay_workflow_vm_publications(job_id,action_id,record) VALUES(${workflowJobId},${actionId},${sql.json(
+            {
+              ...action,
+              stepGeneration: 0,
+              resultTurnId: "turn",
+              checkpointRef: "refs/t3/result",
+              tree: "b".repeat(40),
+              parent: "c".repeat(40),
+              oldRemoteSha: null,
+              canonicalKey: "github.com/acme/example",
+              installationId: "1",
+              branch: "launchpad/test",
+              baseBranch: "main",
+              recoverySource: null,
+              outcome: null,
+              binding: {
+                ...f.principal.threadVm,
+                environmentId: f.owner.environmentId,
+                jobId: workflowJobId,
+                organizationId,
+                operationId: f.operationId,
+                projectId: `vm:${threadId}`,
+              },
+            },
+          )})`;
+          const commandId = NodeCrypto.randomUUID();
+          yield* sql`INSERT INTO relay_workflow_vm_publish_commands(command_id,job_id,action_id,allocation_id,generation,pid,process_identity)
+          VALUES(${commandId},${workflowJobId},${actionId},${allocationId},1,42,'native-owner')`;
+          const [allocation] = yield* sql<{ computeRef: string }>`SELECT compute_ref AS "computeRef"
+          FROM relay_thread_vm_allocations WHERE allocation_id=${allocationId}`;
+          yield* sql`UPDATE relay_thread_vm_allocations SET state='paused',native_paused_generation=1
+            WHERE allocation_id=${allocationId}`;
+          yield* sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE allocation_id=${allocationId}`;
+          const recover = makeWorkflowVmRecovery(sql, objects);
+          const parked = (yield* workflowStore.claim(workflowJobId))!;
+          const blocked = yield* recover.advance(parked, parked.leaseUntil!, () =>
+            Effect.die("A paused native publishing command must keep its ownership."),
+          );
+          expect(blocked?.vmRecovery?.detail).toContain("confirm that publishing stopped");
+          expect(blocked?.detail).toContain("Saved results are still available");
+          expect(blocked?.progress?.executionReleased).not.toBe(true);
+          expect((yield* workflowStore.getJob(workflowJobId))?.pendingControl).toBeNull();
+          expect(
+            yield* sql`SELECT 1 FROM relay_workflow_vm_publish_commands
+            WHERE command_id=${commandId} AND stopped_at IS NULL`,
+          ).toHaveLength(1);
+          expect(
+            yield* sql`SELECT 1 FROM relay_thread_vm_capacity
+            WHERE allocation_id=${allocationId} AND state<>'released'`,
+          ).toEqual([]);
+          expect(
+            yield* sql`SELECT 1 FROM relay_thread_vm_restores WHERE thread_id=${threadId}`,
+          ).toEqual([]);
+          yield* workflowStore.release(workflowJobId, parked.leaseUntil!);
+          yield* sql`UPDATE relay_workflow_jobs SET pending_control=${retry()} WHERE job_id=${workflowJobId}`;
+          expect(
+            yield* makeThreadVmFinalSaveStore(sql, objects).reconcileMissingWorkflowSource({
+              allocationId,
+              threadId,
+              hostId: f.hostId,
+              generation: 1,
+              computeRef: allocation!.computeRef,
+              provisionOperationId: f.operationId,
+            }),
+          ).toBe(true);
+          const claimed = (yield* workflowStore.claim(workflowJobId))!;
+          const unavailable = yield* recover.advance(claimed, claimed.leaseUntil!);
+          expect(unavailable?.vmRecovery?.state).toBe("recovery_error");
+          expect(
+            yield* sql`SELECT operation_id FROM relay_thread_vm_restores WHERE thread_id=${threadId}`,
+          ).toEqual([]);
+          expect((yield* workflowStore.getJob(workflowJobId))?.pendingControl).toBeNull();
+          yield* workflowStore.release(workflowJobId, claimed.leaseUntil!);
+          yield* sql`UPDATE relay_workflow_jobs SET status='cancelling',record=jsonb_set(record,'{status}','"cancelling"'::jsonb),
+          pending_control=${sql.json({ userId: ownerUserId, response: { operation: "cancel" } })} WHERE job_id=${workflowJobId}`;
+          const cancelling = (yield* workflowStore.claim(workflowJobId))!;
+          const cancelled = yield* recover.advance(cancelling, cancelling.leaseUntil!);
+          expect(cancelled?.status).toBe("cancelled");
+          expect(cancelled?.progress?.executionReleased).toBe(true);
+          expect(cancelled?.publicationOutcome?.state).toBe("unknown");
+        }).pipe(Effect.provide(Layer.merge(workflows, NodeFileSystem.layer))),
+    );
+
+    it.effect("cold publishing Retry catalogs a pinned backup once after source loss", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow();
+        const {
+          sql,
+          allocationId,
+          organizationId,
+          ownerUserId,
+          repositoryId,
+          threadId,
+          workflowJobId,
+        } = f;
+        const fs = yield* FileSystem.FileSystem;
+        const objects = makeLocalThreadArtifactObjects(fs, yield* fs.makeTempDirectoryScoped());
+        const store = yield* Workflows;
+        const job = (yield* store.getJob(workflowJobId))!.record;
+        const { computeRef } = (yield* makeThreadVmAllocationStore(sql).getAny(allocationId))!;
+        const backupOperationId = NodeCrypto.randomUUID();
+        const retentionOperationId = NodeCrypto.randomUUID();
+        const captureOperationId = NodeCrypto.randomUUID();
+        const nativeCheckpointOperationId = NodeCrypto.randomUUID();
+        const attachmentOperationId = NodeCrypto.randomUUID();
+        const publicationId = NodeCrypto.randomUUID();
+        const workflowCheckpoint = {
+          jobId: workflowJobId,
+          checkpointId: "review-before-publishing",
+          checkpointGeneration: 0,
+          publicationId,
+          publicationRevision: 1,
+        };
+        const binding = {
+          ...f.principal.threadVm,
+          jobId: workflowJobId,
+          organizationId,
+          environmentId: f.owner.environmentId,
+          operationId: f.operationId,
+          projectId: `vm:${threadId}`,
+        };
+        const sha256 = "a".repeat(64);
+        const manifests = [
+          { operationId: nativeCheckpointOperationId, artifactId: NodeCrypto.randomUUID() },
+          { operationId: attachmentOperationId, artifactId: NodeCrypto.randomUUID() },
+        ] as const;
+        // Seed the already verified conversation and attachment manifests. The restore checks both pins.
+        for (const { operationId, artifactId } of manifests) {
+          yield* sql`INSERT INTO relay_thread_artifacts
+            (artifact_id,thread_id,operation_id,kind,storage_key,sha256,size_bytes,state)
+            VALUES(${artifactId},${threadId},${operationId},'manifest',${artifactId},${sha256},1,'complete')`;
+          yield* sql`INSERT INTO relay_thread_artifact_pins(artifact_id,operation_id)
+            VALUES(${artifactId},${`native-checkpoint:${nativeCheckpointOperationId}`})`;
+        }
+        const point = {
+          sourceEnvironmentId: f.owner.environmentId,
+          generation: 1,
+          sourceSequence: 0,
+          nativeThreadId: NodeCrypto.randomUUID(),
+        };
+        yield* sql`INSERT INTO relay_thread_native_checkpoints
+          (operation_id,thread_id,turn_id,capture_operation_id,source_environment_id,generation,source_sequence,
+            native_thread_id,native_manifest_sha256,archive_sha256,manifest_artifact_id,manifest_sha256,artifact_count)
+          VALUES(${nativeCheckpointOperationId},${threadId},'agent-turn',${captureOperationId},
+            ${point.sourceEnvironmentId},${point.generation},${point.sourceSequence},${point.nativeThreadId},
+            ${sha256},${sha256},${manifests[0].artifactId},${sha256},2)`;
+        yield* sql`INSERT INTO relay_thread_attachment_checkpoints
+          (native_checkpoint_operation_id,operation_id,manifest_artifact_id,manifest_sha256,attachment_manifest_sha256,artifact_count)
+          VALUES(${nativeCheckpointOperationId},${attachmentOperationId},${manifests[1].artifactId},${sha256},${sha256},1)`;
+        yield* sql`INSERT INTO relay_workflow_recovery_records
+          (publication_id,job_id,thread_id,revision,manifest_artifact_id,manifest_sha256,manifest_size_bytes,manifest)
+          VALUES(${publicationId},${workflowJobId},${threadId},1,${NodeCrypto.randomUUID()},${sha256},1,${sql.json({ binding })})`;
+        yield* sql`INSERT INTO relay_thread_vm_backups
+          (operation_id,allocation_id,generation,compute_ref,snapshot_name,phase,source_receipt)
+          VALUES(${backupOperationId},${allocationId},1,${computeRef},${backupOperationId},'pending',${sql.json(
+            {
+              allocationId,
+              computeRef,
+              threadId,
+              generation: 1,
+              environmentId: f.owner.environmentId,
+              provisionOperationId: f.operationId,
+              captureOperationId,
+              bootId: NodeCrypto.randomUUID(),
+              sealEpoch: 1,
+              sourceSequence: point.sourceSequence,
+              nativeCheckpointOperationId,
+              workflowCheckpoint,
+            },
+          )})`;
+        const backups = makeThreadVmBackupStore(sql);
+        const capture = (yield* backups.claim(f.hostId))!;
+        expect(yield* backups.beginCapture(capture)).toBe(true);
+        const sourceBuildId = NodeCrypto.randomUUID();
+        expect(
+          yield* backups.recordCapture(capture, {
+            snapshotId: backupOperationId,
+            sourceTemplateId: backupOperationId,
+            sourceBuildId,
+          }),
+        ).toBe(true);
+        yield* makeThreadVmBackupRetentionStore(sql).pin({
+          threadId,
+          backupOperationId,
+          operationId: retentionOperationId,
+        });
+        yield* makeThreadNativeCheckpointStore(sql, objects).pinCompleteForOperation({
+          threadId,
+          operationId: retentionOperationId,
+          checkpointOperationId: nativeCheckpointOperationId,
+          expected: point,
+        });
+
+        const step = {
+          kind: "action",
+          id: "open-pr",
+          title: "Open PR",
+          action: "open_pull_request",
+        } as const;
+        const push = { kind: "action", id: "push", title: "Push branch", action: "push" } as const;
+        const actionId = `workflow:${workflowJobId}:action:${step.id}:0`;
+        const action = {
+          actionId,
+          stepId: step.id,
+          generation: 0,
+          operation: step.action,
+          state: "uncertain",
+          detail: null,
+          commitSha: "b".repeat(40),
+          pullRequestUrl: "https://github.com/acme/example/pull/1",
+          retryable: true,
+        } as const;
+        const record: RepositoryWorkflowJob = {
+          ...job,
+          status: "paused",
+          workflow: {
+            ...job.workflow!,
+            definition: {
+              ...job.workflow!.definition,
+              steps: [...job.workflow!.definition.steps, push, step],
+            },
+          },
+          progress: {
+            revision: 5,
+            status: "paused",
+            threadId: ThreadId.make(threadId),
+            checkpoint: null,
+            detail: null,
+            stepId: step.id,
+            generation: 0,
+            actions: [action],
+          },
+        };
+        yield* sql`UPDATE relay_workflow_jobs SET status='paused',record=${sql.json(record)} WHERE job_id=${workflowJobId}`;
+        yield* sql`INSERT INTO relay_workflow_vm_publications(job_id,action_id,record)
+          VALUES(${workflowJobId},${actionId},${sql.json({
+            ...action,
+            stepGeneration: 0,
+            resultTurnId: "agent-turn",
+            checkpointRef: "refs/t3/result",
+            tree: "c".repeat(40),
+            parent: "a".repeat(40),
+            oldRemoteSha: action.commitSha,
+            canonicalKey: "github.com/acme/example",
+            installationId: "1",
+            branch: `launchpad/${workflowJobId}`,
+            baseBranch: "main",
+            binding,
+            recoverySource: { backupOperationId, retentionOperationId },
+            outcome: null,
+          })})`;
+        yield* sql`INSERT INTO relay_organizations VALUES(${organizationId},'Organization','2026','2026')`;
+        yield* sql`INSERT INTO relay_organization_members VALUES(${organizationId},${ownerUserId},'admin','2026','2026')`;
+        yield* sql`INSERT INTO relay_thread_vm_policies(organization_id) VALUES(${organizationId}) ON CONFLICT DO NOTHING`;
+        expect(
+          yield* makeThreadVmFinalSaveStore(sql, objects).reconcileMissingWorkflowSource({
+            allocationId,
+            threadId,
+            hostId: f.hostId,
+            generation: 1,
+            computeRef: computeRef!,
+            provisionOperationId: f.operationId,
+          }),
+        ).toBe(true);
+        expect(
+          yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks WHERE thread_id=${threadId}`,
+        ).toEqual([]);
+
+        const retry = respondToWorkflowJob(
+          { repositoryId, jobId: workflowJobId },
+          { operation: "retry_action", actionId, expectedRevision: 5 },
+        ).pipe(
+          Effect.provideService(RelayClientPrincipal, { userId: ownerUserId, token: "test" }),
+          Effect.provideService(ThreadArtifactObjectStorage, objects),
+          Effect.provide(
+            Layer.mergeAll(
+              organizations,
+              repositories,
+              Layer.mock(EnvironmentConnector)({ dispatchJob: () => Effect.die("Source is gone") }),
+              Layer.mock(Machines)({}),
+              Layer.mock(OrganizationProjectCatalog)({}),
+            ),
+          ),
+        );
+        expect((yield* retry).responsePending).toBe(true);
+        const retryId = (yield* store.getJob(workflowJobId))!.pendingControl!.responseId!;
+        expect((yield* retry).responsePending).toBe(true);
+        expect((yield* store.getJob(workflowJobId))!.pendingControl?.responseId).toBe(retryId);
+        const disks = yield* sql<{ operationId: string }>`SELECT d.operation_id AS "operationId",
+          d.backup_operation_id AS "backupOperationId",d.restore_operation_id AS "restoreOperationId",
+          s.completed_at=a.deleted_at::timestamptz AS "usesSourceDeletionTime"
+          FROM relay_thread_vm_saved_disks d JOIN relay_thread_vm_final_saves s USING(operation_id)
+          JOIN relay_thread_vm_allocations a ON a.allocation_id=s.allocation_id
+          WHERE d.thread_id=${threadId}`;
+        expect(disks).toEqual([
+          {
+            operationId: expect.any(String),
+            backupOperationId,
+            restoreOperationId: retryId,
+            usesSourceDeletionTime: true,
+          },
+        ]);
+        expect(
+          yield* sql`SELECT operation_id AS "operationId",allocation_id AS "allocationId",
+          saved_disk_operation_id AS "savedDiskOperationId", phase
+          FROM relay_thread_vm_restores WHERE thread_id=${threadId}`,
+        ).toEqual([
+          {
+            operationId: retryId,
+            allocationId: retryId,
+            savedDiskOperationId: disks[0]!.operationId,
+            phase: "pending",
+          },
+        ]);
+        expect(
+          yield* sql`SELECT a.allocation_id AS "allocationId",c.operation_id AS "capacityId"
+          FROM relay_thread_vm_allocations a JOIN relay_thread_vm_capacity c USING(allocation_id)
+          WHERE a.thread_id=${threadId} AND a.deleted_at IS NULL`,
+        ).toEqual([
+          {
+            allocationId: retryId,
+            capacityId: retryId,
+          },
+        ]);
+      }).pipe(Effect.provide(Layer.merge(workflows, NodeFileSystem.layer))),
+    );
+
     for (const outcome of [
       "resumed",
       "cancelled",
@@ -2466,6 +2860,175 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       }),
     );
 
+    it.effect("authorizes GitHub reads only for the active saved publishing action", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const fs = yield* FileSystem.FileSystem;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "p07-publish-auth-" });
+          const canonicalKey = `github.com/acme/workflow-${f.workflowJobId}`;
+          const installationId = "42";
+          yield* f.sql`INSERT INTO relay_github_installations VALUES
+            (${f.organizationId},${installationId},'acme','Organization',${f.ownerUserId},'2026','2026')`;
+          yield* f.sql`INSERT INTO relay_repository_aliases
+            (canonical_key,repository_id,organization_id,created_at)
+            VALUES (${canonicalKey},${f.repositoryId},${f.organizationId},'2026')`;
+          yield* f.sql`UPDATE relay_thread_vm_provisions SET workflow_snapshot=workflow_snapshot ||
+            jsonb_build_object('canonicalKey',${canonicalKey}::text,'installationId',${installationId}::text,
+              'workflowPublishing',true) WHERE allocation_id=${f.allocationId}`;
+          const savedResult: WorkflowSavedResult = {
+            resultId: NodeCrypto.randomUUID(),
+            stepId: "agent",
+            turnId: "agent-turn",
+            turnCount: 1,
+            outcome: "completed",
+            createdAt: "2026-11-18T13:00:00Z",
+            checkpointRef: "refs/t3/checkpoints/p07",
+            baselineCommitId: "a".repeat(40),
+            commitId: "b".repeat(40),
+            treeId: "c".repeat(40),
+            patch: {
+              artifactId: NodeCrypto.randomUUID(),
+              sha256: "e".repeat(64),
+              sizeBytes: 0,
+            },
+          };
+          yield* f.sql`INSERT INTO relay_workflow_saved_results
+            (result_id,job_id,thread_id,turn_id,revision,result,native_checkpoint_operation_id)
+            VALUES (${savedResult.resultId},${f.workflowJobId},${f.threadId},${savedResult.turnId},
+              1,${f.sql.json(savedResult)},${NodeCrypto.randomUUID()})`;
+          const actionFor = (stepGeneration: number): WorkflowVmPublishingRequest["action"] => ({
+            actionId: `workflow:${f.workflowJobId}:action:push:${stepGeneration}`,
+            stepId: "push",
+            stepGeneration,
+            operation: "push",
+            resultTurnId: savedResult.turnId,
+            checkpointRef: savedResult.checkpointRef,
+            tree: savedResult.treeId,
+            parent: savedResult.baselineCommitId,
+            commitSha: null,
+            oldRemoteSha: null,
+            pullRequestUrl: null,
+          });
+          const action = actionFor(1);
+          const progress = {
+            revision: 2,
+            generation: action.stepGeneration,
+            threadId: ThreadId.make(f.threadId),
+            detail: null,
+          };
+          const checkpoint = {
+            checkpointId: "review-result",
+            turnId: savedResult.turnId,
+            checkpointRef: savedResult.checkpointRef,
+          };
+          yield* f.sql`UPDATE relay_workflow_jobs SET status='awaiting_review',
+            repository_canonical_key=${canonicalKey},
+            pending_control=${f.sql.json({
+              userId: f.ownerUserId,
+              response: {
+                operation: "approve",
+                checkpointId: checkpoint.checkpointId,
+                expectedRevision: progress.revision,
+              },
+            })},
+            record=jsonb_set(record || ${f.sql.json({
+              status: "awaiting_review",
+              progress: { ...progress, status: "awaiting_review", stepId: "review", checkpoint },
+            })},'{workflow,definition,steps}',record#>'{workflow,definition,steps}' || ${f.sql.json(
+              [
+                { kind: "review", id: "review", title: "Review", role: "maintainer" },
+                { kind: "action", id: "push", title: "Push", action: "push" },
+              ],
+            )}) WHERE job_id=${f.workflowJobId}`;
+
+          const bot = { name: "launchpad[bot]", email: "launchpad[bot]@users.noreply.github.com" };
+          const credential = { token: "fixture-token", expiresAt: "2099-01-01T00:00:00Z" };
+          const minted: Parameters<GithubApp["Service"]["mintRepositoryToken"]>[0][] = [];
+          const github = Layer.mock(GithubApp)({
+            gitMetadata: Effect.succeed({
+              status: "ready",
+              appId: "42",
+              appSlug: "launchpad",
+              botUserId: 42,
+              ...bot,
+            }),
+            mintRepositoryToken: (input) =>
+              Effect.sync(() => {
+                minted.push(input);
+                return credential;
+              }),
+          });
+          const publishing = (
+            requestedAction: WorkflowVmPublishingRequest["action"],
+            request: WorkflowVmPublishingRequest["request"] = {
+              kind: "credential",
+              access: "read",
+            },
+          ) =>
+            handleWorkflowVmPublishing({
+              ...f.owner,
+              jobId: f.workflowJobId,
+              action: requestedAction,
+              request,
+            }).pipe(
+              Effect.provideService(RelayEnvironmentPrincipal, f.principal),
+              Effect.provideService(
+                ThreadArtifactObjectStorage,
+                makeLocalThreadArtifactObjects(fs, root),
+              ),
+              Effect.provide(github),
+            );
+          expect(yield* publishing(action)).toEqual({ kind: "waiting_progress" });
+          expect(yield* readWorkflowVmPublishing(f.sql, f.workflowJobId)).toBeNull();
+          expect(minted).toEqual([]);
+
+          yield* f.sql`UPDATE relay_workflow_jobs SET status='running',pending_control=NULL,
+            record=record || ${f.sql.json({
+              status: "running",
+              progress: {
+                ...progress,
+                revision: progress.revision + 1,
+                status: "running",
+                stepId: "push",
+                checkpoint: null,
+                actions: [
+                  {
+                    actionId: action.actionId,
+                    stepId: "push",
+                    generation: action.stepGeneration,
+                    operation: "push",
+                    state: "running",
+                    detail: null,
+                    commitSha: null,
+                    pullRequestUrl: null,
+                    retryable: false,
+                  },
+                ],
+              },
+            })} WHERE job_id=${f.workflowJobId}`;
+          expect(yield* publishing(actionFor(2))).toEqual({ kind: "waiting_progress" });
+          expect(yield* readWorkflowVmPublishing(f.sql, f.workflowJobId)).toBeNull();
+          expect(minted).toEqual([]);
+          expect(yield* publishing(action)).toEqual({ kind: "credential", ...credential, bot });
+          expect(yield* readWorkflowVmPublishing(f.sql, f.workflowJobId)).toMatchObject({
+            actionId: action.actionId,
+            resultTurnId: savedResult.turnId,
+            commitSha: null,
+          });
+          for (const request of [
+            { kind: "credential", access: "push" },
+            { kind: "arm", commandId: NodeCrypto.randomUUID(), pid: 42, identity: "owned" },
+          ] as const) {
+            expect(yield* Effect.flip(publishing(action, request))).toMatchObject({
+              _tag: "RelayTenancyNotFoundError",
+            });
+          }
+          expect(minted).toEqual([{ canonicalKey, installationId, access: "read" }]);
+        }),
+      ).pipe(Effect.provide(NodeFileSystem.layer)),
+    );
+
     it.effect("uploads saved artifacts only through the exact current shared VM credential", () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -2971,6 +3534,120 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect((yield* Fiber.join(edit)).maxRunningVms).toBe(0);
           expect((yield* personal.capacity.get(nextOperationId))?.state).toBe("waiting");
         }),
+    );
+    it.effect("reconciles same-revision VM saves before delivering a queued Review response", () =>
+      Effect.gen(function* () {
+        const { sql, organizationId, ownerUserId, workflowJobId, threadId, repositoryId } =
+          yield* activeWorkflow();
+        yield* sql`INSERT INTO relay_organizations VALUES(${organizationId},'Test','2026','2026')`;
+        yield* sql`INSERT INTO relay_organization_members VALUES(${organizationId},${ownerUserId},'admin','2026','2026')`;
+        const progress = {
+          status: "awaiting_review" as const,
+          revision: 4,
+          generation: 0,
+          threadId: ThreadId.make(threadId),
+          detail: null,
+          hasThread: true,
+          checkpoint: {
+            checkpointId: "checkpoint",
+            turnId: "turn",
+            checkpointRef: "ref",
+            checkpointTurnCount: 1,
+          },
+        };
+        const pending = {
+          userId: ownerUserId,
+          responseId: NodeCrypto.randomUUID(),
+          response: {
+            operation: "request_changes" as const,
+            expectedRevision: progress.revision,
+            checkpointId: progress.checkpoint.checkpointId,
+            text: "Update the saved result",
+          },
+        };
+        yield* sql`UPDATE relay_workflow_jobs SET status=${progress.status},
+          record=record || ${sql.json({ status: progress.status, progress })},
+          pending_control=${sql.json(pending)} WHERE job_id=${workflowJobId}`;
+        const saving: WorkflowResultSaving = {
+          publicationId: NodeCrypto.randomUUID(),
+          resultId: null,
+          state: "saving",
+          detail: null,
+          retryable: false,
+        };
+        const failed: WorkflowResultSaving = {
+          ...saving,
+          state: "failed",
+          detail: "Save failed",
+          retryable: true,
+        };
+        let reported: NonNullable<RepositoryWorkflowJob["progress"]> = {
+          ...progress,
+          resultSaving: saving,
+        };
+        const operations: string[] = [];
+        yield* Effect.gen(function* () {
+          const store = yield* Workflows;
+          const refresh = refreshWorkflowJob(workflowJobId);
+          expect((yield* refresh)?.progress?.resultSaving).toEqual(saving);
+          expect((yield* store.getJob(workflowJobId))?.pendingControl).toEqual(pending);
+          reported = { ...progress, resultSaving: failed };
+          expect((yield* refresh)?.progress?.resultSaving).toEqual(failed);
+          expect((yield* store.getJob(workflowJobId))?.pendingControl).toEqual(pending);
+          reported = { ...progress, checkpoint: { ...progress.checkpoint, checkpointId: "other" } };
+          expect((yield* refresh)?.progress?.resultSaving).toEqual(failed);
+          expect(operations).toEqual(["status", "status", "status"]);
+          reported = progress;
+          expect((yield* refresh)?.progress).toMatchObject({ status: "running", revision: 5 });
+          expect((yield* store.getJob(workflowJobId))?.pendingControl).toBeNull();
+          expect(operations).toEqual(["status", "status", "status", "status", "request_changes"]);
+        }).pipe(
+          Effect.provide([
+            workflows,
+            Layer.mock(EnvironmentConnector)({
+              dispatchJob: (input) =>
+                Effect.sync(() => {
+                  const operation = input.workflowControl!.operation;
+                  operations.push(operation);
+                  return {
+                    accepted: true,
+                    workflowResult: {
+                      protocol: 9,
+                      outcome: "accepted",
+                      detail: null,
+                      progress:
+                        operation === "status"
+                          ? reported
+                          : { ...progress, status: "running", revision: 5, checkpoint: null },
+                    },
+                  };
+                }),
+            }),
+            Layer.mock(Organizations)({
+              getMembershipForUser: ({ userId }) =>
+                Effect.succeed({
+                  userId,
+                  role: "admin",
+                  joinedAt: "now",
+                  organization: { organizationId, name: "Test", createdAt: "now" },
+                }),
+            }),
+            Layer.mock(Repositories)({
+              getById: () =>
+                Effect.succeed({
+                  repositoryId,
+                  organizationId,
+                  name: "Test",
+                  canonicalKeys: [],
+                  createdAt: "now",
+                }),
+              getAccess: () => Effect.succeed("maintainer"),
+            }),
+            Layer.mock(Machines)({}),
+            Layer.mock(OrganizationProjectCatalog)({}),
+          ]),
+        );
+      }),
     );
     it.effect(
       "selects only unfinished terminal VM saves and requested retries with the existing scopes",

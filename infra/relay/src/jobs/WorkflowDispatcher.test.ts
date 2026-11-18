@@ -492,7 +492,9 @@ const vmReviewJob: WorkflowJobRecord = {
 
 for (const automated of [false, true])
   it.effect(
-    `shows VM preparation failures and clears them on recovery (${automated ? "automatic" : "manual"})`,
+    automated
+      ? "keeps an automatic VM run queued when VM execution is disabled"
+      : "shows manual VM preparation failures and clears them on recovery",
     () =>
       Effect.gen(function* () {
         const h = yield* harness;
@@ -535,6 +537,11 @@ for (const automated of [false, true])
               Effect.fail(new WorkflowPersistenceError({ cause: "VM preparation unavailable" })),
           }),
         );
+        if (automated) {
+          assert.equal(failed?.status, "queued");
+          assert.equal(failed?.queueReason?.code, "vm_execution_disabled");
+          return;
+        }
         assert.equal(failed?.detail, message);
         assert.equal(failed?.status, "queued");
         assert.deepStrictEqual(failed?.queueReason, {

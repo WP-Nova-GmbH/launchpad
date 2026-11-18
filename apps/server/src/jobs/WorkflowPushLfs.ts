@@ -31,7 +31,7 @@ function isLfsUploadPointer(contents: string): boolean {
 }
 
 export const workflowPushNeedsLfsUpload = Effect.fn("workflowPushNeedsLfsUpload")(function* (
-  git: GitVcsDriver["Service"],
+  git: Pick<GitVcsDriver["Service"], "execute">,
   input: { cwd: string; commitSha: string; baseSha: string; publishedSha: string | null },
 ): Effect.fn.Return<boolean, GitCommandError> {
   const { cwd, commitSha, baseSha, publishedSha } = input;

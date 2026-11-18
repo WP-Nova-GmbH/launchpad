@@ -147,6 +147,7 @@ export const harness = (
   },
   gitOverride?: (input: Parameters<ExecuteGit>[0]) => ReturnType<ExecuteGit> | undefined,
   jobBranchPrefix?: WorkflowRun["jobBranchPrefix"],
+  vmPublishing = false,
 ) =>
   Effect.gen(function* () {
     const state = yield* Ref.make({
@@ -282,27 +283,29 @@ export const harness = (
       stdoutTruncated: false,
       stderrTruncated: false,
     });
+    const nativeOwner = {
+      commandLauncher: Effect.succeed("native-owner"),
+      host: Effect.sync(boot),
+      inspect: () =>
+        Effect.succeed({
+          protocol: 4 as const,
+          identity: "birth",
+          owned: true,
+          fullStop: false,
+          boot: boot(),
+        }),
+      arm: () =>
+        Effect.sync(() => {
+          deliveries++;
+          return "git";
+        }),
+      stop: () =>
+        stopFails ? Effect.fail(new SetupProcessError({ message: "Ownership lost" })) : Effect.void,
+    };
     const layers = Layer.mergeAll(
       Layer.mock(SetupProcessAdapter)({
-        commandLauncher: Effect.succeed("native-owner"),
-        host: Effect.sync(boot),
-        inspect: () =>
-          Effect.succeed({
-            protocol: 4 as const,
-            identity: "birth",
-            owned: true,
-            fullStop: false,
-            boot: boot(),
-          }),
-        arm: () =>
-          Effect.sync(() => {
-            deliveries++;
-            return "git";
-          }),
-        stop: () =>
-          stopFails
-            ? Effect.fail(new SetupProcessError({ message: "Ownership lost" }))
-            : Effect.void,
+        ...nativeOwner,
+        ...(vmPublishing ? { vmPublishing: nativeOwner } : {}),
       }),
       Layer.mock(SourceControlProviderRegistry)({
         resolveLink: () => undefined,

@@ -82,6 +82,44 @@ export const relayWorkflowRecoveryHeads = pgTable("relay_workflow_recovery_heads
   revision: integer("revision").notNull(),
 });
 
+export const relayWorkflowVmPublications = pgTable(
+  "relay_workflow_vm_publications",
+  {
+    ordinal: bigserial("ordinal", { mode: "number" }).notNull().unique(),
+    jobId: varchar("job_id", { length: 64 })
+      .notNull()
+      .references(() => relayWorkflowJobs.jobId, { onDelete: "cascade" }),
+    actionId: text("action_id").notNull(),
+    record: jsonb("record").notNull(),
+    commitObject: text("commit_object"),
+  },
+  (table) => [primaryKey({ columns: [table.jobId, table.actionId] })],
+);
+
+export const relayWorkflowVmPublishCommands = pgTable(
+  "relay_workflow_vm_publish_commands",
+  {
+    commandId: text("command_id").primaryKey(),
+    jobId: varchar("job_id", { length: 64 }).notNull(),
+    actionId: text("action_id").notNull(),
+    allocationId: varchar("allocation_id", { length: 64 }).notNull(),
+    generation: integer("generation").notNull(),
+    pid: integer("pid").notNull(),
+    processIdentity: text("process_identity").notNull(),
+    stoppedAt: timestamp("stopped_at", { withTimezone: true }),
+    authorizationRejectedAt: timestamp("authorization_rejected_at", { withTimezone: true }),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.jobId, table.actionId],
+      foreignColumns: [relayWorkflowVmPublications.jobId, relayWorkflowVmPublications.actionId],
+    }).onDelete("cascade"),
+    uniqueIndex("workflow_vm_one_publish_command")
+      .on(table.jobId)
+      .where(sql`stopped_at IS NULL`),
+  ],
+);
+
 // A moved VM finishes the move importer, not initial repository setup. Lifecycle
 // and connection readers use the same derived receipt for either activation path.
 export const relayThreadVmReady = pgView("relay_thread_vm_ready", {
@@ -1870,6 +1908,7 @@ export const relayThreadVmProvisions = pgTable(
       readonly branch: string;
       readonly commitSha: string;
       readonly templateBuildId: string;
+      readonly workflowPublishing?: true;
     }>(),
     creationIdentityFenced: boolean("creation_identity_fenced").notNull().default(false),
     ingressRecoveryClaimId: varchar("ingress_recovery_claim_id", { length: 64 }),
@@ -2322,6 +2361,8 @@ export const relayThreadVmRestores = pgTable(
     backupRecoveryOperationId: varchar("backup_recovery_operation_id", { length: 64 })
       .unique()
       .references(() => relayThreadVmBackupRecoveries.operationId),
+    publishingActionId: text("publishing_action_id"),
+    publishingExpectedRevision: integer("publishing_expected_revision"),
     probeAttempt: integer("probe_attempt").notNull().default(0),
     preparationCancellations: jsonb("preparation_cancellations")
       .notNull()

@@ -14,6 +14,7 @@ import {
   type WorkflowVmPreparationScope,
 } from "./ThreadVmWorkflowAccess.ts";
 import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
+import { authorizeWorkflowPublishingRestore } from "./WorkflowVmPublishingRecovery.ts";
 
 interface WorkflowEnrollmentScope extends WorkflowVmPreparationScope {
   readonly restore?: true;
@@ -61,10 +62,12 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
         const [scope] = yield* sql<{
           checkpoint: RelayThreadVmWorkflowCheckpoint;
           actorUserId: string;
+          savedDiskOperationId: string;
           issued: boolean;
           runnerTemplateRef: string;
         }>`SELECT backup.native_capture_receipt#>'{source,workflowCheckpoint}' AS checkpoint,
-        r.actor_user_id AS "actorUserId",e.environment_id IS NOT NULL AS issued, initial.template_id AS "runnerTemplateRef"
+        r.actor_user_id AS "actorUserId",r.saved_disk_operation_id AS "savedDiskOperationId",
+        e.environment_id IS NOT NULL AS issued, initial.template_id AS "runnerTemplateRef"
         FROM relay_thread_vm_restores r JOIN relay_thread_placements t USING(thread_id)
         JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
         JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
@@ -93,7 +96,16 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
           AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)
         FOR SHARE OF r,s,backup,runner,initial`;
         if (!scope) return yield* new ThreadVmEnrollmentInvalid();
-        if (!scope.issued) {
+        if (
+          !scope.issued &&
+          !(yield* authorizeWorkflowPublishingRestore(sql, job, {
+            operationId: input.operationId,
+            actorUserId: scope.actorUserId,
+            threadId: hint.threadId,
+            savedDiskOperationId: scope.savedDiskOperationId,
+            workflowCheckpoint: scope.checkpoint,
+          }))
+        ) {
           const response = yield* authorizeWorkflowVmCheckpoint(sql, job);
           if (
             response?.responseId !== input.operationId ||

@@ -3,7 +3,10 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
-import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import {
+  WorkflowVmDispatchBinding,
+  type WorkflowVmPublishingRestore,
+} from "@t3tools/contracts/workflows";
 import { WorkflowRun, WorkflowRunRecovery } from "../jobs/WorkflowRunStore.ts";
 import { ownershipReleased } from "../jobs/workflowOwnership.ts";
 import { activeWorkflowStep } from "../jobs/workflowSequence.ts";
@@ -20,6 +23,7 @@ const sameBinding = Schema.toEquivalence(WorkflowVmDispatchBinding);
 export function matchesWorkflowVmLifecycleCheckpoint(
   run: WorkflowRun,
   expected: RelayThreadVmWorkflowCheckpoint,
+  publishing?: WorkflowVmPublishingRestore,
 ) {
   const checkpoint = run.progress.checkpoint;
   const step = activeWorkflowStep(run);
@@ -33,15 +37,29 @@ export function matchesWorkflowVmLifecycleCheckpoint(
     !run.pendingQueueDismissal &&
     !run.pendingPreparationRetry &&
     !run.actions?.some((action) => action.commands.some((command) => !command.stopped)) &&
-    checkpoint?.checkpointId === expected.checkpointId &&
-    checkpoint.generation === expected.checkpointGeneration &&
-    checkpoint.stepId === step?.id &&
-    ((checkpoint.kind === "review" &&
-      step?.kind === "review" &&
-      run.progress.status === "awaiting_review") ||
-      (checkpoint.kind === "input" &&
-        step?.kind === "input" &&
-        run.progress.status === "awaiting_input"))
+    (publishing
+      ? step?.kind === "action" &&
+        step.id === publishing.action.stepId &&
+        run.sequence?.generation === publishing.action.stepGeneration &&
+        run.progress.status === "paused" &&
+        run.progress.revision === publishing.expectedRevision &&
+        run.actions?.some(
+          (action) =>
+            action.actionId === publishing.action.actionId &&
+            action.state === "uncertain" &&
+            action.checkpointTurnId === publishing.action.resultTurnId &&
+            action.checkpointRef === publishing.action.checkpointRef &&
+            action.tree === publishing.action.tree,
+        )
+      : checkpoint?.checkpointId === expected.checkpointId &&
+        checkpoint.generation === expected.checkpointGeneration &&
+        checkpoint.stepId === step?.id &&
+        ((checkpoint.kind === "review" &&
+          step?.kind === "review" &&
+          run.progress.status === "awaiting_review") ||
+          (checkpoint.kind === "input" &&
+            step?.kind === "input" &&
+            run.progress.status === "awaiting_input")))
   );
 }
 
@@ -54,6 +72,7 @@ export const requireWorkflowVmLifecycleCheckpoint = Effect.fn(
     threadId: string;
     generation: number;
     workflowCheckpoint: RelayThreadVmWorkflowCheckpoint;
+    publishing?: WorkflowVmPublishingRestore;
   },
 ) {
   const expected = input.workflowCheckpoint;
@@ -75,7 +94,7 @@ export const requireWorkflowVmLifecycleCheckpoint = Effect.fn(
     saved.run.runtime.kind !== "vm" ||
     run.runtime.threadId !== input.threadId ||
     run.runtime.generation !== input.generation ||
-    !matchesWorkflowVmLifecycleCheckpoint(run, expected) ||
+    !matchesWorkflowVmLifecycleCheckpoint(run, expected, input.publishing) ||
     !sameBinding(saved.run.runtime, run.runtime) ||
     !sameRun(saved.run, run) ||
     saved.frozenConfiguration.jobId !== run.jobId ||

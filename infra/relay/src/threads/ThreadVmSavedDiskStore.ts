@@ -9,6 +9,10 @@ import { releaseThreadNativeCheckpointOperation } from "./ThreadNativeCheckpoint
 import { E2BNativeSnapshotReceipt } from "../machines/E2BNativeSnapshotReceipt.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import { savedDiskHasCancelledRestorePlacement } from "./ThreadVmSavedDiskPlacement.ts";
+import {
+  readHeldPublishingBackup,
+  type WorkflowPublishingRecoverySource,
+} from "./WorkflowVmPublishingRecovery.ts";
 
 export class ThreadVmSavedDiskConflict extends Schema.TaggedError<ThreadVmSavedDiskConflict>()(
   "ThreadVmSavedDiskConflict",
@@ -169,6 +173,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
     readonly expectedGeneration: number;
     readonly replacementRequestId?: string;
     readonly workflowJobId?: string;
+    readonly publishingRecovery?: WorkflowPublishingRecoverySource;
   }) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -215,11 +220,24 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
         }
         if (save.restoreOperationId === input.operationId)
           return yield* conflict("Restore already ended; use a new operation identity");
+        const publishing = input.publishingRecovery
+          ? yield* readHeldPublishingBackup(sql, input.threadId, input.publishingRecovery)
+          : null;
+        if (
+          input.publishingRecovery &&
+          (!input.workflowJobId ||
+            publishing?.savedDiskOperationId !== save.operationId ||
+            publishing.checkpoint.jobId !== input.workflowJobId ||
+            (yield* sql`SELECT 1 FROM relay_thread_vm_allocations
+              WHERE thread_id=${input.threadId} AND deleted_at IS NULL`).length)
+        )
+          return yield* conflict("The publishing recovery point no longer owns this saved disk.");
         const [valid] = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks s
         JOIN relay_thread_placements t USING(thread_id)
         JOIN relay_thread_vm_policies p ON p.organization_id=${placement.organizationId}
-        WHERE s.operation_id=${save.operationId} AND s.phase='available' AND t.generation=${input.expectedGeneration}
-          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}))
+        WHERE s.operation_id=${save.operationId} AND t.generation=${input.expectedGeneration}
+          AND (s.phase='available' OR (${publishing !== null} AND s.phase='restored'))
+          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}) OR ${publishing !== null})
           AND ((${input.workflowJobId !== undefined} AND ${workflowOwnsWorkspace(sql)}) OR
             ((s.saved_at AT TIME ZONE p.calendar_time_zone
               + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)

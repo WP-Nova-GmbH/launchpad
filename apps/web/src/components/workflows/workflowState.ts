@@ -166,29 +166,24 @@ export const savedWorkflowDraft = (
 
 export type WorkflowTemplate = "review" | "publish";
 
-export function workflowTemplateNeedsCheckout(template: WorkflowTemplate, vmAuthoring: boolean) {
-  return template === "publish" || !vmAuthoring;
-}
-
 export function newWorkflowDraft(
   projects: ReadonlyArray<RelayOrganizationProject>,
   template: WorkflowTemplate = "review",
   vmAuthoring = false,
 ): WorkflowEditorDraft | null {
   const project = projects[0];
-  const target: WorkflowTarget | null = workflowTemplateNeedsCheckout(template, vmAuthoring)
-    ? project
+  const target: WorkflowTarget | null = vmAuthoring
+    ? { kind: "vm", baseBranch: null }
+    : project
       ? { kind: "machine", environmentId: project.environmentId, projectId: project.projectId }
-      : null
-    : { kind: "vm", baseBranch: null };
+      : null;
   if (!target) return null;
   return {
     workflowId: randomUUID(),
     automation: normalizeWorkflowAutomation(),
     automationResolved: true,
     baseline: null,
-    targetConfirmed:
-      template === "publish" ? projects.length === 1 : projects.length + Number(vmAuthoring) === 1,
+    targetConfirmed: projects.length + Number(vmAuthoring) === 1,
     selectedStepId: "",
     operation: null,
     error: null,
@@ -225,13 +220,8 @@ export function newWorkflowDraft(
   };
 }
 
-function workflowCopyTemplate(source: RepositoryWorkflow) {
-  return source.definition.steps.some((step) => step.kind === "action") ? "publish" : "review";
-}
-
 export function workflowCopyNeedsCheckout(source: RepositoryWorkflow, vmAuthoring: boolean) {
-  if (source.definition.target.kind === "vm" && !vmAuthoring) return false;
-  return workflowTemplateNeedsCheckout(workflowCopyTemplate(source), vmAuthoring);
+  return source.definition.target.kind === "machine" && !vmAuthoring;
 }
 
 export function copiedWorkflowDraft(
@@ -241,7 +231,7 @@ export function copiedWorkflowDraft(
   vmAuthoring = false,
 ) {
   if (source.definition.target.kind === "vm" && !vmAuthoring) return null;
-  const draft = newWorkflowDraft(projects, workflowCopyTemplate(source), vmAuthoring);
+  const draft = newWorkflowDraft(projects, "review", vmAuthoring);
   if (!draft) return null;
   const sourceTarget = source.definition.target;
   const machine =
@@ -252,15 +242,16 @@ export function copiedWorkflowDraft(
             project.projectId === sourceTarget.projectId,
         )
       : undefined;
+  const checkout = machine ?? (sourceTarget.kind === "machine" ? projects[0] : undefined);
   const target: WorkflowTarget | undefined =
-    sourceTarget.kind === "vm" && vmAuthoring
+    sourceTarget.kind === "vm"
       ? { kind: "vm", baseBranch: sameRepository ? sourceTarget.baseBranch : null }
-      : machine
-        ? { kind: "machine", environmentId: machine.environmentId, projectId: machine.projectId }
+      : checkout
+        ? { kind: "machine", environmentId: checkout.environmentId, projectId: checkout.projectId }
         : undefined;
   return {
     ...draft,
-    targetConfirmed: !!target || draft.targetConfirmed,
+    targetConfirmed: sourceTarget.kind === "vm" || !!machine || draft.targetConfirmed,
     definition: {
       ...draft.definition,
       name: `Copy of ${source.definition.name}`.slice(0, 120),

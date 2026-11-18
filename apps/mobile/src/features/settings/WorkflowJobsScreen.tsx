@@ -238,6 +238,13 @@ function WorkflowJobsContent(props: Props) {
   const reviewApproval = workflowReviewApprovalState(drafts.reviews[jobKey], read);
   const checkingReturnedReview = reviewApproval === "checking";
   const selectedJob = read.job;
+  const publicationOutcome =
+    selectedJob?.status === "cancelled" && selectedJob.runtime?.kind === "vm"
+      ? selectedJob.publicationOutcome
+      : undefined;
+  const publishedBranchUrl = publicationOutcome?.branchUrl;
+  const publishedPullRequestUrl =
+    publicationOutcome?.pullRequestUrl ?? selectedJob?.progress?.pullRequestUrl;
   const manualState = workflowManualControlState(selectedJob);
   const vmRecovery = manualState.recovery;
   const approvalPending = workflowApprovalPending(selectedJob);
@@ -1230,10 +1237,35 @@ function WorkflowJobsContent(props: Props) {
               />
             ) : null}
           </SettingsSection>
+          {publicationOutcome ? (
+            <SettingsSection title="GitHub publishing">
+              {publicationOutcome.state === "unknown" ? (
+                <ErrorBanner
+                  title="Publishing outcome unknown"
+                  message="Launchpad could not verify whether GitHub received the last publishing action."
+                  tone="warning"
+                />
+              ) : null}
+              {publishedBranchUrl ? (
+                <SettingsRow
+                  icon="link"
+                  label="Published branch"
+                  onPress={() => void Linking.openURL(publishedBranchUrl)}
+                />
+              ) : null}
+              {publishedPullRequestUrl ? (
+                <SettingsRow
+                  icon="link"
+                  label="Pull request"
+                  onPress={() => void Linking.openURL(publishedPullRequestUrl)}
+                />
+              ) : null}
+            </SettingsSection>
+          ) : null}
           {canPause ||
           (canCancel && !cancelling) ||
           conversationInRunActions ||
-          (!completed && selectedJob.progress?.pullRequestUrl) ? (
+          (!completed && !publicationOutcome && publishedPullRequestUrl) ? (
             <RunDetailsDisclosure key={jobKey + ":actions"} label="Run actions" icon="ellipsis">
               {conversationInRunActions ? (
                 <SettingsActionRow
@@ -1243,12 +1275,12 @@ function WorkflowJobsContent(props: Props) {
                   onPress={() => void openResult(false)}
                 />
               ) : null}
-              {!completed && selectedJob.progress?.pullRequestUrl ? (
+              {!completed && !publicationOutcome && publishedPullRequestUrl ? (
                 <SettingsRow
                   icon="link"
                   label="Pull request"
-                  value={selectedJob.progress.pullRequestUrl}
-                  onPress={() => void Linking.openURL(selectedJob.progress!.pullRequestUrl!)}
+                  value={publishedPullRequestUrl}
+                  onPress={() => void Linking.openURL(publishedPullRequestUrl)}
                 />
               ) : null}
               {canPause ? (

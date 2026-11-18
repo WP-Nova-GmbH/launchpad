@@ -3,7 +3,11 @@ import type {
   CodexConversationManifest,
   RelayThreadVmRestoreRecovery,
 } from "@t3tools/contracts/relay";
-import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
+import {
+  WorkflowVmDispatchBinding,
+  type WorkflowVmPublishingAction,
+  type WorkflowVmPublishingRestore,
+} from "@t3tools/contracts/workflows";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -11,7 +15,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { WorkflowRunRecovery } from "../jobs/WorkflowRunStore.ts";
+import { WorkflowRunRecovery, type WorkflowActionRecord } from "../jobs/WorkflowRunStore.ts";
 import {
   requireWorkflowVmLifecycleCheckpoint,
   matchesWorkflowVmLifecycleCheckpoint,
@@ -35,6 +39,167 @@ class ThreadVmWorkflowRestoreError extends Schema.TaggedError<ThreadVmWorkflowRe
 const fail = () => new ThreadVmWorkflowRestoreError();
 const oid = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u;
 type WorkflowRecovery = NonNullable<RelayThreadVmRestoreRecovery["workflow"]>;
+
+function restoredPublishingAction(
+  action: WorkflowVmPublishingAction,
+  state: "uncertain" | "completed",
+  pullRequestUrl = action.pullRequestUrl,
+): WorkflowActionRecord {
+  return {
+    actionId: action.actionId,
+    stepId: action.stepId,
+    generation: action.stepGeneration,
+    operation: action.operation,
+    state,
+    phase: state === "completed" ? "done" : action.operation === "push" ? "push" : "pull_request",
+    parent: action.parent,
+    tree: action.tree,
+    checkpointRef: action.checkpointRef,
+    checkpointTurnId: action.resultTurnId,
+    commitMessage: null,
+    commitSha: action.commitSha,
+    oldRemoteSha: action.oldRemoteSha,
+    prTitle: null,
+    prBody: null,
+    pullRequestUrl,
+    detail: null,
+    commands: [],
+  };
+}
+
+/** Move the sealed checkpoint forward only through recorded responses and publishing receipts. */
+export function restoreWorkflowPublishingAction(
+  capsule: WorkflowRunRecovery,
+  publishing: WorkflowVmPublishingRestore,
+): WorkflowRunRecovery | null {
+  const run = capsule.run;
+  const { action, outcome, previousPush } = publishing;
+  const sequence = run.sequence;
+  const latest = sequence?.completed.findLast((entry) => entry.checkpoint)?.checkpoint;
+  const steps = run.workflow.definition.steps;
+  const cursor = steps.findIndex((step) => step.id === action.stepId);
+  const target = steps[cursor];
+  if (
+    !sequence ||
+    !latest ||
+    !run.publication ||
+    !run.preparedHead ||
+    publishing.expectedRevision < run.progress.revision ||
+    action.stepGeneration !== sequence.generation ||
+    action.actionId !== `workflow:${run.jobId}:action:${action.stepId}:${sequence.generation}` ||
+    cursor <= sequence.cursor ||
+    target?.kind !== "action" ||
+    target.action !== action.operation ||
+    latest.turnId !== action.resultTurnId ||
+    latest.checkpointRef !== action.checkpointRef ||
+    !capsule.checkpointPins.some(
+      (pin) =>
+        pin.turnId === action.resultTurnId &&
+        pin.checkpointRef === action.checkpointRef &&
+        pin.treeId === action.tree,
+    ) ||
+    (outcome && outcome.commitSha !== action.commitSha)
+  )
+    return null;
+  const responses = [...sequence.responses];
+  const completed = [...sequence.completed];
+  const actions = [...(run.actions ?? [])];
+  let preparedHead = run.preparedHead;
+  let pullRequestUrl = run.publication.pullRequestUrl;
+  let publishedHead = run.publication.publishedHead;
+  for (const step of steps.slice(sequence.cursor, cursor)) {
+    if (step.kind === "agent") return null;
+    if (step.kind === "action") {
+      const receipt = publishing.completedActions.find(
+        (entry) =>
+          entry.stepId === step.id &&
+          entry.stepGeneration === sequence.generation &&
+          entry.operation === step.action,
+      );
+      if (
+        !receipt ||
+        receipt.actionId !== `workflow:${run.jobId}:action:${step.id}:${sequence.generation}` ||
+        receipt.resultTurnId !== action.resultTurnId ||
+        receipt.checkpointRef !== action.checkpointRef ||
+        receipt.tree !== action.tree ||
+        receipt.parent !== preparedHead ||
+        receipt.commitSha !== receipt.outcome.commitSha
+      )
+        return null;
+      actions.push(restoredPublishingAction(receipt, "completed", receipt.outcome.pullRequestUrl));
+      if (receipt.operation === "push") preparedHead = publishedHead = receipt.outcome.commitSha;
+      pullRequestUrl = receipt.outcome.pullRequestUrl ?? pullRequestUrl;
+    } else {
+      const id = `workflow:${run.jobId}:checkpoint:${step.id}:${sequence.generation}`;
+      const response = publishing.responses.find(
+        (entry) =>
+          entry.checkpointId === id &&
+          entry.stepId === step.id &&
+          entry.generation === sequence.generation &&
+          entry.operation === (step.kind === "review" ? "approve" : "input"),
+      );
+      if (!response) return null;
+      if (!responses.some((entry) => entry.checkpointId === id)) responses.push(response);
+    }
+    completed.push({
+      stepId: step.id,
+      generation: sequence.generation,
+      checkpoint: null,
+      head: preparedHead,
+    });
+  }
+  if (action.parent !== preparedHead || action.oldRemoteSha !== publishedHead) return null;
+  let commitSha = action.commitSha;
+  if (action.operation === "open_pull_request") {
+    if (
+      !previousPush ||
+      previousPush.operation !== "push" ||
+      previousPush.resultTurnId !== action.resultTurnId ||
+      previousPush.checkpointRef !== action.checkpointRef ||
+      previousPush.tree !== action.tree ||
+      previousPush.commitSha !== previousPush.outcome.commitSha ||
+      (commitSha !== null && commitSha !== previousPush.outcome.commitSha) ||
+      previousPush.outcome.commitSha !== publishedHead
+    )
+      return null;
+    if (!actions.some((entry) => entry.actionId === previousPush.actionId))
+      actions.push(restoredPublishingAction(previousPush, "completed"));
+    // A read credential can record Open PR before it binds the pushed commit.
+    commitSha = previousPush.outcome.commitSha;
+  }
+  const detail = "The workflow VM recovered the saved result. Retry publishing to verify GitHub.";
+  return {
+    ...capsule,
+    run: {
+      ...run,
+      actions: [
+        ...actions.filter((entry) => entry.actionId !== action.actionId),
+        restoredPublishingAction(
+          { ...action, commitSha },
+          "uncertain",
+          outcome?.pullRequestUrl ?? action.pullRequestUrl,
+        ),
+      ],
+      publication: {
+        ...run.publication,
+        publishedHead,
+        pullRequestUrl: outcome?.pullRequestUrl ?? action.pullRequestUrl ?? pullRequestUrl,
+      },
+      preparedHead,
+      sequence: { ...sequence, cursor, completed, responses, feedback: null },
+      progress: {
+        ...run.progress,
+        revision: publishing.expectedRevision,
+        stepId: action.stepId,
+        status: "paused",
+        underlyingStatus: "paused",
+        checkpoint: null,
+        detail,
+        approvalPending: false,
+      },
+    },
+  };
+}
 
 /** Check the workload-owned home the next Agent actually uses. Archived roots
  * and immutable history prefixes are read through the fixed guest reader. */
@@ -169,7 +334,12 @@ export const readWorkflowVmRecoveryCapsule = Effect.fn("ThreadVmWorkflowRestore.
           capsule.workflowIgnoreRulesBase64)
     )
       return yield* Effect.fail(fail());
-    return capsule;
+    if (!workflow.publishing) return capsule;
+    if (workflow.publishing.latestPublicationRevision < checkpoint.publicationRevision)
+      return yield* Effect.fail(fail());
+    const restored = restoreWorkflowPublishingAction(capsule, workflow.publishing);
+    if (!restored) return yield* Effect.fail(fail());
+    return restored;
   },
 );
 
@@ -229,6 +399,7 @@ export const assertWorkflowVmRestoreReady = Effect.fn("ThreadVmWorkflowRestore.a
       threadId: workflow.binding.threadId,
       generation: workflow.binding.generation,
       workflowCheckpoint: workflow.checkpoint,
+      ...(workflow.publishing ? { publishing: workflow.publishing } : {}),
     });
     const claim = yield* makeThreadCheckoutClaims(sql).get(recovery.operationId);
     const fs = yield* FileSystem.FileSystem;

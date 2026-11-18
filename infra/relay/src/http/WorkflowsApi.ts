@@ -58,8 +58,21 @@ import { mapRelayCommonApiErrors, relayInternalErrorResponse } from "./Api.ts";
 
 const sameWorkflowResponse = Schema.toEquivalence(RespondToWorkflowJob);
 
+function canReplaceBlockedCheckpoint(row: WorkflowJobRecord) {
+  const pending = row.pendingControl;
+  const saving = row.record.progress?.resultSaving;
+  return (
+    row.record.runtime?.kind === "vm" &&
+    pending?.responseId !== undefined &&
+    isWorkflowCheckpointResponse(pending.response) &&
+    !pending.checkpointDispatch &&
+    saving?.state === "failed" &&
+    saving.retryable
+  );
+}
+
 const jobForClient = (row: WorkflowJobRecord): RepositoryWorkflowJob => {
-  const pending = row.pendingControl?.response;
+  const pending = canReplaceBlockedCheckpoint(row) ? undefined : row.pendingControl?.response;
   const operation = pending?.operation;
   const { pendingResponseId: _storedResponseId, ...record } = row.record;
   const { progress } = record;
@@ -68,7 +81,7 @@ const jobForClient = (row: WorkflowJobRecord): RepositoryWorkflowJob => {
     ...(progress?.retryableApproval && !workflowApprovalCanRetry(progress)
       ? { progress: { ...progress, retryableApproval: false } }
       : {}),
-    responsePending: row.pendingControl !== null && !isTerminalWorkflowJob(row.record.status),
+    responsePending: pending !== undefined && !isTerminalWorkflowJob(row.record.status),
     ...(pending?.operation === "retry_saving" &&
     pending.publicationId === row.record.progress?.resultSaving?.publicationId
       ? { resultSaveRetryPending: true }
@@ -117,8 +130,13 @@ const withViewerControls = Effect.fnUntraced(function* (
       userId: membership.userId,
     })) === "maintainer";
   const memberCheckpoint = job.progress?.checkpoint?.role === "member";
+  const publishing = job.workflow?.definition.steps.some(
+    (step) => step.kind === "action" && step.id === job.progress?.stepId,
+  );
   const vmRecovery =
-    job.progress?.status === "awaiting_input" || job.progress?.status === "awaiting_review"
+    publishing ||
+    job.progress?.status === "awaiting_input" ||
+    job.progress?.status === "awaiting_review"
       ? (yield* vmRecoveries([row.jobId])).get(row.jobId)
       : undefined;
   const pending = pendingWorkflowVmCheckpoint(row);
@@ -298,7 +316,8 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     return yield* withViewerControls(row, membership);
   if (
     (row.pendingControl &&
-      !(payload.operation === "cancel" && row.pendingControl.response.operation !== "cancel")) ||
+      !(payload.operation === "cancel" && row.pendingControl.response.operation !== "cancel") &&
+      !(payload.operation === "retry_saving" && canReplaceBlockedCheckpoint(row))) ||
     (row.status === "cancelling" && payload.operation !== "retry_cancellation")
   )
     return yield* new WorkflowConflictError({
@@ -347,6 +366,10 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
     });
   const progress = row.record.progress;
   const retryableApproval = workflowApprovalCanRetry(progress);
+  if (vmCheckpoint && progress?.resultSaving)
+    return yield* new WorkflowConflictError({
+      message: "Finish saving the workflow result before responding.",
+    });
   if (
     checkpointResponse &&
     ((workflowIsFinishing(row.record)
@@ -375,7 +398,7 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
   const pendingControl = {
     userId: membership.userId,
     response: payload,
-    ...(vmCheckpoint
+    ...(vmCheckpoint || (row.record.runtime?.kind === "vm" && payload.operation === "retry_action")
       ? {
           responseId: yield* (yield* Crypto.Crypto).randomUUIDv4.pipe(
             Effect.catch(() => relayInternalErrorResponse("internal_error")),
@@ -620,11 +643,6 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
       return yield* new WorkflowInvalidError({
         message: "Verify the workflow VM build and its Codex models before running.",
       });
-    if (workflow.definition.steps.some((step) => step.kind === "action"))
-      return yield* new WorkflowInvalidError({
-        message:
-          "VM workflows do not support Push or Open PR yet. Remove those steps before running.",
-      });
     const issue = vmWorkflowDefinitionIssue(
       workflow.definition.target.baseBranch,
       workflow.definition.steps,
@@ -647,6 +665,7 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
       organizationId,
       repositoryId,
       baseBranch: workflow.definition.target.baseBranch,
+      publishingSteps: workflow.definition.steps,
     }).pipe(
       Effect.provideService(GithubApp, githubApp.value),
       Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })),

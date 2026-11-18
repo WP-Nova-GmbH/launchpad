@@ -202,10 +202,17 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
                     AND p.retry_at<=clock_timestamp())))
               OR (t.audience='repository' AND j.pending_control->>'responseId'=c.operation_id
                 AND j.pending_control->'checkpointDispatch' IS NULL
-                AND ((j.status='awaiting_review' AND j.pending_control#>>'{response,operation}' IN ('approve','request_changes'))
+                AND ((((j.status='awaiting_review' AND j.pending_control#>>'{response,operation}' IN ('approve','request_changes'))
                   OR (j.status='awaiting_input' AND j.pending_control#>>'{response,operation}'='input'))
+                  AND j.record#>>'{progress,checkpoint,checkpointId}'=j.pending_control#>>'{response,checkpointId}')
+                  OR (c.kind='create' AND j.status='paused'
+                    AND j.pending_control#>>'{response,operation}'='retry_action'
+                    AND EXISTS (SELECT 1 FROM jsonb_array_elements(j.record#>'{progress,actions}') action
+                      WHERE action->>'actionId'=j.pending_control#>>'{response,actionId}'
+                        AND action->>'stepId'=j.record#>>'{progress,stepId}'
+                        AND action->>'generation'=j.record#>>'{progress,generation}'
+                        AND action->>'retryable'='true')))
                 AND j.record#>>'{progress,status}'=j.status
-                AND j.record#>>'{progress,checkpoint,checkpointId}'=j.pending_control#>>'{response,checkpointId}'
                 AND j.record#>>'{progress,revision}'=j.pending_control#>>'{response,expectedRevision}'
                 AND ((c.kind='resume' AND EXISTS (
                   SELECT 1 FROM relay_thread_vm_resumes q WHERE q.operation_id=c.operation_id
