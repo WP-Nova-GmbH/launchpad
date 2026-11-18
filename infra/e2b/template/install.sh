@@ -5,36 +5,55 @@ set -euo pipefail
 # Keep installation in one process and one native snapshot layer.
 export PATH=/opt/launchpad/bin:/opt/launchpad/node/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+runner_arch=$(cat /opt/launchpad-package/runner-arch)
+machine=$(uname -m)
+case "$runner_arch:$machine" in
+  arm64:aarch64)
+    node_arch=arm64
+    node_sha256=81d8f0fdea9dcd3bfdcfeafc5f8359c151f097e9880b0007c0645ca670d07971
+    cloudflared_sha256=5a4e8ce2701105271412059f44b6a0bf1ae4542b4d98ff3180c0c019443a5815
+    ;;
+  amd64:x86_64)
+    node_arch=x64
+    node_sha256=40e1d3225c1c9ae9a2671c98ecb9857e4d5555026394f348645676798840d5c5
+    cloudflared_sha256=5286698547f03df745adb2355f04c12dde52ef425491e81f433642d695521886
+    ;;
+  *)
+    printf 'Runner architecture %s does not match E2B guest architecture %s.\n' "$runner_arch" "$machine" >&2
+    exit 1
+    ;;
+esac
+
 # pnpm's WSL probe otherwise triggers systemd's binfmt automount after restore.
 ln -sf /dev/null /etc/systemd/system/proc-sys-fs-binfmt_misc.automount
 umount --no-canonicalize --lazy /proc/sys/fs/binfmt_misc
-test "$(uname -m)" = aarch64
 apt-get update
 apt-get install -y --no-install-recommends bash ca-certificates curl git gh libatomic1 openssh-client python3 ripgrep tar util-linux xz-utils
 rm -rf /var/lib/apt/lists/*
 
 # Stock finalization makes /usr/local writable; trusted tools stay under /opt.
 mkdir -p /opt/launchpad/bin /opt/launchpad/node
-curl --fail --silent --show-error --location https://nodejs.org/dist/v26.8.2/node-v26.8.2-linux-arm64.tar.xz -o /tmp/node.tar.xz
-echo '81d8f0fdea9dcd3bfdcfeafc5f8359c151f097e9880b0007c0645ca670d07971  /tmp/node.tar.xz' | sha256sum --check --strict
+curl --fail --silent --show-error --location "https://nodejs.org/dist/v26.8.2/node-v26.8.2-linux-$node_arch.tar.xz" -o /tmp/node.tar.xz
+printf '%s  /tmp/node.tar.xz\n' "$node_sha256" | sha256sum --check --strict
 tar -xJf /tmp/node.tar.xz --strip-components=1 --no-same-owner -C /opt/launchpad/node
 rm /tmp/node.tar.xz
 npm install --global --no-audit --no-fund @openai/codex@0.159.3 pnpm@11.10.0
 npm cache clean --force
 
 # Exec the native harness in the tracked PID rather than its npm Node wrapper.
-node --input-type=module <<'JAVASCRIPT'
+node --input-type=module - "$node_arch" "$machine" <<'JAVASCRIPT'
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 const root = "/opt/launchpad/node/lib/node_modules/@openai/codex";
 const require = createRequire(root + "/package.json");
-const pkg = require.resolve("@openai/codex-linux-arm64/package.json");
+const [nodeArch, machine] = process.argv.slice(2);
+const pkg = require.resolve(`@openai/codex-linux-${nodeArch}/package.json`);
 if (JSON.parse(fs.readFileSync(root + "/package.json")).version !== "0.159.3" ||
-    JSON.parse(fs.readFileSync(pkg)).version !== "0.159.3-linux-arm64")
+    JSON.parse(fs.readFileSync(pkg)).version !== `0.159.3-linux-${nodeArch}`)
   throw Error("Unexpected native package");
-const executable = fs.realpathSync(path.join(path.dirname(pkg), "vendor/aarch64-unknown-linux-musl/bin/codex"));
+const executable = fs.realpathSync(path.join(path.dirname(pkg), `vendor/${machine}-unknown-linux-musl/bin/codex`));
 if (!executable.startsWith("/opt/launchpad/node/lib/node_modules/") || !/^[a-zA-Z0-9@/._-]+$/.test(executable))
   throw Error("Unexpected native executable");
 fs.mkdirSync("/opt/launchpad", { recursive: true });
@@ -56,8 +75,8 @@ JAVASCRIPT
 codex --version
 
 # Same pinned connector asset as packages/shared/src/relayClient.ts.
-curl --fail --silent --show-error --location https://github.com/cloudflare/cloudflared/releases/download/2026.5.2/cloudflared-linux-arm64 -o /opt/launchpad/bin/cloudflared
-echo '5a4e8ce2701105271412059f44b6a0bf1ae4542b4d98ff3180c0c019443a5815  /opt/launchpad/bin/cloudflared' | sha256sum --check --strict
+curl --fail --silent --show-error --location "https://github.com/cloudflare/cloudflared/releases/download/2026.5.2/cloudflared-linux-$runner_arch" -o /opt/launchpad/bin/cloudflared
+printf '%s  /opt/launchpad/bin/cloudflared\n' "$cloudflared_sha256" | sha256sum --check --strict
 chmod 0755 /opt/launchpad/bin/cloudflared
 cloudflared --version
 
@@ -71,8 +90,6 @@ tar -xzf server.tar.gz --strip-components=1 --no-same-owner -C /opt/launchpad/se
 chmod -R a+rX /opt/launchpad/server
 rm server.tar.gz server.sha256
 test -f /opt/launchpad/server/client/index.html
-test -d /opt/launchpad/server/node_modules/node-pty
-test -x /opt/launchpad/server/resource-monitor/t3-resource-monitor
 /opt/launchpad/server/t3 --version
 codex --version
 pnpm --version
@@ -122,6 +139,7 @@ runuser -u user -- env PATH="$PATH" HOME=/home/user bash -euc '
   test -r /opt/launchpad/server/client/index.html
   make --version
   c++ --version
-'
+  exec python3 - --native-tools-only
+' < /opt/launchpad-package/runner-guest-proof.py
 cd /
 rm -rf /opt/launchpad-package

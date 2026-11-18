@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 DEFAULT_HUGEPAGES = 4096
+DEFAULT_POSTGRES_HOST_PORT = 5432
 NATIVE_API_REQUEST_TIMEOUT_SECONDS = 70
 
 
@@ -259,11 +260,14 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def build(output, arch, lock=None, *, hugepages=DEFAULT_HUGEPAGES, envd_timeout_seconds=None):
+def build(output, arch, lock=None, *, hugepages=DEFAULT_HUGEPAGES, envd_timeout_seconds=None,
+          postgres_host_port=DEFAULT_POSTGRES_HOST_PORT):
     if arch not in ("arm64", "amd64"):
         raise ValueError("Stock runtime target must be Linux arm64 or amd64")
     if not isinstance(hugepages, int) or hugepages < DEFAULT_HUGEPAGES:
         raise ValueError(f"Stock runtime requires at least {DEFAULT_HUGEPAGES} hugepages")
+    if type(postgres_host_port) is not int or not 1 <= postgres_host_port <= 65535:
+        raise ValueError("PostgreSQL host port must be an integer from 1 to 65535")
     if envd_timeout_seconds is not None and (
         type(envd_timeout_seconds) is not int
         or not 0 < envd_timeout_seconds < NATIVE_API_REQUEST_TIMEOUT_SECONDS
@@ -303,6 +307,15 @@ def build(output, arch, lock=None, *, hugepages=DEFAULT_HUGEPAGES, envd_timeout_
                         (packages / "orchestrator/pkg/version/main.go").read_text())
     if not release or release.groups() != match.groups()[:2]:
         raise ValueError("Stock orchestrator version differs from the native release line")
+    compose = (embed / "compose.yaml").read_bytes()
+    if postgres_host_port != DEFAULT_POSTGRES_HOST_PORT:
+        # The API and dashboard use host networking. The migrator and seed connect by service name.
+        host_binding = b'"127.0.0.1:5432:5432"'
+        host_connection = b"@127.0.0.1:5432/"
+        if compose.count(host_binding) != 1 or compose.count(host_connection) != 2:
+            raise ValueError("Unexpected PostgreSQL host bindings or connections in pinned stock Compose")
+        compose = compose.replace(host_binding, f'"127.0.0.1:{postgres_host_port}:5432"'.encode())
+        compose = compose.replace(host_connection, f"@127.0.0.1:{postgres_host_port}/".encode())
     migration = max(path.name.split("_", 1)[0] for path in (packages / "db/migrations").glob("*.sql"))
     if not re.fullmatch(r"[0-9]{14}", migration):
         raise ValueError("Cannot determine the stock database migration")
@@ -332,7 +345,7 @@ def build(output, arch, lock=None, *, hugepages=DEFAULT_HUGEPAGES, envd_timeout_
     orchestrator.chmod(0o755)
     digest = sha256(orchestrator)
     (artifacts / "install-orchestrator.sh").write_text(INSTALLER)
-    shutil.copyfile(embed / "compose.yaml", output / "compose.yaml")
+    (output / "compose.yaml").write_bytes(compose)
     # The tools image binds the actual launcher and fetch scripts to this source.
     defaults = (embed / ".env").read_text()
     for role, variable in (("tools", "E2B_TOOLS_IMAGE"), ("node-e2b", "E2B_NODE_E2B_IMAGE")):
@@ -407,13 +420,15 @@ def main():
                         help="Number of native 2 MiB hugepages to reserve (default and minimum: %(default)s)")
     parser.add_argument("--envd-timeout-seconds", type=int,
                         help="Guest readiness timeout for the orchestrator (stock default: 10 seconds)")
+    parser.add_argument("--postgres-host-port", type=int, default=DEFAULT_POSTGRES_HOST_PORT,
+                        help="Host loopback port for PostgreSQL (default: %(default)s)")
     args = parser.parse_args()
     if sys.version_info < (3, 12):
         parser.error("Python 3.12 or newer is required for safe source archive extraction")
     if platform.system() != "Linux":
         parser.error("Run inside the dedicated Linux host; on macOS this is inside Lima")
     result = build(args.output, args.arch, hugepages=args.hugepages,
-                   envd_timeout_seconds=args.envd_timeout_seconds)
+                   envd_timeout_seconds=args.envd_timeout_seconds, postgres_host_port=args.postgres_host_port)
     print(f"Prepared stock runtime: {result / 'build.json'}")
     print("No services were started and no existing deployment was changed.")
 

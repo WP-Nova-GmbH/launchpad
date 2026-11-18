@@ -4,6 +4,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { ensureDevVmImage } from "./dev-vm-image.ts";
+import type { LinuxVmArchive } from "./vm-linux-archive.ts";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -35,11 +36,12 @@ async function fixture() {
     archiveDirectory = outputDirectory;
     const archive = NodePath.join(outputDirectory, "server.tar.gz");
     await NodeFSP.writeFile(archive, "packaged Linux server");
-    return { archive, sha256: "a".repeat(64) };
+    return { archive, sha256: "a".repeat(64), arch: "arm64" } satisfies LinuxVmArchive;
   });
-  const buildTemplate = vi.fn(async ({ archive, sha256 }: { archive: string; sha256: string }) => {
+  const buildTemplate = vi.fn(async ({ archive, sha256, arch }: LinuxVmArchive) => {
     expect(await NodeFSP.readFile(archive, "utf8")).toBe("packaged Linux server");
     expect(sha256).toBe("a".repeat(64));
+    expect(arch).toBe("arm64");
     await writeSelection();
   });
   const input = { repoRoot, env, buildArchive, buildTemplate };

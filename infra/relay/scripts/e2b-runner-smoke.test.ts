@@ -34,10 +34,11 @@ const executionChecks = {
   nativeCodexWorkloadsStopped: true,
 };
 
-async function fixture() {
+async function fixture(arch?: "arm64" | "amd64") {
   const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-smoke-"));
   const receipt = {
     state: "built",
+    arch,
     apiUrl: "http://127.0.0.1:3000",
     templateId: "fixture",
     buildTag: "build-00000000-0000-4000-8000-000000000001",
@@ -88,7 +89,7 @@ async function fixture() {
              : command.includes('WORKFLOW_ISOLATION_PROOF') ? JSON.stringify(input.checks)
              : command.includes('WORKFLOW_MODEL_PROOF') ? JSON.stringify({
                  defaultModel: 'gpt-6-astra', models: [{ slug: 'gpt-6-astra', name: 'GPT-6 Astra' }] })
-             : '{}',
+             : JSON.stringify({ architecture: input.guestArchitecture ?? 'aarch64' }),
          }) }};
        }
        static list() { return { hasNext: false }; }
@@ -105,7 +106,12 @@ async function fixture() {
     published,
     async run(
       checks: Record<string, boolean>,
-      options: { isolation?: boolean; cleanupFails?: boolean; tagChanged?: boolean } = {},
+      options: {
+        isolation?: boolean;
+        cleanupFails?: boolean;
+        tagChanged?: boolean;
+        guestArchitecture?: "aarch64" | "x86_64";
+      } = {},
     ) {
       const input = NodePath.join(directory, `input-${attempt}.json`);
       const output = NodePath.join(directory, `output-${attempt++}`);
@@ -150,6 +156,36 @@ async function fixture() {
 }
 
 describe("workflow isolation publication", () => {
+  it.each([
+    ["amd64", "x86_64", "aarch64"],
+    ["arm64", "aarch64", "x86_64"],
+  ] as const)(
+    "publishes %s proof only for the matching guest architecture",
+    async (arch, machine, wrongMachine) => {
+      const test = await fixture(arch);
+      try {
+        const checks = { ...legacyChecks, ...executionChecks };
+        const mismatch = await test.run(checks, { guestArchitecture: wrongMachine });
+        expect(mismatch.result.status, mismatch.result.stderr).toBe(1);
+        expect(mismatch.cleanup.publishedBeforeCleanup).toBe(false);
+        await expect(NodeFSP.readFile(test.published)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(
+          NodeFSP.readFile(NodePath.join(mismatch.output, "workflow-models.json")),
+        ).rejects.toMatchObject({ code: "ENOENT" });
+
+        const matching = await test.run(checks, { guestArchitecture: machine });
+        expect(matching.result.status, matching.result.stderr).toBe(0);
+        const result = JSON.parse(
+          await NodeFSP.readFile(NodePath.join(matching.output, "result.json"), "utf8"),
+        );
+        expect(result.architecture).toBe(machine);
+        expect(await test.readPublished()).toMatchObject({ isolationVersion: 5 });
+      } finally {
+        await test.close();
+      }
+    },
+  );
+
   it("rejects the old model-only evidence and every missing or failed command check", async () => {
     const test = await fixture();
     try {

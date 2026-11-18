@@ -48,7 +48,7 @@ export async function prepareVmRunnerImage(input: {
           signal: controller.signal,
         });
       },
-      buildTemplate: async ({ archive, sha256 }) => {
+      buildTemplate: async ({ archive, sha256, arch }) => {
         const selectionPath =
           input.env.E2B_TEMPLATE_FILE?.trim() ||
           NodePath.join(repoRoot, "infra/relay/.t3/e2b-template.json");
@@ -71,6 +71,8 @@ export async function prepareVmRunnerImage(input: {
                     archive,
                     "--server-sha256",
                     sha256,
+                    "--arch",
+                    arch,
                   ],
                   {
                     cwd: repoRoot,

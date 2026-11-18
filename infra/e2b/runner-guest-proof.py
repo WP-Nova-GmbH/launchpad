@@ -1,5 +1,60 @@
 import os,sys,json,subprocess,tempfile,selectors,time,urllib.request,pathlib,shutil,stat
+
+
+def verify_native_tools():
+    pty_script = """
+const pty = require('/opt/launchpad/server/node_modules/node-pty');
+const terminal = pty.spawn('/bin/bash', ['-c', 'printf runner-pty-ok'], { cwd: '/workspace' });
+let output = '';
+const deadline = setTimeout(() => {
+  terminal.kill();
+  process.exit(2);
+}, 10_000);
+terminal.onData((data) => { output += data; });
+terminal.onExit(({ exitCode }) => {
+  clearTimeout(deadline);
+  if (exitCode !== 0 || !output.includes('runner-pty-ok')) process.exit(1);
+});
+"""
+    terminal = subprocess.run(
+        ["node", "-e", pty_script], capture_output=True, text=True, timeout=15,
+    )
+    if terminal.returncode != 0:
+        raise RuntimeError(f"Native PTY failed (exit {terminal.returncode}): {terminal.stderr.strip()}")
+
+    commands = [
+        {"type": "configure", "version": 3, "rootPid": os.getpid(), "sampleIntervalMs": 0},
+        {"type": "processTable", "version": 3, "requestId": "runner-proof"},
+        {"type": "shutdown", "version": 3},
+    ]
+    monitor = subprocess.run(
+        ["/opt/launchpad/server/resource-monitor/t3-resource-monitor"],
+        input="".join(json.dumps(command) + "\n" for command in commands),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if monitor.returncode != 0:
+        raise RuntimeError(
+            f"Native resource monitor failed (exit {monitor.returncode}): {monitor.stderr.strip()}"
+        )
+    if not any(
+        event.get("type") == "processTable"
+        and event.get("version") == 3
+        and event.get("requestId") == "runner-proof"
+        for event in map(json.loads, monitor.stdout.splitlines())
+    ):
+        raise RuntimeError("Native resource monitor did not return the requested process table")
+
+
 assert os.getuid()==1000
+if sys.argv[1:] == ["--native-tools-only"]:
+    verify_native_tools()
+    sys.exit(0)
+
+architecture=os.uname().machine
+expected_architecture=os.environ['LAUNCHPAD_EXPECTED_ARCHITECTURE']
+assert architecture==expected_architecture, f'Expected {expected_architecture} runner, booted {architecture}'
 def immutable_image_file(name):
  path=pathlib.Path(name)
  assert path.is_absolute() and path.resolve(strict=True)==path, f'Indirect image path: {path}'
@@ -48,14 +103,7 @@ assert versions['cloudflared'].startswith('cloudflared version 2026.5.2 ')
 for tool, expected in [('node','/opt/launchpad/node/bin/node'),('codex','/opt/launchpad/node/bin/codex'),
                        ('cloudflared','/opt/launchpad/bin/cloudflared')]:
  assert pathlib.Path(shutil.which(tool)).resolve()==pathlib.Path(expected), f'Unexpected tool on PATH: {tool}'
-ptyjs="""const pty=require('/opt/launchpad/server/node_modules/node-pty');
-const p=pty.spawn('/bin/bash',['-lc','printf runner-pty-ok'],{cwd:'/workspace',env:process.env});
-let data='';const timer=setTimeout(()=>{p.kill();process.exit(2)},10000);
-p.onData(chunk=>data+=chunk);p.onExit(({exitCode})=>{clearTimeout(timer);if(exitCode!==0||!data.includes('runner-pty-ok'))process.exit(1);console.log('pty-ok')});"""
-ptyresult=subprocess.run(['node','-e',ptyjs],capture_output=True,text=True,timeout=15)
-assert ptyresult.returncode==0, 'Native PTY failed: '+ptyresult.stderr
-monitor=subprocess.run(['/opt/launchpad/server/resource-monitor/t3-resource-monitor'],input='{"type":"configure","version":3,"rootPid":'+str(os.getpid())+',"sampleIntervalMs":0}\n{"type":"processTable","version":3,"requestId":"runner-proof"}\n{"type":"shutdown","version":3}\n',capture_output=True,text=True,timeout=10,check=True)
-assert 'runner-proof' in monitor.stdout, 'monitor did not return requested process table'
+verify_native_tools()
 # Exercise the packaged enrollment command against a guest-loopback relay fixture.
 # Actual relay signature, access and retry transactions have separate PG tests.
 import http.server,threading,base64
@@ -119,7 +167,7 @@ try:
   assert response.status==200 and b'<html' in response.read().lower(), 'bundled web client unavailable'
  db=pathlib.Path(root)/'userdata/state.sqlite'
  assert db.exists(), 'server database missing'
- print(json.dumps({'versions':versions,'resources':{'cpuCount':os.cpu_count(),'memoryKiB':mem_kib,'freeDiskBytes':free_bytes},'workloadTracking':True,'pty':True,'resourceMonitor':True,'serverReady':True,'bundledClient':True,'managementCredentialsAbsent':True,'packagedEnrollment':True,'enrollmentLostReplyRecovery':True,'uid':os.getuid()}))
+ print(json.dumps({'architecture':architecture,'versions':versions,'resources':{'cpuCount':os.cpu_count(),'memoryKiB':mem_kib,'freeDiskBytes':free_bytes},'workloadTracking':True,'pty':True,'resourceMonitor':True,'serverReady':True,'bundledClient':True,'managementCredentialsAbsent':True,'packagedEnrollment':True,'enrollmentLostReplyRecovery':True,'uid':os.getuid()}))
 finally:
  p.terminate()
  try:p.wait(timeout=15)

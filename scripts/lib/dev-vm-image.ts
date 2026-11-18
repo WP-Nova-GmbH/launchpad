@@ -2,6 +2,7 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import type { LinuxVmArchive } from "./vm-linux-archive.ts";
 
 function matchingSelection(content: string, apiUrl: string) {
   const selected: unknown = JSON.parse(content);
@@ -31,8 +32,8 @@ export async function ensureDevVmImage(input: {
   repoRoot: string;
   env: NodeJS.ProcessEnv;
   rebuild?: boolean;
-  buildArchive: (outputDirectory: string) => Promise<{ archive: string; sha256: string }>;
-  buildTemplate: (server: { archive: string; sha256: string }) => Promise<void>;
+  buildArchive: (outputDirectory: string) => Promise<LinuxVmArchive>;
+  buildTemplate: (server: LinuxVmArchive) => Promise<void>;
 }) {
   const override = input.env.E2B_TEMPLATE_FILE?.trim();
   if (override && !NodePath.isAbsolute(override))

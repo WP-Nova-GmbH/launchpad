@@ -32,6 +32,12 @@ class StockRuntimeBuildTests(unittest.TestCase):
             "embed/compose/compose.yaml": json.dumps({"name": "e2b", "services": {
                 "orchestrator": {"command": ["/bin/bash", "/opt/e2b/scripts/orchestrator-launch.sh"]},
                 "fetch-artifacts": {"volumes": ["/:/host"]},
+                "postgres": {"ports": ["127.0.0.1:5432:5432"]},
+                **{
+                    role: {"environment": {"POSTGRES_CONNECTION_STRING": f"postgres://postgres:fixture@{host}:5432/postgres?sslmode=disable"}}
+                    for role, host in (("api", "127.0.0.1"), ("dashboard-api", "127.0.0.1"),
+                                       ("db-migrator", "postgres"), ("seed", "postgres"))
+                },
             }}),
             "embed/compose/.env": "E2B_TOOLS_IMAGE=upstream-tools\nE2B_NODE_E2B_IMAGE=upstream-node\nE2B_ORCHESTRATOR_VERSION=old-release\n"
                                   "E2B_ENVD_VERSION=test-envd\nE2B_FIRECRACKER_VERSION=test-fc\n"
@@ -47,18 +53,21 @@ class StockRuntimeBuildTests(unittest.TestCase):
             **{"packages/" + package + "/Dockerfile": "FROM scratch\n"
                for package in ["api", "db", "client-proxy", "dashboard-api", "orchestrator"]},
         }
-        with tarfile.open(self.archive, "w:gz") as archive:
-            for name, content in self.files.items():
-                data = content.encode()
-                info = tarfile.TarInfo("runtime-fixture/" + name)
-                info.size = len(data)
-                archive.addfile(info, io.BytesIO(data))
+        self.write_fixture_archive()
         self.lock = {"schemaVersion": 1, "orchestratorBuildVersion": self.version, "source": {
             "commit": self.commit, "archiveUrl": "https://example.test/stock.tar.gz",
             "commitTimestamp": "2026-10-27T10:20:42Z",
             "archiveSha256": builder.sha256(self.archive), "archiveDirectory": "runtime-fixture",
         }}
         self.calls = []
+
+    def write_fixture_archive(self):
+        with tarfile.open(self.archive, "w:gz") as archive:
+            for name, content in self.files.items():
+                data = content.encode()
+                info = tarfile.TarInfo("runtime-fixture/" + name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
 
     def fake_run(self, *args):
         self.calls.append(args)
@@ -91,6 +100,7 @@ class StockRuntimeBuildTests(unittest.TestCase):
         self.assertEqual((old / "sentinel").read_text(), "unchanged")
         for name, content in self.files.items():
             self.assertEqual((self.output / "source/runtime-fixture" / name).read_text(), content)
+        self.assertEqual((self.output / "compose.yaml").read_text(), self.files["embed/compose/compose.yaml"])
         self.assertEqual(len(self.calls), 8)  # Download, six images, native artifacts.
         for command in self.calls[1:]:
             self.assertEqual(command[:2], ("docker", "build"))
@@ -181,6 +191,38 @@ class StockRuntimeBuildTests(unittest.TestCase):
                     builder.build(self.output, "arm64", self.lock, envd_timeout_seconds=timeout)
                 command.assert_not_called()
                 self.assertFalse(self.output.exists())
+
+    def test_custom_postgres_host_port_is_loopback_only_and_hashed(self):
+        with patch.object(builder, "run", side_effect=self.fake_run):
+            builder.build(self.output, "amd64", self.lock, postgres_host_port=5434)
+        compose = self.output / "compose.yaml"
+        services = json.loads(compose.read_text())["services"]
+        self.assertEqual(services["postgres"]["ports"], ["127.0.0.1:5434:5432"])
+        for role, endpoint in (("api", "127.0.0.1:5434"), ("dashboard-api", "127.0.0.1:5434"),
+                               ("db-migrator", "postgres:5432"), ("seed", "postgres:5432")):
+            self.assertEqual(services[role]["environment"]["POSTGRES_CONNECTION_STRING"],
+                             f"postgres://postgres:fixture@{endpoint}/postgres?sslmode=disable")
+        receipt = json.loads((self.output / "build.json").read_text())
+        self.assertEqual(receipt["configurationSha256"]["compose.yaml"], builder.sha256(compose))
+
+    def test_rejects_invalid_postgres_host_ports_before_building(self):
+        for port in (0, -1, 65536, True, 5434.5):
+            with self.subTest(port=port), patch.object(builder, "run") as command:
+                with self.assertRaisesRegex(ValueError, "from 1 to 65535"):
+                    builder.build(self.output, "amd64", self.lock, postgres_host_port=port)
+                command.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_rejects_unexpected_postgres_layout_before_building_images(self):
+        path = "embed/compose/compose.yaml"
+        self.files[path] = self.files[path].replace("@127.0.0.1:5432/", "@localhost:5432/", 1)
+        self.write_fixture_archive()
+        self.lock["source"]["archiveSha256"] = builder.sha256(self.archive)
+        with patch.object(builder, "run", side_effect=self.fake_run):
+            with self.assertRaisesRegex(ValueError, "Unexpected PostgreSQL host bindings or connections"):
+                builder.build(self.output, "amd64", self.lock, postgres_host_port=5434)
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse((self.output / "build.json").exists())
 
     def test_bad_source_checksum_never_builds_images_or_publishes_a_receipt(self):
         self.lock["source"]["archiveSha256"] = "0" * 64

@@ -36,6 +36,10 @@ const options = {
 };
 const receipt = JSON.parse(await NodeFSP.readFile(values.receipt, "utf8"));
 NodeAssert.equal(receipt.state, "built");
+// Receipts written before architecture was recorded came from the ARM64-only builder.
+const { arch = "arm64" } = receipt;
+NodeAssert.ok(arch === "arm64" || arch === "amd64", "Unsupported runner architecture in receipt.");
+const expectedArchitecture = arch === "amd64" ? "x86_64" : "aarch64";
 NodeAssert.equal(new URL(receipt.apiUrl).href, new URL(options.apiUrl).href);
 NodeAssert.equal(receipt.templateRef, `${receipt.templateId}:${receipt.buildTag}`);
 NodeAssert.ok(/^build-[a-f0-9-]+$/.test(receipt.buildTag));
@@ -86,12 +90,15 @@ try {
     user: "user",
     timeoutMs: 120000,
     envs: {
+      LAUNCHPAD_EXPECTED_ARCHITECTURE: expectedArchitecture,
       LAUNCHPAD_EXPECTED_RESOURCES: JSON.stringify(resources),
       LAUNCHPAD_WORKLOAD_SHA256: receipt.workloadSha256,
       LAUNCHPAD_WORKLOAD_SERVICE_SHA256: receipt.workloadServiceSha256,
       LAUNCHPAD_INSTALLER_SHA256: receipt.installerSha256,
     },
   });
+  const runner = JSON.parse(result.stdout.trim());
+  NodeAssert.equal(runner.architecture, expectedArchitecture, "Wrong runner architecture.");
   stage = "model-catalog";
   const modelScript = await NodeFSP.readFile(
     new URL("../../e2b/workflow-model-proof.py", import.meta.url),
@@ -192,7 +199,7 @@ try {
   await save("result.json", {
     proof,
     sandboxId: vm.sandboxId,
-    ...JSON.parse(result.stdout.trim()),
+    ...runner,
   });
   console.log(
     "Runner tools, native terminal, resource monitor, server startup and Codex model probe passed.",

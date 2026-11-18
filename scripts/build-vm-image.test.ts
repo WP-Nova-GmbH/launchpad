@@ -47,7 +47,7 @@ async function fixture() {
   vi.mocked(buildLinuxVmArchive).mockImplementation(async (input) => {
     archive = NodePath.join(input.outputDirectory, "server.tar.gz");
     await NodeFSP.writeFile(archive, "Linux fixture");
-    return { archive, sha256: "a".repeat(64) };
+    return { archive, sha256: "a".repeat(64), arch: "amd64" };
   });
   return {
     repoRoot,
@@ -74,7 +74,7 @@ describe("VM runner build command integration", () => {
     await expect(NodeFSP.stat(f.argsFile)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("builds a missing image using the archive and checksum, then reuses the selection", async () => {
+  it("passes the archive, checksum and architecture to E2B, then reuses the selection", async () => {
     const f = await fixture();
     const listeners = process.listenerCount("SIGINT");
     expect((await prepareVmRunnerImage(f)).built).toBe(true);
@@ -83,6 +83,8 @@ describe("VM runner build command integration", () => {
       f.archive(),
       "--server-sha256",
       "a".repeat(64),
+      "--arch",
+      "amd64",
     ]);
     await expect(NodeFSP.stat(NodePath.dirname(f.archive()!))).rejects.toMatchObject({
       code: "ENOENT",

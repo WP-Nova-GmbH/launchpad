@@ -72,12 +72,33 @@ describe("VM Linux server archive", () => {
   });
 
   it("rejects command injection in build versions", () => {
-    expect(() => linuxVmArchiveBuildScript("0.3.3; unexpected", "0.1.7")).toThrow("exact");
-    expect(() => linuxVmArchiveBuildScript("0.3.3", "$(unexpected)")).toThrow("exact");
+    expect(() => linuxVmArchiveBuildScript("0.3.3; unexpected", "0.1.7", "amd64")).toThrow("exact");
+    expect(() => linuxVmArchiveBuildScript("0.3.3", "$(unexpected)", "arm64")).toThrow("exact");
   });
 
-  for (const outcome of ["success", "failure", "cancelled", "cleanup failed"] as const) {
-    it(`cleans only its owned Linux container and scratch after ${outcome}`, async () => {
+  it("rejects an unsupported Linux host before packaging source or running Docker", async () => {
+    const root = await directory();
+    const calls: string[][] = [];
+    await expect(
+      buildLinuxVmArchive({ repoRoot: root, outputDirectory: root, env: {} }, async (input) => {
+        calls.push([input.command, ...input.args]);
+        return "riscv64\n";
+      }),
+    ).rejects.toThrow("found riscv64");
+    expect(calls.map((args) => args.slice(-2))).toEqual([["uname", "-m"]]);
+  });
+
+  const scenarios = [
+    ["aarch64", "success"],
+    ["x86_64", "success"],
+    ["aarch64", "failure"],
+    ["aarch64", "cancelled"],
+    ["aarch64", "cleanup failed"],
+  ] as const;
+  for (const [machine, outcome] of scenarios) {
+    it(`cleans only its owned ${machine} container and scratch after ${outcome}`, async () => {
+      const arch = machine === "x86_64" ? "amd64" : "arm64";
+      const cliArch = machine === "x86_64" ? "x64" : "arm64";
       const root = await directory();
       const output = await directory();
       const bytes = Buffer.from("packaged linux server");
@@ -96,6 +117,10 @@ describe("VM Linux server archive", () => {
       let hostDirectory: string | undefined;
       const run: NonNullable<Parameters<typeof buildLinuxVmArchive>[1]> = async (input) => {
         calls.push(input);
+        if (input.command === "uname" || input.args.at(-2) === "uname") {
+          expect(input.capture).toBe(true);
+          return `${machine}\n`;
+        }
         if (input.command === "git")
           return "package.json\0apps/server/package.json\0pnpm-workspace.yaml\0apps/server/src/new.ts\0.env\0";
         if (input.command === "tar") {
@@ -120,6 +145,11 @@ describe("VM Linux server archive", () => {
           expect(input.args).toContain("--rm");
           expect(input.args).toContain("node:26.8.2-bookworm");
           expect(input.args).toContain("VP_NODE_VERSION=26.8.2");
+          expect(input.args[input.args.indexOf("--platform") + 1]).toBe(`linux/${arch}`);
+          const script = input.args.at(-1);
+          expect(script).toContain(`test "$(uname -m)" = ${machine}`);
+          expect(script).toContain(`--platform linux --arch ${cliArch} --version 0.1.7`);
+          expect(script).toContain(`--archive /tmp/cli-release/t3-0.1.7-linux-${cliArch}.tar.gz`);
           expect(input.args.join(" ")).not.toContain("SECRET_DO_NOT_TRANSFER");
           expect(input.args.join(" ")).not.toContain(root);
           if (outcome === "failure") throw new Error("compiler failed");
@@ -151,6 +181,8 @@ describe("VM Linux server archive", () => {
       );
       if (outcome === "success") {
         const result = await build;
+        expect(result.arch).toBe(arch);
+        expect(NodePath.basename(result.archive)).toContain(`server-linux-${arch}-`);
         expect(await NodeFSP.readFile(result.archive)).toEqual(bytes);
         expect(result.sha256).toBe(NodeCrypto.createHash("sha256").update(bytes).digest("hex"));
       } else {

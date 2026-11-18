@@ -90,15 +90,30 @@ export async function vmArchiveSourcePaths(repoRoot: string, paths: string[]) {
   return files;
 }
 
+type LinuxVmArchitecture = "arm64" | "amd64";
+
+export interface LinuxVmArchive {
+  archive: string;
+  sha256: string;
+  arch: LinuxVmArchitecture;
+}
+
 /** Bookworm matches the runner image's glibc; host tools and Mac modules stay outside it. */
-export function linuxVmArchiveBuildScript(vitePlusVersion: string, version: string) {
+export function linuxVmArchiveBuildScript(
+  vitePlusVersion: string,
+  version: string,
+  arch: LinuxVmArchitecture,
+) {
   if (
     !/^[\d]+\.[\d]+\.[\d]+(?:-[\w.-]+)?$/u.test(vitePlusVersion) ||
     !/^[\d]+\.[\d]+\.[\d]+(?:[-+][\w.-]+)?$/u.test(version)
   )
     throw new Error("Expected exact Vite+ and server versions for the VM build.");
+  const machine = arch === "amd64" ? "x86_64" : "aarch64";
+  const cliArch = arch === "amd64" ? "x64" : "arm64";
+  const releaseArchive = `/tmp/cli-release/t3-${version}-linux-${cliArch}.tar.gz`;
   return [
-    'test "$(uname -m)" = aarch64',
+    `test "$(uname -m)" = ${machine}`,
     "apt-get update",
     "apt-get install -y --no-install-recommends ca-certificates curl build-essential python3 pkg-config libsecret-1-dev",
     "curl --fail --silent --show-error --location https://sh.rustup.rs -o /tmp/rustup.sh",
@@ -112,9 +127,9 @@ export function linuxVmArchiveBuildScript(vitePlusVersion: string, version: stri
     "vp run --filter t3 build",
     "node apps/server/scripts/cli.ts build-exe --verbose",
     "cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml",
-    `node scripts/build-cli-archive.ts --platform linux --arch arm64 --version ${version} --resource-monitor-dir native/resource-monitor/target/release --output-dir /tmp/cli-release`,
-    `node scripts/smoke-cli-archive.ts --archive /tmp/cli-release/t3-${version}-linux-arm64.tar.gz --expect-version ${version}`,
-    `cp /tmp/cli-release/t3-${version}-linux-arm64.tar.gz /transfer/server.tar.gz`,
+    `node scripts/build-cli-archive.ts --platform linux --arch ${cliArch} --version ${version} --resource-monitor-dir native/resource-monitor/target/release --output-dir /tmp/cli-release`,
+    `node scripts/smoke-cli-archive.ts --archive ${releaseArchive} --expect-version ${version}`,
+    `cp ${releaseArchive} /transfer/server.tar.gz`,
   ].join("\n");
 }
 
@@ -129,16 +144,15 @@ export async function buildLinuxVmArchive(
     signal?: AbortSignal;
   },
   run = runArchiveCommand,
-) {
+): Promise<LinuxVmArchive> {
   if (process.platform !== "darwin" && process.platform !== "linux")
     throw new Error("Automatic VM image builds require macOS with launchpad-e2b Lima, or Linux.");
-  const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "launchpad-vm-source-"));
-  const id = NodeCrypto.randomUUID();
-  const hostDirectory = `/tmp/launchpad-vm-build-${id}`;
-  const container = `launchpad-vm-build-${id}`;
-  const archive = NodePath.join(input.outputDirectory, `server-linux-arm64-${id}.tar.gz`);
   const env = input.env ?? process.env;
-  const host = (command: string, args: string[], cleanup = false) =>
+  const host = (
+    command: string,
+    args: string[],
+    { capture = false, cleanup = false }: { capture?: boolean; cleanup?: boolean } = {},
+  ) =>
     run({
       command: process.platform === "darwin" ? "limactl" : command,
       args:
@@ -146,16 +160,24 @@ export async function buildLinuxVmArchive(
           ? ["shell", "--workdir=/", "launchpad-e2b", command, ...args]
           : args,
       env,
+      capture,
       ...(cleanup ? {} : { signal: input.signal }),
     });
+  const machine = (await host("uname", ["-m"], { capture: true })).trim();
+  if (machine !== "aarch64" && machine !== "x86_64")
+    throw new Error(`VM image builds require an ARM64 or AMD64 Linux host (found ${machine}).`);
+  const arch = machine === "x86_64" ? "amd64" : "arm64";
+  await host("sh", ["-euc", "sudo -n docker info >/dev/null"]);
+
+  const scratch = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "launchpad-vm-source-"));
+  const id = NodeCrypto.randomUUID();
+  const hostDirectory = `/tmp/launchpad-vm-build-${id}`;
+  const container = `launchpad-vm-build-${id}`;
+  const archive = NodePath.join(input.outputDirectory, `server-linux-${arch}-${id}.tar.gz`);
   let complete = false;
   let hostCreated = false;
   let containerStarted = false;
   try {
-    await host("sh", [
-      "-euc",
-      'test "$(uname -m)" = aarch64 || { echo "VM image builds require an ARM64 Linux host." >&2; exit 1; }; sudo -n docker info >/dev/null',
-    ]);
     const tracked = await run({
       command: "git",
       args: ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
@@ -189,7 +211,7 @@ export async function buildLinuxVmArchive(
     const { version } = JSON.parse(
       await NodeFSP.readFile(NodePath.join(input.repoRoot, "apps/server/package.json"), "utf8"),
     );
-    const script = linuxVmArchiveBuildScript(vitePlusVersion ?? "", version);
+    const script = linuxVmArchiveBuildScript(vitePlusVersion ?? "", version, arch);
     hostCreated = true;
     await host("sh", ["-euc", `umask 077; mkdir ${quote(hostDirectory)}`]);
     if (process.platform === "darwin")
@@ -209,7 +231,7 @@ export async function buildLinuxVmArchive(
       "--name",
       container,
       "--platform",
-      "linux/arm64",
+      `linux/${arch}`,
       "--cpus",
       "4",
       "--memory",
@@ -241,7 +263,7 @@ export async function buildLinuxVmArchive(
     for await (const chunk of NodeFS.createReadStream(archive)) digest.update(chunk);
     input.signal?.throwIfAborted();
     complete = true;
-    return { archive, sha256: digest.digest("hex") };
+    return { archive, sha256: digest.digest("hex"), arch };
   } finally {
     // Do not remove a container's bind directory until its exact container is gone.
     let cleanupFailure: Error | undefined;
@@ -253,9 +275,10 @@ export async function buildLinuxVmArchive(
             "-euc",
             `ids=$(sudo -n docker ps -aq --filter ${quote(`name=^/${container}$`)}); if [ -n "$ids" ]; then sudo -n docker rm --force ${quote(container)}; fi`,
           ],
-          true,
+          { cleanup: true },
         );
-      if (hostCreated) await host("sudo", ["-n", "rm", "-rf", "--", hostDirectory], true);
+      if (hostCreated)
+        await host("sudo", ["-n", "rm", "-rf", "--", hostDirectory], { cleanup: true });
     } catch (cause) {
       cleanupFailure = new Error(
         `VM build cleanup failed. Check owned container ${container} and scratch ${hostDirectory} on the Linux host before retrying.`,

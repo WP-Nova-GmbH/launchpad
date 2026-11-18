@@ -134,6 +134,10 @@ describe("runner build publication", () => {
         NodePath.join(fixture.directory, "infra", "e2b", "template"),
         { recursive: true },
       );
+      await NodeFSP.copyFile(
+        new URL("../../e2b/runner-guest-proof.py", import.meta.url),
+        NodePath.join(fixture.directory, "infra", "e2b", "runner-guest-proof.py"),
+      );
       const source = await NodeFSP.readFile(
         new URL("./e2b-build-template.mjs", import.meta.url),
         "utf8",
@@ -153,7 +157,10 @@ describe("runner build publication", () => {
         NodePath.join(relay, ".env"),
         "E2B_API_URL=http://127.0.0.1:3000\nE2B_API_KEY=fixture-key\n",
       );
-      for (const apiUrl of [undefined, "http://127.0.0.1:9000"]) {
+      for (const { apiUrl, arch } of [
+        { apiUrl: undefined, arch: undefined },
+        { apiUrl: "http://127.0.0.1:9000", arch: "amd64" },
+      ]) {
         const result = NodeChildProcess.spawnSync(
           process.execPath,
           [
@@ -162,6 +169,7 @@ describe("runner build publication", () => {
             fixture.args["server-archive"],
             "--server-sha256",
             fixture.args["server-sha256"],
+            ...(arch ? ["--arch", arch] : []),
           ],
           {
             cwd: fixture.directory,
@@ -178,12 +186,18 @@ describe("runner build publication", () => {
       }
       const receipts = await NodeFSP.readdir(NodePath.join(relay, ".t3", "e2b-builds"));
       expect(receipts).toHaveLength(2);
-      for (const path of receipts) {
-        const receipt = JSON.parse(
-          await NodeFSP.readFile(NodePath.join(relay, ".t3", "e2b-builds", path), "utf8"),
-        );
-        expect(receipt.name).toBe("launchpad-arm64");
-      }
+      const builds = await Promise.all(
+        receipts.map(async (path) => {
+          const receipt = JSON.parse(
+            await NodeFSP.readFile(NodePath.join(relay, ".t3", "e2b-builds", path), "utf8"),
+          );
+          return [receipt.arch, receipt.name];
+        }),
+      );
+      expect(builds.sort()).toEqual([
+        ["amd64", "launchpad-amd64"],
+        ["arm64", "launchpad-arm64"],
+      ]);
       await expect(NodeFSP.readdir(NodePath.join(fixture.directory, ".t3"))).rejects.toMatchObject({
         code: "ENOENT",
       });
@@ -346,20 +360,21 @@ describe("runner build publication", () => {
     }
   });
 
-  it("preserves the prior selection and diagnostic receipt when E2B fails", async () => {
+  it("preserves the prior selection and diagnostic receipt when E2B rejects an AMD64 build", async () => {
     const fixture = await buildFixture();
     try {
       await NodeFSP.mkdir(NodePath.dirname(fixture.selected));
       const previous = '{"state":"built","templateRef":"previous:build-keep"}\n';
       await NodeFSP.writeFile(fixture.selected, previous);
       buildMock.mockRejectedValue(new Error("fixture build failed"));
-      await expect(buildTemplate(fixture.args, "fixture-key")).rejects.toThrow(
-        "fixture build failed",
-      );
+      await expect(
+        buildTemplate({ ...fixture.args, arch: "amd64" }, "fixture-key"),
+      ).rejects.toThrow("fixture build failed");
       expect(await NodeFSP.readFile(fixture.selected, "utf8")).toBe(previous);
-      expect(JSON.parse(await NodeFSP.readFile(fixture.args.output, "utf8")).state).toBe(
-        "building",
-      );
+      expect(JSON.parse(await NodeFSP.readFile(fixture.args.output, "utf8"))).toMatchObject({
+        state: "building",
+        arch: "amd64",
+      });
     } finally {
       await NodeFSP.rm(fixture.directory, { recursive: true, force: true });
     }
@@ -367,9 +382,115 @@ describe("runner build publication", () => {
 });
 
 describe("E2B runner build inputs", () => {
+  it.skipIf(hostPlatform === "win32").each([
+    { scenario: "working tools", ptyFails: false, monitorEvent: "processTable", error: null },
+    {
+      scenario: "failed PTY load",
+      ptyFails: true,
+      monitorEvent: "processTable",
+      error: "Native PTY failed",
+    },
+    {
+      scenario: "failed monitor execution",
+      ptyFails: false,
+      monitorEvent: null,
+      error: "Native resource monitor failed",
+    },
+    {
+      scenario: "monitor without a process table",
+      ptyFails: false,
+      monitorEvent: "error",
+      error: "did not return the requested process table",
+    },
+  ])(
+    "checks packaged native tools before accepting the image for $scenario",
+    async ({ ptyFails, monitorEvent, error }) => {
+      const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-native-tools-"));
+      try {
+        const server = NodePath.join(root, "server");
+        const workspace = NodePath.join(root, "workspace");
+        const pty = NodePath.join(server, "node_modules/node-pty");
+        const monitor = NodePath.join(server, "resource-monitor/t3-resource-monitor");
+        await NodeFSP.mkdir(pty, { recursive: true });
+        await NodeFSP.mkdir(NodePath.dirname(monitor));
+        await NodeFSP.mkdir(workspace);
+        await NodeFSP.writeFile(
+          NodePath.join(pty, "index.js"),
+          ptyFails
+            ? 'throw Error("Cannot load the fixture native binding");'
+            : `exports.spawn = () => ({
+              onData: (callback) => queueMicrotask(() => callback("runner-pty-ok")),
+              onExit: (callback) => queueMicrotask(() => callback({ exitCode: 0 })),
+            });`,
+        );
+        const monitorResponse = JSON.stringify({
+          type: monitorEvent,
+          version: 3,
+          requestId: "runner-proof",
+        });
+        await NodeFSP.writeFile(
+          monitor,
+          monitorEvent
+            ? `#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '${monitorResponse}'\n`
+            : "#!/bin/sh\nexit 126\n",
+          { mode: 0o755 },
+        );
+        const proof = await NodeFSP.readFile(
+          new URL("../../e2b/runner-guest-proof.py", import.meta.url),
+          "utf8",
+        );
+        const result = NodeChildProcess.spawnSync("python3", ["-", "--native-tools-only"], {
+          // The installer runs the probe as guest UID 1000. Use temporary tool paths on the host.
+          input: `import os\nos.getuid = lambda: 1000\n${proof
+            .replaceAll("/opt/launchpad/server", server)
+            .replaceAll("/workspace", workspace)}`,
+          env: {
+            ...process.env,
+            PATH: `${NodePath.dirname(process.execPath)}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          encoding: "utf8",
+          timeout: 25_000,
+        });
+        if (error) {
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain(error);
+        } else expect(result.status, result.stderr).toBe(0);
+      } finally {
+        await NodeFSP.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.skipIf(hostPlatform === "win32")(
-    "executes the parsed native shim and preserves trusted tools under stock finalization",
+    "rejects a mismatched guest before tool installation",
     async () => {
+      const installer = await NodeFSP.readFile(
+        new URL("../../e2b/template/install.sh", import.meta.url),
+        "utf8",
+      );
+      const guardEnd = installer.indexOf("# pnpm's WSL probe");
+      expect(guardEnd).toBeGreaterThan(0);
+      const guard = installer
+        .slice(0, guardEnd)
+        .replace("cat /opt/launchpad-package/runner-arch", "printf 'amd64\\n'");
+      const result = NodeChildProcess.spawnSync(
+        "/bin/bash",
+        ["-c", `uname() { printf 'aarch64\\n'; }\n${guard}`],
+        { encoding: "utf8" },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "Runner architecture amd64 does not match E2B guest architecture aarch64.",
+      );
+    },
+  );
+
+  it.skipIf(hostPlatform === "win32").each([
+    { nodeArch: "arm64", machine: "aarch64" },
+    { nodeArch: "x64", machine: "x86_64" },
+  ])(
+    "executes the $nodeArch native shim and preserves trusted tools under stock finalization",
+    async ({ nodeArch, machine }) => {
       const dockerfile = await NodeFSP.readFile(
         new URL("../../e2b/template/Dockerfile", import.meta.url),
         "utf8",
@@ -392,7 +513,9 @@ describe("E2B runner build inputs", () => {
       });
       expect(syntax.status, syntax.stderr).toBe(0);
       const nativeSetup =
-        /^node --input-type=module <<'JAVASCRIPT'\n([\s\S]*?)\nJAVASCRIPT$/mu.exec(installer)?.[1];
+        /^node --input-type=module - "\$node_arch" "\$machine" <<'JAVASCRIPT'\n([\s\S]*?)\nJAVASCRIPT$/mu.exec(
+          installer,
+        )?.[1];
       expect(nativeSetup).toBeDefined();
       const fixture = await NodeFSP.realpath(
         await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "runner-shim-")),
@@ -401,8 +524,8 @@ describe("E2B runner build inputs", () => {
         const image = fixture + "/image";
         const prefix = image + "/opt/launchpad/node/lib/node_modules/";
         const root = prefix + "@openai/codex";
-        const optional = root + "/node_modules/@openai/codex-linux-arm64";
-        const native = optional + "/vendor/aarch64-unknown-linux-musl/bin/codex";
+        const optional = `${root}/node_modules/@openai/codex-linux-${nodeArch}`;
+        const native = `${optional}/vendor/${machine}-unknown-linux-musl/bin/codex`;
         const shim = image + "/opt/launchpad/node/bin/codex";
         const manifest = image + "/opt/launchpad/codex-native.json";
         await NodeFSP.mkdir(NodePath.dirname(native), { recursive: true });
@@ -410,7 +533,7 @@ describe("E2B runner build inputs", () => {
         await NodeFSP.writeFile(root + "/package.json", JSON.stringify({ version: "0.159.3" }));
         await NodeFSP.writeFile(
           optional + "/package.json",
-          JSON.stringify({ version: "0.159.3-linux-arm64" }),
+          JSON.stringify({ version: `0.159.3-linux-${nodeArch}` }),
         );
         await NodeFSP.writeFile(
           native,
@@ -425,10 +548,11 @@ describe("E2B runner build inputs", () => {
         await NodeFSP.writeFile(shim, "old shim", { mode: 0o755 });
         const setup = NodeChildProcess.spawnSync(
           process.execPath,
-          ["--input-type=module", "-e", command],
+          ["--input-type=module", "-", nodeArch, machine],
           {
             env: environment,
             encoding: "utf8",
+            input: command,
           },
         );
         expect(setup.status, setup.stderr).toBe(0);
@@ -507,14 +631,15 @@ describe("E2B runner build inputs", () => {
         const shimBefore = await NodeFSP.readFile(shim);
         await NodeFSP.writeFile(
           optional + "/package.json",
-          JSON.stringify({ version: "0.159.2-linux-arm64" }),
+          JSON.stringify({ version: `0.159.2-linux-${nodeArch}` }),
         );
         const rejected = NodeChildProcess.spawnSync(
           process.execPath,
-          ["--input-type=module", "-e", command],
+          ["--input-type=module", "-", nodeArch, machine],
           {
             env: environment,
             encoding: "utf8",
+            input: command,
           },
         );
         expect(rejected.status).not.toBe(0);
@@ -535,13 +660,15 @@ describe("E2B runner build inputs", () => {
       await NodeFSP.writeFile(NodePath.join(source, ".env"), "must stay on host");
       const hash = NodeCrypto.createHash("sha256").update(payload).digest("hex");
       const buildTag = "build-00000000-0000-4000-8000-000000000000";
-      context = await prepareTemplateContext(archive, hash, buildTag);
+      context = await prepareTemplateContext(archive, hash, buildTag, "amd64");
       await NodeFSP.writeFile(archive, "replaced after staging");
       expect((await NodeFSP.readdir(context)).sort()).toEqual([
         "activity.py",
         "install.sh",
         "launchpad-workloads.service",
+        "runner-arch",
         "runner-build-tag",
+        "runner-guest-proof.py",
         "server.sha256",
         "server.tar.gz",
         "workflow-checkpoint-reader.py",
@@ -549,16 +676,20 @@ describe("E2B runner build inputs", () => {
         "workload.py",
       ]);
       expect(await NodeFSP.readFile(NodePath.join(context, "server.tar.gz"))).toEqual(payload);
+      expect(await NodeFSP.readFile(NodePath.join(context, "runner-arch"), "utf8")).toBe("amd64\n");
       expect(await NodeFSP.readFile(NodePath.join(context, "runner-build-tag"), "utf8")).toBe(
         `${buildTag}\n`,
       );
       expect(await NodeFSP.readFile(NodePath.join(context, "install.sh"))).toEqual(
         await NodeFSP.readFile(new URL("../../e2b/template/install.sh", import.meta.url)),
       );
+      expect(await NodeFSP.readFile(NodePath.join(context, "runner-guest-proof.py"))).toEqual(
+        await NodeFSP.readFile(new URL("../../e2b/runner-guest-proof.py", import.meta.url)),
+      );
       expect(await NodeFSP.readFile(NodePath.join(context, "server.sha256"), "utf8")).toBe(
         `${hash}  server.tar.gz\n`,
       );
-      await expect(prepareTemplateContext(archive, hash, buildTag)).rejects.toThrow(
+      await expect(prepareTemplateContext(archive, hash, buildTag, "arm64")).rejects.toThrow(
         "does not match",
       );
     } finally {

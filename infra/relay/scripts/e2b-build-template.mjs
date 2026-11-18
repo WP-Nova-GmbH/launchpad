@@ -41,7 +41,7 @@ export async function writeJsonAtomically(path, value, { ifAbsent = false } = {}
   }
 }
 
-export async function prepareTemplateContext(archive, expectedSha256, buildTag) {
+export async function prepareTemplateContext(archive, expectedSha256, buildTag, arch) {
   if (!/^[a-f0-9]{64}$/.test(expectedSha256))
     throw new Error("A lowercase SHA-256 checksum is required.");
   const context = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "launchpad-template-"));
@@ -64,6 +64,10 @@ export async function prepareTemplateContext(archive, expectedSha256, buildTag) 
       flag: "wx",
       mode: 0o600,
     });
+    await NodeFSP.writeFile(NodePath.join(context, "runner-arch"), `${arch}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
     for (const file of [
       "workload.py",
       "workflow-exec.c",
@@ -73,6 +77,10 @@ export async function prepareTemplateContext(archive, expectedSha256, buildTag) 
       "install.sh",
     ])
       await NodeFSP.copyFile(NodePath.join(templateDirectory, file), NodePath.join(context, file));
+    await NodeFSP.copyFile(
+      NodePath.join(templateDirectory, "..", "runner-guest-proof.py"),
+      NodePath.join(context, "runner-guest-proof.py"),
+    );
     return context;
   } catch (error) {
     await NodeFSP.rm(context, { recursive: true, force: true });
@@ -97,8 +105,12 @@ export function validateBuildTarget(apiUrl, name) {
   return url.href.replace(/\/$/, "");
 }
 
+const isRunnerArch = (arch) => arch === "amd64" || arch === "arm64";
+
 export async function buildTemplate(args, apiKey) {
-  const name = args.name ?? "launchpad-arm64";
+  const arch = args.arch ?? "arm64";
+  if (!isRunnerArch(arch)) throw new Error("Runner architecture must be amd64 or arm64.");
+  const name = args.name ?? `launchpad-${arch}`;
   const apiUrl = validateBuildTarget(args["api-url"] ?? process.env.E2B_API_URL, name);
   if (!apiKey?.trim()) throw new Error("E2B_API_KEY is required on the build host.");
   const buildTag = `build-${NodeCrypto.randomUUID()}`;
@@ -117,6 +129,7 @@ export async function buildTemplate(args, apiKey) {
     args["server-archive"],
     args["server-sha256"],
     buildTag,
+    arch,
   );
   try {
     const dockerfile = await NodeFSP.readFile(
@@ -129,6 +142,7 @@ export async function buildTemplate(args, apiKey) {
       state: "building",
       apiUrl,
       name,
+      arch,
       resources: standardResources,
       skipCache: args["skip-cache"] === true,
       serverSha256: args["server-sha256"],
@@ -202,7 +216,7 @@ if (import.meta.main) {
     options: {
       "skip-cache": { type: "boolean", default: false },
       ...Object.fromEntries(
-        ["api-url", "name", "server-archive", "server-sha256", "output"].map((key) => [
+        ["api-url", "arch", "name", "server-archive", "server-sha256", "output"].map((key) => [
           key,
           { type: "string" },
         ]),
@@ -211,8 +225,11 @@ if (import.meta.main) {
   });
   if (["server-archive", "server-sha256"].some((key) => !values[key])) {
     process.stderr.write(
-      "Required: --server-archive --server-sha256. Optional: --api-url (defaults to E2B_API_URL), --name (launchpad-arm64), --output (new build receipt), --skip-cache. Configure E2B_API_KEY in infra/relay/.env or the build environment.\n",
+      "Required: --server-archive --server-sha256. Optional: --arch amd64|arm64 (default arm64), --api-url (defaults to E2B_API_URL), --name (launchpad-<arch>), --output (new build receipt), --skip-cache. Configure E2B_API_KEY in infra/relay/.env or the build environment.\n",
     );
+    process.exitCode = 2;
+  } else if (values.arch !== undefined && !isRunnerArch(values.arch)) {
+    process.stderr.write("Runner architecture must be amd64 or arm64.\n");
     process.exitCode = 2;
   } else {
     try {

@@ -9,11 +9,13 @@ export function prepareTemplateContext(
   archive: string,
   expectedSha256: string,
   buildTag: string,
+  arch: "amd64" | "arm64",
 ): Promise<string>;
 export function validateBuildTarget(apiUrl: string, name: string): string;
 export function buildTemplate(
   args: {
     "api-url"?: string;
+    arch?: "amd64" | "arm64";
     name?: string;
     "server-archive": string;
     "server-sha256": string;

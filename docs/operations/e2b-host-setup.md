@@ -88,6 +88,11 @@ images, and exports the native orchestrator binary. It writes `build.json`, immu
 image IDs, artifact checksums and a generated Compose configuration. It starts no
 services and refuses an existing output directory.
 
+If another database uses host port `5432`, pass `--postgres-host-port 5434` when
+generating the deployment. The generated Compose maps the chosen loopback port
+to PostgreSQL's container port `5432` and configures the host-networked services
+to use it.
+
 Warm Review and cold Input acceptance passed with 5120 hugepages on a dedicated
 16 GiB host. Use `--hugepages 5120` to reproduce that reservation on a new
 deployment. It reserves 10 GiB for native guests and leaves roughly 6 GiB for
@@ -190,7 +195,9 @@ vp run build:vm-template
 `dev:vm` builds automatically when no image is selected and reuses that selection
 on later starts. Rebuild after changing the server or guest tools. Linux packaging
 uses one disposable Debian Bookworm container; it transfers source through an
-allowlist and removes the container and its temporary files afterward.
+allowlist and removes the container and its temporary files afterward. The build
+uses the Linux host's native architecture, including inside Lima, and produces
+`launchpad-amd64` on x86 Linux or `launchpad-arm64` on ARM64.
 
 The runner includes the packaged server and web client, native dependencies,
 resource monitor, Git, GitHub CLI, Python, Node, pnpm and Codex. Tool versions and
@@ -207,6 +214,9 @@ node infra/relay/scripts/e2b-build-template.mjs \
   --server-archive /absolute/server-linux-arm64.tar.gz \
   --server-sha256 <archive-sha256>
 ```
+
+For an x64 archive, pass `--arch amd64` and use an AMD64 E2B host. The template
+builder defaults to `--arch arm64`.
 
 The selected immutable tag and build are saved in `infra/relay/.t3/e2b-template.json`.
 Restart the relay to load a successful new selection. Already created VMs retain
