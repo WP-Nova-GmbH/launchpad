@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useEffectEvent,
   useLayoutEffect,
   useId,
   useMemo,
@@ -37,7 +38,11 @@ import {
   workflowJobAccessLost,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
-import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
+import {
+  sameWorkflowResultCheckpoint,
+  workflowResultCheckpoint,
+  type WorkflowResultCheckpoint,
+} from "@t3tools/client-runtime/relay/workflow-result";
 import {
   Columns2Icon,
   FileDiffIcon,
@@ -66,7 +71,7 @@ import {
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { SavedWorkflowResultPicker } from "./SavedWorkflowResultPicker";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
 import { useWorkflowClient } from "./workflowState";
@@ -76,6 +81,11 @@ const sameSavedResult = Schema.toEquivalence(WorkflowSavedResult);
 const isRequestFailed = Schema.is(ManagedRelay.ManagedRelayRequestFailedError);
 
 type DeletionTarget = { relayUrl: string; threadId: ThreadId; generation: number };
+type HistoryRequest = { key: string; scope: string; epoch: number };
+type HistoryRead = {
+  request: HistoryRequest;
+  state: "loading" | "retrying" | "failed";
+};
 type DeletionIntent = DeletionTarget & { payload: RelayThreadDeletionRequest };
 type DeletionState =
   | { state: "confirming"; target: DeletionTarget }
@@ -125,6 +135,7 @@ export function SavedWorkflowResults({
   refresh,
   canConfigure,
   onReviewTargetChange,
+  onReviewRenderChange,
   onResultsAvailableChange,
   resultsRef,
 }: {
@@ -133,6 +144,7 @@ export function SavedWorkflowResults({
   refresh: () => Promise<void>;
   canConfigure: boolean;
   onReviewTargetChange?: (current: boolean) => void;
+  onReviewRenderChange?: (checkpoint: WorkflowResultCheckpoint | null) => void;
   onResultsAvailableChange?: ((available: boolean) => void) | undefined;
   resultsRef?: RefObject<HTMLElement | null>;
 }) {
@@ -157,9 +169,17 @@ export function SavedWorkflowResults({
   // A run that ends while someone is reading keeps its result viewer open.
   const [partialResultOpen, setPartialResultOpen] = useState(job.status !== "cancelled");
   const selectedRef = useRef<string | null>(null);
-  selectedRef.current = selected;
+  useLayoutEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
   const [view, setView] = useState<"changes" | "conversation">("changes");
-  const [loaded, setLoaded] = useState<SavedWorkflowResultRead | null>(null);
+  const [loaded, setLoaded] = useState<
+    (SavedWorkflowResultRead & { readId: number; scope: string; retry: number }) | null
+  >(null);
+  const [renderedReview, setRenderedReview] = useState<{
+    readId: number;
+    checkpoint: WorkflowResultCheckpoint;
+  } | null>(null);
   const [conversation, setConversation] = useState<{
     resultId: string;
     history: PortableThreadHistory;
@@ -167,6 +187,7 @@ export function SavedWorkflowResults({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [indexError, setIndexError] = useState<string | null>(null);
+  const [historyRead, setHistoryRead] = useState<HistoryRead | null>(null);
   const [busy, setBusy] = useState(false);
   const [retry, setRetry] = useState(0);
   const [indexRetry, setIndexRetry] = useState(0);
@@ -176,6 +197,11 @@ export function SavedWorkflowResults({
   const localResultsRef = useRef<HTMLElement>(null);
   const savedResults = resultsRef ?? localResultsRef;
   const deletionStatus = useRef<HTMLDivElement>(null);
+  const partialResultToggle = useRef<HTMLButtonElement>(null);
+  const restorePickerFocus = useRef(false);
+  const capturePickerFocus = useCallback(() => {
+    restorePickerFocus.current = true;
+  }, []);
   const deleteButton = useRef<HTMLButtonElement>(null);
   const keepThreadButton = useRef<HTMLButtonElement>(null);
   const completed = job.status === "done";
@@ -192,6 +218,30 @@ export function SavedWorkflowResults({
     retryIntent &&
     (index ? index.relayUrl !== retryIntent.intent.relayUrl : retryIntent.relayChanged);
   const waitingForThread = threadState === "not_started";
+  const resultsScope =
+    index && !resultsUnavailable && !waitingForThread
+      ? JSON.stringify([
+          scope.accountId,
+          scope.organizationId,
+          scope.repositoryId,
+          job.jobId,
+          index.relayUrl,
+          index.threadId,
+        ])
+      : null;
+  const historyKey =
+    resultsScope && index && index.nextCursor !== null
+      ? JSON.stringify([resultsScope, index.generation, index.nextCursor])
+      : null;
+  const paging = historyRead?.request.key === historyKey ? historyRead.state : null;
+  const pagingPending = paging === "loading" || paging === "retrying";
+  const latestHistoryKey = useRef(historyKey);
+  const latestResultsScope = useRef(resultsScope);
+  const inFlightHistory = useRef<HistoryRequest | null>(null);
+  useLayoutEffect(() => {
+    latestHistoryKey.current = historyKey;
+    latestResultsScope.current = resultsScope;
+  }, [historyKey, resultsScope]);
   const capabilities = useAtomValue(threadVmControls.capabilitiesAtom);
   const canDelete = canDeleteSavedWorkflowThread(job, canConfigure, capabilities);
   const latestDeletionAccess = useRef(canDelete);
@@ -226,11 +276,36 @@ export function SavedWorkflowResults({
           scope.organizationId,
           scope.repositoryId,
           job.jobId,
+          index?.threadId,
         ]),
       ),
-    [scope.accountId, scope.organizationId, scope.repositoryId, job.jobId, index?.relayUrl],
+    [
+      scope.accountId,
+      scope.organizationId,
+      scope.repositoryId,
+      job.jobId,
+      index?.relayUrl,
+      index?.threadId,
+    ],
   );
   useEffect(() => () => reader.clear(), [reader]);
+  const clearSavedResults = () => {
+    indexEpoch.current++;
+    inFlightHistory.current = null;
+    setHistoryRead(null);
+    reader.clear();
+    generation.current++;
+    setLoaded(null);
+    setRenderedReview(null);
+    setConversation(null);
+    setError(null);
+    setIndexError(null);
+    setIndex(null);
+    setSelected(null);
+    setBrowsingHistory(false);
+    setBusy(false);
+  };
+  const clearInaccessibleResults = useEffectEvent(clearSavedResults);
   useEffect(() => {
     if (deleted || waitingForThread) return;
     let current = true;
@@ -311,7 +386,9 @@ export function SavedWorkflowResults({
       })
       .catch((cause) => {
         if (current && epoch === indexEpoch.current) {
-          if (completed && !checkedIntent && requestedRelayUrl && !workflowJobAccessLost(cause)) {
+          if (workflowJobAccessLost(cause)) {
+            clearInaccessibleResults();
+          } else if (completed && !checkedIntent && requestedRelayUrl) {
             setIndex((previous) => (previous?.relayUrl === requestedRelayUrl ? previous : null));
           } else {
             setIndex(null);
@@ -348,6 +425,16 @@ export function SavedWorkflowResults({
       ? (results.find((entry) => isCurrentWorkflowReviewResult(job, entry)) ?? null)
       : currentWorkflowSavedResult(job, results);
   const partialResult = cancelled && currentResult?.outcome === "cancelled" ? currentResult : null;
+  const partialResultHidden = !!partialResult && !partialResultOpen;
+  const pickerKey = index?.results.length && !partialResultHidden ? resultsScope : null;
+  useLayoutEffect(() => {
+    if (restorePickerFocus.current) {
+      restorePickerFocus.current = false;
+      (partialResultHidden ? partialResultToggle.current : savedResults.current)?.focus({
+        preventScroll: true,
+      });
+    }
+  }, [pickerKey, partialResultHidden, savedResults]);
   const hasPartialChanges = !!partialResult && partialResult.patch.sizeBytes > 0;
   const resultsAvailable =
     !resultsUnavailable &&
@@ -363,17 +450,20 @@ export function SavedWorkflowResults({
     onReviewTargetChange?.(reviewingCurrent);
   }, [onReviewTargetChange, reviewingCurrent]);
   const recorded = useRef<string | null>(null);
-  const selectResult = (id: string | null) => {
-    if (id !== selected) recorded.current = null;
-    setBrowsingHistory(true);
+  const selectResult = (id: string) => {
+    if (id !== selected) setRenderedReview(null);
+    setBrowsingHistory(id !== currentResult?.resultId);
     setSelected(id);
   };
   const returnToCurrent = () => {
     setView("changes");
     changesTab.current?.focus();
-    setBrowsingHistory(false);
-    if (currentResult) setSelected(currentResult.resultId);
-    else setRetry((n) => n + 1);
+    if (currentResult) {
+      selectResult(currentResult.resultId);
+    } else {
+      setBrowsingHistory(false);
+      setRetry((n) => n + 1);
+    }
   };
   const saving = job.progress?.resultSaving?.state;
   const resultSavePending = saving === "saving" || saving === "failed";
@@ -393,7 +483,7 @@ export function SavedWorkflowResults({
     setLoaded(null);
     setConversation(null);
     setError(null);
-    if (!result) return;
+    if (!result || !resultsScope) return;
     setBusy(true);
     void reader
       .read(result, () =>
@@ -407,7 +497,9 @@ export function SavedWorkflowResults({
         ),
       )
       .then((value) => {
-        if (active.current && request === generation.current) setLoaded(value);
+        if (active.current && request === generation.current) {
+          setLoaded({ ...value, readId: request, scope: resultsScope, retry });
+        }
       })
       .catch((cause) => {
         if (active.current && request === generation.current)
@@ -419,7 +511,7 @@ export function SavedWorkflowResults({
     return () => {
       generation.current++;
     };
-  }, [reader, result, call, scope.repositoryId, job.jobId, retry]);
+  }, [reader, result, resultsScope, call, scope.repositoryId, job.jobId, retry]);
   const patch = useMemo(
     () =>
       loaded
@@ -432,33 +524,56 @@ export function SavedWorkflowResults({
     [loaded],
   );
   const checkpoint = workflowResultCheckpoint(job.progress?.checkpoint);
-  const [renderedId, setRenderedId] = useState<string | null>(null);
+  const [renderedRead, setRenderedRead] = useState<number | null>(null);
+  const activeRead =
+    loaded &&
+    loaded.scope === resultsScope &&
+    loaded.retry === retry &&
+    result &&
+    sameSavedResult(loaded.result, result)
+      ? loaded
+      : null;
+  const verifiedCheckpoint =
+    canVerifyResult &&
+    reviewingCurrent &&
+    checkpoint &&
+    renderedReview &&
+    activeRead?.readId === renderedReview.readId &&
+    sameWorkflowResultCheckpoint(checkpoint, renderedReview.checkpoint)
+      ? renderedReview.checkpoint
+      : null;
+  useLayoutEffect(() => {
+    onReviewRenderChange?.(verifiedCheckpoint);
+    return () => onReviewRenderChange?.(null);
+  }, [onReviewRenderChange, verifiedCheckpoint]);
   const recordVisible = useCallback(() => {
     if (
       view !== "changes" ||
-      !loaded ||
-      loaded.result.resultId !== result?.resultId ||
+      !activeRead ||
       !checkpoint ||
       !canVerifyResult ||
       !reviewingCurrent ||
       patch?.kind === "raw" ||
-      (loaded.patch !== "" && renderedId !== loaded.result.resultId) ||
+      activeRead.readId !== generation.current ||
+      (activeRead.patch !== "" && renderedRead !== activeRead.readId) ||
       document.visibilityState === "hidden"
     )
       return;
-    const key = `${checkpoint.checkpointId}:${loaded.result.resultId}:${loaded.result.patch.sha256}`;
+    const key = `${checkpoint.checkpointId}:${activeRead.readId}`;
     if (recorded.current === key) return;
     recorded.current = key;
     const visitId = randomUUID();
     beginWorkflowReview(appAtomRegistry, scope, job.jobId, visitId, checkpoint);
-    if (recordSavedWorkflowReviewDiff(appAtomRegistry, scope, job.jobId, visitId, loaded.result)) {
+    if (
+      recordSavedWorkflowReviewDiff(appAtomRegistry, scope, job.jobId, visitId, activeRead.result)
+    ) {
       requireFreshWorkflowReviewRead(appAtomRegistry, scope, job.jobId);
+      if (onReviewRenderChange) setRenderedReview({ checkpoint, readId: activeRead.readId });
       void refresh();
     }
   }, [
     view,
-    loaded,
-    result?.resultId,
+    activeRead,
     checkpoint,
     canVerifyResult,
     reviewingCurrent,
@@ -466,7 +581,8 @@ export function SavedWorkflowResults({
     scope,
     patch,
     refresh,
-    renderedId,
+    renderedRead,
+    onReviewRenderChange,
   ]);
   useLayoutEffect(() => {
     recordVisible();
@@ -476,9 +592,13 @@ export function SavedWorkflowResults({
   const diffOptions = useMemo(
     () => ({
       diffStyle: !narrow && diffLayout === "split" ? ("split" as const) : ("unified" as const),
-      onPostRender: () => setRenderedId(loaded?.result.resultId ?? null),
+      onPostRender: () => {
+        if (active.current && loaded?.readId === generation.current) {
+          setRenderedRead(loaded.readId);
+        }
+      },
     }),
-    [loaded?.result, narrow, diffLayout],
+    [loaded, narrow, diffLayout],
   );
   const readConversation = useCallback(
     async (more = false) => {
@@ -553,70 +673,119 @@ export function SavedWorkflowResults({
     }
   };
   const moreResults = async () => {
-    if (!index?.nextCursor || busy) return;
-    const request = generation.current;
-    setBusy(true);
+    if (
+      !historyKey ||
+      !resultsScope ||
+      !index ||
+      index.nextCursor === null ||
+      inFlightHistory.current?.key === historyKey
+    )
+      return;
+    const cursor = index.nextCursor;
+    const request: HistoryRequest = {
+      key: historyKey,
+      scope: resultsScope,
+      epoch: indexEpoch.current,
+    };
+    const sameAuthority = () =>
+      active.current &&
+      request.epoch === indexEpoch.current &&
+      request.scope === latestResultsScope.current;
+    const isCurrent = () =>
+      sameAuthority() &&
+      request === inFlightHistory.current &&
+      request.key === latestHistoryKey.current;
+    inFlightHistory.current = request;
+    setHistoryRead({ request, state: paging === "failed" ? "retrying" : "loading" });
+    let relayChanged = false;
     try {
-      const page = await call((client, token) =>
-        client
+      const page = await call((client, token) => {
+        relayChanged = client.relayUrl !== index.relayUrl;
+        if (relayChanged || !isCurrent())
+          throw new WorkflowRequestNotSentError("The workflow result index changed.");
+        return client
           .listSavedWorkflowResults({
             clerkToken: token,
             repositoryId: scope.repositoryId,
             jobId: job.jobId,
-            before: index.nextCursor!,
+            before: cursor,
           })
-          .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl }))),
-      );
-      if (active.current && request === generation.current)
-        setIndex((previous) => {
-          if (
-            !previous ||
-            previous.nextCursor !== index.nextCursor ||
-            !sameThreadPlacement(index, previous) ||
-            !sameThreadPlacement(index, page)
-          )
-            return previous;
-          // A refresh can retain older cached results beyond the fetched page range.
-          const cursorIndex = previous.results.findIndex(
-            (entry) => entry.resultId === previous.cursorTailId,
-          );
-          const split = cursorIndex === -1 ? previous.results.length : cursorIndex + 1;
-          const results = [
-            ...previous.results.slice(0, split),
-            ...page.results,
-            ...previous.results.slice(split),
-          ];
-          return {
-            ...previous,
-            results: [...new Map(results.map((entry) => [entry.resultId, entry])).values()],
-            ...continueSavedResults(page, previous.cachedRanges ?? []),
-          };
-        });
-    } catch {
-      if (active.current && request === generation.current)
-        setError("Could not load older Agent results.");
+          .pipe(Effect.map((data) => ({ ...data, relayUrl: client.relayUrl })));
+      });
+      if (!isCurrent()) return;
+      if (!sameThreadPlacement(index, page)) {
+        if (page.relayUrl !== index.relayUrl || page.threadId !== index.threadId) {
+          clearSavedResults();
+        }
+        setIndexRetry((previous) => previous + 1);
+        return;
+      }
+      setIndex((previous) => {
+        if (!previous || previous.nextCursor !== cursor || !sameThreadPlacement(index, previous))
+          return previous;
+        // A refresh can retain older cached results beyond the fetched page range.
+        const cursorIndex = previous.results.findIndex(
+          (entry) => entry.resultId === previous.cursorTailId,
+        );
+        const split = cursorIndex === -1 ? previous.results.length : cursorIndex + 1;
+        const cached = new Map(previous.results.map((entry) => [entry.resultId, entry]));
+        const fresh = new Map(
+          page.results.map((entry) => {
+            const existing = cached.get(entry.resultId);
+            return [
+              entry.resultId,
+              existing && sameSavedResult(existing, entry) ? existing : entry,
+            ];
+          }),
+        );
+        const results = [
+          ...previous.results.slice(0, split),
+          ...fresh.values(),
+          ...previous.results.slice(split),
+        ];
+        const byId = new Map(
+          results.map((entry) => [entry.resultId, fresh.get(entry.resultId) ?? entry]),
+        );
+        return {
+          ...previous,
+          results: [...byId.values()],
+          ...continueSavedResults(page, previous.cachedRanges ?? []),
+        };
+      });
+    } catch (cause) {
+      if (workflowJobAccessLost(cause)) {
+        if (sameAuthority()) {
+          clearSavedResults();
+          setIndexError(cause instanceof Error ? cause.message : "Could not read saved results.");
+        }
+      } else if (!isCurrent()) {
+        return;
+      } else if (relayChanged) {
+        clearSavedResults();
+        setIndexRetry((previous) => previous + 1);
+      } else {
+        setHistoryRead({ request, state: "failed" });
+      }
     } finally {
-      if (active.current && request === generation.current) setBusy(false);
+      if (request === inFlightHistory.current) {
+        inFlightHistory.current = null;
+        if (active.current) {
+          setHistoryRead((previous) =>
+            previous?.request === request && previous.state !== "failed" ? null : previous,
+          );
+        }
+      }
     }
   };
   const openDeletion = () => {
-    if (!index || busy || !canDelete) return;
+    if (!index || busy || pagingPending || !canDelete) return;
     const { threadId, generation, relayUrl } = index;
     setDeletion({ state: "confirming", target: { threadId, generation, relayUrl } });
   };
-  const clearSavedResults = () => {
-    indexEpoch.current++;
-    reader.clear();
-    generation.current++;
-    setLoaded(null);
-    setConversation(null);
-    setIndex(null);
-    setSelected(null);
-    setBrowsingHistory(false);
-    setBusy(false);
-  };
   const refreshDeletionTarget = () => {
     indexEpoch.current++;
+    inFlightHistory.current = null;
+    setHistoryRead(null);
     setRetry((previous) => previous + 1);
     void refresh();
   };
@@ -714,11 +883,7 @@ export function SavedWorkflowResults({
   };
   const resultsError = indexError ?? error;
   const resultView = (
-    <div
-      id={`${tabId}-saved-results`}
-      className="space-y-3"
-      hidden={!!partialResult && !partialResultOpen}
-    >
+    <div id={`${tabId}-saved-results`} className="space-y-3" hidden={partialResultHidden}>
       <header className="flex flex-wrap items-start justify-between gap-3">
         {result ? (
           <div className="min-w-0 space-y-1">
@@ -742,35 +907,19 @@ export function SavedWorkflowResults({
             </div>
           </div>
         ) : null}
-        {index?.results.length ? (
-          <div className="w-full min-w-0 sm:w-auto sm:max-w-96">
-            <Select value={selected} onValueChange={selectResult}>
-              <SelectTrigger aria-label="Saved result" size="sm">
-                <SelectValue>
-                  {result
-                    ? `Saved ${new Date(result.createdAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`
-                    : "Choose a saved result"}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectPopup>
-                {index.results.map((entry) => (
-                  <SelectItem key={entry.resultId} value={entry.resultId}>
-                    <div>
-                      <p>{stepTitle(entry.stepId)}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {new Date(entry.createdAt).toLocaleString(undefined, {
-                          dateStyle: "medium",
-                          timeStyle: "short",
-                        })}{" "}
-                        / {entry.outcome}
-                        {entry.resultId === currentResult?.resultId ? " / Current" : " / Earlier"}
-                      </p>
-                    </div>
-                  </SelectItem>
-                ))}
-              </SelectPopup>
-            </Select>
-          </div>
+        {pickerKey && index ? (
+          <SavedWorkflowResultPicker
+            key={pickerKey}
+            results={index.results}
+            selected={result}
+            currentReview={reviewAvailable ? currentResult : null}
+            stepTitle={stepTitle}
+            onSelect={selectResult}
+            canLoadOlder={historyKey !== null}
+            paging={paging}
+            onLoadOlder={() => void moreResults()}
+            onFocusBeforeRemoval={capturePickerFocus}
+          />
         ) : null}
       </header>
       {reviewAvailable && result && !reviewingCurrent ? (
@@ -804,11 +953,6 @@ export function SavedWorkflowResults({
         >
           Open the saved result for this run before retrying completion.
         </WorkflowAlert>
-      ) : null}
-      {index?.nextCursor ? (
-        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void moreResults()}>
-          Load older results
-        </Button>
       ) : null}
       {result ? (
         <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
@@ -991,6 +1135,7 @@ export function SavedWorkflowResults({
             <Button
               aria-controls={`${tabId}-saved-results`}
               aria-expanded={partialResultOpen}
+              ref={partialResultToggle}
               onClick={() => {
                 if (!partialResultOpen) {
                   setSelected(partialResult.resultId);
@@ -1115,7 +1260,7 @@ export function SavedWorkflowResults({
               ref={deleteButton}
               size="sm"
               variant="destructive-outline"
-              disabled={busy || !index}
+              disabled={busy || pagingPending || !index}
               onClick={openDeletion}
             >
               Delete thread permanently
@@ -1157,7 +1302,11 @@ export function SavedWorkflowResults({
             <Button ref={keepThreadButton} variant="outline" onClick={() => setDeletion(null)}>
               Keep thread
             </Button>
-            <Button variant="destructive" disabled={busy} onClick={() => void deleteThread()}>
+            <Button
+              variant="destructive"
+              disabled={busy || pagingPending}
+              onClick={() => void deleteThread()}
+            >
               Delete thread
             </Button>
           </AlertDialogFooter>

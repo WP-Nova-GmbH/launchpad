@@ -49,7 +49,11 @@ import {
   workflowViewerControls,
   workflowApprovalPending,
 } from "@t3tools/client-runtime/relay/workflow-responses";
-import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
+import {
+  sameWorkflowResultCheckpoint,
+  workflowResultCheckpoint,
+  type WorkflowResultCheckpoint,
+} from "@t3tools/client-runtime/relay/workflow-result";
 import { savedWorkflowThreadState } from "@t3tools/client-runtime/relay/workflow-saved-results";
 import {
   workflowDraftAtom,
@@ -105,6 +109,13 @@ import {
 } from "./workflowState";
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
+type SavedReviewRender = { key: string; visitId: string };
+
+const matchesSavedReviewRender = (
+  render: SavedReviewRender | null,
+  key: string | null,
+  visitId: string | undefined,
+) => render !== null && render.key === key && render.visitId === visitId;
 
 /** Keep focus in the run when an update moves or removes the focused action. */
 function useRunActionFocus<Action extends HTMLElement = HTMLButtonElement>(
@@ -213,6 +224,42 @@ export function WorkflowJob({
   const feedbackButton = useRef<HTMLButtonElement>(null);
   const feedbackFocus = useRef<"input" | "button" | null>(null);
   const checkpoint = selectedJob?.progress?.checkpoint;
+  const vmReview = selectedJob?.runtime?.kind === "vm";
+  const savedReviewKey =
+    selectedJob?.runtime?.kind === "vm" && checkpoint && checkpoint.kind !== "input"
+      ? JSON.stringify([
+          key,
+          selectedJob.runtime.threadId,
+          checkpoint.checkpointId,
+          checkpoint.turnId,
+          checkpoint.checkpointTurnCount,
+          checkpoint.checkpointRef,
+        ])
+      : null;
+  const currentSavedReviewRender = useRef<SavedReviewRender | null>(null);
+  const [savedReviewRender, setSavedReviewRender] = useState<SavedReviewRender | null>(null);
+  const onSavedReviewRenderChange = useCallback(
+    (renderedCheckpoint: WorkflowResultCheckpoint | null) => {
+      const currentCheckpoint = workflowResultCheckpoint(
+        appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.job?.progress?.checkpoint,
+      );
+      const review = appAtomRegistry.get(workflowDraftAtom).reviews[key];
+      const proof =
+        savedReviewKey &&
+        renderedCheckpoint &&
+        currentCheckpoint &&
+        review?.verified &&
+        sameWorkflowResultCheckpoint(renderedCheckpoint, currentCheckpoint)
+          ? { key: savedReviewKey, visitId: review.id }
+          : null;
+      currentSavedReviewRender.current = proof;
+      setSavedReviewRender(proof);
+    },
+    [key, savedReviewKey],
+  );
+  const waitingForSavedReviewRender =
+    vmReview &&
+    !matchesSavedReviewRender(savedReviewRender, savedReviewKey, drafts.reviews[key]?.id);
   const reviewApproval = workflowReviewApprovalState(drafts.reviews[key], read);
   const reviewChanged = reviewApproval === "inspect";
   const checkingReturnedReview = reviewApproval === "checking";
@@ -345,6 +392,12 @@ export function WorkflowJob({
         (!viewerControls.canApprove ||
           (finishing && !completionRetryable) ||
           currentRead.job !== selectedJob ||
+          (vmReview &&
+            !matchesSavedReviewRender(
+              currentSavedReviewRender.current,
+              savedReviewKey,
+              currentReview?.id,
+            )) ||
           workflowReviewApprovalState(currentReview, currentRead) !== "allowed")) ||
       ((operation === "input" || operation === "request_changes") && !viewerControls.canRespond)
     )
@@ -768,7 +821,10 @@ export function WorkflowJob({
               recovery.retrying ||
               manualState.responsePending ||
               (!hasResultSave &&
-                (reviewChanged || checkingReturnedReview || manualState.checkpointBlocked))
+                (reviewChanged ||
+                  checkingReturnedReview ||
+                  waitingForSavedReviewRender ||
+                  manualState.checkpointBlocked))
             }
             onClick={() => {
               if (!recovery.retrying) void respond(recoveryRetry);
@@ -1543,6 +1599,7 @@ export function WorkflowJob({
               refresh={refresh}
               canConfigure={canConfigure}
               onReviewTargetChange={setReviewingCurrentResult}
+              onReviewRenderChange={onSavedReviewRenderChange}
               onResultsAvailableChange={completed ? onSavedResultsAvailableChange : undefined}
               resultsRef={savedResults}
             />
@@ -1589,6 +1646,7 @@ export function WorkflowJob({
                     busy ||
                     reviewChanged ||
                     checkingReturnedReview ||
+                    waitingForSavedReviewRender ||
                     manualState.checkpointBlocked ||
                     approvalPending
                   }

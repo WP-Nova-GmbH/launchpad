@@ -1,4 +1,11 @@
-import { act, createElement, type PropsWithChildren } from "react";
+import {
+  act,
+  createContext,
+  createElement,
+  useContext,
+  type PropsWithChildren,
+  type Ref,
+} from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
@@ -27,6 +34,7 @@ const fixture = vi.hoisted(() => ({
   deletion: vi.fn(),
   refresh: vi.fn(),
   target: vi.fn(),
+  renderChange: vi.fn(),
 }));
 const capability = (permanentDelete = true): ThreadVmCapabilities => ({
   configured: true,
@@ -70,13 +78,71 @@ vi.mock("../ui/toggle-group", () => ({
 vi.mock("../ui/button", () => ({
   Button: (props: PropsWithChildren<Record<string, unknown>>) => createElement("button", props),
 }));
-vi.mock("../ui/select", () => ({
-  Select: (props: PropsWithChildren<Record<string, unknown>>) => createElement("select", props),
-  SelectItem: ({ children }: PropsWithChildren) => children,
-  SelectPopup: ({ children }: PropsWithChildren) => children,
-  SelectTrigger: ({ children }: PropsWithChildren) => children,
-  SelectValue: ({ children }: PropsWithChildren) => children,
-}));
+vi.mock("../ui/combobox", () => {
+  type PickerState = {
+    value: WorkflowSavedResult | null;
+    items: ReadonlyArray<WorkflowSavedResult>;
+    onValueChange: (value: WorkflowSavedResult) => void;
+    inputValue: string;
+    onInputValueChange: (
+      value: string,
+      details: { reason: "input-change" | "input-clear" },
+    ) => void;
+  };
+  const PickerContext = createContext<PickerState | null>(null);
+  const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
+  return {
+    Combobox: ({ children, ...state }: PropsWithChildren<PickerState>) =>
+      createElement(
+        PickerContext.Provider,
+        { value: state },
+        createElement(
+          "div",
+          { "data-result-picker": true, "data-selection": state.value?.resultId },
+          children,
+        ),
+      ),
+    ComboboxTrigger: ({
+      children,
+      render: _render,
+      ...props
+    }: PropsWithChildren<Record<string, unknown>>) => createElement("button", props, children),
+    ComboboxPopup: ({ children, ref }: PropsWithChildren<{ ref?: Ref<HTMLDivElement> }>) =>
+      createElement("div", { ref, "data-result-picker-popup": true }, children),
+    ComboboxList: part,
+    ComboboxItem: ({ children, value }: PropsWithChildren<{ value: WorkflowSavedResult }>) => {
+      const picker = useContext(PickerContext)!;
+      return createElement(
+        "button",
+        {
+          role: "option",
+          "aria-selected": picker.value?.resultId === value.resultId,
+          "data-result-id": value.resultId,
+          onClick: () => {
+            picker.onValueChange(value);
+            if (picker.inputValue) picker.onInputValueChange("", { reason: "input-clear" });
+          },
+        },
+        children,
+      );
+    },
+    ComboboxSearchInput: (props: Record<string, unknown>) => {
+      const picker = useContext(PickerContext)!;
+      return createElement("input", {
+        value: picker.inputValue,
+        onChange: (event: { target: { value: string } }) =>
+          picker.onInputValueChange(event.target.value, { reason: "input-change" }),
+        ...props,
+      });
+    },
+    ComboboxStatus: ({ children }: PropsWithChildren) =>
+      createElement("div", { role: "status" }, children),
+    ComboboxEmpty: ({ children }: PropsWithChildren) =>
+      useContext(PickerContext)!.items.length === 0
+        ? createElement("div", { role: "status" }, children)
+        : null,
+  };
+});
 vi.mock("../ui/alert-dialog", () => {
   const part = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
@@ -151,15 +217,33 @@ const view = (currentJob = job, canConfigure = true) =>
       refresh: fixture.refresh,
       canConfigure,
       onReviewTargetChange: fixture.target,
+      onReviewRenderChange: fixture.renderChange,
     }),
   );
-async function mount(currentJob = job, canConfigure = true) {
+async function mount(
+  currentJob = job,
+  canConfigure = true,
+  options?: Parameters<typeof create>[1],
+) {
   await act(async () => {
-    renderer = create(view(currentJob, canConfigure));
+    renderer = create(view(currentJob, canConfigure), options);
   });
 }
 const findButton = (label: string, root = renderer.root) =>
-  root.findAllByType("button").find((button) => button.children.includes(label));
+  root
+    .findAllByType("button")
+    .find((button) => button.props["aria-label"] === label || button.children.includes(label));
+const findPicker = () => renderer.root.findAllByProps({ "data-result-picker": true })[0];
+const pickerOptions = () => findPicker()?.findAllByProps({ role: "option" }) ?? [];
+const pickerSearch = () => findPicker()!.findByType("input");
+async function selectSavedResult(resultId: string) {
+  const option = pickerOptions().find((entry) => entry.props["data-result-id"] === resultId);
+  expect(option).toBeDefined();
+  await act(() => option!.props.onClick());
+}
+async function searchSavedResults(value: string) {
+  await act(() => pickerSearch().props.onChange({ target: { value } }));
+}
 const deleteDialog = () => renderer.root.findAllByProps({ role: "alertdialog" })[0];
 async function press(label: string, root = renderer.root) {
   const button = findButton(label, root);
@@ -167,6 +251,15 @@ async function press(label: string, root = renderer.root) {
   await act(async () => {
     await button!.props.onClick();
   });
+}
+function deferred<A>() {
+  let resolve!: (value: A) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<A>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
 }
 beforeEach(() => {
   vi.stubGlobal("document", {
@@ -248,6 +341,63 @@ it("requires the current saved diff to render before recording a Review visit", 
     await act(() => diff.props.options.onPostRender());
     expect(fixture.refresh).toHaveBeenCalledOnce();
   }));
+
+it("requires a fresh render when returning to the same saved review result", () =>
+  withClient(async () => {
+    const earlier = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      turnId: "earlier",
+      createdAt: "2026-11-10T10:40:00Z",
+    };
+    fixture.list.mockResolvedValue({
+      results: [result, earlier],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === earlier.resultId ? earlier : result,
+      patch,
+    }));
+    await mount();
+    const renderFirstReview = renderer.root.findByType("pre").props.options.onPostRender;
+    await act(() => renderFirstReview());
+    expect(fixture.refresh).toHaveBeenCalledOnce();
+    expect(fixture.renderChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ checkpointId: "checkpoint" }),
+    );
+
+    await searchSavedResults("unmatched");
+    expect(pickerOptions().map((option) => option.props["data-result-id"])).toEqual([
+      result.resultId,
+    ]);
+    expect(fixture.refresh).toHaveBeenCalledOnce();
+    expect(fixture.renderChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ checkpointId: "checkpoint" }),
+    );
+    await searchSavedResults("");
+
+    await selectSavedResult(earlier.resultId);
+    expect(fixture.renderChange).toHaveBeenLastCalledWith(null);
+    const renderEarlier = renderer.root.findByType("pre").props.options.onPostRender;
+    await selectSavedResult(result.resultId);
+    expect(fixture.refresh).toHaveBeenCalledOnce();
+    expect(fixture.renderChange).toHaveBeenLastCalledWith(null);
+    await act(() => {
+      renderFirstReview();
+      renderEarlier();
+    });
+    expect(fixture.refresh).toHaveBeenCalledOnce();
+    expect(fixture.renderChange).toHaveBeenLastCalledWith(null);
+
+    await act(() => renderer.root.findByType("pre").props.options.onPostRender());
+    expect(fixture.refresh).toHaveBeenCalledTimes(2);
+    expect(fixture.renderChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ checkpointId: "checkpoint" }),
+    );
+  }));
+
 it("does not replace a selected result with a late reply for an older selection", () =>
   withClient(async () => {
     const next = {
@@ -272,7 +422,7 @@ it("does not replace a selected result with a late reply for an older selection"
         : Promise.resolve({ result: next, patch }),
     );
     await mount();
-    await act(() => renderer.root.findByType("select").props.onValueChange(next.resultId));
+    await selectSavedResult(next.resultId);
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(next.resultId);
     await act(async () => {
       resolve({ result, patch });
@@ -362,7 +512,7 @@ it("keeps the open conversation and loaded pages of earlier results when the run
     }));
     await mount();
     await press("Load older results");
-    await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
+    await selectSavedResult(earlier.resultId);
     await press("Conversation");
 
     const content = () => JSON.stringify(renderer.toJSON());
@@ -377,7 +527,7 @@ it("keeps the open conversation and loaded pages of earlier results when the run
     });
     await act(() => renderer.update(view(completedWithCheckpoint)));
 
-    expect(renderer.root.findByType("select").props.value).toBe(earlier.resultId);
+    expect(findPicker()?.props["data-selection"]).toBe(earlier.resultId);
     expect(content()).toContain("No saved messages for this Agent result.");
     expect(content()).toContain("Final Agent");
     expect(content()).toContain("Oldest Agent");
@@ -440,23 +590,24 @@ it.each([null, 4] as const)(
         ),
       );
 
-      const titles = () =>
-        renderer.root
-          .findByType("select")
-          .findAllByType("div")
-          .map((option) => option.findAllByType("p")[0]!.children.join(""));
-      expect(titles()).toEqual(["Final Agent", result.stepId, "Oldest Agent"]);
+      const resultIds = () => pickerOptions().map((option) => option.props["data-result-id"]);
+      expect(resultIds()).toEqual([finalResult.resultId, result.resultId, oldest.resultId]);
 
       await press("Load older results");
 
-      expect(titles()).toEqual(["Final Agent", "Middle Agent", result.stepId, "Oldest Agent"]);
+      expect(resultIds()).toEqual([
+        finalResult.resultId,
+        middle.resultId,
+        result.resultId,
+        oldest.resultId,
+      ]);
       expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
       if (cachedCursor !== null) {
         await press("Load older results");
         expect(fixture.list).toHaveBeenLastCalledWith(
           expect.objectContaining({ before: cachedCursor }),
         );
-        expect(titles().at(-1)).toBe(uncached.stepId);
+        expect(resultIds().at(-1)).toBe(uncached.resultId);
       }
       expect(findButton("Load older results")).toBeUndefined();
     }),
@@ -479,7 +630,7 @@ it("hides loaded results when the completion refresh reports that the thread is 
     await act(() => renderer.update(view(completedWithCheckpoint)));
 
     expect(renderer.root.findAllByType("pre")).toHaveLength(0);
-    expect(renderer.root.findAllByType("select")).toHaveLength(0);
+    expect(findPicker()).toBeUndefined();
   }));
 
 it("checks again for saved results when a run finishes with an empty index", () =>
@@ -745,24 +896,248 @@ it("requires fresh confirmation when the first deletion request was never sent",
     expect(fixture.deletion).toHaveBeenCalledOnce();
   }));
 
-it("ignores an older-results page from a different thread placement", () =>
+it("rechecks a different thread returned by a page before showing its saved results", () =>
   withClient(async () => {
     const currentPage = { results: [result], nextCursor: 1, threadId: "thread", generation: 1 };
-    fixture.list.mockImplementation(async ({ before }) =>
-      before
-        ? {
-            results: [{ ...result, resultId: "66666666-6666-4666-8666-666666666666" }],
-            nextCursor: null,
-            threadId: "replacement-thread",
-            generation: 2,
-          }
-        : currentPage,
-    );
+    const replacement = { ...result, resultId: "66666666-6666-4666-8666-666666666666" };
+    const replacementPage = {
+      results: [replacement],
+      nextCursor: null,
+      threadId: "replacement-thread",
+      generation: 2,
+    };
+    const recheck = deferred<typeof replacementPage>();
+    fixture.list
+      .mockResolvedValueOnce(currentPage)
+      .mockResolvedValueOnce(replacementPage)
+      .mockReturnValueOnce(recheck.promise);
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === replacement.resultId ? replacement : result,
+      patch,
+    }));
     await mount({ ...job, status: "done" });
+
     await press("Load older results");
-    expect(findButton("Load older results")).toBeDefined();
-    expect(JSON.stringify(renderer.toJSON())).not.toContain("66666666-6666-4666-8666-666666666666");
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+    expect(fixture.list.mock.calls.map(([input]) => input.before)).toEqual([
+      undefined,
+      1,
+      undefined,
+    ]);
+
+    await act(() => recheck.resolve(replacementPage));
+    expect(pickerOptions().map((option) => option.props["data-result-id"])).toEqual([
+      replacement.resultId,
+    ]);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(replacement.resultId);
+  }));
+
+it("retries the same older page without reloading a conversation selected while paging", () =>
+  withClient(async () => {
+    const earlier = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      stepId: "Earlier Agent",
+    };
+    const oldest = {
+      ...result,
+      resultId: "44444444-4444-4444-8444-444444444444",
+      stepId: "Oldest Agent",
+    };
+    const page = { results: [result, earlier], nextCursor: 10, threadId: "thread", generation: 1 };
+    const attempt = deferred<typeof page>();
+    fixture.list
+      .mockResolvedValueOnce(page)
+      .mockReturnValueOnce(attempt.promise)
+      .mockResolvedValueOnce({
+        ...page,
+        results: [{ ...earlier, patch: { ...earlier.patch } }, oldest],
+        nextCursor: null,
+      });
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === earlier.resultId ? earlier : result,
+      patch,
+    }));
+    await mount();
+    await searchSavedResults("agent");
+    await press("Load older results");
+    expect(JSON.stringify(renderer.toJSON())).toContain("Loading older results…");
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+
+    await selectSavedResult(earlier.resultId);
+    await press("Conversation");
+    const conversation = renderer.root.findByProps({ role: "tabpanel" });
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+    expect(fixture.history).toHaveBeenLastCalledWith(
+      expect.objectContaining({ resultId: earlier.resultId }),
+    );
+    const historyReads = fixture.history.mock.calls.length;
+
+    await act(() => attempt.reject(new Error("Temporarily disconnected")));
+    expect(JSON.stringify(renderer.toJSON())).toContain("Couldn’t load older results");
+    expect(pickerSearch().props.value).toBe("agent");
+    expect(findButton("Retry", conversation)).toBeUndefined();
+    await press("Retry loading older results");
+
+    expect(fixture.list.mock.calls.slice(1).map(([input]) => input.before)).toEqual([10, 10]);
+    expect(findPicker()?.props["data-selection"]).toBe(earlier.resultId);
+    expect(pickerSearch().props.value).toBe("agent");
+    expect(pickerOptions().map((option) => option.props["data-result-id"])).toEqual([
+      result.resultId,
+      earlier.resultId,
+      oldest.resultId,
+    ]);
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+    expect(fixture.history).toHaveBeenCalledTimes(historyReads);
+    expect(findButton("Retry loading older results")).toBeUndefined();
+    expect(findButton("Load older results")).toBeUndefined();
+    await searchSavedResults("");
+    expect(pickerSearch().props.value).toBe("");
+  }));
+
+it("keeps a late index refresh from restoring saved results after paging reports loss of access", () =>
+  withClient(async () => {
+    const firstPage = { results: [result], nextCursor: 10, threadId: "thread", generation: 1 };
+    const refresh = deferred<typeof firstPage>();
+    const olderPage = deferred<typeof firstPage>();
+    fixture.list
+      .mockResolvedValueOnce(firstPage)
+      .mockReturnValueOnce(refresh.promise)
+      .mockReturnValueOnce(olderPage.promise);
+    await mount(completedJob);
+    await act(() => renderer.update(view(completedWithCheckpoint)));
+    await press("Load older results");
+
+    await act(() =>
+      olderPage.reject(
+        ManagedRelay.relayRequestError("listSavedWorkflowResults")(
+          new RelayTenancyNotFoundError({
+            code: "tenancy_not_found",
+            reason: "thread_not_found",
+            traceId: "deleted-thread",
+          }),
+        ),
+      ),
+    );
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+
+    await act(() => refresh.resolve(firstPage));
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+  }));
+
+it.each(["open popup", "closed trigger", "elsewhere"] as const)(
+  "clears saved results after an obsolete-cursor denial with focus on %s",
+  (focusBeforeDenial) =>
+    withClient(async () => {
+      const firstPage = { results: [result], nextCursor: 10, threadId: "thread", generation: 1 };
+      const olderPage = deferred<typeof firstPage>();
+      fixture.list
+        .mockResolvedValueOnce(firstPage)
+        .mockReturnValueOnce(olderPage.promise)
+        .mockResolvedValueOnce({ ...firstPage, nextCursor: 30 });
+
+      const body = {};
+      const ownerDocument = { ...document, body, activeElement: body };
+      vi.stubGlobal("document", ownerDocument);
+      const focusTarget = () => {
+        const node = {
+          ownerDocument,
+          focus: vi.fn(() => {
+            ownerDocument.activeElement = node;
+          }),
+        };
+        return node;
+      };
+      const trigger = focusTarget();
+      const search = focusTarget();
+      const section = focusTarget();
+      const popup = { ownerDocument, contains: (node: unknown) => node === search };
+      await mount(completedJob, true, {
+        createNodeMock: ({ type, props }) => {
+          const host = props as { "aria-label"?: string; "data-result-picker-popup"?: boolean };
+          const label = host["aria-label"];
+          if (type === "input") return search;
+          if (host["data-result-picker-popup"]) return popup;
+          if (type === "button" && typeof label === "string" && label.startsWith("Saved result:"))
+            return trigger;
+          return label === "Saved workflow results" ? section : null;
+        },
+      });
+      await press("Load older results");
+      expect(ownerDocument.activeElement).toBe(search);
+      // Base UI returns focus to the trigger when Escape closes the popup.
+      if (focusBeforeDenial !== "open popup") trigger.focus();
+      const outside = focusTarget();
+      if (focusBeforeDenial === "elsewhere") outside.focus();
+
+      await act(() => renderer.update(view(completedWithCheckpoint)));
+      expect(fixture.list.mock.calls.map(([input]) => input.before)).toEqual([
+        undefined,
+        10,
+        undefined,
+      ]);
+      expect(findPicker()).toBeDefined();
+      expect(renderer.root.findByType("pre")).toBeDefined();
+
+      await act(() =>
+        olderPage.reject(
+          ManagedRelay.relayRequestError("listSavedWorkflowResults")(
+            new RelayTenancyNotFoundError({
+              code: "tenancy_not_found",
+              reason: "thread_not_found",
+              traceId: "deleted-thread",
+            }),
+          ),
+        ),
+      );
+      expect(findPicker()).toBeUndefined();
+      expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+      expect(ownerDocument.activeElement).toBe(
+        focusBeforeDenial === "elsewhere" ? outside : section,
+      );
+    }),
+);
+
+it("keeps replacement thread results visible after a late denial from the previous thread", () =>
+  withClient(async () => {
+    const firstPage = { results: [result], nextCursor: 10, threadId: "thread", generation: 1 };
+    const replacement = { ...result, resultId: "66666666-6666-4666-8666-666666666666" };
+    const olderPage = deferred<typeof firstPage>();
+    fixture.list
+      .mockResolvedValueOnce(firstPage)
+      .mockReturnValueOnce(olderPage.promise)
+      .mockResolvedValueOnce({
+        results: [replacement],
+        nextCursor: 30,
+        threadId: "replacement-thread",
+        generation: 2,
+      });
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === replacement.resultId ? replacement : result,
+      patch,
+    }));
+    await mount(completedJob);
+    await press("Load older results");
+    await act(() => renderer.update(view(completedWithCheckpoint)));
+    await selectSavedResult(replacement.resultId);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(replacement.resultId);
+
+    await act(() =>
+      olderPage.reject(
+        ManagedRelay.relayRequestError("listSavedWorkflowResults")(
+          new RelayTenancyNotFoundError({
+            code: "tenancy_not_found",
+            reason: "thread_not_found",
+            traceId: "replaced-thread",
+          }),
+        ),
+      ),
+    );
+    expect(findPicker()?.props["data-selection"]).toBe(replacement.resultId);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(replacement.resultId);
   }));
 
 it("keeps earlier results read-only and returns to the exact current review", () =>
@@ -788,7 +1163,7 @@ it("keeps earlier results read-only and returns to the exact current review", ()
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(true);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only"');
-    await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
+    await selectSavedResult(earlier.resultId);
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(false);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only result"');
@@ -801,7 +1176,24 @@ it("keeps earlier results read-only and returns to the exact current review", ()
   }));
 it("keeps an opened diff in place when a new checkpoint arrives until Review latest", () =>
   withClient(async () => {
+    const earlier = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      turnId: "earlier",
+    };
+    fixture.list.mockResolvedValue({
+      results: [result, earlier],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === earlier.resultId ? earlier : result,
+      patch,
+    }));
     await mount();
+    await selectSavedResult(earlier.resultId);
+    await selectSavedResult(result.resultId);
     const next = {
       ...result,
       resultId: "44444444-4444-4444-8444-444444444444",
@@ -908,7 +1300,7 @@ it.each(["awaiting_review", "finishing"] as const)(
       expect(JSON.stringify(renderer.toJSON())).not.toContain("Current review result");
       expect(fixture.refresh).toHaveBeenCalledOnce();
 
-      await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
+      await selectSavedResult(earlier.resultId);
       expect(renderer.root.findByType("pre").props.items[0].id).toContain(earlier.resultId);
       const content = JSON.stringify(renderer.toJSON());
       expect(content).not.toContain("A newer result needs review");
@@ -1061,7 +1453,7 @@ it("keeps an open saved conversation in place when a live run is canceled", () =
     expect(content).toContain("Partial changes saved");
     expect(content).toContain("No saved messages for this Agent result.");
     expect(renderer.root.findByProps({ role: "tabpanel" })).toBe(panel);
-    expect(renderer.root.findByType("select").props.value).toBe(result.resultId);
+    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
     expect(fixture.history).toHaveBeenCalledOnce();
     const disclosure = renderer.root
       .findAllByType("button")
@@ -1070,6 +1462,9 @@ it("keeps an open saved conversation in place when a live run is canceled", () =
     expect(renderer.root.findByProps({ id: disclosure.props["aria-controls"] }).props.hidden).toBe(
       false,
     );
+
+    await press("Hide saved result");
+    expect(findPicker()).toBeUndefined();
   }));
 
 it("does not label an earlier completed result as partial when a run is canceled", () =>

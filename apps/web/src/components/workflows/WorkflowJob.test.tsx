@@ -21,12 +21,15 @@ import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
+import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
 import {
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
   beginWorkflowReview,
   updateWorkflowDrafts,
   workflowDraftAtom,
+  workflowJobReadAtom,
+  workflowReviewApprovalState,
   workflowSessionKey,
   setWorkflowSessionAccount,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -662,55 +665,111 @@ describe("workflow result location navigation", () => {
     expect(findButton("Open saved results")).toBeDefined();
   });
 
-  it("refreshes a matching saved checkpoint before enabling approval", async () => {
-    const sleepingReview = { ...vmReview, vmRecovery: { state: "paused" as const } };
-    fixture.call.mockResolvedValue(sleepingReview);
-    await mount(false);
-    expect(text(renderer!.toJSON())).toContain("Workflow VM paused");
-    await act(() => {
-      beginWorkflowReview(appAtomRegistry, scope, "job", "saved-visit", {
-        checkpointId: "checkpoint",
-        turnId: "saved-turn",
-        checkpointTurnCount: 3,
-      });
+  it.each([
+    ["Approve result", "awaiting_review"],
+    ["Retry completion", "finishing"],
+  ] as const)(
+    "requires an active saved diff render and a fresh run read for %s",
+    async (label, status) => {
+      const active = {
+        ...vmReview,
+        status,
+        progress: {
+          ...vmReview.progress,
+          status,
+          retryableApproval: status === "finishing",
+        },
+      } satisfies RepositoryWorkflowJob;
+      const checkpoint = workflowResultCheckpoint(active.progress.checkpoint)!;
+      const key = workflowSessionKey(scope, active.jobId);
+      const saved = () => renderer!.root.findByType(SavedWorkflowResults);
+      const disabled = () => {
+        const { disabled, "aria-disabled": ariaDisabled } = findButton(label).props;
+        return disabled || ariaDisabled;
+      };
+      function recordVisit(visitId: string) {
+        beginWorkflowReview(appAtomRegistry, scope, active.jobId, visitId, checkpoint);
+        expect(
+          recordSavedWorkflowReviewDiff(appAtomRegistry, scope, active.jobId, visitId, {
+            resultId: "11111111-1111-4111-8111-111111111111",
+            stepId: "agent",
+            turnId: checkpoint.turnId,
+            turnCount: checkpoint.checkpointTurnCount,
+            outcome: "completed",
+            createdAt: "now",
+            checkpointRef: "ref",
+            baselineCommitId: "base",
+            commitId: "commit",
+            treeId: "tree",
+            patch: {
+              artifactId: "22222222-2222-4222-8222-222222222222",
+              sha256: "a".repeat(64),
+              sizeBytes: 0,
+            },
+          }),
+        ).toBe(true);
+        requireFreshWorkflowReviewRead(appAtomRegistry, scope, active.jobId);
+      }
+      fixture.call.mockResolvedValue(active);
+      await mount();
+      await act(() => recordVisit("previous-visit"));
+      await pollRun();
+
       expect(
-        recordSavedWorkflowReviewDiff(appAtomRegistry, scope, "job", "saved-visit", {
-          resultId: "11111111-1111-4111-8111-111111111111",
-          stepId: "agent",
-          turnId: "saved-turn",
-          turnCount: 3,
-          outcome: "completed",
-          createdAt: "now",
-          checkpointRef: "ref",
-          baselineCommitId: "base",
-          commitId: "commit",
-          treeId: "tree",
-          patch: {
-            artifactId: "22222222-2222-4222-8222-222222222222",
-            sha256: "a".repeat(64),
-            sizeBytes: 0,
-          },
-        }),
-      ).toBe(true);
-      requireFreshWorkflowReviewRead(appAtomRegistry, scope, "job");
-    });
-    await act(() => renderer!.unmount());
-    const reply = deferred();
-    fixture.call.mockReturnValue(reply.promise);
-    await mount(false);
-    const approval = () =>
-      renderer!.root
-        .findAllByType("button")
-        .find((button) => button.props.children === "Approve result")!;
-    expect(approval().props.disabled).toBe(true);
-    expect(text(renderer!.toJSON())).toContain("Checking the current review");
-    await act(async () => {
-      reply.resolve(sleepingReview);
-      await reply.promise;
-    });
-    expect(approval().props.disabled).toBe(false);
-    expect(fixture.open).not.toHaveBeenCalled();
-  });
+        workflowReviewApprovalState(
+          appAtomRegistry.get(workflowDraftAtom).reviews[key],
+          appAtomRegistry.get(workflowJobReadAtom).jobs[key]!,
+        ),
+      ).toBe("allowed");
+      expect(disabled()).toBe(true);
+      const callsBeforeRendering = fixture.call.mock.calls.length;
+      await press(label);
+      expect(fixture.call).toHaveBeenCalledTimes(callsBeforeRendering);
+
+      await act(() => {
+        recordVisit("current-render");
+        saved().props.onReviewRenderChange(checkpoint);
+      });
+      expect(disabled()).toBe(true);
+      await pollRun();
+      expect(disabled()).toBeFalsy();
+      const previousSubmit = findButton(label).props.onClick;
+
+      await act(() => {
+        saved().props.onReviewRenderChange(null);
+        saved().props.onReviewTargetChange(false);
+      });
+      await act(() => saved().props.onReviewTargetChange(true));
+      expect(disabled()).toBe(true);
+      const callsAfterSelection = fixture.call.mock.calls.length;
+      await act(() => previousSubmit());
+      await press(label);
+      expect(fixture.call).toHaveBeenCalledTimes(callsAfterSelection);
+
+      await act(() => {
+        recordVisit("new-render");
+        saved().props.onReviewRenderChange(checkpoint);
+      });
+      expect(disabled()).toBe(true);
+      await pollRun();
+      expect(disabled()).toBeFalsy();
+      const submit = vi.fn().mockResolvedValue(active);
+      fixture.call.mockImplementationOnce((request) =>
+        request({ respondToWorkflowJob: submit }, "token"),
+      );
+      await press(label);
+      expect(submit).toHaveBeenCalledExactlyOnceWith({
+        clerkToken: "token",
+        repositoryId: scope.repositoryId,
+        jobId: active.jobId,
+        payload: {
+          operation: "approve",
+          checkpointId: checkpoint.checkpointId,
+          expectedRevision: active.progress.revision,
+        },
+      });
+    },
+  );
 
   it("opens conversation and the original saved turn at the current destination", async () => {
     await mount();
