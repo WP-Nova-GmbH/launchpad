@@ -155,7 +155,7 @@ describe("CheckpointDiffQuery.layer", () => {
   );
 
   it.effect(
-    "uses immutable commit pins for strict review and refs for ordinary first-turn diffs",
+    "uses immutable pins for strict reviews and verifies Machine review identity before reading refs",
     () =>
       Effect.gen(function* () {
         const projectId = ProjectId.make("project-1");
@@ -266,7 +266,7 @@ describe("CheckpointDiffQuery.layer", () => {
           ),
         );
 
-        const { result, strictResult } = yield* Effect.gen(function* () {
+        const { result, strictResult, machineResult } = yield* Effect.gen(function* () {
           const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
           const input = {
             threadId,
@@ -288,7 +288,12 @@ describe("CheckpointDiffQuery.layer", () => {
           pinAvailable = false;
           const missingPin = yield* Effect.flip(query.getTurnDiff(strict));
           expect(missingPin._tag).toBe("CheckpointWorkflowPinUnavailableError");
-          return { result, strictResult };
+          const wrongMachineTurn = yield* Effect.flip(
+            query.getTurnDiff({ ...input, expectedTurnId: TurnId.make("replaced-machine-turn") }),
+          );
+          expect(wrongMachineTurn._tag).toBe("CheckpointWorkflowPinUnavailableError");
+          const machineResult = yield* query.getTurnDiff({ ...input, expectedTurnId });
+          return { result, strictResult, machineResult };
         }).pipe(Effect.provide(layer));
 
         const expectedFromRef = checkpointRefForThreadTurn(threadId, 0);
@@ -306,6 +311,12 @@ describe("CheckpointDiffQuery.layer", () => {
             ignoreWhitespace: false,
             requireComplete: true,
           },
+          {
+            cwd: "/tmp/workspace",
+            fromCheckpointRef: expectedFromRef,
+            toCheckpointRef,
+            ignoreWhitespace: true,
+          },
         ]);
         expect(result).toEqual({
           threadId,
@@ -321,6 +332,7 @@ describe("CheckpointDiffQuery.layer", () => {
           completeWorkflowReview: true,
           targetTurnId: expectedTurnId,
         });
+        expect(machineResult).toEqual({ ...result, targetTurnId: expectedTurnId });
       }),
   );
 

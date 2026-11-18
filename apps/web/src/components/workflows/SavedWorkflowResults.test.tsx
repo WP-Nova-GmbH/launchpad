@@ -573,13 +573,15 @@ it("keeps earlier results read-only and returns to the exact current review", ()
     await mount();
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(true);
+    expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only"');
     await act(() => renderer.root.findByType("select").props.onValueChange(earlier.resultId));
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(false);
-    expect(JSON.stringify(renderer.toJSON())).toContain("This saved result is read-only");
+    expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only result"');
     await press("Return to current review");
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
     expect(fixture.target).toHaveBeenLastCalledWith(true);
+    expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only"');
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.refresh).toHaveBeenCalledTimes(2);
   }));

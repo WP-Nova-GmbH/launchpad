@@ -40,7 +40,10 @@ vi.mock("./ChatView.logic", () => ({
 vi.mock("./ui/sidebar", () => ({
   SidebarInset: ({ children }: { children: ReactNode }) => children,
 }));
-vi.mock("./workflows/WorkflowNavigation", () => ({ WorkflowResultReturn: () => null }));
+vi.mock("./workflows/WorkflowNavigation", () => ({
+  useWorkflowConversation: () => null,
+  WorkflowConversationHeader: () => null,
+}));
 vi.mock("../connection/catalog", () => ({ environmentCatalog: { retryNow: "reconnect" } }));
 vi.mock("../state/use-atom-command", () => ({ useAtomCommand: () => fixture.open }));
 vi.mock("../composerDraftStore", () => ({

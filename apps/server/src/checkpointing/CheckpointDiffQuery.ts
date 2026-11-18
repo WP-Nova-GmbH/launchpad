@@ -14,7 +14,6 @@ import {
   type OrchestrationGetTurnDiffInput,
   type OrchestrationGetTurnDiffResult as OrchestrationGetTurnDiffResultType,
   type ThreadId,
-  type TurnId,
 } from "@t3tools/contracts";
 import { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
 import type { WorkflowResultCapture } from "../jobs/WorkflowResultOutbox.ts";
@@ -232,6 +231,7 @@ export const make = Effect.gen(function* () {
     function* (input) {
       const operation = "CheckpointDiffQuery.getTurnDiff";
       const strictWorkflowReview = input.strictWorkflowReview === true;
+      const expectedTurnId = input.expectedTurnId;
       const ignoreWhitespace = !strictWorkflowReview && (input.ignoreWhitespace ?? true);
       yield* Effect.annotateCurrentSpan({
         "checkpoint.thread_id": input.threadId,
@@ -240,7 +240,11 @@ export const make = Effect.gen(function* () {
         "checkpoint.ignore_whitespace": ignoreWhitespace,
       });
 
-      if (!strictWorkflowReview && input.fromTurnCount === input.toTurnCount) {
+      if (
+        !strictWorkflowReview &&
+        expectedTurnId === undefined &&
+        input.fromTurnCount === input.toTurnCount
+      ) {
         const emptyDiff: OrchestrationGetTurnDiffResultType = {
           threadId: input.threadId,
           fromTurnCount: input.fromTurnCount,
@@ -289,32 +293,33 @@ export const make = Effect.gen(function* () {
 
       let fromCheckpointRef: CheckpointRef;
       let toCheckpointRef: CheckpointRef;
-      let targetTurnId: TurnId | undefined;
+      const targetCheckpoint = threadContext.value.checkpoints.find(
+        (checkpoint) => checkpoint.checkpointTurnCount === input.toTurnCount,
+      );
+      const unavailable = () =>
+        new CheckpointWorkflowPinUnavailableError({
+          threadId: input.threadId,
+          turnCount: input.toTurnCount,
+        });
+      if (
+        (strictWorkflowReview || expectedTurnId !== undefined) &&
+        (targetCheckpoint?.turnId !== expectedTurnId || targetCheckpoint?.status !== "ready")
+      )
+        return yield* unavailable();
+
       const binding = yield* workflowRuns.getVmBindingForThread(input.threadId);
       if (strictWorkflowReview) {
-        const unavailable = () =>
-          new CheckpointWorkflowPinUnavailableError({
-            threadId: input.threadId,
-            turnCount: input.toTurnCount,
-          });
-        const checkpoint = threadContext.value.checkpoints.find(
-          (checkpoint) =>
-            checkpoint.checkpointTurnCount === input.toTurnCount &&
-            checkpoint.turnId === input.expectedTurnId &&
-            checkpoint.status === "ready",
-        );
-        if (!checkpoint || input.fromTurnCount !== input.toTurnCount - 1)
+        if (!targetCheckpoint || input.fromTurnCount !== input.toTurnCount - 1)
           return yield* unavailable();
         const pin = yield* workflowRuns.getCheckpointPinForTurn(
           input.threadId,
-          checkpoint.turnId,
+          targetCheckpoint.turnId,
           input.toTurnCount,
         );
-        if (!pin?.baselineCommitId || pin.checkpointRef !== checkpoint.checkpointRef)
+        if (!pin?.baselineCommitId || pin.checkpointRef !== targetCheckpoint.checkpointRef)
           return yield* unavailable();
         fromCheckpointRef = CheckpointRef.make(pin.baselineCommitId);
         toCheckpointRef = CheckpointRef.make(pin.commitId);
-        targetTurnId = checkpoint.turnId;
       } else if (binding) {
         fromCheckpointRef = yield* readWorkflowPin(
           binding,
@@ -338,9 +343,7 @@ export const make = Effect.gen(function* () {
           });
         }
 
-        const to = threadContext.value.checkpoints.find(
-          (checkpoint) => checkpoint.checkpointTurnCount === input.toTurnCount,
-        )?.checkpointRef;
+        const to = targetCheckpoint?.checkpointRef;
         if (!to) {
           return yield* new CheckpointRefUnavailableError({
             operation,
@@ -366,7 +369,8 @@ export const make = Effect.gen(function* () {
 
       const turnDiff = {
         ...buildTurnDiffResult(input, diff),
-        ...(targetTurnId ? { completeWorkflowReview: true as const, targetTurnId } : {}),
+        ...(expectedTurnId !== undefined ? { targetTurnId: expectedTurnId } : {}),
+        ...(strictWorkflowReview ? { completeWorkflowReview: true as const } : {}),
       };
       if (!isTurnDiffResult(turnDiff)) {
         return yield* new CheckpointDiffResultInvalidError({

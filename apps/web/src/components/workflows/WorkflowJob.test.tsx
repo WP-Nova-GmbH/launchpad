@@ -39,9 +39,12 @@ const fixture = vi.hoisted(() => ({
   navigate: vi.fn(),
   select: vi.fn(),
   panel: vi.fn(),
+  locationHash: "",
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
+  useLocation: ({ select }: { select: (location: { hash: string }) => unknown }) =>
+    select({ hash: fixture.locationHash }),
   Link: ({
     to,
     hash,
@@ -260,6 +263,7 @@ beforeEach(() => {
   fixture.navigate.mockReset();
   fixture.select.mockReset();
   fixture.panel.mockReset();
+  fixture.locationHash = "";
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -428,6 +432,69 @@ describe("workflow result location navigation", () => {
     expect(fixture.navigate).toHaveBeenCalledTimes(2);
     expect(job.runtime).toMatchObject({ kind: "machine", environmentId: "original" });
   });
+  it("opens the active Machine review at its checkpoint without requiring a VM review visit", async () => {
+    const review = {
+      ...job,
+      status: "awaiting_review",
+      progress: { ...job.progress!, status: "awaiting_review" },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(review);
+    fixture.open.mockResolvedValue({
+      _tag: "Success",
+      value: { environmentId: "original", threadId: "thread" },
+    });
+    await mount();
+    await press("Inspect saved diff");
+
+    expect(fixture.select).toHaveBeenCalledWith(
+      { environmentId: "original", threadId: "thread" },
+      "saved-turn",
+    );
+    expect(fixture.navigate.mock.calls[0]![0].state({}).workflowOrigin).toEqual({
+      ...scope,
+      jobId: "job",
+      threadId: "thread",
+      reviewCheckpoint: {
+        checkpointId: "checkpoint",
+        turnId: "saved-turn",
+        checkpointTurnCount: 3,
+      },
+    });
+  });
+  it.each([false, true])(
+    "lands at the review after loading and preserves focus moved during the read (%s)",
+    async (movedFocus) => {
+      const reply = deferred();
+      const review = {
+        ...job,
+        status: "awaiting_review",
+        progress: { ...job.progress!, status: "awaiting_review" },
+      } satisfies RepositoryWorkflowJob;
+      const body = {};
+      const ownerDocument = { body, activeElement: body };
+      const section = { ownerDocument, scrollIntoView: vi.fn(), focus: vi.fn() };
+      fixture.locationHash = "workflow-review";
+      fixture.call.mockReturnValueOnce(reply.promise).mockResolvedValue(review);
+      await mount(true, {
+        createNodeMock: ({ props }) =>
+          (props as { id?: string }).id === "workflow-review" ? section : null,
+      });
+      expect(text(renderer!.toJSON())).toContain("Loading run");
+      expect(section.focus).not.toHaveBeenCalled();
+
+      if (movedFocus) ownerDocument.activeElement = {};
+      await act(async () => reply.resolve(review));
+      if (movedFocus) {
+        expect(section.scrollIntoView).not.toHaveBeenCalled();
+      } else {
+        expect(section.scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+        expect(section.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      }
+
+      await pollRun();
+      expect(section.focus).toHaveBeenCalledTimes(movedFocus ? 0 : 1);
+    },
+  );
   it("keeps a failed location lookup visible and retries without opening a stale route", async () => {
     fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));
     await mount();

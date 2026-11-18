@@ -1,4 +1,5 @@
 import { type CheckpointDiffTarget } from "@t3tools/client-runtime/state/threads";
+import { TurnId } from "@t3tools/contracts";
 
 import type { resolveDiffPanelSelection } from "../diffPanelStore";
 import { useCheckpointDiff as useCheckpointDiffQuery } from "../state/queries";
@@ -7,11 +8,14 @@ export function buildDiffPanelCheckpointTarget(
   input: Pick<CheckpointDiffTarget, "environmentId" | "threadId" | "ignoreWhitespace"> & {
     readonly checkpointTurnCount: number | undefined;
   },
-  scope: Pick<ReturnType<typeof resolveDiffPanelSelection>, "reviewBlocked" | "workflowReview">,
+  scope: Pick<
+    ReturnType<typeof resolveDiffPanelSelection>,
+    "reviewBlocked" | "reviewCheckpoint" | "workflowReview"
+  >,
   viewId: string,
 ) {
-  const { reviewBlocked, workflowReview } = scope;
-  const turnCount = workflowReview?.checkpointTurnCount ?? input.checkpointTurnCount ?? null;
+  const { reviewBlocked, reviewCheckpoint, workflowReview } = scope;
+  const turnCount = reviewCheckpoint?.checkpointTurnCount ?? input.checkpointTurnCount ?? null;
   return {
     environmentId: reviewBlocked ? null : input.environmentId,
     threadId: input.threadId,
@@ -19,7 +23,7 @@ export function buildDiffPanelCheckpointTarget(
     toTurnCount: turnCount,
     ignoreWhitespace: input.ignoreWhitespace,
     strictWorkflowReview: workflowReview !== null,
-    expectedTurnId: workflowReview?.expectedTurnId,
+    expectedTurnId: reviewCheckpoint ? TurnId.make(reviewCheckpoint.turnId) : undefined,
     requestKey: workflowReview ? `${workflowReview.visitId}:${viewId}` : undefined,
   };
 }

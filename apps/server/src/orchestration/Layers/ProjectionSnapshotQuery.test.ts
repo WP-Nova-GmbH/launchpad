@@ -2699,6 +2699,34 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("returns the effective pause state in workflow thread snapshots", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("workflow:pause-test:agent");
+      const sql = yield* SqlClient.SqlClient;
+      const query = yield* ProjectionSnapshotQuery;
+      yield* sql`INSERT INTO projection_threads
+        (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
+        VALUES (${threadId}, 'pause-test-project', 'Workflow thread', '{"provider":"codex","model":"gpt-5-codex"}',
+          'full-access', 'default', '2026-09-28T10:00:00Z', '2026-09-28T10:00:00Z')`;
+      yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json)
+        VALUES ('pause-test', ${threadId}, 'awaiting_review', 0,
+          '{"workflow":{"repositoryId":"repo-1"},"manualPause":{"state":"requested"}}')`;
+
+      const readWorkflowJob = query
+        .getThreadDetailSnapshot(threadId)
+        .pipe(Effect.map((snapshot) => Option.getOrThrow(snapshot).thread.workflowJob));
+      const review = { jobId: "pause-test", repositoryId: "repo-1", status: "awaiting_review" };
+      assert.deepEqual(yield* readWorkflowJob, review);
+
+      yield* sql`UPDATE repository_workflow_jobs
+        SET record_json = json_set(record_json, '$.manualPause.state', 'paused') WHERE thread_id = ${threadId}`;
+      assert.deepEqual(yield* readWorkflowJob, { ...review, status: "paused" });
+
+      yield* sql`UPDATE repository_workflow_jobs SET status = 'cancelled' WHERE thread_id = ${threadId}`;
+      assert.isNull(yield* readWorkflowJob);
+    }),
+  );
+
   it.effect("windows to the last N user-anchored turns with subagent turns riding along", () =>
     Effect.gen(function* () {
       yield* seedFanOutThread();

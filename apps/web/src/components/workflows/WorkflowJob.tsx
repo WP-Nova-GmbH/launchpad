@@ -33,7 +33,7 @@ import {
 import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { useCallback, useEffect, useState, useRef, useLayoutEffect, type RefObject } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { useLocation, useNavigate } from "@tanstack/react-router";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openPortableThreadChat } from "../../state/threads";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -90,6 +90,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { WorkflowProgress } from "./WorkflowProgress";
 import {
+  WORKFLOW_REVIEW_ANCHOR,
   useWorkflowClient,
   useWorkflowDrafts,
   useWorkflowJobReads,
@@ -147,6 +148,7 @@ export function WorkflowJob({
   refreshCatalog: () => void;
 }) {
   const navigate = useNavigate();
+  const returningToReview = useLocation({ select: ({ hash }) => hash === WORKFLOW_REVIEW_ANCHOR });
   const openResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const [openingResult, setOpeningResult] = useState(false);
   const [resultError, setResultError] = useState<string | null>(null);
@@ -157,6 +159,8 @@ export function WorkflowJob({
   const conversationButton = useRunActionFocus(key);
   const resumeButton = useRunActionFocus(key);
   const runHeading = useRef<HTMLHeadingElement>(null);
+  const reviewSection = useRef<HTMLElement>(null);
+  const handledReviewReturn = useRef<string | null>(null);
   const checkpointForm = useRunActionFocus<HTMLFormElement>(key, runHeading);
   const retryCompletionButton = useRunActionFocus(key, runHeading);
   const retrySavingButton = useRunActionFocus(key, runHeading);
@@ -223,6 +227,22 @@ export function WorkflowJob({
   const waiting =
     !hasResultSave && !finishing && !!checkpoint && !terminal && !cancelling && atCheckpoint;
   const input = checkpoint?.kind === "input";
+  const runLoaded = selectedJob !== null;
+  const showingReview = waiting && !input;
+  useLayoutEffect(() => {
+    if (!returningToReview) {
+      handledReviewReturn.current = null;
+      return;
+    }
+    if (!runLoaded || handledReviewReturn.current === key) return;
+    const target = showingReview ? reviewSection.current : runHeading.current;
+    if (!target) return;
+    handledReviewReturn.current = key;
+    const { activeElement, body } = target.ownerDocument;
+    if (activeElement !== body && activeElement !== target) return;
+    target.scrollIntoView({ block: "start" });
+    target.focus({ preventScroll: true });
+  }, [key, returningToReview, runLoaded, showingReview]);
   useLayoutEffect(() => {
     if (feedbackFocus.current === "input") feedbackInput.current?.focus();
     if (feedbackFocus.current === "button") feedbackButton.current?.focus();
@@ -436,11 +456,13 @@ export function WorkflowJob({
     try {
       const runtime = selectedJob.runtime;
       if (!runtime) throw new Error("This run has no available execution binding.");
-      const exactReview =
-        diff && runtime.kind === "vm" ? workflowResultCheckpoint(checkpoint) : undefined;
-      const reviewVisitId = exactReview ? randomUUID() : undefined;
-      if (exactReview && reviewVisitId)
-        beginWorkflowReview(appAtomRegistry, scope, jobId, reviewVisitId, exactReview);
+      const reviewCheckpoint =
+        diff && (runtime.kind === "vm" || (waiting && !input))
+          ? workflowResultCheckpoint(checkpoint)
+          : undefined;
+      const reviewVisitId = reviewCheckpoint && runtime.kind === "vm" ? randomUUID() : undefined;
+      if (reviewCheckpoint && reviewVisitId)
+        beginWorkflowReview(appAtomRegistry, scope, jobId, reviewVisitId, reviewCheckpoint);
       const result = await openResult({
         threadId: selectedJob.progress.threadId,
         title: selectedJob.workflow?.definition.name ?? "Workflow result",
@@ -460,12 +482,12 @@ export function WorkflowJob({
         });
       if (diff && checkpoint && checkpoint.kind !== "input") {
         const panel = useDiffPanelStore.getState();
-        if (exactReview)
+        if (reviewVisitId && reviewCheckpoint)
           panel.selectTurn(
             params,
             TurnId.make(checkpoint.turnId),
             undefined,
-            exactReview.checkpointTurnCount,
+            reviewCheckpoint.checkpointTurnCount,
           );
         else panel.selectTurn(params, TurnId.make(checkpoint.turnId));
         useRightPanelStore.getState().open(params, "diff");
@@ -480,9 +502,8 @@ export function WorkflowJob({
             jobId,
             threadId: params.threadId,
             ...(workflowVmGeneration !== undefined ? { workflowVmResultReader: true } : {}),
-            ...(exactReview && reviewVisitId
-              ? { reviewCheckpoint: exactReview, reviewVisitId }
-              : {}),
+            ...(reviewCheckpoint ? { reviewCheckpoint } : {}),
+            ...(reviewVisitId ? { reviewVisitId } : {}),
           },
         }),
       });
@@ -1122,7 +1143,13 @@ export function WorkflowJob({
         </WorkflowAlert>
       ) : null}
       <div className="min-w-0 space-y-5">
-        <section className="space-y-4" aria-label="Current workflow task">
+        <section
+          ref={showingReview ? reviewSection : undefined}
+          id={showingReview ? WORKFLOW_REVIEW_ANCHOR : undefined}
+          tabIndex={showingReview ? -1 : undefined}
+          className="space-y-4"
+          aria-label="Current workflow task"
+        >
           {cancelling ? (
             <WorkflowAlert
               title={cancellationNeedsAttention ? "Cancellation needs attention" : "Canceling run"}

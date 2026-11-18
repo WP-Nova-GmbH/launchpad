@@ -45,6 +45,7 @@ import {
   ThreadPullRequestStack,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
+import type { WorkflowJobProgress } from "@t3tools/contracts/workflows";
 import { legacyLinkedPullRequestOf } from "@t3tools/shared/threadPullRequests";
 import * as Arr from "effect/Array";
 import * as Effect from "effect/Effect";
@@ -56,6 +57,7 @@ import * as Struct from "effect/Struct";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 
+import { workflowProgressStatus } from "../../jobs/workflowSequence.ts";
 import {
   isPersistenceError,
   toPersistenceDecodeError,
@@ -3665,18 +3667,33 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThread>();
       }
 
-      const workflowRows = threadId.startsWith("workflow:")
+      const [workflowJob] = threadId.startsWith("workflow:")
         ? yield* sql<{
             jobId: string;
             repositoryId: string;
-            status: string;
-          }>`SELECT job_id AS "jobId", json_extract(record_json, '$.workflow.repositoryId') AS "repositoryId", status FROM repository_workflow_jobs WHERE thread_id = ${threadId} AND status NOT IN ('done', 'cancelled', 'failed')`.pipe(
+            status: WorkflowJobProgress["status"];
+            pauseState: string | null;
+          }>`SELECT job_id AS "jobId",
+              json_extract(record_json, '$.workflow.repositoryId') AS "repositoryId",
+              status,
+              json_extract(record_json, '$.manualPause.state') AS "pauseState"
+            FROM repository_workflow_jobs
+            WHERE thread_id = ${threadId} AND status NOT IN ('done', 'cancelled', 'failed')`.pipe(
             Effect.orDie,
           )
         : [];
       const promptQueue = yield* getPromptQueue(sql, threadId);
       const thread = {
-        workflowJob: workflowRows[0] ?? null,
+        workflowJob: workflowJob
+          ? {
+              jobId: workflowJob.jobId,
+              repositoryId: workflowJob.repositoryId,
+              status: workflowProgressStatus(
+                workflowJob.status,
+                workflowJob.pauseState === "paused",
+              ),
+            }
+          : null,
         ...(promptQueue ? { promptQueue } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,

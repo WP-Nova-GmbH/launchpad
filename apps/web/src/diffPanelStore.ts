@@ -36,6 +36,7 @@ interface DiffPanelStoreState {
     availableTurnIds: ReadonlyArray<TurnId>,
     origin?: WorkflowReviewOrigin | null,
     declaredReviewVisitId?: string,
+    checkpointOnly?: boolean,
   ) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
@@ -104,7 +105,13 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             },
           };
         }),
-      reconcileTurnSelection: (ref, availableTurnIds, origin, declaredReviewVisitId) =>
+      reconcileTurnSelection: (
+        ref,
+        availableTurnIds,
+        origin,
+        declaredReviewVisitId,
+        checkpointOnly,
+      ) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const previous = state.byThreadKey[threadKey];
@@ -114,6 +121,7 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             availableTurnIds,
             origin,
             declaredReviewVisitId,
+            checkpointOnly,
           );
           if (selection === previous) return state;
           return {
@@ -157,22 +165,25 @@ export function selectThreadDiffPanelSelection(
   return byThreadKey[scopedThreadKey(ref)] ?? DEFAULT_SELECTION;
 }
 
-function resolveDiffPanelWorkflowReview(
+function resolveDiffPanelScope(
   selection: DiffPanelSelection,
   origin: WorkflowReviewOrigin | null | undefined,
+  reviewBlocked: boolean,
 ) {
-  const checkpoint = origin?.reviewCheckpoint;
-  if (
-    selection.kind !== "turn" ||
-    !origin?.reviewVisitId ||
-    checkpoint?.turnId !== selection.turnId
-  )
-    return null;
-  return {
-    visitId: origin.reviewVisitId,
-    expectedTurnId: selection.turnId,
-    checkpointTurnCount: checkpoint.checkpointTurnCount,
-  };
+  const turnId = selection.kind === "turn" ? selection.turnId : undefined;
+  const reviewCheckpoint =
+    !reviewBlocked && turnId && origin?.reviewCheckpoint?.turnId === turnId
+      ? origin.reviewCheckpoint
+      : undefined;
+  const workflowReview =
+    reviewCheckpoint && turnId && origin?.reviewVisitId
+      ? {
+          visitId: origin.reviewVisitId,
+          expectedTurnId: turnId,
+          checkpointTurnCount: reviewCheckpoint.checkpointTurnCount,
+        }
+      : null;
+  return { selection, reviewBlocked, reviewCheckpoint, workflowReview };
 }
 
 export function resolveDiffPanelSelection(
@@ -190,7 +201,7 @@ export function resolveDiffPanelSelection(
   const latestTurnId = availableTurnIds[0];
   const checkpoint = origin?.reviewCheckpoint;
   const fallbackTurnId = checkpoint ? TurnId.make(checkpoint.turnId) : latestTurnId;
-  const selection: DiffPanelSelection =
+  let selection: DiffPanelSelection =
     checkpointOnly && !reviewBlocked && storedSelection.kind !== "turn" && fallbackTurnId
       ? {
           kind: "turn",
@@ -200,21 +211,28 @@ export function resolveDiffPanelSelection(
           ...(checkpoint ? { checkpointTurnCount: checkpoint.checkpointTurnCount } : {}),
         }
       : storedSelection;
-  const workflowReview = reviewBlocked ? null : resolveDiffPanelWorkflowReview(selection, origin);
+  if (
+    !checkpointOnly &&
+    !reviewBlocked &&
+    !origin?.reviewVisitId &&
+    selection.kind === "turn" &&
+    selection.checkpointTurnCount !== undefined
+  ) {
+    // Older checkout review visits stored the count without its route origin.
+    const { checkpointTurnCount: _legacy, ...turn } = selection;
+    selection = turn;
+  }
+  const scope = resolveDiffPanelScope(selection, origin, reviewBlocked);
   if (
     reviewBlocked ||
-    workflowReview ||
+    scope.reviewCheckpoint ||
     selection.kind !== "turn" ||
     selection.checkpointTurnCount !== undefined ||
     latestTurnId === undefined ||
     availableTurnIds.includes(selection.turnId)
   )
-    return { selection, workflowReview, reviewBlocked };
+    return scope;
 
   const latest = { ...selection, turnId: latestTurnId };
-  return {
-    selection: latest,
-    workflowReview: resolveDiffPanelWorkflowReview(latest, origin),
-    reviewBlocked,
-  };
+  return resolveDiffPanelScope(latest, origin, reviewBlocked);
 }

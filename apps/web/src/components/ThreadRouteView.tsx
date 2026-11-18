@@ -12,7 +12,10 @@ import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
 import { waitForDraftHeroTransition } from "./chat/draftHeroTransition";
 import { SidebarInset } from "./ui/sidebar";
-import { WorkflowResultReturn } from "./workflows/WorkflowNavigation";
+import {
+  useWorkflowConversation,
+  WorkflowConversationHeader,
+} from "./workflows/WorkflowNavigation";
 import { Button } from "./ui/button";
 import { environmentCatalog } from "../connection/catalog";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -108,6 +111,12 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     ? environments.presentationById.get(serverThreadRef.environmentId)
     : undefined;
   const connection = environment?.connection;
+  const workflowConversation = useWorkflowConversation({
+    threadId: target.kind === "server" ? target.threadRef.threadId : undefined,
+    threadTitle: serverThread?.title ?? serverThreadShell?.title,
+    threadJob: serverThread ? serverThread.workflowJob : serverThreadShell?.workflowJob,
+    capabilities: environment?.serverConfig?.environment.capabilities,
+  });
   const privateLocationRecovery = canRecoverPrivateThreadLocation({
     capabilities: environment?.serverConfig?.environment.capabilities,
     origin: workflowOrigin,
@@ -295,6 +304,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         threadId={target.threadRef.threadId}
         routeKind="server"
         threadSyncPhase={threadSyncPhase}
+        hasWorkflowConversationHeader={workflowConversation !== null}
       />
     );
   } else {
@@ -366,7 +376,9 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
 
   return (
     <SidebarInset className="h-svh min-h-0 overflow-hidden overscroll-y-none md:h-dvh">
-      <WorkflowResultReturn />
+      {workflowConversation ? (
+        <WorkflowConversationHeader conversation={workflowConversation} />
+      ) : null}
       {target.kind === "server" && privateLocationRecovery ? (
         <CurrentThreadLocation
           key={scopedThreadKey(target.threadRef)}

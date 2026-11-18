@@ -60,6 +60,7 @@ interface ChatHeaderProps {
   activeThreadId: ThreadId;
   draftId?: DraftId;
   activeThreadTitle: string;
+  workflowConversation?: boolean;
   /** Drafts have no server thread yet, so the title carries no action menu. */
   isServerThread: boolean;
   readOnly?: boolean;
@@ -131,6 +132,7 @@ export const ChatHeader = memo(function ChatHeader({
   activeThreadId,
   draftId,
   activeThreadTitle,
+  workflowConversation = false,
   isServerThread,
   readOnly = false,
   activeProject,
@@ -442,18 +444,22 @@ export const ChatHeader = memo(function ChatHeader({
                   }
                 >
                   <ProjectFavicon project={activeProject} className="size-3.5" />
-                  <WorkspaceBreadcrumbText className="max-w-40">
-                    {activeProjectName}
-                  </WorkspaceBreadcrumbText>
+                  {workflowConversation ? null : (
+                    <WorkspaceBreadcrumbText className="max-w-40">
+                      {activeProjectName}
+                    </WorkspaceBreadcrumbText>
+                  )}
                 </TooltipTrigger>
                 <TooltipPopup side="top">
                   {canCreateThread ? `New thread in ${activeProjectName}` : "VM workspace"}
                 </TooltipPopup>
               </Tooltip>
             </WorkspaceBreadcrumbItem>
-            <WorkspaceBreadcrumbSeparator>
-              <WorkspaceBreadcrumbText>/</WorkspaceBreadcrumbText>
-            </WorkspaceBreadcrumbSeparator>
+            {workflowConversation ? null : (
+              <WorkspaceBreadcrumbSeparator>
+                <WorkspaceBreadcrumbText>/</WorkspaceBreadcrumbText>
+              </WorkspaceBreadcrumbSeparator>
+            )}
           </>
         ) : null}
         <WorkspaceBreadcrumbItem current className="min-w-10 flex-1">
@@ -479,20 +485,28 @@ export const ChatHeader = memo(function ChatHeader({
                     type="button"
                     aria-label={`Thread actions for ${activeThreadTitle}`}
                     aria-haspopup="menu"
-                    onClick={openMenuFromTitle}
-                    onDoubleClick={handleTitleDoubleClick}
+                    onClick={workflowConversation ? openTitleMenuNow : openMenuFromTitle}
+                    onDoubleClick={workflowConversation ? undefined : handleTitleDoubleClick}
                     onBlur={cancelPendingTitleMenu}
                     className="group/thread-title inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1 rounded-sm text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                   />
                 }
               >
-                <h2 className="min-w-0">
-                  <WorkspaceBreadcrumbText>{activeThreadTitle}</WorkspaceBreadcrumbText>
-                </h2>
+                {workflowConversation ? (
+                  <WorkspaceBreadcrumbText>Thread actions</WorkspaceBreadcrumbText>
+                ) : (
+                  <h2 className="min-w-0">
+                    <WorkspaceBreadcrumbText>{activeThreadTitle}</WorkspaceBreadcrumbText>
+                  </h2>
+                )}
                 <ChevronDownIcon
                   aria-hidden
                   data-thread-title-chevron
-                  className="size-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/thread-title:opacity-100 group-focus-visible/thread-title:opacity-100"
+                  className={cn(
+                    "size-3.5 shrink-0 text-muted-foreground",
+                    !workflowConversation &&
+                      "opacity-0 transition-opacity group-hover/thread-title:opacity-100 group-focus-visible/thread-title:opacity-100",
+                  )}
                 />
               </TooltipTrigger>
               <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>

@@ -31,6 +31,8 @@ import {
 import { requestConfirmDialog } from "../../confirmDialog";
 import { WorkflowRequestNotSentError } from "./workflowOperations";
 
+export const WORKFLOW_REVIEW_ANCHOR = "workflow-review";
+
 export function restoreCheckoutIssue(
   workflow: RepositoryWorkflow,
   projects: ReadonlyArray<RelayOrganizationProject>,

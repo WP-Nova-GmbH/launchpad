@@ -144,9 +144,10 @@ export function refreshManagedRelayOrganizationCatalog(accountId: string): void 
 
 export function useManagedRelayOrganizationCatalog(options?: {
   readonly allowMissingProjects?: boolean;
+  readonly enabled?: boolean;
 }) {
   const session = useAtomValue(managedRelaySessionAtom);
-  const accountId = session?.accountId ?? null;
+  const accountId = options?.enabled === false ? null : (session?.accountId ?? null);
   const manager = options?.allowMissingProjects
     ? workflowOrganizationCatalogQueryManager
     : managedRelayOrganizationCatalogQueryManager;

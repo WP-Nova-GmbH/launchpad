@@ -1,5 +1,6 @@
 import type { ThreadPromptQueue } from "@t3tools/contracts";
 import {
+  isTerminalWorkflowJob,
   WORKFLOW_RESPONSE_SUMMARY_COUNT_LIMIT,
   WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT,
 } from "@t3tools/contracts/workflows";
@@ -112,6 +113,13 @@ export function advanceWorkflow(run: WorkflowRun): WorkflowRun {
   };
 }
 
+export function workflowProgressStatus(
+  status: WorkflowRun["progress"]["status"],
+  manuallyPaused: boolean,
+): WorkflowRun["progress"]["status"] {
+  return manuallyPaused && !isTerminalWorkflowJob(status) ? "paused" : status;
+}
+
 /** Summaries are bounded; full answers remain in the environment's durable record. */
 export function workflowProgress(run: WorkflowRun): WorkflowRun["progress"] {
   const sequence = run.sequence;
@@ -123,7 +131,7 @@ export function workflowProgress(run: WorkflowRun): WorkflowRun["progress"] {
     manualPause: pause ? { state: pause.state } : null,
     underlyingStatus: run.progress.status,
     lastManualControl: run.lastManualControl ?? null,
-    ...(pause?.state === "paused" ? { status: "paused" as const } : {}),
+    status: workflowProgressStatus(run.progress.status, pause?.state === "paused"),
   };
   return {
     ...progress,

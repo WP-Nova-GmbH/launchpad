@@ -129,16 +129,89 @@ describe("diffPanelStore", () => {
     });
   });
 
-  it("keeps a workflow checkpoint selection while only other turns are available", () => {
+  it("keeps a read-only workflow checkpoint choice while only other turns are available", () => {
     const turnId = TurnId.make("workflow-turn");
     const store = useDiffPanelStore.getState();
     store.selectTurn(THREAD_REF, turnId, undefined, 3);
-    store.reconcileTurnSelection(THREAD_REF, [TurnId.make("latest-turn")]);
+    store.reconcileTurnSelection(THREAD_REF, [TurnId.make("latest-turn")], null, undefined, true);
 
     expect(
       selectThreadDiffPanelSelection(useDiffPanelStore.getState().byThreadKey, THREAD_REF),
     ).toMatchObject({ kind: "turn", turnId, checkpointTurnCount: 3 });
   });
+
+  it("resolves a Machine review checkpoint only for its review route, including outside the loaded history", () => {
+    const turnId = TurnId.make("review-turn");
+    const latest = TurnId.make("remaining-turn");
+    const { reviewVisitId: _visit, ...machineOrigin } = reviewRoute(turnId, 3).workflowOrigin;
+    const origin = workflowResultOrigin(
+      { workflowOrigin: machineOrigin },
+      "account-1",
+      THREAD_REF.threadId,
+    );
+    const store = useDiffPanelStore.getState();
+    const selection = () =>
+      selectThreadDiffPanelSelection(useDiffPanelStore.getState().byThreadKey, THREAD_REF);
+
+    store.selectTurn(THREAD_REF, turnId, "src/app.ts");
+    store.reconcileTurnSelection(THREAD_REF, [latest], origin);
+    expect(resolveDiffPanelSelection(selection(), [latest], origin)).toMatchObject({
+      selection: { kind: "turn", turnId, filePath: "src/app.ts" },
+      reviewCheckpoint: machineOrigin.reviewCheckpoint,
+      workflowReview: null,
+    });
+    expect(selection()).not.toHaveProperty("checkpointTurnCount");
+    expect(resolveDiffPanelSelection(selection(), [latest], null)).toMatchObject({
+      selection: { kind: "turn", turnId: latest },
+      reviewCheckpoint: undefined,
+    });
+  });
+
+  it("recovers an ordinary conversation from a legacy Machine checkpoint count after rewind", () => {
+    const store = useDiffPanelStore.getState();
+    const latest = TurnId.make("remaining-turn");
+    store.selectTurn(THREAD_REF, TurnId.make("removed-review-turn"), undefined, 3);
+
+    store.reconcileTurnSelection(THREAD_REF, [latest]);
+
+    expect(
+      selectThreadDiffPanelSelection(useDiffPanelStore.getState().byThreadKey, THREAD_REF),
+    ).toEqual({ kind: "turn", turnId: latest, filePath: null, revealRequestId: 1 });
+  });
+
+  it.each([1, 3])(
+    "requests the specific Machine review turn outside the loaded history at count %s",
+    (count) => {
+      const turnId = TurnId.make("review-turn");
+      const latest = TurnId.make("latest-turn");
+      const { reviewVisitId: _visit, ...machineOrigin } = reviewRoute(turnId, count).workflowOrigin;
+      const origin = workflowResultOrigin(
+        { workflowOrigin: machineOrigin },
+        "account-1",
+        THREAD_REF.threadId,
+      );
+      const selection = { kind: "turn", turnId, filePath: null, revealRequestId: 1 } as const;
+      const scope = resolveDiffPanelSelection(selection, [latest], origin);
+      const target = buildDiffPanelCheckpointTarget(
+        { ...THREAD_REF, checkpointTurnCount: undefined, ignoreWhitespace: true },
+        scope,
+        "panel",
+      );
+      expect(buildCheckpointDiffTargets(target)).toEqual({
+        fullThread: null,
+        turn: {
+          environmentId: THREAD_REF.environmentId,
+          input: {
+            threadId: THREAD_REF.threadId,
+            fromTurnCount: count - 1,
+            toTurnCount: count,
+            ignoreWhitespace: true,
+            expectedTurnId: turnId,
+          },
+        },
+      });
+    },
+  );
 
   it("opens a read-only result on the latest checkpoint without changing the live checkout default", () => {
     const turnId = TurnId.make("latest-turn");
@@ -278,7 +351,11 @@ describe("diffPanelStore", () => {
     store.reconcileTurnSelection(THREAD_REF, [turnId], unvalidated, declared);
     expect(selection()).toMatchObject({ kind: "turn", turnId: staleTurnId });
 
-    const input = { ...THREAD_REF, checkpointTurnCount: 2, ignoreWhitespace: false };
+    const input = {
+      ...THREAD_REF,
+      checkpointTurnCount: 2,
+      ignoreWhitespace: false,
+    };
     expect(
       buildCheckpointDiffTargets(buildDiffPanelCheckpointTarget(input, blocked, "panel")),
     ).toEqual({ fullThread: null, turn: null });

@@ -31,6 +31,7 @@ import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow
 import {
   Columns2Icon,
   FileDiffIcon,
+  LockIcon,
   RotateCwIcon,
   Rows3Icon,
   Trash2Icon,
@@ -53,6 +54,7 @@ import {
   AlertDialogTitle,
 } from "../ui/alert-dialog";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { WorkflowAlert } from "./WorkflowAlert";
@@ -285,11 +287,12 @@ export function SavedWorkflowResults({
   const reviewAvailable = job.status === "awaiting_review" && !resultSavePending && !finishing;
   const canVerifyResult = !resultSavePending && (reviewAvailable || retryableCompletion);
   const showFinalResultLink = retryableCompletion && currentResult && !resultSavePending;
-  const resultLabel = reviewingCurrent
-    ? reviewAvailable
-      ? "Current review result"
-      : "Latest result"
-    : "Earlier result";
+  const isCurrentReview = reviewingCurrent && reviewAvailable;
+  const resultLabel = isCurrentReview
+    ? "Current review result"
+    : reviewingCurrent
+      ? "Latest result"
+      : "Earlier result";
   const stepTitle = (stepId: string) =>
     job.workflow?.definition.steps.find((step) => step.id === stepId)?.title ?? stepId;
   useEffect(() => {
@@ -610,10 +613,16 @@ export function SavedWorkflowResults({
       className="space-y-3"
       hidden={!!partialResult && !partialResultOpen}
     >
-      <div className="flex flex-wrap items-start justify-between gap-3">
+      <header className="flex flex-wrap items-start justify-between gap-3">
         {result ? (
           <div className="min-w-0 space-y-1">
-            <h3 className="text-sm font-medium">{stepTitle(result.stepId)}</h3>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <h3 className="text-sm font-medium wrap-anywhere">{stepTitle(result.stepId)}</h3>
+              <Badge variant="secondary">
+                <LockIcon aria-hidden />
+                {isCurrentReview ? "Read-only" : "Read-only result"}
+              </Badge>
+            </div>
             <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
               <span>{resultLabel}</span>
               <time dateTime={result.createdAt}>
@@ -657,7 +666,7 @@ export function SavedWorkflowResults({
             </Select>
           </div>
         ) : null}
-      </div>
+      </header>
       {reviewAvailable && result && !reviewingCurrent ? (
         <WorkflowAlert
           title={browsingHistory ? "Earlier result" : "A newer result needs review"}
@@ -673,7 +682,7 @@ export function SavedWorkflowResults({
           }
         >
           {browsingHistory
-            ? "This saved result is read-only. Decisions apply to the current review."
+            ? "Decisions apply to the current review."
             : "Your opened result has been kept in place. Open the current result before deciding."}
         </WorkflowAlert>
       ) : null}

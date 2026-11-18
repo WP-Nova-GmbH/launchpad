@@ -66,6 +66,7 @@ import {
   advanceWorkflow,
   canRecoverPausedWorkflowTurn,
   workflowProgress,
+  workflowProgressStatus,
   workflowPromptId,
   workflowAllowsPrompt,
   workflowTurnPauseDetails,
@@ -406,7 +407,10 @@ export const make = Effect.gen(function* () {
             payload: {
               jobId: run.jobId,
               repositoryId: run.workflow.repositoryId,
-              status: run.progress.status,
+              status: workflowProgressStatus(
+                run.progress.status,
+                run.manualPause?.state === "paused",
+              ),
             },
             turnId: null,
             createdAt,
@@ -1627,7 +1631,11 @@ export const make = Effect.gen(function* () {
         );
       } else {
         if (run.manualPause?.state === "requested" && !run.executionReserved) {
-          run = yield* store.save({ ...run, manualPause: { ...run.manualPause, state: "paused" } });
+          run = yield* store.save({
+            ...run,
+            manualPause: { ...run.manualPause, state: "paused" },
+            progress: { ...run.progress, revision: run.progress.revision + 1 },
+          });
         }
         if (
           (!run.manualPause ||

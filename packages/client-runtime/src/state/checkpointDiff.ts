@@ -43,7 +43,7 @@ export function buildCheckpointDiffTargets(target: CheckpointDiffTarget) {
   if (strictWorkflowReview && !expectedTurnId) return { fullThread: null, turn: null } as const;
 
   const query = { environmentId, ...(requestKey ? { cacheScope: requestKey } : {}) };
-  if (fromTurnCount === 0 && !strictWorkflowReview)
+  if (fromTurnCount === 0 && !expectedTurnId)
     return {
       fullThread: {
         ...query,
@@ -61,9 +61,8 @@ export function buildCheckpointDiffTargets(target: CheckpointDiffTarget) {
         fromTurnCount,
         toTurnCount,
         ignoreWhitespace: strictWorkflowReview ? false : target.ignoreWhitespace,
-        ...(strictWorkflowReview && expectedTurnId
-          ? { strictWorkflowReview: true, expectedTurnId }
-          : {}),
+        ...(strictWorkflowReview ? { strictWorkflowReview: true } : {}),
+        ...(expectedTurnId ? { expectedTurnId } : {}),
       },
     },
   } as const;

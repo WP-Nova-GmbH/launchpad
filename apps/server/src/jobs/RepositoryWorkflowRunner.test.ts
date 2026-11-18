@@ -3209,6 +3209,16 @@ it.effect("manual Pause preserves Input and Review checkpoints, previews and res
       assert.strictEqual(restored.checkpoint!.checkpointId, review.checkpoint!.checkpointId);
       assert.deepStrictEqual(restored.responses, review.responses);
       assert.strictEqual(restored.status, "awaiting_review");
+
+      const progressUpdates = (yield* Ref.get(h.commands)).flatMap((command) =>
+        command.type === "thread.activity.append" && command.activity.kind === "workflow.progress"
+          ? [command.activity.payload]
+          : [],
+      );
+      assert.deepEqual(progressUpdates.slice(-2), [
+        { jobId: "job-1", repositoryId: "repo-1", status: "paused" },
+        { jobId: "job-1", repositoryId: "repo-1", status: "awaiting_review" },
+      ]);
     }),
   ),
 );
@@ -4066,6 +4076,17 @@ for (const excluded of ["uncertain", "failed", "paused", "unreserved", "missing-
         assert.equal(executions, 0);
         assert.equal((yield* store.get("job-1"))!.sequence!.cursor, seed.sequence!.cursor);
         assert.lengthOf(yield* h.starts, 1);
+
+        if (excluded === "unreserved") {
+          assert.isTrue(
+            (yield* Ref.get(h.commands)).some(
+              (command) =>
+                command.type === "thread.activity.append" &&
+                command.activity.kind === "workflow.progress" &&
+                command.activity.summary === "Workflow manually paused",
+            ),
+          );
+        }
       }),
     ),
   );

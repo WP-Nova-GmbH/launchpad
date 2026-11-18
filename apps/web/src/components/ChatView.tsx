@@ -763,6 +763,7 @@ type ChatViewProps =
       reserveTitleBarControlInset?: boolean;
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: ThreadSyncPhase | null;
+      hasWorkflowConversationHeader?: boolean;
       routeKind: "server";
       draftId?: never;
     }
@@ -773,6 +774,7 @@ type ChatViewProps =
       reserveTitleBarControlInset?: boolean;
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: never;
+      hasWorkflowConversationHeader?: never;
       routeKind: "draft";
       draftId: DraftId;
     };
@@ -1468,17 +1470,19 @@ const noopHeldAttachment = (_attachment: ChatFileAttachment) => {};
 
 function ChatComposerWorkspace({
   enabled,
+  hasWorkflowConversationHeader,
   environmentId,
   threadId,
   children,
 }: {
   enabled: boolean;
+  hasWorkflowConversationHeader: boolean;
   environmentId: EnvironmentId;
   threadId: ThreadId;
   children: React.ReactNode;
 }) {
   if (!enabled)
-    return (
+    return hasWorkflowConversationHeader ? null : (
       <p
         role="status"
         className="mx-auto max-w-3xl rounded-lg bg-background px-3 py-2 text-center text-sm text-muted-foreground"
@@ -1515,6 +1519,7 @@ export default function ChatView(props: ChatViewProps) {
     onDiffPanelOpen,
     reserveTitleBarControlInset = true,
     forceExpandedMobileComposer = false,
+    hasWorkflowConversationHeader = false,
   } = props;
   const draftId = routeKind === "draft" ? props.draftId : null;
   const threadSyncPhase = routeKind === "server" ? (props.threadSyncPhase ?? null) : null;
@@ -1598,6 +1603,7 @@ export default function ChatView(props: ChatViewProps) {
       origin: workflowOrigin,
       threadId,
     });
+  const showThreadHeader = !hasWorkflowConversationHeader || canUseLiveWorkspace;
   const canUseLiveWorkspaceRef = useRef(canUseLiveWorkspace);
   canUseLiveWorkspaceRef.current = canUseLiveWorkspace;
   const composerDraftTarget: ScopedThreadRef | DraftId =
@@ -10184,7 +10190,9 @@ export default function ChatView(props: ChatViewProps) {
           ) : null}
         </WizardPopup>
       </Dialog>
-      {rightPanelControlsAtRoot ? panelLayoutControls : null}
+      {rightPanelControlsAtRoot || (!showThreadHeader && !rightPanelControlsInPanel)
+        ? panelLayoutControls
+        : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
@@ -10193,49 +10201,52 @@ export default function ChatView(props: ChatViewProps) {
         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
       >
         {/* Top bar */}
-        <WorkspacePageHeader
-          data-chat-header
-          electron={isElectron}
-          reserveNativeControls={reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar}
-          className="relative bg-background"
-        >
-          {isElectron && rightPanelControlsAtRoot ? (
-            <span
-              aria-hidden
-              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+        {showThreadHeader ? (
+          <WorkspacePageHeader
+            data-chat-header
+            electron={isElectron}
+            reserveNativeControls={reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar}
+            className="relative bg-background"
+          >
+            {isElectron && rightPanelControlsAtRoot ? (
+              <span
+                aria-hidden
+                className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+              />
+            ) : null}
+            {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
+            <ChatHeader
+              {...(!supportsPullRequests || activeProjectRepository === null
+                ? {}
+                : { onOpenPullRequest: openProjectPullRequest })}
+              activeThreadEnvironmentId={activeThread.environmentId}
+              activeThreadId={activeThread.id}
+              {...(routeKind === "draft" && draftId ? { draftId } : {})}
+              activeThreadTitle={activeThread.title}
+              workflowConversation={hasWorkflowConversationHeader}
+              isServerThread={isServerThread}
+              activeProject={activeProject}
+              openInCwd={canUseLiveWorkspace ? gitCwd : null}
+              activeProjectScripts={canUseLiveWorkspace ? activeProjectScripts : undefined}
+              readOnly={!canUseLiveWorkspace}
+              preferredScriptId={
+                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+              }
+              keybindings={keybindings}
+              availableEditors={availableEditors}
+              rightPanelOpen={rightPanelOpen}
+              gitCwd={canUseLiveWorkspace ? gitCwd : null}
+              onNewThreadInProject={handleNewThreadInActiveProject}
+              {...(activeDraftLogicalProjectKey
+                ? { onOpenProjectSettings: handleOpenDraftProjectSettings }
+                : {})}
+              onRunProjectScript={runProjectScript}
+              onAddProjectScript={saveProjectScript}
+              onUpdateProjectScript={updateProjectScript}
+              onDeleteProjectScript={deleteProjectScript}
             />
-          ) : null}
-          {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
-          <ChatHeader
-            {...(!supportsPullRequests || activeProjectRepository === null
-              ? {}
-              : { onOpenPullRequest: openProjectPullRequest })}
-            activeThreadEnvironmentId={activeThread.environmentId}
-            activeThreadId={activeThread.id}
-            {...(routeKind === "draft" && draftId ? { draftId } : {})}
-            activeThreadTitle={activeThread.title}
-            isServerThread={isServerThread}
-            activeProject={activeProject}
-            openInCwd={canUseLiveWorkspace ? gitCwd : null}
-            activeProjectScripts={canUseLiveWorkspace ? activeProjectScripts : undefined}
-            readOnly={!canUseLiveWorkspace}
-            preferredScriptId={
-              activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-            }
-            keybindings={keybindings}
-            availableEditors={availableEditors}
-            rightPanelOpen={rightPanelOpen}
-            gitCwd={canUseLiveWorkspace ? gitCwd : null}
-            onNewThreadInProject={handleNewThreadInActiveProject}
-            {...(activeDraftLogicalProjectKey
-              ? { onOpenProjectSettings: handleOpenDraftProjectSettings }
-              : {})}
-            onRunProjectScript={runProjectScript}
-            onAddProjectScript={saveProjectScript}
-            onUpdateProjectScript={updateProjectScript}
-            onDeleteProjectScript={deleteProjectScript}
-          />
-        </WorkspacePageHeader>
+          </WorkspacePageHeader>
+        ) : null}
 
         {canUseLiveWorkspace ? (
           <PortableThreadCommandStatus
@@ -10451,6 +10462,7 @@ export default function ChatView(props: ChatViewProps) {
               >
                 <ChatComposerWorkspace
                   enabled={canUseLiveWorkspace}
+                  hasWorkflowConversationHeader={hasWorkflowConversationHeader}
                   environmentId={activeThread.environmentId}
                   threadId={activeThread.id}
                 >
