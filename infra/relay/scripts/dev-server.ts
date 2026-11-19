@@ -261,6 +261,10 @@ if (localVmConnections && (!Number.isInteger(port) || port < 1 || port > 65535))
 }
 const databaseUrl = process.env.DEV_RELAY_DATABASE_URL?.trim() || DEFAULT_DATABASE_URL;
 const relayIssuer = process.env.DEV_RELAY_ISSUER?.trim() || `http://127.0.0.1:${port}`;
+const deploymentId = process.env.DEV_RELAY_DEPLOYMENT_ID;
+if (deploymentId !== undefined && !/^[a-f0-9]{32}$/u.test(deploymentId)) {
+  throw new Error("DEV_RELAY_DEPLOYMENT_ID must be a 32-character lowercase hexadecimal value.");
+}
 const cloudMintKeyPair = loadOrCreateDevCloudMintKeyPair(
   process.env.DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH?.trim() ||
     NodeURL.fileURLToPath(
@@ -592,6 +596,17 @@ const managedEndpointSweepLayer =
 
 const main = Effect.gen(function* () {
   const nodeHttp = yield* Effect.promise(() => import("node:http"));
+  const createServer = () => {
+    const server = nodeHttp.createServer();
+    if (deploymentId !== undefined) {
+      server.on("request", (request, response) => {
+        if (request.url?.split("?", 1)[0] !== "/health") return;
+        response.setHeader("x-launchpad-deployment-id", deploymentId);
+        response.setHeader("cache-control", "no-store");
+      });
+    }
+    return server;
+  };
   const threadVmSettings = yield* loadDevThreadVmRuntimeSettings;
   yield* Effect.logInfo("Development relay listening", { port, issuer: relayIssuer });
   // Handler requirements are deferred to the serve step rather than discharged
@@ -714,7 +729,7 @@ const main = Effect.gen(function* () {
         ),
       ),
     ).pipe(
-      Layer.provide(NodeHttpServer.layer(nodeHttp.createServer, { host: "127.0.0.1", port })),
+      Layer.provide(NodeHttpServer.layer(createServer, { host: "127.0.0.1", port })),
       // Delegated thread ids exceed the router's default path parameter limit.
       Layer.provide(Layer.succeed(HttpRouter.RouterConfig, RELAY_HTTP_ROUTER_CONFIG)),
       Layer.provide(runtimeLayer),
