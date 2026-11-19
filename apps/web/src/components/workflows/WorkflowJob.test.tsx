@@ -16,16 +16,28 @@ import {
   type ReactTestRendererJSON,
 } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  OrchestrationDispatchCommandError,
+  ProjectId,
+  ThreadId,
+} from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
-import { workflowResultCheckpoint } from "@t3tools/client-runtime/relay/workflow-result";
 import {
+  workflowResultCheckpoint,
+  type WorkflowResultCheckpoint,
+} from "@t3tools/client-runtime/relay/workflow-result";
+import {
+  activateWorkflowJobView,
+  beginWorkflowJobRequest,
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
   beginWorkflowReview,
+  settleWorkflowJobRequest,
   updateWorkflowDrafts,
   workflowDraftAtom,
   workflowJobReadAtom,
@@ -43,11 +55,22 @@ const fixture = vi.hoisted(() => ({
   select: vi.fn(),
   panel: vi.fn(),
   locationHash: "",
+  workflowReviewReturn: undefined as WorkflowResultCheckpoint | undefined,
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
-  useLocation: ({ select }: { select: (location: { hash: string }) => unknown }) =>
-    select({ hash: fixture.locationHash }),
+  useLocation: ({
+    select,
+  }: {
+    select: (location: {
+      hash: string;
+      state: { workflowReviewReturn: WorkflowResultCheckpoint | undefined };
+    }) => unknown;
+  }) =>
+    select({
+      hash: fixture.locationHash,
+      state: { workflowReviewReturn: fixture.workflowReviewReturn },
+    }),
   Link: ({
     to,
     hash,
@@ -244,12 +267,15 @@ const findButton = (label: string) =>
         button.props["aria-label"] === label ||
         button.children.filter((child) => typeof child === "string").join("") === label,
     )!;
-const conversationButton = () => findButton("Open conversation");
 const headerStatus = () =>
   renderer!.root
     .findAllByType("header")
     .flatMap((header) => header.findAllByType("span"))
     .find((span) => span.props.role === "status")!;
+function conversationOpeningIsBlocked() {
+  const button = findButton("Opening conversation…") ?? findButton("Open conversation");
+  return button.props.disabled === true || button.props["aria-disabled"] === true;
+}
 async function press(label: string) {
   await act(async () => {
     findButton(label).props.onClick();
@@ -294,6 +320,7 @@ beforeEach(() => {
   fixture.select.mockReset();
   fixture.panel.mockReset();
   fixture.locationHash = "";
+  fixture.workflowReviewReturn = undefined;
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -317,7 +344,7 @@ describe("successful run outcome", () => {
     expect(text(link)).toContain("Open pull request");
     expect(link.props.href).toBe(pullRequestUrl);
     expect(findButton("Inspect result")).toBeDefined();
-    expect(conversationButton()).toBeDefined();
+    expect(findButton("Open conversation")).toBeDefined();
   });
 
   it.each([
@@ -916,9 +943,12 @@ describe("workflow result location navigation", () => {
     },
   );
 
-  it("opens conversation and the original saved turn at the current destination", async () => {
+  it("opens conversation and retries the exact completed result at the current destination", async () => {
+    fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));
     await mount();
     await press("Inspect result");
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    await press("Retry saved diff");
     expect(fixture.select).toHaveBeenCalledWith(
       { environmentId: "moved-vm", threadId: "thread" },
       "saved-turn",
@@ -934,12 +964,20 @@ describe("workflow result location navigation", () => {
       jobId: "job",
       threadId: "thread",
       workflowVmResultReader: true,
+      savedDiffCheckpoint: {
+        checkpointId: "checkpoint",
+        turnId: "saved-turn",
+        checkpointTurnCount: 3,
+      },
     });
     expect(fixture.open).toHaveBeenCalledWith(
       expect.objectContaining({ workflowResult: { ...scope, originalEnvironmentId: "original" } }),
     );
     await press("Open conversation");
     expect(fixture.navigate).toHaveBeenCalledTimes(2);
+    expect(
+      fixture.navigate.mock.calls[1]![0].state({}).workflowOrigin.savedDiffCheckpoint,
+    ).toBeUndefined();
     expect(job.runtime).toMatchObject({ kind: "machine", environmentId: "original" });
   });
   it("opens the active Machine review at its checkpoint without requiring a VM review visit", async () => {
@@ -1005,16 +1043,154 @@ describe("workflow result location navigation", () => {
       expect(section.focus).toHaveBeenCalledTimes(movedFocus ? 0 : 1);
     },
   );
-  it("keeps a failed location lookup visible and retries without opening a stale route", async () => {
-    fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));
-    await mount();
-    await press("Inspect result");
-    expect(text(renderer!.toJSON())).toContain("Location unavailable");
-    expect(fixture.navigate).not.toHaveBeenCalled();
-    expect(fixture.select).not.toHaveBeenCalled();
-    await press("Inspect result");
-    expect(fixture.navigate).toHaveBeenCalledTimes(1);
-  });
+  it.each([false, true])(
+    "checks the returned checkpoint against a fresh read before moving focus (changed: %s)",
+    async (changed) => {
+      const reply = deferred();
+      const review = {
+        ...job,
+        status: "awaiting_review",
+        progress: { ...job.progress!, status: "awaiting_review" },
+      } satisfies RepositoryWorkflowJob;
+      activateWorkflowJobView(appAtomRegistry, scope, job.jobId);
+      const request = beginWorkflowJobRequest(appAtomRegistry, scope, job.jobId)!;
+      settleWorkflowJobRequest(appAtomRegistry, request, review);
+      fixture.locationHash = "workflow-review";
+      fixture.workflowReviewReturn = workflowResultCheckpoint(review.progress.checkpoint);
+
+      const refreshed = {
+        ...review,
+        progress: {
+          ...review.progress,
+          revision: review.progress.revision + 1,
+          checkpoint: changed
+            ? { ...review.progress.checkpoint!, checkpointId: "later" }
+            : review.progress.checkpoint,
+        },
+      } satisfies RepositoryWorkflowJob;
+      fixture.call.mockReturnValueOnce(reply.promise).mockResolvedValue(refreshed);
+      const body = {};
+      const ownerDocument = { body, activeElement: body };
+      const heading = { ownerDocument, scrollIntoView: vi.fn(), focus: vi.fn() };
+      const section = { ownerDocument, scrollIntoView: vi.fn(), focus: vi.fn() };
+      await mount(true, {
+        createNodeMock: ({ type, props }) =>
+          type === "h1"
+            ? heading
+            : (props as { id?: string }).id === "workflow-review"
+              ? section
+              : null,
+      });
+      expect(findButton("Inspect saved diff")).toBeDefined();
+      expect(section.focus).not.toHaveBeenCalled();
+      expect(heading.focus).not.toHaveBeenCalled();
+
+      await act(async () => reply.resolve(refreshed));
+
+      const target = changed ? heading : section;
+      expect(target.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "start" });
+      expect(target.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      expect((changed ? section : heading).focus).not.toHaveBeenCalled();
+    },
+  );
+  it.each([
+    {
+      action: "Inspect saved diff",
+      retry: "Retry saved diff",
+      pending: "Opening saved diff…",
+      otherAction: "Open conversation",
+    },
+    {
+      action: "Open conversation",
+      retry: "Retry conversation",
+      pending: "Opening conversation…",
+      otherAction: "Inspect saved diff",
+    },
+  ])(
+    "retries $action at the same Machine destination",
+    async ({ action, retry, pending, otherAction }) => {
+      const review = {
+        ...job,
+        status: "awaiting_review",
+        progress: { ...job.progress!, status: "awaiting_review" },
+      } satisfies RepositoryWorkflowJob;
+      const reply = deferred();
+      fixture.call.mockResolvedValue(review);
+      fixture.open
+        .mockRejectedValueOnce(new Error("Location unavailable"))
+        .mockReturnValueOnce(reply.promise);
+      await mount();
+      await press(action);
+      expect(text(renderer!.toJSON())).toContain("Location unavailable");
+      expect(fixture.navigate).not.toHaveBeenCalled();
+      expect(fixture.select).not.toHaveBeenCalled();
+
+      fixture.call.mockResolvedValue({
+        ...review,
+        progress: {
+          ...review.progress,
+          revision: review.progress.revision + 1,
+          checkpoint: {
+            ...review.progress.checkpoint!,
+            checkpointId: "new-checkpoint",
+            turnId: "new-turn",
+          },
+        },
+      });
+      await press("Refresh run");
+      expect(findButton("Inspect saved diff").props.disabled).toBe(false);
+      await press(retry);
+      expect(findButton(pending)).toBeDefined();
+      expect(findButton(otherAction).props.disabled).toBe(true);
+      expect(text(renderer!.toJSON())).not.toContain("Location unavailable");
+
+      const destination = { environmentId: "original", threadId: "thread" };
+      await act(async () => reply.resolve({ _tag: "Success", value: destination }));
+      expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ to: "/$environmentId/$threadId", params: destination }),
+      );
+      const { workflowOrigin } = fixture.navigate.mock.calls[0]![0].state({});
+      if (action === "Inspect saved diff") {
+        expect(fixture.select).toHaveBeenCalledExactlyOnceWith(destination, "saved-turn");
+        expect(fixture.panel).toHaveBeenCalledExactlyOnceWith(destination, "diff");
+        expect(workflowOrigin.reviewCheckpoint).toEqual({
+          checkpointId: "checkpoint",
+          turnId: "saved-turn",
+          checkpointTurnCount: 3,
+        });
+      } else {
+        expect(fixture.select).not.toHaveBeenCalled();
+        expect(fixture.panel).not.toHaveBeenCalled();
+        expect(workflowOrigin.reviewCheckpoint).toBeUndefined();
+      }
+    },
+  );
+  it.each(["awaiting_review", "done"] as const)(
+    "keeps the same retry control mounted when a running Machine run becomes %s",
+    async (status) => {
+      fixture.call.mockResolvedValue({
+        ...job,
+        status: "running",
+        progress: { ...job.progress!, status: "running", checkpoint: null },
+      } satisfies RepositoryWorkflowJob);
+      fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));
+      await mount();
+      await press("Open conversation");
+      const retry = findButton("Retry conversation");
+      expect(retry).toBeDefined();
+
+      fixture.call.mockResolvedValue({
+        ...job,
+        status,
+        progress: { ...job.progress!, revision: job.progress!.revision + 1, status },
+      } satisfies RepositoryWorkflowJob);
+      await pollRun();
+
+      expect(findButton("Retry conversation")).toBe(retry);
+      await press("Retry conversation");
+      expect(fixture.navigate).toHaveBeenCalledOnce();
+    },
+  );
   it("clears a failed result lookup when another run is selected", async () => {
     fixture.open.mockRejectedValueOnce(new Error("Previous run location unavailable"));
     await mount();
@@ -1032,7 +1208,7 @@ describe("workflow result location navigation", () => {
     fixture.open.mockReturnValueOnce(reply.promise);
     await mount();
     await press("Open conversation");
-    expect(conversationButton().props.disabled).toBe(true);
+    expect(conversationOpeningIsBlocked()).toBe(true);
     appAtomRegistry.set(managedRelaySessionAtom, {
       accountId: scope.accountId,
       readClerkToken: () => Effect.succeed("replacement-token"),
@@ -1042,7 +1218,7 @@ describe("workflow result location navigation", () => {
       await reply.promise;
     });
     expect(fixture.navigate).not.toHaveBeenCalled();
-    expect(conversationButton().props.disabled).toBe(false);
+    expect(conversationOpeningIsBlocked()).toBe(false);
     await press("Open conversation");
     expect(fixture.navigate).toHaveBeenCalledTimes(1);
   });
@@ -1054,7 +1230,7 @@ describe("workflow result location navigation", () => {
     await press("Open conversation");
     fixture.call.mockResolvedValue({ ...job, jobId: "other" });
     await act(async () => renderer!.update(view("other")));
-    expect(conversationButton().props.disabled).toBe(false);
+    expect(conversationOpeningIsBlocked()).toBe(false);
     await press("Open conversation");
     expect(fixture.open).toHaveBeenCalledTimes(2);
     await act(async () => {
@@ -1062,12 +1238,12 @@ describe("workflow result location navigation", () => {
       await oldReply.promise;
     });
     expect(fixture.navigate).not.toHaveBeenCalled();
-    expect(conversationButton().props.disabled).toBe(true);
+    expect(conversationOpeningIsBlocked()).toBe(true);
     await act(async () => {
       newReply.resolve({ _tag: "Success", value: { environmentId: "new-vm", threadId: "thread" } });
       await newReply.promise;
     });
-    expect(conversationButton().props.disabled).toBe(false);
+    expect(conversationOpeningIsBlocked()).toBe(false);
     expect(fixture.navigate).toHaveBeenCalledTimes(1);
     expect(fixture.navigate.mock.calls[0]![0].state({}).workflowOrigin.jobId).toBe("other");
   });
@@ -1116,6 +1292,41 @@ describe("workflow run presentation", () => {
       checkpoint: { ...review.progress.checkpoint, role: "maintainer" },
     },
   } satisfies RepositoryWorkflowJob;
+  it("keeps saved diff opening and recovery visible while composing feedback", async () => {
+    const lookup = deferred();
+    const retry = deferred();
+    fixture.call.mockResolvedValue(review);
+    fixture.open.mockReturnValueOnce(lookup.promise).mockReturnValueOnce(retry.promise);
+    await mount();
+    await press("Inspect saved diff");
+    await press("Request changes");
+    const editor = () => renderer!.root.findByType("textarea");
+    await act(() => editor().props.onChange({ target: { value: "Add a regression test" } }));
+    expect(findButton("Opening saved diff…")).toBeDefined();
+
+    await act(async () =>
+      lookup.resolve(
+        Exit.fail(new OrchestrationDispatchCommandError({ message: "Location unavailable" })),
+      ),
+    );
+    const recovery = renderer!.root
+      .findAllByProps({ role: "alert" })
+      .find((alert) => text(alert).includes("Location unavailable"));
+    expect(text(recovery ?? null)).toContain("Retry saved diff");
+    expect(editor().props.value).toBe("Add a regression test");
+
+    await press("Retry saved diff");
+    expect(findButton("Opening saved diff…")).toBeDefined();
+    expect(editor().props.value).toBe("Add a regression test");
+    expect(fixture.navigate).not.toHaveBeenCalled();
+
+    await act(async () =>
+      retry.resolve(
+        Exit.fail(new OrchestrationDispatchCommandError({ message: "Location still unavailable" })),
+      ),
+    );
+    expect(text(renderer!.toJSON())).toContain("Location still unavailable");
+  });
   it("returns to review without losing feedback, stays closed on refresh, and restores it on request", async () => {
     fixture.call.mockResolvedValue(review);
     await mount();

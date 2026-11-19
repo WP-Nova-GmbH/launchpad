@@ -78,8 +78,6 @@ import {
   emptyWorkflowJobRead,
   workflowStatusLabel,
   workflowJobAccessLost,
-  beginWorkflowReview,
-  bindWorkflowReviewPlacement,
   requireFreshWorkflowReviewRead,
   workflowReviewApprovalState,
   type WorkflowScope,
@@ -106,6 +104,7 @@ import {
   AlertDialogTitle,
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
@@ -121,6 +120,13 @@ import {
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
 type SavedReviewRender = { key: string; visitId: string };
+type MachineResultDestination =
+  | { kind: "conversation" }
+  | { kind: "diff"; checkpoint: WorkflowResultCheckpoint; review: boolean };
+type MachineResultOpening = { destination: MachineResultDestination } & (
+  | { status: "opening" }
+  | { status: "failed"; detail: string }
+);
 
 const checkingCheckpointAccess = "Checking who can respond…";
 const unconfirmedCheckpointAccess =
@@ -316,9 +322,17 @@ export function WorkflowJob({
 }) {
   const navigate = useNavigate();
   const returningToReview = useLocation({ select: ({ hash }) => hash === WORKFLOW_REVIEW_ANCHOR });
+  const returnCheckpoint = useLocation({
+    select: ({ hash, state }) =>
+      hash === WORKFLOW_REVIEW_ANCHOR ? state?.workflowReviewReturn : undefined,
+  });
   const openResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
-  const [openingResult, setOpeningResult] = useState(false);
-  const [resultError, setResultError] = useState<string | null>(null);
+  const [machineResult, setMachineResult] = useState<MachineResultOpening | null>(null);
+  const openingResult = machineResult?.status === "opening" ? machineResult.destination.kind : null;
+  const resultError = machineResult?.status === "failed" ? machineResult : null;
+  const retryResultButton = useRef<HTMLButtonElement>(null);
+  const resultActions = useRef<HTMLDivElement>(null);
+  const restoreOpeningFocus = useRef(false);
   // A catalog refresh can recreate an equivalent scope while the run read is still in flight.
   const scope = useMemo(
     () => ({ accountId, organizationId, repositoryId }),
@@ -328,9 +342,26 @@ export function WorkflowJob({
   const reads = useWorkflowJobReads();
   const drafts = useWorkflowDrafts();
   const key = workflowSessionKey(scope, jobId);
+  const reviewReturn = useMemo(
+    () =>
+      returnCheckpoint
+        ? {
+            key,
+            checkpoint: returnCheckpoint,
+            after: appAtomRegistry.get(workflowJobReadAtom).sequence,
+          }
+        : null,
+    [key, returnCheckpoint],
+  );
   const runHeading = useRef<HTMLHeadingElement>(null);
-  const conversationButton = useRunActionFocus(key, runHeading);
-  const inspectResultButton = useRunActionFocus(key, runHeading);
+  const conversationButton = useRunActionFocus(
+    key,
+    resultError?.destination.kind === "conversation" ? retryResultButton : runHeading,
+  );
+  const inspectResultButton = useRunActionFocus(
+    key,
+    resultError?.destination.kind === "diff" ? retryResultButton : runHeading,
+  );
   const resumeButton = useRunActionFocus(key);
   const reviewSection = useRef<HTMLElement>(null);
   const handledReviewReturn = useRef<string | null>(null);
@@ -360,18 +391,29 @@ export function WorkflowJob({
     (available: boolean) => setAvailableSavedResultsKey(available ? key : null),
     [key],
   );
-  const resultRequest = useRef<{ key: string } | null>(null);
-  useLayoutEffect(
-    () => () => {
-      setResultError(null);
-      if (resultRequest.current?.key !== key) return;
-      resultRequest.current = null;
-      setOpeningResult(false);
-    },
-    [key],
-  );
   const read = reads.jobs[key] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
+  const resultEnvironmentId =
+    selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime.environmentId : undefined;
+  const resultThreadId =
+    selectedJob?.progress?.hasThread === false ? undefined : selectedJob?.progress?.threadId;
+  const resultRequest = useRef<{ key: string } | null>(null);
+  useLayoutEffect(() => {
+    if (!resultEnvironmentId || !resultThreadId) return;
+    return () => {
+      if (resultRequest.current?.key === key) resultRequest.current = null;
+      setMachineResult(null);
+      restoreOpeningFocus.current = false;
+    };
+  }, [key, resultEnvironmentId, resultThreadId]);
+  useLayoutEffect(() => {
+    if (!openingResult || !restoreOpeningFocus.current) return;
+    restoreOpeningFocus.current = false;
+    const target = resultActions.current?.querySelector<HTMLButtonElement>(
+      'button[aria-busy="true"]',
+    );
+    if (target && target.ownerDocument.activeElement === target.ownerDocument.body) target.focus();
+  }, [openingResult]);
   const manualState = workflowManualControlState(selectedJob);
   const vmRecovery = manualState.recovery;
   const actionState = workflowActionState(selectedJob);
@@ -465,20 +507,32 @@ export function WorkflowJob({
   if (checkpointAccessCheck && !currentCheckpointAccessCheck) setCheckpointAccessCheck(null);
   const runLoaded = selectedJob !== null;
   const showingReview = waiting && !input;
+  const returnReadAccepted = !reviewReturn || read.acceptedReadEpoch > reviewReturn.after;
+  const returnReadPending =
+    reviewReturn &&
+    !returnReadAccepted &&
+    (read.epoch <= reviewReturn.after || read.reading || read.mutation);
+  const reviewAtReturn = reviewReturn ? workflowResultCheckpoint(checkpoint) : undefined;
+  const expectedReviewOnReturn =
+    !reviewReturn ||
+    (returnReadAccepted &&
+      reviewAtReturn &&
+      sameWorkflowResultCheckpoint(reviewAtReturn, reviewReturn.checkpoint));
   useLayoutEffect(() => {
     if (!returningToReview) {
       handledReviewReturn.current = null;
       return;
     }
-    if (!runLoaded || handledReviewReturn.current === key) return;
-    const target = showingReview ? reviewSection.current : runHeading.current;
+    if (!runLoaded || returnReadPending || handledReviewReturn.current === key) return;
+    const target =
+      showingReview && expectedReviewOnReturn ? reviewSection.current : runHeading.current;
     if (!target) return;
     handledReviewReturn.current = key;
     const { activeElement, body } = target.ownerDocument;
     if (activeElement !== body && activeElement !== target) return;
     target.scrollIntoView({ block: "start" });
     target.focus({ preventScroll: true });
-  }, [key, returningToReview, runLoaded, showingReview]);
+  }, [key, returningToReview, runLoaded, returnReadPending, showingReview, expectedReviewOnReturn]);
   useLayoutEffect(() => {
     if (feedbackFocus.current === "input") feedbackInput.current?.focus();
     if (feedbackFocus.current === "button") feedbackButton.current?.focus();
@@ -684,58 +738,44 @@ export function WorkflowJob({
       settleWorkflowJobRequest(appAtomRegistry, request, workflowError(cause));
     }
   };
-  const inspect = async (diff: boolean) => {
+  const inspect = async (destination: MachineResultDestination) => {
     if (
-      !selectedJob?.progress ||
-      selectedJob.progress.hasThread === false ||
+      !resultEnvironmentId ||
+      !resultThreadId ||
       resultRequest.current ||
-      (diff && checkingReturnedReview)
+      (destination.kind === "diff" && checkingReturnedReview)
     )
       return;
     const session = appAtomRegistry.get(managedRelaySessionAtom);
     const request = { key };
     resultRequest.current = request;
-    const owns = () =>
-      resultRequest.current === request && appAtomRegistry.get(managedRelaySessionAtom) === session;
-    setOpeningResult(true);
-    setResultError(null);
+    const owns = () => {
+      const current = appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.job;
+      return (
+        resultRequest.current === request &&
+        appAtomRegistry.get(managedRelaySessionAtom) === session &&
+        current?.runtime?.kind === "machine" &&
+        current.runtime.environmentId === resultEnvironmentId &&
+        current.progress?.threadId === resultThreadId &&
+        current.progress.hasThread !== false
+      );
+    };
+    const retry = retryResultButton.current;
+    restoreOpeningFocus.current = !!retry && retry.ownerDocument.activeElement === retry;
+    setMachineResult({ status: "opening", destination });
+    let failure: string | undefined;
     try {
-      const runtime = selectedJob.runtime;
-      if (!runtime) throw new Error("This run has no available execution binding.");
-      const reviewCheckpoint =
-        diff && (runtime.kind === "vm" || (waiting && !input))
-          ? workflowResultCheckpoint(checkpoint)
-          : undefined;
-      const reviewVisitId = reviewCheckpoint && runtime.kind === "vm" ? randomUUID() : undefined;
-      if (reviewCheckpoint && reviewVisitId)
-        beginWorkflowReview(appAtomRegistry, scope, jobId, reviewVisitId, reviewCheckpoint);
       const result = await openResult({
-        threadId: selectedJob.progress.threadId,
-        title: selectedJob.workflow?.definition.name ?? "Workflow result",
-        workflowResult:
-          runtime.kind === "vm"
-            ? { ...scope, jobId }
-            : { ...scope, originalEnvironmentId: runtime.environmentId },
+        threadId: resultThreadId,
+        title: selectedJob?.workflow?.definition.name ?? "Workflow result",
+        workflowResult: { ...scope, originalEnvironmentId: resultEnvironmentId },
       });
       if (!owns()) return;
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
       const { environmentId, threadId, workflowVmGeneration } = result.value;
       const params = { environmentId, threadId };
-      if (reviewVisitId && workflowVmGeneration !== undefined)
-        bindWorkflowReviewPlacement(appAtomRegistry, scope, jobId, reviewVisitId, {
-          ...params,
-          generation: workflowVmGeneration,
-        });
-      if (diff && checkpoint && checkpoint.kind !== "input") {
-        const panel = useDiffPanelStore.getState();
-        if (reviewVisitId && reviewCheckpoint)
-          panel.selectTurn(
-            params,
-            TurnId.make(checkpoint.turnId),
-            undefined,
-            reviewCheckpoint.checkpointTurnCount,
-          );
-        else panel.selectTurn(params, TurnId.make(checkpoint.turnId));
+      if (destination.kind === "diff") {
+        useDiffPanelStore.getState().selectTurn(params, TurnId.make(destination.checkpoint.turnId));
         useRightPanelStore.getState().open(params, "diff");
       }
       await navigate({
@@ -748,17 +788,22 @@ export function WorkflowJob({
             jobId,
             threadId: params.threadId,
             ...(workflowVmGeneration !== undefined ? { workflowVmResultReader: true } : {}),
-            ...(reviewCheckpoint ? { reviewCheckpoint } : {}),
-            ...(reviewVisitId ? { reviewVisitId } : {}),
+            ...(destination.kind === "diff"
+              ? destination.review
+                ? { reviewCheckpoint: destination.checkpoint }
+                : { savedDiffCheckpoint: destination.checkpoint }
+              : {}),
           },
         }),
       });
     } catch (cause) {
-      if (owns()) setResultError(workflowError(cause));
+      if (owns()) failure = workflowError(cause);
     } finally {
       if (resultRequest.current === request) {
         resultRequest.current = null;
-        setOpeningResult(false);
+        setMachineResult(
+          failure === undefined ? null : { status: "failed", destination, detail: failure },
+        );
       }
     }
   };
@@ -1198,13 +1243,20 @@ export function WorkflowJob({
         Resume workflow
       </Button>
     ) : null;
+  const diffCheckpoint = workflowResultCheckpoint(checkpoint);
+  const resultOpeningLabel =
+    openingResult === "diff" ? "Opening saved diff…" : "Opening conversation…";
+  const failedDestination = resultError?.destination;
+  const failedDiff = failedDestination?.kind === "diff";
+  const earlierDiff =
+    failedDestination?.kind === "diff" &&
+    diffCheckpoint !== undefined &&
+    !sameWorkflowResultCheckpoint(failedDestination.checkpoint, diffCheckpoint);
   const conversationActions =
-    !composingFeedback &&
-    selectedJob.runtime?.kind === "machine" &&
-    selectedJob.progress &&
-    selectedJob.progress.hasThread !== false ? (
-      <div className="flex flex-wrap gap-2">
-        {checkpoint && checkpoint.kind !== "input" ? (
+    resultEnvironmentId && resultThreadId && (!composingFeedback || openingResult) ? (
+      <div ref={resultActions} className="flex min-w-0 flex-wrap gap-2 empty:hidden">
+        {openingResult === "diff" ||
+        (!composingFeedback && diffCheckpoint && (!failedDiff || earlierDiff)) ? (
           <Button
             ref={inspectResultButton}
             variant={
@@ -1212,29 +1264,56 @@ export function WorkflowJob({
                 ? "default"
                 : "outline"
             }
-            disabled={openingResult || checkingReturnedReview}
-            onClick={() => void inspect(true)}
+            aria-busy={openingResult === "diff" || undefined}
+            aria-disabled={openingResult === "diff" || undefined}
+            disabled={
+              openingResult === "conversation" || (!openingResult && checkingReturnedReview)
+            }
+            onClick={() => {
+              if (diffCheckpoint)
+                void inspect({ kind: "diff", checkpoint: diffCheckpoint, review: showingReview });
+            }}
           >
-            {completed ? <FileDiffIcon aria-hidden /> : null}
-            {completed ? "Inspect result" : "Inspect saved diff"}
+            {openingResult === "diff" ? (
+              <Spinner aria-hidden />
+            ) : completed ? (
+              <FileDiffIcon aria-hidden />
+            ) : null}
+            {openingResult === "diff"
+              ? resultOpeningLabel
+              : completed
+                ? "Inspect result"
+                : "Inspect saved diff"}
           </Button>
         ) : null}
-        <Button
-          ref={conversationButton}
-          variant={
-            failed || (completed && !pullRequestUrl && (!checkpoint || checkpoint.kind === "input"))
-              ? "default"
-              : conversationInTask
-                ? "outline"
-                : "ghost"
-          }
-          disabled={openingResult}
-          onClick={() => void inspect(false)}
-        >
-          {completed ? <MessageSquareIcon aria-hidden /> : null}
-          Open conversation
-          {conversationInTask || failed ? <ArrowUpRightIcon aria-hidden /> : null}
-        </Button>
+        {openingResult === "conversation" ||
+        (!composingFeedback && failedDestination?.kind !== "conversation") ? (
+          <Button
+            ref={conversationButton}
+            variant={
+              failed ||
+              (completed && !pullRequestUrl && (!checkpoint || checkpoint.kind === "input"))
+                ? "default"
+                : conversationInTask
+                  ? "outline"
+                  : "ghost"
+            }
+            aria-busy={openingResult === "conversation" || undefined}
+            aria-disabled={openingResult === "conversation" || undefined}
+            disabled={openingResult === "diff"}
+            onClick={() => void inspect({ kind: "conversation" })}
+          >
+            {openingResult === "conversation" ? (
+              <Spinner aria-hidden />
+            ) : completed ? (
+              <MessageSquareIcon aria-hidden />
+            ) : null}
+            {openingResult === "conversation" ? resultOpeningLabel : "Open conversation"}
+            {openingResult !== "conversation" && (conversationInTask || failed) ? (
+              <ArrowUpRightIcon aria-hidden />
+            ) : null}
+          </Button>
+        ) : null}
       </div>
     ) : null;
   const draftOpen = !manualHold || collapsedDraftKey !== feedbackKey;
@@ -1867,21 +1946,35 @@ export function WorkflowJob({
           (!completed || pullRequestUrl)
             ? conversationActions
             : null}
+          {/* Keep result feedback in place as the action row moves between run states. */}
+          {resultEnvironmentId && resultThreadId ? (
+            <span role="status" className="sr-only">
+              {openingResult ? resultOpeningLabel : ""}
+            </span>
+          ) : null}
           {resultError ? (
             <WorkflowAlert
-              title="Could not open the result"
+              title={
+                earlierDiff
+                  ? "Couldn’t open the earlier saved diff"
+                  : failedDiff
+                    ? "Couldn’t open the saved diff"
+                    : "Couldn’t open the conversation"
+              }
               actions={
                 <Button
+                  ref={retryResultButton}
                   variant="outline"
                   size="sm"
-                  disabled={openingResult}
-                  onClick={() => void inspect(false)}
+                  disabled={failedDiff && checkingReturnedReview}
+                  onClick={() => void inspect(resultError.destination)}
                 >
-                  Retry opening result
+                  <RotateCwIcon aria-hidden />
+                  {failedDiff ? "Retry saved diff" : "Retry conversation"}
                 </Button>
               }
             >
-              {resultError} Retry opening the result.
+              {resultError.detail}
             </WorkflowAlert>
           ) : null}
           {!recovery &&

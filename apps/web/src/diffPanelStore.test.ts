@@ -179,6 +179,47 @@ describe("diffPanelStore", () => {
     ).toEqual({ kind: "turn", turnId: latest, filePath: null, revealRequestId: 1 });
   });
 
+  it("reopens a saved Machine diff outside loaded history with its exact turn and count", () => {
+    const turnId = TurnId.make("saved-turn");
+    const latest = TurnId.make("latest-turn");
+    const {
+      reviewCheckpoint,
+      reviewVisitId: _visit,
+      ...run
+    } = reviewRoute(turnId, 3).workflowOrigin;
+    const origin = workflowResultOrigin(
+      { workflowOrigin: { ...run, savedDiffCheckpoint: reviewCheckpoint } },
+      "account-1",
+      THREAD_REF.threadId,
+    );
+    const store = useDiffPanelStore.getState();
+    store.selectTurn(THREAD_REF, turnId);
+    store.reconcileTurnSelection(THREAD_REF, [latest], origin);
+    const selection = selectThreadDiffPanelSelection(
+      useDiffPanelStore.getState().byThreadKey,
+      THREAD_REF,
+    );
+    const scope = resolveDiffPanelSelection(selection, [latest], origin);
+    expect(scope.selection).toMatchObject({ kind: "turn", turnId });
+    expect(scope.workflowReview).toBeNull();
+    expect(resolveDiffPanelSelection(selection, [latest], null).selection).toMatchObject({
+      kind: "turn",
+      turnId: latest,
+    });
+
+    const target = buildDiffPanelCheckpointTarget(
+      { ...THREAD_REF, checkpointTurnCount: undefined, ignoreWhitespace: true },
+      scope,
+      "panel",
+    );
+    expect(buildCheckpointDiffTargets(target).turn?.input).toMatchObject({
+      fromTurnCount: 2,
+      toTurnCount: 3,
+      expectedTurnId: turnId,
+      ignoreWhitespace: true,
+    });
+  });
+
   it.each([1, 3])(
     "requests the specific Machine review turn outside the loaded history at count %s",
     (count) => {

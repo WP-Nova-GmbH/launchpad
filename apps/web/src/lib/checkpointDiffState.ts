@@ -10,12 +10,13 @@ export function buildDiffPanelCheckpointTarget(
   },
   scope: Pick<
     ReturnType<typeof resolveDiffPanelSelection>,
-    "reviewBlocked" | "reviewCheckpoint" | "workflowReview"
+    "reviewBlocked" | "reviewCheckpoint" | "savedDiffCheckpoint" | "workflowReview"
   >,
   viewId: string,
 ) {
-  const { reviewBlocked, reviewCheckpoint, workflowReview } = scope;
-  const turnCount = reviewCheckpoint?.checkpointTurnCount ?? input.checkpointTurnCount ?? null;
+  const { reviewBlocked, reviewCheckpoint, savedDiffCheckpoint, workflowReview } = scope;
+  const checkpoint = reviewCheckpoint ?? savedDiffCheckpoint;
+  const turnCount = checkpoint?.checkpointTurnCount ?? input.checkpointTurnCount ?? null;
   return {
     environmentId: reviewBlocked ? null : input.environmentId,
     threadId: input.threadId,
@@ -23,7 +24,7 @@ export function buildDiffPanelCheckpointTarget(
     toTurnCount: turnCount,
     ignoreWhitespace: input.ignoreWhitespace,
     strictWorkflowReview: workflowReview !== null,
-    expectedTurnId: reviewCheckpoint ? TurnId.make(reviewCheckpoint.turnId) : undefined,
+    expectedTurnId: checkpoint ? TurnId.make(checkpoint.turnId) : undefined,
     requestKey: workflowReview ? `${workflowReview.visitId}:${viewId}` : undefined,
   };
 }

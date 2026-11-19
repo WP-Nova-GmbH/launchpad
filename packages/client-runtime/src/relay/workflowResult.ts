@@ -3,16 +3,17 @@ import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type { WorkflowCheckpoint } from "@t3tools/contracts/workflows";
 import type { WorkflowScope } from "./workflowSession.ts";
 
-const ReviewCheckpoint = Schema.Struct({
+const ResultCheckpoint = Schema.Struct({
   checkpointId: Schema.String,
   turnId: Schema.String,
   checkpointTurnCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
 });
-export type WorkflowResultCheckpoint = typeof ReviewCheckpoint.Type;
+export type WorkflowResultCheckpoint = typeof ResultCheckpoint.Type;
 export interface WorkflowResultOrigin extends WorkflowScope {
   readonly jobId: string;
   readonly threadId: string;
   readonly workflowVmResultReader?: true;
+  readonly savedDiffCheckpoint?: WorkflowResultCheckpoint;
   readonly reviewCheckpoint?: WorkflowResultCheckpoint;
   readonly reviewVisitId?: string;
 }
@@ -23,7 +24,8 @@ const Origin = Schema.Struct({
   jobId: Schema.String,
   threadId: Schema.String,
   workflowVmResultReader: Schema.optionalKey(Schema.Literal(true)),
-  reviewCheckpoint: Schema.optionalKey(ReviewCheckpoint),
+  savedDiffCheckpoint: Schema.optionalKey(ResultCheckpoint),
+  reviewCheckpoint: Schema.optionalKey(ResultCheckpoint),
   reviewVisitId: Schema.optionalKey(Schema.String),
 });
 const isOrigin = Schema.is(Origin);

@@ -1,9 +1,14 @@
 import { isElectron } from "../../env";
-import { useEffect } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import { Link, useLocation } from "@tanstack/react-router";
 import { ArrowLeftIcon, ChevronRightIcon, LockIcon, WorkflowIcon } from "lucide-react";
 import type { ExecutionEnvironmentDescriptor, ThreadWorkflowJob } from "@t3tools/contracts";
+import {
+  isTerminalWorkflowJob,
+  workflowIsFinishing,
+  type RepositoryWorkflowJob,
+} from "@t3tools/contracts/workflows";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
   workflowDraftAtom,
@@ -18,15 +23,19 @@ import { workflowResultGitAccess } from "../../lib/workflowResultGitAccess";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
-import { WORKFLOW_REVIEW_ANCHOR } from "./workflowState";
+import { useWorkflowClient, WORKFLOW_REVIEW_ANCHOR } from "./workflowState";
 import {
+  sameWorkflowResultCheckpoint,
+  workflowResultCheckpoint,
   workflowResultOrigin,
+  type WorkflowResultCheckpoint,
   type WorkflowResultOrigin,
 } from "@t3tools/client-runtime/relay/workflow-result";
 
 declare module "@tanstack/react-router" {
   interface HistoryState {
     workflowOrigin?: WorkflowResultOrigin | undefined;
+    workflowReviewReturn?: WorkflowResultCheckpoint | undefined;
   }
 }
 
@@ -61,9 +70,14 @@ export function useWorkflowConversation({
 }) {
   const session = useAtomValue(managedRelaySessionAtom);
   const routeOrigin = useLocation({ select: (location) => location.state.workflowOrigin });
-  const origin = hasCloudPublicConfig()
-    ? workflowResultOrigin({ workflowOrigin: routeOrigin }, session?.accountId, threadId)
-    : null;
+  const accountId = session?.accountId;
+  const origin = useMemo(
+    () =>
+      hasCloudPublicConfig()
+        ? workflowResultOrigin({ workflowOrigin: routeOrigin }, accountId, threadId)
+        : null,
+    [routeOrigin, accountId, threadId],
+  );
   const catalog = useManagedRelayOrganizationCatalog({
     allowMissingProjects: true,
     enabled: origin !== null,
@@ -81,26 +95,22 @@ export function useWorkflowConversation({
   );
   if (!origin || !repository) return null;
 
-  const review = origin.reviewCheckpoint;
-  const checkpoint = job?.progress?.checkpoint;
-  const checkpointTitle =
-    review && checkpoint?.checkpointId === review.checkpointId
-      ? job?.workflow?.definition.steps.find((step) => step.id === checkpoint.stepId)?.title
-      : undefined;
+  const status =
+    threadJob === undefined
+      ? undefined
+      : threadJob?.jobId === origin.jobId && threadJob.repositoryId === origin.repositoryId
+        ? threadJob.status
+        : null;
   const { workflowVmResultReader: readOnly } = workflowResultGitAccess({
     capabilities,
     origin,
     threadId: threadId ?? null,
   });
-  const status =
-    threadJob?.jobId === origin.jobId && threadJob.repositoryId === origin.repositoryId
-      ? threadJob.status
-      : null;
   return {
     origin,
     title: job?.workflow?.definition.name ?? threadTitle ?? "Workflow run",
     repository: repository.name,
-    reviewTitle: review ? (checkpointTitle ?? "Review checkpoint") : null,
+    job,
     readOnly,
     status,
   };
@@ -111,7 +121,83 @@ export function WorkflowConversationHeader({
 }: {
   conversation: NonNullable<ReturnType<typeof useWorkflowConversation>>;
 }) {
-  const { origin, title, repository, reviewTitle, readOnly, status } = conversation;
+  const { origin, title, repository, readOnly, status } = conversation;
+  const call = useWorkflowClient(origin);
+  const review = origin.reviewCheckpoint;
+  const vmReview = origin.workflowVmResultReader === true || origin.reviewVisitId !== undefined;
+  const reviewReadSource = useMemo(
+    () =>
+      review &&
+      !vmReview &&
+      (status === undefined || status === "awaiting_review" || status === "paused")
+        ? { origin, call }
+        : null,
+    [review, vmReview, status, origin, call],
+  );
+  const [reviewRead, setReviewRead] = useState<{
+    source: NonNullable<typeof reviewReadSource>;
+    job: RepositoryWorkflowJob;
+  } | null>(null);
+  useEffect(() => {
+    if (!reviewReadSource) return;
+    const { origin, call } = reviewReadSource;
+    let disposed = false;
+    let reading = false;
+    // Reviews can advance without a thread status change, including between adjacent Review steps.
+    const refresh = async () => {
+      if (reading || document.visibilityState === "hidden") return;
+      reading = true;
+      try {
+        const job = await call((client, token) =>
+          client.getWorkflowJob({
+            clerkToken: token,
+            repositoryId: origin.repositoryId,
+            jobId: origin.jobId,
+          }),
+        );
+        if (!disposed) setReviewRead({ source: reviewReadSource, job });
+      } catch {
+        if (!disposed) setReviewRead(null);
+      } finally {
+        reading = false;
+      }
+    };
+    const refreshOnVisibility = () => void refresh();
+    void refresh();
+    const timer = window.setInterval(refreshOnVisibility, 5000);
+    document.addEventListener("visibilitychange", refreshOnVisibility);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshOnVisibility);
+    };
+  }, [reviewReadSource]);
+  const freshJob = reviewRead?.source === reviewReadSource ? reviewRead.job : null;
+  const job = freshJob ?? conversation.job;
+  const checkpoint = job?.progress?.checkpoint;
+  const current = workflowResultCheckpoint(checkpoint);
+  const pinned = review ?? origin.savedDiffCheckpoint;
+  const matchesCurrent = pinned && current && sameWorkflowResultCheckpoint(pinned, current);
+  const activeMachineReview =
+    freshJob?.runtime?.kind === "machine" &&
+    freshJob.progress?.threadId === origin.threadId &&
+    !isTerminalWorkflowJob(freshJob.status) &&
+    freshJob.status !== "cancelling" &&
+    !workflowIsFinishing(freshJob) &&
+    (!freshJob.progress.resultSaving || freshJob.progress.resultSaving.state === "saved") &&
+    (freshJob.progress.underlyingStatus ?? freshJob.progress.status) === "awaiting_review";
+  const returnToReview = !!review && (vmReview || (!!matchesCurrent && activeMachineReview));
+  const reviewTitle =
+    returnToReview && checkpoint?.checkpointId === review?.checkpointId
+      ? job?.workflow?.definition.steps.find((step) => step.id === checkpoint?.stepId)?.title
+      : undefined;
+  const checkpointTitle = returnToReview
+    ? (reviewTitle ?? "Review checkpoint")
+    : pinned
+      ? job && !matchesCurrent
+        ? "Earlier checkpoint"
+        : "Saved checkpoint"
+      : null;
   const liveStatus = !readOnly && status ? workflowStatusLabel(status) : null;
   return (
     <WorkspacePageHeader
@@ -126,10 +212,10 @@ export function WorkflowConversationHeader({
           <h2 className="truncate text-sm leading-tight font-medium">{title}</h2>
           <div className="flex items-center gap-1 text-xs leading-tight text-muted-foreground">
             <span className="truncate">{repository}</span>
-            {reviewTitle ? (
+            {checkpointTitle ? (
               <>
                 <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0" />
-                <span className="truncate">{reviewTitle}</span>
+                <span className="truncate">{checkpointTitle}</span>
               </>
             ) : null}
           </div>
@@ -142,7 +228,7 @@ export function WorkflowConversationHeader({
         {readOnly ? (
           <Badge variant="secondary">
             <LockIcon aria-hidden="true" />
-            {reviewTitle ? "Read-only" : "Read-only result"}
+            {returnToReview ? "Read-only" : "Read-only result"}
           </Badge>
         ) : liveStatus ? (
           <Badge aria-hidden variant={status === "running" ? "info" : "secondary"}>
@@ -156,13 +242,14 @@ export function WorkflowConversationHeader({
             <Link
               to="/workflows/$repositoryId/jobs/$jobId"
               params={{ repositoryId: origin.repositoryId, jobId: origin.jobId }}
-              hash={reviewTitle ? WORKFLOW_REVIEW_ANCHOR : ""}
+              hash={returnToReview ? WORKFLOW_REVIEW_ANCHOR : ""}
+              state={returnToReview && !vmReview ? { workflowReviewReturn: review } : {}}
               hashScrollIntoView={false}
             />
           }
         >
           <ArrowLeftIcon aria-hidden="true" />
-          {reviewTitle ? "Return to review" : "Back to run"}
+          {returnToReview ? "Return to review" : "Back to run"}
         </Button>
       </div>
     </WorkspacePageHeader>

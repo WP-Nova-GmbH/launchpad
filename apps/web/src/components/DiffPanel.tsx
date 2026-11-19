@@ -106,7 +106,6 @@ import { DiffFileStatus } from "./diffs/DiffFileStatus";
 type DiffThemeType = "light" | "dark";
 const AUTOMATIC_BASE_REF = "__automatic_base_ref__";
 const DIFF_FILE_TREE_STORAGE_KEY = "t3code.diffFileTreeOpen";
-const REVIEW_CHECKPOINT_LABEL = "Review checkpoint";
 const fileEntryCache = new WeakMap<
   FileDiffMetadata,
   { fileDiff: FileDiffMetadata; fileKey: string; fileVersion: number }
@@ -243,13 +242,10 @@ export default function DiffPanel({
       ),
     [declaredReviewVisitId, orderedTurnIds, origin, storedDiffSelection, workflowVmResultReader],
   );
-  const {
-    selection: diffSelection,
-    reviewBlocked,
-    reviewCheckpoint: selectedReviewCheckpoint,
-    workflowReview,
-  } = diffScope;
-  const reviewCheckpoint = origin?.reviewCheckpoint;
+  const { selection: diffSelection, reviewBlocked, workflowReview } = diffScope;
+  const selectedCheckpoint = diffScope.reviewCheckpoint ?? diffScope.savedDiffCheckpoint;
+  const routeCheckpoint = origin?.reviewCheckpoint ?? origin?.savedDiffCheckpoint;
+  const checkpointLabel = origin?.savedDiffCheckpoint ? "Saved diff" : "Review checkpoint";
   const gitStatusQuery = useEnvironmentQuery(
     canReadCheckoutGit && !reviewBlocked && !workflowReview && activeThread && activeCwd
       ? vcsEnvironment.status({
@@ -291,7 +287,7 @@ export default function DiffPanel({
   const selectedTurnId = diffSelection.kind === "turn" ? diffSelection.turnId : null;
   const checkoutDiffSelected = canReadCheckoutGit && !reviewBlocked && selectedTurnId === null;
   const exactCheckpoint =
-    selectedReviewCheckpoint?.checkpointTurnCount ??
+    selectedCheckpoint?.checkpointTurnCount ??
     (diffSelection.kind === "turn" ? diffSelection.checkpointTurnCount : undefined);
   const selectedGitScope = diffSelection.kind === "unstaged" ? "unstaged" : "branch";
   const selectedBaseRef = diffSelection.kind === "branch" ? diffSelection.baseRef : null;
@@ -308,11 +304,10 @@ export default function DiffPanel({
     selectedTurn &&
     (selectedTurn.checkpointTurnCount ?? inferredCheckpointTurnCountByTurnId[selectedTurn.turnId]);
   const latestTurn = orderedTurnDiffSummaries[0];
-  const isReviewCheckpoint = selectedReviewCheckpoint !== undefined;
-  const latestIsReviewCheckpoint =
-    latestTurn !== undefined && reviewCheckpoint?.turnId === latestTurn.turnId;
-  const selectedScopeLabel = isReviewCheckpoint
-    ? REVIEW_CHECKPOINT_LABEL
+  const latestIsPinnedCheckpoint =
+    latestTurn !== undefined && routeCheckpoint?.turnId === latestTurn.turnId;
+  const selectedScopeLabel = selectedCheckpoint
+    ? checkpointLabel
     : selectedTurnId === null
       ? canReadCheckoutGit
         ? selectedGitScope === "unstaged"
@@ -327,8 +322,8 @@ export default function DiffPanel({
     ? `${routeThreadRef.environmentId}:${routeThreadRef.threadId}:${reviewSectionId}`
     : null;
   const codeViewMountKey = `${collapseScopeKey ?? reviewSectionId}:${codeViewRevision}`;
-  const reviewSectionTitle = isReviewCheckpoint
-    ? REVIEW_CHECKPOINT_LABEL
+  const reviewSectionTitle = selectedCheckpoint
+    ? checkpointLabel
     : selectedTurn
       ? `Turn ${selectedCheckpointTurnCount ?? "?"}`
       : selectedGitScope === "unstaged"
@@ -380,7 +375,9 @@ export default function DiffPanel({
     expectedTurnId && !checkpointPending && !verifiedReviewDiff
       ? strictWorkflowReview
         ? (checkpointError ?? "A complete checkpoint diff is unavailable.")
-        : "Could not verify the review checkpoint. Return to the run to check the current review."
+        : diffScope.savedDiffCheckpoint
+          ? "Could not verify the saved diff. Return to the run to try again."
+          : "Could not verify the review checkpoint. Return to the run to check the current review."
       : null;
   useEffect(() => {
     if (
@@ -802,8 +799,8 @@ export default function DiffPanel({
   };
   // Keep the numbered turn marked in the submenu when it has a named scope.
   const selectedTurnValue = selectedTurn ? `turn:${selectedTurn.turnId}` : "";
-  const selectedScopeValue = isReviewCheckpoint
-    ? "review-checkpoint"
+  const selectedScopeValue = selectedCheckpoint
+    ? "pinned-checkpoint"
     : selectedTurnId === null
       ? selectedGitScope
       : selectedTurn?.turnId === latestTurn?.turnId
@@ -812,11 +809,11 @@ export default function DiffPanel({
   const selectScopeValue = (value: string) => {
     if (value === "unstaged" || value === "branch") {
       if (canReadCheckoutGit) selectGitScope(value);
-    } else if (value === "review-checkpoint") {
-      if (reviewCheckpoint) {
+    } else if (value === "pinned-checkpoint") {
+      if (routeCheckpoint) {
         selectTurn(
-          TurnId.make(reviewCheckpoint.turnId),
-          origin?.reviewVisitId ? reviewCheckpoint.checkpointTurnCount : undefined,
+          TurnId.make(routeCheckpoint.turnId),
+          origin?.reviewVisitId ? routeCheckpoint.checkpointTurnCount : undefined,
         );
       }
     } else if (value === "latest") {
@@ -851,12 +848,12 @@ export default function DiffPanel({
                   </DropdownMenuRadioItem>
                 </>
               ) : null}
-              {reviewCheckpoint && (
-                <DropdownMenuRadioItem value="review-checkpoint" closeOnClick>
-                  <span>{REVIEW_CHECKPOINT_LABEL}</span>
+              {routeCheckpoint && (
+                <DropdownMenuRadioItem value="pinned-checkpoint" closeOnClick>
+                  <span>{checkpointLabel}</span>
                 </DropdownMenuRadioItem>
               )}
-              {!latestIsReviewCheckpoint && (
+              {!latestIsPinnedCheckpoint && (
                 <DropdownMenuRadioItem value="latest" closeOnClick>
                   <span>Latest turn</span>
                 </DropdownMenuRadioItem>

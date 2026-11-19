@@ -18,7 +18,10 @@ export type DiffPanelSelection =
     };
 
 const DEFAULT_SELECTION: DiffPanelSelection = { kind: "unstaged" };
-type WorkflowReviewOrigin = Pick<WorkflowResultOrigin, "reviewCheckpoint" | "reviewVisitId">;
+type WorkflowDiffOrigin = Pick<
+  WorkflowResultOrigin,
+  "reviewCheckpoint" | "reviewVisitId" | "savedDiffCheckpoint"
+>;
 
 interface DiffPanelStoreState {
   byThreadKey: Record<string, DiffPanelSelection>;
@@ -34,7 +37,7 @@ interface DiffPanelStoreState {
   reconcileTurnSelection: (
     ref: ScopedThreadRef,
     availableTurnIds: ReadonlyArray<TurnId>,
-    origin?: WorkflowReviewOrigin | null,
+    origin?: WorkflowDiffOrigin | null,
     declaredReviewVisitId?: string,
     checkpointOnly?: boolean,
   ) => void;
@@ -167,13 +170,17 @@ export function selectThreadDiffPanelSelection(
 
 function resolveDiffPanelScope(
   selection: DiffPanelSelection,
-  origin: WorkflowReviewOrigin | null | undefined,
+  origin: WorkflowDiffOrigin | null | undefined,
   reviewBlocked: boolean,
 ) {
   const turnId = selection.kind === "turn" ? selection.turnId : undefined;
   const reviewCheckpoint =
     !reviewBlocked && turnId && origin?.reviewCheckpoint?.turnId === turnId
       ? origin.reviewCheckpoint
+      : undefined;
+  const savedDiffCheckpoint =
+    !reviewBlocked && turnId && origin?.savedDiffCheckpoint?.turnId === turnId
+      ? origin.savedDiffCheckpoint
       : undefined;
   const workflowReview =
     reviewCheckpoint && turnId && origin?.reviewVisitId
@@ -183,13 +190,13 @@ function resolveDiffPanelScope(
           checkpointTurnCount: reviewCheckpoint.checkpointTurnCount,
         }
       : null;
-  return { selection, reviewBlocked, reviewCheckpoint, workflowReview };
+  return { selection, reviewBlocked, reviewCheckpoint, savedDiffCheckpoint, workflowReview };
 }
 
 export function resolveDiffPanelSelection(
   storedSelection: DiffPanelSelection,
   availableTurnIds: ReadonlyArray<TurnId>,
-  origin: WorkflowReviewOrigin | null | undefined,
+  origin: WorkflowDiffOrigin | null | undefined,
   declaredReviewVisitId?: string,
   checkpointOnly = false,
 ) {
@@ -226,6 +233,7 @@ export function resolveDiffPanelSelection(
   if (
     reviewBlocked ||
     scope.reviewCheckpoint ||
+    scope.savedDiffCheckpoint ||
     selection.kind !== "turn" ||
     selection.checkpointTurnCount !== undefined ||
     latestTurnId === undefined ||
