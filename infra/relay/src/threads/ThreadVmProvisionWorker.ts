@@ -201,7 +201,17 @@ export function makeThreadVmProvisionWorker(
             });
             return;
           }
-        } else yield* verifyTemplate;
+        } else {
+          const verified = yield* Effect.result(verifyTemplate);
+          if (verified._tag === "Failure") {
+            if (
+              verified.failure.runnerBuildMismatch &&
+              (yield* store.rejectUnstarted({ ...claim, errorCode: "move_runner_build_mismatch" }))
+            )
+              return;
+            return yield* verified.failure;
+          }
+        }
         const selectedTemplate = snapshot ? row.templateId : templateId;
         const begin = snapshot
           ? sql.withTransaction(

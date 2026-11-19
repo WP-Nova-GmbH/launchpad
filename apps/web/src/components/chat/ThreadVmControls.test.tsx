@@ -33,6 +33,9 @@ const fixture = vi.hoisted(() => ({
   defaultCodex: false,
   cloudConfigured: false,
   vmAccountPending: false,
+  vmRepository: null as AsyncResult.AsyncResult<boolean, never> | null,
+  lookupRepositoryAtom: vi.fn(),
+  projectCanonicalKey: "github.com/org/project" as string | null,
   localThread: null as Record<string, unknown> | null,
   queue: null as ThreadPromptQueue | null,
   route: null as {
@@ -77,6 +80,7 @@ const fixture = vi.hoisted(() => ({
     error: string | null;
   } | null,
   readMove: vi.fn(),
+  submitMove: vi.fn(),
   lifecycle: {
     entries: [] as ThreadVmActionSubmission[],
     ready: true,
@@ -92,14 +96,22 @@ vi.mock("@effect/atom-react", async () => {
       select ? select(value) : value,
   };
 });
-vi.mock("@t3tools/client-runtime/relay", () => ({
-  get managedRelaySessionAtom() {
-    return fixture.signedIn ? fixture.session : null;
-  },
+vi.mock("@t3tools/client-runtime/relay", async (importOriginal) => {
+  const { threadVmRepositoryBlocker } =
+    await importOriginal<typeof import("@t3tools/client-runtime/relay")>();
+  return {
+    threadVmRepositoryBlocker,
+    get managedRelaySessionAtom() {
+      return fixture.signedIn ? fixture.session : null;
+    },
+  };
+});
+vi.mock("../../cloud/managedRelayState", () => ({
+  threadVmRepositoryEligibilityAtom: fixture.lookupRepositoryAtom,
 }));
 vi.mock("../../state/thread-move-submissions", () => ({
   threadMoveRelayUrl: () => "https://relay.example.test",
-  threadMoveSubmissions: { read: fixture.readMove },
+  threadMoveSubmissions: { read: fixture.readMove, submit: fixture.submitMove },
 }));
 vi.mock("../../browser/useOpenLink", () => ({ useOpenLink: () => fixture.openLink }));
 vi.mock("../../state/use-thread-vm-actions", () => ({
@@ -262,7 +274,9 @@ vi.mock("../../state/projects", () => ({
               environmentId: "vm",
               title: "Project",
               workspaceRoot: "/project",
-              repositoryIdentity: { canonicalKey: "github.com/org/project" },
+              repositoryIdentity: fixture.projectCanonicalKey
+                ? { canonicalKey: fixture.projectCanonicalKey }
+                : null,
             },
           ]
         : [];
@@ -417,6 +431,12 @@ const view = (chat = false) =>
   );
 const button = (label: string) =>
   renderer!.root.findAllByType("button").find((node) => node.children.join("") === label)!;
+const privateVmDestination = () =>
+  renderer!.root
+    .findAllByType("button")
+    .find((node) =>
+      node.findAllByType("span").some((span) => span.children.includes("Private VM")),
+    )!;
 const dialogs = () => renderer!.root.findAllByType("dialog");
 const dialogButton = (label: string) =>
   dialogs()[0]!
@@ -472,6 +492,11 @@ beforeEach(() => {
   fixture.defaultCodex = false;
   fixture.cloudConfigured = false;
   fixture.vmAccountPending = false;
+  fixture.vmRepository = AsyncResult.success(true);
+  fixture.projectCanonicalKey = "github.com/org/project";
+  fixture.lookupRepositoryAtom.mockImplementation(
+    (input) => (input && fixture.vmRepository) || AsyncResult.initial(true),
+  );
   fixture.localThread = null;
   fixture.queue = null;
   fixture.route = null;
@@ -779,29 +804,86 @@ describe("simplified VM controls", () => {
       modelSelection: { instanceId: "codex" },
       archivedAt: null,
     };
-    const vmDestination = () =>
-      renderer!.root
-        .findAllByType("button")
-        .find((node) =>
-          node.findAllByType("span").some((span) => span.children.includes("Private VM")),
-        )!;
     await mount(true);
     await openRunOn();
-    expect(vmDestination().props.disabled).toBe(true);
+    expect(privateVmDestination().props.disabled).toBe(true);
     expect(button("VM account…").props.disabled).toBe(false);
     await act(async () => button("VM account…").props.onClick());
     await act(async () => button("Close account editor").props.onClick());
     await openRunOn();
-    expect(vmDestination().props.disabled).toBe(true);
+    expect(privateVmDestination().props.disabled).toBe(true);
     expect(button("VM account…").props.disabled).toBe(false);
     fixture.vmAccountPending = false;
     await act(async () => renderer!.update(view(true)));
-    expect(vmDestination().props.disabled).toBe(false);
-    const sendToVm = vmDestination().props.onClick;
+    expect(privateVmDestination().props.disabled).toBe(false);
+    const sendToVm = privateVmDestination().props.onClick;
     // A command that outlives its render still checks the current pending choice.
     fixture.vmAccountPending = true;
     await act(async () => sendToVm());
-    expect(fixture.enqueue).not.toHaveBeenCalled();
+    expect(fixture.submitMove).not.toHaveBeenCalled();
+  });
+  it("waits for the source repository registration before offering Private VM", async () => {
+    fixture.signedIn = true;
+    fixture.local = true;
+    fixture.defaultCodex = true;
+    fixture.cloudConfigured = true;
+    fixture.localThread = {
+      id: "thread",
+      projectId: "project",
+      modelSelection: { instanceId: "codex" },
+      archivedAt: null,
+    };
+    fixture.vmRepository = AsyncResult.initial(true);
+    await mount(true);
+    await openRunOn();
+    expect(fixture.lookupRepositoryAtom).toHaveBeenCalledWith({
+      accountId: "owner",
+      environmentId: "vm",
+      threadId: "thread",
+      projectId: "project",
+      checkoutPath: "/project",
+      binding: null,
+    });
+    expect(privateVmDestination().props.disabled).toBe(true);
+    fixture.vmRepository = AsyncResult.success(false);
+    await act(async () => renderer!.update(view(true)));
+    expect(privateVmDestination().props.disabled).toBe(true);
+    await act(async () => privateVmDestination().props.onClick());
+    expect(fixture.submitMove).not.toHaveBeenCalled();
+    await act(async () => button("Organization settings").props.onClick());
+    expect(fixture.navigate).toHaveBeenCalledWith({ to: "/settings/organization" });
+
+    fixture.vmRepository = AsyncResult.success(true);
+    await act(async () => renderer!.update(view(true)));
+    expect(privateVmDestination().props.disabled).toBe(false);
+  });
+  it("offers Private VM when the thread worktree has its own registered repository", async () => {
+    fixture.signedIn = true;
+    fixture.local = true;
+    fixture.defaultCodex = true;
+    fixture.cloudConfigured = true;
+    fixture.projectCanonicalKey = null;
+    fixture.localThread = {
+      id: "thread",
+      projectId: "project",
+      worktreePath: "/repo/worktree",
+      modelSelection: { instanceId: "codex" },
+      archivedAt: null,
+    };
+    fixture.lookupRepositoryAtom.mockImplementation((input) =>
+      input
+        ? AsyncResult.success(
+            input.threadId === "thread" && input.checkoutPath === "/repo/worktree",
+          )
+        : AsyncResult.initial(true),
+    );
+
+    await mount(true);
+    await openRunOn();
+    expect(privateVmDestination().props.disabled).toBe(false);
+    fixture.localThread.worktreePath = "/repo/other-worktree";
+    await act(async () => renderer!.update(view(true)));
+    expect(privateVmDestination().props.disabled).toBe(true);
   });
   it("does not treat an explicitly paused queue as a VM problem", async () => {
     fixture.queuePaused = true;

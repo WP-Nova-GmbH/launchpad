@@ -270,18 +270,44 @@ export function makeThreadPlacementStore(sql: PgClient) {
       return yield* conflict("Workflow no longer owns this portable thread");
     return placement;
   });
-  const findMove = Effect.fn("relay.thread_placement.find_move")(function* (input: MoveIdentity) {
-    const [row] =
-      yield* sql<ThreadMove>`SELECT operation_id AS "operationId", thread_id AS "threadId",
-      actor_user_id AS "actorUserId", source_environment_id AS "sourceEnvironmentId", expected_generation AS "expectedGeneration",
-      destination_environment_id AS "destinationEnvironmentId", destination_project_id AS "destinationProjectId",
-      phase, source_cursor AS "sourceCursor", manifest_sha256 AS "manifestSha256", failure_detail AS "failureDetail",
-      transfer_encoding_policy AS "transferEncodingPolicy",
-      cancellation_protocol AS "cancellationProtocol", (source_reopened_at IS NOT NULL) AS "sourceReopened",
-      cancellation_blocker AS "cancellationBlocker", legacy_cancel_command_id AS "legacyCancelCommandId",
-      source_message_id AS "sourceMessageId", destination_verified_commit AS "destinationVerifiedCommit"
-      FROM relay_thread_moves WHERE operation_id = ${input.operationId} AND thread_id = ${input.threadId}`;
-    return row ? yield* participants.project(row) : null;
+  const findMove = Effect.fn("relay.thread_placement.find_move")(function* (
+    input: MoveIdentity,
+    view?: "client",
+  ) {
+    const [row] = yield* sql<
+      ThreadMove & { startupUnconfirmed: boolean }
+    >`SELECT m.operation_id AS "operationId",
+      m.thread_id AS "threadId", m.actor_user_id AS "actorUserId", m.source_environment_id AS "sourceEnvironmentId",
+      m.expected_generation AS "expectedGeneration", m.destination_environment_id AS "destinationEnvironmentId",
+      m.destination_project_id AS "destinationProjectId", m.phase, m.source_cursor AS "sourceCursor",
+      m.manifest_sha256 AS "manifestSha256",
+      CASE WHEN p.phase='cancelled' AND p.error_code='create_rejected'
+        THEN 'E2B rejected the request to create the destination VM. Cancel the move before trying again.'
+        WHEN p.phase='cancelled' AND p.error_code='move_runner_build_mismatch'
+        THEN 'The configured E2B runner is missing or no longer matches its verified build. Cancel the move and ask an admin to fix the runner.'
+        ELSE m.failure_detail END AS "failureDetail",
+      COALESCE(p.phase='created' AND p.error_code='startup_unconfirmed' AND m.phase IN ('frozen','ready'),false)
+        AS "startupUnconfirmed",
+      m.transfer_encoding_policy AS "transferEncodingPolicy",
+      m.cancellation_protocol AS "cancellationProtocol", (m.source_reopened_at IS NOT NULL) AS "sourceReopened",
+      m.cancellation_blocker AS "cancellationBlocker", m.legacy_cancel_command_id AS "legacyCancelCommandId",
+      m.source_message_id AS "sourceMessageId", m.destination_verified_commit AS "destinationVerifiedCommit"
+      FROM relay_thread_moves m
+      LEFT JOIN relay_thread_vm_move_destinations d ON d.operation_id=m.operation_id
+      LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=d.allocation_id
+        AND p.operation_id=m.operation_id AND p.generation=m.expected_generation+1
+      WHERE m.operation_id=${input.operationId} AND m.thread_id=${input.threadId}`;
+    if (!row) return null;
+    const { startupUnconfirmed, ...move } = row;
+    const projected = yield* participants.project(move);
+    // Workers use failureDetail to control transfer. This retrying diagnostic is display-only.
+    if (view === "client" && startupUnconfirmed && projected.failureDetail === null)
+      return {
+        ...projected,
+        failureDetail:
+          "Could not confirm the destination VM’s import server started. Launchpad is retrying.",
+      };
+    return projected;
   });
   const getMove = Effect.fn("relay.thread_placement.get_move")(function* (input: MoveIdentity) {
     const move = yield* findMove(input);
@@ -672,6 +698,12 @@ export function makeThreadPlacementStore(sql: PgClient) {
         yield* sql`UPDATE relay_thread_moves SET phase = 'ready', failure_detail = NULL,
           destination_verified_commit=destination_verified_commit OR ${input.destinationVerifiedCommit ?? false}
           WHERE operation_id = ${input.operationId}`;
+        // The destination answered, so an earlier startup uncertainty no longer applies.
+        yield* sql`UPDATE relay_thread_vm_provisions p SET error_code=NULL
+          FROM relay_thread_vm_move_destinations d
+          WHERE d.operation_id=${input.operationId} AND p.allocation_id=d.allocation_id
+            AND p.operation_id=d.operation_id AND p.generation=${move.expectedGeneration + 1}
+            AND p.phase='created' AND p.error_code='startup_unconfirmed'`;
         if (input.attempt !== undefined)
           yield* participants.resolveBefore({
             ...input,

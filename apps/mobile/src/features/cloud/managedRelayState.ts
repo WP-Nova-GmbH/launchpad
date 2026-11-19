@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
   createManagedRelayQueryManager,
+  createThreadVmRepositoryEligibility,
   deregisterManagedRelayEnvironment,
   managedRelaySessionAtom,
   readManagedRelaySnapshotState,
@@ -15,10 +16,13 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect } from "react";
 
 import { runtimeContextLayer } from "../../lib/runtime";
+import { connectionAtomRuntime } from "../../connection/runtime";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { cloudDebugLog } from "./cloudDebugLog";
 
 const managedRelayAtomRuntime = Atom.runtime(runtimeContextLayer);
+export const threadVmRepositoryEligibilityAtom =
+  createThreadVmRepositoryEligibility(connectionAtomRuntime);
 
 export const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime, {
   onQueryEvent: (event) =>

@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
+import { makeThreadLocalEnrollmentTransport } from "./ThreadLocalEnrollmentTransport.ts";
 import { makeThreadMoveTransport } from "./ThreadMoveTransport.ts";
 import { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
 
@@ -50,6 +51,52 @@ const moveResponse = {
   manifestArtifactId: null,
 };
 
+it.effect(
+  "preserves a repository rejection during local enrollment and retries an uncertain reply",
+  () =>
+    Effect.gen(function* () {
+      const transport = makeThreadLocalEnrollmentTransport(() =>
+        makeExecutorRelayApiClient({
+          url: owner.relayUrl,
+          issuer: owner.relayUrl,
+          environmentCredential: "current-token",
+        }),
+      );
+      const prepare = (response: Response) =>
+        Effect.flip(
+          transport.prepare(owner, {
+            operationId: owner.operationId,
+            actorUserId: "actor",
+            projectId: ProjectId.make("project"),
+            canonicalKey: "github.com/test/repo",
+          }),
+        ).pipe(
+          Effect.provideService(
+            HttpClient.HttpClient,
+            HttpClient.make((request) =>
+              Effect.succeed(HttpClientResponse.fromWeb(request, response)),
+            ),
+          ),
+        );
+      const rejection = yield* prepare(
+        Response.json(
+          new RelayTenancyNotFoundError({
+            code: "tenancy_not_found",
+            reason: "repository_not_found",
+            traceId: "move-test",
+          }),
+          { status: 404 },
+        ),
+      );
+      expect(rejection.requiresRetry).toBe(true);
+      expect(rejection.detail).toContain("Register this repository");
+
+      const outage = yield* prepare(new Response(null, { status: 503 }));
+      expect(outage.requiresRetry).toBeUndefined();
+      expect(outage.detail).toContain("waiting for relay confirmation");
+    }),
+);
+
 it.effect("allows admission retry only when the exact move is absent", () =>
   Effect.gen(function* () {
     const transport = makeThreadMoveTransport(
@@ -83,7 +130,9 @@ it.effect("allows admission retry only when the exact move is absent", () =>
         ),
       );
     expect(yield* lookup("thread_move_not_found")).toBeNull();
-    expect((yield* Effect.flip(lookup("thread_not_found")))._tag).toBe("ThreadMoveError");
+    const denied = yield* Effect.flip(lookup("thread_not_found"));
+    expect(denied.requiresRetry).toBe(true);
+    expect(denied.detail).toContain("could not access this thread");
   }),
 );
 

@@ -1,3 +1,4 @@
+import type { PgClient } from "@effect/sql-pg/PgClient";
 import { EnvironmentId, ProjectId, ThreadId, type MessageId } from "@t3tools/contracts";
 import {
   RelayApi,
@@ -44,7 +45,7 @@ const failures = {
   ThreadPlacementConflict: () => tenancyConflict("thread_placement_changed"),
   SqlError: () => relayInternalErrorResponse("persistence_failed"),
 };
-const response = Effect.fnUntraced(function* (move: ThreadMove) {
+const response = Effect.fnUntraced(function* (move: ThreadMove, cleanupOnly?: true) {
   const identity = {
     operationId: move.operationId,
     actorUserId: move.actorUserId,
@@ -60,7 +61,7 @@ const response = Effect.fnUntraced(function* (move: ThreadMove) {
   };
   // Cleanup participants can still confirm rollback after private access is
   // revoked. Only the identity, phase and rollback hash are needed here.
-  if (!needsMoveAccess(move)) {
+  if (cleanupOnly || !needsMoveAccess(move)) {
     const cleanup: RelayThreadMove = { ...identity, sourceCursor: null, manifestArtifactId: null };
     return cleanup;
   }
@@ -258,6 +259,63 @@ export const beginPortableThreadMove = Effect.fn("relay.api.thread_moves.begin")
   );
 }, Effect.catchTags(failures));
 
+/** Callers authenticate the exact source or owner and hold the owner and placement locks. */
+export const cancelThreadVmMoveAtSource = Effect.fn("relay.api.thread_moves.cancel_vm_at_source")(
+  function* (
+    sql: PgClient,
+    input: Parameters<ReturnType<typeof makeThreadVmMoveDestinationStore>["cancelUnstarted"]>[0],
+  ) {
+    const placements = makeThreadPlacementStore(sql);
+    const move = yield* placements.findMove(input);
+    if (move) {
+      if (
+        move.actorUserId !== input.actorUserId ||
+        move.sourceEnvironmentId !== input.sourceEnvironmentId ||
+        move.expectedGeneration !== input.expectedGeneration ||
+        (move.sourceMessageId != null &&
+          input.sourceMessageId !== undefined &&
+          move.sourceMessageId !== input.sourceMessageId)
+      )
+        return yield* tenancyNotFound("thread_not_found");
+      if (move.destinationEnvironmentId !== `pending-vm:${move.operationId}`) {
+        const destinations = yield* sql`SELECT 1 FROM relay_thread_vm_move_destinations
+          WHERE operation_id=${move.operationId}`;
+        if (!destinations.length) return yield* tenancyNotFound("thread_not_found");
+      }
+      // A lost admission reply may leave the source observing a completed handoff.
+      if (move.phase === "committed" || move.phase === "completed") return move;
+      if (input.supportsSourceReopenAck && move.cancellationProtocol === "legacy")
+        yield* placements.advertiseSourceReopen({
+          ...input,
+          environmentId: input.sourceEnvironmentId,
+          generation: input.expectedGeneration,
+        });
+      return yield* placements.requestAbort(input);
+    }
+
+    const replacements = makeThreadVmReplacementCoordinator(
+      sql,
+      yield* ThreadArtifactObjectStorage,
+    );
+    const pending = yield* replacements.get(input.operationId);
+    if (pending) {
+      if (
+        pending.threadId !== input.threadId ||
+        pending.ownerUserId !== input.actorUserId ||
+        pending.intent.kind !== "move" ||
+        pending.intent.sourceEnvironmentId !== input.sourceEnvironmentId ||
+        pending.intent.expectedGeneration !== input.expectedGeneration ||
+        (pending.intent.sourceMessageId &&
+          input.sourceMessageId !== undefined &&
+          pending.intent.sourceMessageId !== input.sourceMessageId)
+      )
+        return yield* tenancyNotFound("thread_not_found");
+      yield* replacements.cancel({ requestId: input.operationId, ownerUserId: input.actorUserId });
+    }
+    return yield* makeThreadVmMoveDestinationStore(sql).cancelUnstarted(input);
+  },
+);
+
 export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin_vm")(
   function* (
     input: Participant & {
@@ -269,6 +327,35 @@ export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin
     },
   ) {
     const sql = (yield* RelayDb).$client;
+    const source = {
+      ...input,
+      sourceEnvironmentId: input.environmentId,
+      expectedGeneration: input.generation,
+    };
+    if (input.cancelBeforeStart) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.actorUserId},721864))`;
+          yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${input.threadId} FOR UPDATE`;
+          const store = makeThreadPlacementStore(sql);
+          const existing = yield* store.findMove(input);
+          const cleanup = cancelThreadVmMoveAtSource(sql, source);
+          const move = existing
+            ? yield* withThreadMoveParticipant(input, "source", false, () => cleanup)
+            : yield* withEnvironmentThread(
+                input,
+                false,
+                Effect.gen(function* () {
+                  const placement = yield* store.get(input.threadId);
+                  if (placement?.ownerUserId !== input.actorUserId)
+                    return yield* tenancyNotFound("thread_not_found");
+                  return yield* cleanup;
+                }),
+              );
+          return { status: "accepted" as const, move: yield* response(move, true) };
+        }),
+      );
+    }
     const { settings } = yield* ThreadVmRuntimeConfiguration;
     if (!settings) return yield* relayInternalErrorResponse("upstream_unavailable");
     yield* makeThreadVmCapacityStore(sql).configure(settings.hostId, settings.maxRunningVms);
@@ -284,20 +371,8 @@ export const beginPortableThreadVmMove = Effect.fn("relay.api.thread_moves.begin
               const placement = yield* makeThreadPlacementStore(sql).get(input.threadId);
               if (!placement || placement.ownerUserId !== input.actorUserId)
                 return yield* tenancyNotFound("thread_not_found");
-              if (input.cancelBeforeStart) {
-                const objects = yield* ThreadArtifactObjectStorage;
-                const replacements = makeThreadVmReplacementCoordinator(sql, objects);
-                const pending = yield* replacements.get(input.operationId);
-                if (pending && pending.phase !== "admitted")
-                  yield* replacements.cancel({
-                    requestId: input.operationId,
-                    ownerUserId: input.actorUserId,
-                  });
-              }
               return yield* makeThreadVmMoveDestinationStore(sql).enqueue({
-                ...input,
-                sourceEnvironmentId: input.environmentId,
-                expectedGeneration: input.generation,
+                ...source,
                 hostId: settings.hostId,
                 templateId: settings.compute.templateId,
               });

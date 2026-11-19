@@ -193,6 +193,7 @@ export const makeThreadLocalEnrollmentWorker = Effect.fn("ThreadLocalEnrollmentW
         yield* sql`DELETE FROM thread_local_enrollments WHERE thread_id=${threadId} AND operation_id=${intent.operationId}`;
         return false;
       }
+      if (head?.kind === "move" && head.state === "blocked") return false;
       if (head?.kind === "move" && head.state === "cancelling" && head.operationId) {
         const [certificate] = yield* sql<{
           moveOperationId: string;
@@ -258,7 +259,31 @@ export const makeThreadLocalEnrollmentWorker = Effect.fn("ThreadLocalEnrollmentW
       yield* assertWorkflowThreadReleased(sql, threadId).pipe(
         Effect.mapError((error) => fail(threadId, error.message)),
       );
-      const prepared = yield* transport.prepare(owner, request);
+      const preparation = yield* Effect.result(transport.prepare(owner, request));
+      if (preparation._tag === "Failure") {
+        const error = preparation.failure;
+        if (
+          !error.requiresRetry ||
+          head?.kind !== "move" ||
+          head.state !== "moving" ||
+          !head.operationId
+        )
+          return yield* error;
+        // Keep the enrollment intent and any fence until the normal cancellation handshake.
+        yield* engine.dispatch({
+          type: "thread.move.progress",
+          threadId: ThreadId.make(threadId),
+          commandId: CommandId.make(`${head.operationId}:enrollment-rejected:${head.revision}`),
+          messageId: head.messageId,
+          operationId: head.operationId,
+          expectedRevision: head.revision,
+          blocked: true,
+          detail: error.detail,
+          createdAt: yield* now,
+        });
+        return false;
+      }
+      const prepared = preparation.success;
       if (
         prepared.operationId !== intent.operationId ||
         prepared.threadId !== threadId ||

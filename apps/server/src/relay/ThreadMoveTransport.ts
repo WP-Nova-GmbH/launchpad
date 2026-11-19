@@ -1,9 +1,11 @@
 import { EnvironmentId, type MessageId, ThreadId } from "@t3tools/contracts";
-import type {
-  RelayThreadMove,
-  RelayThreadArtifactReceipt,
-  ThreadMoveProgressReport,
-  ThreadTransferFormats,
+import {
+  RelayTenancyConflictError,
+  RelayTenancyNotFoundError,
+  type RelayThreadMove,
+  type RelayThreadArtifactReceipt,
+  type ThreadMoveProgressReport,
+  type ThreadTransferFormats,
 } from "@t3tools/contracts/relay";
 import { THREAD_TRANSFER_SUPPORTED_FORMATS } from "@t3tools/shared/threadTransferEncoding";
 import * as Effect from "effect/Effect";
@@ -17,6 +19,21 @@ export class ThreadMoveError extends Schema.TaggedError<ThreadMoveError>()("Thre
   detail: Schema.String,
   requiresRetry: Schema.optionalKey(Schema.Literal(true)),
 }) {}
+
+const isNotFound = Schema.is(RelayTenancyNotFoundError);
+const isConflict = Schema.is(RelayTenancyConflictError);
+
+export function describeThreadMoveAdmissionRejection(error: unknown): string | undefined {
+  if (isNotFound(error)) {
+    if (error.reason === "repository_not_found")
+      return "Register this repository in Settings → Organization or ask an admin for access. Then cancel this move and try again.";
+    if (error.reason === "thread_not_found")
+      return "Launchpad could not access this thread. Check the source computer’s Launchpad Connect link and repository access.";
+  }
+  if (isConflict(error) && error.reason === "thread_placement_changed")
+    return "The thread location changed before the move could start. Check its current location before trying again.";
+}
+
 export type ThreadMoveOwner = ThreadHistoryOwner & { readonly operationId: string };
 type RelayClient = Effect.Success<ReturnType<typeof makeExecutorRelayApiClient>>;
 type Parameters = { environmentId: EnvironmentId; threadId: ThreadId; operationId: string };
@@ -48,6 +65,7 @@ export function makeThreadMoveTransport<E, R>(
   const request = <A, E1>(
     owner: ThreadMoveOwner,
     action: (client: RelayClient, params: Parameters) => Effect.Effect<A, E1>,
+    describeRejection?: (error: unknown) => string | undefined,
   ) =>
     Effect.gen(function* () {
       const client = yield* clientFor(owner);
@@ -58,7 +76,12 @@ export function makeThreadMoveTransport<E, R>(
       });
     }).pipe(
       Effect.timeout("15 seconds"),
-      Effect.mapError(() => fail(owner.threadId)),
+      Effect.mapError((error) => {
+        const detail = describeRejection?.(error);
+        return detail === undefined
+          ? fail(owner.threadId)
+          : new ThreadMoveError({ threadId: owner.threadId, detail, requiresRetry: true });
+      }),
     );
   const getMove = (owner: ThreadMoveOwner, client: RelayClient, params: Parameters) =>
     client.threadMoves.get({
@@ -113,21 +136,27 @@ export function makeThreadMoveTransport<E, R>(
         sourceThreadTransferFormats?: ThreadTransferFormats;
       },
     ) =>
-      request(owner, (client, params) =>
-        client.threadMoves.beginVm({
-          params,
-          payload: { generation: owner.generation, supportsSourceReopenAck: true, ...input },
-        }),
+      request(
+        owner,
+        (client, params) =>
+          client.threadMoves.beginVm({
+            params,
+            payload: { generation: owner.generation, supportsSourceReopenAck: true, ...input },
+          }),
+        describeThreadMoveAdmissionRejection,
       ),
     get: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) => getMove(owner, client, params)),
     getIfStarted: (owner: ThreadMoveOwner) =>
-      request(owner, (client, params) =>
-        getMove(owner, client, params).pipe(
-          Effect.catchTag("RelayTenancyNotFoundError", (error) =>
-            error.reason === "thread_move_not_found" ? Effect.succeed(null) : Effect.fail(error),
+      request(
+        owner,
+        (client, params) =>
+          getMove(owner, client, params).pipe(
+            Effect.catchTag("RelayTenancyNotFoundError", (error) =>
+              error.reason === "thread_move_not_found" ? Effect.succeed(null) : Effect.fail(error),
+            ),
           ),
-        ),
+        describeThreadMoveAdmissionRejection,
       ),
     selectEncoding: (owner: ThreadMoveOwner) =>
       request(owner, (client, params) =>

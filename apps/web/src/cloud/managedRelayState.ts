@@ -2,6 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   createManagedRelayQueryManager,
   createManagedRelayOrganizationCatalogQueryManager,
+  createThreadVmRepositoryEligibility,
   deregisterManagedRelayEnvironment,
   type ManagedRelayOrganizationCatalogSnapshot,
   ManagedRelay,
@@ -25,6 +26,7 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect } from "react";
 
 import { runtime } from "../lib/runtime";
+import { connectionAtomRuntime } from "../connection/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 
 const managedRelayAtomRuntime = Atom.runtime(
@@ -46,6 +48,8 @@ const managedRelayTenancyAtomRuntime = Atom.runtime(
 );
 
 const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
+export const threadVmRepositoryEligibilityAtom =
+  createThreadVmRepositoryEligibility(connectionAtomRuntime);
 const managedRelayOrganizationCatalogQueryManager =
   createManagedRelayOrganizationCatalogQueryManager(managedRelayTenancyAtomRuntime);
 const workflowOrganizationCatalogQueryManager = createManagedRelayOrganizationCatalogQueryManager(

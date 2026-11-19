@@ -188,10 +188,7 @@ export const getPortableThreadPlacement = Effect.fn("relay.api.thread_history.pl
             : [];
         const operationId = placement.operationId ?? recentCancellation?.operationId;
         const move = operationId
-          ? yield* makeThreadPlacementStore(sql).findMove({
-              threadId,
-              operationId,
-            })
+          ? yield* makeThreadPlacementStore(sql).findMove({ threadId, operationId }, "client")
           : null;
         const previousLocations = yield* sql<{
           environmentId: string;

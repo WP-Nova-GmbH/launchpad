@@ -14,6 +14,7 @@ import * as Repositories from "../tenancy/Repositories.ts";
 import {
   acceptInvitationRecord,
   joinPendingInvitationAutomatically,
+  lookupRegisteredRepository,
   requireAdmin,
   requireMaintainableRepository,
   requireVisibleRepository,
@@ -221,6 +222,24 @@ describe("organization membership resolution", () => {
 });
 
 describe("repository authorization", () => {
+  it.effect("does not create an organization when checking a checkout's registration", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* lookupRegisteredRepository({
+          userId: "user-1",
+          canonicalKey: "github.com/acme/app",
+        }),
+      ).toEqual({ match: null });
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          organizationsLayer({ getMembershipForUser: () => Effect.succeed(null) }),
+          repositoriesLayer({}),
+        ),
+      ),
+    ),
+  );
+
   it.effect("lets an organization admin configure a repository they hold no grant on", () =>
     Effect.gen(function* () {
       const resolved = yield* requireMaintainableRepository({

@@ -39,6 +39,7 @@ import {
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getCommandReceipt: "orchestration.getCommandReceipt",
+  getThreadRepositoryKey: "orchestration.getThreadRepositoryKey",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",

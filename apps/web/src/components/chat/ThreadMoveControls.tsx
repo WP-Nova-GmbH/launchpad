@@ -6,7 +6,7 @@ import { handoffMovedThreadDraft, type MovedThreadDraftConflict } from "../../co
 import { recoverMovedDraftFile } from "../../lib/movedThreadDraft";
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigate, useLocation } from "@tanstack/react-router";
-import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { managedRelaySessionAtom, threadVmRepositoryBlocker } from "@t3tools/client-runtime/relay";
 import {
   threadMoveProjectTargets,
   threadMoveProjectTargetAvailability,
@@ -63,6 +63,7 @@ import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../ui/popov
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { MiddleTruncate } from "../ui/middle-truncate";
 import { useCloudLinkController } from "../../cloud/useCloudLinkController";
+import { threadVmRepositoryEligibilityAtom } from "../../cloud/managedRelayState";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
 import { environmentCatalog } from "../../connection/catalog";
@@ -831,7 +832,7 @@ function RunOnPicker({
       ? "Launchpad Connect is not configured on this host."
       : !session
         ? "Sign in to Launchpad Connect to move this thread."
-        : !thread || !config
+        : !thread || !config || !source
           ? "Checking this thread’s host…"
           : workflowBlocker
             ? workflowBlocker
@@ -848,13 +849,28 @@ function RunOnPicker({
                       : !detailReady
                         ? "Syncing this thread’s queue…"
                         : (originalLocationBlocker ??
-                          (!canonicalKey
-                            ? isVm
-                              ? "The VM’s repository is not available yet. Reconnect to its host and try again."
-                              : "Register this Git repository in Organization settings first."
+                          (isVm && !canonicalKey
+                            ? "The VM’s repository is not available yet. Reconnect to its host and try again."
                             : null));
   const disabled =
     busy || !ready || blocker !== null || status !== null || movePending || movedAway;
+  const choosingVm = !blocker && !status && !movePending && !movedAway && !isVm && vmSupported;
+  const vmRepositoryAtom = threadVmRepositoryEligibilityAtom(
+    open && choosingVm && session && source && thread && host.unavailableReason === null
+      ? {
+          accountId: session.accountId,
+          environmentId,
+          threadId,
+          projectId: source.id,
+          checkoutPath: thread.worktreePath ?? source.workspaceRoot,
+          binding: route,
+        }
+      : null,
+  );
+  const vmRepository = useAtomValue(vmRepositoryAtom);
+  const vmRepositoryBlocker = threadVmRepositoryBlocker(vmRepository);
+  const vmRepositorySetupRequired =
+    vmRepository._tag === "Success" && !vmRepository.waiting && !vmRepository.value;
   const canChooseVmAccount =
     session !== null && route?.phase === "active" && vmSupported && !isVm && !movedAway;
   const originalLocationAttempted = useRef(false);
@@ -911,7 +927,10 @@ function RunOnPicker({
     if (
       kind === "send" &&
       destination?.kind === "vm" &&
-      appAtomRegistry.get(threadVmControls.codexPreferencePendingAtom(environmentId, threadId))
+      (!vmSupported ||
+        host.unavailableReason !== null ||
+        threadVmRepositoryBlocker(appAtomRegistry.get(vmRepositoryAtom)) !== null ||
+        appAtomRegistry.get(threadVmControls.codexPreferencePendingAtom(environmentId, threadId)))
     )
       return;
     if (kind === "send" && destination && disabled) return;
@@ -1059,13 +1078,18 @@ function RunOnPicker({
                 (!blocker && !status && !movePending && !movedAway
                   ? host.unavailableReason
                   : null) ??
+                (choosingVm && !vmRepositorySetupRequired ? vmRepositoryBlocker : null) ??
                 (!blocker && !status && !movePending && !movedAway && !vmSupported && codexSupported
                   ? "Requires the default Codex provider"
                   : "Dedicated to this thread")
               }
               machine="cloud"
               disabled={
-                disabled || !vmSupported || vmAccountPending || host.unavailableReason !== null
+                disabled ||
+                !vmSupported ||
+                vmAccountPending ||
+                host.unavailableReason !== null ||
+                vmRepositoryBlocker !== null
               }
               onClick={() => void run("send", { kind: "vm" })}
             />
@@ -1163,9 +1187,9 @@ function RunOnPicker({
                   ? `${detailedProgress.label}${detailedProgress.detail ? ` · ${detailedProgress.detail}` : ""}`
                   : "This thread is moving. Wait for the move to finish before choosing another machine."}
               </p>
-            ) : blocker ? (
+            ) : blocker || vmRepositorySetupRequired ? (
               <>
-                <p>{blocker}</p>
+                <p>{blocker ?? vmRepositoryBlocker}</p>
                 {!session && hasCloudPublicConfig() && relayUrl ? (
                   <SignInForMoves />
                 ) : session && thread && config && !thread.archivedAt && unavailable ? (
@@ -1184,16 +1208,7 @@ function RunOnPicker({
                   config?.environment.capabilities.threadMoves === false &&
                   codexSupported ? (
                   <ConnectForMoves environmentId={environmentId} />
-                ) : session &&
-                  thread &&
-                  config &&
-                  !thread.archivedAt &&
-                  !unavailable &&
-                  detailReady &&
-                  !canonicalKey &&
-                  codexSupported &&
-                  !isVm &&
-                  config?.environment.capabilities.threadMoves === true ? (
+                ) : vmRepositorySetupRequired ? (
                   <Button
                     size="xs"
                     variant="secondary"

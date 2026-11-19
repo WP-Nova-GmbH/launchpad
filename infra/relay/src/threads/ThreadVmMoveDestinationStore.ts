@@ -7,26 +7,46 @@ import type { RelayThreadVmEnrollmentReceipt } from "@t3tools/contracts/relay";
 import type { ThreadTransferFormat } from "@t3tools/contracts/threadTransferFormat";
 import { normalizeThreadTransferFormats } from "@t3tools/shared/threadTransferEncoding";
 
+type VmMoveSource = {
+  readonly threadId: string;
+  readonly operationId: string;
+  readonly actorUserId: string;
+  readonly sourceEnvironmentId: string;
+  readonly expectedGeneration: number;
+  readonly sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
+  readonly supportsSourceReopenAck?: true;
+  readonly sourceMessageId?: string;
+};
+
 /** Internal coordinator only. The caller rechecks the private owner and source
  * credential. A reserved destination is quarantined, never the serving owner. */
 export function makeThreadVmMoveDestinationStore(sql: PgClient) {
   const placements = makeThreadPlacementStore(sql),
     allocations = makeThreadVmAllocationStore(sql);
   const conflict = (message: string) => new ThreadPlacementConflict({ message });
-  const enqueue = Effect.fn("relay.thread_vm_move.enqueue")(function* (input: {
-    threadId: string;
-    operationId: string;
-    actorUserId: string;
-    sourceEnvironmentId: string;
-    expectedGeneration: number;
-    hostId: string;
-    templateId: string;
-    cancelBeforeStart: boolean;
-    replacementRequestId?: string;
-    sourceThreadTransferFormats?: readonly ThreadTransferFormat[];
-    supportsSourceReopenAck?: true;
-    sourceMessageId?: string;
-  }) {
+  const prepare = (input: VmMoveSource) =>
+    placements.beginMove({
+      ...input,
+      destinationEnvironmentId: `pending-vm:${input.operationId}`,
+      destinationProjectId: `vm:${input.threadId}`,
+    });
+  const abandonBeforeReservation = Effect.fnUntraced(function* (input: VmMoveSource) {
+    yield* placements.requestAbort(input);
+    return yield* placements.destinationRemoved(input);
+  });
+  /** The caller proved under the placement lock that no destination has been admitted. */
+  const cancelUnstarted = Effect.fnUntraced(function* (input: VmMoveSource) {
+    yield* prepare(input);
+    return yield* abandonBeforeReservation(input);
+  });
+  const enqueue = Effect.fn("relay.thread_vm_move.enqueue")(function* (
+    input: VmMoveSource & {
+      hostId: string;
+      templateId: string;
+      cancelBeforeStart: boolean;
+      replacementRequestId?: string;
+    },
+  ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.actorUserId},721864))`;
@@ -62,19 +82,8 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
             return yield* conflict("VM move identity was reused with different intent");
           return move;
         }
-        const move = yield* placements.beginMove({
-          ...input,
-          destinationEnvironmentId: `pending-vm:${input.operationId}`,
-          destinationProjectId: `vm:${input.threadId}`,
-          ...(input.sourceThreadTransferFormats === undefined
-            ? {}
-            : { sourceThreadTransferFormats: input.sourceThreadTransferFormats }),
-        });
-        if (input.cancelBeforeStart) {
-          yield* placements.requestAbort(input);
-          // This transaction has never reserved or attempted a destination create.
-          return yield* placements.destinationRemoved(input);
-        }
+        const move = yield* prepare(input);
+        if (input.cancelBeforeStart) return yield* abandonBeforeReservation(input);
         if (move.phase === "aborted") return move;
         yield* allocations.reserve({
           allocationId: input.operationId,
@@ -128,5 +137,5 @@ export function makeThreadVmMoveDestinationStore(sql: PgClient) {
       }),
     );
   });
-  return { enqueue, assigned };
+  return { enqueue, assigned, cancelUnstarted };
 }

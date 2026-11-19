@@ -88,6 +88,7 @@ export class ThreadVmComputeError extends Schema.TaggedError<ThreadVmComputeErro
     cause: Schema.optional(Schema.Defect()),
     createRejected: Schema.optional(Schema.Boolean),
     connectUncertain: Schema.optional(Schema.Boolean),
+    runnerBuildMismatch: Schema.optionalKey(Schema.Literal(true)),
   },
 ) {}
 

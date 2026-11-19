@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   RelayAuthInvalidError,
   type RelayClientDeviceRecord,
@@ -14,6 +14,7 @@ import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { afterEach, vi } from "vite-plus/test";
 
 import { DPOP_UNKNOWN_HINT } from "./errorPresentation.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
 import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as ManagedRelay from "./managedRelay.ts";
 import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
@@ -21,6 +22,7 @@ import {
   createManagedRelayOrganizationCatalogQueryManager,
   createManagedRelayQueryManager,
   createManagedRelaySession,
+  createThreadVmRepositoryEligibility,
   deregisterManagedRelayEnvironment,
   managedRelayAccountChanges,
   type ManagedRelayQueryEvent,
@@ -111,6 +113,64 @@ function setSession() {
     readClerkToken: () => Promise.resolve("clerk-token"),
   });
 }
+
+it.effect("uses the exact authorized placement for an enrolled thread’s VM eligibility", () =>
+  Effect.gen(function* () {
+    const localRegistry = AtomRegistry.make();
+    yield* Effect.addFinalizer(() => Effect.sync(() => localRegistry.dispose()));
+    setManagedRelaySession(localRegistry, {
+      accountId: "account-1",
+      readClerkToken: () => Promise.resolve("clerk-token"),
+    });
+    const relayUrl = "https://relay.example.test";
+    const threadId = ThreadId.make("thread-1");
+    const environmentId = EnvironmentId.make("environment-1");
+    const projectId = ProjectId.make("project-1");
+    const runtime = Atom.runtime(
+      Layer.merge(
+        Layer.mock(EnvironmentRegistry)({}),
+        ManagedRelayTenancy.layer({ relayUrl }).pipe(
+          Layer.provide(
+            remoteHttpClientLayer(async (input, init) => {
+              const request = new Request(input, init);
+              expect(new URL(request.url).origin).toBe(relayUrl);
+              expect(new URL(request.url).pathname).toBe("/v1/threads/thread-1/placement");
+              return Response.json({
+                threadId,
+                environmentId,
+                projectId,
+                repositoryId: "worktree-repo",
+                organizationId: "organization-1",
+                ownerUserId: "account-1",
+                generation: 2,
+                operationId: null,
+              });
+            }),
+          ),
+        ),
+      ),
+    );
+    const eligibility = createThreadVmRepositoryEligibility(runtime);
+    const source = {
+      accountId: "account-1",
+      environmentId,
+      threadId,
+      projectId,
+      checkoutPath: "/project",
+      binding: { relayUrl: "https://source-transport.example.test", generation: 2 },
+    };
+    expect(yield* AtomRegistry.getResult(localRegistry, eligibility(source))).toBe(true);
+    expect(
+      yield* AtomRegistry.getResult(
+        localRegistry,
+        eligibility({
+          ...source,
+          binding: { relayUrl, generation: 1 },
+        }),
+      ),
+    ).toBe(false);
+  }),
+);
 
 it.effect("keeps workflow repositories usable when only the machine catalog fails", () =>
   Effect.gen(function* () {

@@ -8,7 +8,8 @@ import type {
 import * as Effect from "effect/Effect";
 import type { ThreadHistoryOwner } from "./ThreadHistorySync.ts";
 import type { makeExecutorRelayApiClient } from "./executorRelayClient.ts";
-import { ThreadMoveError } from "./ThreadMoveTransport.ts";
+import { describeThreadMoveAdmissionRejection, ThreadMoveError } from "./ThreadMoveTransport.ts";
+
 export interface ThreadLocalEnrollmentTransport {
   readonly abort: (
     owner: ThreadHistoryOwner,
@@ -38,6 +39,7 @@ export function makeThreadLocalEnrollmentTransport<E, R>(
       client: Effect.Success<ReturnType<typeof makeExecutorRelayApiClient>>,
       params: { environmentId: EnvironmentId; threadId: ThreadId },
     ) => Effect.Effect<A, E1>,
+    describeRejection?: (error: unknown) => string | undefined,
   ) =>
     Effect.gen(function* () {
       return yield* action(yield* clientFor(owner), {
@@ -46,19 +48,25 @@ export function makeThreadLocalEnrollmentTransport<E, R>(
       });
     }).pipe(
       Effect.timeout("15 seconds"),
-      Effect.mapError(
-        () =>
-          new ThreadMoveError({
-            threadId: owner.threadId,
-            detail: "Local enrollment is waiting for relay confirmation. Its source is retained.",
-          }),
-      ),
+      Effect.mapError((error) => {
+        const detail = describeRejection?.(error);
+        return new ThreadMoveError({
+          threadId: owner.threadId,
+          detail:
+            detail ?? "Local enrollment is waiting for relay confirmation. Its source is retained.",
+          ...(detail === undefined ? {} : { requiresRetry: true as const }),
+        });
+      }),
     );
   return {
     abort: (owner: ThreadHistoryOwner, payload: RelayThreadLocalEnrollmentRequest) =>
       call(owner, (c, params) => c.threadEnvironment.abortLocalEnrollment({ params, payload })),
     prepare: (owner: ThreadHistoryOwner, payload: RelayThreadLocalEnrollmentRequest) =>
-      call(owner, (c, params) => c.threadEnvironment.prepareLocalEnrollment({ params, payload })),
+      call(
+        owner,
+        (c, params) => c.threadEnvironment.prepareLocalEnrollment({ params, payload }),
+        describeThreadMoveAdmissionRejection,
+      ),
     receipts: (owner: ThreadHistoryOwner, payload: RelayThreadLocalEnrollmentReceiptRequest) =>
       call(owner, (c, params) =>
         c.threadEnvironment.receiveLocalEnrollmentReceipts({ params, payload }),

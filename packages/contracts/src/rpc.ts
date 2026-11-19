@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   ProviderAuthCancelInput,
   ProviderAuthCompleteInput,
@@ -1382,6 +1382,15 @@ const WsOrchestrationGetCommandReceiptRpc = Rpc.make(ORCHESTRATION_WS_METHODS.ge
   error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
 });
 
+const WsOrchestrationGetThreadRepositoryKeyRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.getThreadRepositoryKey,
+  {
+    payload: Schema.Struct({ threadId: ThreadId }),
+    success: Schema.NullOr(TrimmedNonEmptyString),
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationDispatchCommandRpc = Rpc.make(ORCHESTRATION_WS_METHODS.dispatchCommand, {
   payload: ClientOrchestrationCommand,
   success: OrchestrationRpcSchemas.dispatchCommand.output,
@@ -1657,6 +1666,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationSubscribeThreadPresenceRpc,
   WsSubscribeResourceTelemetryRpc,
   WsOrchestrationGetCommandReceiptRpc,
+  WsOrchestrationGetThreadRepositoryKeyRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetWorkflowScriptRpc,
   WsOrchestrationGetTurnDiffRpc,

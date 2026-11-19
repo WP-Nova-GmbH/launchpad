@@ -116,6 +116,25 @@ export const requireAdmin = Effect.fn("relay.api.tenancy.require_admin")(functio
   return membership;
 });
 
+export const lookupRegisteredRepository = Effect.fn("relay.api.repositories.lookup")(
+  function* (input: { readonly userId: string; readonly canonicalKey: string }) {
+    const organizations = yield* Organizations.Organizations;
+    const membership = yield* organizations.getMembershipForUser({ userId: input.userId });
+    if (!membership) return { match: null };
+    const repositories = yield* Repositories.Repositories;
+    const match = yield* repositories.findByCanonicalKey({ canonicalKey: input.canonicalKey });
+    if (!match || match.organizationId !== membership.organization.organizationId) {
+      return { match: null };
+    }
+    const role = yield* repositories.getAccess({
+      repositoryId: match.repositoryId,
+      userId: input.userId,
+    });
+    if (membership.role !== "admin" && role === null) return { match: null };
+    return { match: toApiRepositorySummary(match, role) };
+  },
+);
+
 /** The caller's own organization and role, from the authenticated principal. */
 const requireMembership = Effect.fn("relay.api.tenancy.require_membership")(function* () {
   const { userId } = yield* RelayClientPrincipal;
@@ -1053,22 +1072,12 @@ export const repositoriesApi = HttpApiBuilder.group(
       )
       .handle(
         "lookupRepository",
-        Effect.fn("relay.api.repositories.lookup")(function* (args) {
-          const membership = yield* requireMembership();
-          const match = yield* repositories.findByCanonicalKey({
+        Effect.fnUntraced(function* (args) {
+          const { userId } = yield* RelayClientPrincipal;
+          return yield* lookupRegisteredRepository({
+            userId,
             canonicalKey: args.payload.canonicalKey,
           });
-          if (!match || match.organizationId !== membership.organization.organizationId) {
-            return { match: null };
-          }
-          const role = yield* repositories.getAccess({
-            repositoryId: match.repositoryId,
-            userId: membership.userId,
-          });
-          if (membership.role !== "admin" && role === null) {
-            return { match: null };
-          }
-          return { match: toApiRepositorySummary(match, role) };
         }, mapRelayCommonApiErrors("not_authorized")),
       )
       .handle(

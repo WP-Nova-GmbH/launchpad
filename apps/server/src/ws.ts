@@ -2431,6 +2431,36 @@ const makeWsRpcLayer = (
                 ),
               ),
           ),
+        [ORCHESTRATION_WS_METHODS.getThreadRepositoryKey]: ({ threadId }) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.getThreadRepositoryKey,
+            access
+              .withFence(
+                Effect.gen(function* () {
+                  yield* access.requireThread(currentSession, threadId);
+                  const [source] = yield* sql<{ checkout: string }>`SELECT
+                  COALESCE(t.worktree_path,p.workspace_root) AS checkout
+                  FROM projection_threads t JOIN projection_projects p USING(project_id)
+                  WHERE t.thread_id=${threadId} AND t.deleted_at IS NULL AND p.deleted_at IS NULL`;
+                  if (!source) return null;
+                  const repository = yield* repositoryIdentityResolver.resolve(source.checkout, {
+                    refresh: true,
+                  });
+                  return repository?.canonicalKey ?? null;
+                }),
+              )
+              .pipe(
+                Effect.mapError((cause) =>
+                  cause._tag === "EnvironmentAuthorizationError"
+                    ? cause
+                    : new OrchestrationGetSnapshotError({
+                        message: "Could not identify this thread’s Git repository.",
+                        cause,
+                      }),
+                ),
+              ),
+            { "rpc.aggregate": "orchestration" },
+          ),
         [ORCHESTRATION_WS_METHODS.getWorkflowScript]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getWorkflowScript,

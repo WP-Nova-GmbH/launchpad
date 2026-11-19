@@ -20,7 +20,7 @@ import { makeE2BThreadVmSetup } from "../machines/E2BThreadVmSetup.ts";
 import { makeThreadVmSetupWorker } from "./ThreadVmSetupWorker.ts";
 import { makeThreadVmServerWorker } from "./ThreadVmServerWorker.ts";
 import { makeThreadVmMoveCleanupWorker } from "./ThreadVmMoveCleanupWorker.ts";
-import { Template } from "e2b";
+import { Template, TemplateError } from "e2b";
 import { parse as parseDomain } from "tldts";
 import * as Config from "effect/Config";
 import * as ConfigProvider from "effect/ConfigProvider";
@@ -405,16 +405,23 @@ export const reconcileThreadVmProvisioning = Effect.fn("relay.thread_vm.reconcil
           requestTimeoutMs: 30_000,
           signal,
         }),
-      catch: () =>
-        new ThreadVmComputeError({
-          operation: "verify runner",
-          message: "Runner build verification is unavailable.",
-        }),
+      catch: (error) =>
+        error instanceof TemplateError && error.statusCode === 404
+          ? new ThreadVmComputeError({
+              operation: "verify runner",
+              message: "The configured runner template is missing.",
+              runnerBuildMismatch: true,
+            })
+          : new ThreadVmComputeError({
+              operation: "verify runner",
+              message: "Runner build verification is unavailable.",
+            }),
     });
     if (!tags.some((entry) => entry.tag === tag && entry.buildId === buildId))
       return yield* new ThreadVmComputeError({
         operation: "verify runner",
         message: "Runner template no longer resolves to the verified build.",
+        runnerBuildMismatch: true,
       });
   });
   const provision = makeThreadVmProvisionWorker(

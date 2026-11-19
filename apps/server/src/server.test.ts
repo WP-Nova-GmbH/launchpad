@@ -37,6 +37,7 @@ import {
   GitCommandError,
   KeybindingRule,
   MessageId,
+  ModelSelection,
   ExternalLauncherCommandNotFoundError,
   OrchestrationShellSnapshot,
   type OrchestrationShellStreamItem,
@@ -271,6 +272,7 @@ const defaultModelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5-codex",
 } as const;
+const encodeModelSelection = Schema.encodeSync(Schema.fromJsonString(ModelSelection));
 
 const providerSetupInstanceId = ProviderInstanceId.make("antigravity-custom-profile");
 const providerSetupDriver = ProviderDriverKind.make("antigravity");
@@ -1830,6 +1832,78 @@ const EMPTY_DEVICE_STATE: DeviceServiceState = {
 };
 
 it.layer(NodeServices.layer)("server router seam", (it) => {
+  it.effect("reads the authorized thread checkout repository afresh", () =>
+    Effect.gen(function* () {
+      const localThread = ThreadId.make("project-checkout-thread");
+      const deniedThread = ThreadId.make("denied-checkout-thread");
+      const workspaceRoot = "/tmp/default-project";
+      const worktreePath = "/tmp/default-project-worktree";
+      const createdAt = "2026-11-19T10:00:00.000Z";
+      const modelJson = encodeModelSelection(defaultModelSelection);
+      yield* buildAppUnderTest({
+        onDatabase: (sql) =>
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO projection_projects
+              (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+              VALUES(${defaultProjectId},'Project',${workspaceRoot},'[]',${createdAt},${createdAt})`;
+            for (const [id, worktree] of [
+              [defaultThreadId, worktreePath],
+              [localThread, null],
+              [deniedThread, worktreePath],
+            ] as const) {
+              yield* sql`INSERT INTO projection_threads
+                (thread_id,project_id,title,model_selection_json,worktree_path,created_at,updated_at)
+                VALUES(${id},${defaultProjectId},'Thread',${modelJson},
+                  ${worktree},${createdAt},${createdAt})`;
+            }
+          }).pipe(Effect.orDie),
+        layers: {
+          repositoryAccess: {
+            requireThread: (_actor, threadId) =>
+              threadId === deniedThread
+                ? Effect.fail(
+                    new EnvironmentAuthorizationError({
+                      message: "Repository unavailable",
+                      requiredScope: "orchestration:read",
+                    }),
+                  )
+                : Effect.void,
+          },
+          repositoryIdentityResolver: {
+            resolve: (path, options) =>
+              Effect.sync(() => {
+                assert.isTrue(options?.refresh);
+                const name = path === worktreePath ? "worktree-upstream" : "project-origin";
+                return {
+                  canonicalKey: `github.com/org/${name}`,
+                  rootPath: path,
+                  locator: {
+                    source: "git-remote" as const,
+                    remoteName: path === worktreePath ? "upstream" : "origin",
+                    remoteUrl: `https://github.com/org/${name}.git`,
+                  },
+                };
+              }),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* withWsRpcClient(wsUrl, (client) =>
+        Effect.gen(function* () {
+          const read = client[ORCHESTRATION_WS_METHODS.getThreadRepositoryKey];
+          assert.equal(
+            yield* read({ threadId: defaultThreadId }),
+            "github.com/org/worktree-upstream",
+          );
+          assert.equal(yield* read({ threadId: localThread }), "github.com/org/project-origin");
+          const denied = yield* read({ threadId: deniedThread }).pipe(Effect.result);
+          assertTrue(denied._tag === "Failure");
+          assert.equal(denied.failure._tag, "EnvironmentAuthorizationError");
+        }),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("authorizes absent-thread receipts and replay by their persisted project scope", () =>
     Effect.gen(function* () {
       const receipts = yield* OrchestrationCommandReceiptRepository;

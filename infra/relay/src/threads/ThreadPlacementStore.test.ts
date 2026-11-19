@@ -81,7 +81,7 @@ import { makeThreadVmSetupStore } from "./ThreadVmSetupStore.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
 import { mintThreadVmRepositoryToken } from "../http/ThreadEnvironmentApi.ts";
 import { reconcileThreadVmProvisioning } from "./ThreadVmRuntime.ts";
-import { Template, Sandbox } from "e2b";
+import { Template, Sandbox, TemplateError } from "e2b";
 import { vi } from "vite-plus/test";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 import * as Crypto from "effect/Crypto";
@@ -1439,78 +1439,76 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         }),
     );
 
-    it.effect(
-      "retains rejected VM creation reserved for personal move and reset coordinators",
-      () =>
-        Effect.gen(function* () {
-          for (const coordinator of ["move", "reset"]) {
-            const f = yield* provisionFixture;
-            const capacity = makeThreadVmCapacityStore(f.sql);
-            if (coordinator === "move") {
-              yield* f.sql`INSERT INTO relay_thread_moves
+    it.effect("retains rejected VM capacity for a move without current ownership or a reset", () =>
+      Effect.gen(function* () {
+        for (const coordinator of ["move", "reset"]) {
+          const f = yield* provisionFixture;
+          const capacity = makeThreadVmCapacityStore(f.sql);
+          if (coordinator === "move") {
+            yield* f.sql`INSERT INTO relay_thread_moves
               (operation_id,thread_id,actor_user_id,source_environment_id,expected_generation,
                 destination_environment_id,destination_project_id,phase)
               VALUES(${f.operationId},${f.threadId},${f.ownerUserId},'local',1,'vm','vm-project','preparing')`;
-              yield* f.sql`INSERT INTO relay_thread_vm_move_destinations(operation_id,allocation_id)
+            yield* f.sql`INSERT INTO relay_thread_vm_move_destinations(operation_id,allocation_id)
               VALUES(${f.operationId},${f.allocationId})`;
-            } else {
-              const sourceAllocationId = NodeCrypto.randomUUID();
-              const sourceOperationId = NodeCrypto.randomUUID();
-              const allocation = (yield* f.allocations.get(f.allocationId))!;
-              yield* f.sql`INSERT INTO relay_thread_vm_allocations
+          } else {
+            const sourceAllocationId = NodeCrypto.randomUUID();
+            const sourceOperationId = NodeCrypto.randomUUID();
+            const allocation = (yield* f.allocations.get(f.allocationId))!;
+            yield* f.sql`INSERT INTO relay_thread_vm_allocations
               (allocation_id,thread_id,organization_id,owner_user_id,template_id,state,deleted_at)
               VALUES(${sourceAllocationId},${f.threadId},${allocation.organizationId},${f.ownerUserId},
                 'template:immutable-build','deleted','now')`;
-              yield* f.sql`INSERT INTO relay_thread_vm_backups
+            yield* f.sql`INSERT INTO relay_thread_vm_backups
               (operation_id,allocation_id,generation,compute_ref,snapshot_name,phase)
               VALUES(${sourceOperationId},${sourceAllocationId},1,${`source-${sourceAllocationId}`},
                 ${sourceOperationId},'retired')`;
-              yield* f.sql`INSERT INTO relay_thread_vm_saved_disks
+            yield* f.sql`INSERT INTO relay_thread_vm_saved_disks
               (operation_id,thread_id,backup_operation_id,generation,host_id,phase)
               VALUES(${sourceOperationId},${f.threadId},${sourceOperationId},1,${f.hostId},'expired')`;
-              yield* f.sql`INSERT INTO relay_thread_artifacts
+            yield* f.sql`INSERT INTO relay_thread_artifacts
               (artifact_id,thread_id,operation_id,kind,storage_key,sha256,size_bytes,state)
               VALUES(${sourceOperationId},${f.threadId},${sourceOperationId},'manifest',
                 ${`thread-artifacts/v1/${sourceOperationId}`},${"a".repeat(64)},0,'complete')`;
-              yield* f.sql`INSERT INTO relay_thread_native_checkpoints
+            yield* f.sql`INSERT INTO relay_thread_native_checkpoints
               (operation_id,thread_id,turn_id,source_environment_id,generation,source_sequence,
                 native_thread_id,native_manifest_sha256,archive_sha256,manifest_artifact_id,
                 manifest_sha256,artifact_count)
               VALUES(${sourceOperationId},${f.threadId},'last-source-turn','local',1,0,
                 ${sourceOperationId},${"a".repeat(64)},${"a".repeat(64)},${sourceOperationId},
                 ${"a".repeat(64)},1)`;
-              yield* f.sql`INSERT INTO relay_thread_vm_resets
+            yield* f.sql`INSERT INTO relay_thread_vm_resets
               (operation_id,thread_id,allocation_id,actor_user_id,expected_generation,
                 saved_disk_operation_id,native_checkpoint_operation_id,source_environment_id,
                 source_sequence,host_id,template_id,canonical_key,branch,revision)
               VALUES(${f.operationId},${f.threadId},${f.allocationId},${f.ownerUserId},1,
                 ${sourceOperationId},${sourceOperationId},'local',0,${f.hostId},
                 'template:immutable-build','github.com/test/reset','main',${"a".repeat(40)})`;
-            }
-            yield* capacity.admitNext(f.hostId);
-            yield* f.provisions.claim("coordinator-creator", f.hostId);
-            yield* f.provisions.beginCreate({
-              allocationId: f.allocationId,
-              claimId: "coordinator-creator",
-              templateId: "template:immutable-build",
-            });
-            expect(
-              yield* f.provisions.rejectCreate({
-                allocationId: f.allocationId,
-                operationId: f.operationId,
-                generation: f.intent.generation,
-                threadId: f.threadId,
-                resourceKind: "personal",
-              }),
-            ).toBe(false);
-            expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
-              phase: "creating",
-              allocationState: "creating",
-              claimId: "coordinator-creator",
-            });
-            expect((yield* capacity.get(f.operationId))?.state).toBe("started");
           }
-        }),
+          yield* capacity.admitNext(f.hostId);
+          yield* f.provisions.claim("coordinator-creator", f.hostId);
+          yield* f.provisions.beginCreate({
+            allocationId: f.allocationId,
+            claimId: "coordinator-creator",
+            templateId: "template:immutable-build",
+          });
+          expect(
+            yield* f.provisions.rejectCreate({
+              allocationId: f.allocationId,
+              operationId: f.operationId,
+              generation: f.intent.generation,
+              threadId: f.threadId,
+              resourceKind: "personal",
+            }),
+          ).toBe(false);
+          expect(yield* f.provisions.get(f.allocationId)).toMatchObject({
+            phase: "creating",
+            allocationState: "creating",
+            claimId: "coordinator-creator",
+          });
+          expect((yield* capacity.get(f.operationId))?.state).toBe("started");
+        }
+      }),
     );
 
     it.effect(
@@ -1696,7 +1694,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
     );
 
     it.effect(
-      "does not contact compute while idle and blocks provisioning when the runner build changed",
+      "does not contact compute while idle and blocks provisioning when the runner build changed or disappeared",
       () =>
         Effect.gen(function* () {
           const sql = yield* PgClient.PgClient;
@@ -1755,6 +1753,37 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
             yield* reconcileThreadVmProvisioning(settings);
             expect(transport).not.toHaveBeenCalled();
             expect(tags).not.toHaveBeenCalled();
+
+            const move = yield* vmMoveFixture();
+            yield* move.begin();
+            const missing = new TemplateError("Runner template not found");
+            missing.statusCode = 404;
+            tags.mockRejectedValue(missing);
+            yield* reconcileThreadVmProvisioning(move.settings);
+            expect(tags).toHaveBeenCalledTimes(1);
+            expect(transport).not.toHaveBeenCalled();
+            expect(create).not.toHaveBeenCalled();
+            expect(
+              yield* makeThreadVmProvisionStore(move.sql).get(move.intent.operationId),
+            ).toMatchObject({
+              phase: "cancelled",
+              allocationState: "deleted",
+              computeRef: null,
+              errorCode: "move_runner_build_mismatch",
+            });
+            expect(
+              (yield* makeThreadVmCapacityStore(move.sql).get(move.intent.operationId))?.state,
+            ).toBe("released");
+            expect(
+              (yield* getPortableThreadPlacement(move.intent.threadId).pipe(
+                Effect.provideService(RelayClientPrincipal, {
+                  userId: move.intent.actorUserId,
+                  token: "test",
+                }),
+              )).moveFailureDetail,
+            ).toContain(
+              "The configured E2B runner is missing or no longer matches its verified build.",
+            );
           } finally {
             transport.mockRestore();
             tags.mockRestore();
@@ -7237,7 +7266,7 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         credentialId,
         environmentPublicKey,
       });
-      const begin = (changes = {}) =>
+      const begin = (changes = {}, configured = true) =>
         beginPortableThreadVmMove({
           threadId,
           operationId,
@@ -7246,7 +7275,12 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
           actorUserId: ownerUserId,
           cancelBeforeStart: false,
           ...changes,
-        }).pipe(asSource, Effect.provideService(ThreadVmRuntimeConfiguration, { settings }));
+        }).pipe(
+          asSource,
+          Effect.provideService(ThreadVmRuntimeConfiguration, {
+            settings: configured ? settings : undefined,
+          }),
+        );
       const metadata = {
         "launchpad.managed": "thread-vm-v1",
         "launchpad.operation_id": operationId,
@@ -7362,6 +7396,49 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
       }),
     );
 
+    for (const admitted of [false, true])
+      it.effect(
+        `cancels an ${admitted ? "admitted" : "unstarted"} VM move at its source after access is revoked`,
+        () =>
+          Effect.gen(function* () {
+            const f = yield* vmMoveFixture();
+            if (admitted) yield* f.begin({ supportsSourceReopenAck: true });
+            const placement = (yield* f.placements.get(f.intent.threadId))!;
+            yield* f.sql`UPDATE relay_organization_members SET role='member'
+            WHERE organization_id=${placement.organizationId} AND user_id=${f.intent.actorUserId}`;
+            expect(yield* Effect.flip(f.begin())).toMatchObject({ reason: "thread_not_found" });
+            const cancel = {
+              cancelBeforeStart: true,
+              supportsSourceReopenAck: true,
+            } as const;
+            expect(
+              yield* Effect.flip(f.begin({ ...cancel, actorUserId: "not-the-owner" })),
+            ).toMatchObject({
+              reason: "thread_not_found",
+            });
+            expect(yield* Effect.flip(f.begin({ ...cancel, generation: 2 }))).toMatchObject({
+              _tag: expect.stringMatching(/^RelayTenancy/),
+            });
+            for (let attempt = 0; attempt < 2; attempt++) {
+              const receipt = yield* f.begin(cancel, false);
+              expect(receipt).toMatchObject({
+                status: "accepted",
+                move: {
+                  operationId: f.intent.operationId,
+                  phase: admitted ? "aborting" : "aborted",
+                  sourceReopenRequired: true,
+                  manifestArtifactId: null,
+                },
+              });
+              expect(receipt).not.toHaveProperty("move.repositoryCanonicalKeys");
+            }
+            expect((yield* f.placements.get(f.intent.threadId))?.environmentId).toBe(
+              placement.environmentId,
+            );
+            if (!admitted) expect(yield* f.allocations.get(f.intent.operationId)).toBeNull();
+          }),
+      );
+
     it.effect("leaves a quota-blocked move local and cancels it without creating a VM", () =>
       Effect.gen(function* () {
         const f = yield* vmMoveFixture();
@@ -7393,6 +7470,146 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         expect((yield* f.placements.get(f.intent.threadId))?.operationId).toBeNull();
         expect(yield* f.allocations.get(f.intent.operationId)).toBeNull();
       }),
+    );
+
+    it.effect(
+      "retries unavailable runner verification but releases the unused VM slot for a confirmed mismatch",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* vmMoveFixture();
+          const provision = makeThreadVmProvisionStore(f.sql);
+          const capacity = makeThreadVmCapacityStore(f.sql);
+          yield* f.begin();
+          let mismatch = false;
+          const worker = makeThreadVmProvisionWorker(
+            f.sql,
+            {
+              create: () => Effect.die("An unverified build may not start creating a VM"),
+              recoverIngress: () => Effect.die("There is no VM to recover"),
+              findOperation: () => Effect.die("There is no VM to reconcile"),
+            },
+            f.intent.templateId,
+            f.intent.hostId,
+            Effect.suspend(() =>
+              Effect.fail(
+                new ThreadVmComputeError({
+                  operation: "verify runner",
+                  message: "Could not verify the runner",
+                  ...(mismatch ? { runnerBuildMismatch: true as const } : {}),
+                }),
+              ),
+            ),
+          );
+          const readPlacement = getPortableThreadPlacement(f.intent.threadId).pipe(
+            Effect.provideService(RelayClientPrincipal, {
+              userId: f.intent.actorUserId,
+              token: "test",
+            }),
+          );
+
+          expect(yield* worker.runOne()).toBe(true);
+          expect(yield* provision.get(f.intent.operationId)).toMatchObject({
+            phase: "pending",
+            errorCode: "compute_unavailable",
+          });
+          expect(yield* capacity.get(f.intent.operationId)).toMatchObject({ state: "reserved" });
+          expect((yield* readPlacement).moveFailureDetail).toBeNull();
+
+          mismatch = true;
+          yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp()
+            WHERE operation_id=${f.intent.operationId}`;
+          expect(yield* worker.runOne()).toBe(true);
+          expect(yield* provision.get(f.intent.operationId)).toMatchObject({
+            phase: "cancelled",
+            allocationState: "deleted",
+            computeRef: null,
+            errorCode: "move_runner_build_mismatch",
+          });
+          expect(yield* capacity.get(f.intent.operationId)).toMatchObject({ state: "released" });
+          expect(yield* readPlacement).toMatchObject({
+            environmentId: f.intent.sourceEnvironmentId,
+            generation: f.intent.expectedGeneration,
+            operationId: f.intent.operationId,
+            moveFailureDetail:
+              "The configured E2B runner is missing or no longer matches its verified build. Cancel the move and ask an admin to fix the runner.",
+          });
+          expect(yield* worker.runOne()).toBe(false);
+        }),
+    );
+
+    it.effect(
+      "reports a rejected VM move and releases capacity while keeping the source local",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* vmMoveFixture();
+          const provision = makeThreadVmProvisionStore(f.sql);
+          yield* f.begin();
+          const worker = makeThreadVmProvisionWorker(
+            f.sql,
+            {
+              create: () =>
+                Effect.fail(
+                  new ThreadVmComputeError({
+                    operation: "create",
+                    message: "E2B rejected the VM template",
+                    createRejected: true,
+                  }),
+                ),
+              recoverIngress: () => Effect.die("Rejected creates do not need ingress recovery"),
+              findOperation: () => Effect.die("Rejected creates do not need reconciliation"),
+            },
+            f.intent.templateId,
+            f.intent.hostId,
+          );
+          expect(yield* worker.runOne()).toBe(true);
+          const rejected = yield* provision.get(f.intent.operationId);
+          expect(rejected).toMatchObject({
+            phase: "cancelled",
+            allocationState: "deleted",
+            computeRef: null,
+            errorCode: "create_rejected",
+          });
+          expect(yield* makeThreadVmCapacityStore(f.sql).get(f.intent.operationId)).toMatchObject({
+            state: "released",
+            computeRef: null,
+          });
+          const readPlacement = getPortableThreadPlacement(f.intent.threadId).pipe(
+            Effect.provideService(RelayClientPrincipal, {
+              userId: f.intent.actorUserId,
+              token: "test",
+            }),
+          );
+          expect(yield* readPlacement).toMatchObject({
+            environmentId: f.intent.sourceEnvironmentId,
+            generation: f.intent.expectedGeneration,
+            operationId: f.intent.operationId,
+            activeMove: { phase: "preparing", destinationKind: "vm" },
+            moveFailureDetail:
+              "E2B rejected the request to create the destination VM. Cancel the move before trying again.",
+          });
+          expect(yield* worker.runOne()).toBe(false);
+
+          yield* f.placements.requestAbort(f.intent);
+          yield* makeThreadVmMoveCleanupWorker(
+            f.sql,
+            {
+              inspect: () => Effect.die("Rejected creates do not need inspection"),
+              destroy: () => Effect.die("Rejected creates have no VM to delete"),
+            },
+            f.intent.hostId,
+          ).runOne();
+          expect(yield* f.placements.getMove(f.intent)).toMatchObject({
+            phase: "aborted",
+            failureDetail: null,
+          });
+          expect(yield* readPlacement).toMatchObject({
+            environmentId: f.intent.sourceEnvironmentId,
+            generation: f.intent.expectedGeneration,
+            operationId: null,
+            moveFailureDetail: null,
+          });
+          expect(yield* provision.rejectCreate(rejected!)).toBe(true);
+        }),
     );
 
     it.effect("keeps cancellation fenced until a never-created VM reservation is released", () =>
@@ -7772,6 +7989,12 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
     it.effect("starts an enrolled move guest only after a verified frozen archive exists", () =>
       Effect.gen(function* () {
         const f = yield* vmMoveFixture();
+        const readPlacement = getPortableThreadPlacement(f.intent.threadId).pipe(
+          Effect.provideService(RelayClientPrincipal, {
+            userId: f.intent.actorUserId,
+            token: "test",
+          }),
+        );
         yield* f.begin();
         yield* f.provision();
         const receipt = yield* f.bind();
@@ -7818,16 +8041,43 @@ describe.skipIf(!databaseUrl)("portable thread ownership (Postgres)", () => {
         expect(
           (yield* makeThreadVmProvisionStore(f.sql).get(f.intent.operationId))?.errorCode,
         ).toBe("startup_unconfirmed");
+        expect((yield* readPlacement).moveFailureDetail).toBe(
+          "Could not confirm the destination VM’s import server started. Launchpad is retrying.",
+        );
+        expect((yield* f.placements.getMove(f.intent)).failureDetail).toBeNull();
         expect((yield* f.placements.get(f.intent.threadId))?.generation).toBe(1);
         yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.intent.operationId}`;
         lost = false;
         expect(yield* worker.runOne()).toBe(true);
         expect(starts).toBe(2);
+        expect((yield* readPlacement).moveFailureDetail).toBeNull();
         expect((yield* f.placements.getMove(f.intent)).phase).toBe("frozen");
+        lost = true;
+        yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.intent.operationId}`;
+        expect(yield* worker.runOne()).toBe(true);
+        expect((yield* readPlacement).moveFailureDetail).toContain("Launchpad is retrying.");
+        yield* f.placements.destinationReady({
+          ...f.intent,
+          environmentId: receipt.environmentId,
+          generation: receipt.generation,
+          sourceCursor: 1,
+          manifestSha256: "a".repeat(64),
+          destinationVerifiedCommit: true,
+        });
+        expect((yield* readPlacement).moveFailureDetail).toBeNull();
+        yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.intent.operationId}`;
+        expect(yield* worker.runOne()).toBe(true);
+        expect((yield* readPlacement).moveFailureDetail).toContain("Launchpad is retrying.");
+        expect((yield* f.placements.getMove(f.intent)).failureDetail).toBeNull();
+        lost = false;
+        yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.intent.operationId}`;
+        expect(yield* worker.runOne()).toBe(true);
+        expect((yield* readPlacement).moveFailureDetail).toBeNull();
         yield* f.sql`UPDATE relay_thread_vm_provisions SET retry_at=clock_timestamp() WHERE allocation_id=${f.intent.operationId}`;
         yield* f.placements.requestAbort(f.intent);
+        expect((yield* readPlacement).moveFailureDetail).toBeNull();
         expect(yield* worker.runOne()).toBe(false);
-        expect(starts).toBe(2);
+        expect(starts).toBe(5);
       }),
     );
 

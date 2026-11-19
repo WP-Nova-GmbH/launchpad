@@ -352,17 +352,26 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
     function* (input: {
       allocationId: string;
       claimId: string;
-      errorCode?: "workflow_template_stale";
+      errorCode?: "workflow_template_stale" | "move_runner_build_mismatch";
     }) {
       yield* sql.withTransaction(
         Effect.gen(function* () {
           const row = yield* locked(input);
           if (row.phase !== "pending") return yield* conflict("Creation may already have started");
+          if (
+            input.errorCode === "move_runner_build_mismatch" &&
+            (row.resourceKind !== "personal" ||
+              !(yield* sql`SELECT 1 FROM relay_thread_vm_move_destinations
+                WHERE allocation_id=${row.allocationId} AND operation_id=${row.operationId}`)
+                .length)
+          )
+            return false;
           yield* allocations.requestDeletion(row.allocationId, row.resourceKind);
           yield* cancelUnstarted(input);
           if (row.allocationState !== "deleting" || input.errorCode === undefined)
             yield* sql`UPDATE relay_thread_vm_provisions SET error_code = ${input.errorCode ?? "access_denied"}
               WHERE allocation_id = ${row.allocationId}`;
+          return true;
         }),
       );
     },
@@ -388,13 +397,37 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
           if (!job) return yield* conflict("Workflow creation identity changed");
           cancellationRequested = job.cancellationRequested;
         }
-        const [placement] = yield* sql`SELECT thread_id FROM relay_thread_placements
+        const [placement] = yield* sql<{
+          operationId: string | null;
+          environmentId: string | null;
+          generation: number;
+        }>`SELECT operation_id AS "operationId", environment_id AS "environmentId", generation
+          FROM relay_thread_placements
           WHERE thread_id=${input.threadId} FOR NO KEY UPDATE`;
         if (!placement) return yield* conflict("Creation thread no longer exists");
-        const coordinated = yield* sql`SELECT 1 FROM relay_thread_vm_move_destinations
-          WHERE allocation_id=${input.allocationId}
-          UNION ALL SELECT 1 FROM relay_thread_vm_resets WHERE allocation_id=${input.allocationId}`;
-        if (coordinated.length) return false;
+        const resets =
+          yield* sql`SELECT 1 FROM relay_thread_vm_resets WHERE allocation_id=${input.allocationId}`;
+        if (resets.length) return false;
+        const [destination] = yield* sql<{
+          operationId: string;
+          threadId: string;
+          sourceEnvironmentId: string;
+          destinationEnvironmentId: string;
+          expectedGeneration: number;
+          phase: string;
+        }>`SELECT m.operation_id AS "operationId", m.thread_id AS "threadId",
+          m.source_environment_id AS "sourceEnvironmentId", m.destination_environment_id AS "destinationEnvironmentId",
+          m.expected_generation AS "expectedGeneration", m.phase
+          FROM relay_thread_vm_move_destinations d JOIN relay_thread_moves m USING (operation_id)
+          WHERE d.allocation_id=${input.allocationId}`;
+        if (
+          destination &&
+          (input.resourceKind !== "personal" ||
+            destination.operationId !== input.operationId ||
+            destination.threadId !== input.threadId ||
+            destination.expectedGeneration + 1 !== input.generation)
+        )
+          return yield* conflict("Creation rejection no longer matches its VM move");
 
         const [allocation] = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
           WHERE allocation_id=${input.allocationId} AND thread_id=${input.threadId}
@@ -426,6 +459,15 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
         )
           return true;
         if (
+          destination &&
+          (placement.operationId !== input.operationId ||
+            placement.environmentId !== destination.sourceEnvironmentId ||
+            placement.generation !== destination.expectedGeneration ||
+            destination.destinationEnvironmentId !== `pending-vm:${input.operationId}` ||
+            !["preparing", "frozen", "aborting"].includes(destination.phase))
+        )
+          return false;
+        if (
           row.phase !== "creating" ||
           !["creating", "deleting"].includes(row.allocationState) ||
           reservation.state !== "started"
@@ -442,9 +484,10 @@ export function makeThreadVmProvisionStore(sql: PgClient) {
           computeRef: null,
           resourceKind: input.resourceKind,
         });
-        const errorCode = cancellationRequested
-          ? "create_rejected_after_cancel"
-          : "create_rejected";
+        const errorCode =
+          cancellationRequested || destination?.phase === "aborting"
+            ? "create_rejected_after_cancel"
+            : "create_rejected";
         yield* sql`UPDATE relay_thread_vm_provisions SET phase='cancelled',claim_id=NULL,claim_until=NULL,
           revision=revision+1,error_code=${errorCode} WHERE allocation_id=${input.allocationId}`;
         // Fence refreshes that read preparation before this receipt acquired the job lock.

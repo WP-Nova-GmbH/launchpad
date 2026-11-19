@@ -11,7 +11,7 @@ import { ThreadVmMenuActions, ThreadVmRefreshButton, useThreadVmUi } from "./Thr
 import { ThreadVmAccountPreference } from "./ThreadVmAccountPreference";
 import { useAtomValue } from "@effect/atom-react";
 import { useNavigation, useRoute } from "@react-navigation/native";
-import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { managedRelaySessionAtom, threadVmRepositoryBlocker } from "@t3tools/client-runtime/relay";
 import {
   threadMoveProjectTargets,
   threadMoveProjectTargetAvailability,
@@ -67,6 +67,7 @@ import {
 import { useAtomCommand } from "../../state/use-atom-command";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { hasCloudPublicConfig } from "../cloud/publicConfig";
+import { threadVmRepositoryEligibilityAtom } from "../cloud/managedRelayState";
 import { environmentCatalog } from "../../connection/catalog";
 
 import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
@@ -759,7 +760,7 @@ function ThreadMachinePicker({
         ? workflowBlocker
         : thread.archivedAt
           ? "Unarchive this thread before moving it."
-          : unavailable || !config || !detailReady
+          : unavailable || !config || !source || !detailReady
             ? "Reconnect this environment to choose another machine."
             : !codexSupported
               ? "Thread moves currently require Codex."
@@ -768,8 +769,8 @@ function ThreadMachinePicker({
                   ? "Open Launchpad on the host machine to connect this environment for thread moves."
                   : "Update this environment’s server to support queued moves."
                 : (originalLocationBlocker ??
-                  (!canonicalKey
-                    ? "Register this project’s Git repository in the host app first."
+                  (currentIsVm && !canonicalKey
+                    ? "The VM’s repository is not available yet. Reconnect to its host and try again."
                     : null));
   const presentation = threadRunOnStatus({
     queue,
@@ -788,6 +789,26 @@ function ThreadMachinePicker({
     !currentIsVm &&
     currentEnvironmentId === environmentId;
   const pickerVisible = openedLocation === locationKey;
+  const vmRepositoryAtom = threadVmRepositoryEligibilityAtom(
+    pickerVisible &&
+      session &&
+      source &&
+      !currentIsVm &&
+      !setupBlocker &&
+      !outstanding &&
+      vmSupported &&
+      host.unavailableReason === null
+      ? {
+          accountId: session.accountId,
+          environmentId,
+          threadId,
+          projectId: source.id,
+          checkoutPath: thread.worktreePath ?? source.workspaceRoot,
+          binding: route,
+        }
+      : null,
+  );
+  const vmRepositoryBlocker = threadVmRepositoryBlocker(useAtomValue(vmRepositoryAtom));
   const originalLocationEligible =
     config?.environment.threadVm?.threadId === threadId &&
     placement?.originalLocation === undefined &&
@@ -836,7 +857,7 @@ function ThreadMachinePicker({
     ? "Private VMs currently require the default Codex provider."
     : vmAccountPending
       ? "Confirm the saved VM account choice before moving"
-      : host.unavailableReason;
+      : (host.unavailableReason ?? vmRepositoryBlocker);
   const destinationLabel = (destination: ThreadMoveDestination) => {
     if (destination.kind === "vm") return "Private VM";
     const target = projects.find(
@@ -889,7 +910,13 @@ function ThreadMachinePicker({
     )
       return;
     // A selected row creates a new move; recovery always uses the exact saved intent.
-    if (destination && (disabled || (destination.kind === "vm" && vmBlocker))) return;
+    if (
+      destination &&
+      (disabled ||
+        (destination.kind === "vm" &&
+          (vmBlocker || threadVmRepositoryBlocker(appAtomRegistry.get(vmRepositoryAtom)))))
+    )
+      return;
     if (kind === "send" && !destination && !saved) return;
     const scope = {
       accountId: session.accountId,
@@ -1211,7 +1238,7 @@ function ThreadMachinePicker({
                 </View>
               ) : !outstanding &&
                 !currentIsVm &&
-                vmBlocker &&
+                host.unavailableReason &&
                 !vmAccountPending &&
                 !host.isPending ? (
                 <Action label="View VM setup instructions" onPress={setup} />

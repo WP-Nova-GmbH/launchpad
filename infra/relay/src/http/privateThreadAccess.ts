@@ -8,7 +8,7 @@ import { tenancyNotFound } from "./tenancyErrors.ts";
 /** Private audience and current repository access are independent of the VM's power state. */
 export const withPrivateThreadOwnerAccess = <A, E, R>(
   threadId: string,
-  mode: "read" | "write",
+  mode: "read" | "write" | "move-cleanup",
   userId: string,
   read: (placement: RelayPortableThreadPlacement) => Effect.Effect<A, E, R>,
 ) =>
@@ -20,7 +20,7 @@ export const withPrivateThreadOwnerAccess = <A, E, R>(
           // Serialize against moves and hold membership/grants until the read completes.
           // Org administrators have no exception to a private thread's audience.
           const rows =
-            mode === "write"
+            mode !== "read"
               ? yield* sql`SELECT thread_id FROM relay_thread_placements
                 WHERE thread_id = ${threadId} AND audience='private' AND owner_user_id = ${userId} FOR UPDATE`
               : yield* sql`SELECT thread_id FROM relay_thread_placements
@@ -33,6 +33,8 @@ export const withPrivateThreadOwnerAccess = <A, E, R>(
           const aborted =
             yield* sql`SELECT 1 FROM relay_thread_local_enrollments WHERE thread_id=${threadId} AND phase='aborted'`;
           if (aborted.length) return yield* tenancyNotFound("thread_not_found");
+          // Move cancellation checks the exact operation while this owner row is locked.
+          if (mode === "move-cleanup") return yield* read(placement);
           const [membership] = yield* sql<{
             role: string;
           }>`SELECT role FROM relay_organization_members
@@ -55,7 +57,7 @@ export const withPrivateThreadOwnerAccess = <A, E, R>(
 
 export const withPrivateThreadAccess = <A, E, R>(
   threadId: string,
-  mode: "read" | "write",
+  mode: "read" | "write" | "move-cleanup",
   action: (placement: RelayPortableThreadPlacement) => Effect.Effect<A, E, R>,
 ) =>
   Effect.flatMap(RelayClientPrincipal, ({ userId }) =>

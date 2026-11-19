@@ -323,7 +323,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     if (
       waitingForCheckout
         ? head.waitingForCheckout && head.detail === detail
-        : !head.waitingForCheckout
+        : !head.waitingForCheckout && head.state !== "blocked"
     )
       return;
     yield* engine.dispatch({
@@ -716,6 +716,24 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     return yield* Effect.gen(function* () {
       const head = claimed;
       let fence = sourceFence;
+      const showBlocked = Effect.fnUntraced(function* (detail: string) {
+        if (head.state === "blocked" && head.detail === detail) return;
+        yield* engine.dispatch({
+          type: "thread.move.progress",
+          threadId: ThreadId.make(threadId),
+          commandId: CommandId.make(`${owner.operationId}:admission-blocked:${head.revision}`),
+          messageId: head.messageId,
+          operationId: CommandId.make(owner.operationId),
+          expectedRevision: head.revision,
+          blocked: true,
+          detail,
+          createdAt: yield* now,
+        });
+      });
+      const showAdmissionRejection = (error: ThreadMoveError) =>
+        error.requiresRetry && head.state !== "cancelling"
+          ? showBlocked(error.detail)
+          : Effect.fail(error);
       const getIntent = Effect.gen(function* () {
         return (
           (yield* transferIntents.get(owner)) ??
@@ -728,16 +746,23 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         );
       });
       const needsDrain = fence.phase === "active" && fence.operationId !== owner.operationId;
+      const cancellingVm = head.state === "cancelling" && head.destination.kind === "vm";
       let beginIntent = needsDrain ? yield* transferIntents.get(owner) : undefined;
       // A lost begin reply leaves the old fence and the new transfer intent.
-      // Reconcile the exact relay operation before applying admission prerequisites.
-      let move = needsDrain
-        ? beginIntent
-          ? yield* transport.getIfStarted(owner)
-          : null
-        : yield* transport.get(owner);
+      // Cancellation reconciles atomically at the relay without reading protected transfer data.
+      const lookup = yield* Effect.result(
+        cancellingVm
+          ? Effect.succeed(null)
+          : needsDrain
+            ? beginIntent
+              ? transport.getIfStarted(owner)
+              : Effect.succeed(null)
+            : transport.get(owner),
+      );
+      if (lookup._tag === "Failure") return yield* showAdmissionRejection(lookup.failure);
+      let move = lookup.success;
       if (!move) {
-        yield* workflowReleased;
+        if (!cancellingVm) yield* workflowReleased;
         beginIntent ??= yield* getIntent;
         const offers = beginIntent.sourceThreadTransferFormats.includes(
           "launchpad-thread-chunks-v2",
@@ -748,12 +773,16 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         if (!actorUserId)
           return yield* fail(threadId, "Sign in before moving this private thread.");
         if (head.destination.kind === "vm") {
-          const result = yield* transport.beginVm(owner, {
-            actorUserId,
-            cancelBeforeStart: head.state === "cancelling",
-            sourceMessageId: head.messageId,
-            ...offers,
-          });
+          const admission = yield* Effect.result(
+            transport.beginVm(owner, {
+              actorUserId,
+              cancelBeforeStart: head.state === "cancelling",
+              sourceMessageId: head.messageId,
+              ...offers,
+            }),
+          );
+          if (admission._tag === "Failure") return yield* showAdmissionRejection(admission.failure);
+          const result = admission.success;
           if (result.status === "quota_reached") {
             const detail =
               result.replacement?.phase === "cancelled"
@@ -761,19 +790,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
                 : result.replacement?.phase === "waiting"
                   ? "Saving the selected VM. This move will continue after its slot is safely released."
                   : `VM limit reached (${result.reservedVms}/${result.maxVms}). Select an idle VM to replace before this move can continue.`;
-            if (head.detail !== detail)
-              yield* engine.dispatch({
-                type: "thread.move.progress",
-                threadId: ThreadId.make(threadId),
-                commandId: CommandId.make(`${owner.operationId}:quota:${head.revision}`),
-                messageId: head.messageId,
-                operationId: CommandId.make(owner.operationId),
-                expectedRevision: head.revision,
-                blocked: true,
-                detail,
-                createdAt: yield* now,
-              });
-            return;
+            return yield* showBlocked(detail);
           }
           move = result.move;
         } else
@@ -868,6 +885,8 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         return;
       }
       yield* workflowReleased;
+      if (head.state === "blocked" && move.phase === "preparing")
+        yield* checkoutNotice(owner, false, "Preparing the destination.");
       const sourceState = move.participantStates?.find(
         (participant) =>
           participant.environmentId === owner.environmentId &&

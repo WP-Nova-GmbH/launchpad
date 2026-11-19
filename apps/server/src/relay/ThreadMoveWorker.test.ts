@@ -2203,9 +2203,22 @@ for (const lost of [
       ).pipe(Effect.provide(RunnerLayer.pipe(Layer.provideMerge(NodeServices.layer)))),
   );
 
-for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as const)
+for (const replacementPhase of [
+  "awaiting_choice",
+  "waiting",
+  "cancelled",
+  "rejected",
+  "relay-cancelled",
+  "restored",
+] as const)
   it.effect(
-    `retains idle provider execution and the queue during a ${replacementPhase} VM replacement`,
+    replacementPhase === "rejected"
+      ? "cancels a previously denied VM admission without needing a regular move read"
+      : replacementPhase === "restored"
+        ? "clears a VM admission error when repository access is restored"
+        : replacementPhase === "relay-cancelled"
+          ? "clears a blocked VM move when the relay accepted a cancellation after access was revoked"
+          : `retains idle provider execution and the queue during a ${replacementPhase} VM replacement`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -2271,12 +2284,23 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
             };
             yield* fences.prepare(enrolled);
             yield* fences.activate(enrolled);
+            const deniesAdmission =
+              replacementPhase === "rejected" ||
+              replacementPhase === "restored" ||
+              replacementPhase === "relay-cancelled";
+            let denied = deniesAdmission;
+            let cancelledAtRelay = false;
+            const denial = new ThreadMoveError({
+              threadId,
+              detail: "Launchpad could not access this thread.",
+              requiresRetry: true,
+            });
             if (replacementPhase === "awaiting_choice")
               for (const workId of ["provider:start-session:idle", "provider:send-turn:settled"])
                 yield* fences.beginWork({ ...enrolled, workId, kind: "provider" });
             const transport: ThreadMoveTransport = {
               sourceFormats: () => Effect.succeed(["launchpad-thread-chunks-v1"] as const),
-              selectEncoding: unused,
+              selectEncoding: (owner) => Effect.succeed(admittedVm(owner.operationId, "preparing")),
               pending: unused,
               begin: unused,
               get: unused,
@@ -2289,26 +2313,67 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
               activate: unused,
               abort: unused,
               removed: unused,
-              sourceReopened: unused,
-              getIfStarted: unused,
+              sourceReopened: (owner) =>
+                Effect.succeed({
+                  ...admittedVm(owner.operationId, "aborted"),
+                  sourceReopenRequired: true,
+                  sourceReopened: true,
+                }),
+              getIfStarted: (owner) => {
+                if (cancelledAtRelay)
+                  return Effect.succeed({
+                    ...admittedVm(owner.operationId, "aborted"),
+                    sourceReopenRequired: true,
+                  });
+                return denied ? Effect.fail(denial) : Effect.succeed(null);
+              },
               reopenBlocked: unused,
               publish: unused,
               artifact: unused,
-              beginVm: (owner) =>
-                Effect.succeed({
-                  status: "quota_reached",
-                  maxVms: 1,
-                  reservedVms: 1,
-                  suggestedReplacement: null,
-                  replacement: {
-                    requestId: owner.operationId,
-                    threadId,
-                    phase: replacementPhase,
-                    victimAllocationId: replacementPhase === "waiting" ? "old-vm" : null,
-                    errorCode: null,
-                  },
-                }),
+              beginVm: (owner, input) =>
+                input.cancelBeforeStart
+                  ? Effect.succeed({
+                      status: "accepted",
+                      move: admittedVm(owner.operationId, "aborted"),
+                    })
+                  : deniesAdmission
+                    ? denied
+                      ? Effect.fail(denial)
+                      : Effect.succeed({
+                          status: "accepted",
+                          move: admittedVm(owner.operationId, "preparing"),
+                        })
+                    : Effect.succeed({
+                        status: "quota_reached",
+                        maxVms: 1,
+                        reservedVms: 1,
+                        suggestedReplacement: null,
+                        replacement: {
+                          requestId: owner.operationId,
+                          threadId,
+                          phase: replacementPhase,
+                          victimAllocationId: replacementPhase === "waiting" ? "old-vm" : null,
+                          errorCode: null,
+                        },
+                      }),
             };
+            const admittedVm = (
+              operationId: string,
+              phase: "preparing" | "aborted",
+            ): RelayThreadMove => ({
+              threadId,
+              actorUserId: "owner",
+              operationId,
+              expectedGeneration: 1,
+              sourceEnvironmentId: sourceId,
+              destinationEnvironmentId: EnvironmentId.make(`pending-vm:${operationId}`),
+              destinationProjectId: ProjectId.make(`vm:${threadId}`),
+              phase,
+              sourceCursor: null,
+              manifestSha256: null,
+              manifestArtifactId: null,
+              transferEncodingPolicy: null,
+            });
             const history = makeThreadHistorySync(sql, engine, {
               append: () => Effect.void,
               confirmThrough: () => Effect.void,
@@ -2346,8 +2411,9 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
             expect(result._tag).toBe("Success");
             expect(q.entries[0]).toMatchObject({
               state: "blocked",
-              detail:
-                replacementPhase === "cancelled"
+              detail: deniesAdmission
+                ? "Launchpad could not access this thread."
+                : replacementPhase === "cancelled"
                   ? "VM replacement was cancelled. Cancel this move to continue here."
                   : replacementPhase === "waiting"
                     ? "Saving the selected VM. This move will continue after its slot is safely released."
@@ -2356,6 +2422,33 @@ for (const replacementPhase of ["awaiting_choice", "waiting", "cancelled"] as co
             expect(
               yield* sql`SELECT 1 FROM thread_execution_work WHERE thread_id=${threadId} AND completed=0`,
             ).toHaveLength(replacementPhase === "awaiting_choice" ? 2 : 0);
+            if (replacementPhase === "rejected") {
+              yield* engine.dispatch({
+                type: "thread.move.cancel",
+                commandId: CommandId.make("cancel-rejected-vm-admission"),
+                threadId,
+                messageId: MessageId.make("move"),
+                expectedRevision: q.entries[0]!.revision,
+                createdAt: at,
+              });
+              const cancellation = yield* Effect.result(worker.source(threadId));
+              expect(cancellation._tag).toBe("Success");
+              expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+            } else if (replacementPhase === "restored") {
+              denied = false;
+              yield* worker.source(threadId);
+              expect((yield* queue).entries[0]).toMatchObject({
+                state: "moving",
+                detail: "Preparing the destination.",
+              });
+              expect((yield* fences.get(threadId))?.phase).toBe("draining");
+            } else if (replacementPhase === "relay-cancelled") {
+              cancelledAtRelay = true;
+              yield* worker.source(threadId);
+              expect((yield* queue).entries.map((entry) => entry.messageId)).toEqual(["prompt"]);
+              expect((yield* fences.get(threadId))?.phase).toBe("active");
+            }
           }).pipe(Effect.provide(environment(path.join(root, "source-state"))));
         }),
       ).pipe(Effect.provide(RunnerLayer.pipe(Layer.provideMerge(NodeServices.layer)))),
@@ -2425,18 +2518,25 @@ it.effect("enrolls a settled native turn despite its last-admitted runtime marke
         });
         let liveSessions: ReadonlyArray<ProviderSession> = [];
         let prepareCalls = 0;
+        let prepareError = new ThreadMoveError({ threadId, detail: "Lost prepare reply" });
         const history = makeThreadHistorySync(sql, engine, {
           append: () => Effect.void,
           confirmThrough: () => Effect.void,
         });
         const worker = yield* makeThreadLocalEnrollmentWorker(
           {
-            abort: unused,
+            abort: (owner, input) =>
+              Effect.succeed({
+                ...input,
+                threadId,
+                environmentId: EnvironmentId.make(owner.environmentId),
+                outcome: "aborted" as const,
+              }),
             receipts: unused,
             confirm: unused,
             prepare: () => {
               prepareCalls++;
-              return Effect.fail(new ThreadMoveError({ threadId, detail: "Lost prepare reply" }));
+              return Effect.fail(prepareError);
             },
           },
           history,
@@ -2505,6 +2605,34 @@ it.effect("enrolls a settled native turn despite its last-admitted runtime marke
         }>`SELECT phase FROM thread_local_enrollments WHERE thread_id=${threadId}`;
         expect(enrollment?.phase).toBe("pending");
         expect(yield* makeThreadExecutionFence(sql).get(threadId)).toBeNull();
+        expect((yield* queue).entries[0]?.state).toBe("moving");
+
+        // An existing enrollment intent can encounter an authoritative rejection on retry.
+        prepareError = new ThreadMoveError({
+          threadId,
+          detail: "Register this repository before moving its thread.",
+          requiresRetry: true,
+        });
+        expect(yield* worker.synchronize(threadId, owner)).toBe(false);
+        const blocked = (yield* queue).entries[0]!;
+        expect(blocked).toMatchObject({ state: "blocked", detail: prepareError.detail });
+        expect(yield* worker.synchronize(threadId, owner)).toBe(false);
+        expect(prepareCalls).toBe(2);
+        expect(yield* makeThreadExecutionFence(sql).get(threadId)).toBeNull();
+
+        yield* engine.dispatch({
+          type: "thread.move.cancel",
+          commandId: CommandId.make("cancel-blocked-move"),
+          threadId,
+          messageId: blocked.messageId,
+          expectedRevision: blocked.revision,
+          createdAt: at,
+        });
+        expect(yield* worker.synchronize(threadId, owner)).toBe(false);
+        expect((yield* queue).entries).toEqual([]);
+        expect(
+          yield* sql`SELECT 1 FROM thread_local_enrollments WHERE thread_id=${threadId}`,
+        ).toEqual([]);
       }).pipe(Effect.provide(environment(root)));
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
