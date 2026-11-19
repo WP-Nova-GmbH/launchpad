@@ -13,8 +13,11 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { useAtomValue } from "@effect/atom-react";
 import { threadVmControls } from "../../state/threads";
-import { ThreadId, type ChatAttachment } from "@t3tools/contracts";
-import type { RelayThreadDeletionRequest } from "@t3tools/contracts/relay";
+import type { ThreadId, ChatAttachment } from "@t3tools/contracts";
+import {
+  RelayTenancyNotFoundError,
+  type RelayThreadDeletionRequest,
+} from "@t3tools/contracts/relay";
 import { ManagedRelay } from "@t3tools/client-runtime/relay";
 import {
   WorkflowSavedResult,
@@ -45,6 +48,7 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-result";
 import {
   Columns2Icon,
+  FileCheck2Icon,
   FileDiffIcon,
   LockIcon,
   RotateCwIcon,
@@ -74,11 +78,12 @@ import { Button } from "../ui/button";
 import { SavedWorkflowResultPicker } from "./SavedWorkflowResultPicker";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
-import { useWorkflowClient } from "./workflowState";
+import { useWorkflowClient, workflowError } from "./workflowState";
 import { WorkflowRequestNotSentError } from "./workflowOperations";
 
 const sameSavedResult = Schema.toEquivalence(WorkflowSavedResult);
 const isRequestFailed = Schema.is(ManagedRelay.ManagedRelayRequestFailedError);
+const isNotFound = Schema.is(Schema.Struct({ cause: RelayTenancyNotFoundError }));
 
 type DeletionTarget = { relayUrl: string; threadId: ThreadId; generation: number };
 type HistoryRequest = { key: string; scope: string; epoch: number };
@@ -176,7 +181,13 @@ export function SavedWorkflowResults({
   }, [selected]);
   const [view, setView] = useState<"changes" | "conversation">("changes");
   const [loaded, setLoaded] = useState<
-    (SavedWorkflowResultRead & { readId: number; scope: string; retry: number }) | null
+    | (SavedWorkflowResultRead & {
+        readId: number;
+        scope: string;
+        retry: number;
+        changesRetry: number;
+      })
+    | null
   >(null);
   const [renderedReview, setRenderedReview] = useState<{
     readId: number;
@@ -187,17 +198,46 @@ export function SavedWorkflowResults({
     history: PortableThreadHistory;
     more: boolean;
   } | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [indexError, setIndexError] = useState<string | null>(null);
+  const [changesError, setChangesError] = useState<string | null>(null);
+  const [conversationError, setConversationError] = useState<{
+    more: boolean;
+    detail: string;
+  } | null>(null);
+  const [attachmentError, setAttachmentError] = useState<ChatAttachment | null>(null);
   const [historyRead, setHistoryRead] = useState<HistoryRead | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [readingIndex, setReadingIndex] = useState(false);
+  const [readingChanges, setReadingChanges] = useState(false);
+  const [readingConversation, setReadingConversation] = useState<"first" | "more" | null>(null);
+  const busy = readingChanges || readingConversation !== null;
   const [retry, setRetry] = useState(0);
   const [indexRetry, setIndexRetry] = useState(0);
+  const [changesRetry, setChangesRetry] = useState(0);
   const [deletion, setDeletion] = useState<DeletionState | null>(null);
   const deletionInFlight = useRef(false);
   const deletionIndexCheck = useRef<DeletionIntent | null>(null);
   const localResultsRef = useRef<HTMLElement>(null);
   const savedResults = resultsRef ?? localResultsRef;
+  const indexRetryButton = useRef<HTMLButtonElement>(null);
+  const changesRetryButton = useRef<HTMLButtonElement>(null);
+  const conversationPageButton = useRef<HTMLButtonElement>(null);
+  const conversationEnd = useRef<HTMLDivElement>(null);
+  const attachmentRetryButton = useRef<HTMLButtonElement>(null);
+  const restorePageRetryFocus = useRef(false);
+  const restoreReadFocus = useCallback(
+    (button: HTMLButtonElement | null) => {
+      if (button && button.ownerDocument?.activeElement === button)
+        savedResults.current?.focus({ preventScroll: true });
+    },
+    [savedResults],
+  );
+  useLayoutEffect(() => {
+    if (!restorePageRetryFocus.current) return;
+    restorePageRetryFocus.current = false;
+    const target = conversationPageButton.current ?? conversationEnd.current;
+    if (target && target.ownerDocument?.activeElement === target.ownerDocument?.body)
+      target.focus();
+  }, [conversation, conversationError]);
   const deletionStatus = useRef<HTMLDivElement>(null);
   const partialResultToggle = useRef<HTMLButtonElement>(null);
   const restorePickerFocus = useRef(false);
@@ -292,25 +332,110 @@ export function SavedWorkflowResults({
     ],
   );
   useEffect(() => () => reader.clear(), [reader]);
-  const clearSavedResults = () => {
+  const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
+  const relayUrl = index?.relayUrl;
+  const threadId = index?.threadId;
+  const contentRead = useMemo(
+    () =>
+      result && resultsScope && relayUrl && threadId
+        ? { result, scope: resultsScope, relayUrl, threadId, call, retry }
+        : null,
+    [result, resultsScope, relayUrl, threadId, call, retry],
+  );
+  const latestContentRead = useRef<typeof contentRead>(null);
+  const conversationRequest = useRef<symbol | null>(null);
+  const attachmentRequests = useRef(new Map<string, NonNullable<typeof contentRead>>());
+  useLayoutEffect(() => {
+    latestContentRead.current = contentRead;
+    setConversation(null);
+    setConversationError(null);
+    setAttachmentError(null);
+    setReadingConversation(null);
+    setChangesError(null);
+    return () => {
+      latestContentRead.current = null;
+      conversationRequest.current = null;
+    };
+  }, [contentRead]);
+  const clearSavedResults = useCallback(() => {
     indexEpoch.current++;
     inFlightHistory.current = null;
     setHistoryRead(null);
     reader.clear();
     generation.current++;
+    latestContentRead.current = null;
+    conversationRequest.current = null;
     setLoaded(null);
     setRenderedReview(null);
     setConversation(null);
-    setError(null);
+    setChangesError(null);
+    setConversationError(null);
+    setAttachmentError(null);
     setIndexError(null);
     setIndex(null);
     setSelected(null);
     setBrowsingHistory(false);
-    setBusy(false);
-  };
+    setReadingIndex(false);
+    setReadingChanges(false);
+    setReadingConversation(null);
+  }, [reader]);
+  const recoverContentRead = useCallback(
+    async (
+      read: NonNullable<typeof contentRead>,
+      epoch: number,
+      cause: unknown,
+      relayChanged: boolean,
+    ) => {
+      const accessLost = workflowJobAccessLost(cause);
+      if (!relayChanged && !accessLost) return false;
+      const sameAuthority = () =>
+        active.current && latestResultsScope.current === read.scope && indexEpoch.current === epoch;
+      if (!sameAuthority()) return true;
+      if (relayChanged) {
+        clearSavedResults();
+        setIndexRetry((n) => n + 1);
+        return true;
+      }
+      if (!isNotFound(cause) || cause.cause.reason !== "thread_not_found") {
+        clearSavedResults();
+        setIndexError(workflowError(cause));
+        return true;
+      }
+
+      // The relay uses the same 404 for a missing artifact and a hidden thread.
+      let movedRelay = false;
+      try {
+        const list = await read.call((client, token) => {
+          movedRelay = client.relayUrl !== read.relayUrl;
+          if (movedRelay || !sameAuthority())
+            throw new WorkflowRequestNotSentError("The saved results changed.");
+          return client.listSavedWorkflowResults({
+            clerkToken: token,
+            repositoryId: scope.repositoryId,
+            jobId: job.jobId,
+          });
+        });
+        if (!sameAuthority()) return true;
+        if (list.threadId === read.threadId) return false;
+        clearSavedResults();
+        setIndexRetry((n) => n + 1);
+      } catch (checkError) {
+        if (!sameAuthority()) return true;
+        clearSavedResults();
+        if (movedRelay) setIndexRetry((n) => n + 1);
+        else setIndexError(workflowError(checkError));
+      }
+      return true;
+    },
+    [clearSavedResults, scope.repositoryId, job.jobId],
+  );
   const clearInaccessibleResults = useEffectEvent(clearSavedResults);
   useEffect(() => {
-    if (deleted || waitingForThread) return;
+    if (deleted || waitingForThread) {
+      setReadingIndex(false);
+      return;
+    }
+    setReadingIndex(true);
     let current = true;
     let requestedRelayUrl: string | undefined;
     const epoch = indexEpoch.current;
@@ -327,6 +452,7 @@ export function SavedWorkflowResults({
     })
       .then((data) => {
         if (!current || epoch !== indexEpoch.current) return;
+        restoreReadFocus(indexRetryButton.current);
         setIndex((previous) => {
           if (
             !previous ||
@@ -400,6 +526,9 @@ export function SavedWorkflowResults({
           }
           setIndexError(cause instanceof Error ? cause.message : "Could not read saved results.");
         }
+      })
+      .finally(() => {
+        if (current && epoch === indexEpoch.current) setReadingIndex(false);
       });
     return () => {
       current = false;
@@ -418,8 +547,8 @@ export function SavedWorkflowResults({
     indexRetry,
     deleted,
     waitingForThread,
+    restoreReadFocus,
   ]);
-  const result = index?.results.find((entry) => entry.resultId === selected) ?? null;
   const finishing = workflowIsFinishing(job);
   const retryableCompletion = finishing && workflowApprovalCanRetry(job.progress);
   const results = index?.results ?? [];
@@ -444,7 +573,7 @@ export function SavedWorkflowResults({
     !waitingForThread &&
     results.length > 0 &&
     (!partialResult || partialResultOpen);
-  const completedWithResults = completed && resultsAvailable;
+  const completedSavedResultsPane = completed && (resultsAvailable || !!indexError);
   useLayoutEffect(() => {
     onResultsAvailableChange?.(resultsAvailable);
   }, [onResultsAvailableChange, resultsAvailable]);
@@ -484,37 +613,60 @@ export function SavedWorkflowResults({
   useEffect(() => {
     const request = ++generation.current;
     setLoaded(null);
-    setConversation(null);
-    setError(null);
-    if (!result || !resultsScope) return;
-    setBusy(true);
+    if (!contentRead) {
+      setReadingChanges(false);
+      return;
+    }
+    const owns = () =>
+      active.current && request === generation.current && contentRead === latestContentRead.current;
+    const epoch = indexEpoch.current;
+    setReadingChanges(true);
+    let relayChanged = false;
     void reader
-      .read(result, () =>
-        call((client, token) =>
-          client.readSavedWorkflowResult({
+      .read(contentRead.result, () =>
+        contentRead.call((client, token) => {
+          relayChanged = client.relayUrl !== contentRead.relayUrl;
+          if (relayChanged || !owns())
+            throw new WorkflowRequestNotSentError("The saved result changed.");
+          return client.readSavedWorkflowResult({
             clerkToken: token,
             repositoryId: scope.repositoryId,
             jobId: job.jobId,
-            resultId: result.resultId,
-          }),
-        ),
+            resultId: contentRead.result.resultId,
+          });
+        }),
       )
       .then((value) => {
-        if (active.current && request === generation.current) {
-          setLoaded({ ...value, readId: request, scope: resultsScope, retry });
-        }
+        if (!owns()) return;
+        restoreReadFocus(changesRetryButton.current);
+        setChangesError(null);
+        setLoaded({
+          ...value,
+          readId: request,
+          scope: contentRead.scope,
+          retry: contentRead.retry,
+          changesRetry,
+        });
       })
-      .catch((cause) => {
-        if (active.current && request === generation.current)
-          setError(cause instanceof Error ? cause.message : "Could not read this saved result.");
+      .catch(async (cause) => {
+        if (!(await recoverContentRead(contentRead, epoch, cause, relayChanged)) && owns())
+          setChangesError(workflowError(cause));
       })
       .finally(() => {
-        if (active.current && request === generation.current) setBusy(false);
+        if (owns()) setReadingChanges(false);
       });
     return () => {
       generation.current++;
     };
-  }, [reader, result, resultsScope, call, scope.repositoryId, job.jobId, retry]);
+  }, [
+    reader,
+    contentRead,
+    changesRetry,
+    scope.repositoryId,
+    job.jobId,
+    recoverContentRead,
+    restoreReadFocus,
+  ]);
   const patch = useMemo(
     () =>
       loaded
@@ -532,6 +684,7 @@ export function SavedWorkflowResults({
     loaded &&
     loaded.scope === resultsScope &&
     loaded.retry === retry &&
+    loaded.changesRetry === changesRetry &&
     result &&
     sameSavedResult(loaded.result, result)
       ? loaded
@@ -552,6 +705,8 @@ export function SavedWorkflowResults({
   const recordVisible = useCallback(() => {
     if (
       view !== "changes" ||
+      readingChanges ||
+      changesError ||
       !activeRead ||
       !checkpoint ||
       !canVerifyResult ||
@@ -576,6 +731,8 @@ export function SavedWorkflowResults({
     }
   }, [
     view,
+    readingChanges,
+    changesError,
     activeRead,
     checkpoint,
     canVerifyResult,
@@ -605,63 +762,107 @@ export function SavedWorkflowResults({
   );
   const readConversation = useCallback(
     async (more = false) => {
-      if (!result || !job.runtime || job.runtime.kind !== "vm") return;
-      const request = generation.current;
-      setBusy(true);
-      setError(null);
+      if (!contentRead || contentRead !== latestContentRead.current || conversationRequest.current)
+        return;
+      const previous =
+        conversation?.resultId === contentRead.result.resultId ? conversation.history : null;
+      if (more && !previous) return;
+      const request = Symbol();
+      const owns = () =>
+        active.current &&
+        request === conversationRequest.current &&
+        contentRead === latestContentRead.current;
+      const epoch = indexEpoch.current;
+      conversationRequest.current = request;
+      setReadingConversation(more ? "more" : "first");
+      let relayChanged = false;
       try {
-        const next = await reader.history(
-          ThreadId.make(job.runtime.threadId),
-          more && conversation?.resultId === result.resultId ? conversation.history : null,
-          (after) =>
-            call((client, token) =>
-              client.getSavedWorkflowHistory({
-                clerkToken: token,
-                repositoryId: scope.repositoryId,
-                jobId: job.jobId,
-                resultId: result.resultId,
-                after,
-                limit: 200,
-              }),
-            ),
+        const next = await reader.history(contentRead.threadId, more ? previous : null, (after) =>
+          contentRead.call((client, token) => {
+            relayChanged = client.relayUrl !== contentRead.relayUrl;
+            if (relayChanged || !owns())
+              throw new WorkflowRequestNotSentError("The saved conversation changed.");
+            return client.getSavedWorkflowHistory({
+              clerkToken: token,
+              repositoryId: scope.repositoryId,
+              jobId: job.jobId,
+              resultId: contentRead.result.resultId,
+              after,
+              limit: 200,
+            });
+          }),
         );
-        if (active.current && generation.current === request)
-          setConversation({ resultId: result.resultId, ...next });
+        if (owns()) {
+          const button = conversationPageButton.current;
+          if (!more) restoreReadFocus(button);
+          else if (!next.more || conversationError)
+            restorePageRetryFocus.current =
+              !!button && button.ownerDocument?.activeElement === button;
+          setConversationError(null);
+          setConversation({ resultId: contentRead.result.resultId, ...next });
+        }
       } catch (cause) {
-        if (active.current && generation.current === request)
-          setError(
-            cause instanceof Error ? cause.message : "Could not read the saved conversation.",
-          );
+        if (!(await recoverContentRead(contentRead, epoch, cause, relayChanged)) && owns()) {
+          const button = conversationPageButton.current;
+          restorePageRetryFocus.current =
+            more &&
+            !conversationError &&
+            !!button &&
+            button.ownerDocument?.activeElement === button;
+          setConversationError({ more, detail: workflowError(cause) });
+        }
       } finally {
-        if (active.current && generation.current === request) setBusy(false);
+        if (owns()) {
+          conversationRequest.current = null;
+          setReadingConversation(null);
+        }
       }
     },
-    [reader, result, job.runtime, job.jobId, scope.repositoryId, conversation, call],
+    [
+      reader,
+      contentRead,
+      job.jobId,
+      scope.repositoryId,
+      conversation,
+      conversationError,
+      recoverContentRead,
+      restoreReadFocus,
+    ],
   );
   useEffect(() => {
     if (
       view === "conversation" &&
       result &&
       conversation?.resultId !== result.resultId &&
-      !busy &&
-      !error
+      !readingConversation &&
+      !conversationError
     )
       void readConversation();
-  }, [view, result, conversation, busy, error, readConversation]);
+  }, [view, result, conversation, readingConversation, conversationError, readConversation]);
   const download = async (file: ChatAttachment) => {
-    if (!result) return;
-    const request = generation.current;
+    if (!contentRead || contentRead !== latestContentRead.current) return;
+    const requests = attachmentRequests.current;
+    if (requests.get(file.id) === contentRead) return;
+    requests.set(file.id, contentRead);
+    const owns = () => active.current && contentRead === latestContentRead.current;
+    const epoch = indexEpoch.current;
+    let relayChanged = false;
+    if (attachmentError?.id === file.id) restoreReadFocus(attachmentRetryButton.current);
+    setAttachmentError((previous) => (previous?.id === file.id ? null : previous));
     try {
-      const bytes = await call((client, token) =>
-        client.downloadSavedWorkflowAttachment({
+      const bytes = await contentRead.call((client, token) => {
+        relayChanged = client.relayUrl !== contentRead.relayUrl;
+        if (relayChanged || !owns())
+          throw new WorkflowRequestNotSentError("The saved conversation changed.");
+        return client.downloadSavedWorkflowAttachment({
           clerkToken: token,
           repositoryId: scope.repositoryId,
           jobId: job.jobId,
-          resultId: result.resultId,
+          resultId: contentRead.result.resultId,
           attachmentId: file.id,
-        }),
-      );
-      if (!active.current || request !== generation.current) return;
+        });
+      });
+      if (!owns()) return;
       const url = URL.createObjectURL(
         new Blob([new Uint8Array(bytes).buffer], { type: file.mimeType }),
       );
@@ -670,9 +871,11 @@ export function SavedWorkflowResults({
       link.download = file.name.split(/[\\/]/u).at(-1) ?? "attachment";
       link.click();
       URL.revokeObjectURL(url);
-    } catch {
-      if (active.current && request === generation.current)
-        setError("Could not download this saved attachment.");
+    } catch (cause) {
+      if (!(await recoverContentRead(contentRead, epoch, cause, relayChanged)) && owns())
+        setAttachmentError(file);
+    } finally {
+      if (requests.get(file.id) === contentRead) requests.delete(file.id);
     }
   };
   const moreResults = async () => {
@@ -794,7 +997,9 @@ export function SavedWorkflowResults({
   };
   const refreshDeletionStatus = () => {
     deletionStatus.current?.focus();
-    setError(null);
+    setChangesError(null);
+    setConversationError(null);
+    setAttachmentError(null);
     setIndexError(null);
     refreshDeletionTarget();
   };
@@ -884,7 +1089,24 @@ export function SavedWorkflowResults({
       deletionInFlight.current = false;
     }
   };
-  const resultsError = indexError ?? error;
+  const conversationRetry = (more: boolean) => (
+    <Button
+      ref={conversationPageButton}
+      size="sm"
+      variant="outline"
+      aria-disabled={readingConversation !== null || undefined}
+      onClick={() => void readConversation(more)}
+    >
+      <RotateCwIcon aria-hidden />
+      {more
+        ? readingConversation
+          ? "Loading more messages…"
+          : "Retry loading more messages"
+        : readingConversation
+          ? "Loading conversation…"
+          : "Retry conversation"}
+    </Button>
+  );
   const resultView = (
     <div id={`${tabId}-saved-results`} className="space-y-3" hidden={partialResultHidden}>
       <header className="flex flex-wrap items-start justify-between gap-3">
@@ -925,6 +1147,27 @@ export function SavedWorkflowResults({
           />
         ) : null}
       </header>
+      {indexError && deletion?.state !== "checking" ? (
+        <WorkflowAlert
+          title={result ? "Couldn’t refresh the results list" : "Couldn’t load the results list"}
+          actions={
+            <Button
+              ref={indexRetryButton}
+              size="sm"
+              variant="outline"
+              aria-disabled={readingIndex || undefined}
+              onClick={() => {
+                if (!readingIndex) setIndexRetry((n) => n + 1);
+              }}
+            >
+              <RotateCwIcon aria-hidden />
+              {readingIndex ? "Loading results…" : "Retry loading results"}
+            </Button>
+          }
+        >
+          {indexError}
+        </WorkflowAlert>
+      ) : null}
       {reviewAvailable && result && !reviewingCurrent ? (
         <WorkflowAlert
           title={browsingHistory ? "Earlier result" : "A newer result needs review"}
@@ -1025,35 +1268,7 @@ export function SavedWorkflowResults({
         tabIndex={result ? 0 : undefined}
         className="space-y-3"
       >
-        {resultsError && deletion?.state !== "checking" ? (
-          <WorkflowAlert
-            title={
-              indexError && result
-                ? "Could not refresh saved results"
-                : "Could not read saved results"
-            }
-            actions={
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setIndexError(null);
-                  if (indexError && result) {
-                    setIndexRetry((n) => n + 1);
-                    return;
-                  }
-                  setError(null);
-                  setRetry((n) => n + 1);
-                }}
-              >
-                Retry
-              </Button>
-            }
-          >
-            {resultsError}
-          </WorkflowAlert>
-        ) : null}
-        {!waitingForThread && !index && !resultsError ? (
+        {!waitingForThread && !index && !indexError ? (
           <p role="status" className="text-sm text-muted-foreground">
             Loading saved results…
           </p>
@@ -1067,55 +1282,135 @@ export function SavedWorkflowResults({
               : "No Agent result has been saved yet."}
           </p>
         ) : null}
-        {busy ? (
-          <p role="status" className="text-sm text-muted-foreground">
-            Loading {view}…
-          </p>
+        {result && view === "changes" ? (
+          changesError ? (
+            <WorkflowAlert
+              title="Couldn’t load changes"
+              actions={
+                <Button
+                  ref={changesRetryButton}
+                  size="sm"
+                  variant="outline"
+                  aria-disabled={readingChanges || undefined}
+                  onClick={() => {
+                    if (!readingChanges) setChangesRetry((n) => n + 1);
+                  }}
+                >
+                  <RotateCwIcon aria-hidden />
+                  {readingChanges ? "Loading changes…" : "Retry changes"}
+                </Button>
+              }
+            >
+              {changesError}
+            </WorkflowAlert>
+          ) : readingChanges ? (
+            <p role="status" className="text-sm text-muted-foreground">
+              Loading changes…
+            </p>
+          ) : activeRead ? (
+            <div className="min-w-0 overflow-hidden">
+              {activeRead.patch === "" ? (
+                <div className="flex items-start gap-3 rounded-lg border p-4">
+                  <FileCheck2Icon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0 space-y-1">
+                    <h4 className="text-sm font-medium">No file changes</h4>
+                    <p className="text-sm text-muted-foreground">
+                      This step saved a result without changing files.
+                    </p>
+                  </div>
+                </div>
+              ) : patch?.kind === "files" ? (
+                <StyledDiffCodeView
+                  options={diffOptions}
+                  items={patch.files.map((fileDiff, n) => ({
+                    id: `${result.resultId}:${n}`,
+                    type: "diff",
+                    fileDiff,
+                  }))}
+                />
+              ) : (
+                <pre className="overflow-auto p-4 text-xs">{activeRead.patch}</pre>
+              )}
+            </div>
+          ) : null
         ) : null}
-        {view === "changes" && loaded && loaded.result.resultId === result?.resultId ? (
-          <div className="min-w-0 overflow-hidden">
-            {loaded.patch === "" ? (
-              <p className="p-4 text-sm text-muted-foreground">No file changes.</p>
-            ) : patch?.kind === "files" ? (
-              <StyledDiffCodeView
-                options={diffOptions}
-                items={patch.files.map((fileDiff, n) => ({
-                  id: `${result!.resultId}:${n}`,
-                  type: "diff",
-                  fileDiff,
-                }))}
-              />
-            ) : (
-              <pre className="overflow-auto p-4 text-xs">{loaded.patch}</pre>
-            )}
-          </div>
-        ) : null}
-        {view === "conversation" && conversation && conversation.resultId === result?.resultId ? (
-          <div className="space-y-4 py-2">
-            {!conversation.history.thread?.messages.length ? (
-              <p className="text-sm text-muted-foreground">
-                No saved messages for this Agent result.
+        {result && view === "conversation" ? (
+          <>
+            {attachmentError ? (
+              <WorkflowAlert
+                title="Couldn’t download the attachment"
+                actions={
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    ref={attachmentRetryButton}
+                    onClick={() => void download(attachmentError)}
+                  >
+                    Retry download
+                  </Button>
+                }
+              >
+                {attachmentError.name}
+              </WorkflowAlert>
+            ) : null}
+            {conversationError && !conversationError.more ? (
+              <WorkflowAlert
+                title="Couldn’t load the conversation"
+                actions={conversationRetry(false)}
+              >
+                {conversationError.detail}
+              </WorkflowAlert>
+            ) : readingConversation === "first" ? (
+              <p role="status" className="text-sm text-muted-foreground">
+                Loading conversation…
               </p>
             ) : null}
-            {conversation.history.thread?.messages.map((message) => (
-              <SavedConversationMessage
-                key={message.id}
-                message={message}
-                busy={busy}
-                onDownload={download}
-              />
-            ))}
-            {conversation.more ? (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busy}
-                onClick={() => void readConversation(true)}
-              >
-                Load more
-              </Button>
+            {conversation?.resultId === result.resultId ? (
+              <div className="space-y-4 py-2">
+                {!conversation.history.thread?.messages.length ? (
+                  <p className="text-sm text-muted-foreground">
+                    No saved messages for this Agent result.
+                  </p>
+                ) : null}
+                {conversation.history.thread?.messages.map((message) => (
+                  <SavedConversationMessage
+                    key={message.id}
+                    message={message}
+                    busy={readingConversation !== null}
+                    onDownload={download}
+                  />
+                ))}
+                {conversationError?.more ? (
+                  <WorkflowAlert
+                    title="Couldn’t load more messages"
+                    actions={conversationRetry(true)}
+                  >
+                    {conversationError.detail}
+                  </WorkflowAlert>
+                ) : conversation.more ? (
+                  <Button
+                    ref={conversationPageButton}
+                    size="sm"
+                    variant="outline"
+                    aria-disabled={readingConversation !== null || undefined}
+                    onClick={() => void readConversation(true)}
+                  >
+                    {readingConversation === "more"
+                      ? "Loading more messages…"
+                      : "Load more messages"}
+                  </Button>
+                ) : (
+                  <div
+                    ref={conversationEnd}
+                    tabIndex={-1}
+                    className="sr-only text-sm text-muted-foreground focus:not-sr-only"
+                  >
+                    End of saved conversation.
+                  </div>
+                )}
+              </div>
             ) : null}
-          </div>
+          </>
         ) : null}
       </div>
     </div>
@@ -1127,10 +1422,10 @@ export function SavedWorkflowResults({
       aria-label="Saved workflow results"
       className={cn(
         "space-y-3",
-        completedWithResults && "rounded-lg border bg-card p-4 text-card-foreground",
+        completedSavedResultsPane && "rounded-lg border bg-card p-4 text-card-foreground",
       )}
     >
-      {completedWithResults ? <h2 className="text-sm font-semibold">Saved results</h2> : null}
+      {completedSavedResultsPane ? <h2 className="text-sm font-semibold">Saved results</h2> : null}
       {!resultsUnavailable && partialResult ? (
         <WorkflowOutcome
           title={hasPartialChanges ? "Partial changes saved" : "Partial result saved"}

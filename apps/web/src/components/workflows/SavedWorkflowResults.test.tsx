@@ -9,12 +9,14 @@ import {
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import {
   RelayRepositoryId,
   RelayTenancyConflictError,
   RelayTenancyNotFoundError,
+  type RelayThreadHistoryPage,
 } from "@t3tools/contracts/relay";
-import { ThreadId } from "@t3tools/contracts";
+import { OrchestrationEvent, ThreadId, type ChatAttachment } from "@t3tools/contracts";
 import type { RepositoryWorkflowJob, WorkflowSavedResult } from "@t3tools/contracts/workflows";
 import {
   setWorkflowSessionAccount,
@@ -31,6 +33,7 @@ const fixture = vi.hoisted(() => ({
   list: vi.fn(),
   read: vi.fn(),
   history: vi.fn(),
+  download: vi.fn(),
   deletion: vi.fn(),
   refresh: vi.fn(),
   target: vi.fn(),
@@ -60,13 +63,31 @@ vi.mock("../../state/threads", () => ({
     },
   },
 }));
-vi.mock("./workflowState", () => ({
+vi.mock("./workflowState", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./workflowState")>()),
   useWorkflowClient: () => fixture.call,
 }));
 vi.mock("../diffs/StyledDiffCodeView", () => ({
   StyledDiffCodeView: (props: Record<string, unknown>) => createElement("pre", props),
 }));
-vi.mock("../chat/SavedConversationMessage", () => ({ SavedConversationMessage: () => null }));
+vi.mock("../chat/SavedConversationMessage", () => ({
+  SavedConversationMessage: ({
+    message,
+    onDownload,
+  }: {
+    message: { text: string; attachments?: ReadonlyArray<ChatAttachment> };
+    onDownload: (attachment: ChatAttachment) => void;
+  }) => (
+    <>
+      <p>{message.text}</p>
+      {message.attachments?.map((attachment) => (
+        <button key={attachment.id} onClick={() => onDownload(attachment)}>
+          {attachment.name}
+        </button>
+      ))}
+    </>
+  ),
+}));
 vi.mock("../../hooks/useSettings", () => ({
   useClientSettings: () => ({ diffLayout: "split" }),
   useUpdateClientSettings: () => vi.fn(),
@@ -206,6 +227,46 @@ const job: RepositoryWorkflowJob = {
     executionReleased: true,
   },
 };
+const decodeHistoryEvent = Schema.decodeUnknownSync(OrchestrationEvent);
+function historyEntry(cursor: number, type: OrchestrationEvent["type"], payload: object) {
+  const threadId = job.progress!.threadId;
+  return {
+    cursor,
+    environmentId: "environment",
+    event: decodeHistoryEvent({
+      type,
+      payload: { threadId, updatedAt: result.createdAt, ...payload },
+      sequence: cursor,
+      eventId: `event-${cursor}`,
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: result.createdAt,
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+    }),
+  };
+}
+const savedConversationStart = () =>
+  historyEntry(1, "thread.created", {
+    projectId: "project",
+    title: "Release notes",
+    modelSelection: { instanceId: "codex", model: "gpt-5.4" },
+    branch: null,
+    worktreePath: null,
+    createdAt: result.createdAt,
+  });
+const savedMessage = (cursor: number, text: string, attachments?: ReadonlyArray<unknown>) =>
+  historyEntry(cursor, "thread.message-sent", {
+    messageId: `message-${cursor}`,
+    role: "assistant",
+    text,
+    ...(attachments ? { attachments } : {}),
+    turnId: result.turnId,
+    streaming: false,
+    createdAt: result.createdAt,
+  });
 let renderer: ReactTestRenderer;
 const view = (currentJob = job, canConfigure = true, showCancellationDetail = true) =>
   createElement(
@@ -293,6 +354,7 @@ beforeEach(() => {
   });
   fixture.read.mockResolvedValue({ result, patch });
   fixture.history.mockResolvedValue({ entries: [] });
+  fixture.download.mockReset().mockResolvedValue(new Uint8Array([42]));
   fixture.deletion.mockImplementation(async ({ threadId, payload }) => ({
     threadId,
     operationId: payload.operationId,
@@ -322,6 +384,7 @@ const withClient = async (test: (client: { relayUrl: string }) => Promise<void>)
     },
     readSavedWorkflowResult: transport(fixture.read),
     getSavedWorkflowHistory: transport(fixture.history),
+    downloadSavedWorkflowAttachment: transport(fixture.download),
     permanentlyDeleteThread: transport(fixture.deletion),
   };
   fixture.call.mockImplementation(
@@ -454,7 +517,7 @@ it("keeps the selected diff visible when completing with an available saved resu
     await act(() => renderer.update(view(completedWithCheckpoint)));
 
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
-    expect(findButton("Retry")).toBeDefined();
+    expect(findButton("Retry loading results")).toBeDefined();
 
     await press("Conversation");
     expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
@@ -465,9 +528,9 @@ it("keeps the selected diff visible when completing with an available saved resu
       threadId: "thread",
       generation: 1,
     });
-    await press("Retry");
+    await press("Retry loading results");
 
-    expect(findButton("Retry")).toBeUndefined();
+    expect(findButton("Retry loading results")).toBeUndefined();
     expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
     expect(fixture.history).toHaveBeenCalledTimes(historyReads);
   }));
@@ -482,7 +545,7 @@ it("keeps the selected patch error retryable when the completion index refresh s
     await act(() => renderer.update(view(completedWithCheckpoint)));
 
     expect(JSON.stringify(renderer.toJSON())).toContain(patchError);
-    await press("Retry");
+    await press("Retry changes");
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
   }));
 
@@ -1312,13 +1375,294 @@ it.each(["awaiting_review", "finishing"] as const)(
     }),
 );
 
-it("retries the selected result after a load failure without jumping to another result", () =>
+it("retries the initial results list before loading the selected patch", () =>
   withClient(async () => {
-    fixture.read.mockRejectedValueOnce(new Error("Disconnected"));
-    await mount();
-    expect(JSON.stringify(renderer.toJSON())).toContain("Disconnected");
-    await press("Retry");
-    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    fixture.list.mockRejectedValueOnce(new Error("Saved storage unavailable."));
+    await mount(completedJob);
+
+    expect(JSON.stringify(renderer.toJSON())).toContain("Couldn’t load the results list");
+    expect(fixture.read).not.toHaveBeenCalled();
+
+    await press("Retry loading results");
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+    expect(fixture.read).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ resultId: result.resultId }),
+    );
+    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
+    expect(findButton("Retry loading results")).toBeUndefined();
+  }));
+
+it("retries Changes for the selected result and keeps its previously loaded conversation", () =>
+  withClient(async () => {
+    const earlier = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      stepId: "Earlier Agent",
+    };
+    fixture.list.mockResolvedValue({
+      results: [result, earlier],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read
+      .mockResolvedValueOnce({ result, patch })
+      .mockRejectedValueOnce(new Error("Saved patch unavailable."))
+      .mockResolvedValueOnce({ result: earlier, patch });
+    await mount(completedJob);
+    await selectSavedResult(earlier.resultId);
+
+    expect(JSON.stringify(renderer.toJSON())).toContain("Couldn’t load changes");
+    await press("Conversation");
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+    expect(findButton("Retry changes")).toBeUndefined();
+
+    await press("Changes");
+    await press("Retry changes");
+    expect(findPicker()?.props["data-selection"]).toBe(earlier.resultId);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(earlier.resultId);
+    expect(fixture.list).toHaveBeenCalledOnce();
+    expect(fixture.read.mock.calls.map(([input]) => input.resultId)).toEqual([
+      result.resultId,
+      earlier.resultId,
+      earlier.resultId,
+    ]);
+    await press("Conversation");
+    expect(fixture.history).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ resultId: earlier.resultId }),
+    );
+  }));
+
+const savedThreadNotFound = (
+  action: "getSavedWorkflowHistory" | "listSavedWorkflowResults" | "read saved thread attachment",
+) =>
+  ManagedRelay.relayRequestError(action)(
+    new RelayTenancyNotFoundError({
+      code: "tenancy_not_found",
+      reason: "thread_not_found",
+      traceId: "missing-thread-read",
+    }),
+  );
+
+it("keeps the selected result when a missing conversation rechecks accessible results", () =>
+  withClient(async () => {
+    fixture.history.mockRejectedValueOnce(savedThreadNotFound("getSavedWorkflowHistory"));
+    await mount(completedJob);
+    await press("Conversation");
+
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
+    expect(findButton("Retry conversation")).toBeDefined();
+    expect(findButton("Retry loading results")).toBeUndefined();
+
+    await press("Retry conversation");
+    expect(fixture.history.mock.calls.map(([input]) => [input.resultId, input.after])).toEqual([
+      [result.resultId, 0],
+      [result.resultId, 0],
+    ]);
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+    expect(fixture.read).toHaveBeenCalledOnce();
+    expect(findButton("Retry conversation")).toBeUndefined();
+    expect(JSON.stringify(renderer.toJSON())).toContain("No saved messages for this Agent result.");
+  }));
+
+it("clears cached results when a previous selection's denial is confirmed for the same thread", () =>
+  withClient(async () => {
+    const other = { ...result, resultId: "33333333-3333-4333-8333-333333333333" };
+    fixture.list
+      .mockResolvedValueOnce({
+        results: [result, other],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+      })
+      .mockRejectedValueOnce(savedThreadNotFound("listSavedWorkflowResults"));
+    fixture.read.mockImplementation(async ({ resultId }) => ({
+      result: resultId === other.resultId ? other : result,
+      patch,
+    }));
+    const firstConversation = deferred<RelayThreadHistoryPage>();
+    fixture.history.mockReturnValueOnce(firstConversation.promise);
+    await mount(completedJob);
+    await selectSavedResult(other.resultId);
+    await selectSavedResult(result.resultId);
+    await press("Conversation");
+    await selectSavedResult(other.resultId);
+    await press("Changes");
+
+    expect(findPicker()?.props["data-selection"]).toBe(other.resultId);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(other.resultId);
+    expect(fixture.read).toHaveBeenCalledTimes(2);
+
+    await act(() => firstConversation.reject(savedThreadNotFound("getSavedWorkflowHistory")));
+
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+    expect(findButton("Retry loading results")).toBeDefined();
+  }));
+
+it("checks a later ambiguous denial even while an earlier access check is pending", () =>
+  withClient(async () => {
+    const accessibleIndex = {
+      results: [result],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    };
+    const firstProof = deferred<typeof accessibleIndex>();
+    fixture.list
+      .mockResolvedValueOnce(accessibleIndex)
+      .mockReturnValueOnce(firstProof.promise)
+      .mockRejectedValueOnce(savedThreadNotFound("listSavedWorkflowResults"));
+    const attachments = ["release-notes", "rollback-steps"].map((id) => ({
+      type: "file",
+      id,
+      name: `${id}.txt`,
+      mimeType: "text/plain",
+      sizeBytes: 1,
+    }));
+    fixture.history.mockResolvedValue({
+      entries: [savedConversationStart(), savedMessage(2, "Release report", attachments)],
+    } satisfies RelayThreadHistoryPage);
+    fixture.download.mockRejectedValue(savedThreadNotFound("read saved thread attachment"));
+    await mount(completedJob);
+    await press("Conversation");
+    await act(async () => {
+      void findButton("release-notes.txt")!.props.onClick();
+    });
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
+
+    await act(async () => {
+      void findButton("rollback-steps.txt")!.props.onClick();
+    });
+    expect(fixture.list).toHaveBeenCalledTimes(3);
+    expect(findPicker()).toBeUndefined();
+    expect(findButton("Retry loading results")).toBeDefined();
+
+    await act(() => firstProof.resolve(accessibleIndex));
+    expect(findPicker()).toBeUndefined();
+    expect(findButton("release-notes.txt")).toBeUndefined();
+    expect(findButton("Retry download")).toBeUndefined();
+    expect(findButton("Retry loading results")).toBeDefined();
+  }));
+
+it("coalesces concurrent downloads of the same attachment and allows retry after failure", () =>
+  withClient(async () => {
+    const attachment = {
+      type: "file",
+      id: "release-report",
+      name: "release-report.txt",
+      mimeType: "text/plain",
+      sizeBytes: 1,
+    };
+    const attempt = deferred<Uint8Array>();
+    fixture.history.mockResolvedValue({
+      entries: [savedConversationStart(), savedMessage(2, "Release report", [attachment])],
+    } satisfies RelayThreadHistoryPage);
+    fixture.download.mockReturnValueOnce(attempt.promise);
+    const link = { click: vi.fn(), href: "", download: "" };
+    vi.stubGlobal("document", { ...document, createElement: vi.fn(() => link) });
+    await mount(completedJob);
+    await press("Conversation");
+    await act(() => {
+      const download = findButton(attachment.name)!.props.onClick;
+      void download();
+      void download();
+    });
+
+    expect(fixture.download).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        resultId: result.resultId,
+        attachmentId: attachment.id,
+      }),
+    );
+    await act(() => attempt.reject(new Error("Download timed out.")));
+
+    await press("Retry download");
+    expect(fixture.download).toHaveBeenCalledTimes(2);
+    expect(link.click).toHaveBeenCalledOnce();
+    expect(link.download).toBe(attachment.name);
+    expect(findButton("Retry download")).toBeUndefined();
+    expect(JSON.stringify(renderer.toJSON())).toContain("Release report");
+  }));
+
+it("retries the failed conversation page without replacing the messages already shown", () =>
+  withClient(async () => {
+    const firstMessage = "The release notes are ready.";
+    const nextMessage = "The rollback steps are included.";
+    fixture.history
+      .mockResolvedValueOnce({
+        entries: [
+          savedConversationStart(),
+          savedMessage(2, firstMessage),
+          ...Array.from({ length: 198 }, (_, index) =>
+            historyEntry(index + 3, "thread.meta-updated", { title: "Release notes" }),
+          ),
+        ],
+      } satisfies RelayThreadHistoryPage)
+      .mockRejectedValueOnce(new Error("The next history page was unavailable."));
+    const retry = deferred<RelayThreadHistoryPage>();
+    fixture.history.mockReturnValueOnce(retry.promise);
+    const body = {};
+    const ownerDocument = { ...document, body, activeElement: body };
+    const focusTarget = () => {
+      const node = {
+        ownerDocument,
+        focus: vi.fn(() => {
+          ownerDocument.activeElement = node;
+        }),
+      };
+      return node;
+    };
+    const retryControl = focusTarget();
+    const continuation = focusTarget();
+    const pane = focusTarget();
+    await mount(completedJob, true, {
+      createNodeMock: ({ type, props }) => {
+        const host = props as { children?: unknown; "aria-label"?: string };
+        const children = Array.isArray(host.children) ? host.children : [host.children];
+        if (type === "button" && children.includes("Retry loading more messages"))
+          return retryControl;
+        if (type === "button" && children.includes("Load more messages")) {
+          // The browser blurs the old retry control when the next page replaces it.
+          if (ownerDocument.activeElement === retryControl) ownerDocument.activeElement = body;
+          return continuation;
+        }
+        return host["aria-label"] === "Saved workflow results" ? pane : null;
+      },
+    });
+    await press("Conversation");
+    await press("Load more messages");
+
+    const content = () =>
+      JSON.stringify(renderer.toJSON(), (key, value) => (key === "ref" ? undefined : value));
+    expect(content()).toContain("Couldn’t load more messages");
+    expect(content()).toContain(firstMessage);
+    retryControl.focus();
+    await act(() => {
+      void findButton("Retry loading more messages")!.props.onClick();
+    });
+    expect(content()).toContain(firstMessage);
+
+    await act(() =>
+      retry.resolve({
+        entries: [
+          savedMessage(201, nextMessage),
+          ...Array.from({ length: 199 }, (_, index) =>
+            historyEntry(index + 202, "thread.meta-updated", { title: "Release notes" }),
+          ),
+        ],
+      }),
+    );
+    expect(ownerDocument.activeElement).toBe(continuation);
+    expect(content()).toContain(firstMessage);
+    expect(content()).toContain(nextMessage);
+    expect(findButton("Retry loading more messages")).toBeUndefined();
+    expect(fixture.history.mock.calls.map(([input]) => input.after)).toEqual([0, 200, 200]);
+    expect(fixture.read).toHaveBeenCalledOnce();
+    expect(fixture.list).toHaveBeenCalledOnce();
   }));
 
 it("keeps Input-first runs empty until an Agent creates results, rather than calling them deleted", () =>
@@ -1414,7 +1758,7 @@ it.each([
       expect(savedResults().props.hidden).toBe(false);
       if (savedPatch)
         expect(savedResults().findByType("pre").props.items[0].id).toContain(partial.resultId);
-      else expect(JSON.stringify(renderer.toJSON())).toContain("No file changes.");
+      else expect(JSON.stringify(renderer.toJSON())).toContain("No file changes");
       expect(fixture.refresh).not.toHaveBeenCalled();
     }),
 );
