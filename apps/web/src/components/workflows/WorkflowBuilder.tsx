@@ -185,6 +185,7 @@ function WorkflowBuilderEditor({
 }) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
+  const [departurePending, setDeparturePending] = useState(false);
   const state = useWorkflowDrafts();
   const key = workflowSessionKey(scope, id ?? "missing");
   const retainedDraft = id ? state.editors[key] : undefined;
@@ -320,7 +321,8 @@ function WorkflowBuilderEditor({
     vmAuthoring,
   ]);
   useEffect(() => {
-    if (!isNew || !id || !draft?.baseline || !active.current) return;
+    if (!isNew || !id || !draft?.baseline || !active.current || isDeparting() || departurePending)
+      return;
     const current = appAtomRegistry.get(workflowDraftAtom);
     if (
       current.accountId !== scope.accountId ||
@@ -333,7 +335,7 @@ function WorkflowBuilderEditor({
       params: { repositoryId: scope.repositoryId, workflowId: id },
       replace: true,
     });
-  }, [isNew, id, draft?.baseline, active, scope, key, navigate]);
+  }, [isNew, id, draft?.baseline, active, isDeparting, departurePending, scope, key, navigate]);
   if (!canConfigure)
     return (
       <div className="p-5">
@@ -785,6 +787,7 @@ function WorkflowBuilderEditor({
       automationSupported={automationSupported}
       automationReason={automationReason}
       onDepart={onDepart}
+      onDeparturePendingChange={setDeparturePending}
       draft={draft}
       projects={projects}
       projectsUnavailable={projectsUnavailable}
@@ -838,6 +841,7 @@ function WorkflowBuilderWorkspace({
   automationSupported,
   automationReason,
   onDepart,
+  onDeparturePendingChange,
   projects,
   projectsUnavailable,
   refreshProjects,
@@ -874,6 +878,7 @@ function WorkflowBuilderWorkspace({
   automationSupported: boolean;
   automationReason?: string | null | undefined;
   onDepart: () => void;
+  onDeparturePendingChange: (pending: boolean) => void;
   projects: ReadonlyArray<RelayOrganizationProject>;
   projectsUnavailable: boolean | undefined;
   refreshProjects: () => void;
@@ -2109,7 +2114,8 @@ function WorkflowBuilderWorkspace({
           scope={scope}
           id={draft.workflowId}
           reading={reading}
-          onDiscard={onDepart}
+          onDepart={onDepart}
+          onDeparturePendingChange={onDeparturePendingChange}
           onCheckSavedVersion={reconcile}
           saveRecoveryFocusRef={saveRecoveryControl}
         />

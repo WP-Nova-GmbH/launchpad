@@ -16,6 +16,14 @@ import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Data from "effect/Data";
 import { it } from "@effect/vitest";
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  Outlet,
+  RouterProvider,
+} from "@tanstack/react-router";
 import * as Queue from "effect/Queue";
 import * as Cause from "effect/Cause";
 import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
@@ -41,11 +49,6 @@ import {
   type WorkflowEditorDraft,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
-import {
-  readConfirmDialogState,
-  registerConfirmDialogHost,
-  respondToConfirmDialog,
-} from "../../confirmDialog";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { workflowVmCodexInstanceId } from "../settings/workflowModels";
 
@@ -55,6 +58,7 @@ const fixture = vi.hoisted(() => ({
   navigate: vi.fn(),
   refreshCatalog: vi.fn<() => void | Promise<void>>(),
   codexStatus: vi.fn<() => Promise<"connected" | "disconnected" | "reconnect_required">>(),
+  realDepartureGuard: false,
   tab: "runs",
   workflowId: undefined as string | undefined,
   supported: false,
@@ -82,12 +86,22 @@ vi.mock("@clerk/react", () => ({
   ClerkLoaded: ({ children }: PropsWithChildren) =>
     fixture.authStatus === "ready" ? children : null,
 }));
-vi.mock("@tanstack/react-router", () => ({
-  useNavigate: () => fixture.navigate,
-  useLocation: () => undefined,
-  useParams: () => ({ repositoryId: "repository", workflowId: fixture.workflowId }),
-  useSearch: () => ({ tab: fixture.tab }),
-}));
+vi.mock("@tanstack/react-router", async () => {
+  const router =
+    await vi.importActual<typeof import("@tanstack/react-router")>("@tanstack/react-router");
+  return {
+    ...router,
+    useNavigate: () => fixture.navigate,
+    useLocation: () => undefined,
+    useParams: (options: Parameters<typeof router.useParams>[0]) => {
+      const readParams = fixture.realDepartureGuard
+        ? router.useParams
+        : () => ({ repositoryId: "repository", workflowId: fixture.workflowId });
+      return readParams(options);
+    },
+    useSearch: () => ({ tab: fixture.tab }),
+  };
+});
 vi.mock(import("../../cloud/publicConfig"), async (importOriginal) => ({
   ...(await importOriginal()),
   hasCloudPublicConfig: () => true,
@@ -124,7 +138,15 @@ vi.mock("./workflowState", async () => ({
   ...(await vi.importActual("./workflowState")),
   useWorkflowClient: () => call,
 }));
-vi.mock("./WorkflowEditorDepartureGuard", () => ({ WorkflowEditorDepartureGuard: () => null }));
+vi.mock("./WorkflowEditorDepartureGuard", async () => {
+  const { WorkflowEditorDepartureGuard } = await vi.importActual<
+    typeof import("./WorkflowEditorDepartureGuard")
+  >("./WorkflowEditorDepartureGuard");
+  return {
+    WorkflowEditorDepartureGuard: (props: ComponentProps<typeof WorkflowEditorDepartureGuard>) =>
+      fixture.realDepartureGuard ? <WorkflowEditorDepartureGuard {...props} /> : null,
+  };
+});
 vi.mock("./WorkflowRun", () => ({ WorkflowRun: () => null }));
 vi.mock("./WorkflowJob", () => ({ WorkflowJob: () => null }));
 vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
@@ -177,6 +199,18 @@ vi.mock("../ui/collapsible", () => {
     },
     CollapsiblePanel: ({ children }: PropsWithChildren) =>
       useContext(Context).open ? <div>{children}</div> : null,
+  };
+});
+vi.mock("../ui/alert-dialog", () => {
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "alertdialog" }, children) : null,
+    AlertDialogPopup: part,
+    AlertDialogHeader: part,
+    AlertDialogTitle: part,
+    AlertDialogDescription: part,
+    AlertDialogFooter: part,
   };
 });
 vi.mock("../ui/dialog", () => {
@@ -441,6 +475,7 @@ beforeEach(() => {
   fixture.refreshCatalog.mockReset();
   fixture.codexStatus.mockReset().mockResolvedValue("connected");
   fixture.save.mockReset();
+  fixture.realDepartureGuard = false;
   fixture.tab = "runs";
   fixture.workflowId = undefined;
   fixture.supported = false;
@@ -1158,13 +1193,15 @@ it.effect("resumes a retained workflow draft after retrying the catalog", () =>
       expect(content()).toContain(
         "Your draft is kept. Retry to load workflow settings before resuming it.",
       );
-      expect(button("Resume new workflow").props.disabled).toBe(true);
+      expect(button("Resume draft").props.disabled).toBe(true);
       expect(fixture.navigate).not.toHaveBeenCalled();
 
       await press("Retry");
-      expect(button("Resume new workflow").props.disabled).toBe(false);
+      expect(content()).toContain("Review the release");
+      expect(content()).toContain("Unsaved draft");
+      expect(button("Resume draft").props.disabled).toBe(false);
       expect(button("Start another workflow").props.disabled).toBe(false);
-      await press("Resume new workflow");
+      await press("Resume draft");
 
       expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
       expect(retainedStarter()).toBe(draft);
@@ -1187,6 +1224,270 @@ it.effect("resumes a retained workflow draft after retrying the catalog", () =>
   }),
 );
 
+it.effect("keeps later draft edits when a save retry succeeds during departure", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.realDepartureGuard = true;
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([]);
+
+      // Memory history uses the same navigation blockers as the desktop client.
+      vi.stubGlobal("document", { activeElement: null, addEventListener() {} });
+      vi.stubGlobal("HTMLElement", function FixtureElement() {});
+      vi.stubGlobal("window", {
+        origin: "http://localhost",
+        addEventListener() {},
+        removeEventListener() {},
+        scrollTo() {},
+      });
+      vi.stubGlobal("self", {});
+      vi.stubGlobal("history", {});
+      vi.stubGlobal("addEventListener", () => {});
+      vi.stubGlobal("scrollTo", () => {});
+      const root = createRootRoute({ component: Outlet });
+      const repo = createRoute({
+        getParentRoute: () => root,
+        path: "workflows/$repositoryId",
+        component: WorkflowsPage,
+      });
+      const editor = createRoute({
+        getParentRoute: () => root,
+        path: "workflows/$repositoryId/new",
+        component: () => <WorkflowsPage view="builder" />,
+      });
+      const savedEditor = createRoute({
+        getParentRoute: () => root,
+        path: "workflows/$repositoryId/$workflowId/edit",
+        component: () => <WorkflowsPage view="builder" />,
+      });
+      const router = createRouter({
+        isServer: false,
+        routeTree: root.addChildren([repo, editor, savedEditor]),
+        history: createMemoryHistory({ initialEntries: ["/workflows/repository"] }),
+      });
+      fixture.navigate.mockImplementation(router.navigate);
+      await router.load();
+      await act(() => {
+        renderer = create(
+          <AppAtomRegistryProvider>
+            <RouterProvider router={router} />
+          </AppAtomRegistryProvider>,
+          { createNodeMock: (element) => (element.type === "form" ? {} : null) },
+        );
+      });
+      await act(async () => {
+        await Promise.all(deliveries);
+      });
+      await press("Create workflow");
+      await press("Create draft");
+      const name = () => renderer!.root.findByProps({ "aria-label": "Workflow name" });
+      await act(() => name().props.onChange({ target: { value: "Release checklist" } }));
+      const draft = retainedStarter();
+      expect(draft?.definition.name).toBe("Release checklist");
+
+      await press("Back to workflows");
+      expect(router.history.location.pathname).toBe("/workflows/repository/new");
+      await press("Keep draft and leave");
+      expect(router.history.location.pathname).toBe("/workflows/repository");
+      expect(content()).toContain("Release checklist");
+      expect(retainedStarter()).toBe(draft);
+
+      await press("Resume draft");
+      expect(name().props.value).toBe("Release checklist");
+      const reply = deferred<RepositoryWorkflow>();
+      fixture.save.mockReturnValueOnce(reply.promise);
+      await act(() => {
+        renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} });
+      });
+      expect(retainedStarter()?.operation?.state).toBe("pending");
+      await press("Back to workflows");
+      await press("Keep draft and leave");
+      expect(content()).toContain("Saving draft");
+
+      await act(async () => {
+        reply.reject(new Error("Connection lost before the save was confirmed"));
+        await Promise.all(deliveries);
+      });
+      expect(content()).toContain("Save not confirmed");
+      expect(button("Start another workflow")).toBeUndefined();
+
+      const uncertainDraft = retainedStarter();
+      await press("Resume draft");
+      expect(name().props.value).toBe("Release checklist");
+      expect(button("Check saved version")).toBeDefined();
+      expect(retainedStarter()?.workflowId).toBe(draft?.workflowId);
+      expect(retainedStarter()).toBe(uncertainDraft);
+      expect(fixture.save).toHaveBeenCalledOnce();
+
+      const editedName = "Release checklist with rollout steps";
+      await act(() => name().props.onChange({ target: { value: editedName } }));
+      await press("Check saved version");
+      const retry = deferred<RepositoryWorkflow>();
+      const retryStarted = deferred<typeof SaveRepositoryWorkflow.Type>();
+      fixture.save.mockImplementationOnce((payload) => {
+        retryStarted.resolve(payload);
+        return retry.promise;
+      });
+      await press("Retry original save", false);
+      const submitted = await retryStarted.promise;
+      expect(submitted.definition.name).toBe("Release checklist");
+      expect(retainedStarter()?.operation?.state).toBe("pending");
+      await press("Back to workflows");
+      expect(router.history.location.pathname).toBe("/workflows/repository/new");
+      expect(button("Keep draft and leave")).toBeDefined();
+
+      const saved = {
+        ...workflow,
+        workflowId: submitted.workflowId,
+        definition: submitted.definition,
+      };
+      fixture.definitions.mockResolvedValue([saved]);
+      await act(async () => {
+        retry.resolve(saved);
+        await Promise.all(deliveries);
+      });
+      await act(async () => {
+        await Promise.all(deliveries);
+      });
+      expect(router.history.location.pathname).toBe("/workflows/repository/new");
+      expect(button("Keep draft and leave")).toBeDefined();
+      expect(retainedStarter()?.baseline).toEqual(saved);
+      expect(retainedStarter()?.definition.name).toBe(editedName);
+
+      await press("Keep draft and leave");
+      expect(router.history.location.pathname).toBe("/workflows/repository");
+      expect(button("Resume draft")).toBeUndefined();
+
+      await press("Resume editing Release checklist");
+      expect(router.history.location.pathname).toBe(
+        `/workflows/repository/${saved.workflowId}/edit`,
+      );
+      expect(name().props.value).toBe(editedName);
+    });
+  }),
+);
+
+it.effect("names the retained draft and template before replacing it", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([workflow]);
+      const starter = newWorkflowDraft([], "review", true)!;
+      const draft = {
+        ...starter,
+        definition: { ...starter.definition, name: "Release checklist" },
+      };
+      startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
+      await mountCatalog();
+
+      expect(content()).toContain(workflow.definition.name);
+      expect(content()).toContain("Release checklist");
+      await press("Start another workflow");
+      await act(() => starterOption("publish").props.onChange());
+      await press("Create draft");
+
+      const confirmation = renderer!.root.findByProps({ role: "alertdialog" });
+      expect(confirmation.findAllByType("dd").map((item) => item.children.join(""))).toEqual([
+        "Release checklist",
+        "Review and open a pull request",
+      ]);
+      expect(retainedStarter()).toBe(draft);
+      await press("Keep draft");
+
+      expect(button("Replace draft")).toBeUndefined();
+      expect(retainedStarter()).toBe(draft);
+      expect(fixture.navigate).not.toHaveBeenCalled();
+
+      await press("Start another workflow");
+      await act(() => starterOption("publish").props.onChange());
+      await press("Create draft");
+      await press("Replace draft");
+
+      expect(retainedStarter()?.workflowId).not.toBe(draft.workflowId);
+      expect(retainedStarter()).toMatchObject({
+        baseline: null,
+        definition: { name: "Reviewed implementation" },
+      });
+      expect(retainedStarter()?.definition.steps.map((step) => step.kind)).toEqual([
+        "agent",
+        "review",
+        "action",
+        "action",
+      ]);
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
+it.effect.each([
+  {
+    state: "pending",
+    recovery: undefined,
+    status: "Saving draft",
+    guidance: "Wait for the save to finish",
+  },
+  {
+    state: "uncertain",
+    recovery: undefined,
+    status: "Save not confirmed",
+    guidance: "Resume this draft to check whether it saved",
+  },
+  {
+    state: "uncertain",
+    recovery: "retryable",
+    status: "Save didn’t land",
+    guidance: "Resume this draft to retry the original save.",
+  },
+  {
+    state: "uncertain",
+    recovery: "conflict",
+    status: "Saved version changed",
+    guidance: "Resume this draft to review the saved version.",
+  },
+] as const)("lets users resume a draft with $status", ({ state, recovery, status, guidance }) =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.vmAuthoring = { models: null };
+      fixture.definitions.mockResolvedValue([workflow]);
+      const starter = newWorkflowDraft([], "review", true)!;
+      const definition = { ...starter.definition, name: "Release draft" };
+      const draft = {
+        ...starter,
+        definition,
+        saveRecovery: recovery,
+        operation: {
+          requestId: "save",
+          state,
+          definition,
+          archived: false,
+          expectedRevision: 0,
+        },
+      };
+      startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
+      await mountCatalog();
+
+      expect(content()).toContain(status);
+      expect(content()).toContain(guidance);
+      if (recovery) expect(content()).not.toContain("Save not confirmed");
+      expect(content()).toContain(draft.definition.name);
+      expect(button("Start another workflow")).toBeUndefined();
+      expect(button("Create workflow")).toBeUndefined();
+
+      await press("Resume draft");
+      expect(fixture.navigate).toHaveBeenCalledWith(newWorkflowRoute);
+      expect(retainedStarter()).toBe(draft);
+      expect(fixture.save).not.toHaveBeenCalled();
+    });
+  }),
+);
+
 it.effect("explains when a retained draft changes during replacement confirmation", () =>
   Effect.gen(function* () {
     yield* serve;
@@ -1196,32 +1497,30 @@ it.effect("explains when a retained draft changes during replacement confirmatio
       fixture.definitions.mockResolvedValue([]);
       const draft = newWorkflowDraft([], "review", true)!;
       startNewWorkflowDraft(appAtomRegistry, starterScope, () => draft);
-      const unregister = registerConfirmDialogHost();
-      try {
-        await mountCatalog();
-        await press("Start another workflow");
-        await press("Create draft");
-        expect(readConfirmDialogState().status).toBe("confirming");
+      await mountCatalog();
 
-        await act(() =>
-          editWorkflowDraft(starterScope, draft.workflowId, (current) => ({
-            ...current,
-            definition: { ...current.definition, name: "Changed during confirmation" },
-          })),
-        );
-        await act(async () => respondToConfirmDialog(true));
+      await press("Start another workflow");
+      await act(() => starterOption("publish").props.onChange());
+      await press("Create draft");
+      expect(button("Replace draft")).toBeDefined();
 
-        expect(content()).toContain(
-          "The retained draft changed while you were confirming. Review it before trying again.",
-        );
-        expect(retainedStarter()).toMatchObject({
-          workflowId: draft.workflowId,
-          definition: { name: "Changed during confirmation" },
-        });
-        expect(fixture.navigate).not.toHaveBeenCalled();
-      } finally {
-        unregister();
-      }
+      await act(() =>
+        editWorkflowDraft(starterScope, draft.workflowId, (current) => ({
+          ...current,
+          definition: { ...current.definition, name: "Changed during confirmation" },
+        })),
+      );
+      await press("Replace draft");
+
+      expect(content()).toContain(
+        "The retained draft changed while you were confirming. Review it before trying again.",
+      );
+      expect(starterOption("publish").props.checked).toBe(true);
+      expect(retainedStarter()).toMatchObject({
+        workflowId: draft.workflowId,
+        definition: { name: "Changed during confirmation" },
+      });
+      expect(fixture.navigate).not.toHaveBeenCalled();
     });
   }),
 );

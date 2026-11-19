@@ -184,7 +184,6 @@ import {
   selectWorkflowStep,
   newWorkflowDraft,
   copiedWorkflowDraft,
-  openNewWorkflowDraft,
 } from "./workflowState";
 
 type Props = Parameters<typeof WorkflowBuilder>[0];
@@ -1238,37 +1237,6 @@ describe("workflow templates and copies", () => {
     expect(copied.definition.steps[0]).not.toBe(source.definition.steps[0]);
     expect(copiedWorkflowDraft(source, [project, destination], true)?.targetConfirmed).toBe(true);
     expect(copiedWorkflowDraft(source, [project, destination], false)?.targetConfirmed).toBe(false);
-  });
-  it("requires explicit discard and cannot overwrite a changed or uncertain retained draft", async () => {
-    await mount();
-    const id = newId();
-    confirmation.mockResolvedValueOnce(false);
-    expect(
-      await openNewWorkflowDraft(scope, () => newWorkflowDraft([project], "publish")),
-    ).toBeNull();
-    expect(newId()).toBe(id);
-    const confirm = deferred<boolean>();
-    confirmation.mockReturnValueOnce(confirm.promise);
-    const pending = openNewWorkflowDraft(scope, () => newWorkflowDraft([project], "publish"));
-    await rename("Changed during confirmation");
-    const rejected = expect(pending).rejects.toThrow("The retained draft changed");
-    confirm.resolve(true);
-    await rejected;
-    expect(newId()).toBe(id);
-    editWorkflowDraft(scope, id, (draft) => ({
-      ...draft,
-      operation: {
-        requestId: "uncertain",
-        state: "uncertain",
-        definition: draft.definition,
-        archived: false,
-        expectedRevision: 0,
-      },
-    }));
-    await expect(openNewWorkflowDraft(scope, () => newWorkflowDraft([project]))).rejects.toThrow(
-      "reconcile",
-    );
-    expect(newId()).toBe(id);
   });
 });
 

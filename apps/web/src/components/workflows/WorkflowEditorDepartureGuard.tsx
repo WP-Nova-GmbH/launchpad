@@ -1,4 +1,4 @@
-import { useEffect, useRef, type RefObject } from "react";
+import { useCallback, useEffect, useRef, type RefObject } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import { useBlocker } from "@tanstack/react-router";
 import {
@@ -28,14 +28,16 @@ export function WorkflowEditorDepartureGuard({
   id,
   reading,
   saveRecoveryFocusRef,
-  onDiscard,
+  onDepart,
+  onDeparturePendingChange,
   onCheckSavedVersion,
 }: {
   scope: WorkflowScope;
   id: string;
   reading: boolean;
   saveRecoveryFocusRef?: RefObject<HTMLButtonElement | null>;
-  onDiscard: () => void;
+  onDepart: () => void;
+  onDeparturePendingChange: (pending: boolean) => void;
   onCheckSavedVersion: () => void;
 }) {
   const stayButtonRef = useRef<HTMLButtonElement>(null);
@@ -55,24 +57,57 @@ export function WorkflowEditorDepartureGuard({
           ? state.editors[workflowSessionKey(scope, id)]
           : undefined;
       // Create-to-edit keeps this same editor after recovering its first Save.
+      const leavingCreate =
+        current.routeId === "/workflows/$repositoryId/new" &&
+        current.params.repositoryId === scope.repositoryId;
       const promotion =
         !!draft?.baseline &&
         state.newWorkflowIds[workflowSessionKey(scope, "new")] === id &&
-        current.routeId === "/workflows/$repositoryId/new" &&
+        leavingCreate &&
         next.routeId === "/workflows/$repositoryId/$workflowId/edit" &&
         next.params.repositoryId === scope.repositoryId &&
         next.params.workflowId === id;
-      return (
+      const needsConfirmation =
         !promotion &&
         current.pathname !== next.pathname &&
         !!draft &&
-        (workflowEditorDirty(draft) || !!draft.operation)
-      );
+        (workflowEditorDirty(draft) || !!draft.operation);
+      if (needsConfirmation && leavingCreate) onDeparturePendingChange(true);
+      return needsConfirmation;
     },
   });
+  // A receipt can establish the first saved version while this departure is blocked.
+  const leavingNewDraft =
+    blocker.status === "blocked" &&
+    blocker.current.routeId === "/workflows/$repositoryId/new" &&
+    blocker.current.params.repositoryId === scope.repositoryId;
+  const canKeepDraft =
+    !!current &&
+    (!current.baseline || leavingNewDraft) &&
+    drafts.newWorkflowIds[workflowSessionKey(scope, "new")] === id;
+  // Reset and receipt settlement can render before the router drops this resolver.
+  const resolvedExit = useRef<(() => void) | undefined>(undefined);
+  const leave = useCallback(
+    (discard: boolean) => {
+      if (blocker.status !== "blocked" || resolvedExit.current === blocker.proceed) return;
+      resolvedExit.current = blocker.proceed;
+      onDepart();
+      if (discard) discardWorkflowEditor(appAtomRegistry, scope, id);
+      blocker.proceed();
+      onDeparturePendingChange(false);
+    },
+    [blocker, id, onDepart, onDeparturePendingChange, scope],
+  );
+  const stay = () => {
+    if (blocker.status !== "blocked" || resolvedExit.current === blocker.proceed) return false;
+    resolvedExit.current = blocker.proceed;
+    blocker.reset();
+    onDeparturePendingChange(false);
+    return true;
+  };
   useEffect(() => {
-    if (blocker.status === "blocked" && !unsaved) blocker.proceed();
-  }, [blocker, unsaved]);
+    if (!unsaved) leave(false);
+  }, [leave, unsaved]);
   const operation = current?.operation;
   const unconfirmed = operation?.state === "uncertain";
   const saveConflict = current?.saveRecovery === "conflict";
@@ -101,10 +136,9 @@ export function WorkflowEditorDepartureGuard({
       key="stay"
       ref={stayButtonRef}
       type="button"
-      variant={operation ? "default" : "outline"}
+      variant={operation && !canKeepDraft ? "default" : "outline"}
       onClick={() => {
-        blocker.reset?.();
-        if (canCheckSavedVersion) onCheckSavedVersion();
+        if (stay() && canCheckSavedVersion) onCheckSavedVersion();
       }}
     >
       {canCheckSavedVersion
@@ -118,14 +152,15 @@ export function WorkflowEditorDepartureGuard({
     <Button
       key="leave"
       type="button"
-      variant={operation ? "outline" : "destructive"}
-      onClick={() => {
-        onDiscard();
-        discardWorkflowEditor(appAtomRegistry, scope, id);
-        blocker.proceed?.();
-      }}
+      variant={operation && !canKeepDraft ? "outline" : "destructive"}
+      onClick={() => leave(true)}
     >
-      {operation && !knownSaveOutcome ? "Leave anyway" : "Discard and leave"}
+      {operation && !knownSaveOutcome && !canKeepDraft ? "Leave anyway" : "Discard and leave"}
+    </Button>
+  );
+  const keepDraftButton = (
+    <Button key="keep" type="button" onClick={() => leave(false)}>
+      Keep draft and leave
     </Button>
   );
 
@@ -133,7 +168,7 @@ export function WorkflowEditorDepartureGuard({
     <AlertDialog
       open={blocker.status === "blocked" && unsaved}
       onOpenChange={(open) => {
-        if (!open) blocker.reset?.();
+        if (!open) stay();
       }}
     >
       <AlertDialogPopup
@@ -150,13 +185,15 @@ export function WorkflowEditorDepartureGuard({
                 ? "Save not confirmed"
                 : operation
                   ? "Save in progress"
-                  : "Discard unsaved changes?"}
+                  : canKeepDraft
+                    ? "Leave this draft?"
+                    : "Discard unsaved changes?"}
           </AlertDialogTitle>
           <AlertDialogDescription className="wrap-anywhere">
             {knownSaveOutcome ? (
               <>
-                The saved version of {workflow} {saveConflict ? "changed" : "is unchanged"}. Your
-                unsaved edits will be lost if you leave.
+                The saved version of {workflow} {saveConflict ? "changed" : "is unchanged"}.
+                {canKeepDraft ? null : " Your unsaved edits will be lost if you leave."}
               </>
             ) : unconfirmed ? (
               <>
@@ -165,21 +202,33 @@ export function WorkflowEditorDepartureGuard({
               </>
             ) : operation ? (
               <>The save for {workflow} may still complete after you leave.</>
+            ) : canKeepDraft ? (
+              <>You have unsaved edits to {workflow}.</>
             ) : (
               <>Your unsaved edits to {workflow} will be lost.</>
             )}
-            {operation && !knownSaveOutcome ? (
+            {canKeepDraft ? (
+              <span className="mt-2 block">
+                Keep the draft to resume it from the workflow catalog. Discarding removes your
+                unsaved edits.
+              </span>
+            ) : null}
+            {operation && !knownSaveOutcome && !canKeepDraft ? (
               <span className="mt-2 block">
                 If you leave and the save doesn’t complete, your edits will be lost.
               </span>
             ) : null}
-            {hasUnsubmittedEdits ? (
+            {hasUnsubmittedEdits && !canKeepDraft ? (
               <span className="mt-2 block">Edits outside that save will be lost if you leave.</span>
             ) : null}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          {operation ? [leaveButton, stayButton] : [stayButton, leaveButton]}
+          {canKeepDraft
+            ? [leaveButton, stayButton, keepDraftButton]
+            : operation
+              ? [leaveButton, stayButton]
+              : [stayButton, leaveButton]}
         </AlertDialogFooter>
       </AlertDialogPopup>
     </AlertDialog>

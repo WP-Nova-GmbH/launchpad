@@ -224,7 +224,13 @@ Anyone with repository access can run a Machine workflow with a description of t
 shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
 worktree and one shared agent conversation. Inspect the saved result and diff before approving a
 Review. Answer an Input checkpoint to supply context for later steps. Responses are retained as
-history, and response drafts remain available while waiting for the machine to acknowledge them. Leaving an editor with unsaved changes asks whether to keep editing or discard and leave. Discard removes local edits; a Save already submitted may still complete. Save errors retain edits; Retry checks the saved version before submitting again. Reloading or restarting the app does not restore unsaved drafts.
+history, and response drafts remain available while waiting for the machine to acknowledge them.
+
+Use **Keep draft and leave** to leave a new workflow editor with the draft and any pending save
+still available in this session. Open the repository’s Workflows catalog and choose **Resume draft**
+to continue editing or recover the save. **Discard and leave** removes local edits. A save already
+submitted may still complete. Save errors retain edits, and **Retry original save** checks the
+saved version before submitting again. Reloading or restarting the app does not restore unsaved drafts.
 
 When automatic triggering is available on your relay, open **Trigger settings** in the editor.
 Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected

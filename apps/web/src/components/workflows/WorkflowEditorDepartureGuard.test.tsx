@@ -51,11 +51,13 @@ const scope = {
   repositoryId: RelayRepositoryId.make("repo"),
 };
 const key = workflowSessionKey(scope, "flow");
-const onDiscard = vi.fn();
+const onDepart = vi.fn();
+const onDeparturePendingChange = vi.fn();
 const onCheckSavedVersion = vi.fn();
 let renderer: ReactTestRenderer | undefined;
 beforeEach(() => {
-  onDiscard.mockReset();
+  onDepart.mockReset();
+  onDeparturePendingChange.mockReset();
   onCheckSavedVersion.mockReset();
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   setWorkflowSessionAccount(appAtomRegistry, null);
@@ -94,7 +96,8 @@ async function mount(initialEntries = ["/settings", "/workflows"]) {
     <WorkflowEditorDepartureGuard
       scope={scope}
       id="flow"
-      onDiscard={onDiscard}
+      onDepart={onDepart}
+      onDeparturePendingChange={onDeparturePendingChange}
       onCheckSavedVersion={onCheckSavedVersion}
       reading={useContext(Reading)}
     />
@@ -110,6 +113,11 @@ async function mount(initialEntries = ["/settings", "/workflows"]) {
     path: "settings",
     component: () => <p>Catalog</p>,
   });
+  const catalog = createRoute({
+    getParentRoute: () => root,
+    path: "workflows/$repositoryId",
+    component: () => <p>Workflow catalog</p>,
+  });
   const createEditor = createRoute({
     getParentRoute: () => root,
     path: "workflows/$repositoryId/new",
@@ -122,7 +130,7 @@ async function mount(initialEntries = ["/settings", "/workflows"]) {
   });
   const history = createMemoryHistory({ initialEntries });
   const router = createRouter({
-    routeTree: root.addChildren([editor, destination, createEditor, savedEditor]),
+    routeTree: root.addChildren([editor, destination, catalog, createEditor, savedEditor]),
     history,
   });
   const app = (reading: boolean) => (
@@ -215,7 +223,7 @@ it("blocks router departures, keeps the draft on dismissal, and discards before 
     history.push("/settings");
   });
   expect(history.location.pathname).toBe("/workflows");
-  expect(dialogText()).toContain("Discard unsaved changes?");
+  expect(dialogText()).toContain("Leave this draft?");
   expect(dialogText()).toContain("Unsaved");
   await click("Keep editing");
   expect(history.location.pathname).toBe("/workflows");
@@ -227,7 +235,7 @@ it("blocks router departures, keeps the draft on dismissal, and discards before 
   expect(history.location.pathname).toBe("/settings");
   expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBeUndefined();
   expect(appAtomRegistry.get(workflowDraftAtom).newWorkflowIds).toEqual({});
-  expect(onDiscard).toHaveBeenCalledOnce();
+  expect(onDepart).toHaveBeenCalledOnce();
   expect(onCheckSavedVersion).not.toHaveBeenCalled();
 });
 it("keeps edits on dialog dismissal and lets a cleared account leave without a prompt", async () => {
@@ -262,28 +270,46 @@ it.each([
     });
     expect(dialogText()).toContain(title);
     expect(dialogText()).toContain(initialDraft?.definition.name);
-    if (recovery) {
-      expect(dialogText()).toContain("Your unsaved edits will be lost if you leave.");
-      expect(dialogText()).not.toContain("Check saved version");
-    } else {
-      expect(dialogText()).toContain(
-        "If you leave and the save doesn’t complete, your edits will be lost.",
-      );
-    }
+    expect(dialogText()).toContain("Keep the draft to resume it from the workflow catalog.");
+    expect(dialogText()).not.toContain("your edits will be lost");
+    if (recovery) expect(dialogText()).not.toContain("Check saved version");
     await click(stayAction);
     expect(history.location.pathname).toBe("/workflows");
     expect(renderer!.root.findAllByProps({ "data-dialog": true })).toHaveLength(0);
     expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBe(initialDraft);
-    expect(onDiscard).not.toHaveBeenCalled();
+    expect(onDepart).not.toHaveBeenCalled();
     expect(onCheckSavedVersion).toHaveBeenCalledTimes(stayAction === "Check saved version" ? 1 : 0);
 
     await act(async () => {
       history.push("/settings");
     });
-    await click(recovery ? "Discard and leave" : "Leave anyway");
+    await click("Discard and leave");
     expect(history.location.pathname).toBe("/settings");
     expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBeUndefined();
-    expect(onDiscard).toHaveBeenCalledOnce();
+    expect(onDepart).toHaveBeenCalledOnce();
+  },
+);
+
+it.each(["unsaved", "pending", "uncertain"] as const)(
+  "keeps the same %s draft and save state on returning to its catalog",
+  async (state) => {
+    if (state !== "unsaved") setSaveState(state);
+    const draft = appAtomRegistry.get(workflowDraftAtom).editors[key];
+    const { history } = await mount(["/workflows/repo/new"]);
+
+    await act(async () => {
+      history.push("/workflows/repo");
+    });
+    expect(history.location.pathname).toBe("/workflows/repo/new");
+    await click("Keep draft and leave");
+
+    expect(history.location.pathname).toBe("/workflows/repo");
+    expect(
+      appAtomRegistry.get(workflowDraftAtom).newWorkflowIds[workflowSessionKey(scope, "new")],
+    ).toBe(draft?.workflowId);
+    expect(appAtomRegistry.get(workflowDraftAtom).editors[key]).toBe(draft);
+    expect(onDepart).toHaveBeenCalledOnce();
+    expect(onCheckSavedVersion).not.toHaveBeenCalled();
   },
 );
 
@@ -310,7 +336,7 @@ it("offers Stay while another read is active and restores Check when it finishes
   await click("Check saved version");
   expect(history.location.pathname).toBe("/workflows");
   expect(onCheckSavedVersion).toHaveBeenCalledOnce();
-  expect(onDiscard).not.toHaveBeenCalled();
+  expect(onDepart).not.toHaveBeenCalled();
 });
 
 it.each([false, true])(
@@ -358,6 +384,7 @@ it.each([false, true])(
       history.push("/settings");
     });
     expect(dialogText()).toContain("Save in progress");
+    expect(dialogText()).not.toContain("Keep draft and leave");
     expect(dialogText().includes("Edits outside that save will be lost if you leave.")).toBe(
       !includesAutomation,
     );
@@ -377,7 +404,7 @@ it("stays in the editor when checking the saved version confirms the save", asyn
   expect(history.location.pathname).toBe("/workflows");
   expect(renderer!.root.findAllByProps({ "data-dialog": true })).toHaveLength(0);
   expect(appAtomRegistry.get(workflowDraftAtom).editors[key]?.baseline?.revision).toBe(1);
-  expect(onDiscard).not.toHaveBeenCalled();
+  expect(onDepart).not.toHaveBeenCalled();
 });
 
 it("continues the original departure if the submitted Save completes while its dialog is open", async () => {
@@ -393,7 +420,7 @@ it("continues the original departure if the submitted Save completes while its d
 
   expect(history.location.pathname).toBe("/settings");
   expect(appAtomRegistry.get(workflowDraftAtom).editors[key]?.baseline?.revision).toBe(1);
-  expect(onDiscard).not.toHaveBeenCalled();
+  expect(onDepart).toHaveBeenCalledOnce();
 });
 
 it("promotes the same recovered Create without discarding later edits and still blocks real departures", async () => {
@@ -431,6 +458,8 @@ it("promotes the same recovered Create without discarding later edits and still 
     history.push("/settings");
   });
   expect(history.location.pathname).toBe("/workflows/repo/flow/edit");
+  expect(dialogText()).toContain("Discard unsaved changes?");
+  expect(dialogText()).not.toContain("Keep draft and leave");
   await click("Keep editing");
 });
 for (const destination of ["/workflows/repo/other/edit", "/workflows/other/flow/edit"])

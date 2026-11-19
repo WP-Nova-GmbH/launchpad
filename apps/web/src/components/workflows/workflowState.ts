@@ -6,7 +6,6 @@ import {
   workflowJobReadAtom,
   updateWorkflowDrafts,
   workflowSessionKey,
-  replaceNewWorkflowDraft,
   sameWorkflowDefinition,
   sameWorkflowAutomation,
   normalizeWorkflowAutomation,
@@ -259,37 +258,6 @@ export function copiedWorkflowDraft(
       steps: structuredClone(source.definition.steps),
     },
   };
-}
-
-/** Draft replacement is explicit and cannot displace a pending or uncertain Create. */
-export async function openNewWorkflowDraft(
-  scope: WorkflowScope,
-  create: () => WorkflowEditorDraft | null,
-) {
-  const state = appAtomRegistry.get(workflowDraftAtom);
-  if (state.accountId !== scope.accountId) return null;
-  const id = state.newWorkflowIds[workflowSessionKey(scope, "new")];
-  const previous = id ? state.editors[workflowSessionKey(scope, id)] : undefined;
-  if (previous?.operation)
-    throw new Error(
-      "Finish or reconcile the retained new workflow's save before starting another draft.",
-    );
-  if (
-    previous &&
-    !previous.baseline &&
-    !(await confirmWorkflow("Discard the retained new workflow draft and start this one?"))
-  )
-    return null;
-  const draft = create();
-  if (!draft)
-    throw new Error(
-      "Enroll an organization machine with a checkout in the destination repository first.",
-    );
-  if (!replaceNewWorkflowDraft(appAtomRegistry, scope, previous, draft))
-    throw new Error(
-      "The retained draft changed while you were confirming. Review it before trying again.",
-    );
-  return draft.workflowId;
 }
 
 export function useActiveWorkflowView() {

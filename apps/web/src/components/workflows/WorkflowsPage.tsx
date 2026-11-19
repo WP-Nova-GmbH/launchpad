@@ -39,6 +39,7 @@ import {
   workflowDraftAutomationResolved,
   clearWorkflowScope,
   replaceNewWorkflowDraft,
+  type WorkflowEditorDraft,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
@@ -55,7 +56,12 @@ import { Spinner } from "../ui/spinner";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
 import { WorkflowCopyDialog } from "./WorkflowCopyDialog";
-import { WorkflowCatalogEmpty, WorkflowTemplateDialog } from "./WorkflowTemplateDialog";
+import {
+  WorkflowCatalogDraft,
+  WorkflowCatalogEmpty,
+  WorkflowDraftReplacementDialog,
+  WorkflowTemplateDialog,
+} from "./WorkflowTemplateDialog";
 import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
 import { WorkflowJob } from "./WorkflowJob";
@@ -71,7 +77,6 @@ import {
   copiedWorkflowDraft,
   workflowCopyNeedsCheckout,
   type WorkflowTemplate,
-  openNewWorkflowDraft,
   useActiveWorkflowView,
   confirmWorkflow,
   saveWorkflowDraft,
@@ -388,22 +393,29 @@ function WorkflowRepositoryView({
     const { activeElement, body } = source.ownerDocument;
     if (activeElement === source || activeElement === body) restoredWorkflowEdit.current?.focus();
   }, [restoreFocusId, canChooseTemplate]);
-  const [templateOpen, setTemplateOpen] = useState(false);
-  const [templateBusy, setTemplateBusy] = useState(false);
+  const [templateDialog, setTemplateDialog] = useState<
+    "picker" | { draft: WorkflowEditorDraft; template: WorkflowTemplate } | null
+  >(null);
+  const [selectedTemplate, setSelectedTemplate] = useState<WorkflowTemplate>("review");
   const [templateError, setTemplateError] = useState<string | null>(null);
-  const templateRequest = useRef<object | null>(null);
+  const templateOpener = useRef<HTMLButtonElement>(null);
   const closeTemplates = useCallback(() => {
-    templateRequest.current = null;
-    setTemplateOpen(false);
-    setTemplateBusy(false);
+    setTemplateDialog(null);
     setTemplateError(null);
   }, []);
   const templateCatalog = useRef({ canChooseTemplate, projects, projectsUnavailable, vmAuthoring });
   useLayoutEffect(() => {
     templateCatalog.current = { canChooseTemplate, projects, projectsUnavailable, vmAuthoring };
-    // oxlint-disable-next-line react/set-state-in-effect -- Cancel pending confirmation when its catalog view loses ownership.
-    if (!canChooseTemplate && templateOpen) closeTemplates();
-  }, [canChooseTemplate, projects, projectsUnavailable, vmAuthoring, templateOpen, closeTemplates]);
+    // oxlint-disable-next-line react/set-state-in-effect -- Close the dialog when its catalog view loses ownership.
+    if (!canChooseTemplate && templateDialog) closeTemplates();
+  }, [
+    canChooseTemplate,
+    projects,
+    projectsUnavailable,
+    vmAuthoring,
+    templateDialog,
+    closeTemplates,
+  ]);
   const newWorkflowSlot = workflowSessionKey(scope, "new");
   const newWorkflowId = drafts.newWorkflowIds[newWorkflowSlot];
   const newWorkflow = newWorkflowId
@@ -459,7 +471,6 @@ function WorkflowRepositoryView({
   useLayoutEffect(
     () => () => {
       copyRequest.current = null;
-      templateRequest.current = null;
     },
     [],
   );
@@ -552,53 +563,55 @@ function WorkflowRepositoryView({
       openDraft();
   };
   const openTemplates = () => {
+    setSelectedTemplate("review");
     setTemplateError(null);
-    setTemplateOpen(true);
+    setTemplateDialog("picker");
   };
-  const useTemplate = async (template: WorkflowTemplate) => {
-    if (!canChooseTemplate || vmAuthoring === null || templateRequest.current) return;
-    const request = {};
-    templateRequest.current = request;
-    setTemplateBusy(true);
-    setTemplateError(null);
-    const owns = () => active.current && templateRequest.current === request;
-    try {
-      const id = await openNewWorkflowDraft(scope, () => {
-        const current = templateCatalog.current;
-        if (!owns() || !current.canChooseTemplate || current.vmAuthoring === null) return null;
-        if (!current.vmAuthoring && !current.projects.length)
-          throw new Error(
-            current.projectsUnavailable
-              ? "Machine checkouts could not be loaded. Retry loading checkouts."
-              : "This template requires a Machine checkout in this repository.",
-          );
-        return newWorkflowDraft(current.projects, template, !!current.vmAuthoring);
-      });
-      if (!owns() || !templateCatalog.current.canChooseTemplate || !id) return;
+  const installTemplate = (
+    template: WorkflowTemplate,
+    expected: WorkflowEditorDraft | undefined,
+  ) => {
+    const current = templateCatalog.current;
+    if (!active.current || !current.canChooseTemplate || current.vmAuthoring === null) return;
+    const draft = newWorkflowDraft(current.projects, template, !!current.vmAuthoring);
+    if (!draft) {
+      setTemplateError(
+        current.projectsUnavailable
+          ? "Machine checkouts could not be loaded. Retry loading checkouts."
+          : "This template requires a Machine checkout in this repository.",
+      );
+    } else if (!replaceNewWorkflowDraft(appAtomRegistry, scope, expected, draft)) {
+      setTemplateError(
+        "The retained draft changed while you were confirming. Review it before trying again.",
+      );
+    } else {
       closeTemplates();
       openDraft();
-    } catch (cause) {
-      if (owns() && templateCatalog.current.canChooseTemplate)
-        setTemplateError(workflowError(cause));
-    } finally {
-      if (owns()) {
-        templateRequest.current = null;
-        setTemplateBusy(false);
-      }
+      return;
+    }
+    setTemplateDialog("picker");
+  };
+  const useTemplate = (template: WorkflowTemplate) => {
+    if (templateDialog !== "picker" || !templateCatalog.current.canChooseTemplate) return;
+    if (newWorkflow?.operation) {
+      setTemplateError(
+        newWorkflow.operation.state === "pending"
+          ? "Wait for the existing draft to finish saving before starting another."
+          : "Resume the existing draft to resolve its save before starting another.",
+      );
+    } else if (retainedDraft) {
+      setTemplateError(null);
+      setTemplateDialog({ draft: retainedDraft, template });
+    } else {
+      installTemplate(template, newWorkflow);
     }
   };
-  const creationActions = canChooseTemplate ? (
-    <div className="flex flex-wrap gap-2">
-      {retainedDraft && !retainedDraft.operation ? (
-        <Button variant="outline" disabled={vmAuthoring === null} onClick={openTemplates}>
-          Start another workflow
-        </Button>
-      ) : null}
-      <Button disabled={vmAuthoring === null} onClick={retainedDraft ? resumeDraft : openTemplates}>
-        {retainedDraft ? "Resume new workflow" : "Create workflow"}
+  const createWorkflow =
+    canChooseTemplate && !retainedDraft ? (
+      <Button ref={templateOpener} disabled={vmAuthoring === null} onClick={openTemplates}>
+        Create workflow
       </Button>
-    </div>
-  ) : null;
+    ) : null;
   const loadGeneration = useRef(0);
   const refresh = useCallback(async () => {
     const generation = ++loadGeneration.current;
@@ -1279,32 +1292,45 @@ function WorkflowRepositoryView({
           onCopy={() => void copySaved()}
         />
       ) : null}
-      {templateOpen && canChooseTemplate && vmAuthoring !== null ? (
-        <WorkflowTemplateDialog
-          repositoryName={entry.repository.name}
-          vmAuthoring={!!vmAuthoring}
-          hasMachineCheckout={projects.length > 0}
-          projectsUnavailable={projectsUnavailable}
-          busy={templateBusy}
-          error={templateError}
-          onRefreshCheckouts={() => {
-            setTemplateError(null);
-            refreshOrganizationCatalog();
-          }}
-          onOpenMachines={
-            organizationAdmin
-              ? () => {
-                  closeTemplates();
-                  void navigate({
-                    to: "/settings/organization",
-                    hash: searchableSetting("organization-machines").id,
-                  });
-                }
-              : undefined
-          }
-          onCreate={(template) => void useTemplate(template)}
-          onClose={closeTemplates}
-        />
+      {templateDialog && canChooseTemplate && vmAuthoring !== null ? (
+        templateDialog === "picker" ? (
+          <WorkflowTemplateDialog
+            repositoryName={entry.repository.name}
+            vmAuthoring={!!vmAuthoring}
+            hasMachineCheckout={projects.length > 0}
+            projectsUnavailable={projectsUnavailable}
+            selected={selectedTemplate}
+            onSelect={setSelectedTemplate}
+            finalFocus={templateOpener}
+            error={templateError}
+            onRefreshCheckouts={() => {
+              setTemplateError(null);
+              refreshOrganizationCatalog();
+            }}
+            onOpenMachines={
+              organizationAdmin
+                ? () => {
+                    closeTemplates();
+                    void navigate({
+                      to: "/settings/organization",
+                      hash: searchableSetting("organization-machines").id,
+                    });
+                  }
+                : undefined
+            }
+            onCreate={useTemplate}
+            onClose={closeTemplates}
+          />
+        ) : (
+          <WorkflowDraftReplacementDialog
+            repositoryName={entry.repository.name}
+            draft={templateDialog.draft}
+            template={templateDialog.template}
+            finalFocus={templateOpener}
+            onKeep={closeTemplates}
+            onReplace={() => installTemplate(templateDialog.template, templateDialog.draft)}
+          />
+        )
       ) : null}
       <WorkspacePageHeader electron={isElectron}>
         <h1 className="text-sm font-medium">Workflows</h1>
@@ -1439,22 +1465,43 @@ function WorkflowRepositoryView({
                       repositoryId={scope.repositoryId}
                       repositoryName={entry.repository.name}
                     />
-                    {firstWorkflow ? null : creationActions}
+                    {firstWorkflow ? null : createWorkflow}
                   </div>
                 ) : null}
               </div>
               {tab === "workflows" ? (
                 <div className="@container/workflow-catalog">
+                  {canChooseTemplate && retainedDraft ? (
+                    <div className={workflows.length ? "mb-4" : undefined}>
+                      <WorkflowCatalogDraft
+                        draft={retainedDraft}
+                        actions={
+                          <div className="flex flex-wrap gap-2">
+                            {!retainedDraft.operation ? (
+                              <Button
+                                ref={templateOpener}
+                                variant="outline"
+                                disabled={vmAuthoring === null}
+                                onClick={openTemplates}
+                              >
+                                Start another workflow
+                              </Button>
+                            ) : null}
+                            <Button
+                              ref={retainedDraft.operation ? templateOpener : undefined}
+                              disabled={vmAuthoring === null}
+                              onClick={resumeDraft}
+                            >
+                              Resume draft
+                            </Button>
+                          </div>
+                        }
+                      />
+                    </div>
+                  ) : null}
                   {rows(false)}
-                  {firstWorkflow ? (
-                    <WorkflowCatalogEmpty
-                      actions={creationActions}
-                      draftName={
-                        canChooseTemplate && retainedDraft
-                          ? retainedDraft.definition.name || "New workflow"
-                          : undefined
-                      }
-                    />
+                  {firstWorkflow && !(canChooseTemplate && retainedDraft) ? (
+                    <WorkflowCatalogEmpty actions={createWorkflow} />
                   ) : archivedOnly ? (
                     <div className="flex items-start gap-3 rounded-lg border bg-card p-4 text-card-foreground">
                       <ArchiveIcon
