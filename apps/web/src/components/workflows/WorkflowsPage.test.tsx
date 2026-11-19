@@ -1595,10 +1595,16 @@ it.effect("refreshes open editor dependencies and ignores a late Codex status fa
         renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
       );
       await act(() =>
-        renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
-          target: { value: "release/1.x" },
-        }),
+        renderer!.root.findByProps({ type: "radio", value: "specific" }).props.onChange(),
       );
+      const branchName = () =>
+        renderer!.root
+          .findAllByType("input")
+          .find(
+            (input) =>
+              typeof input.props.id === "string" && input.props.id.endsWith("-branch-name"),
+          )!;
+      await act(() => branchName().props.onChange({ target: { value: "release/1.x" } }));
       const findMachine = () => renderer!.root.findByProps({ type: "radio", value: "machine" });
       expect(findMachine().props.disabled).toBe(true);
       expect(content()).toContain("Machine checkouts could not be loaded.");
@@ -1625,9 +1631,7 @@ it.effect("refreshes open editor dependencies and ignores a late Codex status fa
       });
       expect(content()).not.toContain("Could not check the organization's Codex connection.");
       expect(findMachine().props.disabled).toBe(false);
-      expect(renderer!.root.findByProps({ placeholder: "Repository default" }).props.value).toBe(
-        "release/1.x",
-      );
+      expect(branchName().props.value).toBe("release/1.x");
       const targetGroup = renderer!.root
         .findAllByType("div")
         .find((node) => node.props.role === "radiogroup")!;

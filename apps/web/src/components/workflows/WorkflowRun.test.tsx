@@ -963,6 +963,14 @@ describe("VM Run submission recovery", () => {
     await mount(props);
     await submit();
 
+    await update({
+      ...props,
+      workflow: {
+        ...vmWorkflow,
+        revision: 2,
+        definition: { ...vmWorkflow.definition, name: "Renamed workflow" },
+      },
+    });
     expect(alertText()).toContain("Base branch unavailable");
     await press("Edit workflow");
     expect(navigate).toHaveBeenLastCalledWith({
@@ -975,7 +983,7 @@ describe("VM Run submission recovery", () => {
       ...props,
       workflow: {
         ...vmWorkflow,
-        revision: 2,
+        revision: 3,
         definition: { ...vmWorkflow.definition, target: { kind: "vm", baseBranch: "main" } },
       },
     });

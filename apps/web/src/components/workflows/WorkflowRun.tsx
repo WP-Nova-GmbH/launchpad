@@ -160,10 +160,16 @@ function WorkflowRunForm({
   const uncertain = draft.operation?.state === "uncertain";
   const runBlocked = vmUnavailable || workflow.archived;
   const rejectedRevision = draft.vmStartFailureRevision;
+  const sameRejectedBranch =
+    savedTarget.kind === "vm" &&
+    draft.vmStartFailure?.kind === "base-branch-unavailable" &&
+    draft.vmStartFailure.branch === savedTarget.baseBranch;
   const staleVmStartFailure =
     draft.vmStartFailure &&
     (savedTarget.kind !== "vm" ||
-      (rejectedRevision !== undefined && workflow.revision > rejectedRevision));
+      (rejectedRevision !== undefined &&
+        workflow.revision > rejectedRevision &&
+        !sameRejectedBranch));
   const retryingStart =
     savedTarget.kind === "vm" &&
     pending &&

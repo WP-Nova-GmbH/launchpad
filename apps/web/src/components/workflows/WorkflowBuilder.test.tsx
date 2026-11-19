@@ -1279,12 +1279,31 @@ describe("VM authoring", () => {
     act(() =>
       renderer!.root.findByProps({ "data-workflow-target": true }).props.onValueChange(kind),
     );
+  const baseBranchMode = (value: "default" | "specific") =>
+    renderer!.root.findByProps({ type: "radio", value });
+  const chooseBaseBranchMode = (value: "default" | "specific") =>
+    act(() => baseBranchMode(value).props.onChange({ target: { checked: true } }));
+  const baseBranchInput = () =>
+    renderer!.root
+      .findAllByType("input")
+      .find((node) => typeof node.props.id === "string" && node.props.id.endsWith("-branch-name"));
   const changeBaseBranch = (value: string) =>
-    act(() =>
-      renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
-        target: { value },
-      }),
-    );
+    act(() => baseBranchInput()!.props.onChange({ target: { value } }));
+  const recordUnavailableSavedBranch = (workflow: RepositoryWorkflow, branch: string) =>
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      runs: {
+        ...state.runs,
+        [workflowSessionKey(scope, workflow.workflowId)]: {
+          instruction: "Keep the run instructions.",
+          operation: null,
+          startedJobId: null,
+          error: "Choose an existing GitHub base branch with at least one commit.",
+          vmStartFailure: { kind: "base-branch-unavailable", branch },
+          vmStartFailureRevision: workflow.revision,
+        },
+      },
+    }));
   const checkoutPicker = () => renderer!.root.findByProps({ "data-checkout-picker": true });
   const checkoutOptions = () => checkoutPicker().findAllByProps({ role: "option" });
   const searchCheckouts = (value: string) =>
@@ -1747,7 +1766,7 @@ describe("VM authoring", () => {
   it.each([
     { name: "the saved override", edit: undefined, expected: "release/1.x" },
     { name: "an unsaved override", edit: "release/2.x", expected: "release/2.x" },
-    { name: "an unsaved reset to the default", edit: "", expected: null },
+    { name: "an unsaved reset to the default", edit: null, expected: null },
   ])("restores $name after returning to VM in the retained draft", async ({ edit, expected }) => {
     const workflow: RepositoryWorkflow = {
       workflowId: "saved-vm",
@@ -1766,7 +1785,8 @@ describe("VM authoring", () => {
     read.mockResolvedValue({ status: "connected" });
     await mount(props);
     await openExecutionSettings();
-    if (edit !== undefined) await changeBaseBranch(edit);
+    if (edit === null) await chooseBaseBranchMode("default");
+    else if (edit !== undefined) await changeBaseBranch(edit);
     await chooseExecutionTarget("machine");
     expect(editor(workflow.workflowId).definition.target.kind).toBe("machine");
     await unmount();
@@ -1777,9 +1797,8 @@ describe("VM authoring", () => {
       kind: "vm",
       baseBranch: expected,
     });
-    expect(renderer!.root.findByProps({ placeholder: "Repository default" }).props.value).toBe(
-      expected ?? "",
-    );
+    expect(baseBranchMode(expected === null ? "default" : "specific").props.checked).toBe(true);
+    expect(baseBranchInput()?.props.value).toBe(expected ?? undefined);
   });
 
   it.each(["Discard changes", "Reload saved version"] as const)(
@@ -1799,6 +1818,7 @@ describe("VM authoring", () => {
       await mount({ ...base, workflow, isNew: false, vmAuthoring: { models: null } });
       await openExecutionSettings();
       await chooseExecutionTarget("vm");
+      await chooseBaseBranchMode("specific");
       await changeBaseBranch("unsaved-branch");
       await chooseExecutionTarget("machine");
       if (action === "Reload saved version") {
@@ -1824,11 +1844,8 @@ describe("VM authoring", () => {
     await act(() =>
       renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
     );
-    await act(() =>
-      renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
-        target: { value: "release/1.x " },
-      }),
-    );
+    await chooseBaseBranchMode("specific");
+    await changeBaseBranch("release/1.x ");
     const receipt: RepositoryWorkflow = {
       ...saved(id),
       definition: { ...editor(id).definition, target: { kind: "vm", baseBranch: "release/1.x" } },
@@ -1853,6 +1870,132 @@ describe("VM authoring", () => {
       }),
     );
   });
+
+  it("blocks saving a blank specific branch until the default is explicitly selected", async () => {
+    const workflow = saved("branch-mode", 1, {
+      ...newWorkflowDraft([], "review", true)!.definition,
+      target: { kind: "vm", baseBranch: "release/1.x" },
+    });
+    read.mockResolvedValueOnce({ status: "connected" });
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      vmAuthoring: { models: null },
+    });
+    expect(baseBranchMode("specific").props.checked).toBe(true);
+    await chooseBaseBranchMode("default");
+    await chooseBaseBranchMode("specific");
+    expect(baseBranchInput()?.props.value).toBe("release/1.x");
+
+    await changeBaseBranch("   ");
+    await submit();
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(baseBranchInput()?.props["aria-invalid"]).toBe(true);
+    expect(editor(workflow.workflowId).operation).toBeNull();
+
+    await chooseBaseBranchMode("default");
+    expect(baseBranchMode("default").props.checked).toBe(true);
+    expect(baseBranchInput()).toBeUndefined();
+    const updated = saved(workflow.workflowId, 2, {
+      ...workflow.definition,
+      target: { kind: "vm", baseBranch: null },
+    });
+    read.mockResolvedValueOnce(updated);
+    await submit();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(editor(workflow.workflowId).baseline?.definition.target).toEqual(
+      updated.definition.target,
+    );
+    await chooseBaseBranchMode("specific");
+    expect(baseBranchInput()?.props.value).toBe("");
+  });
+
+  it("keeps the rejected branch warning through a rename until a replacement branch is saved", async () => {
+    const branch = "release/missing";
+    const workflow = saved("unavailable-branch", 1, {
+      ...newWorkflowDraft([], "review", true)!.definition,
+      target: { kind: "vm", baseBranch: branch },
+    });
+    recordUnavailableSavedBranch(workflow, branch);
+    const props: Props = {
+      ...base,
+      workflow,
+      isNew: false,
+      openExecutionSettings: true,
+      vmAuthoring: { models: null },
+    };
+    read.mockResolvedValue({ status: "connected" });
+    await mount(props);
+
+    expect(textOf(renderer!.root)).toContain("Saved branch unavailable");
+    expect(baseBranchInput()?.props).toMatchObject({ value: branch, "aria-invalid": true });
+    await chooseExecutionTarget("machine");
+    expect(textOf(renderer!.root)).not.toContain("Saved branch unavailable");
+    await chooseExecutionTarget("vm");
+    expect(textOf(renderer!.root)).toContain("Saved branch unavailable");
+
+    await rename("Renamed workflow");
+    const renamed = saved(workflow.workflowId, 2);
+    read.mockResolvedValueOnce(renamed);
+    await submit();
+    expect(editor(workflow.workflowId).baseline).toEqual(renamed);
+    expect(textOf(renderer!.root)).toContain("Saved branch unavailable");
+    expect(baseBranchInput()?.props).toMatchObject({ value: branch, "aria-invalid": true });
+
+    await changeBaseBranch("release/replacement");
+    const repaired = saved(workflow.workflowId, 3);
+    read.mockResolvedValueOnce(repaired);
+    await submit();
+    expect(editor(workflow.workflowId).baseline).toEqual(repaired);
+    expect(textOf(renderer!.root)).not.toContain("Saved branch unavailable");
+    expect(baseBranchInput()?.props.value).toBe("release/replacement");
+  });
+
+  it.each(["clean", "dirty"] as const)(
+    "opens branch recovery with a %s retained editor on an older revision",
+    async (draftState) => {
+      const branch = "release/missing";
+      const older = saved("branch-recovery", 1, newWorkflowDraft([project])!.definition);
+      const newer = saved(older.workflowId, 2, {
+        ...older.definition,
+        target: { kind: "vm", baseBranch: branch },
+      });
+      const props = { ...base, isNew: false, vmAuthoring: { models: null } };
+      read.mockResolvedValue({ status: "connected" });
+      await mount({ ...props, workflow: older });
+      if (draftState === "dirty") await rename("Unsaved name");
+      await unmount();
+
+      recordUnavailableSavedBranch(newer, branch);
+      await mount({ ...props, workflow: newer, openExecutionSettings: true });
+
+      if (draftState === "dirty") {
+        expect(editor(older.workflowId).baseline).toEqual(older);
+        expect(editor(older.workflowId).definition).toEqual({
+          ...older.definition,
+          name: "Unsaved name",
+        });
+        return;
+      }
+
+      expect(editor(older.workflowId).baseline).toEqual(newer);
+      expect(baseBranchInput()?.props).toMatchObject({ value: branch, "aria-invalid": true });
+      expect(textOf(renderer!.root)).toContain("Saved branch unavailable");
+      await changeBaseBranch("release/replacement");
+      const repair = deferred<RepositoryWorkflow>();
+      const repaired = saved(older.workflowId, 3);
+      read.mockReturnValueOnce(repair.promise);
+      await submit();
+      expect(editor(older.workflowId).operation?.expectedRevision).toBe(newer.revision);
+      await act(async () => {
+        repair.resolve(repaired);
+        await repair.promise;
+      });
+      expect(editor(older.workflowId).baseline).toEqual(repaired);
+    },
+  );
 
   it.each([false, true])(
     "uses saved VM Run availability %s when the draft switches to a machine",

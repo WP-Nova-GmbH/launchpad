@@ -8,6 +8,7 @@ import {
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
 import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import { WorkflowCheckoutPicker } from "./WorkflowCheckoutPicker";
+import { WorkflowVmBaseBranch } from "./WorkflowVmBaseBranch";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { OwnerSources } from "./WorkflowOwnerSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
@@ -49,7 +50,6 @@ import {
   AlertDialogPopup,
   AlertDialogTitle,
 } from "../ui/alert-dialog";
-import { Input } from "../ui/input";
 import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
 import { WorkflowStepEditor, useWorkflowEditorModels } from "./WorkflowStepEditor";
 import { WorkflowCanvas, workflowInsertionIndex, type WorkflowInsertion } from "./WorkflowCanvas";
@@ -104,6 +104,7 @@ function matchesDiscardedDraft(current: WorkflowEditorDraft, confirmed: Workflow
     current.automationResolved === confirmed.automationResolved &&
     current.targetConfirmed === confirmed.targetConfirmed &&
     current.lastVmTarget === confirmed.lastVmTarget &&
+    current.lastVmBaseBranch === confirmed.lastVmBaseBranch &&
     current.operation === confirmed.operation &&
     current.saveRecovery === confirmed.saveRecovery &&
     current.error === confirmed.error
@@ -186,7 +187,15 @@ function WorkflowBuilderEditor({
   const active = useActiveWorkflowView();
   const state = useWorkflowDrafts();
   const key = workflowSessionKey(scope, id ?? "missing");
-  const draft = id ? state.editors[key] : undefined;
+  const retainedDraft = id ? state.editors[key] : undefined;
+  const runDraft = state.runs[key];
+  const branchFailure =
+    runDraft?.error &&
+    !runDraft.operation &&
+    runDraft.vmStartFailure?.kind === "base-branch-unavailable"
+      ? runDraft.vmStartFailure
+      : undefined;
+  const rejectedRevision = runDraft?.vmStartFailureRevision ?? 0;
   const workflowRevision = workflow?.revision ?? 0;
   const [latestKnownRevision, setLatestKnownRevision] = useState(workflowRevision);
   if (workflowRevision > latestKnownRevision) setLatestKnownRevision(workflowRevision);
@@ -200,6 +209,29 @@ function WorkflowBuilderEditor({
   }, [projects, projectsUnavailable]);
   const readRequest = useRef<{ draft: WorkflowEditorDraft } | null>(null);
   const [reading, setReading] = useState(false);
+  // Render the latest saved target before the inspector chooses its initial focus.
+  const recoveredDraft =
+    canConfigure &&
+    openExecutionSettings &&
+    branchFailure &&
+    !reading &&
+    workflow &&
+    workflow.revision >= Math.max(rejectedRevision, latestKnownRevision) &&
+    retainedDraft?.baseline &&
+    workflow.revision > retainedDraft.baseline.revision &&
+    !retainedDraft.operation &&
+    !workflowEditorDirty(retainedDraft)
+      ? savedWorkflowDraft(workflow, automationSupported)
+      : undefined;
+  const draft = recoveredDraft ?? retainedDraft;
+  useLayoutEffect(() => {
+    if (!recoveredDraft || isDeparting()) return;
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) =>
+      state.editors[key] === retainedDraft
+        ? { ...state, editors: { ...state.editors, [key]: recoveredDraft } }
+        : state,
+    );
+  }, [recoveredDraft, retainedDraft, scope.accountId, key, isDeparting]);
   const [notice, setNotice] = useState<string | null>(null);
   const [discardReloadStatus, setDiscardReloadStatus] = useState<DiscardReloadStatus>(null);
   const [codexNotice, setCodexNotice] = useState<string | null>(null);
@@ -734,7 +766,15 @@ function WorkflowBuilderEditor({
     return inserted ? stepId : null;
   };
   const vmRunUnavailable = currentSaved?.definition.target.kind === "vm" && !vmExecutionAvailable;
-  const runDraft = state.runs[key];
+  const savedTarget = currentSaved?.definition.target;
+  const unavailableSavedBranch =
+    branchFailure &&
+    currentSaved &&
+    currentSaved.revision >= Math.max(rejectedRevision, latestKnownRevision) &&
+    savedTarget?.kind === "vm" &&
+    savedTarget.baseBranch === branchFailure.branch
+      ? branchFailure.branch
+      : undefined;
   const hasRunSubmission =
     runDraft?.operation?.targetKind === "vm" ||
     ((archived || vmRunUnavailable) && runDraft?.operation?.state === "uncertain");
@@ -756,7 +796,8 @@ function WorkflowBuilderEditor({
       pending={pending}
       archived={archived}
       savedRevision={currentSaved?.revision}
-      latestSavedTarget={currentSaved?.definition.target}
+      latestSavedTarget={savedTarget}
+      unavailableSavedBranch={unavailableSavedBranch}
       discardSavedRevision={discardSavedRevision}
       discardReloadStatus={discardReloadStatus}
       vmRunUnavailable={vmRunUnavailable}
@@ -808,6 +849,7 @@ function WorkflowBuilderWorkspace({
   archived,
   savedRevision,
   latestSavedTarget,
+  unavailableSavedBranch,
   discardSavedRevision,
   discardReloadStatus,
   vmRunUnavailable,
@@ -843,6 +885,7 @@ function WorkflowBuilderWorkspace({
   archived: boolean;
   savedRevision: number | undefined;
   latestSavedTarget: WorkflowTarget | undefined;
+  unavailableSavedBranch: string | null | undefined;
   discardSavedRevision: number;
   discardReloadStatus: DiscardReloadStatus;
   vmRunUnavailable: boolean;
@@ -1008,7 +1051,10 @@ function WorkflowBuilderWorkspace({
   const questionInInspector =
     issue?.field === "question" && issue.stepId === selected?.id && !triggerOpen && !settingsOpen;
   const showPromptNotice = missingStepPrompt && !questionInInspector;
-  const fieldValidationIssue = (issue?.field === "name" && missingName) || missingStepPrompt;
+  const fieldValidationIssue =
+    (issue?.field === "name" && missingName) ||
+    (issue?.field === "baseBranch" && settingsOpen && !triggerOpen) ||
+    missingStepPrompt;
   const editorIssue = publishingIssueInInspector || fieldValidationIssue ? null : issue;
   const editorError =
     !draft.operation &&
@@ -1040,9 +1086,13 @@ function WorkflowBuilderWorkspace({
         ? "Saved checkout unavailable"
         : "Selected checkout unavailable"
       : null;
+  const vmBranchLabel =
+    vm?.baseBranch === null
+      ? "Repository default"
+      : vm?.baseBranch?.trim() || "Branch name required";
   const targetLabel = draft.targetConfirmed
     ? vm
-      ? `VM · ${vm.baseBranch ?? "Repository default"}`
+      ? `VM · ${vmBranchLabel}`
       : target
         ? `${target.machineLabel} · ${target.title}`
         : (checkoutWarning ?? "Machine checkouts could not be loaded")
@@ -1067,9 +1117,19 @@ function WorkflowBuilderWorkspace({
         : "close-settings";
   const recoveryField =
     !projectsUnavailable && !projects.length && canChooseVm ? "target:vm" : machineSettingsField;
+  const branchRecoveryField =
+    vm && draft.targetConfirmed && unavailableSavedBranch !== undefined
+      ? vm.baseBranch === null
+        ? "baseBranch:default"
+        : "baseBranch"
+      : null;
   const entryFocus = useRef<WorkflowFieldFocus | null>(
     openExecutionSettings
-      ? { field: pending ? "close-settings" : recoveryField, stepId: null }
+      ? {
+          field: pending ? "close-settings" : (branchRecoveryField ?? recoveryField),
+          stepId: null,
+          scrollIntoView: !pending && branchRecoveryField !== null,
+        }
       : null,
   );
   const machineDescription = projects.length
@@ -1271,7 +1331,7 @@ function WorkflowBuilderWorkspace({
     setFocusRequest({
       field: problem.publishing ? "repair" : problem.field,
       stepId: problem.stepId,
-      scrollIntoView: missingStepPrompt,
+      scrollIntoView: missingStepPrompt || problem.field === "baseBranch",
     });
   };
   const reviewIssueAction = editorIssue ? (
@@ -1323,6 +1383,11 @@ function WorkflowBuilderWorkspace({
     }
     const problem = issue;
     if (problem) {
+      if (problem.field === "baseBranch") {
+        if (!settingsOpen || triggerOpen) openSettings();
+        focusIssue(problem);
+        return;
+      }
       if (problem.field === "name" && missingName)
         returnFocus.current = fields.current.get("name") ?? null;
       else if (problem.publishing || missingStepPrompt)
@@ -1634,21 +1699,29 @@ function WorkflowBuilderWorkspace({
             </p>
           ) : null}
           {vm && draft.targetConfirmed ? (
-            <label className={styles["workflow-settings-field"]}>
-              <span>Base branch</span>
-              <Input
-                ref={(node) => registerField("baseBranch", node)}
-                value={vm.baseBranch ?? ""}
-                placeholder="Repository default"
-                onChange={(event) => {
-                  const baseBranch = event.target.value || null;
-                  edit((current) => ({
+            <WorkflowVmBaseBranch
+              id={settingsId}
+              baseBranch={vm.baseBranch}
+              unavailableSavedBranch={unavailableSavedBranch}
+              disabled={pending}
+              registerField={registerField}
+              onChange={(nextBranch) =>
+                edit((current) => {
+                  const target = current.definition.target;
+                  if (target.kind !== "vm") return current;
+                  const baseBranch =
+                    nextBranch === "" && target.baseBranch === null
+                      ? (current.lastVmBaseBranch ?? "")
+                      : nextBranch;
+                  return {
                     ...current,
-                    definition: { ...current.definition, target: { kind: "vm", baseBranch } },
-                  }));
-                }}
-              />
-            </label>
+                    lastVmBaseBranch:
+                      baseBranch === null ? (target.baseBranch ?? undefined) : undefined,
+                    definition: { ...current.definition, target: { ...target, baseBranch } },
+                  };
+                })
+              }
+            />
           ) : null}
         </section>
         <section className={styles["workflow-settings-row"]} aria-label="Repository">
@@ -2016,7 +2089,7 @@ function WorkflowBuilderWorkspace({
                 {vm && draft.targetConfirmed ? (
                   <>
                     <GitBranchIcon aria-hidden />
-                    <span>{vm.baseBranch ?? "Repository default"}</span>
+                    <span>{vmBranchLabel}</span>
                   </>
                 ) : null}
                 <ChevronDownIcon aria-hidden />

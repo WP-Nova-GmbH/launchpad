@@ -33,6 +33,7 @@ import {
   type RelayOrganizationProject,
 } from "@t3tools/contracts/relay";
 import {
+  updateWorkflowDrafts,
   workflowDraftAtom,
   workflowSessionKey,
   setWorkflowSessionAccount,
@@ -311,7 +312,7 @@ vi.mock("../ui/radio-group", () => ({
 }));
 
 import { WorkflowBuilder } from "./WorkflowBuilder";
-import { editWorkflowDraft } from "./workflowState";
+import { editWorkflowDraft, newWorkflowDraft } from "./workflowState";
 const scope = {
   accountId: "focus-account",
   organizationId: "organization",
@@ -354,10 +355,14 @@ async function mount(
     projects = vm ? [] : [project],
     automationSupported = false,
     useRoutes = false,
+    workflow,
+    openExecutionSettings = false,
   }: {
     projects?: ReadonlyArray<RelayOrganizationProject>;
     automationSupported?: boolean;
     useRoutes?: boolean;
+    workflow?: RepositoryWorkflow;
+    openExecutionSettings?: boolean;
   } = {},
 ) {
   const editor = (workflowId?: string) => (
@@ -368,9 +373,10 @@ async function mount(
         projects={projects}
         vmAuthoring={vm ? { models: null } : undefined}
         automationSupported={automationSupported}
-        isNew={!workflowId}
-        workflowId={workflowId}
-        workflow={undefined}
+        isNew={!workflow && !workflowId}
+        workflowId={workflow?.workflowId ?? workflowId}
+        workflow={workflow}
+        openExecutionSettings={openExecutionSettings}
         canConfigure
         call={async <A,>() => (await request()) as A}
         refresh={() => {}}
@@ -439,7 +445,7 @@ async function mount(
                   ? "close-settings"
                   : props.type === "submit"
                     ? "save"
-                    : props.placeholder === "Repository default"
+                    : typeof props.id === "string" && props.id.endsWith("-branch-name")
                       ? "baseBranch"
                       : props.children === "Check saved version" ||
                           props.children === "Retry original save"
@@ -569,6 +575,31 @@ describe("Save recovery focus", () => {
 });
 
 describe("Editor validation focus", () => {
+  it("returns focus to the settings opener after submitting a blank branch from its input", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    await mount(true);
+    const opener = new FocusNode();
+    opener.focus();
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
+    );
+    await act(() =>
+      renderer!.root.findByProps({ type: "radio", value: "specific" }).props.onChange(),
+    );
+    field("baseBranch").focus();
+
+    await act(() =>
+      renderer!.root.findByType("form").props.onSubmit({
+        preventDefault() {},
+        nativeEvent: { submitter: field("save") },
+      }),
+    );
+    expect(focusDocument.activeElement).toBe(field("baseBranch"));
+
+    await act(() => renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick());
+    expect(focusDocument.activeElement).toBe(opener);
+  });
+
   it("describes a missing name, focuses it on Save, and clears the error after editing", async () => {
     await mount();
     const nameInput = () =>
@@ -1039,6 +1070,43 @@ describe("Inspector presentation focus", () => {
     expect(focusDocument.activeElement).toBe(field("header-target"));
   });
 
+  it("scrolls to the unavailable saved branch when entering from Run", async () => {
+    const branch = "release/missing";
+    const workflow: RepositoryWorkflow = {
+      workflowId: "missing-branch",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      definition: {
+        ...newWorkflowDraft([], "review", true)!.definition,
+        target: { kind: "vm", baseBranch: branch },
+      },
+      revision: 1,
+      archived: false,
+      createdAt: "now",
+      updatedAt: "now",
+    };
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      runs: {
+        ...state.runs,
+        [workflowSessionKey(scope, workflow.workflowId)]: {
+          instruction: "Run instructions",
+          operation: null,
+          startedJobId: null,
+          error: "Choose an existing GitHub base branch with at least one commit.",
+          vmStartFailure: { kind: "base-branch-unavailable", branch },
+          vmStartFailureRevision: workflow.revision,
+        },
+      },
+    }));
+    request.mockResolvedValue({ status: "connected" });
+    await mount(true, { workflow, openExecutionSettings: true });
+
+    expect(focusDocument.activeElement).toBe(field("baseBranch"));
+    expect(field("baseBranch").value).toBe(branch);
+    expect(field("baseBranch").focusOptions?.preventScroll).toBe(false);
+  });
+
   it.each([
     { vm: false, key: "checkout" },
     { vm: true, key: "target:machine" },
@@ -1065,10 +1133,18 @@ describe("Inspector presentation focus", () => {
       renderer!.root.findByProps({ "aria-label": "Workflow settings" }).props.onClick(),
     );
     await act(() =>
-      renderer!.root.findByProps({ placeholder: "Repository default" }).props.onChange({
-        target: { value: "release/1.x" },
+      renderer!.root.findByProps({ type: "radio", value: "specific" }).props.onChange({
+        target: { checked: true },
       }),
     );
+    await act(() => {
+      const input = renderer!.root
+        .findAllByType("input")
+        .find(
+          (node) => typeof node.props.id === "string" && node.props.id.endsWith("-branch-name"),
+        )!;
+      input.props.onChange({ target: { value: "release/1.x" } });
+    });
     const wide = field("baseBranch");
     wide.focus();
     wide.setSelectionRange(2, 7, "backward");

@@ -70,7 +70,7 @@ export function normalizeWorkflowDefinitionForSave(
 ): WorkflowDefinition {
   const target = definition.target;
   if (target.kind !== "vm") return definition;
-  const baseBranch = target.baseBranch?.trim() || null;
+  const baseBranch = target.baseBranch?.trim() ?? null;
   return baseBranch === target.baseBranch
     ? definition
     : { ...definition, target: { ...target, baseBranch } };
@@ -134,7 +134,7 @@ export function applyWorkflowSaveReceipt(
   const sameTarget = sameWorkflowTarget(current.definition.target, operation.definition.target);
   return {
     ...current,
-    ...(unchangedDefinition ? { definition: saved.definition } : {}),
+    ...(unchangedDefinition ? { definition: saved.definition, lastVmBaseBranch: undefined } : {}),
     ...(operation.archiveDraft && unchangedDefinition ? { selectedStepId: "" } : {}),
     ...(unchangedAutomation
       ? {
@@ -194,6 +194,12 @@ export async function saveWorkflowDraft(
     archived !== undefined || nextArchived
       ? { ...sourceAutomation, enabled: false }
       : sourceAutomation;
+  const definition =
+    previous?.definition ??
+    offOnly?.definition ??
+    normalizeWorkflowDefinitionForSave(archiveBaseline?.definition ?? draft.definition);
+  if (!previous && definition.target.kind === "vm" && definition.target.baseBranch === "")
+    return null;
   const operation = previous
     ? {
         ...previous,
@@ -202,9 +208,7 @@ export async function saveWorkflowDraft(
     : {
         requestId: randomUUID(),
         state: "pending" as const,
-        definition:
-          offOnly?.definition ??
-          normalizeWorkflowDefinitionForSave(archiveBaseline?.definition ?? draft.definition),
+        definition,
         automation,
         includesAutomation: automationSupported,
         archived: nextArchived,

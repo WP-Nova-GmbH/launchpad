@@ -57,6 +57,8 @@ export interface WorkflowEditorDraft {
   readonly targetConfirmed: boolean;
   /** Editor-only VM choice while Machine is selected. Retained until the draft is reset or VM is selected again. */
   readonly lastVmTarget?: typeof WorkflowVmTarget.Type;
+  /** Branch name retained while the draft uses the repository default. */
+  readonly lastVmBaseBranch?: string | undefined;
   readonly saveRecovery?: "retryable" | "conflict" | "check-failed" | undefined;
   readonly operation: {
     readonly requestId: string;
@@ -516,6 +518,12 @@ export function workflowDraftIssue(definition: WorkflowDefinition) {
   if (Exit.isSuccess(decodeWorkflowDefinition(definition))) return null;
   if (!definition.name.trim())
     return { message: "Give this workflow a name.", stepId: null, field: "name" };
+  if (
+    definition.target.kind === "vm" &&
+    definition.target.baseBranch !== null &&
+    !definition.target.baseBranch.trim()
+  )
+    return { message: "Enter a branch name.", stepId: null, field: "baseBranch" };
   for (const step of definition.steps) {
     if (Exit.isSuccess(decodeWorkflowStep(step))) continue;
     const field =
