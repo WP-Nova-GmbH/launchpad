@@ -308,11 +308,13 @@ function EnabledThreadPullRequestsPanel({ threadRef }: { threadRef: ScopedThread
           ))}
         </div>
       </ScrollArea>
-      <footer className="flex items-center justify-between border-t border-border/60 px-2 py-1.5 text-2xs text-muted-foreground">
-        <span>
-          {openCount} open · {links.length} linked
-          {lastSynced ? ` · synced ${formatRelativeTimeLabel(lastSynced)}` : ""}
-        </span>
+      <footer className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 px-2 py-1.5 text-2xs text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+          <span>
+            {openCount} open of {links.length} linked
+          </span>
+          {lastSynced ? <span>Synced {formatRelativeTimeLabel(lastSynced)}</span> : null}
+        </div>
         <Button size="xs" variant="ghost" onClick={openLinkDialog}>
           <PlusIcon className="size-3.5" />
           Link

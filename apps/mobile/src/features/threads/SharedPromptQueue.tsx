@@ -1,17 +1,41 @@
 import {
+  activeThreadMove,
+  threadMoveQueueRows,
+} from "@t3tools/client-runtime/relay/threadMoveQueuePresentation";
+import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
-import type { EnvironmentId, ThreadId, ThreadPromptQueue, TurnId } from "@t3tools/contracts";
+import {
+  CommandId,
+  type EnvironmentId,
+  type ThreadId,
+  type ThreadMoveQueueEntry,
+  type ThreadPromptQueue,
+  type ThreadPromptQueueEntry,
+  type ThreadQueueEntry,
+  type TurnId,
+} from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
+import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { portableCommandStatesAtom } from "@t3tools/client-runtime/relay/portableThreads";
+import { ThreadMoveQueueItem, useThreadMovePlacement } from "./ThreadMoveQueueItem";
+import { createThreadMoveCancellation } from "@t3tools/client-runtime/relay/threadMoveSubmission";
+import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
+import * as Crypto from "expo-crypto";
 import {
   promptAttributionLabel,
   queuedPromptEditConflict,
+  moveQueueEntryNext,
+  moveQueueEntryLater,
   type QueuedPromptEdit,
 } from "@t3tools/client-runtime/state/threads";
-import { useState } from "react";
-import { Alert, Pressable, ScrollView, TextInput, View } from "react-native";
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import { Alert, Pressable, ScrollView, TextInput, View, type ColorValue } from "react-native";
 import { AppText as Text } from "../../components/AppText";
+import { SymbolView } from "../../components/AppSymbol";
 import { threadEnvironment } from "../../state/threads";
+import { threadMoveRelayUrl } from "../../state/thread-move-submissions";
 import { useAtomCommand } from "../../state/use-atom-command";
 
 function QueueButton({
@@ -37,23 +61,135 @@ function QueueButton({
   );
 }
 
-export function SharedPromptQueue({
+export function InlinePromptActions({
+  prompt,
+  disabled,
+  onEdit,
+  onRemove,
+  onPause,
+  tintColor,
+}: {
+  prompt: ThreadPromptQueueEntry;
+  disabled?: boolean;
+  onEdit?: (messageId: string) => void;
+  onRemove?: (messageId: string) => void;
+  onPause?: () => void;
+  tintColor?: ColorValue;
+}) {
+  if (prompt.state === "unknown") return null;
+  return (
+    <>
+      {onPause ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Pause queue"
+          disabled={disabled}
+          hitSlop={8}
+          className="size-7 items-center justify-center"
+          onPress={onPause}
+        >
+          <SymbolView name="pause" size={14} tintColor={tintColor} />
+        </Pressable>
+      ) : null}
+      {prompt.state === "pending" ? (
+        <>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Edit queued prompt"
+            disabled={disabled}
+            hitSlop={8}
+            className="size-7 items-center justify-center"
+            onPress={() => onEdit?.(prompt.messageId)}
+          >
+            <SymbolView name="pencil" size={14} tintColor={tintColor} />
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Remove queued prompt"
+            disabled={disabled}
+            hitSlop={8}
+            className="size-7 items-center justify-center"
+            onPress={() => onRemove?.(prompt.messageId)}
+          >
+            <SymbolView name="trash" size={14} tintColor={tintColor} />
+          </Pressable>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+type SharedPromptQueueProps = {
+  ref?: Ref<SharedPromptQueueHandle>;
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+  queue?: ThreadPromptQueue | undefined;
+  queueGeneration?: number | undefined;
+  queueRetired?: boolean | undefined;
+  activeTurnId: TurnId | null;
+  unavailable: boolean;
+  workflowControlled?: boolean;
+  supportsPreparation?: boolean;
+  hasStartedTurn?: boolean;
+  visibleEntries?: ReadonlyArray<ThreadQueueEntry>;
+};
+
+export interface SharedPromptQueueHandle {
+  edit: (messageId: string) => void;
+  remove: (messageId: string) => void;
+}
+
+export function SharedPromptQueue(props: SharedPromptQueueProps) {
+  const account = useAtomValue(managedRelaySessionAtom);
+  const placement = useThreadMovePlacement(props.environmentId, props.threadId);
+  const scope = JSON.stringify([
+    account?.accountId ?? null,
+    threadMoveRelayUrl(),
+    props.environmentId,
+    props.threadId,
+  ]);
+  if (!props.queue)
+    return activeThreadMove(placement) && !props.workflowControlled ? (
+      <ThreadMoveQueueItem
+        environmentId={props.environmentId}
+        threadId={props.threadId}
+        placement={placement}
+      />
+    ) : null;
+  return (
+    <SharedPromptQueueContent key={scope} {...props} queue={props.queue} placement={placement} />
+  );
+}
+
+function SharedPromptQueueContent({
+  ref,
   environmentId,
   threadId,
   queue,
+  queueGeneration,
+  queueRetired = false,
+  placement,
   activeTurnId,
   unavailable,
+  workflowControlled = false,
   supportsPreparation = false,
   hasStartedTurn = false,
-}: {
-  environmentId: EnvironmentId;
-  threadId: ThreadId;
+  visibleEntries = queue.entries,
+}: SharedPromptQueueProps & {
   queue: ThreadPromptQueue;
-  activeTurnId: TurnId | null;
-  unavailable: boolean;
-  supportsPreparation?: boolean;
-  hasStartedTurn?: boolean;
+  placement: ReturnType<typeof useThreadMovePlacement>;
 }) {
+  const { entries: visibleQueueEntries, fallback: fallbackMove } = threadMoveQueueRows({
+    entries: queueRetired ? queue.entries.filter((entry) => entry.kind !== "move") : queue.entries,
+    placement,
+    queueEnvironmentId: environmentId,
+    queueGeneration,
+  });
+  const cancelMove = useAtomCommand(threadEnvironment.cancelMove, { reportFailure: false });
+  const getCommandReceipt = useAtomCommand(threadEnvironment.getCommandReceipt, {
+    reportFailure: false,
+  });
+  const reorderQueue = useAtomCommand(threadEnvironment.reorderQueue, { reportFailure: false });
   const editPrompt = useAtomCommand(threadEnvironment.editPrompt, { reportFailure: false });
   const removePrompt = useAtomCommand(threadEnvironment.removePrompt, { reportFailure: false });
   const steerPrompt = useAtomCommand(threadEnvironment.steerPrompt, { reportFailure: false });
@@ -66,11 +202,69 @@ export function SharedPromptQueue({
   const [edit, setEdit] = useState<QueuedPromptEdit | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const current = queue.entries.find((entry) => entry.messageId === edit?.messageId);
+  const account = useAtomValue(managedRelaySessionAtom);
+  const portableCommands = useAtomValue(portableCommandStatesAtom);
+  const [cancellation] = useState(createThreadMoveCancellation);
+  const [, setCancellationRevision] = useState(0);
+  const cancellationRelayUrl = threadMoveRelayUrl();
+  const cancellationScope = JSON.stringify([
+    account?.accountId ?? null,
+    cancellationRelayUrl,
+    environmentId,
+    threadId,
+  ]);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    const { changed, rejection } = cancellation.observe(
+      cancellationScope,
+      queue.entries,
+      portableCommands.filter(
+        (command) =>
+          command.accountId === account?.accountId &&
+          normalizeSecureRelayUrl(command.relayUrl) === cancellationRelayUrl &&
+          command.environmentId === environmentId &&
+          command.threadId === threadId,
+      ),
+    );
+    // oxlint-disable-next-line react/set-state-in-effect -- Queue projections and command receipts reconcile the external cancellation tracker.
+    if (changed) setCancellationRevision((value) => value + 1);
+    if (rejection) setError(rejection);
+  }, [
+    cancellation,
+    cancellationScope,
+    cancellationRelayUrl,
+    queue.entries,
+    portableCommands,
+    account?.accountId,
+    environmentId,
+    threadId,
+  ]);
+  const candidate = queue.entries.find((entry) => entry.messageId === edit?.messageId);
+  const current = candidate?.kind === "move" ? undefined : candidate;
+  const firstMoveIndex = queue.entries.findIndex((entry) => entry.kind === "move");
+  const canReorder =
+    queue.handoff === null && queue.entries.every((entry) => entry.state === "pending");
   const conflict = edit ? queuedPromptEditConflict(edit, current) : null;
-  const disabled = unavailable || busy;
+  const disabled =
+    unavailable ||
+    busy ||
+    workflowControlled ||
+    queueRetired ||
+    (placement != null &&
+      (placement.environmentId !== environmentId ||
+        (queueGeneration !== undefined && placement.generation !== queueGeneration)));
   const preparation = queue.preparation;
   const blockedByPreparation = preparation !== undefined && preparation.state !== "ready";
+  const setupActive =
+    preparation?.state === "pending" ||
+    preparation?.state === "running" ||
+    preparation?.settled === false;
   const request = <T,>(input: T) => ({ environmentId, input });
   const run = async (
     action: () => Promise<AtomCommandResult<unknown, unknown>>,
@@ -93,39 +287,124 @@ export function SharedPromptQueue({
       setBusy(false);
     }
   };
-  if (
-    queue.entries.length === 0 &&
-    queue.pauseReason === null &&
-    edit === null &&
-    !blockedByPreparation
-  )
-    return null;
+  const requestCancellation = async (entry: ThreadMoveQueueEntry) => {
+    const isCurrent = () => mounted.current;
+    const command = cancellation.prepare(cancellationScope, entry, () => ({
+      threadId,
+      messageId: entry.messageId,
+      expectedRevision: entry.revision,
+      commandId: CommandId.make(Crypto.randomUUID()),
+      createdAt: new Date().toISOString(),
+    }));
+    if (!command) return;
+    setCancellationRevision((value) => value + 1);
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await cancelMove(request(command));
+      if (!isCurrent()) return;
+      if (result._tag === "Success") {
+        const outcome = cancellation.acknowledge(cancellationScope, command, result.value);
+        if (outcome?.status === "rejected")
+          setError(outcome.detail ?? "The cancellation request was rejected.");
+      } else {
+        cancellation.failed(cancellationScope, command);
+        const failure = squashAtomCommandFailure(result);
+        const receipt = await getCommandReceipt(
+          request({ threadId: command.threadId, commandId: command.commandId }),
+        );
+        if (!isCurrent()) return;
+        const outcome =
+          receipt._tag === "Success"
+            ? cancellation.acknowledge(cancellationScope, command, receipt.value)
+            : null;
+        if (receipt._tag === "Success" && outcome === null) return;
+        if (outcome?.status !== "accepted")
+          setError(
+            outcome?.status === "rejected"
+              ? (outcome.detail ?? "The cancellation request was rejected.")
+              : failure instanceof Error
+                ? failure.message
+                : "Could not confirm cancellation.",
+          );
+      }
+    } catch {
+      if (!isCurrent()) return;
+      cancellation.failed(cancellationScope, command);
+      setError("Could not confirm cancellation. Retry to send the same request.");
+    } finally {
+      if (isCurrent()) {
+        setBusy(false);
+        setCancellationRevision((value) => value + 1);
+      }
+    }
+  };
+  useImperativeHandle(ref, () => ({
+    edit(messageId) {
+      const entry = queue.entries.find((item) => item.messageId === messageId);
+      if (disabled || !entry || entry.kind === "move" || entry.state !== "pending") return;
+      setEdit({ messageId: entry.messageId, revision: entry.revision, text: entry.text });
+      setError(null);
+    },
+    remove(messageId) {
+      const entry = queue.entries.find((item) => item.messageId === messageId);
+      if (disabled || !entry || entry.kind === "move" || entry.state !== "pending") return;
+      void run(() =>
+        removePrompt(
+          request({ threadId, messageId: entry.messageId, expectedRevision: entry.revision }),
+        ),
+      );
+    },
+  }));
+  const visibleIds = new Set(visibleEntries.map((entry) => entry.messageId));
+  const visibleCount = visibleQueueEntries.filter((entry) =>
+    visibleIds.has(entry.messageId),
+  ).length;
+  const hasQueueChrome =
+    visibleCount > 0 ||
+    queue.pauseReason !== null ||
+    blockedByPreparation ||
+    fallbackMove ||
+    setupActive;
+  if (!hasQueueChrome && edit === null && error === null) return null;
   return (
     <ScrollView
-      className="mx-3 mb-2 rounded-xl border border-border bg-white p-3"
+      className="mx-3 mb-2 bg-background px-1 py-2"
       style={{ maxHeight: 260 }}
       keyboardShouldPersistTaps="handled"
     >
-      <View className="mb-2 flex-row items-center justify-between gap-2">
-        <Text className="font-t3-medium text-sm text-foreground">
-          Shared queue · {queue.entries.length}
+      {hasQueueChrome ? (
+        <View className="mb-2 flex-row items-center justify-between gap-2">
+          <Text className="font-t3-medium text-sm text-foreground">
+            Queued {visibleCount + (fallbackMove ? 1 : 0)}
+          </Text>
+          {queue.pauseReason === null || setupActive ? (
+            <QueueButton
+              label={setupActive ? "Stop setup" : "Pause queue"}
+              disabled={disabled || (setupActive && !supportsPreparation)}
+              onPress={() => void run(() => pauseQueue(request({ threadId })))}
+            />
+          ) : queue.pauseReason.code !== "delivery-unknown" ? (
+            <QueueButton
+              label="Resume queue"
+              disabled={disabled || queue.handoff !== null || blockedByPreparation}
+              onPress={() =>
+                void run(() => resumeQueue(request({ threadId, expectedRevision: queue.revision })))
+              }
+            />
+          ) : null}
+        </View>
+      ) : null}
+      {workflowControlled ? (
+        <Text className="mb-2 text-xs text-foreground-muted">
+          Use this job’s review or Cancel controls in Settings → Workflow jobs.
         </Text>
-        {queue.pauseReason === null || (blockedByPreparation && preparation.settled === false) ? (
-          <QueueButton
-            label={blockedByPreparation ? "Stop setup" : "Pause queue"}
-            disabled={disabled}
-            onPress={() => void run(() => pauseQueue(request({ threadId })))}
-          />
-        ) : queue.pauseReason.code !== "delivery-unknown" ? (
-          <QueueButton
-            label="Resume queue"
-            disabled={disabled || queue.handoff !== null || blockedByPreparation}
-            onPress={() =>
-              void run(() => resumeQueue(request({ threadId, expectedRevision: queue.revision })))
-            }
-          />
-        ) : null}
-      </View>
+      ) : null}
+      {setupActive && !blockedByPreparation ? (
+        <Text accessibilityLiveRegion="polite" className="mb-2 text-xs text-foreground-muted">
+          Setup is running in the background.
+        </Text>
+      ) : null}
       {blockedByPreparation ? (
         <View className="mb-2 gap-2">
           <Text accessibilityLiveRegion="polite" className="text-sm text-foreground">
@@ -192,11 +471,13 @@ export function SharedPromptQueue({
           )}
         </View>
       ) : null}
-      <Text accessibilityLiveRegion="polite" className="mb-2 text-xs text-foreground-muted">
-        {queue.pauseReason
-          ? `Paused: ${queue.pauseReason.detail}`
-          : "Prompts wait for the current turn to finish."}
-      </Text>
+      {hasQueueChrome ? (
+        <Text accessibilityLiveRegion="polite" className="mb-2 text-xs text-foreground-muted">
+          {queue.pauseReason
+            ? `Paused: ${queue.pauseReason.detail}`
+            : "Prompts wait for the current turn to finish."}
+        </Text>
+      ) : null}
       {queue.pauseReason?.code === "delivery-unknown" ? (
         <View className="mb-2 flex-row gap-2">
           {(["retry", "dismiss"] as const).map((resolution) => (
@@ -228,71 +509,159 @@ export function SharedPromptQueue({
           ))}
         </View>
       ) : null}
-      {queue.entries.map((entry, index) => (
-        <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
-          <Text className="text-sm text-foreground">
-            {index + 1}. {entry.text || "Attachments"}
-          </Text>
-          {entry.attachments.length > 0 ? (
-            <Text className="text-xs text-foreground-muted">
-              Files: {entry.attachments.map((attachment) => attachment.name).join(", ")}
+      {fallbackMove && (
+        <ThreadMoveQueueItem
+          environmentId={environmentId}
+          threadId={threadId}
+          placement={placement}
+          activeCancellationDisabled={workflowControlled}
+        />
+      )}
+      {visibleQueueEntries.map((entry, index) =>
+        !visibleIds.has(entry.messageId) ? null : entry.kind === "move" ? (
+          <ThreadMoveQueueItem
+            key={entry.messageId}
+            environmentId={environmentId}
+            threadId={threadId}
+            entry={entry}
+            placement={placement}
+            queuePaused={!queue.enabled || queue.pauseReason !== null}
+            cancellation={cancellation.phase(cancellationScope, entry.messageId)}
+            disabled={disabled}
+            activeCancellationDisabled={workflowControlled}
+            onCancel={() => void requestCancellation(entry)}
+          >
+            <QueueButton
+              label="Move next"
+              disabled={disabled || !canReorder || index === 0}
+              onPress={() =>
+                void run(() =>
+                  reorderQueue(
+                    request({
+                      threadId,
+                      expectedRevision: queue.revision,
+                      order: moveQueueEntryNext(queue.entries, entry.messageId),
+                    }),
+                  ),
+                )
+              }
+            />
+            <QueueButton
+              label="Move down"
+              disabled={disabled || !canReorder || index + 1 === queue.entries.length}
+              onPress={() =>
+                void run(() =>
+                  reorderQueue(
+                    request({
+                      threadId,
+                      expectedRevision: queue.revision,
+                      order: moveQueueEntryLater(queue.entries, entry.messageId),
+                    }),
+                  ),
+                )
+              }
+            />
+          </ThreadMoveQueueItem>
+        ) : (
+          <View key={entry.messageId} className="mb-2 gap-1 rounded-lg border border-border p-2">
+            <Text className="text-sm text-foreground">
+              {index + 1}. {entry.text || "Attachments"}
             </Text>
-          ) : null}
-          <Text className="text-xs text-foreground-muted">{promptAttributionLabel(entry)}</Text>
-          {entry.state === "pending" ? (
-            <View className="mt-1 flex-row flex-wrap gap-2">
-              <QueueButton
-                label="Edit"
-                disabled={disabled}
-                onPress={() => {
-                  setEdit({
-                    messageId: entry.messageId,
-                    revision: entry.revision,
-                    text: entry.text,
-                  });
-                  setError(null);
-                }}
-              />
-              <QueueButton
-                label="Steer now"
-                disabled={disabled || activeTurnId === null}
-                onPress={() => {
-                  if (activeTurnId)
+            {entry.attachments.length > 0 ? (
+              <Text className="text-xs text-foreground-muted">
+                Files: {entry.attachments.map((attachment) => attachment.name).join(", ")}
+              </Text>
+            ) : null}
+            <Text className="text-xs text-foreground-muted">{promptAttributionLabel(entry)}</Text>
+            {entry.state === "pending" ? (
+              <View className="mt-1 flex-row flex-wrap gap-2">
+                <QueueButton
+                  label="Edit"
+                  disabled={disabled}
+                  onPress={() => {
+                    setEdit({
+                      messageId: entry.messageId,
+                      revision: entry.revision,
+                      text: entry.text,
+                    });
+                    setError(null);
+                  }}
+                />
+                <QueueButton
+                  label="Steer now"
+                  disabled={
+                    disabled ||
+                    activeTurnId === null ||
+                    (firstMoveIndex >= 0 && index > firstMoveIndex)
+                  }
+                  onPress={() => {
+                    if (activeTurnId)
+                      void run(() =>
+                        steerPrompt(
+                          request({
+                            threadId,
+                            messageId: entry.messageId,
+                            expectedRevision: entry.revision,
+                            expectedTurnId: activeTurnId,
+                          }),
+                        ),
+                      );
+                  }}
+                />
+                <QueueButton
+                  label="Move next"
+                  disabled={disabled || !canReorder || index === 0}
+                  onPress={() =>
                     void run(() =>
-                      steerPrompt(
+                      reorderQueue(
+                        request({
+                          threadId,
+                          expectedRevision: queue.revision,
+                          order: moveQueueEntryNext(queue.entries, entry.messageId),
+                        }),
+                      ),
+                    )
+                  }
+                />
+                <QueueButton
+                  label="Move down"
+                  disabled={disabled || !canReorder || index + 1 === queue.entries.length}
+                  onPress={() =>
+                    void run(() =>
+                      reorderQueue(
+                        request({
+                          threadId,
+                          expectedRevision: queue.revision,
+                          order: moveQueueEntryLater(queue.entries, entry.messageId),
+                        }),
+                      ),
+                    )
+                  }
+                />
+                <QueueButton
+                  label="Remove"
+                  disabled={disabled}
+                  onPress={() =>
+                    void run(() =>
+                      removePrompt(
                         request({
                           threadId,
                           messageId: entry.messageId,
                           expectedRevision: entry.revision,
-                          expectedTurnId: activeTurnId,
                         }),
                       ),
-                    );
-                }}
-              />
-              <QueueButton
-                label="Remove"
-                disabled={disabled}
-                onPress={() =>
-                  void run(() =>
-                    removePrompt(
-                      request({
-                        threadId,
-                        messageId: entry.messageId,
-                        expectedRevision: entry.revision,
-                      }),
-                    ),
-                  )
-                }
-              />
-            </View>
-          ) : (
-            <Text className="text-xs text-foreground-muted">
-              {entry.state === "unknown" ? "Delivery outcome unknown" : "Sending to agent…"}
-            </Text>
-          )}
-        </View>
-      ))}
+                    )
+                  }
+                />
+              </View>
+            ) : (
+              <Text className="text-xs text-foreground-muted">
+                {entry.state === "unknown" ? "Delivery outcome unknown" : "Sending to agent…"}
+              </Text>
+            )}
+          </View>
+        ),
+      )}
       {edit ? (
         <View className="mb-3 gap-2">
           <TextInput

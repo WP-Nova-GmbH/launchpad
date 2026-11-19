@@ -1,5 +1,8 @@
 "use client";
 
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { hasCloudPublicConfig } from "../cloud/publicConfig";
+
 import { threadPullRequestLinkMode } from "@t3tools/client-runtime/thread-pull-request-compatibility";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 
@@ -104,6 +107,10 @@ import { useProjects, useServerConfigs, useThreadShells, waitForProject } from "
 import { useThreadSearch } from "../state/queries";
 import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib/chatThreadActions";
 import {
+  canUseLiveProjectWorkspace,
+  workflowResultGitAccess,
+} from "../lib/workflowResultGitAccess";
+import {
   appendBrowsePathSegment,
   ensureBrowseDirectoryPath,
   findProjectByPath,
@@ -141,6 +148,7 @@ import {
 } from "../wslPaths";
 import {
   ADDON_ICON_CLASS,
+  allowedSearchOverlayMode,
   browseInputEndPaddingClass,
   buildBrowseGroups,
   buildCommandPaletteProjectMetadata,
@@ -181,7 +189,11 @@ import {
   ThreadCommandSubtitle,
 } from "./ThreadCommandSubtitle";
 import { ThreadRowLeadingStatus, ThreadRowTrailingStatus } from "./ThreadStatusIndicators";
-import { primaryServerKeybindingsAtom, primaryServerProvidersAtom } from "../state/server";
+import {
+  primaryServerKeybindingsAtom,
+  primaryServerProvidersAtom,
+  serverEnvironment,
+} from "../state/server";
 import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../providerInstances";
 import { resolveShortcutCommand, threadJumpIndexFromCommand } from "../keybindings";
 import { CommandDialog, CommandDialogPopup, CommandFooterAction } from "./ui/command";
@@ -506,10 +518,6 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     openIntent: null,
   });
   const setOpen = useCallback((open: boolean) => dispatch({ _tag: "SetOpen", open }), []);
-  const toggleMode = useCallback(
-    (mode: SearchOverlayMode) => dispatch({ _tag: "ToggleMode", mode }),
-    [],
-  );
   const openAddProject = useCallback(() => dispatch({ _tag: "OpenAddProject" }), []);
   const openNewThreadIn = useCallback(() => dispatch({ _tag: "OpenNewThreadIn" }), []);
   const clearOpenIntent = useCallback(() => dispatch({ _tag: "ClearOpenIntent" }), []);
@@ -521,6 +529,25 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     select: (params) => resolveThreadRouteTarget(params),
   });
   const routeThreadRef = routeTarget?.kind === "server" ? routeTarget.threadRef : null;
+  const workflowOrigin = useLocation({ select: (location) => location.state.workflowOrigin });
+  const serverConfig = useAtomValue(
+    serverEnvironment.configValueAtom(routeThreadRef?.environmentId ?? null),
+  );
+  const { canReadCheckoutGit: canUseLiveWorkspace } = workflowResultGitAccess({
+    capabilities: serverConfig?.environment.capabilities,
+    origin: workflowOrigin,
+    threadId: routeThreadRef?.threadId ?? null,
+  });
+  const mode = allowedSearchOverlayMode(state.mode, canUseLiveWorkspace) ?? "command";
+  const toggleMode = useCallback(
+    (requested: SearchOverlayMode) => {
+      const allowed = allowedSearchOverlayMode(requested, canUseLiveWorkspace);
+      if (allowed === null) return false;
+      dispatch({ _tag: "ToggleMode", mode: allowed });
+      return true;
+    },
+    [canUseLiveWorkspace],
+  );
   const terminalOpen = useTerminalUiStateStore((state) =>
     routeThreadRef
       ? selectThreadTerminalUiState(state.terminalUiStateByThreadKey, routeThreadRef).terminalOpen
@@ -533,7 +560,12 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    if (!state.open || state.mode === "command") return;
+    // Drop a live workspace overlay immediately when navigation changes its target.
+    if (state.open && state.mode !== mode) setOpen(true);
+  }, [mode, setOpen, state.mode, state.open]);
+
+  useEffect(() => {
+    if (!state.open || mode === "command") return;
     const onEscapeKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.isComposing || event.key !== "Escape") return;
       event.preventDefault();
@@ -542,7 +574,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
     };
     window.addEventListener("keydown", onEscapeKeyDown, true);
     return () => window.removeEventListener("keydown", onEscapeKeyDown, true);
-  }, [state.mode, state.open, toggleMode]);
+  }, [mode, state.open, toggleMode]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -592,6 +624,14 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         });
         return;
       }
+      if (command === "threadVms.open") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.repeat) return;
+        setOpen(false);
+        void navigate({ to: "/settings/vms" });
+        return;
+      }
       if (command === "usage.open") {
         event.preventDefault();
         event.stopPropagation();
@@ -600,12 +640,11 @@ export function CommandPalette({ children }: { children: ReactNode }) {
         return;
       }
       const mode = overlayModeForCommand(command);
-      if (mode === null) {
+      if (mode === null || !toggleMode(mode)) {
         return;
       }
       event.preventDefault();
       event.stopPropagation();
-      toggleMode(mode);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -648,7 +687,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
       <CommandDialog
         open={state.open}
         onOpenChange={(open, eventDetails) => {
-          if (!open && eventDetails.reason === "escape-key" && state.mode !== "command") {
+          if (!open && eventDetails.reason === "escape-key" && mode !== "command") {
             eventDetails.cancel();
             toggleMode("command");
             return;
@@ -661,7 +700,8 @@ export function CommandPalette({ children }: { children: ReactNode }) {
           {children}
         </div>
         <CommandPaletteDialog
-          mode={state.mode}
+          mode={mode}
+          canUseLiveWorkspace={canUseLiveWorkspace}
           openIntent={state.openIntent}
           setOpen={setOpen}
           openOverlayMode={toggleMode}
@@ -674,6 +714,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
 
 function CommandPaletteDialog(props: {
   readonly mode: SearchOverlayMode;
+  readonly canUseLiveWorkspace: boolean;
   readonly openIntent: CommandPaletteOpenIntent | null;
   readonly setOpen: (open: boolean) => void;
   readonly openOverlayMode: (mode: SearchOverlayMode) => void;
@@ -695,7 +736,8 @@ function CommandPaletteDialog(props: {
       data-palette-mode={props.mode}
       data-testid="command-palette"
       finalFocus={() => {
-        composerHandleRef?.current?.focusAtEnd();
+        if (!document.querySelector("[data-portable-thread-library]"))
+          composerHandleRef?.current?.focusAtEnd();
         return false;
       }}
       onBackdropPointerDown={() => {
@@ -708,6 +750,7 @@ function CommandPaletteDialog(props: {
         <ProjectContentSearchDialog onOpenChange={props.setOpen} />
       ) : (
         <OpenCommandPaletteDialog
+          canUseLiveWorkspace={props.canUseLiveWorkspace}
           openIntent={props.openIntent}
           setOpen={props.setOpen}
           openOverlayMode={props.openOverlayMode}
@@ -719,6 +762,7 @@ function CommandPaletteDialog(props: {
 }
 
 function OpenCommandPaletteDialog(props: {
+  readonly canUseLiveWorkspace: boolean;
   readonly openIntent: CommandPaletteOpenIntent | null;
   readonly setOpen: (open: boolean) => void;
   readonly openOverlayMode: (mode: SearchOverlayMode) => void;
@@ -727,7 +771,7 @@ function OpenCommandPaletteDialog(props: {
   const navigate = useNavigate();
   const organizationCatalog = useManagedRelayOrganizationCatalog();
   const pathname = useLocation({ select: (location) => location.pathname });
-  const { clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
+  const { canUseLiveWorkspace, clearOpenIntent, openIntent, openOverlayMode, setOpen } = props;
   const [query, setQuery] = useState(openIntent?.kind === "search" ? openIntent.query : "");
   const [linkedThreadSearch, setLinkedThreadSearch] = useState(
     openIntent?.kind === "search" ? openIntent : null,
@@ -756,8 +800,15 @@ function OpenCommandPaletteDialog(props: {
   const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const availableSettingsSearchItems = useAvailableSettingsSearchItems();
-  const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread } =
-    useHandleNewThread();
+  const {
+    activeDraftThread,
+    activeThread,
+    defaultProjectRef,
+    handleNewThread,
+    canCreateThreadInProject,
+    routeThreadRef,
+  } = useHandleNewThread();
+  const readOnlyEnvironmentId = canUseLiveWorkspace ? null : routeThreadRef?.environmentId;
   const projects = useProjects();
   const referenceThreadRef =
     pathname === "/pull-requests"
@@ -770,8 +821,18 @@ function OpenCommandPaletteDialog(props: {
         ? scopeThreadRef(activeThread.environmentId, activeThread.id)
         : null;
   const openPanelPullRequestUrl = useOpenPanelPullRequestUrl(referenceThreadRef);
-  const activeThreadServerConfig = useServerConfigs().get(
+  const serverConfigs = useServerConfigs();
+  const activeThreadServerConfig = serverConfigs.get(
     activeThread?.environmentId ?? ("" as EnvironmentId),
+  );
+  const canManageProject = useCallback(
+    (project: Project) =>
+      project.environmentId !== readOnlyEnvironmentId &&
+      canUseLiveProjectWorkspace({
+        projectId: project.id,
+        capabilities: serverConfigs.get(project.environmentId)?.environment.capabilities,
+      }),
+    [readOnlyEnvironmentId, serverConfigs],
   );
   const activeThreadReferenceCopyTarget =
     referenceThreadRef === null || (pathname === "/pull-requests" && !openPanelPullRequestUrl)
@@ -960,11 +1021,19 @@ function OpenCommandPaletteDialog(props: {
     () =>
       resolveThreadActionProjectRef({
         activeDraftThread,
-        activeThread: activeThread ?? undefined,
+        activeThread: canUseLiveWorkspace ? (activeThread ?? undefined) : undefined,
         defaultProjectRef,
         handleNewThread,
+        canCreateThreadInProject,
       }),
-    [activeDraftThread, activeThread, defaultProjectRef, handleNewThread],
+    [
+      activeDraftThread,
+      activeThread,
+      canCreateThreadInProject,
+      canUseLiveWorkspace,
+      defaultProjectRef,
+      handleNewThread,
+    ],
   );
   const projectPickerEntries = useMemo(
     () =>
@@ -985,30 +1054,35 @@ function OpenCommandPaletteDialog(props: {
   const projectGroupByTargetKey = useMemo(
     () =>
       new Map(
-        projectPickerEntries.map(({ group, targetProject }) => [
-          `${targetProject.environmentId}:${targetProject.id}`,
-          group,
-        ]),
+        projectPickerEntries.flatMap(({ group }) =>
+          group.memberProjects.map((project) => [`${project.environmentId}:${project.id}`, group]),
+        ),
       ),
     [projectPickerEntries],
   );
 
   const addProjectEnvironmentOptions = useMemo(() => {
-    const options = environments.map((environment): AddProjectEnvironmentOption => {
-      const isPrimary = environment.entry.target._tag === "PrimaryConnectionTarget";
-      return {
-        environmentId: environment.environmentId,
-        label: resolveEnvironmentOptionLabel({
-          isPrimary,
+    const options = environments
+      .filter(
+        (environment) =>
+          environment.environmentId !== readOnlyEnvironmentId &&
+          !environment.serverConfig?.environment.capabilities.workflowVmResultReader,
+      )
+      .map((environment): AddProjectEnvironmentOption => {
+        const isPrimary = environment.entry.target._tag === "PrimaryConnectionTarget";
+        return {
           environmentId: environment.environmentId,
-          runtimeLabel: environment.label,
-        }),
-        isPrimary,
-        machine: resolveEnvironmentMachineKind(environment.serverConfig),
-        isConnected: canCreateProjectInEnvironment(environment.connection.phase),
-        status: connectionStatusText(environment.connection),
-      };
-    });
+          label: resolveEnvironmentOptionLabel({
+            isPrimary,
+            environmentId: environment.environmentId,
+            runtimeLabel: environment.label,
+          }),
+          isPrimary,
+          machine: resolveEnvironmentMachineKind(environment.serverConfig),
+          isConnected: canCreateProjectInEnvironment(environment.connection.phase),
+          status: connectionStatusText(environment.connection),
+        };
+      });
 
     options.sort((left, right) => {
       if (left.isPrimary !== right.isPrimary) {
@@ -1018,7 +1092,7 @@ function OpenCommandPaletteDialog(props: {
     });
 
     return options;
-  }, [environments]);
+  }, [environments, readOnlyEnvironmentId]);
   const defaultAddProjectEnvironmentId =
     addProjectEnvironmentOptions.find((option) => option.isConnected)?.environmentId ?? null;
   const wslAddProjectEnvironmentOption = useMemo(
@@ -1036,7 +1110,12 @@ function OpenCommandPaletteDialog(props: {
       }) ?? null,
     [addProjectEnvironmentOptions, environments],
   );
-  const browseEnvironmentId = addProjectEnvironmentId ?? defaultAddProjectEnvironmentId;
+  const browseEnvironmentId =
+    addProjectEnvironmentId === null
+      ? defaultAddProjectEnvironmentId
+      : (addProjectEnvironmentOptions.find(
+          (option) => option.environmentId === addProjectEnvironmentId,
+        )?.environmentId ?? null);
   const browseEnvironment =
     environments.find((environment) => environment.environmentId === browseEnvironmentId) ?? null;
   // A desktop-local secondary backend (today: the WSL backend). The picker is
@@ -1301,7 +1380,15 @@ function OpenCommandPaletteDialog(props: {
     () =>
       enumerateCommandPaletteItems(
         buildProjectActionItems({
-          projects: pickerProjects,
+          projects: projectPickerEntries.flatMap(({ group, targetProject }) => {
+            const canCreateIn = (project: Project) =>
+              canManageProject(project) &&
+              canCreateThreadInProject(scopeProjectRef(project.environmentId, project.id));
+            const target = canCreateIn(targetProject)
+              ? targetProject
+              : group.memberProjects.find(canCreateIn);
+            return target ? [{ ...target, displayName: group.displayName }] : [];
+          }),
           valuePrefix: "new-thread-in",
           searchTerms: (project) => {
             const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
@@ -1337,28 +1424,17 @@ function OpenCommandPaletteDialog(props: {
           },
           icon: projectFavicon,
           runProject: async (project) => {
-            const group = projectGroupByTargetKey.get(`${project.environmentId}:${project.id}`);
-            const contextualRefBelongsToGroup =
-              contextualProjectRef !== null &&
-              group?.memberProjectRefs.some(
-                (projectRef) =>
-                  projectRef.environmentId === contextualProjectRef.environmentId &&
-                  projectRef.projectId === contextualProjectRef.projectId,
-              );
-            await handleNewThread(
-              contextualRefBelongsToGroup
-                ? contextualProjectRef
-                : scopeProjectRef(project.environmentId, project.id),
-            );
+            await handleNewThread(scopeProjectRef(project.environmentId, project.id));
           },
         }),
       ),
     [
-      contextualProjectRef,
+      canCreateThreadInProject,
+      canManageProject,
       handleNewThread,
-      pickerProjects,
       projectEnvironmentLocationById,
       projectGroupByTargetKey,
+      projectPickerEntries,
     ],
   );
 
@@ -1982,13 +2058,28 @@ function OpenCommandPaletteDialog(props: {
   ]);
 
   const actionItems: Array<CommandPaletteActionItem | CommandPaletteSubmenuItem> = [];
+  actionItems.push({
+    kind: "action",
+    value: "action:vm-threads",
+    title: "VM threads",
+    searchTerms: ["sandbox", "VM", "saved", "restore", "reset", "create", "private"],
+    icon: <MonitorIcon className={ITEM_ICON_CLASS} />,
+    shortcutCommand: "threadVms.open",
+    run: async () => {
+      await navigate({ to: "/settings/vms" });
+    },
+  });
 
   if (projects.length > 0) {
     const activeProjectTitle =
       projectPickerEntries.find((entry) => entry.isPreferred)?.group.displayName ??
       (currentProjectId ? (projectTitleById.get(currentProjectId) ?? null) : null);
 
-    if (activeProjectTitle) {
+    if (
+      canUseLiveWorkspace &&
+      activeProjectTitle &&
+      canCreateThreadInEnvironment(activeThreadServerConfig)
+    ) {
       actionItems.push({
         kind: "action",
         value: "action:new-thread",
@@ -2006,6 +2097,7 @@ function OpenCommandPaletteDialog(props: {
             activeThread: activeThread ?? undefined,
             defaultProjectRef,
             handleNewThread,
+            canCreateThreadInProject,
           });
         },
       });
@@ -2037,6 +2129,7 @@ function OpenCommandPaletteDialog(props: {
   }
 
   if (
+    canUseLiveWorkspace &&
     activeThread !== null &&
     threadPullRequestLinkMode(activeThreadServerConfig?.environment.capabilities) !== "unsupported"
   ) {
@@ -2066,31 +2159,33 @@ function OpenCommandPaletteDialog(props: {
     }
   }
 
-  actionItems.push({
-    kind: "action",
-    value: "action:open-file-picker",
-    searchTerms: ["go to file", "open file", "file picker", "find file", "quick open"],
-    title: "Go to file",
-    icon: <FileSearchIcon className={ITEM_ICON_CLASS} />,
-    keepOpen: true,
-    shortcutCommand: "filePicker.toggle",
-    run: async () => {
-      openOverlayMode("files");
-    },
-  });
+  if (canUseLiveWorkspace) {
+    actionItems.push({
+      kind: "action",
+      value: "action:open-file-picker",
+      searchTerms: ["go to file", "open file", "file picker", "find file", "quick open"],
+      title: "Go to file",
+      icon: <FileSearchIcon className={ITEM_ICON_CLASS} />,
+      keepOpen: true,
+      shortcutCommand: "filePicker.toggle",
+      run: async () => {
+        openOverlayMode("files");
+      },
+    });
 
-  actionItems.push({
-    kind: "action",
-    value: "action:search-project-contents",
-    searchTerms: ["search project", "find in files", "grep", "content search", "text search"],
-    title: "Search project contents",
-    icon: <TextSearchIcon className={ITEM_ICON_CLASS} />,
-    keepOpen: true,
-    shortcutCommand: "projectSearch.toggle",
-    run: async () => {
-      openOverlayMode("content");
-    },
-  });
+    actionItems.push({
+      kind: "action",
+      value: "action:search-project-contents",
+      searchTerms: ["search project", "find in files", "grep", "content search", "text search"],
+      title: "Search project contents",
+      icon: <TextSearchIcon className={ITEM_ICON_CLASS} />,
+      keepOpen: true,
+      shortcutCommand: "projectSearch.toggle",
+      run: async () => {
+        openOverlayMode("content");
+      },
+    });
+  }
 
   actionItems.push({
     kind: "action",
@@ -2266,6 +2361,18 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
+  if (hasCloudPublicConfig())
+    actionItems.push({
+      kind: "action",
+      value: "action:workflows",
+      title: "Open workflows",
+      searchTerms: ["workflow", "automation", "jobs", "human review"],
+      icon: <SettingsIcon className={ITEM_ICON_CLASS} />,
+      run: async () => {
+        await navigate({ to: "/workflows" });
+      },
+    });
+
   actionItems.push({
     kind: "action",
     value: "action:usage",
@@ -2298,7 +2405,7 @@ function OpenCommandPaletteDialog(props: {
       : null) ??
     projectGroups[0] ??
     null;
-  if (contextualProjectGroup) {
+  if (canUseLiveWorkspace && contextualProjectGroup?.memberProjects.some(canManageProject)) {
     actionItems.push({
       kind: "action",
       value: "action:project-settings",

@@ -79,6 +79,34 @@ function waitForFileContent(path: string): Effect.Effect<string> {
 }
 
 it.layer(CursorTextGenerationTestLayer)("CursorTextGeneration", (it) => {
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    Effect.gen(function* () {
+      const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "cursor-workflow-approval-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+      );
+      const logPath = NodePath.join(dir, "requests.ndjson");
+      yield* withFakeAcpAgent(
+        {
+          T3_ACP_REQUEST_LOG_PATH: logPath,
+          T3_ACP_PROMPT_RESPONSE_TEXT: '{"verdict":"approve","reasoning":"In scope"}',
+        },
+        (textGeneration) =>
+          textGeneration.generateApprovalVerdict({
+            cwd: process.cwd(),
+            toolKind: "command",
+            requestType: "command_execution_approval",
+            stepInstruction: "s".repeat(5_000),
+            jobContext: "JOB_CONTEXT",
+            reviewConstraint: "REVIEW_REQUIRED",
+            modelSelection: createModelSelection(ProviderInstanceId.make("cursor"), "gpt-5.4"),
+          }),
+      );
+      const requests = NodeFS.readFileSync(logPath, "utf8");
+      expect(requests).toContain("JOB_CONTEXT");
+      expect(requests).toContain("REVIEW_REQUIRED");
+    }),
+  );
   it.effect("uses ACP model config options instead of raw CLI model ids", () => {
     const requestLogDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-cursor-text-log-"),

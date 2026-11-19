@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_restores" ADD COLUMN "import_receipt" jsonb;

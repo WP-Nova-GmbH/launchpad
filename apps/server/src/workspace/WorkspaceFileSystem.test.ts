@@ -1,3 +1,5 @@
+import * as CheckoutAccess from "./CheckoutAccess.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 // @effect-diagnostics nodeBuiltinImport:off - FileSystem cannot create a FIFO.
 import * as NodeChildProcess from "node:child_process";
 
@@ -34,6 +36,7 @@ const TestLayer = Layer.empty.pipe(
       prefix: "t3-workspace-files-test-",
     }),
   ),
+  Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
   Layer.provideMerge(NodeServices.layer),
 );
 

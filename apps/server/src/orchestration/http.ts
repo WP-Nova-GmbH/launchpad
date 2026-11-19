@@ -174,7 +174,8 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
           const result = yield* Effect.gen(function* () {
             if (
               normalizedCommand.type === "thread.delete" ||
-              normalizedCommand.type === "project.delete"
+              normalizedCommand.type === "project.delete" ||
+              normalizedCommand.type === "thread.archive"
             )
               return yield* dispatchDeletion(actor, normalizedCommand);
             if (

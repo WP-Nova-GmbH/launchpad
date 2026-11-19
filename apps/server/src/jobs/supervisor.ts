@@ -13,9 +13,9 @@
  * @module jobs/supervisor
  */
 import {
+  ApprovalRequestId,
   CommandId,
   EventId,
-  type ApprovalRequestId,
   type ModelSelection,
   type OrchestrationEvent,
   type ProviderApprovalDecision,
@@ -25,12 +25,17 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import { RunRepositoryWorkflow, WorkflowAgentStep } from "@t3tools/contracts/workflows";
 
 import type { OrchestrationEngineShape } from "../orchestration/Services/OrchestrationEngine.ts";
-import type { TextGeneration } from "../textGeneration/TextGeneration.ts";
+import {
+  WORKFLOW_APPROVAL_FAILURE_DETAILS,
+  type TextGeneration,
+} from "../textGeneration/TextGeneration.ts";
 import {
   ApprovalRequestedActivityPayload,
   classifyApprovalRequest,
@@ -42,27 +47,26 @@ export const SUPERVISOR_VERDICT_ACTIVITY_KIND = "job.supervisor.verdict";
 export type SupervisorVerdict = "approve" | "deny" | "escalate";
 
 const decodeApprovalPayload = Schema.decodeUnknownEffect(ApprovalRequestedActivityPayload);
-
-function isApprovalRequested(
-  event: OrchestrationEvent,
-  threadId: ThreadId,
-): event is Extract<OrchestrationEvent, { readonly type: "thread.activity-appended" }> {
-  return (
-    event.type === "thread.activity-appended" &&
-    event.payload.threadId === threadId &&
-    event.payload.activity.kind === "approval.requested"
-  );
-}
+const decodeUserInput = Schema.decodeUnknownOption(
+  Schema.Struct({
+    requestId: ApprovalRequestId,
+    responseMode: Schema.optional(Schema.Literal("message")),
+  }),
+);
+const decodeWorkflowTask = Schema.decodeUnknownOption(
+  Schema.Struct({
+    stepInstruction: WorkflowAgentStep.fields.instruction,
+    jobContext: RunRepositoryWorkflow.fields.instruction,
+    reviewConstraint: Schema.String.check(Schema.isMaxLength(1_000)),
+  }),
+);
 
 /**
  * Watch a thread and answer its approval requests until the enclosing scope
  * closes.
  *
- * Escalation is the absence of a response: the request stays pending, the
- * thread keeps reporting `waiting_for_approval` up the awareness feed, and a
- * human resolves it through the ordinary steering path. There is deliberately
- * no timeout — a paused job is meant to be visible, and a clock that resolved
- * it would be making exactly the decision the supervisor declined to make.
+ * Escalated requests stay pending when a human can steer the thread. Workflow
+ * VMs expose a read-only result, so their supervisor declines those requests.
  */
 export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(function* (input: {
   readonly engine: OrchestrationEngineShape;
@@ -71,14 +75,24 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
   readonly threadId: ThreadId;
   readonly stepInstruction: string;
   readonly cwd: string;
+  readonly resolveCwd?: Effect.Effect<string | null>;
+  readonly jobContext?: string | undefined;
+  readonly reviewConstraint?: string | undefined;
   readonly modelSelection: ModelSelection;
+  readonly workflowVm?: boolean;
+  readonly replayEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly liveEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly resolvedRequestIds?: ReadonlySet<string>;
+  readonly resolvedUserInputIds?: ReadonlySet<string>;
+  readonly recordedVerdicts?: ReadonlyMap<string, SupervisorVerdict>;
 }) {
   const { engine, textGeneration, crypto, threadId, stepInstruction, cwd, modelSelection } = input;
 
   // The engine republishes persisted events after a dispatch failure, so the
   // same request can arrive twice. Answering twice would mean a second model
   // call and a second response to a request already settled.
-  const answered = new Set<string>();
+  const answered = new Set(input.resolvedRequestIds);
+  const answeredUserInputs = new Set(input.resolvedUserInputIds);
 
   const commandId = (tag: string) =>
     crypto.randomUUIDv4.pipe(
@@ -104,7 +118,7 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
         // has to read as a decision someone made.
         tone: record.verdict === "approve" ? "info" : "approval",
         kind: SUPERVISOR_VERDICT_ACTIVITY_KIND,
-        summary: `Supervisor ${record.verdict === "escalate" ? "escalated" : `${record.verdict}d`} an approval request`,
+        summary: `Supervisor ${record.verdict === "deny" ? "denied" : `${record.verdict}d`} an approval request`,
         payload: {
           requestId: record.requestId,
           ...(record.requestType === undefined ? {} : { requestType: record.requestType }),
@@ -128,7 +142,10 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
     // marks the pending-approval projection resolved.
     yield* engine.dispatch({
       type: "thread.approval.respond",
-      commandId: yield* commandId("respond"),
+      commandId:
+        input.replayEvents === undefined
+          ? yield* commandId("respond")
+          : CommandId.make(`server:supervisor:${threadId}:${requestId}:respond`),
       threadId,
       requestId,
       decision,
@@ -136,7 +153,31 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
     });
   });
 
-  const handle = Effect.fn("attachApprovalSupervisor.handle")(function* (
+  const settleVerdict = Effect.fnUntraced(function* (record: Parameters<typeof recordVerdict>[0]) {
+    const decline = record.verdict === "escalate" && input.workflowVm;
+    const verdict = decline ? "deny" : record.verdict;
+    yield* recordVerdict(
+      decline
+        ? {
+            ...record,
+            verdict,
+            reasoning: `${record.reasoning} Workflow VM tool approvals cannot be handed to a human.`,
+          }
+        : record,
+    );
+    if (verdict === "escalate") {
+      yield* Effect.logInfo("supervisor escalated an approval request", {
+        threadId,
+        requestId: record.requestId,
+        reasoning: record.reasoning,
+      });
+      return;
+    }
+    // A denial lets the agent try another approach without ending the step.
+    yield* respond(record.requestId, verdict === "approve" ? "accept" : "decline");
+  });
+
+  const handleApproval = Effect.fn("attachApprovalSupervisor.handle")(function* (
     event: Extract<OrchestrationEvent, { readonly type: "thread.activity-appended" }>,
   ) {
     const payload = yield* decodeApprovalPayload(event.payload.activity.payload).pipe(
@@ -158,91 +199,131 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
     }
     answered.add(requestId);
 
+    const recorded = input.recordedVerdicts?.get(requestId);
+    if (recorded !== undefined) {
+      if (recorded !== "escalate" || input.workflowVm)
+        yield* respond(requestId, recorded === "approve" ? "accept" : "decline");
+      return;
+    }
     const disposition = classifyApprovalRequest({ requestType, detail });
 
     // The verdict is always recorded before it is acted on, so "why did the
     // agent do that" stays answerable even if the response never lands.
     if (disposition.kind === "auto-approve") {
-      yield* recordVerdict({
+      return yield* settleVerdict({
         requestId,
         requestType,
         verdict: "approve",
         reasoning: disposition.reason,
         consultedModel: false,
       });
-      yield* respond(requestId, "accept");
-      return;
     }
 
     if (disposition.kind === "deny") {
-      yield* recordVerdict({
+      return yield* settleVerdict({
         requestId,
         requestType,
         verdict: "deny",
         reasoning: disposition.reason,
         consultedModel: false,
       });
-      yield* respond(requestId, "decline");
-      return;
     }
 
+    const actualCwd = input.resolveCwd ? yield* input.resolveCwd : cwd;
+    const validTask = input.jobContext === undefined || Option.isSome(decodeWorkflowTask(input));
+    if (!actualCwd || !validTask) {
+      return yield* settleVerdict({
+        requestId,
+        requestType,
+        verdict: "escalate",
+        reasoning: !actualCwd
+          ? "The job's prepared workspace is unavailable."
+          : "The saved workflow task is invalid or exceeds its supported length.",
+        consultedModel: false,
+      });
+    }
     const generated = yield* textGeneration
       .generateApprovalVerdict({
-        cwd,
+        cwd: actualCwd,
         toolKind: disposition.toolKind,
         requestType: requestType ?? "unknown",
         ...(detail === undefined ? {} : { requestDetail: detail }),
         stepInstruction,
+        ...(input.jobContext === undefined
+          ? {}
+          : { jobContext: input.jobContext, reviewConstraint: input.reviewConstraint }),
         modelSelection,
       })
-      .pipe(Effect.option);
+      .pipe(Effect.result);
 
-    if (generated._tag === "None") {
-      // A supervisor that cannot be reached has not approved anything.
-      yield* Effect.logWarning("supervisor model call failed; escalating", { threadId, requestId });
-      yield* recordVerdict({
+    if (generated._tag === "Failure") {
+      const failure = Object.entries(WORKFLOW_APPROVAL_FAILURE_DETAILS).find(
+        ([, detail]) => detail === generated.failure.detail,
+      );
+      // Persist only our fixed explanations, never provider error bodies or causes.
+      yield* Effect.logWarning("supervisor model call failed", {
+        threadId,
+        requestId,
+        failureKind: failure?.[0] ?? "unavailable",
+      });
+      return yield* settleVerdict({
         requestId,
         requestType,
         verdict: "escalate",
-        reasoning: "The supervisor model could not be reached.",
+        reasoning: failure?.[1] ?? "The supervisor model did not return a usable approval verdict.",
         consultedModel: true,
       });
-      return;
     }
 
-    const { verdict, reasoning } = generated.value;
-    yield* recordVerdict({ requestId, requestType, verdict, reasoning, consultedModel: true });
-
-    if (verdict === "escalate") {
-      // Deliberately no response: the request stays pending, the thread reads
-      // as waiting_for_approval, and a human decides.
-      yield* Effect.logInfo("supervisor escalated an approval request", {
-        threadId,
-        requestId,
-        reasoning,
-      });
-      return;
-    }
-
-    // A denial feeds back to the agent with its reasoning, exactly as a human
-    // denial does, and does not fail the step — a supervisor that killed the
-    // job on first denial would make pipelines brittle.
-    yield* respond(requestId, verdict === "approve" ? "accept" : "decline");
+    const { verdict, reasoning } = generated.success;
+    yield* settleVerdict({ requestId, requestType, verdict, reasoning, consultedModel: true });
   });
 
+  const handleUserInput = Effect.fnUntraced(function* (payload: unknown) {
+    const request = decodeUserInput(payload);
+    if (Option.isNone(request) || request.value.responseMode === "message") return;
+    const { requestId } = request.value;
+    if (answeredUserInputs.has(requestId)) return;
+    // A native callback blocks the turn. Return no answers so Codex can continue
+    // without choosing on the user's behalf. Async questions do not block it.
+    yield* engine.dispatch({
+      type: "thread.user-input.respond",
+      commandId: CommandId.make(`server:supervisor:${threadId}:${requestId}:user-input`),
+      threadId,
+      requestId,
+      answers: {},
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+    });
+    answeredUserInputs.add(requestId);
+  });
+
+  const events =
+    input.replayEvents === undefined
+      ? engine.streamDomainEvents
+      : Stream.concat(
+          input.replayEvents,
+          input.liveEvents ?? (yield* engine.subscribeDomainEvents),
+        );
   yield* Effect.forkScoped(
-    Stream.runForEach(engine.streamDomainEvents, (event) =>
-      isApprovalRequested(event, threadId)
-        ? handle(event).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("supervisor failed to answer an approval request", {
-                threadId,
-                cause: Cause.pretty(cause),
-              }),
-            ),
-          )
-        : Effect.void,
-    ),
+    Stream.runForEach(events, (event) => {
+      if (event.type !== "thread.activity-appended" || event.payload.threadId !== threadId)
+        return Effect.void;
+      const activity = event.payload.activity;
+      const handle =
+        activity.kind === "approval.requested"
+          ? handleApproval(event)
+          : input.workflowVm && activity.kind === "user-input.requested"
+            ? handleUserInput(activity.payload)
+            : Effect.void;
+      return handle.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("supervisor failed to answer a provider request", {
+            threadId,
+            cause: Cause.pretty(cause),
+          }),
+        ),
+      );
+    }),
     { startImmediately: true },
   );
 }) satisfies (input: {
@@ -253,4 +334,10 @@ export const attachApprovalSupervisor = Effect.fn("attachApprovalSupervisor")(fu
   readonly stepInstruction: string;
   readonly cwd: string;
   readonly modelSelection: ModelSelection;
+  readonly workflowVm?: boolean;
+  readonly replayEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly liveEvents?: Stream.Stream<OrchestrationEvent>;
+  readonly resolvedRequestIds?: ReadonlySet<string>;
+  readonly resolvedUserInputIds?: ReadonlySet<string>;
+  readonly recordedVerdicts?: ReadonlyMap<string, SupervisorVerdict>;
 }) => Effect.Effect<void, never, Scope.Scope>;

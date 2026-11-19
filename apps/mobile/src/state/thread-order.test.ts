@@ -18,7 +18,11 @@ vi.mock("./atom-registry", async () => {
 });
 vi.mock("./threads", async () => {
   const { Atom } = await import("effect/unstable/reactivity");
-  return { environmentThreadShells: { threadShellsAtom: Atom.make([]).pipe(Atom.keepAlive) } };
+  const source = Atom.make([]).pipe(Atom.keepAlive);
+  return {
+    environmentThreadShells: { threadShellsAtom: source },
+    navigationThreadShellsAtom: source,
+  };
 });
 vi.mock("./server", async () => {
   const { Atom } = await import("effect/unstable/reactivity");
@@ -73,6 +77,24 @@ function fixture() {
 afterEach(() => appAtomRegistry.reset());
 
 describe("shared mobile pending move", () => {
+  it("keeps a writable move pending when a cached workflow result joins the list", () => {
+    const { rows, start, upsert } = fixture();
+    const move = start();
+    appAtomRegistry.set(shellsAtom, [
+      ...rows,
+      {
+        ...rows[0]!,
+        id: ThreadId.make("workflow:result"),
+        environmentId: EnvironmentId.make("workflow-vm"),
+      },
+    ]);
+    expect(move.isPending()).toBe(true);
+    move.complete();
+    upsert("b", "aa");
+    upsert("a", "bb");
+    expect(getPendingThreadOrder()).toBeNull();
+  });
+
   it("blocks another pickup after receipts and clears on final canonical upsert", () => {
     const { start, upsert } = fixture();
     const move = start();

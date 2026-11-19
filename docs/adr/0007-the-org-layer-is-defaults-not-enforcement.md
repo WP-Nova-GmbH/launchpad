@@ -4,7 +4,7 @@ status: accepted
 
 # The org layer supplies defaults and authorship, not enforcement
 
-Across config, workflows, and repository settings, the organization layer is **authoritative
+Across config and repository settings, the organization layer is **authoritative
 about what the default is** and **not** a mechanism for preventing change. Where something can
 be edited by the person it applies to, it is not enforced against them. Control comes from
 who is allowed to change a thing, not from marking parts of it immutable.
@@ -16,7 +16,12 @@ who is allowed to change a thing, not from marking parts of it immutable.
   can be edited back, immediately and by design.
 - **Executors.** Org config is authoritative, but as _sole authorship_ rather than enforcement:
   there is no competing editor on the machine, so nothing has to be locked.
-- **Workflows.** A repository may override any part of the org workflow, gates included.
+- **Workflows.** Each repository owns its workflow definitions, gates included. Copying a
+  workflow creates an independent definition; later edits to the source do not update the
+  copy. This avoids inheritance and override reconciliation when repositories need different
+  steps or review points. Copies retain steps and settings but clear event trigger configuration
+  and start with automatic triggering disabled, so a destination does not unexpectedly react
+  to the source repository's events.
 - **Provider credentials.** The exception that proves the rule — those are genuinely enforced,
   and only because enforcement lives outside this system entirely, in Infisical
   ([ADR-0003](./0003-provider-credentials-are-fetched-by-executors-not-pushed.md)).
@@ -31,10 +36,10 @@ misleads administrators into believing something is guaranteed when it is not.
 
 ## Compensating control: visibility
 
-Every override layer is patch-shaped (`optionalKey` throughout, presence means intent), so an
-override **is** a diff against the layer above it. Deviation is therefore queryable without any
-extra modelling: administrators get _"these repositories deviate from your workflow, and here is
-how"_ from a read, not from a permission system.
+Configuration override layers are patch-shaped (`optionalKey` throughout, presence means
+intent), so an override **is** a diff against the layer above it. Configuration deviation is
+therefore queryable without extra modelling. Repository workflows are complete definitions;
+their steps and gates remain visible without implying a relationship to an organization default.
 
 ## Consequences
 

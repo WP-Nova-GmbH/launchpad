@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -85,6 +86,40 @@ function makeHandle(input: {
 }
 
 describe("CloudManagedEndpointRuntime", () => {
+  it.effect(
+    "never resolves or spawns cached or new connectors when managed tunnels are disabled",
+    () =>
+      Effect.gen(function* () {
+        const runtime = yield* buildCloudManagedEndpointRuntime(
+          ChildProcessSpawner.make(() => Effect.die("disabled connector spawned")),
+          Layer.succeed(
+            RelayClient.RelayClient,
+            RelayClient.RelayClient.of({
+              resolve: Effect.die("disabled connector resolved"),
+              install: Effect.die("disabled connector installed"),
+              installWithProgress: () => Effect.die("disabled connector installed"),
+            }),
+          ),
+        );
+        const config = {
+          providerKind: "cloudflare_tunnel" as const,
+          connectorToken: "cached-token",
+          tunnelId: "cached-tunnel",
+        };
+        expect(yield* runtime.applyConfig(config)).toEqual({ status: "disabled" });
+        yield* runtime.requestRecovery(config);
+        expect(yield* runtime.applyConfig({ ...config, connectorToken: "new-token" })).toEqual({
+          status: "disabled",
+        });
+      }).pipe(
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({ env: { T3CODE_DISABLE_MANAGED_TUNNELS: "1" } }),
+          ),
+        ),
+      ),
+  );
+
   it("retries connector startup failures but stops for unsupported runtimes", () => {
     expect(
       ManagedEndpointRuntime.isRetryableManagedEndpointRuntimeStatus({

@@ -3817,10 +3817,10 @@ export function makeOpenCodeAdapter(
       const request = context.pendingPermissions.get(requestId);
       if (!request) {
         if (context.emittedTerminalRequestIds.has(requestId)) return;
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "permission.reply",
-          detail:
+          operation: "respondToRequest",
+          issue:
             context.pendingRequestRecovery || context.requestRelationRetries.has(requestId)
               ? "OpenCode is still loading this permission request. Try again."
               : `Unknown pending permission request: ${requestId}`,
@@ -3869,10 +3869,10 @@ export function makeOpenCodeAdapter(
       const request = context.pendingQuestions.get(requestId);
       if (!request) {
         if (context.emittedTerminalRequestIds.has(requestId)) return;
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "question.reply",
-          detail:
+          operation: "respondToUserInput",
+          issue:
             context.pendingRequestRecovery || context.requestRelationRetries.has(requestId)
               ? "OpenCode is still loading this question. Try again."
               : `Unknown pending user-input request: ${requestId}`,

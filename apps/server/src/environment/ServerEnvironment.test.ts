@@ -8,11 +8,14 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
+import { THREAD_VM_IDENTITY_SECRET } from "../relay/ThreadVmEnrollment.ts";
 
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import { RepositoryAccess } from "../auth/RepositoryAccess.ts";
 import {
   PUBLISH_AGENT_ACTIVITY_SECRET,
   RELAY_ENVIRONMENT_CREDENTIAL_SECRET,
@@ -24,6 +27,7 @@ import * as ServerEnvironment from "./ServerEnvironment.ts";
 const isServerEnvironmentIdPersistenceError = Schema.is(
   ServerEnvironment.ServerEnvironmentIdPersistenceError,
 );
+const encodeTestJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const makeServerEnvironmentLayer = (baseDir: string) =>
   ServerEnvironment.layer.pipe(
@@ -169,6 +173,10 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
 
       expect(first.environmentId).toBe(second.environmentId);
       expect(first.orchestrationProtocolVersion).toBe(ORCHESTRATION_PROTOCOL_VERSION);
+      expect(second.capabilities.threadTransferFormats).toEqual([
+        "launchpad-thread-chunks-v1",
+        "launchpad-thread-chunks-v2",
+      ]);
       expect(second.capabilities.repositoryIdentity).toBe(true);
       expect(second.capabilities.connectionProbe).toBe(true);
       expect(second.capabilities.attachmentUploads).toBe(true);
@@ -181,7 +189,64 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       expect(second.capabilities.threadPullRequests).toBe(true);
       expect(second.capabilities.threadPullRequestLinking).toBe(true);
       expect(second.capabilities.agentActivityPublishing).toBe(false);
+      expect(second.threadVm).toBeUndefined();
     }),
+  );
+
+  it.effect(
+    "advertises an installed private VM scope without exposing its enrollment credential",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-vm-descriptor-" });
+        const config = yield* makeServerConfig(baseDir);
+        const environmentId = "00000000-0000-4000-8000-000000000001";
+        yield* fileSystem.makeDirectory(config.stateDir, { recursive: true });
+        yield* fileSystem.writeFileString(config.environmentIdPath, environmentId);
+        const enrollment = new TextEncoder().encode(
+          encodeTestJson({
+            operationId: "enrollment",
+            environmentId,
+            scope: {
+              allocationId: "vm",
+              threadId: "private-thread",
+              repositoryId: "repo",
+              generation: 2,
+            },
+            relayUrl: "https://relay.example.test",
+            relayIssuer: "https://relay.example.test",
+            environmentCredential: "test-only-credential",
+            cloudMintPublicKey: "test-only-public-key",
+          }),
+        );
+        const secrets = ServerSecretStore.ServerSecretStore.of({
+          get: (key) =>
+            Effect.succeed(
+              key === THREAD_VM_IDENTITY_SECRET ? Option.some(enrollment) : Option.none(),
+            ),
+          set: () => Effect.void,
+          create: () => Effect.void,
+          getOrCreateRandom: () => Effect.succeed(new Uint8Array()),
+          remove: () => Effect.void,
+        });
+        const readDescriptor = Effect.gen(function* () {
+          return yield* (yield* ServerEnvironment.ServerEnvironment).getDescriptor;
+        }).pipe(
+          Effect.provide(ServerEnvironment.layer),
+          Effect.provideService(ServerSecretStore.ServerSecretStore, secrets),
+          Effect.provideService(ServerConfig.ServerConfig, config),
+        );
+        const descriptor = yield* readDescriptor;
+        expect(descriptor.environmentId).toBe(environmentId);
+        expect(descriptor.threadVm).toEqual({ threadId: "private-thread" });
+        expect(descriptor.capabilities.workflowVmResultReader).toBe(false);
+        expect(encodeTestJson(descriptor)).not.toContain("test-only-credential");
+        const access = yield* RepositoryAccess;
+        const workflow = yield* readDescriptor.pipe(
+          Effect.provideService(RepositoryAccess, { ...access, workflowVm: true }),
+        );
+        expect(workflow.capabilities.workflowVmResultReader).toBe(true);
+      }),
   );
 
   it.effect("reports agent activity publishing from the current secret state", () =>
@@ -228,6 +293,39 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
         expect(disabled.capabilities.agentActivityPublishing).toBe(false);
       }).pipe(Effect.provide(testLayer));
     }),
+  );
+
+  it.effect(
+    "allows personal relay-linked threads to move without enabling organization access",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-server-environment-personal-move-test-",
+        });
+        const testLayer = Layer.mergeAll(
+          ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer)),
+          ServerSecretStore.layer,
+        ).pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), baseDir)));
+
+        yield* Effect.gen(function* () {
+          const secrets = yield* ServerSecretStore.ServerSecretStore;
+          const environment = yield* ServerEnvironment.ServerEnvironment;
+          const encode = (value: string) => new TextEncoder().encode(value);
+          expect((yield* environment.getDescriptor).capabilities.threadMoves).toBe(false);
+          yield* secrets.set(RELAY_URL_SECRET, encode("https://relay.example"));
+          expect((yield* environment.getDescriptor).capabilities.threadMoves).toBe(false);
+          yield* secrets.set(RELAY_ENVIRONMENT_CREDENTIAL_SECRET, encode(" \n"));
+          expect((yield* environment.getDescriptor).capabilities.threadMoves).toBe(false);
+          yield* secrets.set(RELAY_ENVIRONMENT_CREDENTIAL_SECRET, encode("credential"));
+          const linked = yield* environment.getDescriptor;
+          expect(linked.capabilities.threadMoves).toBe(true);
+          expect(linked.capabilities.organizationRepositoryAccess).toBe(false);
+          expect(linked.capabilities.sharedPromptQueue).toBe(false);
+          yield* secrets.remove(RELAY_ENVIRONMENT_CREDENTIAL_SECRET);
+          expect((yield* environment.getDescriptor).capabilities.threadMoves).toBe(false);
+        }).pipe(Effect.provide(testLayer));
+      }),
   );
 
   it.effect("advertises desktopAppUpdate only with desktop mode and the control fd", () =>

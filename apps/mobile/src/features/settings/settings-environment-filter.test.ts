@@ -1,13 +1,25 @@
 import type { EnvironmentId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { toggleSettingsEnvironment } from "./settings-environment-filter.logic";
+import {
+  canManageSettingsWorkspace,
+  toggleSettingsEnvironment,
+} from "./settings-environment-filter.logic";
 
 const first = "first" as EnvironmentId;
 const second = "second" as EnvironmentId;
 const connected = [{ environmentId: first }, { environmentId: second }];
 
 describe("settings environment filter", () => {
+  it("excludes result readers and cached result checkouts from mutable settings scopes", () => {
+    expect(canManageSettingsWorkspace({ workflowVmResultReader: true })).toBe(false);
+    expect(canManageSettingsWorkspace({ workflowVmResultReader: true }, "project")).toBe(false);
+    expect(canManageSettingsWorkspace(undefined, "vm:workflow:job")).toBe(false);
+    expect(canManageSettingsWorkspace({}, "vm:workflow:job")).toBe(false);
+    expect(canManageSettingsWorkspace(undefined, "machine-checkout")).toBe(true);
+    expect(canManageSettingsWorkspace({ workflowVmResultReader: false }, "vm:thread")).toBe(true);
+  });
+
   it("starts with all connected environments and can narrow to either or neither", () => {
     const withoutFirst = toggleSettingsEnvironment(null, connected, first);
     expect([...withoutFirst!]).toEqual([second]);

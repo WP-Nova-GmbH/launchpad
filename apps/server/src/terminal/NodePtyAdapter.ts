@@ -1,3 +1,12 @@
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  WorkflowVmGuest,
+  signalRunningWorkflowVmWorkload,
+  vmWorkloadCommand,
+  workflowVmProcessEnvironment,
+} from "../vmWorkloadCommand.ts";
+import * as NodeCrypto from "node:crypto";
 import * as NodeModule from "node:module";
 
 import * as Context from "effect/Context";
@@ -82,13 +91,75 @@ const ensureNodePtySpawnHelperExecutable = Effect.fn(function* () {
   yield* fs.chmod(helperPath, 0o755).pipe(Effect.orElseSucceed(() => undefined));
 });
 
+const encodeSetupLaunch = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      protocol: Schema.Literal(1),
+      token: Schema.String,
+      candidates: Schema.Array(
+        Schema.Struct({ shell: Schema.String, args: Schema.optional(Schema.Array(Schema.String)) }),
+      ),
+    }),
+  ),
+);
+
 class NodePtyProcess implements PtyAdapter.PtyProcess {
   private readonly process: import("node-pty").IPty;
   private readonly platform: NodeJS.Platform;
+  private readonly signalWorkflow: ((signal: string) => Promise<void>) | undefined;
+  private readonly outputListeners = new Set<(data: string) => void>();
+  private readonly shellExitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
+  private shellExit: PtyAdapter.PtyExitEvent | undefined;
+  private pendingFrame = "";
 
-  constructor(process: import("node-pty").IPty, platform: NodeJS.Platform) {
+  constructor(
+    process: import("node-pty").IPty,
+    platform: NodeJS.Platform,
+    token?: string,
+    signalWorkflow?: (signal: string) => Promise<void>,
+  ) {
     this.process = process;
     this.platform = platform;
+    this.signalWorkflow = signalWorkflow;
+    if (token) {
+      const prefix = `\x1b]T3_SETUP_EXIT;${token};`;
+      process.onData((data) => {
+        this.pendingFrame += data;
+        while (this.pendingFrame.length > 0) {
+          const index = this.pendingFrame.indexOf(prefix);
+          if (index < 0) {
+            let keep = Math.min(prefix.length - 1, this.pendingFrame.length);
+            while (keep > 0 && !prefix.startsWith(this.pendingFrame.slice(-keep))) keep--;
+            const output = this.pendingFrame.slice(0, this.pendingFrame.length - keep);
+            this.pendingFrame = keep ? this.pendingFrame.slice(-keep) : "";
+            for (const listener of this.outputListeners) if (output) listener(output);
+            break;
+          }
+          const output = this.pendingFrame.slice(0, index);
+          for (const listener of this.outputListeners) if (output) listener(output);
+          this.pendingFrame = this.pendingFrame.slice(index);
+          const end = this.pendingFrame.indexOf("\x07", prefix.length);
+          if (end < 0 && this.pendingFrame.length <= prefix.length + 16) break;
+          const code = end < 0 ? "" : this.pendingFrame.slice(prefix.length, end);
+          if (/^-?\d{1,10}$/.test(code)) {
+            this.shellExit = { exitCode: Number(code), signal: null };
+            for (const listener of this.shellExitListeners) listener(this.shellExit);
+            this.pendingFrame = this.pendingFrame.slice(end + 1);
+          } else {
+            for (const listener of this.outputListeners) listener(this.pendingFrame[0]!);
+            this.pendingFrame = this.pendingFrame.slice(1);
+          }
+        }
+      });
+      process.onExit(() => {
+        for (const listener of this.outputListeners)
+          if (this.pendingFrame) listener(this.pendingFrame);
+        this.pendingFrame = "";
+      });
+    } else
+      process.onData((data) => {
+        for (const listener of this.outputListeners) listener(data);
+      });
   }
 
   get pid(): number {
@@ -103,15 +174,24 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
     this.process.resize(cols, rows);
   }
 
-  kill(signal?: string): void {
+  kill(signal?: string): void | Promise<void> {
+    if (this.signalWorkflow) return this.signalWorkflow(signal ?? "SIGHUP");
     // node-pty terminates the Windows process tree without a POSIX signal.
     this.process.kill(this.platform === "win32" ? undefined : signal);
   }
 
   onData(callback: (data: string) => void): () => void {
-    const disposable = this.process.onData(callback);
+    this.outputListeners.add(callback);
     return () => {
-      disposable.dispose();
+      this.outputListeners.delete(callback);
+    };
+  }
+
+  onShellExit(callback: (event: PtyAdapter.PtyExitEvent) => void): () => void {
+    this.shellExitListeners.add(callback);
+    if (this.shellExit) callback(this.shellExit);
+    return () => {
+      this.shellExitListeners.delete(callback);
     };
   }
 
@@ -130,6 +210,10 @@ class NodePtyProcess implements PtyAdapter.PtyProcess {
 
 export const make = Effect.fn("NodePtyAdapter.make")(function* () {
   const loadNodePtyModule = yield* NodePtyModuleLoaderRef;
+  const trackWorkloads = yield* VmWorkloadTracking;
+  const workflowGuest = yield* WorkflowVmGuest;
+  const controlSpawner = yield* VmControlSpawner;
+  const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const platform = yield* HostProcessPlatform;
@@ -157,31 +241,112 @@ export const make = Effect.fn("NodePtyAdapter.make")(function* () {
 
   return PtyAdapter.PtyAdapter.of({
     spawn: Effect.fn("NodePtyAdapter.spawn")(function* (input) {
+      if (workflowGuest && (!trackWorkloads || !controlSpawner)) {
+        return yield* new PtyAdapter.PtySpawnError({
+          adapter: "node-pty",
+          shell: input.shell,
+          cause: new Error("Workflow terminal isolation is unavailable."),
+        });
+      }
       yield* ensureNodePtySpawnHelperExecutableCached;
       // node-pty only writes `name` into the child's TERM on the Unix path;
       // the ConPTY path leaves the environment untouched, so Windows children
       // inherit a missing or 16-color TERM unless it is set here.
-      const env =
-        platform === "win32" && input.env["TERM"] === undefined
+      const env = workflowGuest
+        ? workflowVmProcessEnvironment(input.env)
+        : platform === "win32" && input.env["TERM"] === undefined
           ? { ...input.env, TERM: "xterm-256color" }
           : input.env;
-      const ptyProcess = yield* Effect.try({
-        try: () =>
-          nodePty.spawn(input.shell, input.args ?? [], {
-            cwd: input.cwd,
-            cols: input.cols,
-            rows: input.rows,
-            env,
-            name: "xterm-256color",
-          }),
-        catch: (cause) =>
-          new PtyAdapter.PtySpawnError({
-            adapter: "node-pty",
-            shell: input.shell,
-            cause,
-          }),
-      });
-      return new NodePtyProcess(ptyProcess, platform);
+      const token = input.ownerExecutable ? NodeCrypto.randomUUID().replaceAll("-", "") : undefined;
+      const protectedOwner = workflowGuest && token !== undefined;
+      const candidate = input.ownerShellCandidates?.[0];
+      const script = candidate?.args?.[1];
+      const spawnError = (cause: unknown) =>
+        new PtyAdapter.PtySpawnError({ adapter: "node-pty", shell: input.shell, cause });
+      if (
+        protectedOwner &&
+        (input.ownerShellCandidates?.length !== 1 ||
+          candidate?.shell !== "/bin/bash" ||
+          candidate.args?.length !== 2 ||
+          candidate.args[0] !== "-c" ||
+          script === undefined ||
+          script.includes("\0"))
+      ) {
+        return yield* spawnError(new Error("Invalid workflow setup shell."));
+      }
+      const scriptFile = protectedOwner
+        ? `/tmp/launchpad-workflow-setup-${NodeCrypto.randomUUID().replaceAll("-", "")}.sh`
+        : undefined;
+      const removeScript = scriptFile
+        ? fs.remove(scriptFile, { force: true }).pipe(Effect.ignore)
+        : Effect.void;
+      const ownedCommand = input.ownerExecutable ?? input.shell;
+      const ownedArgs = scriptFile
+        ? ["--setup-owner-v4", "--script-file-v1", scriptFile]
+        : input.ownerExecutable
+          ? [
+              "--setup-owner-v4",
+              "--launch-v1",
+              encodeSetupLaunch({
+                protocol: 1,
+                token: token!,
+                candidates: input.ownerShellCandidates ?? [
+                  { shell: input.shell, args: input.args ?? [] },
+                ],
+              }),
+            ]
+          : (input.args ?? []);
+      const workload = trackWorkloads
+        ? vmWorkloadCommand(
+            ownedCommand,
+            ownedArgs,
+            "terminal",
+            workflowGuest ? input.cwd : undefined,
+          )
+        : null;
+      const launch = workload ?? { command: ownedCommand, args: ownedArgs };
+      const ptyProcess = yield* Effect.gen(function* () {
+        if (scriptFile) {
+          yield* Effect.gen(function* () {
+            const file = yield* fs.open(scriptFile, { flag: "wx", mode: 0o600 });
+            yield* file
+              .writeAll(Buffer.from(script!.replaceAll("\r\n", "\n")))
+              .pipe(Effect.onError(() => removeScript));
+          }).pipe(Effect.scoped, Effect.mapError(spawnError));
+        }
+        const process = yield* Effect.try({
+          try: () =>
+            nodePty.spawn(launch.command, launch.args, {
+              cwd: workflowGuest && input.cwd ? "/" : input.cwd,
+              cols: input.cols,
+              rows: input.rows,
+              env: protectedOwner ? { ...env, LAUNCHPAD_WORKFLOW_SETUP_EXIT_TOKEN: token } : env,
+              name: "xterm-256color",
+            }),
+          catch: spawnError,
+        }).pipe(Effect.onError(() => removeScript));
+        if (scriptFile) process.onExit(() => void runPromise(removeScript));
+        return process;
+      }).pipe(Effect.uninterruptible);
+      if (!workflowGuest || !workload || !controlSpawner)
+        return new NodePtyProcess(ptyProcess, platform, token);
+      let running = true;
+      ptyProcess.onExit(() => void (running = false));
+      return new NodePtyProcess(ptyProcess, platform, token, (signal) =>
+        runPromise(
+          removeScript.pipe(
+            Effect.andThen(
+              signalRunningWorkflowVmWorkload(
+                controlSpawner,
+                workload.workloadId,
+                ptyProcess.pid,
+                signal,
+                Effect.sync(() => running),
+              ),
+            ),
+          ),
+        ),
+      );
     }),
   });
 });

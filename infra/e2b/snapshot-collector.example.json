@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "project": "e2b",
+  "storagePath": "/var/lib/e2b/storage/templates",
+  "buildCachePath": "/var/lib/e2b/storage/build-cache",
+  "journalPath": "/var/lib/e2b/snapshot-collection.jsonl",
+  "orchestratorAddress": "127.0.0.1:5008",
+  "minimumAgeSeconds": 3600
+}

@@ -27,6 +27,7 @@ Choose the command for the surface you are working on:
 | Command                | What it starts                                                                                  |
 | ---------------------- | ----------------------------------------------------------------------------------------------- |
 | `vp run dev:desktop`   | Electron, the web development server, and a desktop-managed backend.                            |
+| `vp run dev:vm`        | Desktop, local relay and a reusable Cloudflare relay tunnel; requires the configured E2B host.  |
 | `vp run dev`           | The browser app and backend.                                                                    |
 | `vp run dev:share`     | The browser app and backend shared over Tailscale; see sharing below.                           |
 | `vp run dev:mobile`    | Metro for an installed Expo development client; requires a separate reachable backend.          |
@@ -35,6 +36,7 @@ Choose the command for the surface you are working on:
 
 Desktop development builds the backend before opening Electron; allow the initial build to
 finish. The desktop app starts its own backend, so `dev:desktop` is sufficient for that surface.
+For VM moves, use the [VM development setup](vm-development.md).
 Linux also needs the [native desktop prerequisites](#linux-appimage-prerequisites).
 
 For browser development, open the complete pairing URL printed by the dev runner, including
@@ -108,6 +110,10 @@ Set `DEV_RELAY_DATABASE_URL` in `infra/relay/.env` to use that port; update any 
 commands, including shutdown and reset. The project name isolates containers and
 volumes; the port must also be free. Each running relay needs its own `DEV_RELAY_PORT`, with
 the corresponding `T3CODE_RELAY_URL` in that worktree's root `.env`.
+
+For VM setup and thread moves, see [VM development](./vm-development.md). The
+[E2B host setup](./e2b-host-setup.md) covers the underlying Linux host and optional
+Lima host for Mac development.
 
 ### State and ports
 
@@ -207,6 +213,12 @@ vp test run <files>
 vp lint <files>
 vp run --filter <package> typecheck
 ```
+
+Relay workflow event integration suites require `WORKFLOW_SOURCES_TEST_DATABASE_URL` for a
+disposable PostgreSQL instance whose role can create/drop test databases. Set
+`WORKFLOW_PAGES_TEST_DATABASE_URL` to that instance for the job-page/origin regressions. CI and
+release test jobs provide an isolated service; the event suites fail clearly when their URL is absent.
+Never point either variable at production state.
 
 Use `vp run lint:mobile` for native mobile changes. CI owns the full suite; see
 [ci.yml](../../.github/workflows/ci.yml) for its current jobs.

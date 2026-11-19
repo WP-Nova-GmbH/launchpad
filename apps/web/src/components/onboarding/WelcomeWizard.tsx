@@ -3,6 +3,7 @@ import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import type {
   AgentSessionProjectCandidate,
+  AgentSessionImportProgress,
   EnvironmentId,
   ProjectId,
   ScopedProjectRef,
@@ -64,6 +65,7 @@ import { getDriverOption } from "../settings/providerDriverMeta";
 import { TerminalViewport } from "../ThreadTerminalDrawer";
 import { CloudEnvironmentConnectRows } from "../cloud/CloudEnvironmentConnectList";
 import { ClaudeAI, OpenAI } from "../Icons";
+import { Alert, AlertTitle, AlertDescription } from "../ui/alert";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
@@ -961,6 +963,14 @@ function ImportStep({
   const projects = useProjects();
   const [selectedPaths, setSelectedPaths] = useState<ReadonlySet<string> | null>(null);
   const [importError, setImportError] = useState("");
+  const [importHasHistory, setImportHasHistory] = useState(false);
+  const [importProgress, setImportProgress] = useState<{
+    readonly project: string;
+    readonly projectIndex: number;
+    readonly projectCount: number;
+    readonly stage: "preparing" | "importing" | "finishing";
+    readonly counts: AgentSessionImportProgress;
+  } | null>(null);
   const [landingProject, setLandingProject] = useState<ScopedProjectRef | null>(null);
   // Keep project creation attempts separate from completed history imports so both can retry.
   const importedProjectsRef = useRef(new Map<string, ScopedProjectRef>());
@@ -1025,6 +1035,7 @@ function ImportStep({
       return;
     }
     setIsImporting(true);
+    setImportProgress((current) => (current === null ? null : { ...current, stage: "finishing" }));
     setLandingProject(projectRef);
   };
 
@@ -1052,7 +1063,7 @@ function ImportStep({
     let importedThreadCount = 0;
     let skippedThreadCount = 0;
     const refreshEnvironments = new Set<EnvironmentId>();
-    for (const candidate of selection) {
+    for (const [index, candidate] of selection.entries()) {
       const { environmentId } = candidate;
       if (
         importGeneration !== importGenerationRef.current ||
@@ -1061,6 +1072,20 @@ function ImportStep({
         return;
       }
       if (importedProjects.has(candidate.key)) continue;
+      const currentProject = {
+        project: candidate.title,
+        projectIndex: index + 1,
+        projectCount: selection.length,
+      };
+      setImportProgress({
+        ...currentProject,
+        stage: "preparing",
+        counts: {
+          importedCount: importedThreadCount,
+          skippedCount: skippedThreadCount,
+          reading: null,
+        },
+      });
       let projectId = resolveOnboardingProjectId(readProjects(), environmentId, candidate);
       if (projectId === null) {
         let attempt = projectAttempts.get(candidate.key);
@@ -1099,9 +1124,28 @@ function ImportStep({
         }
       }
 
+      setImportProgress((current) =>
+        current === null ? null : { ...current, stage: "importing" },
+      );
+      let latestCounts: AgentSessionImportProgress | null = null;
       const threadImportResult = await importThreads({
         environmentId,
-        input: { projectId, expectedWorkspaceRoot: candidate.path },
+        input: {
+          request: { projectId, expectedWorkspaceRoot: candidate.path },
+          onProgress: (counts) => {
+            if (importGeneration !== importGenerationRef.current) return;
+            latestCounts = counts;
+            setImportProgress({
+              ...currentProject,
+              stage: "importing",
+              counts: {
+                ...counts,
+                importedCount: importedThreadCount + counts.importedCount,
+                skippedCount: skippedThreadCount + counts.skippedCount,
+              },
+            });
+          },
+        },
       });
       if (
         importGeneration !== importGenerationRef.current ||
@@ -1122,23 +1166,36 @@ function ImportStep({
           importedProjectsCount += 1;
           importedProjects.set(candidate.key, scopeProjectRef(environmentId, projectId));
         }
-      } else if (!isAtomCommandInterrupted(threadImportResult)) {
-        projectAttempts.delete(candidate.key);
-        refreshEnvironments.add(environmentId);
+      } else {
+        // Streamed counts describe persisted histories even when the final reply is lost.
+        const landed = latestCounts as AgentSessionImportProgress | null;
+        importedThreadCount += landed?.importedCount ?? 0;
+        skippedThreadCount += landed?.skippedCount ?? 0;
+        if (landed !== null && landed.importedCount > 0) {
+          projectsWithImportedHistoryRef.current.set(
+            candidate.key,
+            scopeProjectRef(environmentId, projectId),
+          );
+        }
+        if (!isAtomCommandInterrupted(threadImportResult)) {
+          projectAttempts.delete(candidate.key);
+          refreshEnvironments.add(environmentId);
+        }
       }
     }
     for (const scan of scans) {
       if (refreshEnvironments.has(scan.environmentId)) scan.refresh();
     }
     setIsImporting(false);
+    setImportHasHistory(projectsWithImportedHistoryRef.current.size > 0);
     if (importedProjectsCount < selection.length) {
       if (importedThreadCount > 0 && skippedThreadCount > 0) {
         setImportError(
-          `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. ${skippedThreadCount} ${skippedThreadCount === 1 ? "thread" : "threads"} could not be imported.`,
+          `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. ${skippedThreadCount} ${skippedThreadCount === 1 ? "history was" : "histories were"} skipped.`,
         );
       } else if (skippedThreadCount > 0) {
         setImportError(
-          `${skippedThreadCount} ${skippedThreadCount === 1 ? "thread could" : "threads could"} not be imported.`,
+          `${skippedThreadCount} ${skippedThreadCount === 1 ? "history was" : "histories were"} skipped.`,
         );
       } else if (importedThreadCount > 0) {
         setImportError(
@@ -1173,95 +1230,177 @@ function ImportStep({
 
   return (
     <StepShell
-      title="Choose your projects"
-      description="Import projects and conversations from your selected computers."
+      title={isImporting ? "Importing your projects" : "Choose your projects"}
+      description={
+        isImporting
+          ? "Bringing your conversation history into Launchpad."
+          : "Import projects and conversations from your selected computers."
+      }
     >
-      {candidates.length > 0 ? (
-        <div className="mt-5 flex items-center justify-between gap-3 text-xs text-muted-foreground">
-          <span role="status">
-            {selected.length} of {candidates.length} selected
-          </span>
-          <div className="flex items-center gap-1">
-            <Button
-              variant="ghost"
-              size="xs"
-              disabled={isImporting || selected.length === candidates.length}
-              onClick={() => setSelectedPaths(new Set(candidates.map((item) => item.key)))}
-            >
-              Select all
-            </Button>
-            <Button
-              variant="ghost"
-              size="xs"
-              disabled={isImporting || selected.length === 0}
-              onClick={() => setSelectedPaths(new Set())}
-            >
-              Select none
-            </Button>
+      {!isImporting ? (
+        <>
+          {candidates.length > 0 ? (
+            <div className="mt-5 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span role="status">
+                {selected.length} of {candidates.length} selected
+              </span>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={isImporting || selected.length === candidates.length}
+                  onClick={() => setSelectedPaths(new Set(candidates.map((item) => item.key)))}
+                >
+                  Select all
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={isImporting || selected.length === 0}
+                  onClick={() => setSelectedPaths(new Set())}
+                >
+                  Select none
+                </Button>
+              </div>
+            </div>
+          ) : null}
+          <ScrollArea scrollFade className="mt-2 h-auto max-h-80">
+            <div className="space-y-5 pr-3">
+              {scans.map((scan) => {
+                const scanCandidates = candidates.filter(
+                  (candidate) => candidate.environmentId === scan.environmentId,
+                );
+                const label =
+                  environments.find(
+                    (environment) => environment.environmentId === scan.environmentId,
+                  )?.label ?? "Computer";
+                return (
+                  <fieldset
+                    key={scan.environmentId}
+                    className="min-w-0 space-y-0.5"
+                    disabled={isImporting}
+                  >
+                    {scans.length > 1 ? (
+                      <legend className="mb-2 text-sm font-medium">{label}</legend>
+                    ) : null}
+                    {scan.isPending && scan.data === null ? (
+                      <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
+                        <Spinner size="md" />
+                        Looking for projects…
+                      </div>
+                    ) : scan.error !== null ? (
+                      <div
+                        role="alert"
+                        className="flex items-center justify-between gap-3 text-sm text-muted-foreground"
+                      >
+                        <span>Could not check projects. {scan.error}</span>
+                        <Button variant="ghost" size="sm" onClick={scan.refresh}>
+                          Retry
+                        </Button>
+                      </div>
+                    ) : scanCandidates.length === 0 ? (
+                      <p className="py-2 text-sm text-muted-foreground">
+                        No existing Claude Code or Codex projects found.
+                      </p>
+                    ) : null}
+                    {scan.data?.truncated ? (
+                      <p className="text-xs text-muted-foreground" role="status">
+                        {SCAN_LIMIT_MESSAGE}
+                      </p>
+                    ) : null}
+                    <ImportCandidateList
+                      candidates={scanCandidates}
+                      selectedKeys={selectedKeys}
+                      onSelectionChange={setSelectedPaths}
+                    />
+                  </fieldset>
+                );
+              })}
+            </div>
+          </ScrollArea>
+        </>
+      ) : null}
+      {isImporting && importProgress !== null ? (
+        <div
+          className="mt-4 rounded-xl border border-border bg-muted/30 p-4"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <p className="truncate text-sm font-medium">
+              {importProgress.stage === "finishing"
+                ? "Opening your projects…"
+                : `${importProgress.stage === "preparing" ? "Preparing" : "Importing"} ${importProgress.project}`}
+            </p>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              Project {importProgress.projectIndex} of {importProgress.projectCount}
+            </span>
           </div>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {importProgress.counts.importedCount} threads imported ·{" "}
+            {importProgress.counts.skippedCount} skipped
+          </p>
+          {importProgress.counts.reading !== null ? (
+            <div className="mt-3 space-y-1.5" aria-live="off">
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>
+                  {importProgress.counts.reading.bytesRead ===
+                  importProgress.counts.reading.totalBytes
+                    ? "Processing history…"
+                    : "Reading conversation history…"}
+                </span>
+                <span>
+                  {Math.round(importProgress.counts.reading.bytesRead / 1024 / 1024)} /{" "}
+                  {Math.ceil(importProgress.counts.reading.totalBytes / 1024 / 1024)} MB
+                </span>
+              </div>
+              <div
+                className="h-1.5 overflow-hidden rounded-full bg-muted"
+                role="progressbar"
+                aria-label="Reading the current conversation history"
+                aria-valuemin={0}
+                aria-valuemax={Math.max(1, importProgress.counts.reading.totalBytes)}
+                aria-valuenow={importProgress.counts.reading.bytesRead}
+              >
+                <div
+                  className="h-full bg-primary"
+                  style={{
+                    width: `${importProgress.counts.reading.totalBytes === 0 ? 100 : Math.min(100, (importProgress.counts.reading.bytesRead / importProgress.counts.reading.totalBytes) * 100)}%`,
+                  }}
+                />
+              </div>
+            </div>
+          ) : null}
+          <p className="mt-2 text-xs text-muted-foreground">
+            Conversations appear as each history finishes importing. Large histories can take a
+            while.
+          </p>
         </div>
       ) : null}
-      <ScrollArea scrollFade className="mt-2 h-auto max-h-80">
-        <div className="space-y-5 pr-3">
-          {scans.map((scan) => {
-            const scanCandidates = candidates.filter(
-              (candidate) => candidate.environmentId === scan.environmentId,
-            );
-            const label =
-              environments.find((environment) => environment.environmentId === scan.environmentId)
-                ?.label ?? "Computer";
-            return (
-              <fieldset
-                key={scan.environmentId}
-                className="min-w-0 space-y-0.5"
-                disabled={isImporting}
-              >
-                {scans.length > 1 ? (
-                  <legend className="mb-2 text-sm font-medium">{label}</legend>
-                ) : null}
-                {scan.isPending && scan.data === null ? (
-                  <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
-                    <Spinner size="md" />
-                    Looking for projects…
-                  </div>
-                ) : scan.error !== null ? (
-                  <div
-                    role="alert"
-                    className="flex items-center justify-between gap-3 text-sm text-muted-foreground"
-                  >
-                    <span>Could not check projects. {scan.error}</span>
-                    <Button variant="ghost" size="sm" onClick={scan.refresh}>
-                      Retry
-                    </Button>
-                  </div>
-                ) : scanCandidates.length === 0 ? (
-                  <p className="py-2 text-sm text-muted-foreground">
-                    No existing Claude Code or Codex projects found.
-                  </p>
-                ) : null}
-                {scan.data?.truncated ? (
-                  <p className="text-xs text-muted-foreground" role="status">
-                    {SCAN_LIMIT_MESSAGE}
-                  </p>
-                ) : null}
-                <ImportCandidateList
-                  candidates={scanCandidates}
-                  selectedKeys={selectedKeys}
-                  onSelectionChange={setSelectedPaths}
-                />
-              </fieldset>
-            );
-          })}
+      {importError ? (
+        <div className="mt-4">
+          <Alert variant={importHasHistory ? "warning" : "error"}>
+            <AlertTitle>{importError}</AlertTitle>
+            <AlertDescription>
+              {importHasHistory
+                ? "Your imported conversations are saved. Retry remaining to try the skipped histories again, or continue with what is ready."
+                : "Retry remaining to try again, or continue without importing history."}
+            </AlertDescription>
+          </Alert>
         </div>
-      </ScrollArea>
-      {importError ? <p className="mt-3 text-sm text-destructive">{importError}</p> : null}
+      ) : null}
       <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
         <Button
           variant="ghost-muted"
           disabled={isImporting}
           onClick={importError ? finishAfterImport : () => void onDone()}
         >
-          {importError ? "Continue without the rest" : "Do not import projects"}
+          {importError
+            ? importHasHistory
+              ? "Continue with imported"
+              : "Continue without import"
+            : "Skip import"}
         </Button>
         <Button
           autoFocus
@@ -1270,7 +1409,9 @@ function ImportStep({
         >
           {isImporting
             ? "Importing…"
-            : `Import ${selected.length} ${selected.length === 1 ? "project" : "projects"}`}
+            : importError
+              ? "Retry remaining"
+              : `Import ${selected.length} ${selected.length === 1 ? "project" : "projects"}`}
         </Button>
       </div>
     </StepShell>

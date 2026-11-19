@@ -5,6 +5,7 @@ import {
   MessageId,
   ThreadId,
 } from "@t3tools/contracts";
+import { threadCommandAcceptance } from "@t3tools/client-runtime/operations";
 import type { StartThreadTurnInput } from "@t3tools/client-runtime/state/threads";
 import * as Schema from "effect/Schema";
 import { create } from "zustand";
@@ -49,7 +50,32 @@ function read(): ReadonlyArray<SharedPromptSubmission> {
 
 export const useSharedPromptSubmissions = create<{
   entries: ReadonlyArray<SharedPromptSubmission>;
-}>(() => ({ entries: read() }));
+  activeCommandIds: ReadonlyArray<CommandId>;
+}>(() => ({ entries: read(), activeCommandIds: [] }));
+
+const activeAttempts = new Map<string, { commandId: CommandId; count: number }>();
+const activeCommandIds = () =>
+  [...activeAttempts].flatMap(([key, attempt]) =>
+    key.startsWith(storagePrefix()) ? [attempt.commandId] : [],
+  );
+
+/** Active attempts render inline; the durable journal remains available after failure or reload. */
+export function beginSharedPromptSubmission(commandId: CommandId) {
+  const key = storageKey(commandId);
+  const previous = activeAttempts.get(key);
+  activeAttempts.set(key, { commandId, count: (previous?.count ?? 0) + 1 });
+  useSharedPromptSubmissions.setState({ activeCommandIds: activeCommandIds() });
+  let finished = false;
+  return () => {
+    if (finished) return;
+    finished = true;
+    const current = activeAttempts.get(key);
+    if (current && current.count > 1)
+      activeAttempts.set(key, { ...current, count: current.count - 1 });
+    else activeAttempts.delete(key);
+    useSharedPromptSubmissions.setState({ activeCommandIds: activeCommandIds() });
+  };
+}
 
 function write(entry: SharedPromptSubmission) {
   // Persist before dispatch. A storage failure must leave the composer intact.
@@ -177,5 +203,22 @@ export function reviseRejectedSharedPrompt(
 export function setSharedPromptSubmissionAccount(nextAccountId: string | null) {
   if (accountId === nextAccountId) return;
   accountId = nextAccountId;
-  useSharedPromptSubmissions.setState({ entries: read() });
+  useSharedPromptSubmissions.setState({ entries: read(), activeCommandIds: activeCommandIds() });
+}
+
+export const sharedPromptSubmissionAccount = () => accountId;
+
+/** A late acknowledgement must never mutate a different account's local journal. */
+export function reconcileSharedPromptSubmission(
+  commandId: CommandId,
+  receipt: Parameters<typeof threadCommandAcceptance>[0],
+  expectedAccountId: string | null,
+) {
+  if (accountId !== expectedAccountId) return;
+  if ("relay" in receipt && receipt.relay.commandId !== commandId) return;
+  const outcome = threadCommandAcceptance(receipt);
+  if (outcome.status === "accepted") forgetSharedPromptSubmission(commandId);
+  else if (outcome.status === "rejected")
+    rejectSharedPromptSubmission(commandId, outcome.detail ?? "The server rejected this prompt.");
+  return outcome;
 }

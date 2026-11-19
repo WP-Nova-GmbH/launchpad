@@ -1937,3 +1937,104 @@ export function useStickyComposerModelSelection(): ModelSelection | null {
   }, []);
   return selection;
 }
+
+export interface MovedThreadDraftConflict {
+  readonly source: ComposerDraft;
+  readonly destination: ComposerDraft;
+}
+
+/** Transfer device-local composer ownership after a verified committed placement. */
+export async function handoffMovedThreadDraft(input: {
+  readonly sourceKey: string;
+  readonly destinationKey: string;
+  readonly stillCurrent: () => boolean;
+  readonly choice?: {
+    readonly use: "source" | "destination";
+    readonly conflict: MovedThreadDraftConflict;
+  };
+}): Promise<{ readonly conflict?: MovedThreadDraftConflict }> {
+  await waitForComposerDraftsLoaded();
+  if (!input.stillCurrent()) throw new Error("Your account or this thread’s location changed.");
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const source = current[input.sourceKey];
+  const destination = current[input.destinationKey];
+  if (!source || isEmptyDraft(source) || input.sourceKey === input.destinationKey) return {};
+  if (
+    input.choice &&
+    (input.choice.conflict.source !== source || input.choice.conflict.destination !== destination)
+  ) {
+    throw new Error("A draft changed while you were choosing. Check both drafts again.");
+  }
+  if (destination && !isEmptyDraft(destination) && !input.choice)
+    return { conflict: { source, destination } };
+  if (input.choice?.use === "destination") return {};
+  const moved: ComposerDraft = {
+    ...source,
+    attachments: source.attachments.map(stripAttachmentUploadReference),
+    ...(source.context
+      ? {
+          context: {
+            ...source.context,
+            records: source.context.records.map((record) =>
+              record.kind === "terminal" && "terminalId" in record && "terminalLabel" in record
+                ? {
+                    ...record,
+                    terminalId: `snapshot:${record.contextId}`,
+                    terminalLabel: `${record.terminalLabel.replace(/ \(snapshot\)$/, "")} (snapshot)`,
+                  }
+                : record,
+            ),
+          },
+        }
+      : {}),
+  };
+  const next = { ...current, [input.destinationKey]: moved };
+  // Keep both drafts in the first atomic snapshot. A chosen draft and its
+  // unselected counterpart must never rely on separate successful writes.
+  if (destination && !isEmptyDraft(destination)) next[input.sourceKey] = destination;
+  else delete next[input.sourceKey];
+  const sticky = appAtomRegistry.get(stickyComposerModelSelectionAtom);
+  const cloud = appAtomRegistry.get(composerCloudDraftsAtom);
+  await persistenceQueue.run(async () => {
+    const unchanged = () =>
+      input.stillCurrent() &&
+      appAtomRegistry.get(composerDraftsAtom) === current &&
+      appAtomRegistry.get(stickyComposerModelSelectionAtom) === sticky &&
+      appAtomRegistry.get(composerCloudDraftsAtom) === cloud;
+    let writeFailure: { readonly cause: unknown } | undefined;
+    try {
+      if (unchanged()) await writePersistedComposerState(next, sticky, cloud);
+    } catch (cause) {
+      writeFailure = { cause };
+    }
+    if (!unchanged()) {
+      // The file contains the whole document, so an edit in ANY composer,
+      // model selection or account archive must win over this snapshot.
+      try {
+        let saved = false;
+        while (!saved) {
+          const latest = appAtomRegistry.get(composerDraftsAtom);
+          const latestSticky = appAtomRegistry.get(stickyComposerModelSelectionAtom);
+          const latestCloud = appAtomRegistry.get(composerCloudDraftsAtom);
+          await writePersistedComposerState(latest, latestSticky, latestCloud);
+          saved =
+            appAtomRegistry.get(composerDraftsAtom) === latest &&
+            appAtomRegistry.get(stickyComposerModelSelectionAtom) === latestSticky &&
+            appAtomRegistry.get(composerCloudDraftsAtom) === latestCloud;
+        }
+      } catch (cause) {
+        persistRetryNeeded = true;
+        throw new Error(
+          "Your drafts changed during the move and could not be saved. They remain on this device; try again.",
+          { cause },
+        );
+      }
+      throw new Error(
+        "Your drafts, account or this thread’s location changed during the move. Your drafts are saved; try again.",
+      );
+    }
+    if (writeFailure) throw writeFailure.cause;
+    appAtomRegistry.set(composerDraftsAtom, next);
+  });
+  return {};
+}

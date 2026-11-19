@@ -5,17 +5,20 @@ import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import {
   forgetSharedPromptSubmission,
-  rejectSharedPromptSubmission,
+  reconcileSharedPromptSubmission,
+  sharedPromptSubmissionAccount,
   reviseRejectedSharedPrompt,
   useSharedPromptSubmissions,
   type SharedPromptSubmission,
 } from "../../sharedPromptSubmissionStore";
 import { verifyStashedAttachmentUpload } from "../../lib/attachmentUploadQueue";
-import { threadEnvironment } from "../../state/threads";
+import { portableThreadCommands, threadEnvironment } from "../../state/threads";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
+
+const EMPTY_MESSAGE_IDS: ReadonlyArray<string> = [];
 
 function receiptInput(entry: SharedPromptSubmission, projectId: ProjectId | undefined) {
   if (entry.command.type !== "thread.turn.start") return null;
@@ -32,12 +35,15 @@ export function SharedPromptSubmissions({
   threadRef,
   projectId,
   unavailable,
+  representedMessageIds = EMPTY_MESSAGE_IDS,
 }: {
   threadRef: ScopedThreadRef;
   projectId?: ProjectId;
   unavailable: boolean;
+  representedMessageIds?: ReadonlyArray<string> | undefined;
 }) {
   const entries = useSharedPromptSubmissions((state) => state.entries);
+  const activeCommandIds = useSharedPromptSubmissions((state) => state.activeCommandIds);
   const config = useAtomValue(serverEnvironment.configValueAtom(threadRef.environmentId));
   const receipt = useAtomCommand(threadEnvironment.getCommandReceipt, { reportFailure: false });
   const start = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
@@ -57,24 +63,23 @@ export function SharedPromptSubmissions({
       ),
     [entries, threadRef.environmentId, threadRef.threadId],
   );
-  const available = !unavailable && config?.environment.capabilities.sharedPromptQueue === true;
+  const portable = useAtomValue(
+    portableThreadCommands.viewAtom(threadRef.environmentId, threadRef.threadId),
+  );
+  const canRetry = !unavailable && config?.environment.capabilities.sharedPromptQueue === true;
+  const available = portable !== null || canRetry;
   const preparationSupported = config?.environment.capabilities.sharedPreparation === true;
   useEffect(() => {
-    if (!available) return;
+    if (!available || portable?.error) return;
     let cancelled = false;
+    const account = sharedPromptSubmissionAccount();
     for (const entry of pending) {
       const input = receiptInput(entry, projectId);
       if (!input) continue;
       void receipt({ environmentId: entry.environmentId, input }).then((result) => {
         if (cancelled || result._tag !== "Success") return;
         try {
-          if (result.value.status === "accepted")
-            forgetSharedPromptSubmission(entry.command.commandId);
-          else if (result.value.status === "rejected")
-            rejectSharedPromptSubmission(
-              entry.command.commandId,
-              result.value.detail ?? "The server rejected this prompt.",
-            );
+          reconcileSharedPromptSubmission(entry.command.commandId, result.value, account);
         } catch {
           /* Keep the durable journal if local cleanup cannot finish. */
         }
@@ -84,7 +89,19 @@ export function SharedPromptSubmissions({
       cancelled = true;
     };
     // Only receipts remove ownership; an absent thread/queue entry proves nothing.
-  }, [available, pending, receipt, projectId]);
+  }, [available, pending, receipt, projectId, portable?.error]);
+  useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- Authoritative receipts can remove an entry while its recovery controls are open.
+    setEditing((current) =>
+      current && pending.some((entry) => entry.command.commandId === current.commandId)
+        ? current
+        : null,
+    );
+    setDismissing((current) =>
+      current && pending.some((entry) => entry.command.commandId === current) ? current : null,
+    );
+    if (pending.length === 0) setError(null);
+  }, [pending]);
 
   const discard = (commandId: CommandId) => {
     try {
@@ -99,23 +116,24 @@ export function SharedPromptSubmissions({
     const expectedAccountId = appAtomRegistry.get(managedRelaySessionAtom)?.accountId ?? null;
     const input = receiptInput(entry, projectId);
     if (!input || entry.command.type !== "thread.turn.start") return;
+    const account = sharedPromptSubmissionAccount();
     setBusy(entry.command.commandId);
     setError(null);
     try {
       const outcome = await receipt({ environmentId: entry.environmentId, input });
+      if (sharedPromptSubmissionAccount() !== account) return;
       if (outcome._tag !== "Success") {
         setError("The outcome could not be checked. This submission remains saved.");
         return;
       }
-      if (outcome.value.status === "accepted") {
-        forgetSharedPromptSubmission(entry.command.commandId);
-        return;
-      }
-      if (outcome.value.status === "rejected") {
-        rejectSharedPromptSubmission(
-          entry.command.commandId,
-          outcome.value.detail ?? "The server rejected this prompt.",
-        );
+      const acceptance = reconcileSharedPromptSubmission(
+        entry.command.commandId,
+        outcome.value,
+        account,
+      );
+      if (!acceptance || acceptance.status !== "unknown") return;
+      if (retry && !canRetry) {
+        setError("Reconnect to verify saved files before retrying this draft.");
         return;
       }
       if (
@@ -133,6 +151,7 @@ export function SharedPromptSubmissions({
           environmentId: entry.environmentId,
           attachmentId: attachment.id,
         });
+        if (sharedPromptSubmissionAccount() !== account) return;
         if (verification.status !== "verified") {
           setError(
             verification.status === "missing"
@@ -156,7 +175,19 @@ export function SharedPromptSubmissions({
       setBusy(null);
     }
   };
-  if (pending.length === 0) return null;
+  const visible = pending.filter(
+    (entry) =>
+      entry.command.commandId === editing?.commandId ||
+      entry.command.commandId === dismissing ||
+      entry.rejection ||
+      entry.awaitingSend ||
+      (!activeCommandIds.includes(entry.command.commandId) &&
+        !(
+          entry.command.type === "thread.turn.start" &&
+          representedMessageIds.includes(entry.command.message.messageId)
+        )),
+  );
+  if (visible.length === 0) return null;
   return (
     <section
       aria-label="Prompts waiting for acceptance"
@@ -164,10 +195,10 @@ export function SharedPromptSubmissions({
     >
       <p className="text-sm font-medium">Saved submissions</p>
       <p className="text-xs text-muted-foreground">
-        These prompts stay on this device until the server confirms acceptance. Setup failures after
+        These prompts stay on this device until Launchpad confirms acceptance. Setup failures after
         acceptance appear in the shared queue.
       </p>
-      {pending.map((entry) => (
+      {visible.map((entry) => (
         <div key={entry.command.commandId} className="space-y-1">
           <p className="whitespace-pre-wrap text-sm">
             {"message" in entry.command ? entry.command.message.text : "Saved prompt"}
@@ -250,7 +281,7 @@ export function SharedPromptSubmissions({
               <Button
                 size="xs"
                 variant="secondary"
-                disabled={!available || busy !== null}
+                disabled={!canRetry || busy !== null}
                 onClick={() => void reconcile(entry, true)}
               >
                 {entry.awaitingSend ? "Send revised draft" : "Retry submission"}

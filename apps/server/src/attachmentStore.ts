@@ -1,3 +1,8 @@
+import {
+  toSafeThreadAttachmentSegment,
+  attachmentFileExtension as layoutFileExtension,
+  attachmentRelativePath as layoutRelativePath,
+} from "@t3tools/shared/attachmentLayout";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
@@ -9,10 +14,9 @@ import {
   normalizeAttachmentRelativePath,
   resolveAttachmentRelativePath,
 } from "./attachmentPaths.ts";
-import { inferImageExtension, SAFE_IMAGE_FILE_EXTENSIONS } from "./imageMime.ts";
+import { SAFE_IMAGE_FILE_EXTENSIONS } from "./imageMime.ts";
 
 const ATTACHMENT_FILENAME_EXTENSIONS = [...SAFE_IMAGE_FILE_EXTENSIONS, ".bin"];
-const ATTACHMENT_ID_THREAD_SEGMENT_MAX_CHARS = 80;
 const ATTACHMENT_ID_THREAD_SEGMENT_PATTERN = "[a-z0-9_]+(?:-[a-z0-9_]+)*";
 const ATTACHMENT_ID_UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const ATTACHMENT_ID_FILE_EXTENSION_PATTERN = "[a-z0-9]{1,10}";
@@ -25,29 +29,9 @@ export const PENDING_ATTACHMENT_THREAD_SEGMENT = "pending";
 const PENDING_ATTACHMENT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PARTIAL_UPLOAD_MAX_AGE_MS = 60 * 60 * 1000;
 
-export function toSafeThreadAttachmentSegment(threadId: string): string | null {
-  const segment = threadId
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/gi, "-")
-    .replace(/-+/g, "-")
-    .replace(/^[-_]+|[-_]+$/g, "")
-    .slice(0, ATTACHMENT_ID_THREAD_SEGMENT_MAX_CHARS)
-    .replace(/[-_]+$/g, "");
-  if (segment.length === 0) {
-    return null;
-  }
-  return segment === PENDING_ATTACHMENT_THREAD_SEGMENT ? "_pending" : segment;
-}
-
+export { toSafeThreadAttachmentSegment } from "@t3tools/shared/attachmentLayout";
 export function attachmentFileExtension(fileName: string): string {
-  const extension = NodePath.extname(fileName).toLowerCase();
-  // ".part" is reserved for in-flight uploads; a stored "archive.part" would
-  // look stale to sweepStalePendingAttachments and get deleted.
-  if (extension === ".part" || !/^\.[a-z0-9]{1,10}$/.test(extension)) {
-    return ".bin";
-  }
-  return extension;
+  return layoutFileExtension(fileName, NodePath.extname);
 }
 
 function attachmentIdExtensionSuffix(extension: string | undefined): string {
@@ -102,19 +86,7 @@ export function parseThreadSegmentFromAttachmentId(attachmentId: string): string
 
 /** Null for attachment types this build does not know; callers skip those. */
 export function attachmentRelativePath(attachment: ChatAttachment): string | null {
-  switch (attachment.type) {
-    case "image": {
-      const extension = inferImageExtension({
-        mimeType: attachment.mimeType,
-        fileName: attachment.name,
-      });
-      return `${attachment.id}${extension}`;
-    }
-    case "file":
-      return `${attachment.id}${attachmentFileExtension(attachment.name)}`;
-    default:
-      return null;
-  }
+  return layoutRelativePath(attachment, attachmentFileExtension);
 }
 
 export function resolveAttachmentPath(input: {

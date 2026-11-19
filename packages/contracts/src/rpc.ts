@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import * as Rpc from "effect/unstable/rpc/Rpc";
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   ProviderAuthCancelInput,
   ProviderAuthCompleteInput,
@@ -37,6 +37,7 @@ import {
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
   AgentSessionImportResult,
+  AgentSessionImportProgressEvent,
   AgentSessionScanInput,
   AgentSessionScanResult,
   AgentSessionScanError,
@@ -118,6 +119,12 @@ import {
   ServerProviderAccountExportInput,
 } from "./providerAccount.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import {
+  CodexVmSignInBridge,
+  CodexVmSignInBridgeInput,
+  CodexVmSignInCallback,
+  CodexVmSignInError,
+} from "./codexVmSignIn.ts";
 import {
   PullRequestActionInput,
   PullRequestActivity,
@@ -306,6 +313,7 @@ export const WS_METHODS = {
   filesystemBrowse: "filesystem.browse",
   agentSessionsScan: "agentSessions.scan",
   agentSessionsImport: "agentSessions.import",
+  agentSessionsImportWithProgress: "agentSessions.importWithProgress",
   assetsCreateUrl: "assets.createUrl",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
   attachmentsDelete: "attachments.delete",
@@ -319,6 +327,10 @@ export const WS_METHODS = {
   providerAuthCancel: "provider.auth.cancel",
   providerAuthLogout: "provider.auth.logout",
   providerAuthSubscribe: "provider.auth.subscribe",
+  codexVmSignInCapability: "codexVm.signIn.capability",
+  codexVmSignInStart: "codexVm.signIn.start",
+  codexVmSignInWait: "codexVm.signIn.wait",
+  codexVmSignInCancel: "codexVm.signIn.cancel",
   providerInstallStart: "provider.install.start",
   providerInstallCancel: "provider.install.cancel",
   providerInstallSubscribe: "provider.install.subscribe",
@@ -531,6 +543,27 @@ const WsServerUpdateProviderRpc = Rpc.make(WS_METHODS.serverUpdateProvider, {
 });
 
 const ProviderSetupRpcError = Schema.Union([ProviderSetupError, EnvironmentAuthorizationError]);
+const CodexVmSignInRpcError = Schema.Union([CodexVmSignInError, EnvironmentAuthorizationError]);
+const WsCodexVmSignInCapabilityRpc = Rpc.make(WS_METHODS.codexVmSignInCapability, {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({ supported: Schema.Boolean }),
+  error: EnvironmentAuthorizationError,
+});
+const WsCodexVmSignInStartRpc = Rpc.make(WS_METHODS.codexVmSignInStart, {
+  payload: Schema.Struct({}),
+  success: CodexVmSignInBridge,
+  error: CodexVmSignInRpcError,
+});
+const WsCodexVmSignInWaitRpc = Rpc.make(WS_METHODS.codexVmSignInWait, {
+  payload: CodexVmSignInBridgeInput,
+  success: CodexVmSignInCallback,
+  error: CodexVmSignInRpcError,
+});
+const WsCodexVmSignInCancelRpc = Rpc.make(WS_METHODS.codexVmSignInCancel, {
+  payload: CodexVmSignInBridgeInput,
+  success: Schema.Void,
+  error: CodexVmSignInRpcError,
+});
 
 const WsProviderConsumeResetCreditRpc = Rpc.make(WS_METHODS.providerConsumeResetCredit, {
   payload: ProviderConsumeResetCreditInput,
@@ -1020,6 +1053,18 @@ const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   ]),
 });
 
+const WsAgentSessionsImportWithProgressRpc = Rpc.make(WS_METHODS.agentSessionsImportWithProgress, {
+  payload: AgentSessionImportInput,
+  success: AgentSessionImportProgressEvent,
+  error: Schema.Union([
+    AgentSessionImportProjectChangedError,
+    AgentSessionImportProjectNotFoundError,
+    AgentSessionScanError,
+    EnvironmentAuthorizationError,
+  ]),
+  stream: true,
+});
+
 const WsAssetsCreateUrlRpc = Rpc.make(WS_METHODS.assetsCreateUrl, {
   payload: AssetCreateUrlInput,
   success: AssetCreateUrlResult,
@@ -1337,6 +1382,15 @@ const WsOrchestrationGetCommandReceiptRpc = Rpc.make(ORCHESTRATION_WS_METHODS.ge
   error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
 });
 
+const WsOrchestrationGetThreadRepositoryKeyRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.getThreadRepositoryKey,
+  {
+    payload: Schema.Struct({ threadId: ThreadId }),
+    success: Schema.NullOr(TrimmedNonEmptyString),
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationDispatchCommandRpc = Rpc.make(ORCHESTRATION_WS_METHODS.dispatchCommand, {
   payload: ClientOrchestrationCommand,
   success: OrchestrationRpcSchemas.dispatchCommand.output,
@@ -1473,6 +1527,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,
   WsProviderAuthStartRpc,
+  WsCodexVmSignInCapabilityRpc,
+  WsCodexVmSignInStartRpc,
+  WsCodexVmSignInWaitRpc,
+  WsCodexVmSignInCancelRpc,
   WsProviderAuthCompleteRpc,
   WsProviderAuthRespondRpc,
   WsProviderAuthCancelRpc,
@@ -1548,6 +1606,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsFilesystemBrowseRpc,
   WsAgentSessionsScanRpc,
   WsAgentSessionsImportRpc,
+  WsAgentSessionsImportWithProgressRpc,
   WsAssetsCreateUrlRpc,
   WsAttachmentsCreateUploadUrlRpc,
   WsAttachmentsDeleteRpc,
@@ -1607,6 +1666,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationSubscribeThreadPresenceRpc,
   WsSubscribeResourceTelemetryRpc,
   WsOrchestrationGetCommandReceiptRpc,
+  WsOrchestrationGetThreadRepositoryKeyRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetWorkflowScriptRpc,
   WsOrchestrationGetTurnDiffRpc,

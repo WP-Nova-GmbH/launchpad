@@ -393,6 +393,7 @@ export const assetRouteLayer = HttpRouter.add(
     }
 
     const repositoryAccess = yield* RepositoryAccess;
+    if (repositoryAccess.workflowVm) return HttpServerResponse.text("Not Found", { status: 404 });
     const requestFiber = yield* Effect.fiber;
     const asset = yield* repositoryAccess.withFence(
       Effect.gen(function* () {
@@ -451,6 +452,7 @@ export const attachmentUploadRouteLayer = HttpRouter.add(
       return HttpServerResponse.text("Not Found", { status: 404 });
     }
     const repositoryAccess = yield* RepositoryAccess;
+    if (repositoryAccess.workflowVm) return HttpServerResponse.text("Not Found", { status: 404 });
     const requestFiber = yield* Effect.fiber;
     const claims = yield* repositoryAccess.withFence(
       Effect.gen(function* () {

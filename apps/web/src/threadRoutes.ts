@@ -1,6 +1,65 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
-import type { EnvironmentId, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
+import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
+import type {
+  EnvironmentId,
+  ScopedThreadRef,
+  ThreadId,
+  ThreadRelayRouting,
+} from "@t3tools/contracts";
+import type { RelayPortableThreadPlacement } from "@t3tools/contracts/relay";
 import type { DraftId } from "./composerDraftStore";
+
+interface ThreadMoveHandoff extends ScopedThreadRef {
+  readonly accountId: string;
+  readonly relayUrl: string;
+  readonly generation: number;
+}
+
+declare module "@tanstack/react-router" {
+  interface HistoryState {
+    threadMoveHandoff?: ThreadMoveHandoff;
+  }
+}
+
+export function isCurrentThreadMoveHandoff(
+  handoff: ThreadMoveHandoff,
+  target: ScopedThreadRef,
+  accountId: string,
+  relayUrl: string | null,
+  placement: RelayPortableThreadPlacement | undefined,
+): boolean {
+  return (
+    handoff.accountId === accountId &&
+    handoff.relayUrl === relayUrl &&
+    handoff.threadId === target.threadId &&
+    handoff.environmentId === target.environmentId &&
+    placement?.threadId === handoff.threadId &&
+    placement.environmentId === handoff.environmentId &&
+    placement.generation === handoff.generation &&
+    placement.operationId === null
+  );
+}
+
+export function threadMoveHandoffPhase(input: {
+  readonly handoff: ThreadMoveHandoff;
+  readonly connection: EnvironmentConnectionPhase | undefined;
+  readonly liveRouting: ThreadRelayRouting | undefined;
+  readonly liveArchivedThread: boolean;
+  readonly deleted: boolean;
+  readonly readFailed: boolean;
+}) {
+  if (input.deleted) return "unavailable";
+  if (input.connection === "error" || input.connection === "unsupported") return "blocked";
+  if (
+    input.connection === "connected" &&
+    (input.liveArchivedThread ||
+      (input.liveRouting?.phase === "active" &&
+        input.liveRouting.generation === input.handoff.generation))
+  )
+    return "opened";
+  if (input.connection === "connected" && input.readFailed) return "unreadable";
+  return "opening";
+}
 
 export type ThreadRouteTarget =
   | {

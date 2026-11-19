@@ -522,12 +522,14 @@ describe("EnvironmentThreads", () => {
       yield* first.threadState.semaphore.take(1);
       yield* Queue.offer(first.inputs, update);
       yield* Deferred.await(applying);
+      expect((yield* Ref.get(first.latest)).snapshotSequence).toBe(CACHED_SNAPSHOT_SEQUENCE);
       yield* Scope.close(scope, Exit.void);
       yield* first.threadState.semaphore.release(1);
 
       const resumed = yield* makeHarness({ resumeCache });
       const state = yield* awaitThreadState(resumed.observed, (value) => value.status === "live");
       expect(Option.getOrThrow(state.data).title).toBe(BASE_THREAD.title);
+      expect(state.snapshotSequence).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(yield* Ref.get(resumed.lastSubscribeAfterSequence)).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(yield* Ref.get(first.savedThreads)).toEqual([
         {
@@ -654,6 +656,7 @@ describe("EnvironmentThreads", () => {
       const state = yield* awaitThreadState(harness.observed, (value) => Option.isSome(value.data));
 
       expect(Option.getOrThrow(state.data)).toEqual(BASE_THREAD);
+      expect(state.snapshotSequence).toBe(CACHED_SNAPSHOT_SEQUENCE);
       expect(Option.isNone(state.error)).toBe(true);
     }),
   );
@@ -697,6 +700,7 @@ describe("EnvironmentThreads", () => {
       yield* Effect.yieldNow;
 
       expect(Option.getOrThrow(state.data).title).toBe("Live title");
+      expect(state.snapshotSequence).toBe(2);
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.thread.title).toBe("Live title");
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.snapshotSequence).toBe(2);
     }),

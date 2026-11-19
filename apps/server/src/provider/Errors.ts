@@ -85,6 +85,22 @@ export class ProviderAdapterProcessError extends Schema.TaggedError<ProviderAdap
   }
 }
 
+/** Private resume probes may be retried only after an affirmative cleanup receipt. */
+export class ProviderAdapterProbeError extends Schema.TaggedError<ProviderAdapterProbeError>()(
+  "ProviderAdapterProbeError",
+  {
+    provider: Schema.String,
+    threadId: Schema.String,
+    detail: Schema.String,
+    cleanupConfirmed: Schema.Boolean,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 /**
  * ProviderWorkspaceMissingError - The session's working directory no longer
  * exists on disk, so no provider process can start in it.
@@ -210,7 +226,25 @@ export type ProviderAdapterError =
   | ProviderAdapterRequestError
   | ProviderAdapterProcessError;
 
+export class ProviderExecutionError extends Schema.TaggedError<ProviderExecutionError>()(
+  "ProviderExecutionError",
+  {
+    threadId: Schema.String,
+    operation: Schema.String,
+    uncertain: Schema.Boolean,
+    waitingForCheckout: Schema.optional(Schema.Boolean),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    return this.uncertain
+      ? "This provider operation may already have started. Reconcile it before retrying."
+      : "Provider execution is waiting for permission from the thread’s current environment.";
+  }
+}
+
 export type ProviderServiceError =
+  | ProviderExecutionError
   | ProviderValidationError
   | ProviderUnsupportedError
   | ProviderWorkspaceMissingError

@@ -44,6 +44,7 @@ import {
 import { useThreadRowProviderInstanceResolver } from "../threads/thread-provider-instance";
 import {
   buildThreadListV2Items,
+  getThreadListV2ArrangementThreads,
   getThreadListV2OrderedSection,
   buildThreadListV2ListItems,
   threadListV2ListItemsAreEqual,
@@ -516,13 +517,17 @@ export function HomeScreen(props: HomeScreenProps) {
   // the memoized rows' props comparison on every parent render.
   const resolveProviderInstance = useThreadRowProviderInstanceResolver(serverConfigs);
   const pendingOrder = usePendingThreadOrder(nowMinute, snoozeWakeTick);
+  const arrangementThreads = useMemo(
+    () => getThreadListV2ArrangementThreads(props.threads, serverConfigs),
+    [props.threads, serverConfigs],
+  );
   // Up/down menu availability for every card, computed once per section per
   // rebuild (see computeThreadMoveAvailability): per-thread planner calls made
   // list construction quadratic, and this list rebuilds on every minute tick.
   const threadMoveAvailability = useMemo(() => {
     const sectionAvailability = (section: "pinned" | "active") =>
       computeThreadMoveAvailability({
-        allThreads: props.threads,
+        allThreads: arrangementThreads,
         section,
         pendingOrder,
         reorderableEnvironmentIds: new Set(
@@ -535,7 +540,7 @@ export function HomeScreen(props: HomeScreenProps) {
           ),
         ),
         ordered: getThreadListV2OrderedSection({
-          threads: props.threads,
+          threads: arrangementThreads,
           section,
           pendingOrder,
           now: new Date().toISOString(),
@@ -547,7 +552,7 @@ export function HomeScreen(props: HomeScreenProps) {
     return new Map([...sectionAvailability("pinned"), ...sectionAvailability("active")]);
   }, [
     serverConfigs,
-    props.threads,
+    arrangementThreads,
     pendingOrder,
     queuedThreadKeys,
     settlementEnvironmentIds,
@@ -561,6 +566,7 @@ export function HomeScreen(props: HomeScreenProps) {
     return buildThreadListV2Items({
       pendingOrder,
       threads: props.threads.filter((thread) => thread.archivedAt === null),
+      arrangementThreads,
       environmentId: props.selectedEnvironmentId,
       projectRefs: v2ScopedProjectGroup === null ? null : v2ScopedProjectGroup.projectRefs,
       searchQuery: props.searchQuery,
@@ -576,6 +582,7 @@ export function HomeScreen(props: HomeScreenProps) {
     });
   }, [
     pendingOrder,
+    arrangementThreads,
     queuedThreadKeys,
     nowMinute,
     snoozeWakeTick,
@@ -892,10 +899,6 @@ export function HomeScreen(props: HomeScreenProps) {
 
   const listHeader = Platform.OS === "ios" ? null : <HomeTopContentSpacer />;
 
-  // Project scoping lives in the header filter menu (no inline chip row on
-  // mobile — the menu is the one filter surface).
-  const v2ListHeader = listHeader;
-
   // Use the v2 project scope for its empty state. Snoozed threads need no
   // special empty state: their shelf header is a list row even while collapsed.
   const v2ListEmpty =
@@ -961,7 +964,7 @@ export function HomeScreen(props: HomeScreenProps) {
             drawDistance={500}
             recycleItems
             extraData={v2ExtraData}
-            ListHeaderComponent={v2ListHeader}
+            ListHeaderComponent={listHeader}
             ListFooterComponent={
               settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
                 <ThreadListV2ShowMoreRow

@@ -37,6 +37,9 @@ export type ApprovalDisposition =
   /** Needs the supervisor model. */
   | { readonly kind: "consult"; readonly toolKind: ProviderRuntimeToolKind };
 
+export const MASKED_UNSAFE_WORKFLOW_APPROVAL =
+  "This workflow operation was denied before its details were masked.";
+
 /**
  * Commands that escape the checkpointed workspace. `refs/t3/checkpoints/*`
  * makes local mistakes cheap to reverse; these have no such backstop, and
@@ -72,6 +75,8 @@ export function classifyApprovalRequest(input: {
   readonly requestType: string | undefined;
   readonly detail: string | undefined;
 }): ApprovalDisposition {
+  if (input.detail === MASKED_UNSAFE_WORKFLOW_APPROVAL)
+    return { kind: "deny", reason: "This operation leaves the workflow's prepared workspace." };
   const toolKind = providerRuntimeToolKindForRequestType(input.requestType);
 
   if (toolKind === "file-read") {

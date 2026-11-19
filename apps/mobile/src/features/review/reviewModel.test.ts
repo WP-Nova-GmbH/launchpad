@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import { makeGitReviewPatchFixtures } from "@t3tools/shared/testing/gitReviewPatch";
 
 import {
   MessageId,
@@ -136,6 +137,48 @@ describe("buildReviewSectionItems", () => {
 });
 
 describe("buildReviewParsedDiff", () => {
+  it("retains raw Git filenames, file types, and copies in strict workflow review", () => {
+    const { trailing, rename, quoted, fileType, copy, interior } = makeGitReviewPatchFixtures();
+    expect(copy).toContain("copy from copy-source.txt\ncopy to copy-target.txt");
+    for (const patch of [trailing, rename, quoted, fileType, copy]) {
+      expect(buildReviewParsedDiff(patch, "ordinary").kind).toBe("files");
+      expect(buildReviewParsedDiff(patch, "strict-review", true)).toMatchObject({
+        kind: "raw",
+        text: patch,
+      });
+    }
+    const rendered = buildReviewParsedDiff(interior, "strict-review", true);
+    expect(rendered).toMatchObject({
+      kind: "files",
+      files: [
+        expect.objectContaining({
+          path: "interior space.txt",
+          rows: expect.arrayContaining([
+            expect.objectContaining({ content: "++ b/header-lookalike " }),
+            expect.objectContaining({ content: "copy from x" }),
+          ]),
+        }),
+      ],
+    });
+  });
+
+  it.each([false, true])("preserves mode changes in strict review (text hunks: %s)", (withText) => {
+    const patch = [
+      "diff --git a/setup.sh b/setup.sh",
+      "old mode 100644",
+      "new mode 100755",
+      ...(withText
+        ? ["--- a/setup.sh", "+++ b/setup.sh", "@@ -1 +1 @@", "-echo before", "+echo after"]
+        : []),
+      "",
+    ].join("\n");
+    expect(buildReviewParsedDiff(patch, "ordinary").kind).toBe("files");
+    expect(buildReviewParsedDiff(patch, "strict-review", true)).toMatchObject({
+      kind: "raw",
+      text: patch,
+    });
+  });
+
   it.each([
     ["a/example.ts", "a/example.ts"],
     ["b/example.ts", "b/example.ts"],
@@ -259,6 +302,55 @@ describe("buildReviewParsedDiff", () => {
       header: "@@ -1,1 +1,2 @@",
     });
   });
+
+  it.each(["[truncated]", "[truncated]\t "])(
+    "preserves a literal final patch line %j in workflow review",
+    (line) => {
+      const diff = [
+        "diff --git a/a.txt b/a.txt",
+        "--- a/a.txt",
+        "+++ b/a.txt",
+        "@@ -1 +1 @@",
+        "-before",
+        `+${line}`,
+        "",
+      ].join("\n");
+      const parsed = buildReviewParsedDiff(diff, "workflow", true);
+      expect(parsed).toMatchObject({
+        kind: "files",
+        notice: null,
+        files: [
+          expect.objectContaining({
+            rows: expect.arrayContaining([
+              expect.objectContaining({ change: "add", content: line }),
+            ]),
+          }),
+        ],
+      });
+    },
+  );
+
+  it.each(["\\ No newline at end of file", "@@ malformed hunk @@"])(
+    "shows the complete raw workflow patch when rows cannot represent %j",
+    (lastLine) => {
+      const diff = [
+        "diff --git a/a.txt b/a.txt",
+        "--- a/a.txt",
+        "+++ b/a.txt",
+        "@@ -1 +1 @@",
+        "-before",
+        "+after",
+        lastLine,
+        "",
+      ].join("\n");
+      expect(buildReviewParsedDiff(diff, "ordinary")).toMatchObject({ kind: "files" });
+      expect(buildReviewParsedDiff(diff, "workflow", true)).toMatchObject({
+        kind: "raw",
+        text: diff,
+        notice: null,
+      });
+    },
+  );
 
   it("suppresses preview for non-text file formats", () => {
     const preview = getReviewFilePreviewState(

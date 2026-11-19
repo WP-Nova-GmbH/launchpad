@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off - Exercise the copied command in a real POSIX shell.
+import * as NodeChildProcess from "node:child_process";
+import * as NodeOS from "node:os";
+import * as NodeURL from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import type { RelayMachine, RelayRepositorySummary } from "@t3tools/contracts/relay";
 
@@ -190,18 +194,57 @@ describe("machineStatusPresentation", () => {
   });
 });
 
-describe("machineEnrollmentCommand", () => {
-  it("is one pasteable line pointing at a dedicated home directory", () => {
+const hasPosixShell = NodeChildProcess.spawnSync("sh", ["-c", "exit 0"]).status === 0;
+describe.skipIf(!hasPosixShell)("machineEnrollmentCommand", () => {
+  it("runs the checkout server with the invitation and isolated machine state", () => {
     const command = machineEnrollmentCommand({
+      machineId: "machine-1",
+      seed: "t3mseed_abc123",
+      relayUrl: "https://relay.example.test/'$UNSET",
+    });
+    const result = NodeChildProcess.spawnSync(
+      "sh",
+      [
+        "-c",
+        'HOME="/fixture home"; npx() { return 99; }; vp() { printf "%s\\n" "$@" "$T3CODE_HOME" "$T3CODE_MACHINE_ENROLLMENT_SEED" "$T3CODE_MACHINE_ENROLLMENT_RELAY_URL" "$T3CODE_EXECUTOR_SELF_UPDATE"; }; ' +
+          command,
+      ],
+      {
+        cwd: NodeURL.fileURLToPath(new URL("../../../../../", import.meta.url)),
+        encoding: "utf8",
+      },
+    );
+    expect(command).not.toContain("\n");
+    expect(result.status).toBe(0);
+    expect(result.stdout.trimEnd().split("\n")).toEqual([
+      "env",
+      "exec",
+      "node",
+      "./apps/server/src/bin.ts",
+      "serve",
+      "/fixture home/.t3/machines/machine-1",
+      "t3mseed_abc123",
+      "https://relay.example.test/'$UNSET",
+      "0",
+    ]);
+  });
+
+  it("explains how to run setup outside a Launchpad checkout", () => {
+    const command = machineEnrollmentCommand({
+      machineId: "machine-1",
       seed: "t3mseed_abc123",
       relayUrl: "https://relay.example.test",
     });
-    expect(command).toBe(
-      'T3CODE_HOME="$HOME/.t3/machine" ' +
-        'T3CODE_MACHINE_ENROLLMENT_SEED="t3mseed_abc123" ' +
-        'T3CODE_MACHINE_ENROLLMENT_RELAY_URL="https://relay.example.test" ' +
-        "npx t3 serve",
+    const result = NodeChildProcess.spawnSync(
+      "sh",
+      ["-c", `npx() { return 99; }; vp() { return 99; }; ${command}`],
+      {
+        cwd: NodeOS.tmpdir(),
+        encoding: "utf8",
+      },
     );
-    expect(command).not.toContain("\n");
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Run this command from the root of a Launchpad checkout");
+    expect(result.stderr).not.toContain("t3mseed_abc123");
   });
 });

@@ -8,6 +8,7 @@ import {
   archiveSelectedThreadEntries,
   buildBulkTitleRegenerationContextMenuItem,
   buildBulkUnpinContextMenuItem,
+  buildLegacyThreadContextMenuItems,
   buildMultiSelectThreadContextMenuItems,
   createThreadJumpHintVisibilityController,
   deleteSelectedThreadEntries,
@@ -294,6 +295,12 @@ describe("buildBulkTitleRegenerationContextMenuItem", () => {
 });
 
 describe("buildMultiSelectThreadContextMenuItems", () => {
+  it("keeps only Mark unread when the selection includes a read-only workflow result", () => {
+    expect(
+      buildMultiSelectThreadContextMenuItems({ count: 2, hasRunningThread: false, readOnly: true }),
+    ).toEqual([{ id: "mark-unread", label: "Mark unread (2)" }]);
+  });
+
   it("offers bulk archive with the selected count", () => {
     expect(
       buildMultiSelectThreadContextMenuItems({ count: 3, hasRunningThread: false }),
@@ -304,6 +311,32 @@ describe("buildMultiSelectThreadContextMenuItems", () => {
     expect(
       buildMultiSelectThreadContextMenuItems({ count: 2, hasRunningThread: true }),
     ).toContainEqual({ id: "archive", label: "Archive (2)", disabled: true });
+  });
+});
+
+describe("buildLegacyThreadContextMenuItems", () => {
+  it("keeps read-only actions on a saved result with a branch", () => {
+    expect(
+      buildLegacyThreadContextMenuItems({ readOnly: true, newThreadBranch: "run/result" }).map(
+        ({ id }) => id,
+      ),
+    ).toEqual(["mark-unread", "copy-path", "copy-thread-id"]);
+  });
+
+  it("retains regular thread actions for writable environments", () => {
+    expect(
+      buildLegacyThreadContextMenuItems({ readOnly: false, newThreadBranch: "feature" }).map(
+        ({ id }) => id,
+      ),
+    ).toEqual([
+      "new-thread-on-branch",
+      "rename",
+      "mark-unread",
+      "copy-path",
+      "copy-thread-id",
+      "project-settings",
+      "delete",
+    ]);
   });
 });
 

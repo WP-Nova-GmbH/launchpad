@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { ThreadTransferFormats } from "./threadTransferFormat.ts";
 
 import {
   EnvironmentId,
@@ -87,9 +88,12 @@ export const ServerSelfUpdateCapability = Schema.Literals([
 export type ServerSelfUpdateCapability = typeof ServerSelfUpdateCapability.Type;
 
 export const ExecutionEnvironmentCapabilities = Schema.Struct({
+  threadTransferFormats: Schema.optionalKey(ThreadTransferFormats),
   /** Environment owns durable shared prompt queues; ordinary sends must enqueue. */
   sharedPromptQueue: Schema.optionalKey(Schema.Boolean),
   sharedPreparation: Schema.optionalKey(Schema.Boolean),
+  /** Queued moves, including atomic insertion after already claimed work. */
+  threadMoves: Schema.optionalKey(Schema.Boolean),
   /** Organization repository grants are enforced on existing connections. */
   organizationRepositoryAccess: Schema.optionalKey(Schema.Boolean),
   /** Initial repository policy synchronization has completed. Relay outages do not reset it. */
@@ -169,6 +173,7 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Server can stream self-update progress before acknowledging the
       restart. Clients fall back to server.updateServer when absent. */
   serverSelfUpdateProgress: Schema.optionalKey(Schema.Boolean),
+  agentSessionImportProgress: Schema.optionalKey(Schema.Boolean),
   /** Server can durably mark running provider turns before a self-update and
       continue them after the replacement process starts. */
   serverUpdateThreadContinuation: Schema.optionalKey(Schema.Boolean),
@@ -192,11 +197,15 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
       desktop servers whose app predates the remote trigger, where clients
       must keep telling the user to update the app on that machine. */
   desktopAppUpdate: Schema.optionalKey(Schema.Boolean),
+  /** This workflow VM serves read-only run results to clients. */
+  workflowVmResultReader: Schema.optionalKey(Schema.Boolean),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 
 export const ExecutionEnvironmentDescriptor = Schema.Struct({
   environmentId: EnvironmentId,
+  /** This environment belongs exclusively to one VM thread and cannot receive other thread moves. */
+  threadVm: Schema.optionalKey(Schema.Struct({ threadId: ThreadId })),
   label: TrimmedNonEmptyString,
   platform: ExecutionEnvironmentPlatform,
   serverVersion: TrimmedNonEmptyString,

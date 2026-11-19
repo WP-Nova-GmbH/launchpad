@@ -158,7 +158,7 @@ function bytesToBase64(bytes: Uint8Array): string {
  * Blob → base64 data URL. Uses `arrayBuffer()` rather than `FileReader` so
  * the module works anywhere `Blob` does (including non-DOM test runners).
  */
-async function blobToDataUrl(blob: File | Blob, mimeTypeOverride?: string): Promise<string> {
+export async function blobToDataUrl(blob: File | Blob, mimeTypeOverride?: string): Promise<string> {
   const buffer = await blob.arrayBuffer();
   const mimeType = mimeTypeOverride || blob.type || "application/octet-stream";
   return `data:${mimeType};base64,${bytesToBase64(new Uint8Array(buffer))}`;

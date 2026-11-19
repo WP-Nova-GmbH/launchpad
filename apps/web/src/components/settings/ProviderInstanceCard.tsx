@@ -608,23 +608,30 @@ export function ProviderInstanceCard({
     : summary.detail;
   const editorStatusNode =
     isAuthenticated && authEmail ? (
-      <>
-        {needsAttention ? statusDotNode : null}
-        <span>Authenticated as</span>
-        <ProviderAuthEmail email={authEmail} />
-        {authLabel ? <span>· {authLabel}</span> : null}
-        {inlineStatusDetail ? (
-          <span className="min-w-0 [overflow-wrap:anywhere]">· {inlineStatusDetail}</span>
+      <div className="min-w-0 space-y-1">
+        <span className="flex items-center gap-1.5">
+          {needsAttention ? statusDotNode : null}Authenticated as
+        </span>
+        {authEmail ? (
+          <span className="block">
+            <ProviderAuthEmail email={authEmail} />
+          </span>
         ) : null}
-      </>
+        {authLabel ? <span className="block">{authLabel}</span> : null}
+        {inlineStatusDetail ? (
+          <span className="block [overflow-wrap:anywhere]">{inlineStatusDetail}</span>
+        ) : null}
+      </div>
     ) : (
-      <>
-        {statusDotNode}
-        <span>{summary.headline}</span>
+      <div className="min-w-0 space-y-1">
+        <span className="flex items-center gap-1.5">
+          {statusDotNode}
+          {summary.headline}
+        </span>
         {inlineStatusDetail ? (
-          <span className="min-w-0 [overflow-wrap:anywhere]">· {inlineStatusDetail}</span>
+          <span className="block [overflow-wrap:anywhere]">{inlineStatusDetail}</span>
         ) : null}
-      </>
+      </div>
     );
   if (mode === "list") {
     return (
@@ -718,10 +725,20 @@ export function ProviderInstanceCard({
               <ProviderStatusDiagnostic detail={statusDiagnostic}>
                 <span
                   tabIndex={statusDiagnostic ? 0 : undefined}
-                  className="pointer-events-auto line-clamp-2 [overflow-wrap:anywhere]"
+                  className="pointer-events-auto min-w-0 [overflow-wrap:anywhere]"
                 >
-                  {summary.headline}
-                  {needsAttention && inlineStatusDetail ? ` · ${inlineStatusDetail}` : null}
+                  <span className="block">
+                    {isAuthenticated && !needsAttention ? "Authenticated" : summary.headline}
+                  </span>
+                  {isAuthenticated && authEmail ? (
+                    <span className="block">
+                      <ProviderAuthEmail email={authEmail} />
+                    </span>
+                  ) : null}
+                  {isAuthenticated && authLabel ? <span className="block">{authLabel}</span> : null}
+                  {needsAttention && inlineStatusDetail ? (
+                    <span className="block">{inlineStatusDetail}</span>
+                  ) : null}
                 </span>
               </ProviderStatusDiagnostic>
             </span>

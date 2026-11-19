@@ -130,8 +130,12 @@ function buildThreadKey(input: {
     : null;
 }
 
-function buildSectionCacheKey(threadKey: string, sectionId: string): string {
-  return `${threadKey}:${sectionId}`;
+function buildSectionCacheKey(
+  threadKey: string,
+  sectionId: string,
+  strictWorkflowReview = false,
+): string {
+  return `${strictWorkflowReview ? "strict" : "preview"}:${threadKey}:${sectionId}`;
 }
 
 export function useReviewCacheForThread(input: {
@@ -283,13 +287,19 @@ export function getCachedReviewParsedDiff(input: {
   readonly threadKey: string | null;
   readonly sectionId: string | null;
   readonly diff: string | null | undefined;
+  readonly strictWorkflowReview?: boolean;
 }): ReviewParsedDiff {
+  const { strictWorkflowReview = false } = input;
   if (!input.threadKey || !input.sectionId) {
-    return buildReviewParsedDiff(input.diff, input.sectionId ?? "mobile-review");
+    return buildReviewParsedDiff(
+      input.diff,
+      input.sectionId ?? "mobile-review",
+      strictWorkflowReview,
+    );
   }
 
-  const cacheKey = buildSectionCacheKey(input.threadKey, input.sectionId);
-  const normalizedDiff = input.diff?.trim() ?? null;
+  const cacheKey = buildSectionCacheKey(input.threadKey, input.sectionId, strictWorkflowReview);
+  const normalizedDiff = (strictWorkflowReview ? input.diff : input.diff?.trim()) ?? null;
   const cache = appAtomRegistry.get(reviewParsedDiffCacheAtom);
   const cached = cache.entries.get(cacheKey);
   if (cached && cached.diff === normalizedDiff) {
@@ -298,7 +308,7 @@ export function getCachedReviewParsedDiff(input: {
     return cached.parsed;
   }
 
-  const parsed = buildReviewParsedDiff(input.diff, input.sectionId);
+  const parsed = buildReviewParsedDiff(input.diff, input.sectionId, strictWorkflowReview);
   if (cached) {
     cache.entries.delete(cacheKey);
     cache.sourceCharacterCount -= cached.sourceCharacterCount;

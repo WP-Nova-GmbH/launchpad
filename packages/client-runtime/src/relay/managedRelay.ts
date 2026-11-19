@@ -1,5 +1,11 @@
 import {
+  WorkflowConflictError,
+  WorkflowInvalidError,
+  WorkflowSubmissionPendingError,
+} from "@t3tools/contracts/workflows";
+import {
   RelayAccessTokenType,
+  CodexVmConnectionError,
   RelayApi,
   type RelayClientEnvironmentRecord,
   type RelayClientDeviceRecord,
@@ -84,6 +90,24 @@ export const ManagedRelayDpopSignerError = Schema.Union([
 export type ManagedRelayDpopSignerError = typeof ManagedRelayDpopSignerError.Type;
 
 export const ManagedRelayRequestAction = Schema.Literals([
+  "read Codex VM connection",
+  "start Codex VM sign-in",
+  "complete Codex VM sign-in",
+  "read Codex VM sign-in",
+  "cancel Codex VM sign-in",
+  "disconnect Codex VM sign-in",
+  "workflow sources",
+  "listWorkflows",
+  "saveWorkflow",
+  "listWorkflowJobs",
+  "pageWorkflowJobs",
+  "runWorkflow",
+  "getWorkflowJob",
+  "getWorkflowJobResult",
+  "listSavedWorkflowResults",
+  "readSavedWorkflowResult",
+  "getSavedWorkflowHistory",
+  "respondToWorkflowJob",
   "exchange relay DPoP access token",
   "list relay-managed environments",
   "list relay client devices",
@@ -96,7 +120,52 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "unregister relay mobile device",
   "register relay live activity",
   "read relay agent activity snapshot",
+  "read relay health",
   "read relay organization",
+  "read thread VM policy",
+  "read workflow VM limit",
+  "save workflow VM limit",
+  "read thread VM status",
+  "read VM Codex sign-in",
+  "read VM Codex account source",
+  "read saved VM Codex account",
+  "save VM Codex account",
+  "select VM Codex account source",
+  "start VM Codex sign-in",
+  "cancel VM Codex sign-in",
+  "open private VM preview",
+  "read thread VM setup",
+  "resume thread VM",
+  "cancel thread VM setup",
+  "create thread VM",
+
+  "read saved thread attachment",
+  "list portable threads",
+  "read portable thread placement",
+  "read portable thread history",
+  "read current thread queue",
+  "queue portable thread command",
+  "cancel active thread move",
+  "retry active thread move",
+  "read thread move cancellation",
+  "read portable thread command receipt",
+  "read pending portable thread commands",
+  "update thread VM policy",
+  "read VM replacement",
+  "permanently delete thread",
+  "read thread deletion",
+  "reset thread VM",
+  "read VM reset",
+  "cancel VM reset",
+  "restore thread VM",
+  "read VM restore",
+  "read VM backup recovery",
+  "restore VM backup",
+  "cancel VM backup recovery",
+  "cancel VM restore",
+  "read VM replacement choices",
+  "select VM replacement",
+  "cancel VM replacement",
   "read access removal status",
   "rename relay organization",
   "list relay organization members",
@@ -108,6 +177,8 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "revoke relay invitation",
   "accept relay invitation",
   "list relay repositories",
+  "read workflow environment",
+  "save workflow environment",
   "register relay repository",
   "look up relay repository",
   "delete relay repository",
@@ -144,6 +215,25 @@ export const ManagedRelayRequestAction = Schema.Literals([
 export type ManagedRelayRequestAction = typeof ManagedRelayRequestAction.Type;
 
 export const ManagedRelayRequestActivity = Schema.Literals([
+  "Codex VM connection",
+  "Codex VM sign-in",
+  "Codex VM sign-in completion",
+  "Codex VM sign-in status",
+  "Codex VM sign-in cancellation",
+  "Codex VM disconnection",
+  "Relay health read",
+  "workflow sources",
+  "listWorkflows",
+  "saveWorkflow",
+  "listWorkflowJobs",
+  "pageWorkflowJobs",
+  "runWorkflow",
+  "getWorkflowJob",
+  "getWorkflowJobResult",
+  "listSavedWorkflowResults",
+  "readSavedWorkflowResult",
+  "getSavedWorkflowHistory",
+  "respondToWorkflowJob",
   "Relay DPoP access token exchange",
   "Relay environment listing",
   "Relay client device listing",
@@ -157,6 +247,48 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay Live Activity registration",
   "Relay agent activity snapshot",
   "Relay organization read",
+  "Thread VM policy read",
+  "Workflow VM limit read",
+  "Workflow VM limit update",
+  "Thread VM status read",
+  "VM Codex sign-in read",
+  "VM Codex account source read",
+  "Saved VM Codex account read",
+  "Saved VM Codex account write",
+  "VM Codex account source selection",
+  "VM Codex sign-in start",
+  "VM Codex sign-in cancellation",
+  "Thread VM setup read",
+  "Thread VM resume",
+  "Thread VM setup cancellation",
+  "Thread VM creation",
+
+  "Portable thread placement read",
+  "Saved thread attachment download",
+  "Portable thread list read",
+  "Portable thread history read",
+  "Current thread queue read",
+  "Private VM preview",
+  "Portable thread command submission",
+  "Active thread move cancellation",
+  "Active thread move retry",
+  "Thread move cancellation read",
+  "Portable thread command receipt read",
+  "Pending portable thread commands",
+  "Thread VM policy update",
+  "VM replacement read",
+  "Thread deletion",
+  "Thread deletion status",
+  "VM reset",
+  "VM reset status",
+  "VM reset cancellation",
+  "VM restore",
+  "VM restore status",
+  "VM backup recovery",
+  "VM restore cancellation",
+  "VM replacement choices",
+  "VM replacement selection",
+  "VM replacement cancellation",
   "Access removal status",
   "Relay organization rename",
   "Relay organization member listing",
@@ -168,6 +300,8 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "Relay invitation revocation",
   "Relay invitation acceptance",
   "Relay repository listing",
+  "Workflow environment read",
+  "Workflow environment update",
   "Relay repository registration",
   "Relay repository lookup",
   "Relay repository removal",
@@ -229,6 +363,11 @@ export class ManagedRelayUrlInvalidError extends Schema.TaggedError<ManagedRelay
   }
 }
 
+const isWorkflowConflictError = Schema.is(WorkflowConflictError);
+const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
+const isWorkflowSubmissionPendingError = Schema.is(WorkflowSubmissionPendingError);
+const isCodexVmConnectionError = Schema.is(CodexVmConnectionError);
+
 export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRelayRequestFailedError>()(
   "ManagedRelayRequestFailedError",
   {
@@ -240,6 +379,13 @@ export class ManagedRelayRequestFailedError extends Schema.TaggedError<ManagedRe
   },
 ) {
   override get message(): string {
+    if (
+      isWorkflowConflictError(this.cause) ||
+      isWorkflowInvalidError(this.cause) ||
+      isWorkflowSubmissionPendingError(this.cause) ||
+      isCodexVmConnectionError(this.cause)
+    )
+      return this.cause.message;
     const message = `Could not ${this.action}.`;
     return this.transportFailed ? `${message} ${NETWORK_BLOCKING_HINT}` : message;
   }
@@ -295,6 +441,10 @@ export const ManagedRelayClientError = Schema.Union([
 export type ManagedRelayClientError = typeof ManagedRelayClientError.Type;
 
 export type RelayHttpRequestError =
+  | import("@t3tools/contracts/relay").CodexVmConnectionError
+  | import("@t3tools/contracts/workflows").WorkflowConflictError
+  | import("@t3tools/contracts/workflows").WorkflowInvalidError
+  | import("@t3tools/contracts/workflows").WorkflowSubmissionPendingError
   | RelayProtectedErrorType
   | HttpClientError.HttpClientError
   | Schema.SchemaError;

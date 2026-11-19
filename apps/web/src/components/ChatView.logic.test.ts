@@ -18,6 +18,7 @@ import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
 
 import type { Thread, ThreadShell, TurnDiffSummary } from "../types";
+import { deriveMessagesTimelineRows } from "./chat/MessagesTimeline.logic";
 import { deriveProviderInstanceEntries, NO_PROVIDER_MODEL_SELECTION } from "../providerInstances";
 import type { CodexArtifactTemplate } from "@t3tools/client-runtime/codex-artifact-templates";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -48,6 +49,7 @@ import {
   getStartedThreadModelChangeBlockReason,
   hasEnvironmentReconnectWarningGraceElapsed,
   hasServerAcknowledgedLocalDispatch,
+  hasTimelineWork,
   shouldRefocusComposerOnWindowFocus,
   isBranchMismatchDismissedForSession,
   reconcileMountedTerminalThreadIds,
@@ -1806,6 +1808,65 @@ describe("startNewThreadForProject", () => {
       }),
     ).toBe(false);
     expect(called).toBe(false);
+  });
+});
+
+describe("hasTimelineWork", () => {
+  const idle = {
+    sharedPromptQueue: true,
+    isWorking: true,
+    runningTurnId: null,
+    isPreparingWorktree: false,
+    isCompacting: false,
+    isRevertingCheckpoint: false,
+  };
+
+  it("reserves Thinking for an actual turn through dispatch, queueing and startup", () => {
+    const createdAt = "2026-10-30T10:00:00Z";
+    const message = {
+      id: MessageId.make("sending"),
+      role: "user" as const,
+      text: "Start this task",
+      pendingStatus: "Sending…" as const,
+      turnId: null,
+      streaming: false,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    const runningTurnId = TurnId.make("accepted-provider-turn");
+    const transitions = [
+      { ...idle, stage: "dispatch" },
+      { ...idle, stage: "pending", isWorking: false },
+      { ...idle, stage: "starting", isWorking: false },
+      { ...idle, stage: "provider running", runningTurnId },
+      { ...idle, stage: "another prompt queues", runningTurnId },
+    ];
+    for (const state of transitions) {
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries: [{ kind: "message", id: message.id, createdAt, message }],
+        runningTurnId: state.runningTurnId,
+        isWorking: hasTimelineWork(state),
+        activeTurnStartedAt: createdAt,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+      expect(
+        rows.map((row) => row.kind),
+        state.stage,
+      ).toEqual(state.runningTurnId === null ? ["message"] : ["message", "working", "thinking"]);
+    }
+  });
+
+  it("preserves explicit setup, compaction and checkpoint work", () => {
+    for (const work of ["isPreparingWorktree", "isCompacting", "isRevertingCheckpoint"] as const) {
+      expect(hasTimelineWork({ ...idle, isWorking: false, [work]: true })).toBe(true);
+    }
+  });
+
+  it("keeps the existing working predicate for non-shared queues", () => {
+    for (const isWorking of [false, true]) {
+      expect(hasTimelineWork({ ...idle, sharedPromptQueue: false, isWorking })).toBe(isWorking);
+    }
   });
 });
 

@@ -325,3 +325,39 @@ layer("ProjectionThreadMessageRepository", (it) => {
     }),
   );
 });
+
+layer("workflow message attribution", (it) => {
+  it.effect("retains workflow identity through projection reads and later updates", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProjectionThreadMessageRepository;
+      const workflowOrigin = {
+        kind: "automation" as const,
+        jobId: "job",
+        workflowId: "flow",
+        workflowName: "Frozen name",
+      };
+      const message = {
+        messageId: MessageId.make("auto-prompt"),
+        threadId: ThreadId.make("auto-thread"),
+        turnId: null,
+        role: "user" as const,
+        text: "task",
+        isStreaming: false,
+        createdAt: "2026-10-15T00:00:00.000Z",
+        updatedAt: "2026-10-15T00:00:00.000Z",
+      };
+      yield* repository.upsert({ ...message, workflowOrigin });
+      yield* repository.upsert({ ...message, text: "updated" });
+      assert.deepStrictEqual(
+        (yield* repository.listByThreadId({ threadId: message.threadId }))[0]?.workflowOrigin,
+        workflowOrigin,
+      );
+      const read = yield* repository.getByMessageId({ messageId: message.messageId });
+      assert.equal(read._tag, "Some");
+      if (read._tag === "Some") {
+        assert.deepStrictEqual(read.value.workflowOrigin, workflowOrigin);
+        assert.isUndefined(read.value.author);
+      }
+    }),
+  );
+});

@@ -39,6 +39,7 @@ const modelSelection = {
 const encodeMetadata = Schema.encodeEffect(
   Schema.fromJsonString(Schema.Struct({ cwd: Schema.String })),
 );
+const encodePrompt = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 interface PromptContext {
   readonly emit: (
@@ -278,6 +279,26 @@ const makeFixture = Effect.fn("makeAntigravityTextGenerationFixture")(function* 
 });
 
 it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture({
+        outputs: ['{"verdict":"approve","reasoning":"In scope"}'],
+      });
+      yield* fixture.textGeneration.generateApprovalVerdict({
+        cwd: fixture.projectDirectory,
+        toolKind: "command",
+        requestType: "command_execution_approval",
+        stepInstruction: "s".repeat(5_000),
+        jobContext: "JOB_CONTEXT",
+        reviewConstraint: "REVIEW_REQUIRED",
+        modelSelection,
+      });
+      const prompt = yield* encodePrompt(fixture.state.prompts[0]);
+      expect(prompt).toContain("JOB_CONTEXT");
+      expect(prompt).toContain("REVIEW_REQUIRED");
+      yield* fixture.assertCleaned;
+    }),
+  );
   it.effect(
     "generates all helper types in empty workspaces and removes only owned session files",
     () =>

@@ -29,14 +29,12 @@ write_files:
       [Service]
       Type=simple
       ExecStartPre=-/usr/bin/docker rm -f launchpad-relay
-      # host network: the relay binds loopback for Caddy and must reach the
-      # loopback endpoints its Docker machines advertise. The socket mount is
-      # how it provisions those machines as sibling containers.
+      # Host network lets Caddy reach the loopback relay and the relay reach
+      # the local database. VM management uses the configured E2B API.
       ExecStart=/usr/bin/docker run --name launchpad-relay \
         --network=host \
         --env-file /etc/launchpad-relay/provisioned.env \
         --env-file /etc/launchpad-relay/relay.env \
-        -v /var/run/docker.sock:/var/run/docker.sock \
         -v /var/lib/launchpad-relay:/var/lib/launchpad-relay \
         launchpad-relay
       ExecStop=/usr/bin/docker stop launchpad-relay
@@ -73,7 +71,7 @@ write_files:
       set -euo pipefail
       export DEBIAN_FRONTEND=noninteractive
 
-      # Docker: runs the relay container and the org-machine containers.
+      # Docker hosts the relay container and its loopback database.
       if ! command -v docker >/dev/null; then
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -108,12 +106,14 @@ write_files:
       DEV_RELAY_DATABASE_URL=postgres://launchpad_relay:$${password}@127.0.0.1:5432/launchpad_relay
       DEV_RELAY_ISSUER=https://${relay_domain}
       DEV_RELAY_CLOUD_MINT_PRIVATE_KEY_PATH=/var/lib/launchpad-relay/cloud-mint-private.pem
+      DEV_RELAY_ARTIFACT_ROOT=/var/lib/launchpad-relay/thread-artifacts
       EOF
       fi
       # The relay's signing key must outlive its container: every enrolled
       # machine and linked environment pins the public half, so a key that
       # regenerates on each deploy strands all of them ("endpoint unavailable").
       install -m 0700 -d /var/lib/launchpad-relay
+      install -m 0700 -d /var/lib/launchpad-relay/thread-artifacts
       # Present-but-empty until the operator fills it, so the relay unit's
       # --env-file never refuses to start.
       touch /etc/launchpad-relay/relay.env

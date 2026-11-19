@@ -13,10 +13,21 @@ import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import type { ManagedExecutorRelayConfig } from "../cloud/machineEnrollment.ts";
 
-export const makeExecutorRelayApiClient = (relayConfig: ManagedExecutorRelayConfig) =>
+export const makeExecutorRelayApiClient = (
+  relayConfig: ManagedExecutorRelayConfig,
+  transformRequest: (
+    request: HttpClientRequest.HttpClientRequest,
+  ) => HttpClientRequest.HttpClientRequest = (request) => request,
+) =>
   HttpApiClient.make(RelayApi, {
     baseUrl: relayConfig.url,
-    transformClient: HttpClient.mapRequest(
-      HttpClientRequest.setHeader("authorization", `Bearer ${relayConfig.environmentCredential}`),
+    transformClient: HttpClient.mapRequest((request) =>
+      transformRequest(
+        HttpClientRequest.setHeader(
+          request,
+          "authorization",
+          `Bearer ${relayConfig.environmentCredential}`,
+        ),
+      ),
     ),
   });

@@ -1,0 +1,2 @@
+ALTER TABLE "relay_thread_vm_allocations" ADD COLUMN "native_paused_generation" integer;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_allocations" ADD CONSTRAINT "relay_thread_vm_allocations_native_paused_generation" CHECK ("native_paused_generation" IS NULL OR "native_paused_generation" > 0);

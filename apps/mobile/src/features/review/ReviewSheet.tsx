@@ -1,5 +1,10 @@
+import { WorkflowResultReturn, type WorkflowResultOrigin } from "../settings/WorkflowResultReturn";
+import { managedRelaySessionAtom, type ManagedRelaySession } from "@t3tools/client-runtime/relay";
+import { recordWorkflowReviewDiff } from "@t3tools/client-runtime/relay/workflow-session";
+import { portableThreadClientRouteAtom } from "@t3tools/client-runtime/relay/portableThreadLibrary";
+import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { useIsFocused, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
 import { ScreenHeader } from "../../components/ScreenHeader";
 import type { ScreenHeaderMenuItem } from "../../components/ScreenHeader.types";
@@ -12,6 +17,7 @@ import {
   type ReactElement,
   useCallback,
   useEffect,
+  useId,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -19,6 +25,7 @@ import {
 } from "react";
 import {
   ActivityIndicator,
+  AppState,
   FlatList,
   Platform,
   Pressable,
@@ -28,6 +35,7 @@ import {
   StyleSheet,
   View,
 } from "react-native";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppText as Text } from "../../components/AppText";
@@ -37,6 +45,8 @@ import { MaterialScreenContent } from "../../components/MaterialScreenContent";
 import { cn } from "../../lib/cn";
 import { environmentCatalog } from "../../connection/catalog";
 import { useEnvironmentPresentation } from "../../state/presentation";
+import { useRemoteEnvironmentRuntime } from "../../state/use-remote-environment-registry";
+import { resolveWorkflowResultAccess } from "../../state/workflow-result-access";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { IOS_NAV_BAR_HEIGHT } from "../../lib/layoutMetrics";
@@ -63,7 +73,7 @@ import { useReviewFileVisibility } from "./reviewFileVisibility";
 import { useReviewSections } from "./useReviewSections";
 import { useNativeReviewDiffBridge } from "./useNativeReviewDiffBridge";
 import { useReviewCommentSelectionController } from "./useReviewCommentSelectionController";
-import { resolveReviewAvailability } from "./reviewAvailability";
+import { resolveReviewAvailability, resolveWorkflowReviewRoute } from "./reviewAvailability";
 import { resolveSelectedReviewFileId } from "./reviewPaneSelection";
 import { buildReviewSectionMenu } from "./review-section-menu";
 import { reportShowcaseSceneRendered } from "../showcase/showcaseRenderSignal";
@@ -126,8 +136,12 @@ function ReviewHeader(
                     id: "sections",
                     inline: true,
                     items: [
-                      sectionAction(props.sectionMenu.workingTree, "Working tree"),
-                      sectionAction(props.sectionMenu.branchChanges, "Branch changes"),
+                      ...(props.workspaceEnabled
+                        ? [
+                            sectionAction(props.sectionMenu.workingTree, "Working tree"),
+                            sectionAction(props.sectionMenu.branchChanges, "Branch changes"),
+                          ]
+                        : []),
                       sectionAction(props.sectionMenu.latestTurn, "Latest turn"),
                     ],
                   },
@@ -442,20 +456,38 @@ function ReviewFileNavigator({
 }
 
 type ReviewSheetProps = StaticScreenProps<{
+  readonly workflowOrigin?: WorkflowResultOrigin;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
 }>;
 
-export function ReviewSheet(props: ReviewSheetProps) {
+function ReviewSheetContent({
+  environmentId,
+  threadId,
+  workflowOrigin,
+  relaySession,
+  onReturnToThread,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly workflowOrigin: WorkflowResultOrigin | null;
+  readonly relaySession: ManagedRelaySession | null;
+  readonly onReturnToThread: () => void;
+}) {
   const { nativeReviewDiffStyle } = useAppearanceCodeSurface();
-  useAdaptiveWorkspacePaneRole("inspector");
-  const { panes, showAuxiliaryPane } = useAdaptiveWorkspaceLayout();
-  const navigation = useNavigation();
+  const { panes } = useAdaptiveWorkspaceLayout();
+  const focused = useIsFocused();
+  const diffViewId = useId();
   const insets = useSafeAreaInsets();
   const { themeAppearance: selectedTheme } = useAppearancePreferences();
   const headerIcon = String(useUniwindTheme()["--color-icon"]);
-  const { environmentId, threadId } = props.route.params;
   const environment = useEnvironmentPresentation(environmentId);
+  const runtime = useRemoteEnvironmentRuntime(environmentId);
+  const { readOnly, workspaceEnabled } = resolveWorkflowResultAccess(
+    runtime?.serverConfig?.environment.capabilities ?? null,
+    workflowOrigin,
+    threadId,
+  );
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, "environment retry");
   const isEnvironmentReady = environment.presentation?.connection.phase === "connected";
   const { draftMessage } = useThreadDraftForThread({ environmentId, threadId });
@@ -466,9 +498,6 @@ export function ReviewSheet(props: ReviewSheetProps) {
   // in-flow AndroidScreenHeader, so it needs no inset either.)
   const topContentInset = 0;
 
-  useEffect(() => {
-    showAuxiliaryPane("inspector");
-  }, [environmentId, showAuxiliaryPane, threadId]);
   const {
     error,
     reviewSections,
@@ -477,12 +506,37 @@ export function ReviewSheet(props: ReviewSheetProps) {
     selectSection,
     isSelectedSectionPending,
     diffPreviewRevision,
+    workflowDiff,
+    workflowDiffError,
   } = useReviewSections({
-    enabled: isEnvironmentReady,
+    enabled: isEnvironmentReady && (!workflowOrigin?.reviewVisitId || focused),
     environmentId,
     threadId,
     reviewCache,
+    workspaceEnabled,
+    workflowCheckpoint: workflowOrigin?.reviewCheckpoint,
+    workflowReviewRequestKey: workflowOrigin?.reviewVisitId
+      ? `${workflowOrigin.reviewVisitId}:${diffViewId}`
+      : undefined,
   });
+  useEffect(() => {
+    if (!focused || !workflowOrigin?.reviewVisitId || !workflowDiff) return;
+    const recordVisibleDiff = (state: typeof AppState.currentState) => {
+      if (state !== "active" || appAtomRegistry.get(managedRelaySessionAtom) !== relaySession)
+        return;
+      const placement = appAtomRegistry.get(portableThreadClientRouteAtom(environmentId, threadId));
+      if (!placement) return;
+      recordWorkflowReviewDiff(
+        appAtomRegistry,
+        workflowOrigin,
+        { environmentId, threadId, generation: placement.generation },
+        workflowDiff,
+      );
+    };
+    recordVisibleDiff(AppState.currentState);
+    const subscription = AppState.addEventListener("change", recordVisibleDiff);
+    return () => subscription.remove();
+  }, [environmentId, focused, relaySession, threadId, workflowDiff, workflowOrigin]);
   useReviewDiffPrewarming({
     threadKey: reviewCache.threadKey,
     sections: reviewSections,
@@ -500,6 +554,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
     environmentId,
     cwd: selectedThreadCwd,
     selectedSection,
+    strictWorkflowReview: workflowDiff !== null,
     revision: diffPreviewRevision,
     draftMessage,
   });
@@ -537,7 +592,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
   const commentSelection = useReviewCommentSelectionController({
     environmentId,
     threadId,
-    selectedSection,
+    selectedSection: readOnly ? null : selectedSection,
     nativeReviewDiffData,
   });
   const nativeBridge = useNativeReviewDiffBridge({
@@ -644,16 +699,6 @@ export function ReviewSheet(props: ReviewSheetProps) {
   const handleRetryEnvironment = useCallback(() => {
     void retryEnvironment(environmentId);
   }, [environmentId, retryEnvironment]);
-  const handleReturnToThread = useCallback(() => {
-    if (navigation.canGoBack()) {
-      navigation.goBack();
-      return;
-    }
-    navigation.navigate("Thread", {
-      environmentId: String(environmentId),
-      threadId: String(threadId),
-    });
-  }, [environmentId, navigation, threadId]);
   const androidHeaderSubtitle = [
     selectedSection?.title,
     headerDiffSummary.additions,
@@ -725,13 +770,14 @@ export function ReviewSheet(props: ReviewSheetProps) {
         androidSubtitle={androidHeaderSubtitle}
         iconColor={headerIcon}
         selectedThreadCwd={selectedThreadCwd}
+        workspaceEnabled={workspaceEnabled}
         sectionMenu={sectionMenu}
         selectedSection={selectedSection}
         showSectionToolbar={showSectionToolbar}
         showChangedFilesToggle={showChangedFilesToggle}
         onRefresh={handlePullToRefresh}
         onSelectSection={selectSection}
-        onReturnToThread={handleReturnToThread}
+        onReturnToThread={onReturnToThread}
       />
 
       <MaterialScreenContent>
@@ -787,7 +833,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
                     tokensResetKey={nativeBridge.tokensResetKey}
                     viewedFileIdsJson={nativeBridge.viewedFileIdsJson}
                     onDebug={handleNativeDebug}
-                    onPressLine={commentSelection.onPressLine}
+                    {...(!readOnly ? { onPressLine: commentSelection.onPressLine } : {})}
                     onVisibleFileChange={handleVisibleFileChange}
                     onToggleComment={nativeBridge.onToggleComment}
                     onToggleFile={handleNativeToggleFile}
@@ -839,7 +885,9 @@ export function ReviewSheet(props: ReviewSheetProps) {
                       Platform.OS === "android" && "mt-2 text-center",
                     )}
                   >
-                    This thread has no ready turn diffs and the worktree diff is empty.
+                    {workspaceEnabled
+                      ? "This thread has no ready turn diffs and the worktree diff is empty."
+                      : "This thread has no ready turn diffs."}
                   </Text>
                 </View>
               ) : selectedSection.isLoading && selectedSection.diff === null ? (
@@ -852,7 +900,7 @@ export function ReviewSheet(props: ReviewSheetProps) {
                   <ActivityIndicator size="small" />
                   <Text className="text-xs text-foreground-muted">Loading diff…</Text>
                 </View>
-              ) : parsedDiff.kind === "empty" ? (
+              ) : workflowDiffError ? null : parsedDiff.kind === "empty" ? (
                 <View
                   className={
                     Platform.OS === "android"
@@ -916,5 +964,64 @@ export function ReviewSheet(props: ReviewSheetProps) {
         </View>
       </MaterialScreenContent>
     </>
+  );
+}
+
+export function ReviewSheet(props: ReviewSheetProps) {
+  const { environmentId, threadId, workflowOrigin: routeOrigin } = props.route.params;
+  const relaySession = useAtomValue(managedRelaySessionAtom);
+  const { origin, blocked } = useMemo(
+    () => resolveWorkflowReviewRoute(routeOrigin, relaySession?.accountId, threadId),
+    [relaySession, routeOrigin, threadId],
+  );
+  useAdaptiveWorkspacePaneRole("inspector");
+  const { showAuxiliaryPane } = useAdaptiveWorkspaceLayout();
+  useEffect(() => {
+    showAuxiliaryPane("inspector");
+  }, [environmentId, showAuxiliaryPane, threadId]);
+
+  const navigation = useNavigation();
+  const handleReturnToThread = useCallback(() => {
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+      return;
+    }
+    navigation.navigate("Thread", {
+      environmentId: String(environmentId),
+      threadId: String(threadId),
+    });
+  }, [environmentId, navigation, threadId]);
+
+  return (
+    <View className="flex-1">
+      {blocked ? (
+        <>
+          <ScreenHeader
+            title="Review changes"
+            onBack={handleReturnToThread}
+            backInSplitView={{ accessibilityLabel: "Back to chat", icon: "chevron.left" }}
+            hideBottomBorder
+          />
+          <MaterialScreenContent>
+            <View className="flex-1 items-center justify-center bg-sheet px-6 android:bg-sheet-solid">
+              <Text accessibilityRole="alert" className="text-center text-foreground-muted">
+                Reconnect to Launchpad Connect to inspect this workflow checkpoint.
+              </Text>
+            </View>
+          </MaterialScreenContent>
+        </>
+      ) : (
+        <>
+          <WorkflowResultReturn origin={origin ?? undefined} threadId={threadId} />
+          <ReviewSheetContent
+            environmentId={environmentId}
+            threadId={threadId}
+            workflowOrigin={origin}
+            relaySession={relaySession}
+            onReturnToThread={handleReturnToThread}
+          />
+        </>
+      )}
+    </View>
   );
 }

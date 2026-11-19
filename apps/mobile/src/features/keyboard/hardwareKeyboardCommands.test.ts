@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { parseActiveThreadPath } from "./hardwareKeyboardCommands";
+import { savedWorkflowDiffParams } from "../review/reviewAvailability";
+import { activeThreadWorkflowOrigin, parseActiveThreadPath } from "./hardwareKeyboardCommands";
 
 describe("parseActiveThreadPath", () => {
   it("extracts the active thread from thread subroutes", () => {
@@ -25,4 +26,38 @@ describe("parseActiveThreadPath", () => {
   it("ignores malformed encoded route components", () => {
     expect(parseActiveThreadPath("/threads/%E0%A4%A/thread-1")).toBeNull();
   });
+});
+
+it("opens keyboard review with the current workflow origin but without a stale review visit", () => {
+  const thread = parseActiveThreadPath(
+    "/threads/guest/workflow%3Arun?workflowOrigin=%5Bobject%20Object%5D",
+  )!;
+  const workflowOrigin = {
+    accountId: "account",
+    organizationId: "organization",
+    repositoryId: "repository",
+    jobId: "run",
+    threadId: "workflow:run",
+    workflowVmResultReader: true,
+  };
+  const params = {
+    ...thread,
+    workflowOrigin: {
+      ...workflowOrigin,
+      reviewVisitId: "prior-visit",
+      reviewCheckpoint: { checkpointId: "checkpoint", turnId: "turn", checkpointTurnCount: 1 },
+    },
+  };
+  expect(thread).toEqual({ environmentId: "guest", threadId: "workflow:run" });
+  expect(
+    savedWorkflowDiffParams(
+      thread.environmentId,
+      thread.threadId,
+      activeThreadWorkflowOrigin(thread, params, "account"),
+    ),
+  ).toEqual({ ...thread, workflowOrigin });
+  expect(activeThreadWorkflowOrigin(thread, params, "other-account")).toBeUndefined();
+  expect(
+    activeThreadWorkflowOrigin(thread, { ...params, environmentId: "other-guest" }, "account"),
+  ).toBeUndefined();
 });

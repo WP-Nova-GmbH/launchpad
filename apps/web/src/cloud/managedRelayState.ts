@@ -2,6 +2,7 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   createManagedRelayQueryManager,
   createManagedRelayOrganizationCatalogQueryManager,
+  createThreadVmRepositoryEligibility,
   deregisterManagedRelayEnvironment,
   type ManagedRelayOrganizationCatalogSnapshot,
   ManagedRelay,
@@ -25,6 +26,7 @@ import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect } from "react";
 
 import { runtime } from "../lib/runtime";
+import { connectionAtomRuntime } from "../connection/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 
 const managedRelayAtomRuntime = Atom.runtime(
@@ -46,8 +48,14 @@ const managedRelayTenancyAtomRuntime = Atom.runtime(
 );
 
 const managedRelayQueryManager = createManagedRelayQueryManager(managedRelayAtomRuntime);
+export const threadVmRepositoryEligibilityAtom =
+  createThreadVmRepositoryEligibility(connectionAtomRuntime);
 const managedRelayOrganizationCatalogQueryManager =
   createManagedRelayOrganizationCatalogQueryManager(managedRelayTenancyAtomRuntime);
+const workflowOrganizationCatalogQueryManager = createManagedRelayOrganizationCatalogQueryManager(
+  managedRelayTenancyAtomRuntime,
+  { allowMissingProjects: true },
+);
 
 const managedRelayMutationScheduler = createAtomCommandScheduler();
 
@@ -133,12 +141,21 @@ export function useManagedRelayDevices() {
   };
 }
 
-export function useManagedRelayOrganizationCatalog() {
+export function refreshManagedRelayOrganizationCatalog(accountId: string): void {
+  managedRelayOrganizationCatalogQueryManager.refresh(appAtomRegistry, accountId);
+  workflowOrganizationCatalogQueryManager.refresh(appAtomRegistry, accountId);
+}
+
+export function useManagedRelayOrganizationCatalog(options?: {
+  readonly allowMissingProjects?: boolean;
+  readonly enabled?: boolean;
+}) {
   const session = useAtomValue(managedRelaySessionAtom);
-  const accountId = session?.accountId ?? null;
-  const atom = accountId
-    ? managedRelayOrganizationCatalogQueryManager.catalogAtom(accountId)
-    : EMPTY_ORGANIZATION_CATALOG_ATOM;
+  const accountId = options?.enabled === false ? null : (session?.accountId ?? null);
+  const manager = options?.allowMissingProjects
+    ? workflowOrganizationCatalogQueryManager
+    : managedRelayOrganizationCatalogQueryManager;
+  const atom = accountId ? manager.catalogAtom(accountId) : EMPTY_ORGANIZATION_CATALOG_ATOM;
   const result = useAtomValue(atom);
   const snapshot = readManagedRelaySnapshotState(result);
   useEffect(() => {
@@ -151,9 +168,9 @@ export function useManagedRelayOrganizationCatalog() {
   }, [snapshot.error, snapshot.errorTraceId]);
   const refresh = useCallback(() => {
     if (accountId) {
-      managedRelayOrganizationCatalogQueryManager.refresh(appAtomRegistry, accountId);
+      manager.refresh(appAtomRegistry, accountId);
     }
-  }, [accountId]);
+  }, [accountId, manager]);
 
   return {
     ...snapshot,

@@ -1377,3 +1377,32 @@ describe("composer and pull request shortcuts", () => {
     });
   }
 });
+
+describe("VM thread shortcut", () => {
+  it("opens VM threads outside the terminal and respects platform modifier keys", () => {
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "v", metaKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "mac", context: { terminalFocus: false } },
+      ),
+      "threadVms.open",
+    );
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "v", ctrlKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "windows", context: { terminalFocus: false } },
+      ),
+      "threadVms.open",
+    );
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "v", ctrlKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "windows", context: { terminalFocus: true } },
+      ),
+      null,
+    );
+  });
+});

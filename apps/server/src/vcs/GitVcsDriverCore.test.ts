@@ -30,12 +30,14 @@ import {
 } from "@t3tools/contracts";
 import { ServerConfig } from "../config.ts";
 import { gitCommandDuration } from "../observability/Metrics.ts";
+import { CurrentWorkflowCommand } from "../processRunner.ts";
 import {
   makeGitVcsDriverCore,
   parseGitCheckoutProgressLine,
   splitNullSeparatedGitStdoutPaths,
 } from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import * as VcsProcess from "./VcsProcess.ts";
 
 const encodeGitCommandError = Schema.encodeEffect(Schema.fromJsonString(GitCommandError));
 
@@ -45,6 +47,136 @@ const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
 const TestLayer = GitVcsDriver.layer.pipe(
   Layer.provide(ServerConfigLayer),
   Layer.provideMerge(NodeServices.layer),
+);
+
+it.effect("routes GitHub fetch and owned local Git through the workflow process", () =>
+  Effect.gen(function* () {
+    const local = yield* makeGitVcsDriverCore();
+    const source = yield* makeTmpDir();
+    const sourceGit = (args: ReadonlyArray<string>) =>
+      local.execute({ operation: "test.fetch.source", cwd: source, args });
+    yield* sourceGit(["init", "--quiet", "--initial-branch=release"]);
+    yield* sourceGit([
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.test",
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--allow-empty",
+      "--message",
+      "Test release",
+    ]);
+    yield* sourceGit(["branch", "topic/kept"]);
+    yield* sourceGit(["branch", "topic/ignored"]);
+    yield* sourceGit(["tag", "local-fixture-tag"]);
+    const requests: VcsProcess.VcsProcessInput[] = [];
+    const driver = yield* makeGitVcsDriverCore().pipe(
+      Effect.provideService(
+        VcsProcess.VcsProcess,
+        VcsProcess.VcsProcess.of({
+          run: (input) =>
+            Effect.gen(function* () {
+              requests.push(input);
+              if (input.credentialUrl) {
+                // Exercise real Git fetch and HEAD discovery using an offline source.
+                const result = yield* local
+                  .execute({
+                    operation: input.operation,
+                    cwd: input.cwd,
+                    args: input.args.map((arg) => (arg === input.credentialUrl ? source : arg)),
+                    ...(input.env === undefined ? {} : { env: input.env }),
+                  })
+                  .pipe(Effect.orDie);
+                return {
+                  ...result,
+                  exitCode: ChildProcessSpawner.ExitCode(result.exitCode ?? 1),
+                };
+              }
+              return {
+                exitCode: ChildProcessSpawner.ExitCode(0),
+                stdout: "",
+                stderr: "",
+                stdoutTruncated: false,
+                stderrTruncated: false,
+              };
+            }),
+        }),
+      ),
+    );
+    const cwd = yield* makeTmpDir();
+    const git = (args: ReadonlyArray<string>) =>
+      driver.execute({ operation: "test.fetch.fixture", cwd, args });
+    const githubRemoteUrl = "https://github.com/example/workflow.git";
+    yield* git(["init", "--quiet"]);
+    yield* git(["remote", "add", "origin", githubRemoteUrl]);
+    const releaseRefspec = "+refs/heads/release:refs/remotes/origin/release";
+    const topicsRefspec = "+refs/heads/topic/*:refs/remotes/origin/custom/*";
+    const ignoredRefspec = "^refs/heads/topic/ignored";
+    yield* git(["config", "--replace-all", "remote.origin.fetch", releaseRefspec]);
+    yield* git(["config", "--add", "remote.origin.fetch", topicsRefspec]);
+    yield* git(["config", "--add", "remote.origin.fetch", ignoredRefspec]);
+    yield* git(["config", "remote.origin.tagOpt", "--no-tags"]);
+    yield* git(["config", "remote.origin.proxy", "http://proxy.invalid:8080"]);
+    const proxyOption = `--config-env=http.${githubRemoteUrl}.proxy=LAUNCHPAD_WORKFLOW_GIT_PROXY`;
+    yield* driver.fetchRemote({ cwd, remoteName: "origin", githubRemoteUrl });
+    assert.equal((yield* git(["tag", "--list"])).stdout, "");
+    assert.equal(requests[0]?.env?.LAUNCHPAD_WORKFLOW_GIT_PROXY, "http://proxy.invalid:8080");
+    assert.equal(yield* driver.resolveDefaultBranchName(cwd, "origin"), "release");
+    assert.isTrue(
+      yield* driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "custom/kept" }),
+    );
+    assert.isFalse(
+      yield* driver.remoteBranchExists({ cwd, remoteName: "origin", refName: "custom/ignored" }),
+    );
+    yield* git(["config", "--add", "remote.origin.url", "https://github.com/example/other.git"]);
+    const failure = yield* driver
+      .fetchRemote({ cwd, remoteName: "origin", githubRemoteUrl })
+      .pipe(Effect.flip);
+    assert.match(failure.detail, /remote no longer resolves/);
+    yield* driver
+      .execute({ operation: "test.stage", cwd, args: ["add", "file"] })
+      .pipe(
+        Effect.provideService(
+          CurrentWorkflowCommand,
+          Effect.die("The process service owns this command"),
+        ),
+      );
+    assert.deepEqual(
+      requests.map(({ command, args, credentials, credentialUrl }) => ({
+        command,
+        args,
+        credentials,
+        credentialUrl,
+      })),
+      [
+        {
+          command: "git",
+          args: [
+            proxyOption,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--",
+            githubRemoteUrl,
+            releaseRefspec,
+            topicsRefspec,
+            ignoredRefspec,
+          ],
+          credentials: "github",
+          credentialUrl: githubRemoteUrl,
+        },
+        {
+          command: "git",
+          args: [proxyOption, "ls-remote", "--symref", "--", githubRemoteUrl, "HEAD"],
+          credentials: "github",
+          credentialUrl: githubRemoteUrl,
+        },
+        { command: "git", args: ["add", "file"], credentials: "none", credentialUrl: undefined },
+      ],
+    );
+  }).pipe(Effect.provide(Layer.provideMerge(ServerConfigLayer, NodeServices.layer))),
 );
 
 const makeNonRepositoryHandle = () =>

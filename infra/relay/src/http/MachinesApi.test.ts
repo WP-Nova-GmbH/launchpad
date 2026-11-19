@@ -8,7 +8,6 @@ import * as Redacted from "effect/Redacted";
 import * as RelayConfiguration from "../Config.ts";
 import * as EnvironmentCredentials from "../environments/EnvironmentCredentials.ts";
 import * as ManagedEndpointProvider from "../environments/ManagedEndpointProvider.ts";
-import * as MachineComputeProvider from "../machines/MachineComputeProvider.ts";
 import * as MachineLimits from "../machines/MachineLimits.ts";
 import * as Machines from "../machines/Machines.ts";
 import {
@@ -62,8 +61,8 @@ const enrolledMachine = (overrides?: Partial<Machines.MachineRecord>): Machines.
   organizationId: "organization-1",
   role: "agent_executor",
   label: "Executor 1",
-  computeKind: "docker",
-  computeRef: "container-1",
+  computeKind: "self_hosted",
+  computeRef: null,
   seedExpiresAt: "2100-01-01T00:00:00.000Z",
   environmentId: "env-machine-test",
   environmentPublicKey: "machine-public-key",
@@ -106,20 +105,6 @@ function limitsLayer(overrides?: Partial<MachineLimits.MachineLimits["Service"]>
   );
 }
 
-function computeLayer(
-  overrides?: Partial<MachineComputeProvider.MachineComputeProvider["Service"]>,
-) {
-  return Layer.succeed(
-    MachineComputeProvider.MachineComputeProvider,
-    MachineComputeProvider.MachineComputeProvider.of({
-      kind: "docker",
-      create: unexpected("compute create"),
-      destroy: unexpected("compute destroy"),
-      ...overrides,
-    }),
-  );
-}
-
 function endpointLayer(
   overrides?: Partial<ManagedEndpointProvider.ManagedEndpointProvider["Service"]>,
 ) {
@@ -153,167 +138,34 @@ function credentialsLayer(
 const baseLayer = Layer.mergeAll(RelayConfiguration.layer(relaySettings), cryptoLayer);
 
 describe("provisionMachineRecord", () => {
-  it.effect(
-    "creates the record before compute and hands the driver a seed matching the stored hash",
-    () => {
-      const calls: Array<string> = [];
-      let storedSeedHash: string | null = null;
-      let driverSeed: string | null = null;
-      let createdRecord: Machines.MachineRecord | null = null;
-      return Effect.gen(function* () {
-        const machine = yield* provisionMachineRecord({
-          organizationId: "organization-1",
-          createdByUserId: "user_admin",
-          label: "Executor 1",
-          role: "agent_executor",
+  for (const role of ["agent_executor", "review_host"] as const) {
+    it.effect(`refuses retired ${role} provisioning before creating any machine state`, () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          provisionMachineRecord({
+            organizationId: "organization-1",
+            createdByUserId: "user_admin",
+            label: "Old managed machine",
+            role,
+          }),
+        );
+        expect(error).toMatchObject({
+          _tag: "RelayMachineComputeUnavailableError",
+          reason: "retired",
         });
-        expect(calls).toEqual(["create", "compute-create", "record-compute-ref"]);
-        expect(driverSeed).toMatch(/^t3mseed_[0-9a-f]{64}$/);
-        expect(storedSeedHash).toBe(seedHashOf(driverSeed ?? ""));
-        expect(machine.status).toBe("awaiting_enrollment");
-        expect(machine.computeKind).toBe("docker");
-        expect(machine.role).toBe("agent_executor");
       }).pipe(
         Effect.provide(
           Layer.mergeAll(
             baseLayer,
-            limitsLayer(),
-            credentialsLayer(),
-            endpointLayer(),
-            machinesLayer({
-              create: (input) =>
-                Effect.sync(() => {
-                  calls.push("create");
-                  storedSeedHash = input.seedHash;
-                  createdRecord = {
-                    ...input,
-                    computeRef: null,
-                    environmentId: null,
-                    environmentPublicKey: null,
-                    endpointHttpBaseUrl: null,
-                    endpointWsBaseUrl: null,
-                    endpointProviderKind: null,
-                    enrolledAt: null,
-                    deprovisionedAt: null,
-                    createdAt: "2026-08-19T00:00:00.000Z",
-                  };
-                  return createdRecord;
-                }),
-              recordComputeRef: () =>
-                Effect.sync(() => {
-                  calls.push("record-compute-ref");
-                }),
-              getById: () => Effect.succeed(createdRecord),
-            }),
-            computeLayer({
-              create: (input) =>
-                Effect.sync(() => {
-                  calls.push("compute-create");
-                  driverSeed = input.seed;
-                  expect(input.relayUrl).toBe("https://relay.example.test");
-                  return { computeKind: "docker" as const, computeRef: "container-1" };
-                }),
+            machinesLayer({}),
+            limitsLayer({
+              ensureCapacity: unexpected("quota reservation"),
             }),
           ),
         ),
-      );
-    },
-  );
-
-  it.effect("refuses provisioning past the organization quota", () =>
-    Effect.gen(function* () {
-      const error = yield* Effect.flip(
-        provisionMachineRecord({
-          organizationId: "organization-1",
-          createdByUserId: "user_admin",
-          label: "Executor 1",
-          role: "agent_executor",
-        }),
-      );
-      expect(error).toMatchObject({
-        _tag: "RelayTenancyConflictError",
-        reason: "machine_limit_reached",
-      });
-    }).pipe(
-      Effect.provide(
-        Layer.mergeAll(
-          baseLayer,
-          limitsLayer({
-            ensureCapacity: (input) =>
-              Effect.fail(
-                new MachineLimits.MachineLimitExceeded({
-                  organizationId: input.organizationId,
-                  maxMachines: 5,
-                  activeMachines: 5,
-                }),
-              ),
-          }),
-          credentialsLayer(),
-          endpointLayer(),
-          machinesLayer({}),
-          computeLayer(),
-        ),
-      ),
-    ),
-  );
-
-  it.effect("removes the record when the compute driver fails", () => {
-    let removedMachineId: string | null = null;
-    return Effect.gen(function* () {
-      const error = yield* Effect.flip(
-        provisionMachineRecord({
-          organizationId: "organization-1",
-          createdByUserId: "user_admin",
-          label: "Executor 1",
-          role: "review_host",
-        }),
-      );
-      expect(error).toMatchObject({
-        _tag: "RelayMachineComputeUnavailableError",
-        reason: "request_failed",
-      });
-      expect(removedMachineId).not.toBeNull();
-    }).pipe(
-      Effect.provide(
-        Layer.mergeAll(
-          baseLayer,
-          limitsLayer(),
-          credentialsLayer(),
-          endpointLayer(),
-          machinesLayer({
-            create: (input) =>
-              Effect.succeed({
-                ...input,
-                computeRef: null,
-                environmentId: null,
-                environmentPublicKey: null,
-                endpointHttpBaseUrl: null,
-                endpointWsBaseUrl: null,
-                endpointProviderKind: null,
-                enrolledAt: null,
-                deprovisionedAt: null,
-                createdAt: "2026-08-19T00:00:00.000Z",
-              }),
-            remove: (input) =>
-              Effect.sync(() => {
-                removedMachineId = input.machineId;
-              }),
-          }),
-          computeLayer({
-            create: (input) =>
-              Effect.fail(
-                new MachineComputeProvider.MachineComputeRequestFailed({
-                  operation: "create",
-                  computeKind: "docker",
-                  machineId: input.machineId,
-                  cause: new Error("driver down"),
-                }),
-              ),
-          }),
-        ),
       ),
     );
-  });
+  }
 });
 
 describe("connectMachineRecord", () => {
@@ -356,8 +208,6 @@ describe("connectMachineRecord", () => {
                 };
               }),
           }),
-          // Every compute call is `unexpected`: a self-hosted machine has no driver.
-          computeLayer(),
         ),
       ),
     );
@@ -394,7 +244,6 @@ describe("connectMachineRecord", () => {
           credentialsLayer(),
           endpointLayer(),
           machinesLayer({}),
-          computeLayer(),
         ),
       ),
     ),
@@ -419,77 +268,39 @@ describe("deprovisionMachineRecord", () => {
           credentialsLayer(),
           endpointLayer(),
           machinesLayer({ getById: () => Effect.succeed(enrolledMachine()) }),
-          computeLayer(),
         ),
       ),
     ),
   );
 
-  it.effect("tombstones first, then revokes credentials, endpoint, and compute", () => {
-    const calls: Array<string> = [];
-    let endpointOwner: string | null = null;
-    return Effect.gen(function* () {
-      const result = yield* deprovisionMachineRecord({
-        organizationId: "organization-1",
-        machineId: "machine-1",
-      });
-      expect(result).toEqual({ ok: true });
-      expect(calls).toEqual([
-        "prepare-deprovision",
-        "tombstone",
-        "revoke-credentials",
-        "deprovision-endpoint",
-        "destroy-compute",
-      ]);
-      expect(endpointOwner).toBe("org:organization-1");
-    }).pipe(
-      Effect.provide(
-        Layer.mergeAll(
-          baseLayer,
-          limitsLayer(),
-          credentialsLayer({
-            revokeForEnvironmentPublicKey: (input) =>
-              Effect.sync(() => {
-                calls.push("revoke-credentials");
-                expect(input).toEqual({
-                  environmentId: "env-machine-test",
-                  environmentPublicKey: "machine-public-key",
-                });
-                return true;
-              }),
+  for (const computeKind of ["docker", "hetzner"] as const) {
+    it.effect(`refuses ${computeKind} cleanup before changing its live identity`, () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          deprovisionMachineRecord({
+            organizationId: "organization-1",
+            machineId: "machine-1",
           }),
-          endpointLayer({
-            prepareDeprovision: () =>
-              Effect.sync(() => {
-                calls.push("prepare-deprovision");
-                return null;
-              }),
-            deprovision: (input) =>
-              Effect.sync(() => {
-                calls.push("deprovision-endpoint");
-                endpointOwner = input.userId;
-                return true;
-              }),
-          }),
-          machinesLayer({
-            getById: () => Effect.succeed(enrolledMachine()),
-            deprovision: () =>
-              Effect.sync(() => {
-                calls.push("tombstone");
-                return true;
-              }),
-          }),
-          computeLayer({
-            destroy: (input) =>
-              Effect.sync(() => {
-                calls.push("destroy-compute");
-                expect(input).toEqual({ computeKind: "docker", computeRef: "container-1" });
-              }),
-          }),
+        );
+        expect(error).toMatchObject({
+          _tag: "RelayMachineComputeUnavailableError",
+          reason: "retired",
+        });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            baseLayer,
+            machinesLayer({
+              getById: () =>
+                Effect.succeed(enrolledMachine({ computeKind, computeRef: "legacy-ref" })),
+            }),
+            credentialsLayer(),
+            endpointLayer({ prepareDeprovision: unexpected("endpoint teardown") }),
+          ),
         ),
       ),
     );
-  });
+  }
 
   it.effect("tears down an enrolled self-hosted machine without a compute call", () => {
     const calls: Array<string> = [];
@@ -538,8 +349,6 @@ describe("deprovisionMachineRecord", () => {
                 return true;
               }),
           }),
-          // A self-hosted machine has no compute ref, so destroy stays `unexpected`.
-          computeLayer(),
         ),
       ),
     );
@@ -553,7 +362,7 @@ describe("deprovisionMachineRecord", () => {
         machineId: "machine-1",
       });
       expect(result).toEqual({ ok: true });
-      expect(calls).toEqual(["tombstone", "destroy-compute"]);
+      expect(calls).toEqual(["tombstone"]);
     }).pipe(
       Effect.provide(
         Layer.mergeAll(
@@ -580,12 +389,6 @@ describe("deprovisionMachineRecord", () => {
               Effect.sync(() => {
                 calls.push("tombstone");
                 return true;
-              }),
-          }),
-          computeLayer({
-            destroy: () =>
-              Effect.sync(() => {
-                calls.push("destroy-compute");
               }),
           }),
         ),

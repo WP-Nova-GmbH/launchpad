@@ -451,3 +451,288 @@ it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("ProviderSessionDirectoryL
     }),
   );
 });
+
+it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("conditional shutdown proof", (it) => {
+  it.effect("matches the episode atomically and preserves native history", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const threadId = ThreadId.make("conditional-episode");
+      const identity = {
+        threadId,
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        workflowJobId: "job",
+        continuationKey: "native-home",
+        runtimeEpisode: "original",
+      };
+      yield* directory.upsert({
+        ...identity,
+        resumeCursor: { opaque: "history" },
+        runtimePayload: {
+          cwd: "/workspace",
+          providerContinuation: { ...identity, shutdownConfirmed: false },
+        },
+      });
+      yield* directory.recordImportedTranscript({ threadId, source: importedSource });
+      assert.equal(yield* directory.confirmShutdown(identity), true);
+      const stopped = Option.getOrThrow(yield* directory.getBinding(threadId));
+      expect(stopped.runtimePayload).toMatchObject({
+        cwd: "/workspace",
+        importedTranscripts: [importedSource],
+        providerContinuation: { shutdownConfirmed: true, shutdownEvidenceVersion: 2 },
+      });
+      yield* directory.upsert({
+        ...identity,
+        runtimePayload: {
+          providerContinuation: {
+            ...identity,
+            runtimeEpisode: "replacement",
+            shutdownConfirmed: false,
+          },
+        },
+      });
+      assert.equal(yield* directory.confirmShutdown(identity), false);
+      expect(Option.getOrThrow(yield* directory.getBinding(threadId)).runtimePayload).toMatchObject(
+        {
+          providerContinuation: { runtimeEpisode: "replacement", shutdownConfirmed: false },
+        },
+      );
+      assert.deepEqual(Option.getOrThrow(yield* directory.getBinding(threadId)).resumeCursor, {
+        opaque: "history",
+      });
+    }),
+  );
+  it.effect("routine stale payloads cannot reinstall old proof", () =>
+    Effect.gen(function* () {
+      const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const threadId = ThreadId.make("stale-payload-proof");
+      const row = {
+        threadId,
+        providerName: "codex",
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        adapterKey: "codex",
+        runtimeMode: "approval-required" as const,
+        status: "running" as const,
+        lastSeenAt: "2026-10-12T00:00:00.000Z",
+        resumeCursor: { opaque: "history" },
+        runtimePayload: {
+          providerContinuation: { runtimeEpisode: "old", shutdownConfirmed: true },
+        },
+      };
+      yield* repository.upsert(row);
+      yield* repository.upsert({
+        ...row,
+        runtimePayload: {
+          providerContinuation: {
+            runtimeEpisode: "new",
+            shutdownConfirmed: false,
+          },
+        },
+      });
+      yield* repository.upsert(row, { preserveContinuation: true });
+      expect(
+        Option.getOrThrow(yield* repository.getByThreadId({ threadId })).runtimePayload,
+      ).toMatchObject({
+        providerContinuation: { runtimeEpisode: "new", shutdownConfirmed: false },
+      });
+    }),
+  );
+});
+
+it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("runtime cursor ownership", (it) => {
+  it.effect("a late old binding update cannot replace the new native cursor", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const identity = {
+        threadId: ThreadId.make("late-native-cursor"),
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+      };
+      yield* directory.upsert({
+        ...identity,
+        resumeCursor: { resume: "original" },
+        runtimePayload: {
+          providerContinuation: {
+            runtimeEpisode: "original",
+            continuationKey: "home",
+            shutdownConfirmed: false,
+          },
+        },
+      });
+      yield* directory.upsert({
+        ...identity,
+        resumeCursor: { resume: "replacement" },
+        runtimePayload: {
+          providerContinuation: {
+            runtimeEpisode: "replacement",
+            continuationKey: "home",
+            shutdownConfirmed: false,
+          },
+        },
+      });
+      yield* directory.upsert(
+        { ...identity, status: "stopped", resumeCursor: { resume: "original" } },
+        { expectedRuntimeEpisode: "original" },
+      );
+      const current = Option.getOrThrow(yield* directory.getBinding(identity.threadId));
+      assert.deepEqual(current.resumeCursor, { resume: "replacement" });
+      assert.equal(current.status, "running");
+    }),
+  );
+});
+
+it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("guarded live runtime writes", (it) => {
+  it.effect.each(["stop-first", "write-first"] as const)(
+    "confirmed shutdown wins within the same episode: %s",
+    (order) =>
+      Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory;
+        const identity = {
+          threadId: ThreadId.make(`guarded-stop-${order}`),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        };
+        const continuation = {
+          runtimeEpisode: "original",
+          continuationKey: "home",
+          shutdownConfirmed: false,
+        };
+        yield* directory.upsert({
+          ...identity,
+          status: "running",
+          resumeCursor: { opaque: "history" },
+          runtimePayload: { providerContinuation: continuation, activeTurnId: "original-turn" },
+        });
+        yield* directory.recordImportedTranscript({
+          threadId: identity.threadId,
+          source: importedSource,
+        });
+        const write = directory.upsert(
+          {
+            ...identity,
+            status: "running",
+            resumeCursor: { opaque: "stale-history" },
+            runtimePayload: {
+              activeTurnId: "stale-turn",
+              continueAfterServerUpdate: "stale-turn",
+              continueAfterServerUpdatePrepared: true,
+            },
+          },
+          { expectedRuntimeEpisode: "original" },
+        );
+        const stop = directory.confirmShutdown({
+          ...identity,
+          workflowJobId: null,
+          continuationKey: "home",
+          runtimeEpisode: "original",
+        });
+        if (order === "write-first") yield* write;
+        assert.equal(yield* stop, true);
+        const confirmed = Option.getOrThrow(yield* directory.getBinding(identity.threadId));
+        yield* write;
+        assert.deepEqual(
+          Option.getOrThrow(yield* directory.getBinding(identity.threadId)),
+          confirmed,
+        );
+        assert.equal(yield* stop, true);
+        assert.equal(confirmed.status, "stopped");
+        assert.propertyVal(confirmed.runtimePayload, "activeTurnId", null);
+        assert.propertyVal(confirmed.runtimePayload, "continueAfterServerUpdate", null);
+        assert.propertyVal(confirmed.runtimePayload, "continueAfterServerUpdatePrepared", null);
+        expect(confirmed.runtimePayload).toMatchObject({ importedTranscripts: [importedSource] });
+        yield* directory.upsert({
+          ...identity,
+          status: "starting",
+          runtimePayload: {
+            providerContinuation: { ...continuation, runtimeEpisode: "replacement" },
+          },
+        });
+        yield* directory.upsert(
+          { ...identity, status: "running", resumeCursor: { opaque: "replacement-history" } },
+          { expectedRuntimeEpisode: "replacement" },
+        );
+        assert.deepEqual(
+          Option.getOrThrow(yield* directory.getBinding(identity.threadId)).resumeCursor,
+          { opaque: "replacement-history" },
+        );
+      }),
+  );
+  it.effect.each(["absent", "true", "missing", "malformed", "unconfirmed-stopped"] as const)(
+    "requires an existing, explicitly unconfirmed episode: %s",
+    (state) =>
+      Effect.gen(function* () {
+        const directory = yield* ProviderSessionDirectory;
+        const identity = {
+          threadId: ThreadId.make(`guarded-state-${state}`),
+          provider: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        };
+        if (state !== "absent")
+          yield* directory.upsert({
+            ...identity,
+            status: "stopped",
+            resumeCursor: { opaque: "current" },
+            runtimePayload: {
+              providerContinuation: {
+                runtimeEpisode: "episode",
+                continuationKey: "home",
+                ...(state === "missing"
+                  ? {}
+                  : {
+                      shutdownConfirmed:
+                        state === "unconfirmed-stopped" ? false : state === "true" ? true : "false",
+                    }),
+              },
+            },
+          });
+        const before = yield* directory.getBinding(identity.threadId);
+        yield* directory.upsert(
+          {
+            ...identity,
+            status: "running",
+            resumeCursor: { opaque: "new" },
+            runtimePayload: { activeTurnId: "new-turn" },
+          },
+          { expectedRuntimeEpisode: "episode" },
+        );
+        const after = yield* directory.getBinding(identity.threadId);
+        if (state === "unconfirmed-stopped") {
+          assert.equal(Option.getOrThrow(after).status, "running");
+          assert.deepEqual(Option.getOrThrow(after).resumeCursor, { opaque: "new" });
+        } else assert.deepEqual(after, before);
+      }),
+  );
+});
+
+it.layer(makeDirectoryLayer(SqlitePersistenceMemory))("deleted runtime guard", (it) => {
+  it.effect("a stale guarded repository write cannot recreate a deleted binding", () =>
+    Effect.gen(function* () {
+      const directory = yield* ProviderSessionDirectory;
+      const repository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const identity = {
+        threadId: ThreadId.make("deleted-before-live-write"),
+        provider: ProviderDriverKind.make("codex"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      };
+      yield* directory.upsert({
+        ...identity,
+        runtimePayload: {
+          providerContinuation: { runtimeEpisode: "original", shutdownConfirmed: false },
+        },
+        resumeCursor: { opaque: "current" },
+      });
+      const previous = Option.getOrThrow(
+        yield* repository.getByThreadId({ threadId: identity.threadId }),
+      );
+      yield* repository.deleteByThreadId({ threadId: identity.threadId });
+      yield* repository.upsert(
+        { ...previous, status: "running", resumeCursor: { opaque: "stale" } },
+        { expectedRuntimeEpisode: "original", preserveContinuation: true },
+      );
+      assert.equal(
+        Option.isNone(yield* repository.getByThreadId({ threadId: identity.threadId })),
+        true,
+      );
+    }),
+  );
+});

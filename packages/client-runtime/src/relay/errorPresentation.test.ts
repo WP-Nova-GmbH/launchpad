@@ -1,4 +1,8 @@
-import { RelayAuthInvalidError } from "@t3tools/contracts/relay";
+import {
+  RelayAuthInvalidError,
+  RelayMachineComputeUnavailableError,
+  RelayTenancyConflictError,
+} from "@t3tools/contracts/relay";
 import { describe, expect, it } from "@effect/vitest";
 
 import {
@@ -9,6 +13,25 @@ import {
 } from "./errorPresentation.ts";
 
 describe("relayProtectedErrorMessage", () => {
+  it("explains that a VM thread starts by moving an uploaded local workspace", () => {
+    const error = new RelayTenancyConflictError({
+      code: "tenancy_conflict",
+      reason: "thread_vm_move_required",
+      traceId: "trace-vm-move",
+    });
+    expect(relayProtectedErrorMessage(error)).toBe(
+      "Start a thread locally, then move it to a private VM to upload its workspace.",
+    );
+  });
+  it("explains the retired provisioning route to older clients", () => {
+    const error = new RelayMachineComputeUnavailableError({
+      code: "machine_compute_unavailable",
+      reason: "retired",
+      traceId: "trace-retired",
+    });
+    expect(relayProtectedErrorMessage(error)).toContain("replaced by thread VMs");
+    expect(relayProtectedErrorMessage(error)).toContain("cleanup on its original host");
+  });
   it("presents clock skew as one possible cause when the relay omits the reason", () => {
     const error = new RelayAuthInvalidError({
       code: "auth_invalid",

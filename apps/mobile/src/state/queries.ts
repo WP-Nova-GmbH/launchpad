@@ -1,5 +1,9 @@
 import { filterComposerPullRequestMatches } from "@t3tools/shared/composerPullRequestMatches";
 import type { VcsRefTarget } from "@t3tools/client-runtime/state/vcs";
+import {
+  buildCheckpointDiffTargets,
+  type CheckpointDiffTarget,
+} from "@t3tools/client-runtime/state/threads";
 import type {
   EnvironmentId,
   ProjectId,
@@ -26,11 +30,7 @@ import { useEnvironmentQuery } from "./query";
 import { useEnvironmentThread } from "./threads";
 import { vcsEnvironment } from "./vcs";
 import { composerPullRequests } from "./pull-requests";
-import {
-  buildCheckpointDiffTargets,
-  normalizeComposerPathSearchQuery,
-  type CheckpointDiffTarget,
-} from "./queryTargets";
+import { normalizeComposerPathSearchQuery } from "./queryTargets";
 
 const COMPOSER_PATH_SEARCH_DEBOUNCE_MS = 200;
 const COMPOSER_PATH_SEARCH_LIMIT = 20;
@@ -353,16 +353,7 @@ export function useComposerPathSearch(target: ComposerPathSearchTarget) {
 }
 
 export function useCheckpointDiff(target: CheckpointDiffTarget) {
-  const targets = useMemo(
-    () => buildCheckpointDiffTargets(target),
-    [
-      target.environmentId,
-      target.fromTurnCount,
-      target.ignoreWhitespace,
-      target.threadId,
-      target.toTurnCount,
-    ],
-  );
+  const targets = buildCheckpointDiffTargets(target);
   const fullThread = useEnvironmentQuery(
     targets.fullThread === null
       ? null

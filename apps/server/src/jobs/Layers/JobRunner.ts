@@ -7,6 +7,7 @@ import {
   type OrchestrationThread,
   type RuntimeMode,
 } from "@t3tools/contracts";
+import { LAUNCHPAD_JOB_BRANCH_PREFIX, jobBranchName } from "@t3tools/shared/workflowStorage";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -36,16 +37,7 @@ import {
   type JobGateStep,
 } from "../workflow.ts";
 
-/**
- * Deterministic and deliberately not a `t3code/<hex>` temporary branch:
- * `ProviderCommandReactor` renames those to a model-generated name on the
- * first turn, in a forked fiber that races the turn. A job wants the branch it
- * chose, and wants it stable for the push and the pull request.
- */
-export function jobBranchName(jobId: string): string {
-  const sanitized = jobId.replaceAll(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  return `t3-job/${sanitized.length > 0 ? sanitized : "job"}`;
-}
+export { jobBranchName } from "@t3tools/shared/workflowStorage";
 
 function lastAssistantText(thread: OrchestrationThread): string | null {
   for (let index = thread.messages.length - 1; index >= 0; index -= 1) {
@@ -347,7 +339,7 @@ const make = Effect.gen(function* () {
     // Jobs always build on what is actually on the remote: an executor's
     // checkout is long-lived and its local base branch may be arbitrarily
     // stale.
-    const branch = jobBranchName(request.jobId);
+    const branch = jobBranchName(request.jobId, LAUNCHPAD_JOB_BRANCH_PREFIX);
     const worktreePath = yield* Effect.gen(function* () {
       yield* gitWorkflow.fetchRemote({ cwd: workspaceRoot, remoteName: "origin" });
       const remoteBase = yield* gitWorkflow.resolveRemoteTrackingCommit({

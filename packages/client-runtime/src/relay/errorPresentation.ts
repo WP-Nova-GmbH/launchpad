@@ -71,14 +71,28 @@ export function relayProtectedErrorMessage(error: RelayProtectedError): string {
     case "RelayMachineEnrollUnavailableError":
       return `Relay cannot provision the machine's managed endpoint (${error.reason}).`;
     case "RelayMachineComputeUnavailableError":
+      if (error.reason === "retired")
+        return "Managed machine provisioning has been replaced by thread VMs. Existing managed compute requires cleanup on its original host.";
       return error.reason === "not_configured"
         ? "Relay has no machine compute provider configured."
         : "Relay could not reach the machine compute provider.";
     case "RelayTenancyForbiddenError":
       return `Relay refused the organization change (${error.reason}).`;
     case "RelayTenancyNotFoundError":
+      if (error.reason === "thread_not_found")
+        return "This thread is unavailable or you no longer have access.";
       return `Relay could not find the organization record (${error.reason}).`;
     case "RelayTenancyConflictError":
+      if (error.reason === "thread_deletion_conflict")
+        return "Deletion cannot start while another VM operation is being confirmed. Wait for it to finish or cancel it, then retry.";
+      if (error.reason === "thread_placement_changed")
+        return "The thread location changed or is moving. Refresh its location before retrying.";
+      if (error.reason === "thread_vm_move_required")
+        return "Start a thread locally, then move it to a private VM to upload its workspace.";
+      if (error.reason === "thread_command_conflict")
+        return "This request conflicts with an existing thread command. Refresh the thread before retrying.";
+      if (error.reason === "vm_policy_changed")
+        return "VM settings changed elsewhere. Reload them before saving.";
       return `Relay refused the organization change because it conflicts with existing state (${error.reason}).`;
     case "RelayTenancyInvalidError":
       return `Relay refused the organization record as invalid (${error.reason}).`;

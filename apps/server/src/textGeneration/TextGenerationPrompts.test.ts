@@ -5,7 +5,34 @@ import {
   buildCommitMessagePrompt,
   buildPrContentPrompt,
   buildThreadTitlePrompt,
+  buildApprovalVerdictPrompt,
 } from "./TextGenerationPrompts.ts";
+
+describe("workflow approval context", () => {
+  it("preserves both maximum-length task sections and the review constraint in the model prompt", () => {
+    const stepInstruction = "STEP_END_123".padStart(32_000, "s");
+    const jobContext = "JOB_END_4567".padStart(32_000, "j");
+    const reviewConstraint = "Keep changes local and require human review.";
+    const { prompt } = buildApprovalVerdictPrompt({
+      toolKind: "command",
+      requestType: "command_execution_approval",
+      requestDetail: "run tests",
+      stepInstruction,
+      jobContext,
+      reviewConstraint,
+    });
+    expect(prompt).toContain(stepInstruction);
+    expect(prompt).toContain(jobContext);
+    expect(prompt).toContain(reviewConstraint);
+    expect(
+      buildApprovalVerdictPrompt({
+        toolKind: "command",
+        requestType: "command_execution_approval",
+        stepInstruction,
+      }).prompt,
+    ).not.toContain("STEP_END_123");
+  });
+});
 import {
   normalizeCliError,
   sanitizeThreadTitle,

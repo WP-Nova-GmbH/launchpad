@@ -15,6 +15,7 @@ export function SettingsRow(props: {
   readonly icon: SymbolName;
   readonly label: string;
   readonly value?: string;
+  readonly subtitle?: string;
   readonly valuePosition?: "below" | "trailing";
   readonly target?: SettingsSheetTarget;
   readonly fullScreenTarget?: SettingsLegalDocumentTarget;
@@ -26,12 +27,14 @@ export function SettingsRow(props: {
       <MaterialListRow
         className="bg-grouped-card"
         title={props.label}
-        subtitle={props.valuePosition === "trailing" ? undefined : props.value}
-        accessibilityLabel={[props.label, props.value].filter(Boolean).join(", ")}
+        subtitle={props.subtitle ?? (props.valuePosition === "trailing" ? undefined : props.value)}
+        accessibilityLabel={[props.label, props.subtitle, props.value].filter(Boolean).join(", ")}
         trailing={
           props.valuePosition === "trailing" && props.value ? (
-            <View className="flex-row items-center gap-3">
-              <Text className="text-sm text-foreground-muted">{props.value}</Text>
+            <View
+              className={cn("flex-row items-center gap-3", props.subtitle && "max-w-[40%] shrink")}
+            >
+              <Text className="shrink text-sm text-foreground-muted">{props.value}</Text>
               <SymbolView name="chevron.right" size={16} tintColorClassName="accent-chevron" />
             </View>
           ) : undefined
@@ -68,15 +71,22 @@ export function SettingsRow(props: {
         weight="regular"
       />
       <>
-        <Text className="shrink-0 text-lg text-foreground" numberOfLines={1}>
-          {props.label}
-        </Text>
-        <View className="min-w-0 flex-1 items-end">
+        {props.subtitle ? (
+          <View className="min-w-0 flex-1 gap-1">
+            <Text className="text-base font-t3-medium text-foreground">{props.label}</Text>
+            <Text className="text-sm text-foreground-muted">{props.subtitle}</Text>
+          </View>
+        ) : (
+          <Text className="shrink-0 text-lg text-foreground" numberOfLines={1}>
+            {props.label}
+          </Text>
+        )}
+        <View className={cn("min-w-0 items-end", props.subtitle ? "max-w-[40%] shrink" : "flex-1")}>
           {props.value ? (
             <Text
               className="max-w-[180px] text-right text-base text-foreground-muted"
               ellipsizeMode="middle"
-              numberOfLines={1}
+              numberOfLines={props.subtitle ? undefined : 1}
             >
               {props.value}
             </Text>
@@ -97,7 +107,7 @@ export function SettingsRow(props: {
   if (target) {
     return (
       <Pressable
-        accessibilityLabel={props.label}
+        accessibilityLabel={[props.label, props.subtitle, props.value].filter(Boolean).join(", ")}
         accessibilityRole="button"
         disabled={props.disabled}
         onPress={() =>
@@ -116,7 +126,7 @@ export function SettingsRow(props: {
   if (fullScreenTarget) {
     return (
       <Pressable
-        accessibilityLabel={props.label}
+        accessibilityLabel={[props.label, props.subtitle, props.value].filter(Boolean).join(", ")}
         accessibilityRole="button"
         disabled={props.disabled}
         onPress={() => navigation.navigate(fullScreenTarget)}
@@ -128,7 +138,7 @@ export function SettingsRow(props: {
 
   return (
     <Pressable
-      accessibilityLabel={props.label}
+      accessibilityLabel={[props.label, props.subtitle, props.value].filter(Boolean).join(", ")}
       accessibilityRole="button"
       disabled={props.disabled}
       onPress={props.onPress}

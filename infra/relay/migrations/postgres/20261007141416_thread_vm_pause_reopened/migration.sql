@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_pauses" ADD COLUMN "source_reopened_at" timestamp with time zone;

@@ -413,6 +413,22 @@ export function projectEvent(
         })),
       );
 
+    case "thread.placement-imported":
+      return Effect.succeed({
+        ...nextBase,
+        threads: nextBase.threads.map((thread) =>
+          thread.id === event.payload.threadId
+            ? {
+                ...thread,
+                projectId: event.payload.projectId,
+                branch: event.payload.branch,
+                worktreePath: event.payload.worktreePath,
+                updatedAt: event.payload.updatedAt,
+              }
+            : thread,
+        ),
+      });
+
     case "thread.created":
       return Effect.gen(function* () {
         const payload = yield* decodeForEvent(
@@ -803,6 +819,9 @@ export function projectEvent(
             turnId: payload.turnId,
             streaming: payload.streaming,
             ...(payload.author !== undefined ? { author: payload.author } : {}),
+            ...(payload.workflowOrigin !== undefined
+              ? { workflowOrigin: payload.workflowOrigin }
+              : {}),
             ...(payload.editedBy !== undefined ? { editedBy: payload.editedBy } : {}),
             ...(payload.steeredBy !== undefined ? { steeredBy: payload.steeredBy } : {}),
             createdAt: payload.createdAt,
@@ -831,6 +850,7 @@ export function projectEvent(
                       : {}),
                     ...(message.context !== undefined ? { context: message.context } : {}),
                     ...(message.author ? { author: message.author } : {}),
+                    ...(message.workflowOrigin ? { workflowOrigin: message.workflowOrigin } : {}),
                     ...(message.editedBy ? { editedBy: message.editedBy } : {}),
                     ...(message.steeredBy ? { steeredBy: message.steeredBy } : {}),
                   }

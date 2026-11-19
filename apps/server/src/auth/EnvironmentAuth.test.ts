@@ -374,17 +374,39 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
   it.effect("inherits a constrained pairing grant when token exchange omits scope", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-      const pairingCredential = yield* serverAuth.issuePairingCredential({
-        scopes: ["orchestration:read"],
-      });
+      const sessions = yield* SessionStore.SessionStore;
+      const proof = { proofKeyThumbprint: "test-reviewer-proof-key" };
+      const issueGrant = () =>
+        serverAuth.createPairingLink({
+          subject: "cloud-connect",
+          scopes: ["orchestration:read"],
+          ...proof,
+        });
+      const grant = yield* issueGrant();
 
       const token = yield* serverAuth.exchangeBootstrapCredentialForAccessToken(
-        pairingCredential.credential,
+        grant.credential,
         undefined,
         requestMetadata,
+        proof,
       );
 
+      expect(token.token_type).toBe("DPoP");
       expect(token.scope).toBe("orchestration:read");
+      expect(yield* sessions.verify(token.access_token)).toMatchObject({
+        scopes: ["orchestration:read"],
+        ...proof,
+      });
+      const secondGrant = yield* issueGrant();
+      const denied = yield* Effect.flip(
+        serverAuth.exchangeBootstrapCredentialForAccessToken(
+          secondGrant.credential,
+          ["orchestration:read", "orchestration:operate"],
+          requestMetadata,
+          proof,
+        ),
+      );
+      expect(denied._tag).toBe("ServerAuthScopeNotGrantedError");
     }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
   );
 

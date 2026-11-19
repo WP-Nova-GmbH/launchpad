@@ -1,0 +1,22 @@
+[Unit]
+Description=Report unused Launchpad VM snapshot layers
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/launchpad-e2b/snapshot-collector.json
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/launchpad-e2b/launchpad-snapshot-collector
+StandardInput=file:/etc/launchpad-e2b/snapshot-collector.json
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min
+KillMode=control-group
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes

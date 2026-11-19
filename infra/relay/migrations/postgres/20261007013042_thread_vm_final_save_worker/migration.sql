@@ -1,0 +1,2 @@
+ALTER TABLE "relay_thread_vm_final_saves" ADD COLUMN "physical_delete_started_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ADD CONSTRAINT "relay_thread_vm_final_saves_delete_started" CHECK ("physical_delete_started_at" IS NULL OR "phase" IN ('deleting','completed'));

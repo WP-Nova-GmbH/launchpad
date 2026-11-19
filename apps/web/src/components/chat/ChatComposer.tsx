@@ -1813,7 +1813,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const uploadableAttachments = [...composerImages, ...uploadableFiles];
     for (const attachment of uploadableAttachments) {
       // A needs-reattach file has no bytes to upload and no upload to verify.
-      if (attachment.type === "file" && composerFileNeedsReattach(attachment)) {
+      if (
+        attachment.type === "file" &&
+        composerFileNeedsReattach(attachment) &&
+        !attachment.recoveryUpload
+      ) {
         continue;
       }
       startAttachmentUpload({

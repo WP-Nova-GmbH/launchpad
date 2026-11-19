@@ -4,8 +4,10 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
+import type { RelayThreadVmGitMetadata } from "@t3tools/contracts/relay";
 
 import * as RelaySecretBox from "../auth/SecretBox.ts";
 import * as RelayConfiguration from "../Config.ts";
@@ -24,6 +26,37 @@ export interface GithubInstallationToken {
   /** ISO-8601, as GitHub reports it; tokens live about an hour. */
   readonly expiresAt: string;
 }
+
+const repositoryPermissions = {
+  read: { contents: "read" },
+  "workflow-push": { contents: "write" },
+  "workflow-pr": { contents: "read", pull_requests: "write" },
+  "workflow-publish": { contents: "write", pull_requests: "write" },
+  "workflow-read-pr": { contents: "read", pull_requests: "read" },
+} as const;
+type RepositoryAccess = keyof typeof repositoryPermissions;
+type RepositoryPermissions = (typeof repositoryPermissions)[RepositoryAccess];
+type RepositoryScope = { readonly installationId: string; readonly canonicalKey: string };
+
+export type GithubWorkflowPublicationTarget =
+  | { readonly kind: "branch"; readonly branch: string }
+  | { readonly kind: "pull_request"; readonly branch: string; readonly number?: number };
+
+export interface GithubWorkflowPullRequest {
+  readonly number: number;
+  readonly url: string;
+  readonly headBranch: string;
+  readonly headRepository: string;
+  readonly headSha: string;
+  readonly baseBranch: string;
+  readonly baseRepository: string;
+  readonly state: "open" | "closed" | "merged";
+  readonly body: string;
+}
+
+export type GithubWorkflowPublicationObservation =
+  | { readonly kind: "branch"; readonly sha: string }
+  | { readonly kind: "pull_request"; readonly pullRequests: readonly GithubWorkflowPullRequest[] };
 
 export interface GithubRepository {
   readonly fullName: string;
@@ -47,12 +80,18 @@ export class GithubRequestFailed extends Schema.TaggedError<GithubRequestFailed>
   "GithubRequestFailed",
   {
     operation: Schema.Literals([
+      "sign-app-token",
       "read-app",
       "read-installation",
       "mint-token",
       "list-repositories",
+      "read-repository",
+      "read-branch",
+      "read-pull-request",
     ]),
     status: Schema.optionalKey(Schema.Number),
+    rateLimited: Schema.optionalKey(Schema.Boolean),
+    permissionDenied: Schema.optionalKey(Schema.Boolean),
     cause: Schema.Defect(),
   },
 ) {
@@ -85,6 +124,26 @@ export class GithubApp extends Context.Service<
     readonly mintInstallationToken: (input: {
       readonly installationId: string;
     }) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
+    /** A VM may borrow access to exactly one bound repository, never the installation. */
+    readonly mintRepositoryToken: (
+      input: RepositoryScope & { readonly access?: RepositoryAccess },
+    ) => Effect.Effect<GithubInstallationToken, GithubAppNotConfigured | GithubRequestFailed>;
+    readonly observeWorkflowPublication: (
+      input: RepositoryScope & { readonly target: GithubWorkflowPublicationTarget },
+    ) => Effect.Effect<
+      GithubWorkflowPublicationObservation,
+      GithubAppNotConfigured | GithubRequestFailed
+    >;
+    readonly resolveRepositoryBranch: (input: {
+      readonly installationId: string;
+      readonly canonicalKey: string;
+      readonly baseBranch: string | null;
+    }) => Effect.Effect<
+      { readonly branch: string; readonly commitSha: string },
+      GithubAppNotConfigured | GithubRequestFailed
+    >;
+    /** Public bot authorship only; unavailable metadata never prevents importing a repository. */
+    readonly gitMetadata: Effect.Effect<RelayThreadVmGitMetadata>;
     /** Every account the App is installed on, as GitHub reports it. */
     readonly listInstallations: Effect.Effect<
       ReadonlyArray<GithubInstallationAccount>,
@@ -126,6 +185,56 @@ function toInstallationAccount(raw: unknown): GithubInstallationAccount | null {
 }
 
 const GITHUB_API = "https://api.github.com";
+const decodeRepositoryToken = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    token: Schema.String.check(Schema.isMinLength(1)),
+    expires_at: Schema.String,
+    repositories: Schema.Array(Schema.Struct({ full_name: Schema.String })),
+    permissions: Schema.optionalKey(Schema.Unknown),
+  }),
+);
+const isPermissions = Schema.is(Schema.Record(Schema.String, Schema.String));
+const gitCommitSha = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/));
+const decodeDefaultBranch = Schema.decodeUnknownEffect(
+  Schema.Struct({ default_branch: Schema.String.check(Schema.isMinLength(1)) }),
+);
+const decodeBranchRef = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    ref: Schema.String,
+    object: Schema.Struct({
+      type: Schema.Literal("commit"),
+      sha: gitCommitSha,
+    }),
+  }),
+);
+const pullRequestRepository = Schema.Struct({ full_name: Schema.String });
+const workflowPullRequest = Schema.Struct({
+  number: Schema.Int.check(Schema.isGreaterThan(0)),
+  state: Schema.Literals(["open", "closed"]),
+  merged_at: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  body: Schema.NullOr(Schema.String),
+  head: Schema.Struct({
+    ref: Schema.String,
+    sha: gitCommitSha,
+    repo: pullRequestRepository,
+  }),
+  base: Schema.Struct({ ref: Schema.String, repo: pullRequestRepository }),
+});
+const decodeWorkflowPullRequest = Schema.decodeUnknownEffect(workflowPullRequest);
+const decodeWorkflowPullRequests = Schema.decodeUnknownEffect(Schema.Array(workflowPullRequest));
+const decodeApp = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    id: Schema.Int.check(Schema.isGreaterThan(0)),
+    slug: Schema.String.check(Schema.isPattern(/^[a-zA-Z0-9-]+$/)),
+  }),
+);
+const decodeBot = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    id: Schema.Int.check(Schema.isGreaterThan(0)),
+    login: Schema.String,
+    type: Schema.Literal("Bot"),
+  }),
+);
 
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -205,245 +314,629 @@ const appJwt = Effect.fn("relay.github.app_jwt")(function* (input: {
         new TextEncoder().encode(signingInput),
       ),
     );
-  }).pipe(Effect.mapError((cause) => new GithubRequestFailed({ operation: "mint-token", cause })));
+  }).pipe(
+    Effect.mapError((cause) => new GithubRequestFailed({ operation: "sign-app-token", cause })),
+  );
   return `${signingInput}.${base64Url(signature)}`;
 });
 
-export const make = Effect.gen(function* () {
-  const config = yield* RelayConfiguration.RelayConfiguration;
-  const httpClient = yield* HttpClient.HttpClient;
-  const records = yield* GithubAppRecords.GithubAppRecords;
-  const secretBox = yield* RelaySecretBox.RelaySecretBox;
+export const make = () => {
+  // Share only public metadata across request-scoped layer builds, never their services or credentials.
+  let gitCache:
+    | {
+        relayIssuer: string;
+        appId: string;
+        configuredSlug: string;
+        expiresAt: number;
+        metadata: RelayThreadVmGitMetadata;
+      }
+    | undefined;
+  return Effect.gen(function* () {
+    const config = yield* RelayConfiguration.RelayConfiguration;
+    const httpClient = yield* HttpClient.HttpClient;
+    const records = yield* GithubAppRecords.GithubAppRecords;
+    const secretBox = yield* RelaySecretBox.RelaySecretBox;
 
-  // Configuration wins; an App created from Organization settings is what a
-  // relay without one falls back to. Read per use rather than cached, so the
-  // App becomes usable the moment its record lands.
-  const unreadable = (cause: unknown) => new GithubRequestFailed({ operation: "read-app", cause });
-  const storedCredentials: Effect.Effect<
-    RelayConfiguration.GithubAppCredentials,
-    GithubAppNotConfigured | GithubRequestFailed
-  > = records.get.pipe(
-    Effect.mapError(unreadable),
-    Effect.flatMap(
-      (
-        record,
-      ): Effect.Effect<
-        RelayConfiguration.GithubAppCredentials,
-        GithubAppNotConfigured | GithubRequestFailed
-      > =>
-        record === null
-          ? Effect.fail(new GithubAppNotConfigured())
-          : secretBox.open(record.privateKeySealed).pipe(
-              Effect.mapError(unreadable),
-              Effect.map((pem) => ({
-                appId: record.appId,
-                appSlug: record.appSlug,
-                privateKey: Redacted.make(pem),
-              })),
-            ),
-    ),
-  );
-  const credentials: Effect.Effect<
-    RelayConfiguration.GithubAppCredentials,
-    GithubAppNotConfigured | GithubRequestFailed
-  > = Effect.suspend(() => (config.github ? Effect.succeed(config.github) : storedCredentials));
-
-  const request = Effect.fn("relay.github.request")(function* (input: {
-    readonly path: string;
-    readonly method?: "GET" | "POST";
-    readonly token: string;
-    readonly operation: GithubRequestFailed["operation"];
-  }) {
-    const httpRequest = (input.method === "POST" ? HttpClientRequest.post : HttpClientRequest.get)(
-      `${GITHUB_API}${input.path}`,
-    ).pipe(
-      HttpClientRequest.setHeaders({
-        authorization: `Bearer ${input.token}`,
-        accept: "application/vnd.github+json",
-        "user-agent": "t3code-relay",
-        "x-github-api-version": "2022-11-28",
-      }),
+    // Configuration wins; an App created from Organization settings is what a
+    // relay without one falls back to. Read per use rather than cached, so the
+    // App becomes usable the moment its record lands.
+    const unreadable = (cause: unknown) =>
+      new GithubRequestFailed({ operation: "read-app", cause });
+    const storedCredentials: Effect.Effect<
+      RelayConfiguration.GithubAppCredentials,
+      GithubAppNotConfigured | GithubRequestFailed
+    > = records.get.pipe(
+      Effect.mapError(unreadable),
+      Effect.flatMap(
+        (
+          record,
+        ): Effect.Effect<
+          RelayConfiguration.GithubAppCredentials,
+          GithubAppNotConfigured | GithubRequestFailed
+        > =>
+          record === null
+            ? Effect.fail(new GithubAppNotConfigured())
+            : secretBox.open(record.privateKeySealed).pipe(
+                Effect.mapError(unreadable),
+                Effect.map((pem) => ({
+                  appId: record.appId,
+                  appSlug: record.appSlug,
+                  privateKey: Redacted.make(pem),
+                })),
+              ),
+      ),
     );
-    const response = yield* httpClient
-      .execute(httpRequest)
-      .pipe(
-        Effect.mapError((cause) => new GithubRequestFailed({ operation: input.operation, cause })),
+    const credentials: Effect.Effect<
+      RelayConfiguration.GithubAppCredentials,
+      GithubAppNotConfigured | GithubRequestFailed
+    > = Effect.suspend(() => (config.github ? Effect.succeed(config.github) : storedCredentials));
+
+    const request = Effect.fn("relay.github.request")(function* (input: {
+      readonly path: string;
+      readonly method?: "GET" | "POST";
+      readonly token?: string;
+      readonly operation: GithubRequestFailed["operation"];
+      readonly body?: {
+        readonly repositories: ReadonlyArray<string>;
+        readonly permissions?: RepositoryPermissions;
+      };
+      readonly rejectRedirects?: boolean;
+    }) {
+      let httpRequest = (input.method === "POST" ? HttpClientRequest.post : HttpClientRequest.get)(
+        `${GITHUB_API}${input.path}`,
+      ).pipe(
+        HttpClientRequest.setHeaders({
+          ...(input.token === undefined ? {} : { authorization: `Bearer ${input.token}` }),
+          accept: "application/vnd.github+json",
+          "user-agent": "t3code-relay",
+          "x-github-api-version": "2022-11-28",
+        }),
       );
-    if (response.status >= 400) {
-      return yield* new GithubRequestFailed({
-        operation: input.operation,
-        status: response.status,
-        cause: `GitHub responded ${response.status}`,
-      });
-    }
-    return yield* response.json.pipe(
-      Effect.mapError(
-        (cause) =>
-          new GithubRequestFailed({
-            operation: input.operation,
-            status: response.status,
-            cause,
-          }),
-      ),
-    );
-  });
-
-  const installationToken = Effect.fn("relay.github.installation_token")(function* (input: {
-    readonly installationId: string;
-  }) {
-    const app = yield* credentials;
-    const jwt = yield* appJwt({
-      appId: app.appId,
-      privateKeyPem: Redacted.value(app.privateKey),
-    });
-    const body = yield* request({
-      path: `/app/installations/${input.installationId}/access_tokens`,
-      method: "POST",
-      token: jwt,
-      operation: "mint-token",
-    });
-    const parsed = body as { readonly token?: string; readonly expires_at?: string };
-    if (!parsed.token) {
-      return yield* new GithubRequestFailed({
-        operation: "mint-token",
-        cause: "GitHub returned no token",
-      });
-    }
-    // Deliberately returned, never stored: it expires within the hour and the
-    // relay can always mint another.
-    const expiresAt =
-      parsed.expires_at ?? DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 1 }));
-    return { token: parsed.token, expiresAt } satisfies GithubInstallationToken;
-  });
-
-  return GithubApp.of({
-    installUrl: credentials.pipe(
-      Effect.map((app) => `https://github.com/apps/${app.appSlug}/installations/new`),
-      Effect.catchTag("GithubAppNotConfigured", () => Effect.succeed(null)),
-      Effect.catchTag("GithubRequestFailed", (error) =>
-        Effect.logWarning("github app record unreadable", { cause: error.cause }).pipe(
-          Effect.as(null),
+      if (input.body) {
+        httpRequest = yield* HttpClientRequest.bodyJson(input.body)(httpRequest).pipe(
+          Effect.mapError(
+            () =>
+              new GithubRequestFailed({
+                operation: input.operation,
+                cause: "Invalid request body",
+              }),
+          ),
+        );
+      }
+      const execute = httpClient.execute(httpRequest);
+      const response = yield* (
+        input.rejectRedirects
+          ? execute.pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }))
+          : execute
+      ).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GithubRequestFailed({
+              operation: input.operation,
+              cause: input.rejectRedirects ? "Could not reach GitHub" : cause,
+            }),
         ),
-      ),
-    ),
+      );
+      if (response.status >= 400 || (input.rejectRedirects && response.status >= 300)) {
+        const rateLimited =
+          response.status === 429 ||
+          (response.status === 403 &&
+            (response.headers["retry-after"] !== undefined ||
+              response.headers["x-ratelimit-remaining"] === "0"));
+        const permissionDenied =
+          input.operation === "mint-token" &&
+          input.body?.permissions !== undefined &&
+          (response.status === 403 || response.status === 422) &&
+          !rateLimited &&
+          (yield* response.json.pipe(
+            Effect.map(
+              (body) =>
+                typeof body === "object" &&
+                body !== null &&
+                "message" in body &&
+                typeof body.message === "string" &&
+                /permissions requested are not granted/u.test(body.message.toLowerCase()),
+            ),
+            Effect.orElseSucceed(() => false),
+          ));
+        return yield* new GithubRequestFailed({
+          operation: input.operation,
+          status: response.status,
+          ...(rateLimited ? { rateLimited: true } : {}),
+          ...(permissionDenied ? { permissionDenied: true } : {}),
+          cause: `GitHub responded ${response.status}`,
+        });
+      }
+      return yield* response.json.pipe(
+        Effect.mapError(
+          (cause) =>
+            new GithubRequestFailed({
+              operation: input.operation,
+              status: response.status,
+              cause: input.rejectRedirects ? "Invalid GitHub response" : cause,
+            }),
+        ),
+      );
+    });
 
-    getInstallation: Effect.fn("relay.github.get_installation")(function* (input) {
+    const installationToken = Effect.fn("relay.github.installation_token")(function* (input: {
+      readonly installationId: string;
+    }) {
       const app = yield* credentials;
       const jwt = yield* appJwt({
         appId: app.appId,
         privateKeyPem: Redacted.value(app.privateKey),
       });
       const body = yield* request({
-        path: `/app/installations/${input.installationId}`,
+        path: `/app/installations/${input.installationId}/access_tokens`,
+        method: "POST",
         token: jwt,
-        operation: "read-installation",
+        operation: "mint-token",
+      });
+      const parsed = body as { readonly token?: string; readonly expires_at?: string };
+      if (!parsed.token) {
+        return yield* new GithubRequestFailed({
+          operation: "mint-token",
+          cause: "GitHub returned no token",
+        });
+      }
+      // Deliberately returned, never stored: it expires within the hour and the
+      // relay can always mint another.
+      const expiresAt =
+        parsed.expires_at ?? DateTime.formatIso(DateTime.add(yield* DateTime.now, { hours: 1 }));
+      return { token: parsed.token, expiresAt } satisfies GithubInstallationToken;
+    });
+
+    const readExactRepositoryBranch = Effect.fnUntraced(function* (
+      repositoryPath: string,
+      branch: string,
+      token: string,
+    ) {
+      const branchPath = yield* Effect.try({
+        try: () =>
+          branch
+            .split("/")
+            .map((part) => {
+              if (!part || part === "." || part === "..") throw new Error("Invalid branch segment");
+              return encodeURIComponent(part);
+            })
+            .join("/"),
+        catch: () =>
+          new GithubRequestFailed({ operation: "read-branch", cause: "Invalid branch name" }),
+      });
+      const resolved = yield* request({
+        path: `${repositoryPath}/git/ref/heads/${branchPath}`,
+        token,
+        operation: "read-branch",
+        rejectRedirects: true,
       }).pipe(
-        // A missing installation is an answer, not a fault.
-        Effect.catchIf(
-          (error) => error.status === 404,
-          () => Effect.succeed(null),
+        Effect.flatMap(decodeBranchRef),
+        Effect.catchTag(
+          "SchemaError",
+          () =>
+            new GithubRequestFailed({
+              operation: "read-branch",
+              cause: "Invalid GitHub branch reference",
+            }),
         ),
       );
-      if (body === null) {
-        return null;
-      }
-      const parsed = body as {
-        readonly id?: number;
-        readonly created_at?: string;
-        readonly account?: { readonly login?: string; readonly type?: string };
-      };
-      if (!parsed.id || !parsed.account?.login) {
-        return null;
-      }
-      return {
-        installationId: String(parsed.id),
-        accountLogin: parsed.account.login,
-        accountType: parsed.account.type ?? "Organization",
-        createdAt: parsed.created_at ?? "",
-      };
-    }),
+      if (resolved.ref !== `refs/heads/${branch}`)
+        return yield* new GithubRequestFailed({
+          operation: "read-branch",
+          cause: "GitHub returned a different branch reference",
+        });
+      return resolved.object.sha;
+    });
 
-    mintInstallationToken: installationToken,
-
-    listInstallations: Effect.gen(function* () {
-      const app = yield* credentials;
-      const jwt = yield* appJwt({
+    // Leave time for the second App read even when GitHub hangs; the binding has a seven-second budget.
+    const activeApp = credentials.pipe(
+      Effect.catchTags({
+        GithubAppNotConfigured: () => Effect.succeed(null),
+        GithubRequestFailed: () => Effect.succeed(undefined),
+      }),
+      Effect.timeoutOrElse({ duration: "2 seconds", orElse: () => Effect.void }),
+    );
+    const gitMetadata = Effect.gen(function* () {
+      const app = yield* activeApp;
+      if (app === null) {
+        if (gitCache?.relayIssuer === config.relayIssuer) gitCache = undefined;
+        return { status: "unconfigured" } as const;
+      }
+      if (app === undefined) return { status: "unknown" } as const;
+      const now = (yield* DateTime.now).epochMilliseconds;
+      let metadata: RelayThreadVmGitMetadata;
+      let expiresAt: number;
+      if (
+        gitCache?.relayIssuer === config.relayIssuer &&
+        gitCache.appId === app.appId &&
+        gitCache.configuredSlug === app.appSlug &&
+        gitCache.expiresAt > now
+      ) {
+        metadata = gitCache.metadata;
+        expiresAt = gitCache.expiresAt;
+      } else {
+        let appSlug: string | undefined;
+        metadata = yield* Effect.gen(function* () {
+          const jwt = yield* appJwt({
+            appId: app.appId,
+            privateKeyPem: Redacted.value(app.privateKey),
+          });
+          const raw = yield* request({ path: "/app", token: jwt, operation: "read-app" });
+          const actual = yield* decodeApp(raw);
+          if (String(actual.id) !== app.appId) return yield* Effect.fail("Mismatched App");
+          appSlug = actual.slug;
+          const name = `${appSlug}[bot]`;
+          const bot = yield* decodeBot(
+            yield* request({ path: `/users/${encodeURIComponent(name)}`, operation: "read-app" }),
+          );
+          if (bot.login !== name) return yield* Effect.fail("Mismatched bot");
+          return {
+            status: "ready",
+            appId: app.appId,
+            appSlug,
+            botUserId: bot.id,
+            name,
+            email: `${bot.id}+${name}@users.noreply.github.com`,
+          } as const;
+        }).pipe(
+          Effect.timeout("2 seconds"),
+          Effect.catch(() =>
+            Effect.succeed({
+              status: "pending" as const,
+              appId: app.appId,
+              ...(appSlug === undefined ? {} : { appSlug }),
+            }),
+          ),
+        );
+        expiresAt = now + (metadata.status === "ready" ? 300_000 : 30_000);
+      }
+      // Configuration/storage may change while GitHub responds. Never publish a stale App's bot.
+      const current = yield* activeApp;
+      if (current === null) {
+        if (gitCache?.relayIssuer === config.relayIssuer) gitCache = undefined;
+        return { status: "unconfigured" } as const;
+      }
+      if (current === undefined) {
+        // Keep an observed replacement/rename visible without accepting or caching an unconfirmed author.
+        return {
+          status: "pending",
+          appId: app.appId,
+          ...("appSlug" in metadata && metadata.appSlug !== undefined
+            ? { appSlug: metadata.appSlug }
+            : {}),
+        } as const;
+      }
+      if (current.appId !== app.appId || current.appSlug !== app.appSlug) {
+        return { status: "pending", appId: current.appId } as const;
+      }
+      gitCache = {
+        relayIssuer: config.relayIssuer,
         appId: app.appId,
-        privateKeyPem: Redacted.value(app.privateKey),
-      });
-      const collected: Array<GithubInstallationAccount> = [];
-      for (let page = 1; page <= 10; page += 1) {
+        configuredSlug: app.appSlug,
+        expiresAt,
+        metadata,
+      };
+      return metadata;
+    });
+
+    const github: GithubApp["Service"] = GithubApp.of({
+      gitMetadata,
+      installUrl: credentials.pipe(
+        Effect.map((app) => `https://github.com/apps/${app.appSlug}/installations/new`),
+        Effect.catchTag("GithubAppNotConfigured", () => Effect.succeed(null)),
+        Effect.catchTag("GithubRequestFailed", (error) =>
+          Effect.logWarning("github app record unreadable", { cause: error.cause }).pipe(
+            Effect.as(null),
+          ),
+        ),
+      ),
+
+      getInstallation: Effect.fn("relay.github.get_installation")(function* (input) {
+        const app = yield* credentials;
+        const jwt = yield* appJwt({
+          appId: app.appId,
+          privateKeyPem: Redacted.value(app.privateKey),
+        });
         const body = yield* request({
-          path: `/app/installations?per_page=100&page=${page}`,
+          path: `/app/installations/${input.installationId}`,
           token: jwt,
           operation: "read-installation",
-        });
-        const rows = Array.isArray(body) ? (body as ReadonlyArray<unknown>) : [];
-        for (const row of rows) {
-          const account = toInstallationAccount(row);
-          if (account) collected.push(account);
+        }).pipe(
+          // A missing installation is an answer, not a fault.
+          Effect.catchIf(
+            (error) => error.status === 404,
+            () => Effect.succeed(null),
+          ),
+        );
+        if (body === null) {
+          return null;
         }
-        if (rows.length < 100) break;
-      }
-      return collected;
-    }).pipe(Effect.withSpan("relay.github.list_installations")),
-
-    describe: Effect.fn("relay.github.describe")(function* (input) {
-      const jwt = yield* appJwt({ appId: input.appId, privateKeyPem: input.privateKey });
-      const body = yield* request({ path: "/app", token: jwt, operation: "read-app" });
-      const parsed = body as {
-        readonly id?: number;
-        readonly slug?: string;
-        readonly name?: string;
-      };
-      if (!parsed.id || !parsed.slug || String(parsed.id) !== input.appId) {
-        return yield* new GithubRequestFailed({
-          operation: "read-app",
-          cause: "GitHub answered for a different App, or none",
-        });
-      }
-      return { appId: String(parsed.id), appSlug: parsed.slug, name: parsed.name ?? parsed.slug };
-    }),
-
-    listRepositories: Effect.fn("relay.github.list_repositories")(function* (input) {
-      const { token } = yield* installationToken({ installationId: input.installationId });
-      const collected: Array<GithubRepository> = [];
-      for (let page = 1; page <= 10; page += 1) {
-        const body = yield* request({
-          path: `/installation/repositories?per_page=100&page=${page}`,
-          token,
-          operation: "list-repositories",
-        });
-        const repositories = (
-          body as {
-            readonly repositories?: ReadonlyArray<{
-              readonly full_name?: string;
-              readonly name?: string;
-              readonly default_branch?: string;
-              readonly private?: boolean;
-            }>;
-          }
-        ).repositories;
-        if (!repositories || repositories.length === 0) {
-          break;
+        const parsed = body as {
+          readonly id?: number;
+          readonly created_at?: string;
+          readonly account?: { readonly login?: string; readonly type?: string };
+        };
+        if (!parsed.id || !parsed.account?.login) {
+          return null;
         }
-        for (const repository of repositories) {
-          if (!repository.full_name || !repository.name) continue;
-          collected.push({
-            fullName: repository.full_name,
-            name: repository.name,
-            defaultBranch: repository.default_branch ?? "main",
-            isPrivate: repository.private ?? false,
-            // Matches what `normalizeGitRemoteUrl` derives from a checkout's
-            // remote, so a registered key recognises the clone (ADR-0006).
-            canonicalKey: `github.com/${repository.full_name}`.toLowerCase(),
+        return {
+          installationId: String(parsed.id),
+          accountLogin: parsed.account.login,
+          accountType: parsed.account.type ?? "Organization",
+          createdAt: parsed.created_at ?? "",
+        };
+      }),
+
+      mintInstallationToken: installationToken,
+
+      mintRepositoryToken: Effect.fn("relay.github.repository_token")(function* (input) {
+        const match = /^github\.com\/([a-zA-Z0-9-]+)\/([a-zA-Z0-9_.-]+)$/.exec(input.canonicalKey);
+        const repository = match?.[2];
+        if (
+          !repository ||
+          repository === "." ||
+          repository === ".." ||
+          !/^[1-9][0-9]*$/.test(input.installationId) ||
+          (input.access !== undefined && !Object.hasOwn(repositoryPermissions, input.access))
+        ) {
+          return yield* new GithubRequestFailed({
+            operation: "mint-token",
+            cause: "Invalid repository scope",
           });
         }
-        if (repositories.length < 100) break;
-      }
-      return collected;
-    }),
-  });
-});
+        const permissions =
+          input.access === undefined ? undefined : repositoryPermissions[input.access];
+        const app = yield* credentials;
+        const jwt = yield* appJwt({
+          appId: app.appId,
+          privateKeyPem: Redacted.value(app.privateKey),
+        });
+        const body = yield* request({
+          path: `/app/installations/${input.installationId}/access_tokens`,
+          method: "POST",
+          token: jwt,
+          operation: "mint-token",
+          body: {
+            repositories: [repository],
+            ...(permissions === undefined ? {} : { permissions }),
+          },
+          rejectRedirects: permissions !== undefined,
+        });
+        if ((yield* credentials).appId !== app.appId) {
+          return yield* new GithubRequestFailed({
+            operation: "mint-token",
+            cause: "The configured App changed while minting repository access",
+          });
+        }
+        // A missing or unexpected scope must never become an installation-wide fallback.
+        // Discard decoder diagnostics: the upstream body contains the bearer token.
+        const parsed = yield* decodeRepositoryToken(body).pipe(
+          Effect.mapError(
+            () =>
+              new GithubRequestFailed({
+                operation: "mint-token",
+                cause: "Invalid scoped token response",
+              }),
+          ),
+        );
+        if (
+          parsed.repositories.length !== 1 ||
+          `github.com/${parsed.repositories[0]?.full_name}`.toLowerCase() !==
+            input.canonicalKey.toLowerCase() ||
+          !Number.isFinite(Date.parse(parsed.expires_at)) ||
+          Date.parse(parsed.expires_at) <= (yield* DateTime.now).epochMilliseconds
+        ) {
+          return yield* new GithubRequestFailed({
+            operation: "mint-token",
+            cause: "Unexpected repository token scope or expiry",
+          });
+        }
+        if (permissions !== undefined) {
+          const granted = parsed.permissions;
+          const requested: Readonly<Record<string, string>> = permissions;
+          if (!isPermissions(granted))
+            return yield* new GithubRequestFailed({
+              operation: "mint-token",
+              cause: "Missing scoped token permissions",
+            });
+          const missing = Object.entries(requested).some(
+            ([key, level]) =>
+              granted[key] === undefined || (level === "write" && granted[key] === "read"),
+          );
+          if (
+            missing ||
+            Object.entries(granted).some(
+              ([key, level]) => level !== (key === "metadata" ? "read" : requested[key]),
+            )
+          )
+            return yield* new GithubRequestFailed({
+              operation: "mint-token",
+              ...(missing ? { permissionDenied: true } : {}),
+              cause: "Unexpected repository token permissions",
+            });
+        }
+        return { token: parsed.token, expiresAt: parsed.expires_at };
+      }),
 
-export const layer = Layer.effect(GithubApp, make);
+      resolveRepositoryBranch: Effect.fn("relay.github.resolve_repository_branch")(
+        function* (input) {
+          const { token } = yield* github.mintRepositoryToken({ ...input, access: "read" });
+          const repositoryPath = `/repos/${input.canonicalKey.slice("github.com/".length)}`;
+          const branch =
+            input.baseBranch ??
+            (yield* request({
+              path: repositoryPath,
+              token,
+              operation: "read-repository",
+              rejectRedirects: true,
+            }).pipe(
+              Effect.flatMap(decodeDefaultBranch),
+              Effect.catchTag(
+                "SchemaError",
+                () =>
+                  new GithubRequestFailed({
+                    operation: "read-repository",
+                    cause: "GitHub returned no default branch",
+                  }),
+              ),
+            )).default_branch;
+          return {
+            branch,
+            commitSha: yield* readExactRepositoryBranch(repositoryPath, branch, token),
+          };
+        },
+      ),
+
+      observeWorkflowPublication: Effect.fn("relay.github.observe_workflow_publication")(
+        function* ({ installationId, canonicalKey, target }) {
+          const repository = canonicalKey.slice("github.com/".length);
+          const repositoryPath = `/repos/${repository}`;
+          const { token } = yield* github.mintRepositoryToken({
+            installationId,
+            canonicalKey,
+            access: target.kind === "branch" ? "read" : "workflow-read-pr",
+          });
+          if (target.kind === "branch")
+            return {
+              kind: "branch",
+              sha: yield* readExactRepositoryBranch(repositoryPath, target.branch, token),
+            } as const;
+
+          const observationFailed = (cause: string) =>
+            new GithubRequestFailed({ operation: "read-pull-request", cause });
+          const { number } = target;
+          if (number !== undefined && (!Number.isSafeInteger(number) || number < 1))
+            return yield* observationFailed("Invalid pull request number");
+          const path =
+            number === undefined
+              ? `${repositoryPath}/pulls?${new URLSearchParams({
+                  head: `${repository.split("/")[0]}:${target.branch}`,
+                  state: "all",
+                  per_page: "20",
+                })}`
+              : `${repositoryPath}/pulls/${number}`;
+          const raw = yield* request({
+            path,
+            token,
+            operation: "read-pull-request",
+            rejectRedirects: true,
+          });
+          const pulls = yield* (
+            number === undefined
+              ? decodeWorkflowPullRequests(raw)
+              : decodeWorkflowPullRequest(raw).pipe(Effect.map((pull) => [pull]))
+          ).pipe(
+            Effect.mapError(() => observationFailed("Incomplete GitHub pull request evidence")),
+          );
+          if (pulls.length >= 20 || (number !== undefined && pulls[0]?.number !== number))
+            return yield* observationFailed("GitHub pull request evidence could not be confirmed");
+
+          const pullRequests: readonly GithubWorkflowPullRequest[] = pulls.map((pull) => ({
+            number: pull.number,
+            url: `https://${canonicalKey}/pull/${pull.number}`,
+            headBranch: pull.head.ref,
+            headRepository: pull.head.repo.full_name,
+            headSha: pull.head.sha,
+            baseBranch: pull.base.ref,
+            baseRepository: pull.base.repo.full_name,
+            state: pull.merged_at ? "merged" : pull.state,
+            body: pull.body ?? "",
+          }));
+          return { kind: "pull_request", pullRequests } as const;
+        },
+        Effect.timeoutOrElse({
+          duration: "6 seconds",
+          orElse: () =>
+            Effect.fail(
+              new GithubRequestFailed({
+                operation: "read-pull-request",
+                cause: "GitHub publication observation timed out",
+              }),
+            ),
+        }),
+      ),
+
+      listInstallations: Effect.gen(function* () {
+        const app = yield* credentials;
+        const jwt = yield* appJwt({
+          appId: app.appId,
+          privateKeyPem: Redacted.value(app.privateKey),
+        });
+        const collected: Array<GithubInstallationAccount> = [];
+        for (let page = 1; page <= 10; page += 1) {
+          const body = yield* request({
+            path: `/app/installations?per_page=100&page=${page}`,
+            token: jwt,
+            operation: "read-installation",
+          });
+          const rows = Array.isArray(body) ? (body as ReadonlyArray<unknown>) : [];
+          for (const row of rows) {
+            const account = toInstallationAccount(row);
+            if (account) collected.push(account);
+          }
+          if (rows.length < 100) break;
+        }
+        return collected;
+      }).pipe(Effect.withSpan("relay.github.list_installations")),
+
+      describe: Effect.fn("relay.github.describe")(function* (input) {
+        const jwt = yield* appJwt({ appId: input.appId, privateKeyPem: input.privateKey });
+        const body = yield* request({ path: "/app", token: jwt, operation: "read-app" });
+        const parsed = body as {
+          readonly id?: number;
+          readonly slug?: string;
+          readonly name?: string;
+        };
+        if (!parsed.id || !parsed.slug || String(parsed.id) !== input.appId) {
+          return yield* new GithubRequestFailed({
+            operation: "read-app",
+            cause: "GitHub answered for a different App, or none",
+          });
+        }
+        return { appId: String(parsed.id), appSlug: parsed.slug, name: parsed.name ?? parsed.slug };
+      }),
+
+      listRepositories: Effect.fn("relay.github.list_repositories")(function* (input) {
+        const { token } = yield* installationToken({ installationId: input.installationId });
+        const collected: Array<GithubRepository> = [];
+        for (let page = 1; page <= 10; page += 1) {
+          const body = yield* request({
+            path: `/installation/repositories?per_page=100&page=${page}`,
+            token,
+            operation: "list-repositories",
+          });
+          const repositories = (
+            body as {
+              readonly repositories?: ReadonlyArray<{
+                readonly full_name?: string;
+                readonly name?: string;
+                readonly default_branch?: string;
+                readonly private?: boolean;
+              }>;
+            }
+          ).repositories;
+          if (!repositories || repositories.length === 0) {
+            break;
+          }
+          for (const repository of repositories) {
+            if (!repository.full_name || !repository.name) continue;
+            collected.push({
+              fullName: repository.full_name,
+              name: repository.name,
+              defaultBranch: repository.default_branch ?? "main",
+              isPrivate: repository.private ?? false,
+              // Matches what `normalizeGitRemoteUrl` derives from a checkout's
+              // remote, so a registered key recognises the clone (ADR-0006).
+              canonicalKey: `github.com/${repository.full_name}`.toLowerCase(),
+            });
+          }
+          if (repositories.length < 100) break;
+        }
+        return collected;
+      }),
+    });
+    return github;
+  });
+};
+
+export const layer = Layer.effect(GithubApp, make());
