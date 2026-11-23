@@ -1264,6 +1264,7 @@ function WorkflowRepositoryView({
             vmExecutionAvailable={vmExecutionAvailable}
             codexRefreshVersion={codexRefreshVersion}
             canConfigure={canConfigure}
+            organizationAdmin={organizationAdmin}
             call={call}
             refresh={refresh}
           />

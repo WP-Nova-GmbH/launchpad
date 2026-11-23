@@ -76,7 +76,7 @@ vi.mock("./WorkflowCanvas", async () => ({
 vi.mock("./WorkflowStepEditor", () => ({
   WorkflowStepEditor: (props: Record<string, unknown>) =>
     createElement("div", { ...props, "data-testid": "step-fixture" }),
-  useWorkflowEditorModels: () => ({ issues: modelIssues() }),
+  useWorkflowEditorModels: () => ({ issues: modelIssues(), defaultDisabledReason: () => null }),
 }));
 vi.mock("../ui/alert-dialog", () => {
   const part = ({ children }: PropsWithChildren) => children;

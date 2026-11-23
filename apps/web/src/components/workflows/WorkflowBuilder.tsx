@@ -4,12 +4,14 @@ import {
   WORKFLOW_MAX_STEPS,
   WorkflowAutomation,
   WorkflowStep as WorkflowStepSchema,
+  WorkflowTarget as WorkflowTargetSchema,
   workflowPublishingPrerequisites,
 } from "@t3tools/contracts/workflows";
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
 import { WorkflowTriggerInspector, workflowTriggerLabel } from "./WorkflowTriggerInspector";
 import { WorkflowCheckoutPicker } from "./WorkflowCheckoutPicker";
 import { WorkflowVmBaseBranch } from "./WorkflowVmBaseBranch";
+import { WorkflowTargetSwitchNotice } from "./WorkflowTargetSwitchNotice";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { OwnerSources } from "./WorkflowOwnerSources";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
@@ -101,6 +103,7 @@ import {
 
 const isWorkflowAutomation = Schema.is(WorkflowAutomation);
 const equivalentWorkflowSteps = Schema.toEquivalence(Schema.Array(WorkflowStepSchema));
+const equivalentWorkflowTargets = Schema.toEquivalence(WorkflowTargetSchema);
 
 function adjacentWorkflowStepMove(
   steps: ReadonlyArray<WorkflowStep>,
@@ -130,6 +133,7 @@ function matchesDiscardedDraft(current: WorkflowEditorDraft, confirmed: Workflow
     current.automationResolved === confirmed.automationResolved &&
     current.targetConfirmed === confirmed.targetConfirmed &&
     current.lastVmTarget === confirmed.lastVmTarget &&
+    current.lastMachineTarget === confirmed.lastMachineTarget &&
     current.lastVmBaseBranch === confirmed.lastVmBaseBranch &&
     current.operation === confirmed.operation &&
     current.saveRecovery === confirmed.saveRecovery &&
@@ -152,6 +156,7 @@ type WorkflowBuilderProps = {
   vmAutomationAvailable?: boolean;
   codexRefreshVersion?: number;
   canConfigure: boolean;
+  organizationAdmin?: boolean;
   call: ReturnType<typeof useWorkflowClient>;
   refresh: () => void;
   automationSupported?: boolean;
@@ -197,6 +202,7 @@ function WorkflowBuilderEditor({
   vmExecutionAvailable = false,
   codexRefreshVersion = 0,
   canConfigure,
+  organizationAdmin = false,
   call,
   refresh,
   automationSupported = false,
@@ -809,6 +815,7 @@ function WorkflowBuilderEditor({
   return (
     <WorkflowBuilderWorkspace
       repositoryName={repositoryName}
+      organizationAdmin={organizationAdmin}
       openExecutionSettings={openExecutionSettings}
       automationSupported={automationSupported}
       automationReason={automationReason}
@@ -862,6 +869,7 @@ type WorkflowFieldFocus = {
 
 function WorkflowBuilderWorkspace({
   repositoryName,
+  organizationAdmin,
   openExecutionSettings,
   draft,
   automationSupported,
@@ -899,6 +907,7 @@ function WorkflowBuilderWorkspace({
   scope,
 }: {
   repositoryName: string;
+  organizationAdmin: boolean;
   openExecutionSettings: boolean;
   draft: WorkflowEditorDraft;
   automationSupported: boolean;
@@ -960,6 +969,7 @@ function WorkflowBuilderWorkspace({
     });
   // Measure before mounting a panel so a retained desktop selection never opens a transient Sheet.
   const [docked, setDocked] = useState<boolean | null>(null);
+  const [machineEnrollmentGuideOpen, setMachineEnrollmentGuideOpen] = useState(false);
   const focusRequest = useRef<WorkflowFieldFocus | null>(null);
   const [focusVersion, setFocusVersion] = useState(0);
   const focusEpoch = useRef(0);
@@ -1002,6 +1012,7 @@ function WorkflowBuilderWorkspace({
   const workspace = useRef<HTMLFormElement>(null);
   const settingsId = useId();
   const nameErrorId = `${settingsId}-name-error`;
+  const targetSwitchStatusId = `${settingsId}-target-switch-status`;
   const executionTargetControl = useRef<HTMLButtonElement>(null);
   const saveControl = useRef<HTMLButtonElement>(null);
   const saveRecoveryControl = useRef<HTMLButtonElement>(null);
@@ -1092,7 +1103,9 @@ function WorkflowBuilderWorkspace({
     target.focus();
   });
   const fields = useRef(new Map<string, HTMLElement>());
+  const focusedCheckoutRemoval = useRef<HTMLElement | null>(null);
   const returnFocus = useRef<HTMLElement | null>(null);
+  const targetModelReview = useRef<string | null>(null);
   const questionReviewControl = useRef<HTMLButtonElement>(null);
   const questionFocusPending = useRef(false);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
@@ -1158,6 +1171,57 @@ function WorkflowBuilderWorkspace({
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
+  const baselineTarget = draft.baseline?.definition.target;
+  const baselineMachine = baselineTarget?.kind === "machine" ? baselineTarget : null;
+  const savedMachine = latestSavedTarget?.kind === "machine" ? latestSavedTarget : null;
+  const targetSwitch =
+    baselineTarget && baselineTarget.kind !== draft.definition.target.kind
+      ? draft.definition.target.kind
+      : undefined;
+  const targetVersionConflict =
+    newerSavedVersion &&
+    !!baselineTarget &&
+    (!equivalentWorkflowTargets(baselineTarget, draft.definition.target) ||
+      (!!latestSavedTarget && !equivalentWorkflowTargets(baselineTarget, latestSavedTarget)));
+  const unavailableMachineTarget =
+    !!machine &&
+    !target &&
+    (!savedMachine ||
+      machine.environmentId !== savedMachine.environmentId ||
+      machine.projectId !== savedMachine.projectId);
+  const showMachineEnrollment =
+    !projects.length &&
+    !projectsUnavailable &&
+    ((latestSavedTarget?.kind === "vm" && !!vm && !!vmAuthoring && draft.targetConfirmed) ||
+      targetSwitch === "machine");
+  const modelIssues =
+    targetSwitch === "vm" && draft.targetConfirmed
+      ? draft.definition.steps.flatMap((step) => {
+          if (step.kind !== "agent") return [];
+          const issue = models.issues.find((entry) => entry.stepId === step.id);
+          if (issue) return [issue];
+          const detail = step.modelSelection ? null : models.defaultDisabledReason(step);
+          return detail ? [{ stepId: step.id, title: step.title, detail }] : [];
+        })
+      : models.issues;
+  const switchDestination =
+    targetSwitch &&
+    draft.targetConfirmed &&
+    !draft.operation &&
+    !targetVersionConflict &&
+    !unavailableMachineTarget &&
+    (!vm || (!!vmAuthoring && !(vmTriggerUnavailable && automation.enabled))) &&
+    issue?.field !== "baseBranch"
+      ? targetSwitch
+      : undefined;
+  const showSwitchNotice = !!switchDestination && settingsOpen && !triggerOpen;
+  const showEditorModelIssues = modelIssues.length > 0 && !showSwitchNotice;
+  const agentSteps = draft.definition.steps.filter((step) => step.kind === "agent");
+  const usesDefaultModels =
+    !!switchDestination &&
+    !modelIssues.length &&
+    agentSteps.length > 0 &&
+    agentSteps.every(({ modelSelection }) => !modelSelection);
   const checkoutWarning =
     draft.targetConfirmed && machine && !target && !projectsUnavailable
       ? latestSavedTarget?.kind === "machine" &&
@@ -1187,12 +1251,28 @@ function WorkflowBuilderWorkspace({
         ? "Save the execution target before restoring this workflow."
         : "Choose and save an available execution target before restoring this workflow.";
   const canChooseVm = !!vmAuthoring && (vmAutomationAvailable || !automation.enabled);
+  const savedMachineFallback =
+    baselineMachine && savedMachine && equivalentWorkflowTargets(baselineMachine, savedMachine)
+      ? baselineMachine
+      : null;
+  const canChooseMachine = projects.length > 0 || (!!vm && !!savedMachineFallback);
   const showCheckout = (!vmAuthoring || !!machine) && projects.length > 0;
+  const targetSwitchStatus = draft.operation
+    ? ""
+    : targetVersionConflict
+      ? "A newer version is saved. Reload the saved workflow before switching targets."
+      : targetSwitch === "machine" &&
+          showCheckout &&
+          (!draft.targetConfirmed || unavailableMachineTarget)
+        ? "Choose a checkout before saving the switch."
+        : switchDestination && (switchDestination === "machine" || !modelIssues.length)
+          ? `Save to switch this workflow to ${switchDestination === "vm" ? "VM" : "Machine"}.`
+          : "";
   const machineSettingsField = showCheckout
     ? "checkout"
     : vmAuthoring && projects.length
       ? "target:machine"
-      : projectsUnavailable
+      : projectsUnavailable || showMachineEnrollment
         ? "refresh-checkouts"
         : "close-settings";
   const recoveryField =
@@ -1216,7 +1296,9 @@ function WorkflowBuilderWorkspace({
     ? "Use an enrolled repository checkout."
     : projectsUnavailable
       ? "Machine checkouts could not be loaded."
-      : "No enrolled checkout for this repository.";
+      : savedMachine
+        ? "The saved Machine checkout is unavailable."
+        : "No enrolled checkout for this repository.";
   const vmDescription = !canChooseVm
     ? "Turn off automatic triggering before choosing VM."
     : !vmExecutionAvailable
@@ -1226,6 +1308,22 @@ function WorkflowBuilderWorkspace({
     if (node) fields.current.set(field, node);
     else fields.current.delete(field);
   }, []);
+  const registerCheckoutRecoveryField = useCallback((field: string, node: HTMLElement | null) => {
+    if (!node) return;
+    fields.current.set(field, node);
+    return () => {
+      if (node.ownerDocument.activeElement === node) focusedCheckoutRemoval.current = node;
+      if (fields.current.get(field) === node) fields.current.delete(field);
+    };
+  }, []);
+  const registerCheckoutRefresh = useCallback(
+    (node: HTMLButtonElement | null) => registerCheckoutRecoveryField("refresh-checkouts", node),
+    [registerCheckoutRecoveryField],
+  );
+  const registerMachineEnrollmentGuide = useCallback(
+    (node: HTMLElement | null) => registerCheckoutRecoveryField("machine-enrollment-guide", node),
+    [registerCheckoutRecoveryField],
+  );
   const panelKey = triggerOpen
     ? "trigger"
     : settingsOpen
@@ -1261,7 +1359,11 @@ function WorkflowBuilderWorkspace({
     };
     const node =
       focusableField(key) ??
-      (request.field === "repair" ? focusableField(`${request.stepId}:repair-warning`) : undefined);
+      (request.field === "repair"
+        ? focusableField(`${request.stepId}:repair-warning`)
+        : request.field === "refresh-checkouts"
+          ? (focusableField(machineSettingsField) ?? focusableField("close-settings"))
+          : undefined);
     focusRequest.current = null;
     if (!node) return false;
     node.focus({
@@ -1280,7 +1382,17 @@ function WorkflowBuilderWorkspace({
       node.scrollTop = request.selection.scrollTop;
     }
     return true;
-  }, []);
+  }, [machineSettingsField]);
+  const restoreCheckoutFocus = useCallback(() => {
+    const previous = focusedCheckoutRemoval.current;
+    if (!previous || panelIdentity.current !== "workflow") return false;
+    focusedCheckoutRemoval.current = null;
+    const { activeElement, body } = previous.ownerDocument;
+    if (focusRequest.current || (activeElement !== previous && activeElement !== body))
+      return false;
+    focusRequest.current = { field: "refresh-checkouts", stepId: null, scrollIntoView: true };
+    return focusPending();
+  }, [focusPending]);
   useLayoutEffect(() => {
     mounted.current = true;
     focusRequest.current = entryFocus.current;
@@ -1295,6 +1407,10 @@ function WorkflowBuilderWorkspace({
     if (!panelOpen) sheetReady.current = false;
     if (docked === true || !panelOpen || sheetReady.current) focusPending();
   }, [panelKey, panelOpen, docked, focusVersion, focusPending]);
+  useLayoutEffect(() => {
+    if (panelKey !== "workflow") focusedCheckoutRemoval.current = null;
+    else if (docked === true || sheetReady.current) restoreCheckoutFocus();
+  });
   useLayoutEffect(() => {
     if (!workspace.current || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(([entry]) => {
@@ -1431,6 +1547,7 @@ function WorkflowBuilderWorkspace({
     return true;
   };
   const choose = (id: string) => {
+    targetModelReview.current = null;
     setLastStepRemoval(null);
     setLastStepMove(null);
     setFocusRequest(null);
@@ -1483,6 +1600,23 @@ function WorkflowBuilderWorkspace({
     if (docked && !panelOpen) restoreQuestionFocus();
   });
   const close = () => {
+    const reviewedModel = targetModelReview.current;
+    if (reviewedModel) {
+      targetModelReview.current = null;
+      const nextModel =
+        modelIssues.find(({ stepId }) => stepId === reviewedModel) ?? modelIssues[0];
+      returnFocus.current = executionTargetControl.current;
+      setSettingsOpen(true);
+      setTriggerOpen(false);
+      select("");
+      setFocusRequest({
+        field:
+          switchDestination && nextModel ? `target-model:${nextModel.stepId}` : "close-settings",
+        stepId: null,
+        scrollIntoView: !!(switchDestination && nextModel),
+      });
+      return;
+    }
     // The question action remounts after closing.
     const questionOpener = !!returnFocus.current?.getAttribute("data-workflow-question-review");
     questionFocusPending.current = questionOpener;
@@ -1494,6 +1628,7 @@ function WorkflowBuilderWorkspace({
     if (!questionOpener) returnFocus.current?.focus();
   };
   const openSettings = () => {
+    targetModelReview.current = null;
     setTriggerOpen(false);
     setFocusRequest(null);
     returnFocus.current =
@@ -1535,6 +1670,10 @@ function WorkflowBuilderWorkspace({
     if (opener) returnFocus.current = opener;
     setFocusRequest({ field: "model", stepId, scrollIntoView: true });
   };
+  const reviewTargetModel = (stepId: string) => {
+    reviewModel(stepId, executionTargetControl.current ?? undefined);
+    targetModelReview.current = stepId;
+  };
   const insertPushBranch = () => {
     if (selected?.kind !== "action" || selected.action !== "open_pull_request") return;
     const preceding = draft.definition.steps[draft.definition.steps.indexOf(selected) - 1];
@@ -1543,6 +1682,7 @@ function WorkflowBuilderWorkspace({
     }
   };
   const openTrigger = (opener?: HTMLElement | null) => {
+    targetModelReview.current = null;
     setFocusRequest(null);
     setSettingsOpen(false);
     select("");
@@ -1553,6 +1693,11 @@ function WorkflowBuilderWorkspace({
     if (pending || reading) return;
     if (recoveringSave) {
       saveRecoveryControl.current?.focus();
+      return;
+    }
+    if (targetVersionConflict) {
+      if (!settingsOpen || triggerOpen) openSettings();
+      setFocusRequest({ field: "reload-target", stepId: null, scrollIntoView: true });
       return;
     }
     if (offSave && !hasOtherEdits && !automation.enabled) {
@@ -1605,7 +1750,7 @@ function WorkflowBuilderWorkspace({
       }));
       return;
     }
-    if (!draft.targetConfirmed || (machine && !target && !draft.baseline) || (vm && !vmAuthoring)) {
+    if (!draft.targetConfirmed || unavailableMachineTarget || (vm && !vmAuthoring)) {
       openSettings();
       edit((current) => ({
         ...current,
@@ -1615,20 +1760,22 @@ function WorkflowBuilderWorkspace({
             : "Choose an available execution target before saving.",
       }));
       setFocusRequest({
-        field: showCheckout
-          ? "checkout"
-          : vmAuthoring && projects.length
-            ? "target:machine"
-            : canChooseVm
-              ? "target:vm"
-              : "close-settings",
+        field:
+          machine && (showCheckout || projectsUnavailable || showMachineEnrollment)
+            ? machineSettingsField
+            : vmAuthoring && projects.length
+              ? "target:machine"
+              : canChooseVm
+                ? "target:vm"
+                : "close-settings",
         stepId: null,
       });
       return;
     }
-    const modelIssue = vm ? models.issues[0] : undefined;
+    const modelIssue = vm ? modelIssues[0] : undefined;
     if (modelIssue) {
-      reviewModel(modelIssue.stepId, submitter ?? saveControl.current ?? undefined);
+      if (showSwitchNotice) reviewTargetModel(modelIssue.stepId);
+      else reviewModel(modelIssue.stepId, submitter ?? saveControl.current ?? undefined);
       return;
     }
     setFocusRequest(null);
@@ -1706,9 +1853,19 @@ function WorkflowBuilderWorkspace({
       </header>
       <fieldset disabled={pending} className="min-w-0">
         <section className={styles["workflow-settings-execution"]}>
-          <h3 id={`${settingsId}-target`} className="text-sm font-medium">
-            Execution target
-          </h3>
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <h3 id={`${settingsId}-target`} className="text-sm font-medium">
+              Execution target
+            </h3>
+            {latestSavedTarget ? (
+              <p id={`${settingsId}-saved-target`} className="text-xs text-muted-foreground">
+                Saved target{" "}
+                <strong className="font-medium text-foreground">
+                  {latestSavedTarget.kind === "machine" ? "Machine" : "VM"}
+                </strong>
+              </p>
+            ) : null}
+          </div>
           {vmAuthoring ? (
             <>
               {!machine && !draft.targetConfirmed ? (
@@ -1716,6 +1873,7 @@ function WorkflowBuilderWorkspace({
               ) : null}
               <RadioGroup
                 aria-labelledby={`${settingsId}-target`}
+                aria-describedby={latestSavedTarget ? `${settingsId}-saved-target` : undefined}
                 disabled={pending}
                 value={machine ? "machine" : draft.targetConfirmed ? "vm" : null}
                 onKeyDownCapture={(event) => {
@@ -1743,6 +1901,9 @@ function WorkflowBuilderWorkspace({
                       const savedTarget = draft.baseline?.definition.target;
                       return {
                         ...draft,
+                        ...(target.kind === "machine"
+                          ? { lastMachineTarget: { target, confirmed: current.targetConfirmed } }
+                          : {}),
                         targetConfirmed: true,
                         error: null,
                         definition: {
@@ -1759,26 +1920,32 @@ function WorkflowBuilderWorkspace({
                     });
                     return;
                   }
-                  const project = projects[0];
-                  if (value === "machine" && project)
-                    edit((current) => {
-                      const lastVmTarget = current.definition.target;
-                      if (lastVmTarget.kind === "machine") return current;
-                      return {
-                        ...current,
-                        lastVmTarget,
-                        targetConfirmed: projects.length === 1,
-                        error: null,
-                        definition: {
-                          ...current.definition,
-                          target: {
-                            kind: "machine",
-                            environmentId: project.environmentId,
-                            projectId: project.projectId,
-                          },
-                        },
-                      };
-                    });
+                  if (value !== "machine" || !canChooseMachine) return;
+                  edit((current) => {
+                    const { lastMachineTarget, ...draft } = current;
+                    const lastVmTarget = draft.definition.target;
+                    if (lastVmTarget.kind === "machine") return current;
+                    const project = projects[0];
+                    const machineTarget = project
+                      ? (lastMachineTarget?.target ??
+                        baselineMachine ?? {
+                          kind: "machine" as const,
+                          environmentId: project.environmentId,
+                          projectId: project.projectId,
+                        })
+                      : savedMachineFallback;
+                    if (!machineTarget) return current;
+                    return {
+                      ...draft,
+                      lastVmTarget,
+                      targetConfirmed:
+                        !project ||
+                        (lastMachineTarget?.confirmed ??
+                          (!!baselineMachine || projects.length === 1)),
+                      error: null,
+                      definition: { ...draft.definition, target: machineTarget },
+                    };
+                  });
                 }}
               >
                 <label
@@ -1788,7 +1955,7 @@ function WorkflowBuilderWorkspace({
                   <RadioGroupItem
                     id={`${settingsId}-machine`}
                     value="machine"
-                    disabled={!projects.length}
+                    disabled={!canChooseMachine}
                     aria-labelledby={`${settingsId}-machine-label`}
                     aria-describedby={`${settingsId}-machine-description`}
                     ref={(node) => registerField("target:machine", node)}
@@ -1820,9 +1987,11 @@ function WorkflowBuilderWorkspace({
                 </label>
               </RadioGroup>
             </>
-          ) : vm ? (
-            <p className="text-xs text-warning-foreground">
-              Update the relay to save a VM workflow.
+          ) : vm || latestSavedTarget ? (
+            <p className="text-xs text-muted-foreground">
+              {vm
+                ? "Update the relay to save a VM workflow."
+                : "VM workflow settings are unavailable on this relay."}
             </p>
           ) : null}
           {showCheckout ? (
@@ -1848,7 +2017,7 @@ function WorkflowBuilderWorkspace({
                 }))
               }
             />
-          ) : checkoutWarning ? (
+          ) : checkoutWarning && !showMachineEnrollment ? (
             <WorkflowAlert variant="warning" title={checkoutWarning}>
               Your workflow edits are kept.
             </WorkflowAlert>
@@ -1862,12 +2031,55 @@ function WorkflowBuilderWorkspace({
                 type="button"
                 variant="outline"
                 size="sm"
-                ref={(node) => registerField("refresh-checkouts", node)}
+                ref={registerCheckoutRefresh}
                 onClick={refreshProjects}
               >
                 Retry loading checkouts
               </Button>
             </div>
+          ) : showMachineEnrollment ? (
+            <WorkflowAlert
+              title="No Machine checkout available"
+              variant={targetSwitch === "machine" ? "warning" : "info"}
+              announce={false}
+              actions={
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  ref={registerCheckoutRefresh}
+                  onClick={refreshProjects}
+                >
+                  Refresh checkouts
+                </Button>
+              }
+            >
+              {organizationAdmin ? (
+                <>
+                  <p>Connect an organization machine with a checkout of this repository.</p>
+                  <details className="mt-2" open={machineEnrollmentGuideOpen}>
+                    <summary
+                      id={`${settingsId}-machine-enrollment-guide`}
+                      ref={registerMachineEnrollmentGuide}
+                      className="cursor-pointer font-medium"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        setMachineEnrollmentGuideOpen((open) => !open);
+                      }}
+                    >
+                      Where to connect
+                    </summary>
+                    <p className="mt-1">Settings → Organization → Machines</p>
+                    <p className="mt-1">
+                      Choose Connect your own machine, then open this repository as a project on
+                      that machine.
+                    </p>
+                  </details>
+                </>
+              ) : (
+                "Ask an organization admin to connect a machine with a checkout of this repository."
+              )}
+            </WorkflowAlert>
           ) : !projects.length && (machine || (!vmAuthoring && !vm)) ? (
             <p className="text-xs text-muted-foreground">
               {!vmAuthoring ? `${machineDescription} ` : null}
@@ -1901,6 +2113,28 @@ function WorkflowBuilderWorkspace({
               }
             />
           ) : null}
+          {usesDefaultModels ? (
+            <p className="text-xs text-muted-foreground">
+              Agent models use the {vm ? "managed default" : "project default"}.
+            </p>
+          ) : null}
+          {switchDestination ? (
+            <WorkflowTargetSwitchNotice
+              destination={switchDestination}
+              steps={draft.definition.steps}
+              issues={modelIssues}
+              disabled={pending}
+              registerReviewButton={(stepId, node) => registerField(`target-model:${stepId}`, node)}
+              onReviewModel={reviewTargetModel}
+            />
+          ) : null}
+          <p
+            id={targetSwitchStatusId}
+            role="status"
+            className={targetSwitchStatus ? "text-xs text-muted-foreground" : "sr-only"}
+          >
+            {targetSwitchStatus}
+          </p>
         </section>
         <section className={styles["workflow-settings-row"]} aria-label="Repository">
           <h3 className="text-sm font-medium">Repository</h3>
@@ -1928,13 +2162,21 @@ function WorkflowBuilderWorkspace({
           <Button
             ref={(node) => {
               discardControl.current = node;
+              registerField("reload-target", node);
               registerField("discard-changes", node);
             }}
             type="button"
             variant="ghost"
             size="sm"
             aria-disabled={reading || undefined}
-            aria-describedby={discardReloadStatus ? discardReloadFeedbackId : undefined}
+            aria-describedby={
+              [
+                targetVersionConflict && !draft.operation ? targetSwitchStatusId : null,
+                discardReloadStatus ? discardReloadFeedbackId : null,
+              ]
+                .filter(Boolean)
+                .join(" ") || undefined
+            }
             onClick={() => {
               if (reading) return;
               if (draft.operation || (!workflowEditorDirty(draft) && !newerSavedVersion))
@@ -1942,7 +2184,11 @@ function WorkflowBuilderWorkspace({
               else setDiscardConfirmation({ draft, open: true });
             }}
           >
-            {retryDiscardReload ? "Retry reload" : "Discard changes"}
+            {retryDiscardReload
+              ? "Retry reload"
+              : targetVersionConflict && !draft.operation
+                ? "Reload saved version"
+                : "Discard changes"}
           </Button>
           <AlertDialog
             open={discardDialogOpen}
@@ -2346,7 +2592,7 @@ function WorkflowBuilderWorkspace({
       discardReloadInEditor ||
       editorIssue ||
       showPromptNotice ||
-      models.issues.length ? (
+      showEditorModelIssues ? (
         <div className={styles["workflow-editor-notices"]}>
           {vmRunUnavailable ? (
             <div id="workflow-vm-run-unavailable">
@@ -2520,51 +2766,14 @@ function WorkflowBuilderWorkspace({
               {invalidStep.title}
             </WorkflowAlert>
           ) : null}
-          {vm && models.issues.length ? (
-            <WorkflowAlert title="Agent models need attention" variant="warning">
-              <ul className="divide-y divide-warning/25">
-                {models.issues.map((modelIssue) => {
-                  const stepIndex = draft.definition.steps.findIndex(
-                    ({ id }) => id === modelIssue.stepId,
-                  );
-                  const step = draft.definition.steps[stepIndex];
-                  const model = step?.kind === "agent" ? step.modelSelection?.model : undefined;
-                  const name = step?.title.trim();
-                  const stepLabel = stepIndex >= 0 ? `Agent step ${stepIndex + 1}` : "Agent step";
-                  const title = name ? `${stepLabel}: ${name}` : stepLabel;
-                  return (
-                    <li
-                      key={modelIssue.stepId}
-                      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-2 first:pt-0 last:pb-0"
-                    >
-                      <div className="min-w-0">
-                        <p className="font-medium text-foreground">{title}</p>
-                        <p className="text-xs text-foreground">
-                          {model ? (
-                            <>
-                              <span className="font-mono">{model}</span>{" "}
-                            </>
-                          ) : null}
-                          {modelIssue.detail}
-                        </p>
-                      </div>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        aria-label={`Review model for ${title}`}
-                        disabled={pending}
-                        data-workflow-validation-action
-                        onClick={(event) => reviewModel(modelIssue.stepId, event.currentTarget)}
-                      >
-                        Review model
-                      </Button>
-                    </li>
-                  );
-                })}
-              </ul>
-            </WorkflowAlert>
-          ) : models.issues.length ? (
+          {vm && showEditorModelIssues ? (
+            <WorkflowTargetSwitchNotice
+              steps={draft.definition.steps}
+              issues={modelIssues}
+              disabled={pending}
+              onReviewModel={reviewModel}
+            />
+          ) : showEditorModelIssues ? (
             <WorkflowAlert
               title="Agent models need attention"
               variant="warning"
@@ -2664,7 +2873,7 @@ function WorkflowBuilderWorkspace({
                 // The confirmation owns focus when the docked inspector becomes a sheet.
                 if (stepConfirmationOpen) return false;
                 // Restore once before interaction; animation completion must not replay a caret.
-                return !focusPending();
+                return !(focusPending() || restoreCheckoutFocus());
               }}
               finalFocus={() => {
                 if (

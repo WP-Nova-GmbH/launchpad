@@ -57,6 +57,11 @@ export interface WorkflowEditorDraft {
   readonly targetConfirmed: boolean;
   /** Editor-only VM choice while Machine is selected. Retained until the draft is reset or VM is selected again. */
   readonly lastVmTarget?: typeof WorkflowVmTarget.Type;
+  /** Editor-only checkout and confirmation to restore when switching back to Machine. */
+  readonly lastMachineTarget?: {
+    readonly target: Extract<WorkflowDefinition["target"], { kind: "machine" }>;
+    readonly confirmed: boolean;
+  };
   /** Branch name retained while the draft uses the repository default. */
   readonly lastVmBaseBranch?: string | undefined;
   readonly saveRecovery?: "retryable" | "conflict" | "check-failed" | undefined;

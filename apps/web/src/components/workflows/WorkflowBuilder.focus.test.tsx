@@ -22,11 +22,12 @@ import {
 } from "@tanstack/react-router";
 import { Route as NewWorkflowRoute } from "../../routes/workflows.$repositoryId.new";
 import { Route as EditWorkflowRoute } from "../../routes/workflows.$repositoryId.$workflowId.edit";
-import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
 import {
   WORKFLOW_MAX_STEPS,
   workflowPublishingPrerequisites,
   type RepositoryWorkflow,
+  type WorkflowDefinition,
   type WorkflowStep,
 } from "@t3tools/contracts/workflows";
 import {
@@ -147,10 +148,14 @@ vi.mock("./WorkflowTriggerInspector", async () => ({
     ),
 }));
 const modelIssues = vi.hoisted(() =>
-  vi.fn<() => { stepId: string; title: string; detail: string }[]>(),
+  vi.fn<(definition: WorkflowDefinition) => { stepId: string; title: string; detail: string }[]>(),
 );
+const defaultDisabledReason = vi.hoisted(() => vi.fn<() => string | null>());
 vi.mock("./WorkflowStepEditor", () => ({
-  useWorkflowEditorModels: () => ({ issues: modelIssues() }),
+  useWorkflowEditorModels: (definition: WorkflowDefinition) => ({
+    issues: modelIssues(definition),
+    defaultDisabledReason,
+  }),
   WorkflowStepEditor: (props: StepProps) => {
     const step = props.definition.steps.find((entry) => entry.id === props.selectedId)!;
     const field = step.kind === "agent" ? "instruction" : "question";
@@ -351,9 +356,9 @@ vi.mock("../ui/input", () => ({
   Input: (props: Record<string, unknown>) => createElement("input", props),
 }));
 vi.mock("../ui/combobox", () => {
-  const component = ({ children }: PropsWithChildren) => children;
   return {
-    Combobox: component,
+    Combobox: ({ children, ...props }: PropsWithChildren<Record<string, unknown>>) =>
+      createElement("div", { ...props, "data-testid": "checkout-options" }, children),
     ComboboxTrigger: ({ render: _render, ...props }: Record<string, unknown>) =>
       createElement("button", { ...props, "data-focus-key": "checkout" }),
     ComboboxPopup: () => null,
@@ -364,7 +369,8 @@ vi.mock("../ui/combobox", () => {
   };
 });
 vi.mock("../ui/radio-group", () => ({
-  RadioGroup: ({ children }: PropsWithChildren) => children,
+  RadioGroup: ({ children, ...props }: PropsWithChildren<Record<string, unknown>>) =>
+    createElement("div", { ...props, "data-testid": "execution-target-options" }, children),
   RadioGroupItem: ({ value, ...props }: Record<string, unknown>) =>
     createElement("span", { ...props, "data-focus-key": `target:${value}` }),
 }));
@@ -411,16 +417,24 @@ async function mount(
   vm = false,
   {
     projects = vm ? [] : [project],
+    projectsUnavailable = false,
+    refreshProjects = () => {},
+    vmExecutionAvailable = false,
     automationSupported = false,
     useRoutes = false,
     workflow,
     openExecutionSettings = false,
+    organizationAdmin = false,
   }: {
     projects?: ReadonlyArray<RelayOrganizationProject>;
+    projectsUnavailable?: boolean;
+    refreshProjects?: () => void;
+    vmExecutionAvailable?: boolean;
     automationSupported?: boolean;
     useRoutes?: boolean;
     workflow?: RepositoryWorkflow;
     openExecutionSettings?: boolean;
+    organizationAdmin?: boolean;
   } = {},
 ) {
   const editor = (workflowId?: string) => (
@@ -429,16 +443,19 @@ async function mount(
         scope={scope}
         repositoryName="Repository"
         projects={projects}
+        projectsUnavailable={projectsUnavailable}
         vmAuthoring={vm ? { models: null } : undefined}
+        vmExecutionAvailable={vmExecutionAvailable}
         automationSupported={automationSupported}
         isNew={!workflow && !workflowId}
         workflowId={workflow?.workflowId ?? workflowId}
         workflow={workflow}
         openExecutionSettings={openExecutionSettings}
+        organizationAdmin={organizationAdmin}
         canConfigure
         call={async <A,>() => (await request()) as A}
         refresh={() => {}}
-        refreshProjects={() => {}}
+        refreshProjects={refreshProjects}
       />
     </AppAtomRegistryProvider>
   );
@@ -494,30 +511,44 @@ async function mount(
         const key =
           typeof props["data-focus-key"] === "string"
             ? props["data-focus-key"]
-            : props["aria-label"] === "Workflow name"
-              ? "name"
-              : typeof props["aria-label"] === "string" &&
-                  props["aria-label"].startsWith("Execution target: ")
-                ? "header-target"
-                : props["aria-label"] === "Close settings"
-                  ? "close-settings"
-                  : props.type === "submit"
-                    ? "save"
-                    : typeof props.id === "string" && props.id.endsWith("-branch-name")
-                      ? "baseBranch"
-                      : props.children === "Check saved version" ||
-                          props.children === "Retry original save"
-                        ? "recovery"
-                        : props.children === "Keep step"
-                          ? "keep-step"
-                          : props.children === "Keep current order"
-                            ? "keep-current-order"
-                            : null;
+            : typeof props["aria-label"] === "string" &&
+                props["aria-label"].startsWith("Review model for ")
+              ? props["aria-label"]
+              : props["aria-label"] === "Workflow name"
+                ? "name"
+                : typeof props["aria-label"] === "string" &&
+                    props["aria-label"].startsWith("Execution target: ")
+                  ? "header-target"
+                  : props["aria-label"] === "Close settings"
+                    ? "close-settings"
+                    : props.type === "submit"
+                      ? "save"
+                      : typeof props.id === "string" && props.id.endsWith("-branch-name")
+                        ? "baseBranch"
+                        : props.children === "Check saved version" ||
+                            props.children === "Retry original save"
+                          ? "recovery"
+                          : props.children === "Keep step"
+                            ? "keep-step"
+                            : props.children === "Keep current order"
+                              ? "keep-current-order"
+                              : props.children === "Refresh checkouts" ||
+                                  props.children === "Retry loading checkouts"
+                                ? "refresh-checkouts"
+                                : props.children === "Reload saved version"
+                                  ? "reload-saved"
+                                  : element.type === "summary" &&
+                                      props.children === "Where to connect"
+                                    ? "machine-enrollment-guide"
+                                    : null;
         if (!key) return null;
         const cacheKey = `${presentation}:${key}`;
         let node = cache.get(cacheKey);
         if (!node?.isConnected) {
-          node = element.type === "button" ? new FocusNode(props) : new TextField();
+          node =
+            element.type === "button" || element.type === "summary"
+              ? new FocusNode(props)
+              : new TextField();
           cache.set(cacheKey, node);
         }
         node.value = typeof props.value === "string" ? props.value : "";
@@ -570,6 +601,7 @@ beforeEach(() => {
   request.mockReset().mockRejectedValue(new Error("Unexpected request"));
   navigate.mockReset();
   modelIssues.mockReset().mockReturnValue([]);
+  defaultDisabledReason.mockReset().mockReturnValue(null);
   setWorkflowSessionAccount(appAtomRegistry, null);
   setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
 });
@@ -1028,6 +1060,480 @@ describe("Step removal", () => {
 
     expect(draft().definition.steps.map((step) => step.id)).toEqual(["plan", "push", "open-pr"]);
     expect(workflowDraftIssue(draft().definition)).toBeNull();
+  });
+});
+
+describe("Execution target settings", () => {
+  const savedMachine: RepositoryWorkflow = {
+    workflowId: "execution-target",
+    organizationId: scope.organizationId,
+    repositoryId: scope.repositoryId,
+    revision: 1,
+    createdAt: "now",
+    updatedAt: "now",
+    archived: false,
+    definition: newWorkflowDraft([project])!.definition,
+  };
+  const savedVm: RepositoryWorkflow = {
+    ...savedMachine,
+    definition: { ...savedMachine.definition, target: { kind: "vm", baseBranch: null } },
+  };
+  const editor = () =>
+    appAtomRegistry.get(workflowDraftAtom).editors[
+      workflowSessionKey(scope, savedMachine.workflowId)
+    ]!;
+  const settings = () => renderer!.root.findByType("aside").findByType("fieldset");
+  const targetOptions = () => settings().findByProps({ "data-testid": "execution-target-options" });
+  const chooseTarget = (target: "machine" | "vm") =>
+    act(() => targetOptions().props.onValueChange(target));
+  const submit = () =>
+    act(() => renderer!.root.findByType("form").props.onSubmit({ preventDefault() {} }));
+  const checkoutOptions = () => settings().findByProps({ "data-testid": "checkout-options" });
+  const chooseCheckout = (checkout: RelayOrganizationProject) =>
+    act(() => checkoutOptions().props.onValueChange(checkout));
+  const changeName = (name: string) =>
+    act(() =>
+      renderer!.root.findByProps({ "aria-label": "Workflow name" }).props.onChange({
+        target: { value: name },
+      }),
+    );
+  const updateBuilder = (patch: Partial<Parameters<typeof WorkflowBuilder>[0]>) => {
+    const props = renderer!.root.findByType(WorkflowBuilder).props as Parameters<
+      typeof WorkflowBuilder
+    >[0];
+    return act(() =>
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <WorkflowBuilder {...props} {...patch} />
+        </AppAtomRegistryProvider>,
+      ),
+    );
+  };
+
+  it("keeps a target switch in the draft until ordinary Save confirms it", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    const firstCheckout = {
+      ...project,
+      projectId: ProjectId.make("other"),
+      title: "Other checkout",
+    };
+    await mount(true, {
+      workflow: savedMachine,
+      projects: [firstCheckout, project],
+      vmExecutionAvailable: true,
+      openExecutionSettings: true,
+    });
+    const unsavedName = "Edited workflow name";
+    await changeName(unsavedName);
+    await chooseCheckout(firstCheckout);
+    expect(editor().definition.target).toMatchObject({ projectId: firstCheckout.projectId });
+
+    await chooseTarget("vm");
+
+    const pending = "Save to switch this workflow to VM.";
+    expect(visibleText(settings())).toContain(pending);
+    expect(visibleText(settings())).toMatch(/Saved target\s*Machine/);
+    expect(targetOptions().props.value).toBe("vm");
+    expect(editor().definition.target).toEqual({ kind: "vm", baseBranch: null });
+    expect(editor().baseline).toEqual(savedMachine);
+
+    await updateBuilder({ projects: [] });
+    const machineRadio = () => settings().findByProps({ "data-focus-key": "target:machine" });
+    expect(machineRadio().props.disabled).toBe(false);
+    await chooseTarget("machine");
+
+    expect(visibleText(settings())).not.toContain(pending);
+    expect(editor().definition.target).toEqual(savedMachine.definition.target);
+    expect(editor().targetConfirmed).toBe(true);
+    expect(editor().definition.name).toBe(unsavedName);
+    expect(editor().baseline).toEqual(savedMachine);
+
+    await updateBuilder({ projects: [firstCheckout, project] });
+    await chooseTarget("vm");
+    const saved = { ...savedMachine, definition: editor().definition, revision: 2 };
+    request.mockClear().mockResolvedValueOnce(saved);
+    await submit();
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(editor().baseline).toMatchObject({ revision: 2, definition: saved.definition });
+    expect(visibleText(settings())).not.toContain(pending);
+    expect(targetOptions().props.value).toBe("vm");
+
+    await updateBuilder({ projects: [] });
+    expect(machineRadio().props.disabled).toBe(true);
+    expect(visibleText(settings())).toContain("No Machine checkout available");
+  });
+
+  it("shows a newer saved target without treating the retained work as a local target switch", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    await mount(true, {
+      workflow: savedMachine,
+      projects: [project],
+      vmExecutionAvailable: true,
+      openExecutionSettings: true,
+    });
+    const unsavedName = "Local workflow edit";
+    await changeName(unsavedName);
+
+    await updateBuilder({ workflow: { ...savedVm, revision: 2 } });
+
+    expect(visibleText(settings())).toMatch(/Saved target\s*VM/);
+    expect(visibleText(settings())).toContain(
+      "A newer version is saved. Reload the saved workflow before switching targets.",
+    );
+    expect(visibleText(settings())).not.toContain("Save to switch this workflow");
+    expect(targetOptions().props.value).toBe("machine");
+    request.mockClear();
+
+    await submit();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(focusDocument.activeElement === field("reload-saved")).toBe(true);
+    expect(editor().baseline).toEqual(savedMachine);
+    expect(editor().definition).toEqual({ ...savedMachine.definition, name: unsavedName });
+
+    const status = settings()
+      .findAllByType("p")
+      .find((node) => node.props.id?.endsWith("-target-switch-status"))!;
+    const reload = recoveryButton("Reload saved version");
+    expect(reload.props["aria-describedby"]).toBe(status.props.id);
+    await act(() => reload.props.onClick());
+
+    const confirmReload = recoveryButton("Discard edits and reload");
+    expect(confirmReload).toBeDefined();
+    expect(request).not.toHaveBeenCalled();
+    expect(editor().definition.name).toBe(unsavedName);
+
+    request.mockRejectedValueOnce(new Error("Reload failed"));
+    await act(() => confirmReload.props.onClick());
+
+    const descriptions = recoveryButton("Retry reload").props["aria-describedby"].split(
+      " ",
+    ) as string[];
+    expect(descriptions).toContain(status.props.id);
+    const feedbackId = descriptions.find((description) => description.endsWith("-discard-reload"));
+    expect(feedbackId).toBeDefined();
+    expect(visibleText(settings().findByProps({ id: feedbackId }))).toContain(
+      "Could not reload the saved version. Your draft is kept.",
+    );
+    expect(editor().definition.name).toBe(unsavedName);
+  });
+
+  it("restores the confirmed draft checkout instead of the saved checkout after trying VM", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    const secondCheckout = {
+      ...project,
+      projectId: ProjectId.make("second"),
+      title: "Second checkout",
+    };
+    await mount(true, {
+      workflow: savedMachine,
+      projects: [project, secondCheckout],
+      vmExecutionAvailable: true,
+      openExecutionSettings: true,
+    });
+    const unsavedName = "Local checkout edits";
+    await changeName(unsavedName);
+    await chooseCheckout(secondCheckout);
+    expect(editor().targetConfirmed).toBe(true);
+    const chosen = editor().definition.target;
+    expect(chosen).toMatchObject({ kind: "machine", projectId: secondCheckout.projectId });
+
+    await chooseTarget("vm");
+    await chooseTarget("machine");
+
+    expect(editor().definition.target).toEqual(chosen);
+    expect(checkoutOptions().props.value).toEqual(secondCheckout);
+    expect(editor().targetConfirmed).toBe(true);
+    expect(editor().definition.name).toBe(unsavedName);
+    expect(editor().baseline).toEqual(savedMachine);
+  });
+
+  it("reuses the execution target status while choosing and confirming a checkout", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    const secondCheckout = {
+      ...project,
+      projectId: ProjectId.make("second"),
+      title: "Second checkout",
+    };
+    await mount(true, {
+      workflow: savedVm,
+      projects: [project, secondCheckout],
+      vmExecutionAvailable: true,
+      openExecutionSettings: true,
+    });
+    const status = () =>
+      settings()
+        .findAllByType("p")
+        .find(
+          (node) =>
+            node.props.role === "status" && node.props.id?.endsWith("-target-switch-status"),
+        )!;
+    const announcement = status();
+    expect(visibleText(announcement)).toBe("");
+
+    await chooseTarget("machine");
+    expect(status()).toBe(announcement);
+    expect(visibleText(status())).toContain("Choose a checkout before saving the switch.");
+
+    await chooseCheckout(secondCheckout);
+    expect(status()).toBe(announcement);
+    expect(visibleText(status())).toContain("Save to switch this workflow to Machine.");
+
+    await updateBuilder({ projects: [project] });
+    expect(status()).toBe(announcement);
+    expect(visibleText(status())).toContain("Choose a checkout before saving the switch.");
+
+    await chooseTarget("vm");
+    expect(status()).toBe(announcement);
+    expect(visibleText(status())).toBe("");
+  });
+
+  it.each([false, true])(
+    "keeps focus predictable after refreshing checkouts (focus moved: %s)",
+    async (focusMoved) => {
+      const refreshProjects = vi.fn();
+      request.mockResolvedValue({ status: "connected" });
+      await mount(true, {
+        workflow: savedVm,
+        projects: [],
+        refreshProjects,
+        vmExecutionAvailable: true,
+        openExecutionSettings: true,
+      });
+      const refresh = field("refresh-checkouts");
+      refresh.focus();
+      await act(() =>
+        recoveryButton("Refresh checkouts").props.onClick({ currentTarget: refresh }),
+      );
+      expect(refreshProjects).toHaveBeenCalledOnce();
+      if (focusMoved) field("name").focus();
+
+      await updateBuilder({ projects: [project] });
+
+      expect(recoveryButton("Refresh checkouts")).toBeUndefined();
+      expect(focusDocument.activeElement === field(focusMoved ? "name" : "target:machine")).toBe(
+        true,
+      );
+      expect(editor().definition.target).toEqual(savedVm.definition.target);
+    },
+  );
+
+  it("keeps incompatible Agent selections and opens their Review model actions from the settings inspector", async () => {
+    const [agent, review] = savedMachine.definition.steps;
+    if (agent?.kind !== "agent" || !review) throw new Error("Expected Agent and Review steps");
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("checkout-codex"),
+      model: "checkout-model",
+    };
+    const steps = [
+      { ...agent, title: "Implement", modelSelection },
+      { ...agent, id: "verify", title: "Verify", modelSelection },
+      review,
+    ];
+    const workflow = { ...savedMachine, definition: { ...savedMachine.definition, steps } };
+    request.mockResolvedValue({ status: "connected" });
+    modelIssues.mockImplementation(({ target }) =>
+      target.kind === "vm"
+        ? [
+            { stepId: agent.id, title: "Implement", detail: "Choose a managed Codex model." },
+            { stepId: "verify", title: "Verify", detail: "Choose a managed Codex model." },
+          ]
+        : [],
+    );
+    await mount(true, {
+      workflow,
+      projects: [project],
+      vmExecutionAvailable: true,
+      openExecutionSettings: true,
+    });
+
+    await chooseTarget("vm");
+
+    const modelButtons = settings()
+      .findAllByType("button")
+      .filter((button) => button.children.includes("Review model"));
+    expect(modelButtons.map((button) => button.props["aria-label"])).toEqual([
+      "Review model for Agent step 1: Implement",
+      "Review model for Agent step 2: Verify",
+    ]);
+    expect(visibleText(settings())).toContain(modelSelection.model);
+    expect(editor().definition.steps).toEqual(steps);
+
+    const reviewVerify = modelButtons[1]!;
+    const reviewVerifyLabel = reviewVerify.props["aria-label"];
+    await act(() => reviewVerify.props.onClick({ currentTarget: field(reviewVerifyLabel) }));
+    expect(editor().selectedStepId).toBe("verify");
+    expect(focusDocument.activeElement).toBe(field("verify:model"));
+    expect(editor().definition.steps).toEqual(steps);
+
+    await act(() => renderer!.root.findByProps({ "aria-label": "Close settings" }).props.onClick());
+    expect(settings().findByProps({ "aria-label": reviewVerifyLabel })).toBeDefined();
+    expect(focusDocument.activeElement).toBe(field(reviewVerifyLabel));
+
+    request.mockClear();
+    await submit();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(focusDocument.activeElement).toBe(field("agent:model"));
+    expect(editor().definition.target.kind).toBe("vm");
+    expect(editor().baseline).toEqual(workflow);
+    expect(editor().definition.steps).toEqual(steps);
+  });
+
+  it("blocks switching to VM when an Agent inherits a positively unsupported managed default", async () => {
+    const issue = "This VM build does not support the managed default Codex model.";
+    defaultDisabledReason.mockReturnValue(issue);
+    request.mockResolvedValue({ status: "connected" });
+    await mount(true, {
+      workflow: savedMachine,
+      projects: [project],
+      vmExecutionAvailable: true,
+      openExecutionSettings: true,
+    });
+
+    await chooseTarget("vm");
+
+    expect(visibleText(settings())).toContain(issue);
+    expect(editor().definition.steps[0]).toMatchObject({ modelSelection: null });
+    request.mockClear();
+
+    await submit();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(editor().baseline).toEqual(savedMachine);
+    expect(focusDocument.activeElement).toBe(field("agent:model"));
+  });
+
+  it.each([false, true])(
+    "explains a disabled Machine target with no usable checkouts (read failed: %s)",
+    async (projectsUnavailable) => {
+      const refreshProjects = vi.fn();
+      request.mockResolvedValue({ status: "connected" });
+      await mount(true, {
+        workflow: savedVm,
+        projects: [],
+        projectsUnavailable,
+        refreshProjects,
+        vmExecutionAvailable: true,
+        openExecutionSettings: true,
+      });
+
+      expect(settings().findByProps({ "data-focus-key": "target:machine" }).props.disabled).toBe(
+        true,
+      );
+      expect(targetOptions().props.value).toBe("vm");
+      const retry = recoveryButton("Retry loading checkouts");
+      if (projectsUnavailable) {
+        expect(visibleText(settings())).toContain("Machine checkouts could not be loaded.");
+        await act(() => retry.props.onClick());
+        expect(refreshProjects).toHaveBeenCalledOnce();
+      } else {
+        expect(visibleText(settings())).toContain("No Machine checkout available");
+        expect(visibleText(settings())).toContain(
+          "Ask an organization admin to connect a machine with a checkout of this repository.",
+        );
+        expect(retry).toBeUndefined();
+        await act(() => recoveryButton("Refresh checkouts").props.onClick());
+        expect(refreshProjects).toHaveBeenCalledOnce();
+      }
+      expect(editor().definition.target).toEqual(savedVm.definition.target);
+    },
+  );
+
+  it.each([
+    { target: "VM", nextField: "target:machine" },
+    { target: "Machine", nextField: "checkout" },
+  ] as const)(
+    "restores focus from the Machine enrollment guide on resize and checkout refresh ($target)",
+    async ({ target, nextField }) => {
+      const refreshProjects = vi.fn();
+      request.mockResolvedValue({ status: "connected" });
+      await mount(true, {
+        workflow: savedVm,
+        projects: [project],
+        refreshProjects,
+        vmExecutionAvailable: true,
+        organizationAdmin: true,
+        openExecutionSettings: true,
+      });
+      if (target === "Machine") await chooseTarget("machine");
+      await updateBuilder({ projects: [] });
+      await act(() => recoveryButton("Refresh checkouts").props.onClick());
+      expect(refreshProjects).toHaveBeenCalledOnce();
+
+      const guide = () =>
+        renderer!.root
+          .findAllByType("details")
+          .find((item) => visibleText(item.findByType("summary")) === "Where to connect")!;
+      const summary = () => field("machine-enrollment-guide");
+      const dockedSummary = summary();
+      dockedSummary.focus();
+      await act(() =>
+        guide()
+          .findByType("summary")
+          .props.onClick({ preventDefault() {} }),
+      );
+      expect(guide().props.open).toBe(true);
+
+      await changeWidth(800);
+
+      expect(guide().props.open).toBe(true);
+      const sheetSummary = summary();
+      expect(sheetSummary !== dockedSummary).toBe(true);
+      expect(focusDocument.activeElement === sheetSummary).toBe(true);
+
+      await changeWidth(1200);
+
+      expect(guide().props.open).toBe(true);
+      expect(focusDocument.activeElement === summary()).toBe(true);
+
+      await updateBuilder({ projects: [project] });
+
+      expect(guide()).toBeUndefined();
+      expect(focusDocument.activeElement === field(nextField)).toBe(true);
+      expect(editor().definition.target).toEqual(
+        (target === "Machine" ? savedMachine : savedVm).definition.target,
+      );
+    },
+  );
+
+  it("blocks saving a switch to Machine if its checkout disappears", async () => {
+    request.mockResolvedValue({ status: "connected" });
+    await mount(true, {
+      workflow: savedVm,
+      projects: [project],
+      vmExecutionAvailable: true,
+      organizationAdmin: true,
+      openExecutionSettings: true,
+    });
+    await chooseTarget("machine");
+    expect(editor().definition.target).toEqual(savedMachine.definition.target);
+    expect(editor().targetConfirmed).toBe(true);
+
+    await updateBuilder({ projects: [] });
+    request.mockClear();
+
+    await submit();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(editor().definition.target).toEqual(savedMachine.definition.target);
+    expect(editor().baseline).toEqual(savedVm);
+    expect(visibleText(settings())).toContain("No Machine checkout available");
+    const guide = settings()
+      .findAllByType("details")
+      .find((item) => visibleText(item.findByType("summary")) === "Where to connect");
+    expect(guide).toBeDefined();
+    expect(visibleText(guide!)).toContain("Settings → Organization → Machines");
+    const refresh = field("refresh-checkouts");
+    expect(focusDocument.activeElement).toBe(refresh);
+
+    await act(() => recoveryButton("Refresh checkouts").props.onClick({ currentTarget: refresh }));
+    await updateBuilder({ projects: [project] });
+
+    expect(recoveryButton("Refresh checkouts")).toBeUndefined();
+    expect(focusDocument.activeElement === field("checkout")).toBe(true);
+    expect(editor().definition.target).toEqual(savedMachine.definition.target);
   });
 });
 
