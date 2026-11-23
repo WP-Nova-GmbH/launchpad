@@ -32,7 +32,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TYPOGRAPHY_ADVANCED_STORAGE_KEY } from "../../appearanceFonts";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
-import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
+import {
+  retryT3ConnectSignIn,
+  T3_CONNECT_SIGN_IN_ERROR,
+  useT3ConnectAuthPrompt,
+} from "../clerk/useT3ConnectAuthPrompt";
 import { useCompleteOnboarding } from "../../onboarding/firstRun";
 import {
   groupOnboardingProjects,
@@ -409,7 +413,8 @@ function ConnectAccountOption({
 }) {
   const { environments } = useEnvironments();
   const { isLoaded, isSignedIn } = useAuth({ treatPendingAsSignedOut: false });
-  const { openAuthPrompt } = useT3ConnectAuthPrompt();
+  const { status, openAuthPrompt } = useT3ConnectAuthPrompt();
+  const signInLoading = status !== "error" && (!isLoaded || status === "loading");
   const [expanded, setExpanded] = useState(true);
   const [discoveryReady, setDiscoveryReady] = useState(false);
   const onDiscoveryReady = useCallback(() => setDiscoveryReady(true), []);
@@ -418,9 +423,12 @@ function ConnectAccountOption({
     <div className="rounded-lg border border-border bg-background">
       <Collapsible open={expanded && !!isSignedIn && discoveryReady} onOpenChange={setExpanded}>
         <CollapsibleTrigger
-          disabled={disabled || !isLoaded}
+          disabled={disabled || signInLoading}
           onClick={(event) => {
-            if (!isSignedIn) {
+            if (status === "error") {
+              event.preventDefault();
+              retryT3ConnectSignIn();
+            } else if (!isSignedIn) {
               event.preventDefault();
               setExpanded(true);
               openAuthPrompt();
@@ -433,13 +441,15 @@ function ConnectAccountOption({
           <CloudIcon className="size-4 text-muted-foreground" />
           <span className="flex-1 text-left">Launchpad Connect</span>
           <span className="text-xs text-muted-foreground">
-            {!isLoaded
-              ? "Loading sign-in…"
-              : !isSignedIn
-                ? "Sign in"
-                : !discoveryReady
-                  ? "Loading computers…"
-                  : null}
+            {status === "error"
+              ? "Retry sign-in"
+              : signInLoading
+                ? "Loading sign-in…"
+                : !isSignedIn
+                  ? "Sign in"
+                  : !discoveryReady
+                    ? "Loading computers…"
+                    : null}
           </span>
           <ChevronRightIcon
             className={cn("size-4 text-muted-foreground", expanded && isSignedIn && "rotate-90")}
@@ -472,6 +482,11 @@ function ConnectAccountOption({
           </div>
         </CollapsiblePanel>
       </Collapsible>
+      {status === "error" ? (
+        <p role="alert" className="px-3 pb-3 text-xs text-muted-foreground">
+          {T3_CONNECT_SIGN_IN_ERROR}
+        </p>
+      ) : null}
     </div>
   );
 }

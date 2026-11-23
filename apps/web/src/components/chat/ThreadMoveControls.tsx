@@ -65,7 +65,7 @@ import { MiddleTruncate } from "../ui/middle-truncate";
 import { useCloudLinkController } from "../../cloud/useCloudLinkController";
 import { threadVmRepositoryEligibilityAtom } from "../../cloud/managedRelayState";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
-import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
+import { T3ConnectSignInButton } from "../clerk/T3ConnectSignInButton";
 import { environmentCatalog } from "../../connection/catalog";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ComposerControl } from "./ComposerControl";
@@ -393,15 +393,6 @@ export function CurrentThreadLocation(props: {
         {...props}
       />
     </>
-  );
-}
-
-function SignInForMoves() {
-  const { openAuthPrompt } = useT3ConnectAuthPrompt();
-  return (
-    <Button size="xs" variant="secondary" onClick={openAuthPrompt}>
-      Sign in
-    </Button>
   );
 }
 
@@ -1191,7 +1182,7 @@ function RunOnPicker({
               <>
                 <p>{blocker ?? vmRepositoryBlocker}</p>
                 {!session && hasCloudPublicConfig() && relayUrl ? (
-                  <SignInForMoves />
+                  <T3ConnectSignInButton size="xs" variant="secondary" />
                 ) : session && thread && config && !thread.archivedAt && unavailable ? (
                   <Button
                     size="xs"

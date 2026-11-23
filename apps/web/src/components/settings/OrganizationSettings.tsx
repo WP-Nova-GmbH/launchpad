@@ -50,7 +50,7 @@ import {
   type OrganizationAdminState,
 } from "../../cloud/organizationAdmin";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
-import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
+import { T3ConnectSignInButton } from "../clerk/T3ConnectSignInButton";
 import {
   AlertDialog,
   AlertDialogClose,
@@ -1773,16 +1773,6 @@ function OrganizationSettingsNotice({
 }
 
 /**
- * Signing in from the page that told you to. The sidebar carries the same
- * action, but a person who opened Organization settings is already here.
- */
-function OrganizationSignInButton() {
-  const { openAuthPrompt } = useT3ConnectAuthPrompt();
-
-  return <Button onClick={openAuthPrompt}>Sign in</Button>;
-}
-
-/**
  * Split from `OrganizationSettings` because the state hook reads Clerk, and
  * `ClerkProvider` is only mounted when Launchpad Connect is configured. Calling the
  * hook above that check would crash the app on a build without it.
@@ -1803,7 +1793,7 @@ function ConfiguredOrganizationSettings() {
     return (
       <OrganizationSettingsNotice
         title="Sign in to Launchpad Connect"
-        action={<OrganizationSignInButton />}
+        action={<T3ConnectSignInButton />}
       >
         Your organization is created the first time you ask for it, so signing in is all it takes.
       </OrganizationSettingsNotice>

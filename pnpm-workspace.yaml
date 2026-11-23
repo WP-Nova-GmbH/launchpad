@@ -29,6 +29,7 @@ catalog:
   "@clerk/expo": 4.6.8
   "@clerk/react": 6.16.1
   "@clerk/shared": 4.33.0
+  "@clerk/ui": 1.33.1
   "@effect/atom-react": 4.0.0-rc.115
   "@effect/openapi-generator": 4.0.0-rc.115
   "@effect/platform-node": 4.0.0-rc.115
@@ -135,6 +136,10 @@ overrides:
   "@clerk/expo": "catalog:"
   "@clerk/react": "catalog:"
   "@clerk/shared": "catalog:"
+  # Desktop serves the prebuilt browser assets from this package.
+  "@clerk/ui@1.33.1>@solana/wallet-adapter-base": "-"
+  "@clerk/ui@1.33.1>@solana/wallet-adapter-react": "-"
+  "@clerk/ui@1.33.1>@solana/wallet-standard": "-"
   "@effect/atom-react": "catalog:"
   "@effect/platform-node": "catalog:"
   "@effect/platform-node-shared": "catalog:"

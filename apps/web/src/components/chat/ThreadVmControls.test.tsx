@@ -68,6 +68,8 @@ const fixture = vi.hoisted(() => ({
   refresh: vi.fn(),
   navigate: vi.fn(),
   signedIn: false,
+  clerkStatus: "ready" as "loading" | "error" | "ready",
+  openSignIn: vi.fn(),
   session: { accountId: "owner" },
   checkLocation: vi.fn(),
   openThread: vi.fn(),
@@ -314,7 +316,17 @@ vi.mock("../../cloud/useCloudLinkController", () => ({ useCloudLinkController: v
 vi.mock("../../cloud/publicConfig", () => ({
   hasCloudPublicConfig: () => fixture.cloudConfigured,
 }));
-vi.mock("../clerk/useT3ConnectAuthPrompt", () => ({ useT3ConnectAuthPrompt: vi.fn() }));
+vi.mock("@clerk/react", () => ({
+  useClerk: () => ({
+    get status() {
+      return fixture.clerkStatus;
+    },
+    get loaded() {
+      return fixture.clerkStatus === "ready";
+    },
+    openSignIn: fixture.openSignIn,
+  }),
+}));
 vi.mock("../../connection/catalog", () => ({ environmentCatalog: {} }));
 vi.mock("./MovedThreadDraftRecovery", () => ({ MovedThreadDraftRecovery: () => null }));
 vi.mock("./ThreadVmAccountPreference", () => ({
@@ -482,6 +494,7 @@ beforeEach(() => {
   fixture.authAction.mockResolvedValue(AsyncResult.success({}));
   fixture.navigate.mockReset();
   fixture.signedIn = false;
+  fixture.clerkStatus = "ready";
   fixture.checkLocation.mockReset();
   fixture.checkLocation.mockResolvedValue(AsyncResult.success({}));
   fixture.location = null;
@@ -555,6 +568,38 @@ async function openConfirmation(kind: "reset" | "delete" | "backup", chat = fals
 }
 
 describe("simplified VM controls", () => {
+  it("waits for Launchpad Connect before offering sign-in, and reloads after startup fails", async () => {
+    const href = "https://launchpad.example.test/project/thread";
+    const reload = vi.fn();
+    vi.stubGlobal("window", { location: { href, reload } });
+    fixture.cloudConfigured = true;
+    fixture.clerkStatus = "loading";
+    await mount(true);
+    await openRunOn();
+
+    expect(button("Loading sign-in…").props.disabled).toBe(true);
+    expect(button("Sign in")).toBeUndefined();
+    expect(fixture.openSignIn).not.toHaveBeenCalled();
+
+    fixture.clerkStatus = "error";
+    await act(async () => renderer!.update(view(true)));
+    expect(
+      renderer!.root.findAllByProps({ role: "alert" }).map((node) => node.children.join("")),
+    ).toContain("Could not load Launchpad Connect sign-in.");
+    await act(async () => button("Retry sign-in").props.onClick());
+    expect(reload).toHaveBeenCalledExactlyOnceWith();
+    expect(fixture.openSignIn).not.toHaveBeenCalled();
+
+    fixture.clerkStatus = "ready";
+    await act(async () => renderer!.update(view(true)));
+    expect(button("Retry sign-in")).toBeUndefined();
+    await act(async () => button("Sign in").props.onClick());
+    expect(fixture.openSignIn).toHaveBeenCalledExactlyOnceWith({
+      forceRedirectUrl: href,
+      signUpForceRedirectUrl: href,
+    });
+  });
+
   it("does not reopen the same destination or show a second notice while opening a moved thread", async () => {
     fixture.signedIn = true;
     fixture.location = {
