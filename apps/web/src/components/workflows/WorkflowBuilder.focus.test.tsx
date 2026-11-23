@@ -220,6 +220,12 @@ vi.mock("./WorkflowStepEditor", () => ({
             repair,
           )
         : null,
+      step.kind === "review"
+        ? createElement("button", {
+            "data-focus-key": `${step.id}:rework`,
+            ref: (node: HTMLElement | null) => props.registerField("rework", node),
+          })
+        : null,
       createElement("button", {
         "aria-label": "Step actions",
         "data-focus-key": `${step.id}:actions`,
@@ -235,11 +241,8 @@ vi.mock("./WorkflowStepEditor", () => ({
         onClick: () => props.onRequestMove(step, 1),
       }),
       createElement("button", {
-        "aria-label": "Remove only step",
-        onClick: () => {
-          props.change([]);
-          props.select("");
-        },
+        "aria-label": "Remove step from inspector",
+        onClick: () => props.onRequestRemove(step),
       }),
     );
   },
@@ -300,9 +303,11 @@ vi.mock("../ui/sheet", () => ({
     children,
     initialFocus,
     finalFocus,
+    inert,
   }: PropsWithChildren<{
     initialFocus: () => boolean | HTMLElement | null | void;
     finalFocus: () => boolean | HTMLElement | null | void;
+    inert?: boolean;
   }>) => {
     initialSheetFocus = initialFocus;
     useLayoutEffect(() => {
@@ -316,7 +321,7 @@ vi.mock("../ui/sheet", () => ({
         });
       };
     }, []);
-    return children;
+    return createElement("div", { "data-testid": "inspector-sheet", inert }, children);
   },
   SheetTitle: ({ children }: PropsWithChildren) => children,
 }));
@@ -503,9 +508,11 @@ async function mount(
                       : props.children === "Check saved version" ||
                           props.children === "Retry original save"
                         ? "recovery"
-                        : props.children === "Keep current order"
-                          ? "keep-current-order"
-                          : null;
+                        : props.children === "Keep step"
+                          ? "keep-step"
+                          : props.children === "Keep current order"
+                            ? "keep-current-order"
+                            : null;
         if (!key) return null;
         const cacheKey = `${presentation}:${key}`;
         let node = cache.get(cacheKey);
@@ -822,6 +829,208 @@ describe("Step movement", () => {
   });
 });
 
+describe("Step removal", () => {
+  const releaseNotes: WorkflowStep = {
+    kind: "input",
+    id: "release-notes",
+    title: "Release notes",
+    question: "What should the release notes include?",
+    role: "member",
+  };
+  const push: WorkflowStep = { kind: "action", id: "push", title: "Push branch", action: "push" };
+  const removalDialog = stepConfirmation;
+  const inspectorSheet = () => renderer!.root.findByProps({ "data-testid": "inspector-sheet" });
+  async function requestRemoval(stepId: string) {
+    await act(() => canvas().props.onSelect(stepId));
+    field(`${stepId}:actions`).focus();
+    await act(() =>
+      renderer!.root.findByProps({ "aria-label": "Remove step from inspector" }).props.onClick(),
+    );
+  }
+
+  it("removes an independent step immediately and focuses its neighbor", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    await setSteps([agent!, releaseNotes, review!]);
+
+    await requestRemoval(releaseNotes.id);
+
+    expect(removalDialog()).toBeUndefined();
+    expect(draft().definition.steps).toEqual([agent, review]);
+    expect(draft().selectedStepId).toBe("review");
+    expect(focusDocument.activeElement).toBe(field("review:title"));
+  });
+
+  it("keeps the resized inspector inert until the removal confirmation restores focus", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    if (review?.kind !== "review") throw new Error("Expected a Review step");
+    const steps = [agent!, releaseNotes, { ...review, reworkStepId: "agent" }];
+    await setSteps(steps);
+    await requestRemoval("agent");
+
+    const confirmation = removalDialog()!;
+    const keep = field("keep-step");
+    expect(visibleText(confirmation)).toContain("Review changes loses its rework Agent");
+    expect(focusDocument.activeElement).toBe(keep);
+
+    await changeWidth(800);
+    expect(removalDialog()).toBe(confirmation);
+    expect(focusDocument.activeElement).toBe(keep);
+    expect(inspectorSheet().props.inert).toBe(true);
+
+    const actions = field("agent:actions");
+    const restore = actions.focus.bind(actions);
+    const restoreFocus = vi.spyOn(actions, "focus").mockImplementation((options) => {
+      expect(inspectorSheet().props.inert).toBeFalsy();
+      restore(options);
+    });
+    try {
+      await act(() => recoveryButton("Keep step").props.onClick());
+
+      expect(restoreFocus).toHaveBeenCalledOnce();
+    } finally {
+      restoreFocus.mockRestore();
+    }
+
+    expect(removalDialog()).toBeUndefined();
+    expect(inspectorSheet().props.inert).toBeFalsy();
+    expect(draft().definition.steps).toEqual(steps);
+    expect(draft().selectedStepId).toBe("agent");
+    expect(focusDocument.activeElement).toBe(actions);
+  });
+
+  it("keeps the Review's explicit rework reference and focuses its repair after confirmation", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    if (review?.kind !== "review") throw new Error("Expected a Review step");
+    const earlier = { ...agent!, id: "plan", title: "Plan change" };
+    await setSteps([earlier, agent!, releaseNotes, { ...review, reworkStepId: "agent" }]);
+    await requestRemoval("agent");
+
+    const confirmation = removalDialog()!;
+    expect(visibleText(confirmation)).toContain("Choose another earlier Agent");
+    expect(draft().definition.steps).toHaveLength(4);
+    await act(() => recoveryButton("Remove step").props.onClick());
+
+    expect(draft().selectedStepId).toBe("review");
+    expect(draft().definition.steps.at(-1)).toMatchObject({ reworkStepId: "agent" });
+    expect(workflowDraftIssue(draft().definition)).toMatchObject({
+      stepId: "review",
+      field: "rework",
+    });
+    expect(focusDocument.activeElement).toBe(field("review:rework"));
+  });
+
+  it("keeps an Open PR confirmation after a sheet resize and an equivalent steps replacement", async () => {
+    width = 800;
+    await mount();
+    const [agent] = draft().definition.steps;
+    await setSteps([agent!, push, releaseNotes, openPrStep]);
+    await requestRemoval(push.id);
+    const confirmation = removalDialog()!;
+    expect(visibleText(confirmation)).toContain("Open PR will be blocked");
+    expect(focusDocument.activeElement).toBe(field("keep-step"));
+
+    await changeWidth(1200);
+    await setSteps(draft().definition.steps.map((step) => ({ ...step })));
+    expect(removalDialog()).toBe(confirmation);
+    expect(focusDocument.activeElement).toBe(field("keep-step"));
+    expect(recoveryButton("Remove step").props.disabled).toBe(false);
+
+    await act(() => recoveryButton("Remove step").props.onClick());
+
+    expect(draft().definition.steps).toEqual([agent, releaseNotes, openPrStep]);
+    expect(draft().selectedStepId).toBe(openPrStep.id);
+    expect(focusDocument.activeElement).toBe(field("open-pr:repair"));
+  });
+
+  it("removes a Push branch immediately when Open PR can use an earlier Push branch", async () => {
+    await mount();
+    const [agent] = draft().definition.steps;
+    const earlierPush = { ...push, id: "earlier-push" };
+    await setSteps([agent!, earlierPush, push, openPrStep]);
+
+    await requestRemoval(push.id);
+
+    expect(removalDialog()).toBeUndefined();
+    expect(draft().definition.steps).toEqual([agent, earlierPush, openPrStep]);
+    expect(workflowDraftIssue(draft().definition)).toBeNull();
+  });
+
+  it("names the earlier Agent before changing an implicit Review rework target", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    const earlierAgent = { ...agent!, id: "plan", title: "Plan change" };
+    await setSteps([earlierAgent, agent!, review!]);
+
+    await requestRemoval("agent");
+
+    expect(visibleText(removalDialog()!)).toContain(
+      "Review changes will send rework to Plan change",
+    );
+    await act(() => recoveryButton("Remove step").props.onClick());
+
+    expect(draft().definition.steps).toEqual([earlierAgent, review]);
+    expect(workflowDraftIssue(draft().definition)).toBeNull();
+    expect(focusDocument.activeElement).toBe(field("review:rework"));
+  });
+
+  it("reports when Review will inspect a different Agent result without changing its explicit rework target", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    if (review?.kind !== "review") throw new Error("Expected a Review step");
+    const plan = { ...agent!, id: "plan", title: "Plan change" };
+    const implement = { ...agent!, title: "Implement change" };
+    const explicitReview = { ...review, reworkStepId: plan.id };
+    const steps = [plan, implement, explicitReview];
+    await setSteps(steps);
+
+    await requestRemoval(implement.id);
+
+    const confirmation = removalDialog()!;
+    expect(visibleText(confirmation)).toContain(
+      "Review changes will inspect a different saved result",
+    );
+    expect(visibleText(confirmation)).toContain("saved result from Plan change");
+    expect(draft().definition.steps).toEqual(steps);
+
+    await act(() => recoveryButton("Remove step").props.onClick());
+
+    expect(draft().definition.steps).toEqual([plan, explicitReview]);
+    expect(draft().selectedStepId).toBe(review.id);
+    expect(focusDocument.activeElement).toBe(field("review:title"));
+    expect(workflowDraftIssue(draft().definition)).toBeNull();
+  });
+
+  it("names same-titled publishing steps and the Agent now providing their saved result", async () => {
+    await mount();
+    const [agent] = draft().definition.steps;
+    const originalAgent = { ...agent!, id: "plan" };
+    await setSteps([
+      originalAgent,
+      agent!,
+      { ...push, title: "Publish" },
+      { ...openPrStep, title: "Publish" },
+    ]);
+
+    await requestRemoval("agent");
+
+    const confirmation = removalDialog()!;
+    expect(visibleText(confirmation)).toContain("Remove Agent (step 2)?");
+    const warnings = confirmation.findAllByType("li").map(visibleText);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain("Publish (step 3) will publish a different saved result");
+    expect(warnings[1]).toContain("Publish (step 4) will publish a different saved result");
+    for (const warning of warnings) expect(warning).toContain("saved result from Agent (step 1)");
+
+    await act(() => recoveryButton("Remove step").props.onClick());
+
+    expect(draft().definition.steps.map((step) => step.id)).toEqual(["plan", "push", "open-pr"]);
+    expect(workflowDraftIssue(draft().definition)).toBeNull();
+  });
+});
+
 describe("Editor validation focus", () => {
   it("returns focus to the settings opener after submitting a blank branch from its input", async () => {
     request.mockResolvedValue({ status: "connected" });
@@ -1046,10 +1255,19 @@ describe("Inspector presentation focus", () => {
     async (editorWidth) => {
       width = editorWidth;
       await mount();
+      await act(() =>
+        editWorkflowDraft(scope, id(), (current) => ({
+          ...current,
+          definition: {
+            ...current.definition,
+            steps: current.definition.steps.filter((step) => step.id === "agent"),
+          },
+        })),
+      );
       await inspect();
       field("agent:title").focus();
       await act(() =>
-        renderer!.root.findByProps({ "aria-label": "Remove only step" }).props.onClick(),
+        renderer!.root.findByProps({ "aria-label": "Remove step from inspector" }).props.onClick(),
       );
       expect(draft().definition.steps).toEqual([]);
       expect(focusDocument.activeElement).toBe(field("add-step"));

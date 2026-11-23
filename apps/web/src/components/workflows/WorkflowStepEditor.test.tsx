@@ -21,7 +21,6 @@ import {
   type WorkflowStep,
   type WorkflowVmModelCatalog,
 } from "@t3tools/contracts/workflows";
-import { workflowDraftIssue } from "@t3tools/client-runtime/relay/workflow-session";
 import type { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { workflowVmCodexInstanceId } from "../settings/workflowModels";
 
@@ -247,6 +246,7 @@ function connectMachine() {
 let renderer: ReactTestRenderer | undefined;
 let definition: WorkflowDefinition = original;
 let selectedId = "";
+const requestRemoval = vi.fn<(step: WorkflowStep) => boolean>();
 function Harness({
   initial = original,
   selection = "implement",
@@ -270,7 +270,7 @@ function Harness({
     <WorkflowStepEditor
       definition={current}
       selectedId={selected}
-      select={select}
+      onRequestRemove={requestRemoval}
       change={change}
       onRequestMove={(step, offset) => {
         const index = steps.indexOf(step);
@@ -335,6 +335,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   machine.environment.mockReset().mockReturnValue(null);
   machine.project.mockReset().mockReturnValue(null);
+  requestRemoval.mockReset().mockReturnValue(true);
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -812,24 +813,14 @@ describe("Workflow step editing", () => {
     expect(definition.steps[0]?.title).toBe("Build change");
     expect(definition.steps[1]?.title).toBe("Plan");
   });
-  it("keeps invalidated rework IDs visible rather than retargeting after removal", async () => {
-    await mount();
+  it("leaves the selected step intact when requesting removal from Step actions", async () => {
+    await mount({ selection: "implement" });
+
     await click("Remove step");
-    expect(selectedId).toBe("review");
-    expect(definition.steps.map((step) => step.id)).toEqual(["plan", "review"]);
-    expect(definition.steps[1]).toMatchObject({ reworkStepId: "implement" });
-    expect(workflowDraftIssue(definition)).toMatchObject({ stepId: "review", field: "rework" });
-    expect(JSON.stringify(renderer!.toJSON())).toContain("Unavailable Agent step");
-    expect(visibleText(renderer!.root)).toContain(
-      "The saved Agent is no longer available. Choose an earlier Agent.",
-    );
-  });
-  it("removing the last step leaves an explicit empty, invalid draft", async () => {
-    await mount({ initial: { ...original, steps: [original.steps[0]!] }, selection: "plan" });
-    await click("Remove step");
-    expect(definition.steps).toEqual([]);
-    expect(selectedId).toBe("");
-    expect(workflowDraftIssue(definition)).not.toBeNull();
+
+    expect(requestRemoval).toHaveBeenCalledExactlyOnceWith(original.steps[1]);
+    expect(selectedId).toBe("implement");
+    expect(definition.steps).toEqual(original.steps);
   });
   it("never falls back to editing the first step for an absent selection", async () => {
     await mount({ selection: "missing" });

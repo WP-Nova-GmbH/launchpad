@@ -59,6 +59,8 @@ import {
   workflowStepMoveImpacts,
   type WorkflowStepMoveImpact,
 } from "./workflowStepMove";
+import { WorkflowStepRemovalDialog } from "./WorkflowStepRemovalDialog";
+import { workflowStepRemovalImpacts, type WorkflowStepRemovalImpact } from "./workflowStepRemoval";
 import { WorkflowCanvas, workflowInsertionIndex, type WorkflowInsertion } from "./WorkflowCanvas";
 import { Sheet, SheetPopup, SheetTitle } from "../ui/sheet";
 import {
@@ -970,16 +972,29 @@ function WorkflowBuilderWorkspace({
     steps: ReadonlyArray<WorkflowStep>;
     impacts: ReadonlyArray<WorkflowStepMoveImpact>;
   } | null>(null);
-  const stepConfirmationOpen = !!stepMove;
+  const [stepRemoval, setStepRemoval] = useState<{
+    step: WorkflowStep;
+    steps: ReadonlyArray<WorkflowStep>;
+    impacts: ReadonlyArray<WorkflowStepRemovalImpact>;
+  } | null>(null);
+  const stepConfirmationOpen = !!(stepMove || stepRemoval);
+  const stepRemovalApplied = useRef(false);
+  const [lastStepRemoval, setLastStepRemoval] = useState<{
+    steps: ReadonlyArray<WorkflowStep>;
+    name: string;
+  } | null>(null);
   const [lastStepMove, setLastStepMove] = useState<{
     steps: ReadonlyArray<WorkflowStep>;
     stepId: string;
     message: string;
   } | null>(null);
+  const removalNotice =
+    lastStepRemoval?.steps === draft.definition.steps ? `${lastStepRemoval.name} removed` : "";
   const moveNotice =
     lastStepMove?.steps === draft.definition.steps && lastStepMove.stepId === draft.selectedStepId
       ? lastStepMove.message
       : "";
+  const stepNotice = removalNotice || moveNotice;
   const presentation = useRef<boolean | null>(null);
   const panelIdentity = useRef<string | null>(null);
   const sheetReady = useRef(false);
@@ -1081,6 +1096,15 @@ function WorkflowBuilderWorkspace({
   const questionReviewControl = useRef<HTMLButtonElement>(null);
   const questionFocusPending = useRef(false);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
+  const removalBlockedReason = stepRemoval
+    ? pending
+      ? "Wait for the save to finish before removing this step."
+      : selected?.id !== stepRemoval.step.id ||
+          (stepRemoval.steps !== draft.definition.steps &&
+            !equivalentWorkflowSteps(stepRemoval.steps, draft.definition.steps))
+        ? "Workflow steps changed. Keep the step and reopen Remove step to review the current effects."
+        : null
+    : null;
   const moveBlockedReason = stepMove
     ? pending
       ? "Wait for the save to finish before moving this step."
@@ -1363,7 +1387,51 @@ function WorkflowBuilderWorkspace({
     });
     setStepMove(null);
   };
+  const removeStep = (step: WorkflowStep, impact?: WorkflowStepRemovalImpact) => {
+    const steps = draft.definition.steps;
+    const index = steps.findIndex((entry) => entry.id === step.id);
+    if (index < 0) return false;
+    const nextId = impact?.step.id ?? steps[index + 1]?.id ?? steps[index - 1]?.id ?? "";
+    const remaining = steps.filter((entry) => entry.id !== step.id);
+    let applied = false;
+    edit((current) => {
+      if (current.definition.steps !== steps || current.selectedStepId !== step.id) return current;
+      applied = true;
+      return {
+        ...current,
+        definition: { ...current.definition, steps: remaining },
+        selectedStepId: nextId,
+      };
+    });
+    if (!applied) return false;
+    setLastStepRemoval(impact ? null : { steps: remaining, name: step.title.trim() || "Step" });
+    if (nextId) {
+      const field =
+        !impact || impact.kind === "publishing-retargeted" || impact.kind === "review-result"
+          ? "title"
+          : impact.kind === "publishing-agent"
+            ? "repair-warning"
+            : impact.kind === "publishing-push"
+              ? "repair"
+              : "rework";
+      setFocusRequest({ field, stepId: nextId, scrollIntoView: !!impact });
+    } else {
+      returnFocus.current = fields.current.get("add-step") ?? null;
+      setFocusRequest({ field: "add-step", stepId: null });
+    }
+    return true;
+  };
+  const requestStepRemoval = (step: WorkflowStep) => {
+    if (pending || stepConfirmationOpen || selected?.id !== step.id) return false;
+    const steps = draft.definition.steps;
+    const impacts = workflowStepRemovalImpacts(steps, step.id);
+    if (!impacts.length) return removeStep(step);
+    stepRemovalApplied.current = false;
+    setStepRemoval({ step, steps, impacts });
+    return true;
+  };
   const choose = (id: string) => {
+    setLastStepRemoval(null);
     setLastStepMove(null);
     setFocusRequest(null);
     setSettingsOpen(false);
@@ -2118,10 +2186,10 @@ function WorkflowBuilderWorkspace({
       <p
         role="status"
         className={
-          moveNotice ? "border-b px-4 py-2 text-xs wrap-anywhere text-muted-foreground" : "sr-only"
+          stepNotice ? "border-b px-4 py-2 text-xs wrap-anywhere text-muted-foreground" : "sr-only"
         }
       >
-        {moveNotice}
+        {stepNotice}
       </p>
       <WorkflowStepEditor
         key={selected.id}
@@ -2136,15 +2204,7 @@ function WorkflowBuilderWorkspace({
         openWorkflowSettings={openMachineSettings}
         insertPushBranch={insertPushBranch}
         registerField={(field, node) => registerField(`${selected.id}:${field}`, node)}
-        select={(id) => {
-          select(id);
-          if (id) {
-            setFocusRequest({ field: "title", stepId: id });
-          } else {
-            returnFocus.current = fields.current.get("add-step") ?? null;
-            setFocusRequest({ field: "add-step", stepId: null });
-          }
-        }}
+        onRequestRemove={requestStepRemoval}
         change={(steps) => {
           reorder(steps);
         }}
@@ -2645,6 +2705,22 @@ function WorkflowBuilderWorkspace({
           onKeep={() => setStepMove(null)}
           onMove={confirmStepMove}
           finalFocus={stepActionsReturnTarget}
+        />
+      ) : null}
+      {stepRemoval ? (
+        <WorkflowStepRemovalDialog
+          step={stepRemoval.step}
+          steps={stepRemoval.steps}
+          impacts={stepRemoval.impacts}
+          blockedReason={removalBlockedReason}
+          onKeep={() => setStepRemoval(null)}
+          onRemove={() => {
+            if (removalBlockedReason || !removeStep(stepRemoval.step, stepRemoval.impacts[0]))
+              return;
+            stepRemovalApplied.current = true;
+            setStepRemoval(null);
+          }}
+          finalFocus={() => !stepRemovalApplied.current && stepActionsReturnTarget()}
         />
       ) : null}
     </form>

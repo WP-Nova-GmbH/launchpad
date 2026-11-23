@@ -211,7 +211,7 @@ function PublishingStepSettings({
 export function WorkflowStepEditor({
   definition,
   selectedId,
-  select,
+  onRequestRemove,
   onRequestMove,
   change,
   models,
@@ -226,7 +226,7 @@ export function WorkflowStepEditor({
 }: {
   definition: WorkflowDefinition;
   selectedId: string | null;
-  select: (id: string) => void;
+  onRequestRemove: (step: WorkflowStep) => boolean;
   onRequestMove: (step: WorkflowStep, offset: -1 | 1) => boolean;
   change: (steps: ReadonlyArray<WorkflowStep>) => void;
   models: ReturnType<typeof workflowModelState>;
@@ -248,12 +248,6 @@ export function WorkflowStepEditor({
   const patch = (update: WorkflowStep) => {
     if (disabled) return;
     change(definition.steps.map((entry) => (entry.id === update.id ? update : entry)));
-  };
-  const remove = () => {
-    if (disabled || !step) return;
-    skipMenuFocus.current = true;
-    change(definition.steps.filter((entry) => entry.id !== step.id));
-    select(definition.steps[index + 1]?.id ?? definition.steps[index - 1]?.id ?? "");
   };
   const vm = definition.target.kind === "vm";
   const promptError =
@@ -373,7 +367,13 @@ export function WorkflowStepEditor({
                       </MenuItem>
                     );
                   })}
-                  <MenuItem disabled={disabled} variant="destructive" onClick={remove}>
+                  <MenuItem
+                    disabled={disabled}
+                    variant="destructive"
+                    onClick={() => {
+                      if (!disabled && step) skipMenuFocus.current = onRequestRemove(step);
+                    }}
+                  >
                     Remove step
                   </MenuItem>
                 </MenuPopup>
