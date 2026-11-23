@@ -14,8 +14,35 @@ vi.mock("../ui/checkbox", () => ({
       onClick: () => onCheckedChange(!checked),
     }),
 }));
+type TriggerSourceClient = Pick<WorkflowSources.Client, "repository" | "selection" | "metadata">;
+type TriggerSourceFixture = {
+  client: TriggerSourceClient;
+  enqueue: (read: Effect.Effect<void>) => void;
+  deliveries: Promise<void>[];
+};
+const triggerSources = vi.hoisted(() => ({ current: null as TriggerSourceFixture | null }));
 vi.mock("../../cloud/workflowSources", () => ({
-  useWorkflowSources: () => ({ snapshot: null, loading: false, refresh: vi.fn() }),
+  useWorkflowSources: (
+    _accountId: string,
+    read: (client: TriggerSourceClient, token: string) => Effect.Effect<unknown, unknown>,
+  ) => {
+    const [snapshot, setSnapshot] = useState<unknown>(null);
+    useEffect(() => {
+      const fixture = triggerSources.current;
+      if (!fixture) return;
+      const delivered = deferred<void>();
+      fixture.deliveries.push(delivered.promise);
+      fixture.enqueue(
+        read(fixture.client, "token").pipe(
+          Effect.orDie,
+          Effect.tap((result) => Effect.sync(() => setSnapshot(result))),
+          Effect.ensuring(Effect.sync(() => delivered.resolve())),
+          Effect.asVoid,
+        ),
+      );
+    }, [read]);
+    return { snapshot, loading: false, refresh: vi.fn() };
+  },
 }));
 vi.mock("./WorkflowSources", () => ({
   RepositorySourcesPanel: () => null,
@@ -28,6 +55,8 @@ import {
   createContext,
   createElement,
   useContext,
+  useEffect,
+  useState,
   type PropsWithChildren,
   type ReactElement,
   type ReactNode,
@@ -39,9 +68,18 @@ import {
   RelayMachineId,
   RelayRepositoryId,
   type RelayOrganizationProject,
+  type WorkflowRepositorySources,
+  type WorkflowSourceSelection,
 } from "@t3tools/contracts/relay";
 import { WorkflowConflictError, type RepositoryWorkflow } from "@t3tools/contracts/workflows";
-import { ManagedRelay, type ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
+import {
+  ManagedRelay,
+  type ManagedRelayTenancy,
+  type WorkflowSources,
+} from "@t3tools/client-runtime/relay";
+import { it as effectTest } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Queue from "effect/Queue";
 import {
   workflowDraftAtom,
   workflowSessionKey,
@@ -134,6 +172,7 @@ vi.mock("../ui/combobox", () => {
     }: PropsWithChildren<Record<string, unknown>>) =>
       createElement("button", { role: "combobox", ...props }, children),
     ComboboxPopup: component,
+    ComboboxStatus: component,
     ComboboxList: ({
       children,
     }: {
@@ -323,6 +362,7 @@ beforeEach(() => {
   navigate.mockReset();
   confirmation.mockReset().mockResolvedValue(true);
   read.mockReset();
+  triggerSources.current = null;
   modelIssues.mockReset().mockReturnValue([]);
   refresh.mockReset();
   setWorkflowSessionAccount(appAtomRegistry, null);
@@ -2203,7 +2243,7 @@ describe("VM authoring", () => {
       return write.promise;
     });
     expect(button("Review model")?.props.disabled).toBeFalsy();
-    await click("Save Off only");
+    await click("Turn off automatic runs");
     expect(button("Review model")?.props.disabled).toBe(true);
     await act(() => write.resolve(receipt));
     expect(button("Review model")?.props.disabled).toBeFalsy();
@@ -2259,6 +2299,205 @@ const recoveryTrigger = {
   labelIds: [],
 } as const;
 const recoveryAuto = { enabled: true, trigger: recoveryTrigger };
+
+describe("Automatic trigger footer", () => {
+  const footer = () => renderer!.root.findByType("footer");
+  const text = (node: ReactTestInstance | string): string =>
+    typeof node === "string" ? node : node.children.map(text).join(" ").replace(/\s+/g, " ").trim();
+  const savedState = () =>
+    footer()
+      .findAllByType("p")
+      .find((node) => node.props.role === "status")!;
+  const openTrigger = () =>
+    act(() =>
+      renderer!.root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick(),
+    );
+
+  effectTest.effect("keeps saved Off visible while a verified trigger is ready to enable", () =>
+    Effect.gen(function* () {
+      const repository = {
+        configured: true,
+        canAllow: true,
+        canManage: true,
+        exchangeInProgress: false,
+        eligible: [],
+        sources: [
+          {
+            source: {
+              connectionId: recoveryTrigger.connectionId,
+              organizationId: scope.organizationId,
+              applicationId: "application",
+              workspaceId: "workspace",
+              workspaceName: "Engineering",
+              viewerName: "Maintainer",
+              authorizationEpoch: 1,
+              status: "connected",
+              health: { code: "healthy", retryAt: null },
+              delivery: "verified",
+            },
+            grant: {
+              grantId: recoveryTrigger.grantId,
+              connectionId: recoveryTrigger.connectionId,
+              organizationId: scope.organizationId,
+              repositoryId: scope.repositoryId,
+              generation: 1,
+              revoked: false,
+            },
+          },
+        ],
+      } satisfies WorkflowRepositorySources;
+      const criteria = {
+        authorizationEpoch: 1,
+        team: { id: recoveryTrigger.teamId, name: "Platform" },
+        state: { id: recoveryTrigger.stateId, name: "Ready" },
+        labels: [],
+        issues: [],
+        deliveryReady: true,
+      } satisfies WorkflowSourceSelection;
+      const reads = yield* Queue.unbounded<Effect.Effect<void>>();
+      const deliveries: Promise<void>[] = [];
+      triggerSources.current = {
+        client: {
+          repository: () => Effect.succeed(repository),
+          selection: () => Effect.succeed(criteria),
+          metadata: () => Effect.succeed({ items: [], nextCursor: null }),
+        },
+        enqueue: (read) => Queue.offerUnsafe(reads, read),
+        deliveries,
+      };
+      yield* Effect.forever(Queue.take(reads).pipe(Effect.flatten)).pipe(Effect.forkScoped);
+      const drain = async () => {
+        while (deliveries.length) await act(async () => Promise.all(deliveries.splice(0)));
+      };
+      yield* Effect.promise(async () => {
+        const workflow = {
+          ...saved("trigger-enable", 1, newWorkflowDraft([project])!.definition),
+          automation: { ...recoveryAuto, enabled: false },
+        };
+        await mount({ ...base, workflow, isNew: false, automationSupported: true });
+        await openTrigger();
+        await drain();
+
+        const enable = footer().findByProps({ role: "checkbox" });
+        expect(enable.props.checked).toBe(false);
+        expect(enable.props.disabled).toBe(false);
+        const savedAnnouncement = savedState();
+        await act(() => enable.props.onClick());
+        await drain();
+
+        expect(text(footer().findByType("h3"))).toBe("Automatic runs");
+        expect(savedState()).toBe(savedAnnouncement);
+        expect(text(savedAnnouncement)).toBe("Automatic runs. Saved Off");
+        expect(text(footer())).toContain("Ready to enable");
+        expect(text(footer())).toContain(
+          "Saving will enable this rule for future matching events.",
+        );
+        expect(button("Save workflow", footer())?.props.disabled).toBe(false);
+        expect(editor(workflow.workflowId).automation).toEqual(recoveryAuto);
+        expect(editor(workflow.workflowId).baseline?.automation).toEqual(workflow.automation);
+        expect(read).not.toHaveBeenCalled();
+      });
+    }),
+  );
+
+  it("shows saved On during a draft removal and applies removal through ordinary Save", async () => {
+    const workflow = {
+      ...saved("trigger-remove", 1, newWorkflowDraft([], "review", true)!.definition),
+      automation: recoveryAuto,
+    };
+    read.mockResolvedValueOnce({ status: "connected" });
+    await mount({
+      ...base,
+      workflow,
+      isNew: false,
+      automationSupported: true,
+      vmAuthoring: { models: null },
+      vmAutomationAvailable: true,
+    });
+    const editedName = "Edited workflow name";
+    await rename(editedName);
+    await openTrigger();
+    read.mockClear();
+
+    const savedAnnouncement = savedState();
+    await click("Remove automatic trigger", footer());
+
+    expect(savedState()).toBe(savedAnnouncement);
+    const content = text(footer());
+    expect(text(savedState())).toBe("Automatic runs. Saved On");
+    expect(content).toContain("Trigger removal pending");
+    expect(content).toContain("The saved rule can still start runs until you save the removal.");
+    expect(content).not.toContain("Connection setup needed");
+    const turnOff = button("Turn off automatic runs", footer())!;
+    const description = footer().findByProps({ id: turnOff.props["aria-describedby"] });
+    expect(text(description)).toBe(
+      "Stops new automatic runs and keeps your other workflow edits in the draft.",
+    );
+    expect(editor(workflow.workflowId).baseline?.automation).toEqual(recoveryAuto);
+    expect(read).not.toHaveBeenCalled();
+
+    const automation = { enabled: false, trigger: null };
+    const receipt = {
+      ...workflow,
+      revision: 2,
+      definition: { ...workflow.definition, name: editedName },
+      automation,
+    };
+    read.mockImplementationOnce(async () => {
+      expect(editor(workflow.workflowId).operation).toMatchObject({
+        automation,
+        definition: receipt.definition,
+      });
+      return receipt;
+    });
+    await click("Save workflow", footer());
+
+    expect(read).toHaveBeenCalledOnce();
+    expect(editor(workflow.workflowId).baseline).toEqual(receipt);
+    expect(workflowEditorDirty(editor(workflow.workflowId))).toBe(false);
+    expect(savedState()).toBe(savedAnnouncement);
+    expect(text(savedAnnouncement)).toBe("Automatic runs. Saved Off");
+    expect(text(footer())).not.toContain("Trigger removal pending");
+  });
+
+  it("keeps a pending trigger removal when VM automation becomes unavailable", async () => {
+    const workflow = {
+      ...saved("trigger-removal-outage", 1, newWorkflowDraft([], "review", true)!.definition),
+      automation: recoveryAuto,
+    };
+    const props: Props = {
+      ...base,
+      workflow,
+      isNew: false,
+      automationSupported: true,
+      vmAuthoring: { models: null },
+      vmAutomationAvailable: true,
+    };
+    read.mockResolvedValueOnce({ status: "connected" });
+    await mount(props);
+    await openTrigger();
+    read.mockClear();
+    await click("Remove automatic trigger", footer());
+
+    await act(() =>
+      renderer!.update(
+        <AppAtomRegistryProvider>
+          <WorkflowBuilder {...props} vmAutomationAvailable={false} />
+        </AppAtomRegistryProvider>,
+      ),
+    );
+
+    const warning = text(renderer!.root.findByProps({ title: "Automatic VM runs unavailable" }));
+    expect(warning).toContain(
+      "Trigger removal pending. The saved rule is still enabled. Save the workflow to remove it.",
+    );
+    expect(warning).not.toContain("can still start runs");
+    expect(editor(workflow.workflowId).automation).toEqual({ enabled: false, trigger: null });
+    expect(editor(workflow.workflowId).baseline?.automation).toEqual(recoveryAuto);
+    expect(read).not.toHaveBeenCalled();
+  });
+});
+
 describe("captured automation recovery in the editor", () => {
   for (const committed of [true, false])
     it(`recovers an earlier ${committed ? "committed" : "uncommitted"} Save before validating incomplete edits`, async () => {

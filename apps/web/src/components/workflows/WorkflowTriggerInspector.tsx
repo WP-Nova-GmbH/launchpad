@@ -1,6 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import { useCallback, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffectEvent, useId, useLayoutEffect, useRef, useState } from "react";
 import { WorkflowAutomation, type WorkflowTrigger } from "@t3tools/contracts/workflows";
 import {
   RelayOrganizationId,
@@ -18,6 +18,7 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { CheckIcon, ChevronDownIcon, RefreshCwIcon, XIcon, ZapIcon } from "lucide-react";
 import { useWorkflowSources } from "../../cloud/workflowSources";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import {
@@ -90,6 +91,10 @@ export function WorkflowTriggerInspector({
   const validAutomation = isWorkflowAutomation(value);
   const complete = !!trigger && validAutomation;
   const triggerDirty = !sameWorkflowAutomation(value, savedAutomation);
+  const savedRunsOn = savedAutomation?.enabled === true;
+  const removalPending = !trigger && !!savedAutomation?.trigger;
+  const turnOffPending = complete && savedRunsOn && !value.enabled;
+  const turnOffDescriptionId = useId();
   const [connectionsOpen, setConnectionsOpen] = useState<"connect" | "access" | null>(null);
   const [reconnectKey, setReconnectKey] = useState<string | null>(null);
   const read = useCallback(
@@ -186,11 +191,62 @@ export function WorkflowTriggerInspector({
       Review save status
     </Button>
   ) : null;
-  const saveOff = onSaveOff ? (
-    <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={onSaveOff}>
-      {hasOtherEdits ? "Save Off only" : "Turn off automatic runs"}
-    </Button>
-  ) : null;
+  const saveOff =
+    onSaveOff && !onReviewSave ? (
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={disabled}
+        aria-describedby={turnOffDescriptionId}
+        onClick={onSaveOff}
+      >
+        Turn off automatic runs
+      </Button>
+    ) : null;
+  const turnOffDescription = (
+    <p id={turnOffDescriptionId} className="text-xs text-muted-foreground">
+      {hasOtherEdits
+        ? "Stops new automatic runs and keeps your other workflow edits in the draft."
+        : "Stops new automatic runs. Existing jobs continue."}
+    </p>
+  );
+  const removalDescription = savedRunsOn
+    ? vmTriggerUnavailable
+      ? "The saved rule is still enabled. Save the workflow to remove it."
+      : "The saved rule can still start runs until you save the removal."
+    : "Save the workflow to remove the saved rule.";
+  const footerStatus = removalPending
+    ? ["Trigger removal pending", removalDescription]
+    : !trigger
+      ? null
+      : !complete
+        ? [
+            "Complete the rule to save it",
+            trigger.event === "entered_status" ? "Choose a team and status." : "Choose a team.",
+          ]
+        : turnOffPending
+          ? [
+              "Turn-off pending",
+              saveOff
+                ? "Save workflow also applies your other edits."
+                : "Saving will stop new automatic runs. Existing jobs continue.",
+            ]
+          : connectionUnknown
+            ? ["Connection status unknown"]
+            : !canEnable
+              ? [
+                  selected.loading || (!criteria && !selected.error && editableRule)
+                    ? "Checking trigger readiness…"
+                    : "Cannot enable yet",
+                  !value.enabled ? "You can save the rule with automatic runs off." : undefined,
+                ]
+              : triggerDirty && value.enabled
+                ? savedRunsOn
+                  ? ["Ready to save rule", "Saving will update this rule for future events."]
+                  : ["Ready to enable", "Saving will enable this rule for future matching events."]
+                : null;
+  const cancelTriggerEdits = () => onChange(normalizeWorkflowAutomation(savedAutomation));
   const retrySelection = (
     <Button
       type="button"
@@ -283,10 +339,9 @@ export function WorkflowTriggerInspector({
               </>
             }
           >
-            Automatic runs for VM workflows are unavailable for this repository.
-            {hasOtherEdits && onSaveOff
-              ? " Save Off only to keep your other changes as a draft."
-              : ""}
+            <p>Automatic runs for VM workflows are unavailable for this repository.</p>
+            {removalPending ? <p>Trigger removal pending. {removalDescription}</p> : null}
+            {saveOff ? turnOffDescription : null}
           </WorkflowAlert>
         </div>
       ) : (
@@ -671,6 +726,16 @@ export function WorkflowTriggerInspector({
             </section>
           ) : null}
           <footer className={styles["workflow-trigger-section"]}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-medium">Automatic runs</h3>
+              <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span className="sr-only">Automatic runs. </span>
+                {savedAutomation ? "Saved" : "Before saving"}
+                <Badge variant={savedRunsOn ? "success" : "secondary"}>
+                  {savedRunsOn ? "On" : "Off"}
+                </Badge>
+              </p>
+            </div>
             {trigger ? (
               <label className="flex items-center gap-3 text-sm font-medium">
                 <Checkbox
@@ -683,77 +748,60 @@ export function WorkflowTriggerInspector({
                 Enable automatic runs when saved
               </label>
             ) : null}
-            {vmTarget ? (
+            {vmTarget && trigger ? (
               <p className="text-xs text-muted-foreground">
                 Automatic VM runs can use this repository’s workflow variables and secrets.
               </p>
             ) : null}
-            <div className="space-y-1 text-xs" aria-live="polite">
-              <p className="font-medium">
-                {connectionUnknown
-                  ? "Connection status unknown"
-                  : !trigger
-                    ? "Connection setup needed"
-                    : !complete
-                      ? "Complete the rule to save it"
-                      : !canEnable
-                        ? selected.loading || !criteria
-                          ? "Checking trigger readiness…"
-                          : "Cannot enable yet"
-                        : value.enabled
-                          ? savedAutomation?.enabled
-                            ? "Ready to save rule"
-                            : "Ready to enable"
-                          : "Automatic runs are off"}
-              </p>
-              <p className="text-muted-foreground">
-                Currently {savedAutomation?.enabled ? "on" : "off"}.{" "}
-                {triggerDirty
-                  ? value.enabled
-                    ? savedAutomation?.enabled
-                      ? "Saving will update the rule for future events."
-                      : "Saving will enable automatic runs with this rule."
-                    : savedAutomation?.enabled
-                      ? "Saving will stop new automatic runs. Existing jobs are preserved."
-                      : "Saving will keep automatic runs off."
-                  : value.enabled
-                    ? "Future matching events can start this workflow."
-                    : "Manual runs remain available."}
-              </p>
-              {complete && !value.enabled && !canEnable ? (
-                <p className="text-muted-foreground">
-                  You can save this rule off. Verify readiness before enabling.
-                </p>
-              ) : null}
-              {!complete && trigger ? (
-                <p className="text-muted-foreground">
-                  Choose a team{trigger.event === "entered_status" ? " and status" : ""}, or remove
-                  the incomplete trigger to save the workflow without it.
-                </p>
+            <div className={footerStatus ? "space-y-1 text-xs" : "sr-only"} role="status">
+              {footerStatus ? (
+                <>
+                  <p className="font-medium">{footerStatus[0]}</p>
+                  {footerStatus[1] ? (
+                    <p className="text-muted-foreground">{footerStatus[1]}</p>
+                  ) : null}
+                </>
               ) : null}
             </div>
-            {!onReviewSave ? (
-              <p className="text-xs text-muted-foreground">
-                {hasOtherEdits && onSaveOff
-                  ? "Save Off only to keep your other changes as a draft."
-                  : "Save applies all pending workflow changes. Only future matching events will start runs."}
-              </p>
+            {saveOff ? (
+              <div className="grid justify-items-start gap-2 border-t pt-3">
+                {turnOffDescription}
+                {saveOff}
+              </div>
             ) : null}
             <div className="flex flex-wrap items-center justify-end gap-2">
-              {triggerDirty ? (
-                <div className="mr-auto">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="xs"
-                    disabled={disabled}
-                    onClick={() => onChange(normalizeWorkflowAutomation(savedAutomation))}
-                  >
-                    Cancel trigger edits
-                  </Button>
+              {trigger || triggerDirty ? (
+                <div className="mr-auto flex flex-wrap items-center gap-1">
+                  {triggerDirty && !removalPending ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      disabled={disabled}
+                      onClick={cancelTriggerEdits}
+                    >
+                      Cancel trigger edits
+                    </Button>
+                  ) : null}
+                  {trigger || removalPending ? (
+                    <Button
+                      type="button"
+                      variant={removalPending ? "ghost" : "ghost-destructive"}
+                      size="xs"
+                      disabled={disabled}
+                      onClick={
+                        removalPending
+                          ? cancelTriggerEdits
+                          : () => onChange({ enabled: false, trigger: null })
+                      }
+                    >
+                      {removalPending
+                        ? "Cancel trigger edits"
+                        : `Remove ${complete ? "automatic" : "incomplete"} trigger`}
+                    </Button>
+                  ) : null}
                 </div>
               ) : null}
-              {saveOff}
               {reviewSave ?? (
                 <Button
                   type="button"
@@ -767,19 +815,6 @@ export function WorkflowTriggerInspector({
                 </Button>
               )}
             </div>
-            {trigger ? (
-              <div>
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost-destructive"
-                  disabled={disabled}
-                  onClick={() => onChange({ enabled: false, trigger: null })}
-                >
-                  Remove {complete ? "automatic" : "incomplete"} trigger
-                </Button>
-              </div>
-            ) : null}
           </footer>
         </>
       )}
