@@ -7,6 +7,8 @@ import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { useProject } from "../../state/entities";
 import styles from "./workflowEditor.module.css";
 import {
+  ArrowDownIcon,
+  ArrowUpIcon,
   UploadIcon,
   BotIcon,
   CircleCheckIcon,
@@ -34,6 +36,23 @@ import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
+
+const moveOptions = [
+  {
+    offset: -1,
+    label: "Move up",
+    direction: "Above",
+    boundary: "Already the first step",
+    Icon: ArrowUpIcon,
+  },
+  {
+    offset: 1,
+    label: "Move down",
+    direction: "Below",
+    boundary: "Already the last step",
+    Icon: ArrowDownIcon,
+  },
+] as const;
 
 function PublishingStepSettings({
   definition,
@@ -197,8 +216,8 @@ export function WorkflowStepEditor({
   definition,
   selectedId,
   select,
+  onRequestMove,
   change,
-  move: moveSteps,
   models,
   vmModels,
   targetConfirmed,
@@ -212,8 +231,8 @@ export function WorkflowStepEditor({
   definition: WorkflowDefinition;
   selectedId: string | null;
   select: (id: string) => void;
+  onRequestMove: (step: WorkflowStep, offset: -1 | 1) => boolean;
   change: (steps: ReadonlyArray<WorkflowStep>) => void;
-  move: (steps: ReadonlyArray<WorkflowStep>) => void;
   models: ReturnType<typeof workflowModelState>;
   vmModels?: WorkflowVmModelCatalog | null | undefined;
   targetConfirmed: boolean;
@@ -225,7 +244,7 @@ export function WorkflowStepEditor({
   registerField: (field: string, node: HTMLElement | null) => void;
 }) {
   const id = useId();
-  const removingStep = useRef(false);
+  const skipMenuFocus = useRef(false);
   const { entries, modelOptions } = models;
   const index = definition.steps.findIndex((step) => step.id === selectedId);
   const step = definition.steps[index];
@@ -235,16 +254,9 @@ export function WorkflowStepEditor({
     if (disabled) return;
     change(definition.steps.map((entry) => (entry.id === update.id ? update : entry)));
   };
-  const move = (offset: number) => {
-    const steps = [...definition.steps];
-    const target = index + offset;
-    if (disabled || !step || target < 0 || target >= steps.length) return;
-    [steps[index], steps[target]] = [steps[target]!, steps[index]!];
-    moveSteps(steps);
-  };
   const remove = () => {
     if (disabled || !step) return;
-    removingStep.current = true;
+    skipMenuFocus.current = true;
     change(definition.steps.filter((entry) => entry.id !== step.id));
     select(definition.steps[index + 1]?.id ?? definition.steps[index - 1]?.id ?? "");
   };
@@ -301,10 +313,17 @@ export function WorkflowStepEditor({
                       : "Review"}
               </p>
             </div>
+            <span
+              className="shrink-0 whitespace-nowrap text-muted-foreground text-xs tabular-nums"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              Step {index + 1}
+            </span>
             <div className="flex items-center gap-1">
               <Menu
                 onOpenChange={(open) => {
-                  if (open) removingStep.current = false;
+                  if (open) skipMenuFocus.current = false;
                 }}
               >
                 <MenuTrigger
@@ -316,16 +335,51 @@ export function WorkflowStepEditor({
                 >
                   <EllipsisIcon aria-hidden />
                 </MenuTrigger>
-                <MenuPopup align="end" finalFocus={() => !removingStep.current}>
-                  <MenuItem disabled={disabled || index === 0} onClick={() => move(-1)}>
-                    Move up
-                  </MenuItem>
-                  <MenuItem
-                    disabled={disabled || index === definition.steps.length - 1}
-                    onClick={() => move(1)}
-                  >
-                    Move down
-                  </MenuItem>
+                <MenuPopup
+                  align="end"
+                  className="w-[min(17rem,calc(100vw-2rem))]"
+                  finalFocus={() => !skipMenuFocus.current}
+                >
+                  {moveOptions.map(({ offset, label, direction, boundary, Icon }) => {
+                    const destination = index + offset;
+                    const neighbor = definition.steps[destination];
+                    const detailId = `${id}-move-${offset}`;
+                    const positionId = `${detailId}-position`;
+                    return (
+                      <MenuItem
+                        key={offset}
+                        label={label}
+                        aria-label={label}
+                        aria-describedby={neighbor ? `${detailId} ${positionId}` : detailId}
+                        disabled={disabled || !neighbor}
+                        onClick={() => {
+                          if (!disabled && neighbor)
+                            skipMenuFocus.current = onRequestMove(step, offset);
+                        }}
+                      >
+                        <Icon aria-hidden />
+                        <span className="grid min-w-0 flex-1 gap-0.5 py-0.5">
+                          <span>{label}</span>
+                          <span
+                            id={detailId}
+                            className="wrap-anywhere text-muted-foreground text-xs"
+                          >
+                            {neighbor
+                              ? `${direction} ${neighbor.title.trim() || "Untitled step"}`
+                              : boundary}
+                          </span>
+                        </span>
+                        {neighbor ? (
+                          <span
+                            id={positionId}
+                            className="shrink-0 whitespace-nowrap text-muted-foreground text-xs tabular-nums"
+                          >
+                            Step {destination + 1}
+                          </span>
+                        ) : null}
+                      </MenuItem>
+                    );
+                  })}
                   <MenuItem disabled={disabled} variant="destructive" onClick={remove}>
                     Remove step
                   </MenuItem>

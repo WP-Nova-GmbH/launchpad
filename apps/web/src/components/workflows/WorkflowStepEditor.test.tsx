@@ -181,7 +181,17 @@ function Harness({
       selectedId={selected}
       select={select}
       change={change}
-      move={change}
+      onRequestMove={(step, offset) => {
+        const index = steps.indexOf(step);
+        const destination = index + offset;
+        const neighbor = steps[destination];
+        if (index === -1 || !neighbor) return false;
+        const next = steps.slice();
+        next[index] = neighbor;
+        next[destination] = step;
+        change(next);
+        return false;
+      }}
       models={models}
       vmModels={vmModels}
       targetConfirmed
@@ -199,13 +209,12 @@ async function mount(props: Parameters<typeof Harness>[0] = {}) {
     renderer = create(<Harness {...props} />);
   });
 }
+const button = (label: string) =>
+  renderer!.root
+    .findAllByType("button")
+    .find((node) => node.props["aria-label"] === label || node.props.children === label)!;
 async function click(label: string) {
-  await act(() =>
-    renderer!.root
-      .findAllByType("button")
-      .find((node) => node.props.children === label)!
-      .props.onClick(),
-  );
+  await act(() => button(label).props.onClick());
 }
 const textParts = (node: ReactTestInstance): ReadonlyArray<string> =>
   node.children.flatMap((child) => (typeof child === "string" ? child : textParts(child)));
@@ -256,7 +265,9 @@ describe("Workflow step editing", () => {
       selection: "input",
     });
     const question = () => renderer!.root.findByType("textarea");
-    const error = renderer!.root.findByProps({ "aria-live": "polite" });
+    const error = renderer!.root
+      .findAllByType("p")
+      .find((node) => node.props["aria-live"] === "polite")!;
     expect(error.children).toHaveLength(0);
     await act(() =>
       renderer!.root
@@ -625,7 +636,19 @@ describe("Workflow step editing", () => {
   });
   it("retains the selected identity and explicit rework target after moving an Agent", async () => {
     await mount();
+    expect(visibleText(button("Move up"))).toBe("Move up Above Plan Step 1");
+    expect(visibleText(button("Move down"))).toBe("Move down Below Review Step 3");
+
     await click("Move up");
+
+    expect(button("Move up").props.disabled).toBe(true);
+    expect(visibleText(button("Move up"))).toBe("Move up Already the first step");
+    expect(visibleText(button("Move down"))).toBe("Move down Below Plan Step 2");
+    expect(
+      renderer!.root
+        .findAllByType("span")
+        .some((node) => node.props["aria-live"] === "polite" && visibleText(node) === "Step 1"),
+    ).toBe(true);
     expect(definition.steps.map((step) => step.id)).toEqual(["implement", "plan", "review"]);
     expect(selectedId).toBe("implement");
     expect(definition.steps[2]).toMatchObject({ reworkStepId: "implement" });

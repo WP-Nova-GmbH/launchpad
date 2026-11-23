@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import {
   WORKFLOW_MAX_STEPS,
   WorkflowAutomation,
+  WorkflowStep as WorkflowStepSchema,
   workflowPublishingPrerequisites,
 } from "@t3tools/contracts/workflows";
 import { WorkflowEditorDepartureGuard } from "./WorkflowEditorDepartureGuard";
@@ -52,6 +53,12 @@ import {
 } from "../ui/alert-dialog";
 import { RadioGroup, RadioGroupItem } from "../ui/radio-group";
 import { WorkflowStepEditor, useWorkflowEditorModels } from "./WorkflowStepEditor";
+import { WorkflowStepMoveDialog } from "./WorkflowStepMoveDialog";
+import {
+  workflowMoveStepTitle,
+  workflowStepMoveImpacts,
+  type WorkflowStepMoveImpact,
+} from "./workflowStepMove";
 import { WorkflowCanvas, workflowInsertionIndex, type WorkflowInsertion } from "./WorkflowCanvas";
 import { Sheet, SheetPopup, SheetTitle } from "../ui/sheet";
 import {
@@ -91,6 +98,23 @@ import {
 } from "./workflowOperations";
 
 const isWorkflowAutomation = Schema.is(WorkflowAutomation);
+const equivalentWorkflowSteps = Schema.toEquivalence(Schema.Array(WorkflowStepSchema));
+
+function adjacentWorkflowStepMove(
+  steps: ReadonlyArray<WorkflowStep>,
+  stepId: string,
+  offset: -1 | 1,
+) {
+  const index = steps.findIndex((step) => step.id === stepId);
+  const destinationIndex = index + offset;
+  const step = steps[index];
+  const destination = steps[destinationIndex];
+  if (!step || !destination) return null;
+  const nextSteps = [...steps];
+  nextSteps[index] = destination;
+  nextSteps[destinationIndex] = step;
+  return { step, destination, destinationIndex, nextSteps };
+}
 
 type DiscardReloadStatus = "loading" | "failed" | "draft-changed" | null;
 
@@ -938,6 +962,24 @@ function WorkflowBuilderWorkspace({
   const [focusVersion, setFocusVersion] = useState(0);
   const focusEpoch = useRef(0);
   const [movementVersion, setMovementVersion] = useState(0);
+  const [stepMove, setStepMove] = useState<{
+    step: WorkflowStep;
+    destination: WorkflowStep;
+    destinationIndex: number;
+    offset: -1 | 1;
+    steps: ReadonlyArray<WorkflowStep>;
+    impacts: ReadonlyArray<WorkflowStepMoveImpact>;
+  } | null>(null);
+  const stepConfirmationOpen = !!stepMove;
+  const [lastStepMove, setLastStepMove] = useState<{
+    steps: ReadonlyArray<WorkflowStep>;
+    stepId: string;
+    message: string;
+  } | null>(null);
+  const moveNotice =
+    lastStepMove?.steps === draft.definition.steps && lastStepMove.stepId === draft.selectedStepId
+      ? lastStepMove.message
+      : "";
   const presentation = useRef<boolean | null>(null);
   const panelIdentity = useRef<string | null>(null);
   const sheetReady = useRef(false);
@@ -1039,6 +1081,15 @@ function WorkflowBuilderWorkspace({
   const questionReviewControl = useRef<HTMLButtonElement>(null);
   const questionFocusPending = useRef(false);
   const selected = draft.definition.steps.find((step) => step.id === draft.selectedStepId);
+  const moveBlockedReason = stepMove
+    ? pending
+      ? "Wait for the save to finish before moving this step."
+      : selected?.id !== stepMove.step.id ||
+          (stepMove.steps !== draft.definition.steps &&
+            !equivalentWorkflowSteps(stepMove.steps, draft.definition.steps))
+        ? "Workflow steps changed. Keep the current order and reopen Step actions to review the move."
+        : null
+    : null;
   const panelOpen = triggerOpen || settingsOpen || !!selected;
   const publishingIssueInInspector =
     issue?.publishing === true &&
@@ -1266,7 +1317,54 @@ function WorkflowBuilderWorkspace({
       current.editors[workflowSessionKey(scope, draft.workflowId)]?.definition.steps === steps
     );
   };
+  const applyStepMove = (
+    steps: ReadonlyArray<WorkflowStep>,
+    stepId: string,
+    nextSteps: ReadonlyArray<WorkflowStep>,
+  ) => {
+    let applied = false;
+    edit((current) => {
+      if (current.definition.steps !== steps || current.selectedStepId !== stepId) return current;
+      applied = true;
+      return { ...current, definition: { ...current.definition, steps: nextSteps } };
+    });
+    if (applied) setMovementVersion((version) => version + 1);
+    return applied;
+  };
+  const requestStepMove = (step: WorkflowStep, offset: -1 | 1) => {
+    if (pending || stepConfirmationOpen || selected?.id !== step.id) return false;
+    const steps = draft.definition.steps;
+    const move = adjacentWorkflowStepMove(steps, step.id, offset);
+    if (!move) return false;
+    const impacts = workflowStepMoveImpacts(steps, move.nextSteps);
+    if (!impacts.length) {
+      applyStepMove(steps, step.id, move.nextSteps);
+      return false;
+    }
+    setStepMove({
+      step: move.step,
+      destination: move.destination,
+      destinationIndex: move.destinationIndex,
+      offset,
+      steps,
+      impacts,
+    });
+    return true;
+  };
+  const confirmStepMove = () => {
+    if (!stepMove || moveBlockedReason) return;
+    const steps = draft.definition.steps;
+    const move = adjacentWorkflowStepMove(steps, stepMove.step.id, stepMove.offset);
+    if (!move || !applyStepMove(steps, stepMove.step.id, move.nextSteps)) return;
+    setLastStepMove({
+      steps: move.nextSteps,
+      stepId: move.step.id,
+      message: `Moved ${stepMove.offset === -1 ? "above" : "below"} ${workflowMoveStepTitle(move.destination)}`,
+    });
+    setStepMove(null);
+  };
   const choose = (id: string) => {
+    setLastStepMove(null);
     setFocusRequest(null);
     setSettingsOpen(false);
     setTriggerOpen(false);
@@ -1300,6 +1398,13 @@ function WorkflowBuilderWorkspace({
       );
     if (triggerOpen) return canvasTrigger();
     return settingsOpen ? executionTargetControl.current : null;
+  };
+  const stepActionsReturnTarget = () => {
+    if (!mounted.current) return false;
+    const actions = fields.current.get(`${selected?.id}:actions`);
+    if (actions?.isConnected && !actions.matches(':disabled, [aria-disabled="true"]'))
+      return actions;
+    return inspectorReturnTarget() ?? true;
   };
   const restoreQuestionFocus = () => {
     if (!questionFocusPending.current) return;
@@ -2009,35 +2114,43 @@ function WorkflowBuilderWorkspace({
       </fieldset>
     </div>
   ) : selected ? (
-    <WorkflowStepEditor
-      key={selected.id}
-      definition={draft.definition}
-      selectedId={selected.id}
-      models={models}
-      vmModels={vmAuthoring?.models}
-      targetConfirmed={draft.targetConfirmed}
-      machineCheckoutAvailable={!!target}
-      disabled={pending}
-      close={close}
-      openWorkflowSettings={openMachineSettings}
-      insertPushBranch={insertPushBranch}
-      registerField={(field, node) => registerField(`${selected.id}:${field}`, node)}
-      select={(id) => {
-        select(id);
-        if (id) {
-          setFocusRequest({ field: "title", stepId: id });
-        } else {
-          returnFocus.current = fields.current.get("add-step") ?? null;
-          setFocusRequest({ field: "add-step", stepId: null });
+    <>
+      <p
+        role="status"
+        className={
+          moveNotice ? "border-b px-4 py-2 text-xs wrap-anywhere text-muted-foreground" : "sr-only"
         }
-      }}
-      change={(steps) => {
-        reorder(steps);
-      }}
-      move={(steps) => {
-        if (reorder(steps)) setMovementVersion((version) => version + 1);
-      }}
-    />
+      >
+        {moveNotice}
+      </p>
+      <WorkflowStepEditor
+        key={selected.id}
+        definition={draft.definition}
+        selectedId={selected.id}
+        models={models}
+        vmModels={vmAuthoring?.models}
+        targetConfirmed={draft.targetConfirmed}
+        machineCheckoutAvailable={!!target}
+        disabled={pending}
+        close={close}
+        openWorkflowSettings={openMachineSettings}
+        insertPushBranch={insertPushBranch}
+        registerField={(field, node) => registerField(`${selected.id}:${field}`, node)}
+        select={(id) => {
+          select(id);
+          if (id) {
+            setFocusRequest({ field: "title", stepId: id });
+          } else {
+            returnFocus.current = fields.current.get("add-step") ?? null;
+            setFocusRequest({ field: "add-step", stepId: null });
+          }
+        }}
+        change={(steps) => {
+          reorder(steps);
+        }}
+        onRequestMove={requestStepMove}
+      />
+    </>
   ) : null;
   return (
     <form
@@ -2451,6 +2564,7 @@ function WorkflowBuilderWorkspace({
         />
         {docked && panelOpen ? (
           <aside
+            inert={stepConfirmationOpen}
             aria-label={
               triggerOpen
                 ? "Trigger settings"
@@ -2467,14 +2581,16 @@ function WorkflowBuilderWorkspace({
         {docked === false ? (
           <Sheet
             open={panelOpen}
+            modal={!stepConfirmationOpen}
             onOpenChange={(open) => {
-              if (!open && presentation.current === false) close();
+              if (!open && !stepConfirmationOpen && presentation.current === false) close();
             }}
             onOpenChangeComplete={(open) => {
               if (!open && !panelOpen && presentation.current === false) restoreQuestionFocus();
             }}
           >
             <SheetPopup
+              inert={stepConfirmationOpen}
               showCloseButton={false}
               initialFocus={() => {
                 if (
@@ -2485,12 +2601,15 @@ function WorkflowBuilderWorkspace({
                 )
                   return false;
                 sheetReady.current = true;
+                // The confirmation owns focus when the docked inspector becomes a sheet.
+                if (stepConfirmationOpen) return false;
                 // Restore once before interaction; animation completion must not replay a caret.
                 return !focusPending();
               }}
               finalFocus={() => {
                 if (
                   !mounted.current ||
+                  stepConfirmationOpen ||
                   presentation.current !== false ||
                   returnFocus.current?.getAttribute("data-workflow-question-review")
                 )
@@ -2515,6 +2634,19 @@ function WorkflowBuilderWorkspace({
           </Sheet>
         ) : null}
       </div>
+      {stepMove ? (
+        <WorkflowStepMoveDialog
+          step={stepMove.step}
+          destination={stepMove.destination}
+          destinationIndex={stepMove.destinationIndex}
+          offset={stepMove.offset}
+          impacts={stepMove.impacts}
+          blockedReason={moveBlockedReason}
+          onKeep={() => setStepMove(null)}
+          onMove={confirmStepMove}
+          finalFocus={stepActionsReturnTarget}
+        />
+      ) : null}
     </form>
   );
 }

@@ -5,10 +5,11 @@ import {
   cloneElement,
   createElement,
   useLayoutEffect,
+  useRef,
   type PropsWithChildren,
   type ReactElement,
 } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   createMemoryHistory,
@@ -26,6 +27,7 @@ import {
   WORKFLOW_MAX_STEPS,
   workflowPublishingPrerequisites,
   type RepositoryWorkflow,
+  type WorkflowStep,
 } from "@t3tools/contracts/workflows";
 import {
   RelayMachineId,
@@ -35,6 +37,7 @@ import {
 import {
   updateWorkflowDrafts,
   workflowDraftAtom,
+  workflowDraftIssue,
   workflowSessionKey,
   setWorkflowSessionAccount,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -217,7 +220,20 @@ vi.mock("./WorkflowStepEditor", () => ({
             repair,
           )
         : null,
+      createElement("button", {
+        "aria-label": "Step actions",
+        "data-focus-key": `${step.id}:actions`,
+        ref: (node: HTMLElement | null) => props.registerField("actions", node),
+      }),
       createElement("button", { "aria-label": "Close settings", onClick: props.close }),
+      createElement("button", {
+        "aria-label": "Move up from inspector",
+        onClick: () => props.onRequestMove(step, -1),
+      }),
+      createElement("button", {
+        "aria-label": "Move down from inspector",
+        onClick: () => props.onRequestMove(step, 1),
+      }),
       createElement("button", {
         "aria-label": "Remove only step",
         onClick: () => {
@@ -228,6 +244,43 @@ vi.mock("./WorkflowStepEditor", () => ({
     );
   },
 }));
+vi.mock("../ui/alert-dialog", () => {
+  type FocusTarget = { current: HTMLElement | null } | (() => HTMLElement | boolean | null);
+  const readFocus = (target?: FocusTarget) =>
+    typeof target === "function" ? target() : target?.current;
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "alertdialog" }, children) : null,
+    AlertDialogPopup: ({
+      children,
+      initialFocus,
+      finalFocus,
+    }: PropsWithChildren<{ initialFocus?: FocusTarget; finalFocus?: FocusTarget }>) => {
+      const latestFinal = useRef(finalFocus);
+      latestFinal.current = finalFocus;
+      useLayoutEffect(() => {
+        const opener = focusDocument.activeElement;
+        queueMicrotask(() => {
+          const target = readFocus(initialFocus);
+          if (target && typeof target !== "boolean") target.focus();
+        });
+        return () => {
+          queueMicrotask(() => {
+            const target = readFocus(latestFinal.current);
+            if (target === true) opener?.focus();
+            else if (target) target.focus();
+          });
+        };
+      }, []);
+      return children;
+    },
+    AlertDialogHeader: part,
+    AlertDialogTitle: part,
+    AlertDialogDescription: part,
+    AlertDialogFooter: part,
+  };
+});
 vi.mock("../ui/sheet", () => ({
   Sheet: ({
     open,
@@ -450,7 +503,9 @@ async function mount(
                       : props.children === "Check saved version" ||
                           props.children === "Retry original save"
                         ? "recovery"
-                        : null;
+                        : props.children === "Keep current order"
+                          ? "keep-current-order"
+                          : null;
         if (!key) return null;
         const cacheKey = `${presentation}:${key}`;
         let node = cache.get(cacheKey);
@@ -572,6 +627,199 @@ describe("Save recovery focus", () => {
       expect(focusDocument.activeElement).toBe(moveFocus ? target : field("save"));
     },
   );
+});
+
+const stepConfirmation = () =>
+  renderer!.root.findAllByType("section").find((node) => node.props.role === "alertdialog");
+const visibleText = (node: ReactTestInstance): string =>
+  node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join("");
+const setSteps = (steps: ReadonlyArray<WorkflowStep>) =>
+  act(() =>
+    editWorkflowDraft(scope, id(), (current) => ({
+      ...current,
+      definition: { ...current.definition, steps },
+    })),
+  );
+
+describe("Step movement", () => {
+  const question: WorkflowStep = {
+    kind: "input",
+    id: "question",
+    title: "Deployment note",
+    question: "What should the release notes include?",
+    role: "member",
+  };
+  const push: WorkflowStep = { kind: "action", id: "push", title: "Push branch", action: "push" };
+  const moveNotice = () =>
+    renderer!.root
+      .findAllByProps({ role: "status" })
+      .map(visibleText)
+      .find((text) => text.startsWith("Moved "));
+
+  async function requestMove(stepId: string, direction: "up" | "down" = "up") {
+    await act(() => canvas().props.onSelect(stepId));
+    field(`${stepId}:actions`).focus();
+    await act(() =>
+      renderer!.root
+        .findByProps({ "aria-label": `Move ${direction} from inspector` })
+        .props.onClick(),
+    );
+  }
+
+  it("moves an independent step immediately and keeps its inspector selected", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    await setSteps([question, agent!, review!]);
+
+    await requestMove(question.id, "down");
+
+    expect(stepConfirmation()).toBeUndefined();
+    expect(draft().definition.steps).toEqual([agent, question, review]);
+    expect(draft().selectedStepId).toBe(question.id);
+    expect(focusDocument.activeElement).toBe(field(`${question.id}:actions`));
+  });
+
+  it("previews the new result and rework Agent before moving Review", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    if (review?.kind !== "review") throw new Error("Expected a Review step");
+    const plan = { ...agent!, id: "plan", title: "Plan change" };
+    const implement = { ...agent!, title: "Implement change" };
+    const automaticReview = { ...review, reworkStepId: undefined };
+    const steps = [plan, implement, automaticReview];
+    await setSteps(steps);
+
+    await requestMove(review.id);
+
+    const confirmation = stepConfirmation()!;
+    expect(visibleText(confirmation)).toContain(`Move ${review.title}?`);
+    expect(visibleText(confirmation)).toContain("Above Implement change");
+    expect(visibleText(confirmation)).toContain("Step 2");
+    expect(confirmation.findAllByType("dt").map(visibleText)).toEqual([
+      "Saved result to review",
+      "Send requested changes back to",
+    ]);
+    expect(confirmation.findAllByType("dd").map(visibleText)).toEqual([
+      expect.stringMatching(/Implement change.*Plan change/),
+      expect.stringMatching(/Implement change.*Plan change/),
+    ]);
+    expect(draft().definition.steps).toEqual(steps);
+    expect(focusDocument.activeElement).toBe(field("keep-current-order"));
+
+    await act(() => recoveryButton("Keep current order").props.onClick());
+
+    expect(stepConfirmation()).toBeUndefined();
+    expect(draft().definition.steps).toEqual(steps);
+    expect(focusDocument.activeElement).toBe(field(`${review.id}:actions`));
+
+    await requestMove(review.id);
+    await act(() => recoveryButton("Move step").props.onClick());
+
+    expect(stepConfirmation()).toBeUndefined();
+    expect(draft().definition.steps).toEqual([plan, automaticReview, implement]);
+    expect(draft().selectedStepId).toBe(review.id);
+    expect(focusDocument.activeElement).toBe(field(`${review.id}:actions`));
+    expect(workflowDraftIssue(draft().definition)).toBeNull();
+    expect(moveNotice()).toBe("Moved above Implement change");
+
+    await setSteps([plan, automaticReview, implement, question]);
+    expect(moveNotice()).toBeUndefined();
+
+    await requestMove(review.id, "down");
+    await act(() => recoveryButton("Move step").props.onClick());
+    expect(moveNotice()).toBe("Moved below Implement change");
+
+    await act(() => canvas().props.onSelect(plan.id));
+    expect(moveNotice()).toBeUndefined();
+    await act(() => canvas().props.onSelect(review.id));
+    expect(moveNotice()).toBeUndefined();
+  });
+
+  it("keeps dependency titles separate from their actual step positions", async () => {
+    await mount();
+    const [agent, review] = draft().definition.steps;
+    if (review?.kind !== "review") throw new Error("Expected a Review step");
+    const first = { ...agent!, id: "first", title: "Implement (currently step 2)" };
+    const second = { ...agent!, title: "Implement" };
+    const last = { ...agent!, id: "last", title: "Implement" };
+    await setSteps([first, second, { ...review, reworkStepId: undefined }, last]);
+
+    await requestMove(review.id);
+
+    const changes = stepConfirmation()!.findAllByType("dd");
+    expect(changes).toHaveLength(2);
+    for (const change of changes) {
+      const labels = change
+        .findAll(
+          (node) =>
+            typeof node.type === "string" &&
+            node.children.length > 0 &&
+            node.children.every((child) => typeof child === "string"),
+        )
+        .map(visibleText)
+        .filter((label) => label.startsWith("Implement") || /^Step \d+$/.test(label));
+      expect(labels).toEqual([second.title, "Step 2", first.title, "Step 1"]);
+    }
+  });
+
+  it("warns before moving Open PR ahead of its required Push branch", async () => {
+    await mount();
+    const [agent] = draft().definition.steps;
+    const steps = [agent!, push, openPrStep];
+    await setSteps(steps);
+
+    await requestMove(openPrStep.id);
+
+    const confirmation = stepConfirmation()!;
+    expect(visibleText(confirmation)).toContain("Move Open PR?");
+    expect(visibleText(confirmation)).toContain("Above Push branch");
+    expect(visibleText(confirmation)).toContain("Open PR will be blocked");
+    expect(draft().definition.steps).toEqual(steps);
+
+    await act(() => recoveryButton("Move step").props.onClick());
+
+    expect(stepConfirmation()).toBeUndefined();
+    expect(draft().definition.steps).toEqual([agent, openPrStep, push]);
+    expect(draft().selectedStepId).toBe(openPrStep.id);
+    expect(focusDocument.activeElement).toBe(field(`${openPrStep.id}:actions`));
+    expect(field(`${openPrStep.id}:repair`)).toBeDefined();
+  });
+
+  it("warns when an Open PR already missing Push would also lose its Agent", async () => {
+    await mount();
+    const [agent] = draft().definition.steps;
+    const steps = [agent!, openPrStep, push];
+    await setSteps(steps);
+
+    await requestMove(openPrStep.id);
+
+    const confirmation = stepConfirmation()!;
+    expect(visibleText(confirmation)).toContain("Open PR will be blocked");
+    expect(visibleText(confirmation)).toContain(
+      "An Agent step must come before Push branch, and Push branch must come before Open PR.",
+    );
+    expect(draft().definition.steps).toEqual(steps);
+  });
+
+  it("blocks a pending move when the step order changes before confirmation", async () => {
+    await mount();
+    const [agent] = draft().definition.steps;
+    await setSteps([agent!, push, openPrStep]);
+    await requestMove(openPrStep.id);
+
+    const steps = [agent!, push, question, openPrStep];
+    await setSteps(steps);
+
+    expect(visibleText(stepConfirmation()!)).toContain("Workflow steps changed.");
+    expect(recoveryButton("Move step").props.disabled).toBe(true);
+    await act(() => recoveryButton("Move step").props.onClick());
+    expect(draft().definition.steps).toEqual(steps);
+
+    await act(() => recoveryButton("Keep current order").props.onClick());
+
+    expect(stepConfirmation()).toBeUndefined();
+    expect(focusDocument.activeElement).toBe(field(`${openPrStep.id}:actions`));
+  });
 });
 
 describe("Editor validation focus", () => {
