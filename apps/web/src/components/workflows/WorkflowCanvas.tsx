@@ -12,6 +12,7 @@ import { CSS } from "@dnd-kit/utilities";
 import {
   BotIcon,
   UploadIcon,
+  GitBranchIcon,
   MessageSquareIcon,
   UserRoundCheckIcon,
   GripVerticalIcon,
@@ -23,7 +24,9 @@ import {
   AlertCircleIcon,
 } from "lucide-react";
 import {
+  Fragment,
   useCallback,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -31,14 +34,16 @@ import {
   type Ref,
 } from "react";
 import {
+  workflowPublishingPrerequisites,
   workflowZones,
   type WorkflowDefinition,
   isAutomaticWorkflowStep,
   type WorkflowStep,
 } from "@t3tools/contracts/workflows";
 import type { workflowModelState } from "../settings/workflowModels";
+import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { Button } from "../ui/button";
-import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
+import { Menu, MenuTrigger, MenuPopup, MenuItem, MenuSeparator } from "../ui/menu";
 
 export type WorkflowInsertion = { edge: "start" | "end" } | { after: WorkflowStep };
 
@@ -445,6 +450,7 @@ function InsertMenu({
   triggerRef?: Ref<HTMLButtonElement> | undefined;
   toolbar?: boolean;
 }) {
+  const contextId = useId();
   const [captured, setCaptured] = useState<WorkflowInsertion | null>(null);
   const inserted = useRef(false);
   const valid =
@@ -479,39 +485,128 @@ function InsertMenu({
           </>
         ) : null}
       </MenuTrigger>
-      <MenuPopup finalFocus={() => !inserted.current}>
-        {(["agent", "input", "review", "action", "open_pull_request"] as const).map((kind) => (
-          <MenuItem
-            key={kind}
-            onClick={() => {
-              if (valid && captured) {
-                inserted.current = true;
-                onInsert(captured, kind);
-              }
-              setCaptured(null);
-            }}
-          >
-            {kind === "action" || kind === "open_pull_request" ? (
-              <UploadIcon />
-            ) : kind === "agent" ? (
-              <BotIcon />
-            ) : kind === "input" ? (
-              <MessageSquareIcon />
-            ) : (
-              <UserRoundCheckIcon />
-            )}
-            {kind === "open_pull_request"
-              ? "Open PR"
-              : kind === "action"
-                ? "Push branch"
-                : kind === "agent"
-                  ? "Agent step"
-                  : kind === "input"
-                    ? "Human input"
-                    : "Human review"}
-          </MenuItem>
-        ))}
+      <MenuPopup
+        align={toolbar ? "start" : "center"}
+        aria-describedby={contextId}
+        className="w-[min(22rem,calc(100vw-2rem))]"
+        finalFocus={() => !inserted.current}
+      >
+        <InsertStepOptions
+          steps={definition.steps}
+          anchor={captured ?? anchor}
+          contextId={contextId}
+          onChoose={(kind) => {
+            if (valid && captured) {
+              inserted.current = true;
+              onInsert(captured, kind);
+            }
+            setCaptured(null);
+          }}
+        />
       </MenuPopup>
     </Menu>
+  );
+}
+
+function InsertStepOptions({
+  steps,
+  anchor,
+  contextId,
+  onChoose,
+}: {
+  steps: ReadonlyArray<WorkflowStep>;
+  anchor: WorkflowInsertion;
+  contextId: string;
+  onChoose: (kind: WorkflowStep["kind"] | "open_pull_request") => void;
+}) {
+  const index = workflowInsertionIndex(steps, anchor);
+  if (index === null) return null;
+  const previous = steps[index - 1];
+  const { agent, push } = workflowPublishingPrerequisites(steps, index);
+  const needsAgent = agent ? null : "Needs an earlier Agent step.";
+  const options = [
+    {
+      kind: "agent",
+      label: "Agent step",
+      Icon: BotIcon,
+      detail: "Run an agent with your instructions.",
+      advisory: null,
+    },
+    {
+      kind: "input",
+      label: "Human input",
+      Icon: MessageSquareIcon,
+      detail: "Pause until someone answers a question.",
+      advisory: null,
+    },
+    {
+      kind: "review",
+      label: "Human review",
+      Icon: UserRoundCheckIcon,
+      detail: "Pause for approval or requested changes.",
+      advisory: needsAgent,
+    },
+    {
+      kind: "action",
+      label: "Push branch",
+      Icon: GitBranchIcon,
+      detail: "Commit changes and push the run branch.",
+      advisory: needsAgent,
+    },
+    {
+      kind: "open_pull_request",
+      label: "Open PR",
+      Icon: PullRequestGlyph.pullRequest,
+      detail: push
+        ? "Open a pull request from the pushed branch."
+        : "Open a pull request on GitHub.",
+      advisory: !agent
+        ? "Needs an Agent followed by Push branch."
+        : !push
+          ? `Needs Push branch after step ${steps.indexOf(agent) + 1}.`
+          : null,
+    },
+  ] as const;
+  return (
+    <>
+      <div className="space-y-0.5 px-2 py-1.5">
+        <p className="font-medium text-sm">Add a step</p>
+        <div id={contextId} className="space-y-0.5 text-xs">
+          <p className="text-muted-foreground">
+            {previous ? `After step ${index}` : "After Trigger"}
+          </p>
+          {previous ? (
+            <p className="wrap-anywhere">{previous.title.trim() || "Untitled step"}</p>
+          ) : null}
+        </div>
+      </div>
+      <MenuSeparator />
+      {options.map(({ kind, label, Icon, detail, advisory }) => (
+        <Fragment key={kind}>
+          {kind === "action" ? <MenuSeparator /> : null}
+          <MenuItem
+            className="items-start"
+            label={label}
+            aria-label={label}
+            aria-describedby={`${contextId}-${kind}`}
+            onClick={() => onChoose(kind)}
+          >
+            <Icon aria-hidden className="mt-0.5" />
+            <span className="grid min-w-0 gap-0.5 py-0.5">
+              <span>{label}</span>
+              <span id={`${contextId}-${kind}`} className="grid gap-0.5 text-xs">
+                <span className="text-muted-foreground">{detail}</span>
+                {advisory ? (
+                  <span className="flex items-start gap-1 wrap-anywhere text-warning-foreground">
+                    <AlertCircleIcon aria-hidden className="mt-0.5 size-3 shrink-0" />
+                    {advisory}
+                  </span>
+                ) : null}
+              </span>
+            </span>
+          </MenuItem>
+        </Fragment>
+      ))}
+    </>
   );
 }

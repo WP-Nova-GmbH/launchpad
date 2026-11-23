@@ -1,13 +1,15 @@
 import {
   act,
   cloneElement,
+  createContext,
   createElement,
+  useContext,
   useState,
   useInsertionEffect,
   type ReactElement,
   type PropsWithChildren,
 } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
 import { workflowModelState } from "../settings/workflowModels";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -58,12 +60,39 @@ describe("Workflow canvas insertion anchors", () => {
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
-vi.mock("../ui/menu", () => ({
-  Menu: () => null,
-  MenuTrigger: () => null,
-  MenuPopup: () => null,
-  MenuItem: () => null,
-}));
+vi.mock("../ui/menu", () => {
+  type MenuProps = PropsWithChildren<{ open: boolean; onOpenChange: (open: boolean) => void }>;
+  const Context = createContext({ open: false, onOpenChange: (_open: boolean) => {} });
+  return {
+    Menu: ({ children, open, onOpenChange }: MenuProps) =>
+      createElement(Context.Provider, { value: { open, onOpenChange } }, children),
+    MenuTrigger: ({
+      render,
+      children,
+      ...props
+    }: PropsWithChildren<{
+      render: ReactElement<Record<string, unknown>>;
+      disabled?: boolean;
+    }>) => {
+      const { open, onOpenChange } = useContext(Context);
+      return cloneElement(
+        render,
+        {
+          ...props,
+          onClick: () => {
+            if (!props.disabled) onOpenChange(!open);
+          },
+        },
+        children,
+      );
+    },
+    MenuPopup: ({ children }: PropsWithChildren) =>
+      useContext(Context).open ? createElement("div", { role: "menu" }, children) : null,
+    MenuItem: (props: Record<string, unknown>) =>
+      createElement("button", { ...props, role: "menuitem" }),
+    MenuSeparator: () => createElement("hr"),
+  };
+});
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
   TooltipTrigger: ({ render, children }: PropsWithChildren<{ render: ReactElement }>) =>
@@ -72,7 +101,11 @@ vi.mock("../ui/tooltip", () => ({
 }));
 let renderer: ReactTestRenderer | undefined;
 const overview = vi.fn();
-async function mountCanvas() {
+const insert = vi.fn();
+async function mountCanvas(
+  steps: ReadonlyArray<WorkflowStep> = [first, second, last],
+  selectedStepId = "",
+) {
   const definition = {
     name: "Zoom example",
     target: {
@@ -80,19 +113,19 @@ async function mountCanvas() {
       environmentId: EnvironmentId.make("environment"),
       projectId: ProjectId.make("project"),
     },
-    steps: [first, second, last],
+    steps,
   };
   await act(() => {
     renderer = create(
       <WorkflowCanvas
         definition={definition}
-        selectedStepId=""
+        selectedStepId={selectedStepId}
         invalidStepId={null}
         models={workflowModelState(definition, [], DEFAULT_UNIFIED_SETTINGS, null, false)}
         pending={false}
         onSelect={() => {}}
         onReorder={() => false}
-        onInsert={() => {}}
+        onInsert={insert}
         onOverview={overview}
         panelOpen={false}
       />,
@@ -109,6 +142,7 @@ const zoomLabel = () => renderer!.root.findByType("output").children.join("");
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   overview.mockReset();
+  insert.mockReset();
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -129,6 +163,112 @@ describe("Workflow canvas zoom controls", () => {
     expect(zoomLabel()).toBe("115%");
     await zoom("Show workflow overview", 1);
     expect(zoomLabel()).toBe("100%");
+  });
+});
+
+describe("Add a step picker", () => {
+  const push: WorkflowStep = { id: "push", kind: "action", title: "Push branch", action: "push" };
+  const visibleText = (node: ReactTestInstance): string =>
+    node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join("");
+  const menu = () => renderer!.root.findByProps({ role: "menu" });
+  const menuTextElements = () =>
+    menu()
+      .findAll((node) => typeof node.type === "string")
+      .map(visibleText);
+  const option = (name: string) =>
+    menu()
+      .findAllByType("button")
+      .find((item) => item.props["aria-label"] === name)!;
+  const openPicker = (name: string) =>
+    act(() =>
+      renderer!.root
+        .findAllByType("button")
+        .find((item) => item.props["aria-label"] === name)!
+        .props.onClick(),
+    );
+
+  it("shows unmet prerequisites after Trigger and still allows all five insertions", async () => {
+    await mountCanvas();
+
+    const choices = [
+      ["Agent step", "agent"],
+      ["Human input", "input"],
+      ["Human review", "review"],
+      ["Push branch", "action"],
+      ["Open PR", "open_pull_request"],
+    ] as const;
+    for (const [label, kind] of choices) {
+      await openPicker("Insert step at position 1");
+
+      expect(visibleText(menu())).toContain("After Trigger");
+      expect(visibleText(option("Human review"))).toContain("Needs an earlier Agent step.");
+      expect(visibleText(option("Push branch"))).toContain("Needs an earlier Agent step.");
+      expect(visibleText(option("Open PR"))).toContain("Needs an Agent followed by Push branch.");
+      expect(option(label).props.disabled).toBeFalsy();
+
+      await act(() => option(label).props.onClick());
+      expect(insert).toHaveBeenLastCalledWith({ edge: "start" }, kind);
+      expect(renderer!.root.findAllByProps({ role: "menu" })).toHaveLength(0);
+    }
+    expect(insert).toHaveBeenCalledTimes(choices.length);
+  });
+
+  it("distinguishes the trigger and numbered anchors even when step titles contain step numbers", async () => {
+    const titleWithNumber = { ...first, title: "Trigger (step 2)" };
+    const namedTrigger = { ...first, id: "named-trigger", title: "Trigger" };
+    await mountCanvas([titleWithNumber, namedTrigger], namedTrigger.id);
+
+    await openPicker("Insert step at position 1");
+    expect(menuTextElements()).toContain("After Trigger");
+    await act(() => option("Human input").props.onClick());
+    expect(insert).toHaveBeenNthCalledWith(1, { edge: "start" }, "input");
+
+    await openPicker("Insert step after Trigger (step 2) (position 2)");
+    expect(menuTextElements()).toEqual(
+      expect.arrayContaining(["After step 1", "Trigger (step 2)"]),
+    );
+    expect(visibleText(option("Open PR"))).toContain("Needs Push branch after step 1.");
+    await act(() => option("Human input").props.onClick());
+    expect(insert).toHaveBeenNthCalledWith(2, { after: titleWithNumber }, "input");
+
+    await openPicker("Add a step after Trigger");
+    expect(menuTextElements()).toEqual(expect.arrayContaining(["After step 2", "Trigger"]));
+    expect(visibleText(option("Open PR"))).toContain("Needs Push branch after step 2.");
+    await act(() => option("Human input").props.onClick());
+    expect(insert).toHaveBeenNthCalledWith(3, { after: namedTrigger }, "input");
+  });
+
+  it("identifies the Agent that needs a Push branch when inserting after a later step", async () => {
+    await mountCanvas([first, second], second.id);
+
+    await openPicker("Add a step after Question");
+
+    expect(menuTextElements()).toEqual(expect.arrayContaining(["After step 2", "Question"]));
+    expect(visibleText(option("Open PR"))).toContain("Needs Push branch after step 1.");
+    await act(() => option("Open PR").props.onClick());
+    expect(insert).toHaveBeenCalledExactlyOnceWith({ after: second }, "open_pull_request");
+  });
+
+  it("offers to open a pull request from the branch pushed after the latest Agent", async () => {
+    await mountCanvas([first, push], push.id);
+
+    await openPicker("Add a step after Push branch");
+
+    expect(menuTextElements()).toEqual(expect.arrayContaining(["After step 2", "Push branch"]));
+    expect(visibleText(option("Open PR"))).toContain("Open a pull request from the pushed branch.");
+    await act(() => option("Open PR").props.onClick());
+    expect(insert).toHaveBeenCalledExactlyOnceWith({ after: push }, "open_pull_request");
+  });
+
+  it("checks Open PR against the latest Agent when an earlier same-named Agent has a Push branch", async () => {
+    const latest = { ...first, id: "build" };
+    await mountCanvas([first, push, latest], latest.id);
+
+    await openPicker("Add a step after Plan");
+
+    expect(menuTextElements()).toEqual(expect.arrayContaining(["After step 3", "Plan"]));
+    expect(visibleText(option("Open PR"))).toContain("Needs Push branch after step 3.");
+    expect(visibleText(option("Open PR"))).not.toContain("from the pushed branch");
   });
 });
 
