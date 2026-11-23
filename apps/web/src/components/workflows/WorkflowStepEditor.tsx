@@ -1,5 +1,6 @@
 import { useId, useRef } from "react";
 import { WorkflowAlert } from "./WorkflowAlert";
+import { WorkflowReviewReworkPicker } from "./WorkflowReviewReworkPicker";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { useEnvironment } from "../../state/environments";
 import { useEnvironmentSettings } from "../../hooks/useSettings";
@@ -247,13 +248,6 @@ export function WorkflowStepEditor({
     change(definition.steps.filter((entry) => entry.id !== step.id));
     select(definition.steps[index + 1]?.id ?? definition.steps[index - 1]?.id ?? "");
   };
-  const earlierAgents =
-    step?.kind === "review"
-      ? definition.steps.slice(0, index).filter((entry) => entry.kind === "agent")
-      : [];
-  const invalidRework =
-    step?.kind === "review" &&
-    !earlierAgents.some((entry) => !step.reworkStepId || entry.id === step.reworkStepId);
   const triggerLabel = step?.kind === "agent" ? models.triggerLabel(step) : undefined;
   const vm = definition.target.kind === "vm";
   const vmModelIssue = vm ? models.issues.find((issue) => issue.stepId === step?.id) : undefined;
@@ -553,50 +547,14 @@ export function WorkflowStepEditor({
               </div>
             )}
             {step.kind === "review" ? (
-              <div className="space-y-1">
-                <p id={`${id}-rework`} className="text-sm">
-                  Send requested changes back to
-                </p>
-                <Select
-                  value={step.reworkStepId ? `agent:${step.reworkStepId}` : "nearest"}
-                  onValueChange={(value) =>
-                    patch({
-                      ...step,
-                      reworkStepId: value?.startsWith("agent:") ? value.slice(6) : undefined,
-                    })
-                  }
-                >
-                  <SelectTrigger
-                    aria-labelledby={`${id}-rework`}
-                    aria-invalid={invalidRework || undefined}
-                    aria-describedby={invalidRework ? `${id}-rework-issue` : undefined}
-                    data-workflow-field="rework"
-                    ref={(node) => registerField("rework", node)}
-                  >
-                    <SelectValue>
-                      {step.reworkStepId
-                        ? (definition.steps.find((entry) => entry.id === step.reworkStepId)
-                            ?.title ?? "Unavailable Agent step")
-                        : "Previous Agent step"}
-                    </SelectValue>
-                  </SelectTrigger>
-                  <SelectPopup>
-                    <SelectItem value="nearest">Previous Agent step</SelectItem>
-                    {earlierAgents.map((entry) => (
-                      <SelectItem key={entry.id} value={`agent:${entry.id}`}>
-                        {entry.title}
-                      </SelectItem>
-                    ))}
-                  </SelectPopup>
-                </Select>
-                {invalidRework ? (
-                  <p id={`${id}-rework-issue`} className="text-xs text-destructive-foreground">
-                    {earlierAgents.length
-                      ? "Choose an earlier Agent step."
-                      : "Add an Agent step before Review."}
-                  </p>
-                ) : null}
-              </div>
+              <WorkflowReviewReworkPicker
+                steps={definition.steps}
+                reviewIndex={index}
+                reworkStepId={step.reworkStepId}
+                disabled={disabled}
+                onChange={(reworkStepId) => patch({ ...step, reworkStepId })}
+                registerTrigger={(node) => registerField("rework", node)}
+              />
             ) : null}
           </fieldset>
         </div>

@@ -22,15 +22,88 @@ vi.mock("../ui/menu", () => ({
   MenuPopup: ({ children }: PropsWithChildren) => children,
   MenuItem: (props: Record<string, unknown>) => createElement("button", props),
 }));
-vi.mock("../ui/select", () => {
+vi.mock("../ui/select", async () => {
+  const { createContext, useContext, useState } = await import("react");
+  type SelectProps = {
+    disabled?: boolean;
+    readOnly?: boolean;
+    value?: string | null;
+    open?: boolean;
+    onOpenChange?: (open: boolean) => void;
+    onValueChange?: (value: string) => void;
+  };
+  const SelectState = createContext<
+    | (SelectProps & {
+        open: boolean;
+        toggle: () => void;
+        choose: (value: string) => void;
+      })
+    | null
+  >(null);
+  const OptionValue = createContext<string | null>(null);
   const component = ({ children }: PropsWithChildren) => createElement("div", null, children);
   return {
-    Select: ({ children, ...props }: PropsWithChildren) =>
-      createElement("div", { ...props, "data-workflow-model-select": true }, children),
-    SelectTrigger: component,
+    Select: ({ children, ...props }: PropsWithChildren<SelectProps>) => {
+      const [internalOpen, setInternalOpen] = useState(false);
+      const open = props.open ?? internalOpen;
+      const setOpen = props.onOpenChange ?? setInternalOpen;
+      return createElement(
+        SelectState.Provider,
+        {
+          value: {
+            ...props,
+            open,
+            toggle: () => {
+              if (!props.disabled && !props.readOnly) setOpen(!open);
+            },
+            choose: (value) => {
+              props.onValueChange?.(value);
+              setOpen(false);
+            },
+          },
+        },
+        createElement("div", { ...props, "data-workflow-model-select": true }, children),
+      );
+    },
+    SelectTrigger: ({ children, ...props }: PropsWithChildren) => {
+      const select = useContext(SelectState)!;
+      return createElement(
+        "button",
+        {
+          ...props,
+          disabled: select.disabled,
+          "aria-readonly": select.readOnly || undefined,
+          "aria-expanded": select.open,
+          onClick: select.toggle,
+        },
+        children,
+      );
+    },
     SelectValue: component,
-    SelectPopup: component,
-    SelectItem: component,
+    SelectPopup: ({ children }: PropsWithChildren) =>
+      useContext(SelectState)?.open ? createElement("div", { role: "listbox" }, children) : null,
+    SelectGroup: component,
+    SelectGroupLabel: component,
+    SelectItem: ({
+      children,
+      disabled,
+      value,
+    }: PropsWithChildren<{ disabled?: boolean; value: string }>) => {
+      const select = useContext(SelectState)!;
+      return createElement(
+        "button",
+        {
+          disabled,
+          "data-option-value": value,
+          onClick: disabled ? undefined : () => select.choose(value),
+        },
+        createElement(OptionValue.Provider, { value }, children),
+      );
+    },
+    SelectItemIndicator: ({ children }: PropsWithChildren) =>
+      useContext(SelectState)?.value === useContext(OptionValue)
+        ? createElement("span", { "data-slot": "select-item-indicator" }, children)
+        : null,
   };
 });
 vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
@@ -134,18 +207,30 @@ async function click(label: string) {
       .props.onClick(),
   );
 }
-const visibleText = (node: ReactTestInstance): string =>
-  node.children.map((child) => (typeof child === "string" ? child : visibleText(child))).join(" ");
-const publishingDetails = () =>
+const textParts = (node: ReactTestInstance): ReadonlyArray<string> =>
+  node.children.flatMap((child) => (typeof child === "string" ? child : textParts(child)));
+const visibleText = (node: ReactTestInstance) =>
+  textParts(node).join(" ").replace(/\s+/g, " ").trim();
+const inspectorDetails = () =>
   Object.fromEntries(
     renderer!.root
       .findByType("dl")
       .findAllByType("dt")
-      .map((term) => [
-        visibleText(term),
-        visibleText(term.parent!.findByType("dd")).replace(/\s+/g, " ").trim(),
-      ]),
+      .map((term) => [visibleText(term), visibleText(term.parent!.findByType("dd"))]),
   );
+const reworkPicker = () =>
+  renderer!.root.findByProps({ "data-workflow-field": "rework" }).findByType("button");
+const openReworkPicker = async () => act(() => reworkPicker().props.onClick());
+const selectOption = (value: string) => renderer!.root.findByProps({ "data-option-value": value });
+const indicatedOptions = () =>
+  renderer!.root
+    .findByProps({ role: "listbox" })
+    .findAllByType("button")
+    .flatMap((option) =>
+      option
+        .findAllByProps({ "data-slot": "select-item-indicator" })
+        .map(() => option.props["data-option-value"]),
+    );
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -196,6 +281,123 @@ describe("Workflow step editing", () => {
       question: replacement,
       role: "maintainer",
     });
+  });
+
+  it("keeps the reviewed result on the latest Agent when selecting another rework target", async () => {
+    const [plan, implement, review] = original.steps;
+    if (!plan || !implement || review?.kind !== "review")
+      throw new Error("Expected Review fixture.");
+    await mount({
+      initial: {
+        ...original,
+        steps: [
+          { ...plan, title: implement.title },
+          implement,
+          { ...review, reworkStepId: undefined },
+        ],
+      },
+      selection: "review",
+    });
+
+    const reviewedResult = () => inspectorDetails()["Saved result to review"];
+    expect(reviewedResult()).toBe("Implement Step 2");
+    expect(visibleText(reworkPicker())).toBe("Previous Agent step Currently Implement Step 2");
+    await openReworkPicker();
+
+    expect(visibleText(selectOption("agent:plan"))).toBe("Implement Step 1");
+    expect(visibleText(selectOption("agent:implement"))).toBe("Implement Step 2");
+    expect(indicatedOptions()).toEqual(["nearest"]);
+
+    await act(() => selectOption("agent:plan").props.onClick());
+
+    expect(definition.steps[2]).toMatchObject({ reworkStepId: "plan" });
+    expect(visibleText(reworkPicker())).toBe("Implement Step 1");
+    expect(reviewedResult()).toBe("Implement Step 2");
+
+    await openReworkPicker();
+    expect(indicatedOptions()).toEqual(["agent:plan"]);
+    await act(() => selectOption("nearest").props.onClick());
+
+    expect(definition.steps[2]).toMatchObject({ reworkStepId: undefined });
+    expect(visibleText(reworkPicker())).toBe("Previous Agent step Currently Implement Step 2");
+    await openReworkPicker();
+    expect(indicatedOptions()).toEqual(["nearest"]);
+  });
+
+  it.each([
+    {
+      removed: false,
+      current: "Implement Unavailable Step 3",
+      reason: "The saved Agent runs after Review.",
+    },
+    {
+      removed: true,
+      current: "Unavailable Agent step",
+      reason: "The saved Agent is no longer available.",
+    },
+  ])(
+    "keeps an unavailable rework Agent visible before letting the user replace it (removed=$removed)",
+    async ({ removed, current, reason }) => {
+      const [plan, implement, review] = original.steps;
+      await mount({
+        initial: { ...original, steps: removed ? [plan!, review!] : [plan!, review!, implement!] },
+        selection: "review",
+      });
+
+      expect(definition.steps[1]).toMatchObject({ reworkStepId: "implement" });
+      expect(inspectorDetails()["Saved result to review"]).toBe("Plan Step 1");
+      expect(visibleText(reworkPicker())).toBe(current);
+      expect(reworkPicker().props["aria-invalid"]).toBe(true);
+      const issueId = reworkPicker().props["aria-describedby"];
+      expect(visibleText(renderer!.root.findByProps({ id: issueId }))).toBe(
+        `${reason} Choose an earlier Agent.`,
+      );
+      await openReworkPicker();
+
+      expect(
+        renderer!.root.findAllByProps({ "data-option-value": "agent:implement" }),
+      ).toHaveLength(0);
+      expect(indicatedOptions()).toEqual([]);
+
+      await act(() => selectOption("agent:plan").props.onClick());
+
+      expect(definition.steps[1]).toMatchObject({ reworkStepId: "plan" });
+      expect(visibleText(reworkPicker())).toBe("Plan Step 1");
+      expect(reworkPicker().props["aria-invalid"]).toBeUndefined();
+      expect(renderer!.root.findAllByProps({ id: issueId })).toHaveLength(0);
+    },
+  );
+
+  it("shows how to unblock a Review with no earlier Agent", async () => {
+    const [plan, , review] = original.steps;
+    if (review?.kind !== "review") throw new Error("Expected Review fixture.");
+    await mount({
+      initial: { ...original, steps: [{ ...review, reworkStepId: undefined }, plan!] },
+      selection: "review",
+    });
+
+    expect(inspectorDetails()["Saved result to review"]).toBe("No earlier Agent");
+    expect(visibleText(renderer!.root)).toContain("Add an Agent step before Review.");
+    expect(reworkPicker().props.disabled).toBe(false);
+    expect(reworkPicker().props["aria-readonly"]).toBe(true);
+
+    await openReworkPicker();
+
+    expect(reworkPicker().props["aria-expanded"]).toBe(false);
+    expect(renderer!.root.findAllByProps({ role: "listbox" })).toHaveLength(0);
+
+    await click("Move down");
+
+    expect(inspectorDetails()["Saved result to review"]).toBe("Plan Step 1");
+    expect(visibleText(reworkPicker())).toBe("Previous Agent step Currently Plan Step 1");
+    expect(reworkPicker().props["aria-invalid"]).toBeUndefined();
+    expect(reworkPicker().props["aria-readonly"]).toBeUndefined();
+
+    await openReworkPicker();
+
+    expect(reworkPicker().props["aria-expanded"]).toBe(true);
+    await act(() => selectOption("agent:plan").props.onClick());
+    expect(definition.steps[1]).toMatchObject({ reworkStepId: "plan" });
   });
 
   it("updates Open PR readiness when a Push branch follows its latest Agent", async () => {
@@ -277,7 +479,7 @@ describe("Workflow step editing", () => {
     expect(selectedId).toBe("push");
     const readyInspector = visibleText(renderer!.root);
     expect(readyInspector).toContain("Ready");
-    expect(publishingDetails()["Execution target"]).toBe("Machine");
+    expect(inspectorDetails()["Execution target"]).toBe("Machine");
     expect(readyInspector).not.toContain("Machine checkout unavailable");
     expect(readyInspector).not.toContain("GitHub access pending verification");
   });
@@ -302,7 +504,7 @@ describe("Workflow step editing", () => {
         machineCheckoutAvailable: false,
       });
 
-      expect(publishingDetails()).toEqual({
+      expect(inspectorDetails()).toEqual({
         "Execution target": "VM",
         "Saved result": "Implement",
         "GitHub App access for the run": access,
@@ -328,7 +530,7 @@ describe("Workflow step editing", () => {
         machineCheckoutAvailable: false,
       });
 
-      expect(publishingDetails()).toEqual({
+      expect(inspectorDetails()).toEqual({
         "Execution target": "VM",
         "Publishes after": "Push the release",
         "Base branch": expected,
@@ -441,7 +643,9 @@ describe("Workflow step editing", () => {
     expect(definition.steps[1]).toMatchObject({ reworkStepId: "implement" });
     expect(workflowDraftIssue(definition)).toMatchObject({ stepId: "review", field: "rework" });
     expect(JSON.stringify(renderer!.toJSON())).toContain("Unavailable Agent step");
-    expect(JSON.stringify(renderer!.toJSON())).toContain("Choose an earlier Agent step.");
+    expect(visibleText(renderer!.root)).toContain(
+      "The saved Agent is no longer available. Choose an earlier Agent.",
+    );
   });
   it("removing the last step leaves an explicit empty, invalid draft", async () => {
     await mount({ initial: { ...original, steps: [original.steps[0]!] }, selection: "plan" });
