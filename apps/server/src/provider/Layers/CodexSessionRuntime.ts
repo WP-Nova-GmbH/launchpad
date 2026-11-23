@@ -543,6 +543,34 @@ function makeCodexServerNotification<M extends CodexRpc.ServerNotificationMethod
   return { method, params } as CodexServerNotification;
 }
 
+function fileChangeApprovalKey(threadId: string, turnId: string, itemId: string): string {
+  return JSON.stringify([threadId, turnId, itemId]);
+}
+
+function describeProposedFileChanges(
+  changes: ReadonlyArray<EffectCodexSchema.V2ItemStartedNotification__FileUpdateChange>,
+): string | undefined {
+  // Approval covers the whole patch. Use the existing fallback if we can't
+  // describe every path, and keep paths literal for workflow secret masking.
+  if (changes.length === 0 || changes.length > 20) return undefined;
+  const lines: string[] = [];
+  let length = 0;
+  const unsafePath = /[\p{Cc}\p{Zl}\p{Zp}\p{Bidi_Control}]| -> /u;
+  for (const change of changes) {
+    const destination = change.kind.type === "update" ? change.kind.move_path : undefined;
+    if (unsafePath.test(change.path) || (destination && unsafePath.test(destination))) {
+      return undefined;
+    }
+    const line = destination
+      ? `update ${change.path} -> ${destination}`
+      : `${change.kind.type} ${change.path}`;
+    if (length + line.length + 1 > 3_900) return undefined;
+    lines.push(line);
+    length += line.length + 1;
+  }
+  return lines.join("\n");
+}
+
 function normalizeCodexModelSlug(
   model: string | undefined | null,
   preferredId?: string,
@@ -1577,6 +1605,23 @@ export const makeCodexSessionRuntime = (
     const serverNotifications = yield* Queue.unbounded<
       CodexServerNotification | { readonly barrier: Deferred.Deferred<void> }
     >();
+    const proposedFileChanges = new Map<string, string>();
+    const rememberProposedFileChanges = (notification: CodexServerNotification) => {
+      if (notification.method !== "item/started" && notification.method !== "item/completed")
+        return;
+      const { threadId, turnId, item } = notification.params;
+      if (item.type !== "fileChange") return;
+      const key = fileChangeApprovalKey(threadId, turnId, item.id);
+      proposedFileChanges.delete(key);
+      if (notification.method !== "item/started" || item.status !== "inProgress") return;
+      const detail = describeProposedFileChanges(item.changes);
+      if (detail === undefined) return;
+      if (proposedFileChanges.size >= 64) {
+        const oldest = proposedFileChanges.keys().next().value;
+        if (oldest !== undefined) proposedFileChanges.delete(oldest);
+      }
+      proposedFileChanges.set(key, detail);
+    };
     let handlingNotification = false;
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
     const randomUUIDv4 = (purpose: CodexErrors.CodexAppServerIdentifierPurpose) =>
@@ -2382,6 +2427,9 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/fileChange/requestApproval", (payload) =>
       Effect.gen(function* () {
+        const key = fileChangeApprovalKey(payload.threadId, payload.turnId, payload.itemId);
+        const detail = proposedFileChanges.get(key);
+        proposedFileChanges.delete(key);
         const requestId = ApprovalRequestId.make(
           yield* randomUUIDv4("file-change-approval-request"),
         );
@@ -2418,6 +2466,7 @@ export const makeCodexSessionRuntime = (
           method: "item/fileChange/requestApproval",
           requestId,
           requestKind: "file-change",
+          ...(detail ? { message: detail } : {}),
           ...(turnId ? { turnId } : {}),
           ...(itemId ? { itemId } : {}),
           payload,
@@ -2621,11 +2670,12 @@ export const makeCodexSessionRuntime = (
     );
 
     const registerServerNotification = <M extends CodexRpc.ServerNotificationMethod>(method: M) =>
-      client.handleServerNotification(method, (params) =>
-        Queue.offer(serverNotifications, makeCodexServerNotification(method, params)).pipe(
-          Effect.asVoid,
-        ),
-      );
+      client.handleServerNotification(method, (params) => {
+        const notification = makeCodexServerNotification(method, params);
+        // Capture the proposal before the wire can deliver its approval request.
+        rememberProposedFileChanges(notification);
+        return Queue.offer(serverNotifications, notification).pipe(Effect.asVoid);
+      });
 
     yield* Effect.forEach(
       Object.values(

@@ -15,6 +15,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { type ProviderApprovalDecision, type ProviderEvent, ThreadId } from "@t3tools/contracts";
+import type { V2ItemStartedNotification } from "effect-codex-app-server/schema";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -607,6 +608,89 @@ describe("CodexSessionRuntime collab integration", () => {
 
   // it.live: the runtime talks to a real child process; under it.effect's
   // TestClock the internal timers freeze and the join never completes.
+  it.live("correlates file-change approval details with the exact native thread and turn", () =>
+    Effect.gen(function* () {
+      const turnId = "approval-turn";
+      const itemId = "patch-item";
+      const secretPath = '/workspace/project/quote"and\\slash.md';
+      const started = (
+        threadId: string,
+        proposalTurn: string,
+        id: string,
+        paths: ReadonlyArray<string>,
+      ) => ({
+        method: "item/started",
+        params: {
+          threadId,
+          turnId: proposalTurn,
+          startedAtMs: 0,
+          item: {
+            id,
+            type: "fileChange",
+            status: "inProgress",
+            changes: paths.map((path) => ({
+              path,
+              kind: { type: "update" },
+              diff: "private patch contents",
+            })),
+          },
+        } satisfies V2ItemStartedNotification,
+      });
+      const largePatchId = "large-patch";
+      const secretPathId = "quoted-path";
+      const script = {
+        rootThreadId: ROOT,
+        turnIds: [turnId],
+        holdTurnOpen: true,
+        notifications: [
+          started(ROOT, turnId, itemId, ["/workspace/project/README.md"]),
+          started(CHILD_A, turnId, itemId, ["/workspace/project/wrong-thread.md"]),
+          started(ROOT, "different-turn", itemId, ["/workspace/project/wrong-turn.md"]),
+          started(ROOT, turnId, secretPathId, [secretPath]),
+          started(
+            ROOT,
+            turnId,
+            largePatchId,
+            Array.from({ length: 21 }, (_, index) => `/workspace/project/file-${index}`),
+          ),
+        ],
+        serverRequests: [itemId, secretPathId, largePatchId].map((requestItemId) => ({
+          method: "item/fileChange/requestApproval",
+          params: { threadId: ROOT, turnId, itemId: requestItemId, startedAtMs: 0 },
+        })),
+      };
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(scriptPath, { force: true })),
+      );
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-codex-file-change-approval"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "approval-required",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const requestFiber = yield* runtime.events.pipe(
+        Stream.filter((event) => event.method === "item/fileChange/requestApproval"),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "Update README.md" });
+      const requests = new Map(
+        Array.from(yield* Fiber.join(requestFiber).pipe(Effect.timeout("10 seconds"))).map(
+          (request) => [String(request.itemId), request.message],
+        ),
+      );
+      assert.equal(requests.size, 3);
+      assert.equal(requests.get(itemId), "update /workspace/project/README.md");
+      assert.equal(requests.get(secretPathId), `update ${secretPath}`);
+      assert.isUndefined(requests.get(largePatchId));
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.live("Stop answers a parked app-permission approval with a withheld grant", () =>
     Effect.gen(function* () {
       // Interrupting a turn whose app-permission prompt is still parked must

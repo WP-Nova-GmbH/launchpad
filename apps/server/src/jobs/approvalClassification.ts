@@ -86,6 +86,10 @@ export function classifyApprovalRequest(input: {
     return { kind: "auto-approve", reason: "Reading files needs no supervision." };
   }
 
+  // A file-change approval describes a patch. Its paths may contain shell
+  // words, but any later attempt to execute them requires its own approval.
+  if (toolKind === "file-change") return { kind: "consult", toolKind };
+
   const detail = input.detail ?? "";
   for (const { pattern, what } of ESCAPES_THE_WORKSPACE) {
     if (pattern.test(detail)) {

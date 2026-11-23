@@ -1434,9 +1434,9 @@ function mapToRuntimeEvents(
             EffectCodexSchema.ServerRequest__FileChangeRequestApprovalParams,
             event.payload,
           );
-          // These params carry no path of their own, only the root the agent
-          // wants to write under.
-          return nonEmptyDetail(payload?.reason) ?? nonEmptyDetail(payload?.grantRoot);
+          return (
+            nonEmptyDetail(payload?.reason) ?? nonEmptyDetail(payload?.grantRoot) ?? event.message
+          );
         }
         case "mcpServer/elicitation/request":
           return elicitation?.message;

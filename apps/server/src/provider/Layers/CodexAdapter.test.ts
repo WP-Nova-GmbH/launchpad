@@ -2567,6 +2567,7 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         requestKind: "file-change",
         requestId: ApprovalRequestId.make("req-file-change"),
         turnId: asTurnId("turn-1"),
+        message: "update /tmp/workspace/README.md",
         payload: {
           itemId: "item-1",
           grantRoot: "/tmp/workspace",
@@ -2584,6 +2585,40 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       }
       NodeAssert.equal(firstEvent.value.payload.requestType, "file_change_approval");
       NodeAssert.equal(firstEvent.value.payload.detail, "/tmp/workspace");
+    }),
+  );
+
+  it.effect("passes the proposed file changes to the approval pipeline", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const firstEventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const proposal = "update /workspace/project/README.md ";
+
+      yield* runtime.emit({
+        id: asEventId("evt-file-change-proposal"),
+        kind: "request",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-08-24T00:00:00.000Z",
+        method: "item/fileChange/requestApproval",
+        requestKind: "file-change",
+        requestId: ApprovalRequestId.make("req-file-change"),
+        message: proposal,
+        payload: {
+          itemId: "item-1",
+          reason: null,
+          startedAtMs: 0,
+          threadId: "provider-thread-1",
+          turnId: "turn-1",
+        },
+      });
+
+      const firstEvent = yield* Fiber.join(firstEventFiber);
+      NodeAssert.equal(firstEvent._tag, "Some");
+      if (firstEvent._tag !== "Some") return;
+      NodeAssert.equal(firstEvent.value.type, "request.opened");
+      if (firstEvent.value.type !== "request.opened") return;
+      NodeAssert.equal(firstEvent.value.payload.detail, proposal);
     }),
   );
 
