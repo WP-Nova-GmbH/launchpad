@@ -159,6 +159,19 @@ it("permits streamed checkpoints and moves only for the assigned thread", () => 
     ["GET", path + "/moves/" + id + "/artifacts%2F" + id],
   ] as const)
     expect(threadVmCredentialAllows(principal, method, url)).toBe(false);
+  for (const action of ["reopened", "reopen-blocked"]) {
+    const url = `${path}/moves/${id}/${action}`;
+    expect(threadVmCredentialAllows(principal, "POST", url)).toBe(true);
+    expect(threadVmCredentialAllows(principal, "GET", url)).toBe(false);
+    expect(threadVmCredentialAllows(principal, "POST", `${url}/extra`)).toBe(false);
+    expect(threadVmCredentialAllows(principal, "POST", url.replace(id, "bad"))).toBe(false);
+    expect(threadVmCredentialAllows(principal, "POST", url.replace("vm-env", "another-env"))).toBe(
+      false,
+    );
+    expect(
+      threadVmCredentialAllows(principal, "POST", url.replace("private-thread", "another-thread")),
+    ).toBe(false);
+  }
 });
 
 it("permits only this thread's exact restore discovery and UUID artifact paths", () => {

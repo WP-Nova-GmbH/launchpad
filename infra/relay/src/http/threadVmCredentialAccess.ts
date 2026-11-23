@@ -63,6 +63,8 @@ export function threadVmCredentialAllows(
         "commit",
         "activate",
         "abort",
+        "reopened",
+        "reopen-blocked",
       ].includes(parts[8]!)
     );
   }
