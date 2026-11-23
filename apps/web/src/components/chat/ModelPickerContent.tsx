@@ -162,6 +162,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
    */
   lockedProvider: ProviderDriverKind | null;
   lockedContinuationGroupKey?: string | null;
+  getDisabledInstanceTooltip?: (entry: ProviderInstanceEntry) => string;
   /**
    * All configured provider instances in display order. Used to render
    * the sidebar (one button per instance) and to resolve display names
@@ -826,8 +827,10 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
             {...(lockedDisabledInstanceIds
               ? {
                   disabledInstanceIds: lockedDisabledInstanceIds,
-                  getDisabledInstanceTooltip: (entry: ProviderInstanceEntry) =>
-                    `${entry.displayName} is unavailable in this thread. Start a new thread to switch providers.`,
+                  getDisabledInstanceTooltip:
+                    props.getDisabledInstanceTooltip ??
+                    ((entry: ProviderInstanceEntry) =>
+                      `${entry.displayName} is unavailable in this thread. Start a new thread to switch providers.`),
                 }
               : {})}
           />

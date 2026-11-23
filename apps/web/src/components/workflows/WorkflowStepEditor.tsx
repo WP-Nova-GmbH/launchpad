@@ -26,12 +26,8 @@ import {
   type WorkflowDefinition,
   type WorkflowVmModelCatalog,
 } from "@t3tools/contracts/workflows";
-import {
-  workflowModelState,
-  workflowVmCodexInstanceId,
-  workflowVmModelState,
-} from "../settings/workflowModels";
-import { ProviderModelPicker } from "../chat/ProviderModelPicker";
+import { workflowModelState, workflowVmModelState } from "../settings/workflowModels";
+import { WorkflowAgentModelPicker } from "./WorkflowAgentModelPicker";
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
@@ -245,7 +241,6 @@ export function WorkflowStepEditor({
 }) {
   const id = useId();
   const skipMenuFocus = useRef(false);
-  const { entries, modelOptions } = models;
   const index = definition.steps.findIndex((step) => step.id === selectedId);
   const step = definition.steps[index];
   const operationLabel =
@@ -260,9 +255,7 @@ export function WorkflowStepEditor({
     change(definition.steps.filter((entry) => entry.id !== step.id));
     select(definition.steps[index + 1]?.id ?? definition.steps[index - 1]?.id ?? "");
   };
-  const triggerLabel = step?.kind === "agent" ? models.triggerLabel(step) : undefined;
   const vm = definition.target.kind === "vm";
-  const vmModelIssue = vm ? models.issues.find((issue) => issue.stepId === step?.id) : undefined;
   const promptError =
     step?.kind === "agent" && !step.instruction.trim()
       ? "Enter instructions for this Agent step."
@@ -441,121 +434,16 @@ export function WorkflowStepEditor({
               </div>
             ) : null}
             {step.kind === "agent" ? (
-              <div className="space-y-2">
-                <p className="text-sm">Model</p>
-                {vm ? (
-                  <>
-                    <Select
-                      value={
-                        vmModelIssue
-                          ? null
-                          : step.modelSelection
-                            ? "model:" + step.modelSelection.model
-                            : "default"
-                      }
-                      onValueChange={(value) => {
-                        const model = vmModels?.models.find(
-                          (entry) => "model:" + entry.slug === value,
-                        );
-                        if (value === "default" || model)
-                          patch({
-                            ...step,
-                            modelSelection: model
-                              ? { instanceId: workflowVmCodexInstanceId, model: model.slug }
-                              : null,
-                          });
-                      }}
-                    >
-                      <SelectTrigger
-                        aria-label="Managed Codex model"
-                        aria-invalid={vmModelIssue ? true : undefined}
-                        aria-describedby={
-                          vmModelIssue ? `${id}-model-issue ${id}-approvals` : `${id}-approvals`
-                        }
-                        ref={(node) => registerField("model", node)}
-                      >
-                        <SelectValue>{triggerLabel}</SelectValue>
-                      </SelectTrigger>
-                      <SelectPopup>
-                        <SelectItem value="default">Managed default</SelectItem>
-                        {vmModels?.models.map((model) => (
-                          <SelectItem key={model.slug} value={"model:" + model.slug}>
-                            {model.name}
-                          </SelectItem>
-                        ))}
-                      </SelectPopup>
-                    </Select>
-                    {vmModelIssue ? (
-                      <WorkflowAlert
-                        title="Selected model unavailable"
-                        variant="warning"
-                        actions={
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            onClick={() => patch({ ...step, modelSelection: null })}
-                          >
-                            Use managed default
-                          </Button>
-                        }
-                      >
-                        <span id={`${id}-model-issue`}>{vmModelIssue.detail}</span>
-                      </WorkflowAlert>
-                    ) : !vmModels ? (
-                      <WorkflowAlert title="VM model choices unavailable" variant="info">
-                        VM model choices could not be loaded. The managed default is available.
-                      </WorkflowAlert>
-                    ) : null}
-                  </>
-                ) : entries[0] ? (
-                  <ProviderModelPicker
-                    disabled={disabled}
-                    triggerClassName="w-full max-w-none sm:max-w-none"
-                    activeInstanceId={
-                      models.effectiveSelection(step)?.instanceId ?? entries[0].instanceId
-                    }
-                    model={models.effectiveSelection(step)?.model ?? ""}
-                    {...(triggerLabel ? { triggerLabel } : {})}
-                    lockedProvider={
-                      step.id === models.first?.id ? null : (models.anchor?.driverKind ?? null)
-                    }
-                    lockedContinuationGroupKey={
-                      step.id === models.first?.id
-                        ? null
-                        : (models.anchor?.continuationGroupKey ?? null)
-                    }
-                    instanceEntries={entries}
-                    modelOptionsByInstance={modelOptions}
-                    getModelDisabledReason={(instanceId, model) =>
-                      models.disabledReason(instanceId, model, step.id)
-                    }
-                    onInstanceModelChange={(instanceId, model) =>
-                      patch({ ...step, modelSelection: { instanceId, model } })
-                    }
-                  />
-                ) : (
-                  <p className="text-sm text-muted-foreground">
-                    {step.modelSelection
-                      ? `${step.modelSelection.instanceId} · ${step.modelSelection.model} (Unverified). `
-                      : "Project default. "}
-                    Connect to this environment to choose or verify a model.
-                  </p>
-                )}
-                <p id={`${id}-approvals`} className="text-xs text-muted-foreground">
-                  Approvals required
-                </p>
-                {step.modelSelection && !vmModelIssue ? (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => patch({ ...step, modelSelection: null })}
-                  >
-                    {vm ? "Use managed default" : "Use project default"}
-                  </Button>
-                ) : null}
-              </div>
+              <WorkflowAgentModelPicker
+                step={step}
+                models={models}
+                vm={vm}
+                vmModels={vmModels}
+                targetConfirmed={targetConfirmed}
+                disabled={disabled}
+                onChange={(modelSelection) => patch({ ...step, modelSelection })}
+                registerControl={(node) => registerField("model", node)}
+              />
             ) : step.kind === "action" ? (
               <PublishingStepSettings
                 definition={definition}

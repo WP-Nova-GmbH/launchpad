@@ -7,9 +7,16 @@ import {
   type ServerProvider,
   type UnifiedSettings,
 } from "@t3tools/contracts";
-import type { WorkflowDefinition } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+  type WorkflowDefinition,
+} from "@t3tools/contracts/workflows";
 import { describe, expect, it } from "vite-plus/test";
-import { workflowModelState } from "./workflowModels";
+import {
+  workflowModelState,
+  workflowVmCodexInstanceId,
+  workflowVmModelState,
+} from "./workflowModels";
 
 const instanceId = ProviderInstanceId.make("codex_work");
 const selection = { instanceId, model: "custom-a" };
@@ -243,5 +250,129 @@ describe("workflow target model choices", () => {
     );
     expect(restricted.disabledReason(instanceId, "custom-a", "next")).toBeNull();
     expect(restricted.disabledReason(instanceId, "built-in", "first")).toBeNull();
+  });
+});
+
+describe("Agent model picker presentation", () => {
+  it("uses the effective Machine project default even when its built-in model is hidden", () => {
+    const projectDefault = { ...selection, model: "built-in" };
+    const inherited = { ...first, modelSelection: null };
+    const hidden: UnifiedSettings = {
+      ...settings(),
+      providerModelPreferences: {
+        [instanceId]: { hiddenModels: ["built-in"], modelOrder: [] },
+      },
+    };
+    const state = workflowModelState(definition, providers, hidden, projectDefault, true);
+    expect(state.describeSelection(inherited)).toMatchObject({
+      title: "Project default",
+      detail: expect.stringMatching(/^Currently Built in on /),
+      issue: null,
+    });
+    expect(state.defaultDisabledReason(first)).toBeNull();
+  });
+
+  it("distinguishes an unverified Machine default from a known incompatible default", () => {
+    const projectDefault = { ...selection, model: "built-in" };
+    const restrictedProviders = providers.map((provider) => ({
+      ...provider,
+      requiresNewThreadForModelChange: true,
+    }));
+    const next = definition.steps[1];
+    if (next?.kind !== "agent") throw new Error("Invalid later Agent fixture");
+    const verified = workflowModelState(
+      definition,
+      restrictedProviders,
+      settings(),
+      projectDefault,
+      true,
+    );
+    expect(verified.describeDefault(next).issue?.kind).toBe("unavailable");
+    expect(verified.defaultDisabledReason(next)).toContain("cannot change models");
+    const unverified = workflowModelState(
+      definition,
+      restrictedProviders,
+      settings(),
+      projectDefault,
+      false,
+    );
+    expect(unverified.describeDefault(next)).toMatchObject({
+      detail: null,
+      issue: { kind: "unverified" },
+    });
+    expect(unverified.defaultDisabledReason(next)).toBeNull();
+  });
+
+  it("resolves a legacy project default for display without changing Machine continuation checks", () => {
+    const projectDefault = { instanceId, model: "gpt-5-codex" };
+    const firstAgent = { ...first, modelSelection: { instanceId, model: "gpt-5.4" } };
+    const nextAgent = { ...firstAgent, id: "next" };
+    const workflow = { ...definition, steps: [firstAgent, nextAgent] };
+    const legacyProvider: ServerProvider = {
+      ...providers[0]!,
+      models: [{ slug: "gpt-5.4", name: "GPT-5.4", isCustom: false, capabilities: {} }],
+      requiresNewThreadForModelChange: true,
+    };
+    const state = workflowModelState(workflow, [legacyProvider], settings(), projectDefault, true);
+    expect(state.describeDefault(firstAgent)).toMatchObject({
+      detail: expect.stringMatching(/^Currently GPT-5\.4 on /),
+      issue: null,
+    });
+    expect(state.defaultDisabledReason(firstAgent)).toBeNull();
+    expect(state.defaultDisabledReason(nextAgent)).toContain("cannot change models");
+  });
+
+  it("distinguishes a checkout with no configured default from missing project data", () => {
+    const noDefaults = workflowModelState(definition, providers, settings(), null, true);
+    expect(noDefaults.describeDefault(first).issue).toMatchObject({ kind: "unavailable" });
+    expect(noDefaults.defaultDisabledReason(first)).toBe(
+      "No default model is configured for this checkout.",
+    );
+    const missingProject = workflowModelState(definition, providers, settings(), undefined, true);
+    expect(missingProject.describeDefault(first).issue).toMatchObject({ kind: "unverified" });
+    expect(missingProject.defaultDisabledReason(first)).toBeNull();
+    const disconnected = workflowModelState(definition, providers, settings(), null, false);
+    expect(disconnected.describeDefault(first).issue).toMatchObject({ kind: "unverified" });
+    expect(disconnected.defaultDisabledReason(first)).toBeNull();
+  });
+
+  it("names the actual VM runtime default and preserves unverified managed overrides", () => {
+    const alternative = {
+      name: "Catalog default",
+      slug: "catalog-default",
+      isCustom: false,
+      capabilities: null,
+    };
+    const catalog = {
+      defaultModel: alternative.slug,
+      models: [
+        alternative,
+        {
+          name: "Runtime model",
+          slug: WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    const explicit = {
+      ...first,
+      modelSelection: { instanceId: workflowVmCodexInstanceId, model: alternative.slug },
+    };
+    expect(workflowVmModelState(definition, catalog).describeDefault(explicit)).toEqual({
+      title: "Managed default",
+      detail: "Currently Runtime model",
+      issue: null,
+    });
+    const missing = workflowVmModelState(definition, { ...catalog, models: [alternative] });
+    expect(missing.defaultDisabledReason(explicit)).toContain("does not support");
+    expect(missing.describeSelection(explicit).title).toBe("Catalog default");
+    const unverified = workflowVmModelState(definition, null);
+    expect(unverified.describeSelection(explicit)).toMatchObject({
+      title: alternative.slug,
+      issue: { kind: "unverified" },
+    });
+    expect(unverified.defaultDisabledReason(explicit)).toBeNull();
+    expect(unverified.describeSelection(first).issue?.kind).toBe("unavailable");
   });
 });

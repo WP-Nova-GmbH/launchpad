@@ -4,7 +4,7 @@ import {
   type ProviderDriverKind,
   type ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState, type ComponentProps, type ReactNode } from "react";
 import { Badge } from "../ui/badge";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -51,6 +51,12 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
   /** Aggregate settings can show a neutral value without claiming one provider is selected. */
   triggerLabel?: string;
   triggerAriaLabel?: string;
+  triggerProps?: Pick<
+    ComponentProps<typeof PopoverTrigger>,
+    "ref" | "aria-describedby" | "aria-invalid"
+  >;
+  pickerHeader?: ReactNode;
+  getDisabledInstanceTooltip?: (entry: ProviderInstanceEntry) => string;
   onOpenChange?: (open: boolean) => void;
   onOpenProviderSetup?: (instanceId: ProviderInstanceId) => void;
   getModelDisabledReason?: (instanceId: ProviderInstanceId, model: string) => string | null;
@@ -201,6 +207,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
       }}
     >
       <PopoverTrigger
+        {...props.triggerProps}
         render={
           <ComposerControl
             aria-label={props.triggerAriaLabel ?? allModelNames}
@@ -284,6 +291,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         className="before:hidden"
         padding="none"
       >
+        {props.pickerHeader}
         <ModelPickerContent
           activeInstanceId={activeInstanceId}
           model={props.model}
@@ -297,6 +305,9 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
             : {})}
           lockedProvider={props.lockedProvider}
           lockedContinuationGroupKey={props.lockedContinuationGroupKey ?? null}
+          {...(props.getDisabledInstanceTooltip
+            ? { getDisabledInstanceTooltip: props.getDisabledInstanceTooltip }
+            : {})}
           instanceEntries={props.instanceEntries}
           {...(props.keybindings ? { keybindings: props.keybindings } : {})}
           modelOptionsByInstance={props.modelOptionsByInstance}

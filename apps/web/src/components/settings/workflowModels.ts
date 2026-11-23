@@ -4,9 +4,14 @@ import type {
   ServerProvider,
   UnifiedSettings,
 } from "@t3tools/contracts";
-import type { WorkflowDefinition, WorkflowStep } from "@t3tools/contracts/workflows";
-import type { WorkflowVmModelCatalog } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+  type WorkflowDefinition,
+  type WorkflowStep,
+  type WorkflowVmModelCatalog,
+} from "@t3tools/contracts/workflows";
 import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
+import { normalizeModelSlug } from "@t3tools/shared/model";
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
@@ -16,6 +21,18 @@ import { getCustomModelOptionsByInstance } from "../../modelSelection";
 export const workflowVmCodexInstanceId = defaultInstanceIdForDriver(
   ProviderDriverKind.make("codex"),
 );
+
+type AgentStep = Extract<WorkflowStep, { kind: "agent" }>;
+type ModelIssue = { kind: "unavailable" | "unverified"; detail: string };
+
+export type WorkflowModelPresentation = {
+  title: string;
+  detail: string | null;
+  issue: ModelIssue | null;
+};
+
+const unavailable = (detail: string): ModelIssue => ({ kind: "unavailable", detail });
+const unverified = (detail: string): ModelIssue => ({ kind: "unverified", detail });
 
 export function workflowVmModelState(
   definition: WorkflowDefinition,
@@ -37,12 +54,45 @@ export function workflowVmModelState(
       (options?.length ? "Choose a model without saved options." : null);
     return detail ? [{ stepId: step.id, title: step.title, detail }] : [];
   });
+  // Start resolves the managed default from the runtime's model slug.
+  const defaultModel = catalog?.models.find(({ slug }) => slug === WORKFLOW_VM_DEFAULT_CODEX_MODEL);
+  const defaultPresentation: WorkflowModelPresentation = {
+    title: "Managed default",
+    detail: defaultModel ? `Currently ${defaultModel.name}` : null,
+    issue: !catalog
+      ? unverified("VM model choices could not be loaded. You can save with the managed default.")
+      : !defaultModel
+        ? unavailable("This VM build does not support the managed default Codex model.")
+        : null,
+  };
+  const describeSelection = (step: AgentStep): WorkflowModelPresentation => {
+    if (!step.modelSelection) return defaultPresentation;
+    const { instanceId, model, options } = step.modelSelection;
+    const managedCodex = instanceId === workflowVmCodexInstanceId;
+    const title =
+      (managedCodex && catalog?.models.find(({ slug }) => slug === model)?.name) || model;
+    const detail =
+      disabledReason(instanceId, model) ??
+      (options?.length ? "Choose a model without saved options." : null);
+    const issue = !managedCodex
+      ? unavailable("Workflow VMs use managed Codex models.")
+      : !catalog
+        ? unverified("A verified VM model catalog is required to keep this model.")
+        : detail
+          ? unavailable(detail)
+          : null;
+    return { title, detail: managedCodex ? "Managed Codex" : null, issue };
+  };
   return {
     entries: [],
     modelOptions: new Map(),
     anchor: undefined,
     first: definition.steps.find((step) => step.kind === "agent"),
     effectiveSelection: (step) => step.modelSelection,
+    describeSelection,
+    describeDefault: () => defaultPresentation,
+    defaultDisabledReason: () =>
+      defaultPresentation.issue?.kind === "unavailable" ? defaultPresentation.issue.detail : null,
     disabledReason,
     triggerLabel: (step) => {
       const selection = step.modelSelection;
@@ -72,43 +122,93 @@ export function workflowModelState(
   const first = definition.steps.find((step) => step.kind === "agent");
   const firstSelection = first?.modelSelection ?? projectDefault;
   const anchor = entries.find((entry) => entry.instanceId === firstSelection?.instanceId);
-  const effectiveSelection = (step: Extract<WorkflowStep, { kind: "agent" }>) =>
-    step.modelSelection ?? projectDefault;
-  const disabledReason = (
+  const effectiveSelection = (step: AgentStep) => step.modelSelection ?? projectDefault;
+  const compatibilityIssue = (
     instanceId: ProviderInstanceId,
     model: string,
     stepId: string,
-  ): string | null => {
+  ): ModelIssue | null => {
     const entry = entries.find((entry) => entry.instanceId === instanceId);
     if (!configurationReady)
-      return "Connect to the selected environment to verify provider compatibility.";
+      return unverified("Connect to the selected environment to verify provider compatibility.");
     if (!entry?.enabled || !entry.installed || !entry.isAvailable)
-      return "This provider is unavailable on the selected environment.";
+      return unavailable("This provider is unavailable on the selected environment.");
     if (stepId === first?.id) return null;
     if (!firstSelection || !anchor)
-      return "Choose or connect the first Agent's provider to verify compatibility.";
+      return unverified("Choose or connect the first Agent's provider to verify compatibility.");
     if (entry.driverKind !== anchor.driverKind)
-      return `Choose a compatible ${anchor.displayName} provider to continue the shared conversation.`;
+      return unavailable(
+        `Choose a compatible ${anchor.displayName} provider to continue the shared conversation.`,
+      );
     if (
       entry.instanceId !== anchor.instanceId &&
       (!anchor.continuationGroupKey || !entry.continuationGroupKey)
     )
-      return "Compatibility between these provider instances is unverified.";
+      return unverified("Compatibility between these provider instances is unverified.");
     if (
       entry.continuationGroupKey &&
       anchor.continuationGroupKey &&
       entry.continuationGroupKey !== anchor.continuationGroupKey
     )
-      return "These providers cannot share conversation state.";
+      return unavailable("These providers cannot share conversation state.");
     if (
       (instanceId !== firstSelection.instanceId || model !== firstSelection.model) &&
       (anchor.snapshot.requiresNewThreadForModelChange ||
         entry.snapshot.requiresNewThreadForModelChange)
     )
-      return "This provider cannot change models or instances within the shared conversation.";
+      return unavailable(
+        "This provider cannot change models or instances within the shared conversation.",
+      );
     return null;
   };
-  const triggerLabel = (step: Extract<WorkflowStep, { kind: "agent" }>): string | undefined => {
+  const disabledReason = (instanceId: ProviderInstanceId, model: string, stepId: string) =>
+    compatibilityIssue(instanceId, model, stepId)?.detail ?? null;
+
+  const describe = (
+    step: AgentStep,
+    selection: ModelSelection | null | undefined,
+    inherited: boolean,
+  ): WorkflowModelPresentation => {
+    const defaultTitle = "Project default";
+    if (!selection)
+      return {
+        title: defaultTitle,
+        detail: null,
+        issue:
+          configurationReady && selection === null
+            ? unavailable("No default model is configured for this checkout.")
+            : unverified("Connect to the selected project to verify its default provider."),
+      };
+    const { instanceId, model } = selection;
+    const entry = entries.find((candidate) => candidate.instanceId === instanceId);
+    // Resolve inherited labels like the runtime, without changing the stored routing comparison.
+    const modelSlug =
+      inherited && entry ? (normalizeModelSlug(model, entry.driverKind) ?? model) : model;
+    // Hidden built-ins remain usable project defaults.
+    const option =
+      modelOptions.get(instanceId)?.find(({ slug }) => slug === modelSlug) ??
+      (inherited
+        ? entry?.models.find(({ slug, isCustom }) => !isCustom && slug === modelSlug)
+        : null);
+    const issue =
+      compatibilityIssue(instanceId, model, step.id) ??
+      (option
+        ? null
+        : unavailable("This model is not available in the selected provider's choices."));
+    return {
+      title: inherited ? defaultTitle : (option?.name ?? model),
+      detail: inherited
+        ? !issue && option && entry
+          ? `Currently ${option.name} on ${entry.displayName}`
+          : null
+        : (entry?.displayName ?? null),
+      issue,
+    };
+  };
+  const describeDefault = (step: AgentStep) => describe(step, projectDefault, true);
+  const describeSelection = (step: AgentStep) =>
+    step.modelSelection ? describe(step, step.modelSelection, false) : describeDefault(step);
+  const triggerLabel = (step: AgentStep): string | undefined => {
     const selection = step.modelSelection;
     if (!selection) return "Project default";
     const entry = entries.find((entry) => entry.instanceId === selection.instanceId);
@@ -142,6 +242,12 @@ export function workflowModelState(
     anchor,
     first,
     effectiveSelection,
+    describeSelection,
+    describeDefault,
+    defaultDisabledReason: (step: AgentStep) => {
+      const issue = describeDefault(step).issue;
+      return issue?.kind === "unavailable" ? issue.detail : null;
+    },
     disabledReason,
     triggerLabel,
     issues,

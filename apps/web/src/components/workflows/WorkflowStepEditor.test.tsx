@@ -1,13 +1,28 @@
-import { act, createElement, useLayoutEffect, useState, type PropsWithChildren } from "react";
+import {
+  act,
+  createElement,
+  useLayoutEffect,
+  useState,
+  type ComponentProps,
+  type PropsWithChildren,
+} from "react";
 import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { DEFAULT_UNIFIED_SETTINGS, EnvironmentId, ProjectId } from "@t3tools/contracts";
-import type {
-  WorkflowDefinition,
-  WorkflowStep,
-  WorkflowVmModelCatalog,
+import {
+  DEFAULT_UNIFIED_SETTINGS,
+  EnvironmentId,
+  ProjectId,
+  ProviderDriverKind,
+  type ServerProvider,
+} from "@t3tools/contracts";
+import {
+  WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+  type WorkflowDefinition,
+  type WorkflowStep,
+  type WorkflowVmModelCatalog,
 } from "@t3tools/contracts/workflows";
 import { workflowDraftIssue } from "@t3tools/client-runtime/relay/workflow-session";
+import type { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { workflowVmCodexInstanceId } from "../settings/workflowModels";
 
 vi.mock("../ui/button", () => ({
@@ -106,12 +121,61 @@ vi.mock("../ui/select", async () => {
         : null,
   };
 });
-vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
+const machine = vi.hoisted(() => ({ environment: vi.fn(), project: vi.fn() }));
+vi.mock("../../state/environments", () => ({ useEnvironment: machine.environment }));
 vi.mock("../../hooks/useSettings", () => ({
   useEnvironmentSettings: () => DEFAULT_UNIFIED_SETTINGS,
 }));
-vi.mock("../../state/entities", () => ({ useProject: () => null }));
-vi.mock("../chat/ProviderModelPicker", () => ({ ProviderModelPicker: () => null }));
+vi.mock("../../state/entities", () => ({ useProject: machine.project }));
+vi.mock("../chat/ProviderModelPicker", () => ({
+  ProviderModelPicker: (props: ComponentProps<typeof ProviderModelPicker>) => {
+    const [internalOpen, setInternalOpen] = useState(false);
+    const open = props.open ?? internalOpen;
+    const setOpen = props.onOpenChange ?? setInternalOpen;
+    return createElement(
+      "div",
+      null,
+      createElement(
+        "button",
+        {
+          ...props.triggerProps,
+          "aria-label": props.triggerAriaLabel,
+          disabled: props.disabled,
+          onClick: () => setOpen(!open),
+        },
+        props.triggerLabel ?? props.model,
+      ),
+      open
+        ? createElement(
+            "div",
+            { role: "listbox" },
+            props.pickerHeader,
+            props.instanceEntries.flatMap(({ instanceId }) =>
+              (props.modelOptionsByInstance.get(instanceId) ?? []).map((model) => {
+                const reason = props.getModelDisabledReason?.(instanceId, model.slug);
+                return createElement(
+                  "button",
+                  {
+                    key: `${instanceId}:${model.slug}`,
+                    "aria-label": model.name,
+                    disabled: !!reason,
+                    onClick: reason
+                      ? undefined
+                      : () => {
+                          props.onInstanceModelChange(instanceId, model.slug);
+                          setOpen(false);
+                        },
+                  },
+                  model.name,
+                  reason,
+                );
+              }),
+            ),
+          )
+        : null,
+    );
+  },
+}));
 import { useWorkflowEditorModels, WorkflowStepEditor } from "./WorkflowStepEditor";
 const original: WorkflowDefinition = {
   name: "Example",
@@ -153,6 +217,33 @@ const vmPublishing: WorkflowDefinition = {
     { id: "pr", kind: "action", title: "Open PR", action: "open_pull_request" },
   ],
 };
+const machineProvider = {
+  instanceId: workflowVmCodexInstanceId,
+  driver: ProviderDriverKind.make("codex"),
+  enabled: true,
+  installed: true,
+  version: null,
+  status: "ready",
+  auth: { status: "authenticated" },
+  checkedAt: "2026-10-12T00:00:00.000Z",
+  continuation: { groupKey: "checkout-codex" },
+  requiresNewThreadForModelChange: true,
+  models: [
+    { slug: "project-model", name: "Project model", isCustom: false, capabilities: {} },
+    { slug: "alternate-model", name: "Alternate model", isCustom: false, capabilities: {} },
+  ],
+  slashCommands: [],
+  skills: [],
+} satisfies ServerProvider;
+function connectMachine() {
+  machine.environment.mockReturnValue({
+    connection: { phase: "connected" },
+    serverConfig: { providers: [machineProvider] },
+  });
+  machine.project.mockReturnValue({
+    defaultModelSelection: { instanceId: machineProvider.instanceId, model: "project-model" },
+  });
+}
 let renderer: ReactTestRenderer | undefined;
 let definition: WorkflowDefinition = original;
 let selectedId = "";
@@ -240,7 +331,11 @@ const indicatedOptions = () =>
         .findAllByProps({ "data-slot": "select-item-indicator" })
         .map(() => option.props["data-option-value"]),
     );
-beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  machine.environment.mockReset().mockReturnValue(null);
+  machine.project.mockReset().mockReturnValue(null);
+});
 afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
@@ -578,61 +673,120 @@ describe("Workflow step editing", () => {
     ).toBe(true);
   });
 
-  it("keeps an unavailable VM model visible and allows returning to the managed default", async () => {
-    const current = original.steps[1]!;
-    if (current.kind !== "agent") throw new Error("Expected the Agent step fixture.");
+  it("keeps an unverified saved VM model visible and allows returning to the managed default", async () => {
+    const [plan, implement, review] = original.steps;
+    if (implement?.kind !== "agent" || !plan || !review)
+      throw new Error("Expected Agent fixtures.");
+    const saved = { instanceId: workflowVmCodexInstanceId, model: "saved-model" };
     await mount({
       initial: {
         ...original,
         target: { kind: "vm", baseBranch: null },
-        steps: [
-          original.steps[0]!,
-          {
-            ...current,
-            modelSelection: { instanceId: workflowVmCodexInstanceId, model: "saved-model" },
-          },
-          original.steps[2]!,
-        ],
+        steps: [plan, { ...implement, modelSelection: saved }, review],
       },
     });
-    expect(JSON.stringify(renderer!.toJSON())).toContain("saved-model (Unverified)");
-    expect(JSON.stringify(renderer!.toJSON())).toContain(
-      "Select the managed default before saving",
-    );
-    const picker = () => renderer!.root.findByProps({ "aria-label": "Managed Codex model" });
-    const [issueId, approvalsId] = picker().props["aria-describedby"].split(" ");
-    expect(picker().props["aria-invalid"]).toBe(true);
-    expect(renderer!.root.findByProps({ id: issueId }).props.children).toContain(
-      "Select the managed default before saving",
-    );
-    expect(definition.steps[1]).toMatchObject({
-      modelSelection: { instanceId: workflowVmCodexInstanceId, model: "saved-model" },
+
+    const warning = renderer!.root.findByProps({
+      role: "group",
+      "aria-label": "Saved model unverified",
     });
+    expect(warning.props.tabIndex).toBe(-1);
+    expect(visibleText(warning)).toContain("saved-model");
+    const [issueId, approvalsId] = warning.props["aria-describedby"].split(" ");
+    expect(visibleText(renderer!.root.findByProps({ id: issueId }))).toContain(
+      "A verified VM model catalog is required to keep this model.",
+    );
+    expect(visibleText(renderer!.root.findByProps({ id: approvalsId }))).toBe("Approvals required");
+    expect(button("Choose another model")).toBeUndefined();
+    expect(definition.steps[1]).toMatchObject({ modelSelection: saved });
+
     await click("Use managed default");
+
     expect(definition.steps[1]).toMatchObject({ modelSelection: null });
-    expect(picker().props["aria-invalid"]).toBeUndefined();
-    expect(picker().props["aria-describedby"]).toBe(approvalsId);
+    expect(visibleText(renderer!.root)).toContain("Managed default unverified");
+    expect(visibleText(renderer!.root)).not.toContain("saved-model");
   });
 
-  it("selects explicit models using the managed Codex instance", async () => {
+  it("shows the current VM default and keeps it distinct from an explicit model choice", async () => {
     await mount({
       initial: { ...original, target: { kind: "vm", baseBranch: null } },
       vmModels: {
-        defaultModel: "verified-model",
+        defaultModel: WORKFLOW_VM_DEFAULT_CODEX_MODEL,
         models: [
+          {
+            name: "Managed Codex Stable",
+            slug: WORKFLOW_VM_DEFAULT_CODEX_MODEL,
+            isCustom: false,
+            capabilities: null,
+          },
           { name: "Verified model", slug: "verified-model", isCustom: false, capabilities: null },
         ],
       },
     });
-    await act(() =>
-      renderer!.root
-        .findByProps({ "data-workflow-model-select": true })
-        .props.onValueChange("model:verified-model"),
+
+    expect(visibleText(button("Managed Codex model, Managed default"))).toContain(
+      "Managed default",
     );
+    expect(visibleText(renderer!.root)).toContain("Currently Managed Codex Stable");
+    expect(definition.steps[1]).toMatchObject({ modelSelection: null });
+
+    await click("Managed Codex model, Managed default");
+    await act(() => selectOption("model:verified-model").props.onClick());
+
     expect(definition.steps[1]).toMatchObject({
       modelSelection: { instanceId: workflowVmCodexInstanceId, model: "verified-model" },
     });
-    expect(JSON.stringify(renderer!.toJSON())).toContain("Verified model");
+    expect(visibleText(button("Managed Codex model, Verified model"))).toBe("Verified model");
+  });
+
+  it("shows the checkout default and explains a model blocked by conversation continuation", async () => {
+    connectMachine();
+    await mount();
+
+    expect(visibleText(button("Machine model, Project default"))).toContain("Project default");
+    expect(visibleText(renderer!.root)).toMatch(/Currently.*Project model/);
+
+    await click("Machine model, Project default");
+
+    const alternate = button("Alternate model");
+    expect(alternate.props.disabled).toBe(true);
+    expect(visibleText(alternate)).toContain(
+      "This provider cannot change models or instances within the shared conversation.",
+    );
+    expect(definition.steps[1]).toMatchObject({ modelSelection: null });
+  });
+
+  it("keeps a saved Machine model visible and requires a compatible replacement when the default conflicts", async () => {
+    connectMachine();
+    const [plan, implement, review] = original.steps;
+    if (plan?.kind !== "agent" || implement?.kind !== "agent" || !review)
+      throw new Error("Expected Agent fixtures.");
+    const replacement = { instanceId: machineProvider.instanceId, model: "alternate-model" };
+    const saved = { instanceId: machineProvider.instanceId, model: "retired-model" };
+    await mount({
+      initial: {
+        ...original,
+        steps: [
+          { ...plan, modelSelection: replacement },
+          { ...implement, modelSelection: saved },
+          review,
+        ],
+      },
+    });
+
+    expect(visibleText(renderer!.root)).toContain("Saved model unavailable");
+    expect(visibleText(renderer!.root)).toContain("retired-model");
+    expect(visibleText(button("Choose another model"))).toBe("Choose another model");
+    expect(button("Use project default")).toBeUndefined();
+    expect(definition.steps[1]).toMatchObject({ modelSelection: saved });
+
+    await click("Choose another model");
+    expect(button("Project model").props.disabled).toBe(true);
+    expect(button("Project default").props.disabled).toBe(true);
+    await click("Alternate model");
+
+    expect(definition.steps[1]).toMatchObject({ modelSelection: replacement });
+    expect(visibleText(renderer!.root)).not.toContain("retired-model");
   });
   it("retains the selected identity and explicit rework target after moving an Agent", async () => {
     await mount();
