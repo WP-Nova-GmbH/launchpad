@@ -9,6 +9,7 @@ import {
   CloudIcon,
   FileDiffIcon,
   GitBranchIcon,
+  LockKeyholeIcon,
   MessageSquareIcon,
   MonitorIcon,
   PauseIcon,
@@ -36,7 +37,15 @@ import {
 import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
 import { WorkflowVmRecoveryStatus, workflowVmRecoveryTask } from "./WorkflowVmRecovery";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
-import { useCallback, useEffect, useState, useRef, useLayoutEffect, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  useRef,
+  useLayoutEffect,
+  useMemo,
+  type RefObject,
+} from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openPortableThreadChat } from "../../state/threads";
@@ -112,6 +121,10 @@ import {
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
 type SavedReviewRender = { key: string; visitId: string };
+
+const checkingCheckpointAccess = "Checking who can respond…";
+const unconfirmedCheckpointAccess =
+  "Response access couldn’t be confirmed. Refresh the run to try again.";
 
 const matchesSavedReviewRender = (
   render: SavedReviewRender | null,
@@ -287,7 +300,7 @@ function CancelledVmPublication({
 }
 
 export function WorkflowJob({
-  scope,
+  scope: { accountId, organizationId, repositoryId },
   jobId,
   projects,
   canConfigure,
@@ -306,6 +319,11 @@ export function WorkflowJob({
   const openResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const [openingResult, setOpeningResult] = useState(false);
   const [resultError, setResultError] = useState<string | null>(null);
+  // A catalog refresh can recreate an equivalent scope while the run read is still in flight.
+  const scope = useMemo(
+    () => ({ accountId, organizationId, repositoryId }),
+    [accountId, organizationId, repositoryId],
+  );
   const call = useWorkflowClient(scope);
   const reads = useWorkflowJobReads();
   const drafts = useWorkflowDrafts();
@@ -329,6 +347,11 @@ export function WorkflowJob({
   const retryPreparationButton = useRunActionFocus(key, runHeading);
   const runControlsTrigger = useRef<HTMLButtonElement>(null);
   const [cancelDialogKey, setCancelDialogKey] = useState<string | null>(null);
+  const [checkpointAccessCheck, setCheckpointAccessCheck] = useState<{
+    key: string;
+    checkpointId: string;
+    epoch: number;
+  } | null>(null);
   const recoverySettingsLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
   const savedResultsButton = useRunActionFocus(key, runHeading);
   const savedResults = useRef<HTMLElement>(null);
@@ -425,6 +448,21 @@ export function WorkflowJob({
   const waiting =
     !hasResultSave && !finishing && !!checkpoint && !terminal && !cancelling && atCheckpoint;
   const input = checkpoint?.kind === "input";
+  const readOnlyCheckpoint =
+    waiting && checkpoint && !viewerControls.canRespond && (input || !viewerControls.canApprove)
+      ? checkpoint
+      : null;
+  const responseAccessUnconfirmed =
+    !selectedJob?.viewerControls &&
+    (selectedJob?.vmAdmission || selectedJob?.runtime?.kind === "vm");
+  const currentCheckpointAccessCheck =
+    waiting &&
+    checkpointAccessCheck?.key === key &&
+    checkpointAccessCheck.checkpointId === checkpoint?.checkpointId &&
+    checkpointAccessCheck.epoch === read.epoch
+      ? checkpointAccessCheck
+      : null;
+  if (checkpointAccessCheck && !currentCheckpointAccessCheck) setCheckpointAccessCheck(null);
   const runLoaded = selectedJob !== null;
   const showingReview = waiting && !input;
   useLayoutEffect(() => {
@@ -447,26 +485,30 @@ export function WorkflowJob({
     feedbackFocus.current = null;
   });
   const busy = !!read.mutation;
-  const refresh = useCallback(async () => {
-    const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId);
-    if (!request) return;
-    try {
-      settleWorkflowJobRequest(
-        appAtomRegistry,
-        request,
-        await call((client, token) =>
-          client.getWorkflowJob({ clerkToken: token, repositoryId: scope.repositoryId, jobId }),
-        ),
-      );
-    } catch (cause) {
-      settleWorkflowJobRequest(
-        appAtomRegistry,
-        request,
-        workflowError(cause),
-        workflowJobAccessLost(cause),
-      );
-    }
-  }, [call, scope, jobId]);
+  const refresh = useCallback(
+    async (onStart?: (epoch: number) => void) => {
+      const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId);
+      if (!request) return;
+      onStart?.(request.epoch);
+      try {
+        settleWorkflowJobRequest(
+          appAtomRegistry,
+          request,
+          await call((client, token) =>
+            client.getWorkflowJob({ clerkToken: token, repositoryId: scope.repositoryId, jobId }),
+          ),
+        );
+      } catch (cause) {
+        settleWorkflowJobRequest(
+          appAtomRegistry,
+          request,
+          workflowError(cause),
+          workflowJobAccessLost(cause),
+        );
+      }
+    },
+    [call, scope, jobId],
+  );
   useLayoutEffect(() => {
     activateWorkflowJobView(appAtomRegistry, scope, jobId);
     requireFreshWorkflowReviewRead(appAtomRegistry, scope, jobId);
@@ -742,7 +784,12 @@ export function WorkflowJob({
     });
   const refreshRun = () => {
     refreshCatalog();
-    void refresh();
+    void refresh(
+      responseAccessUnconfirmed && readOnlyCheckpoint
+        ? (epoch) =>
+            setCheckpointAccessCheck({ key, checkpointId: readOnlyCheckpoint.checkpointId, epoch })
+        : undefined,
+    );
   };
   const runNavigation = (
     <nav className="flex items-center justify-between gap-2" aria-label="Run navigation">
@@ -936,8 +983,41 @@ export function WorkflowJob({
     completed && pullRequestUrl ? parseChangeRequestUrl(pullRequestUrl)?.number : undefined;
   const confirmationPending =
     approvalPending || manualState.responsePending || !!selectedJob.pendingManualControl;
+  const maintainerRequired =
+    readOnlyCheckpoint &&
+    !responseAccessUnconfirmed &&
+    !canConfigure &&
+    readOnlyCheckpoint.role !== "member";
+  const maintainerAction = input ? "answer" : "review the result";
+  const showCheckpointAccess =
+    !checkpointResponsePending &&
+    !confirmationPending &&
+    (!manualState.checkpointBlocked || manualHold);
+  const checkpointAccessMessage =
+    readOnlyCheckpoint && showCheckpointAccess
+      ? responseAccessUnconfirmed
+        ? read.reading
+          ? checkingCheckpointAccess
+          : unconfirmedCheckpointAccess
+        : maintainerRequired
+          ? manualHold
+            ? `Only a repository maintainer can ${maintainerAction}.`
+            : `Waiting for a repository maintainer to ${maintainerAction}.`
+          : input
+            ? "You don’t have access to answer this checkpoint."
+            : "You don’t have access to respond to this review."
+      : null;
+  const checkpointAccessAnnouncement =
+    currentCheckpointAccessCheck && showCheckpointAccess
+      ? read.reading
+        ? checkingCheckpointAccess
+        : read.acceptedReadEpoch !== currentCheckpointAccessCheck.epoch || responseAccessUnconfirmed
+          ? unconfirmedCheckpointAccess
+          : (checkpointAccessMessage ?? "Your response access is confirmed.")
+      : "";
   const running = selectedJob.status === "running";
   const needsInput = selectedJob.status === "awaiting_input";
+  const needsReview = selectedJob.status === "awaiting_review" && waiting;
   const paused = selectedJob.status === "paused";
   const activeRetry =
     read.mutation && pendingRetry?.key === key && pendingRetry.epoch === read.epoch
@@ -1002,9 +1082,11 @@ export function WorkflowJob({
     ? ActivityIcon
     : needsInput
       ? MessageSquareIcon
-      : paused && !publishingFailure
-        ? PauseIcon
-        : null;
+      : needsReview
+        ? ClipboardCheckIcon
+        : paused && !publishingFailure
+          ? PauseIcon
+          : null;
   const pausedBeforeStep = manualHold && manualState.status === "waiting_capacity" && !checkpoint;
   const showPauseDetail = manualHold && !confirmationPending;
   const statusLabel = workflowStatusLabel(selectedJob.status);
@@ -1083,7 +1165,7 @@ export function WorkflowJob({
       : null;
   const taskTitle = composingFeedback
     ? "Request changes"
-    : checkpointResponsePending
+    : waiting && (!stepRepeatsWorkflowName || checkpointResponsePending)
       ? (checkpointStep?.title ?? (input ? "Input checkpoint" : "Review checkpoint"))
       : terminal
         ? statusLabel
@@ -1094,6 +1176,13 @@ export function WorkflowJob({
             : (checkpointStep?.title ??
               (StatusIcon ? null : workflowStatusLabel(manualState.status ?? selectedJob.status)));
   const conversationInTask = running && !checkpoint;
+  const inspectReviewInTask =
+    needsReview &&
+    !!machine &&
+    !manualHold &&
+    !confirmationPending &&
+    !checkpointResponsePending &&
+    !composingFeedback;
   const checkpointPanel = composingFeedback || checkpointResponsePending;
   const TaskIcon = checkpointPanel ? (input ? MessageSquareIcon : ClipboardCheckIcon) : StatusIcon;
   const resumeAction =
@@ -1273,14 +1362,25 @@ export function WorkflowJob({
         ) : null}
       </form>
     </details>
-  ) : waiting && !viewerControls.canRespond && !viewerControls.canApprove ? (
-    <p className="text-sm text-muted-foreground">
-      This checkpoint requires a repository maintainer.
-    </p>
+  ) : readOnlyCheckpoint ? (
+    <>
+      {readOnlyCheckpoint.kind === "input" ? (
+        <p className="text-sm font-medium">{readOnlyCheckpoint.question}</p>
+      ) : null}
+      {checkpointAccessMessage ? (
+        <div className="flex items-start gap-2 border-t pt-3 text-sm text-muted-foreground">
+          <LockKeyholeIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
+          <p>{checkpointAccessMessage}</p>
+        </div>
+      ) : null}
+    </>
   ) : null;
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl space-y-6 wrap-anywhere">
       {runNavigation}
+      <p role="status" aria-label="Checkpoint response access" className="sr-only">
+        {checkpointAccessAnnouncement}
+      </p>
       <AlertDialog
         open={canCancelRun && cancelDialogKey === key}
         onOpenChange={(open) => {
@@ -1620,7 +1720,7 @@ export function WorkflowJob({
                       aria-hidden={!composingFeedback}
                       className={cn(
                         "inline-flex items-center gap-2 text-sm font-medium",
-                        (needsInput || composingFeedback) &&
+                        (needsInput || needsReview || composingFeedback) &&
                           !checkpointResponsePending &&
                           "text-warning-foreground",
                         running && "text-info-foreground",
@@ -1672,6 +1772,7 @@ export function WorkflowJob({
                 </div>
               )}
               {checkpointResponse}
+              {inspectReviewInTask ? conversationActions : null}
             </div>
           )}
           {selectedJob.status === "queued" && !queuedTask ? (
@@ -1733,6 +1834,7 @@ export function WorkflowJob({
           {waiting &&
           !manualHold &&
           !input &&
+          viewerControls.canApprove &&
           !composingFeedback &&
           !checkpointResponsePending &&
           (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) &&
@@ -1758,7 +1860,11 @@ export function WorkflowJob({
             />
           ) : null}
           {!recoveryInTask ? recoveryCard : null}
-          {!conversationInTask && !failed && !publishingFailure && (!completed || pullRequestUrl)
+          {!conversationInTask &&
+          !inspectReviewInTask &&
+          !failed &&
+          !publishingFailure &&
+          (!completed || pullRequestUrl)
             ? conversationActions
             : null}
           {resultError ? (

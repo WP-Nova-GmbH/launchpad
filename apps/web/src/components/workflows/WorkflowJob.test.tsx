@@ -203,10 +203,15 @@ function text(
   if (typeof node === "string") return node;
   return Array.isArray(node) ? node.map(text).join(" ") : (node.children ?? []).map(text).join(" ");
 }
-const view = (jobId = "job", canConfigure = true, organizationAdmin = false) => (
+const view = (
+  jobId = "job",
+  canConfigure = true,
+  organizationAdmin = false,
+  workflowScope = scope,
+) => (
   <AppAtomRegistryProvider>
     <WorkflowJob
-      scope={scope}
+      scope={workflowScope}
       jobId={jobId}
       projects={[]}
       canConfigure={canConfigure}
@@ -240,6 +245,11 @@ const findButton = (label: string) =>
         button.children.filter((child) => typeof child === "string").join("") === label,
     )!;
 const conversationButton = () => findButton("Open conversation");
+const headerStatus = () =>
+  renderer!.root
+    .findAllByType("header")
+    .flatMap((header) => header.findAllByType("span"))
+    .find((span) => span.props.role === "status")!;
 async function press(label: string) {
   await act(async () => {
     findButton(label).props.onClick();
@@ -600,8 +610,7 @@ describe("workflow result location navigation", () => {
     } satisfies RepositoryWorkflowJob;
     const feedback = "Add rollback verification before publishing.";
     const task = () => text(renderer!.root.findByProps({ "aria-label": "Current workflow task" }));
-    const announcement = () =>
-      text(renderer!.root.findByProps({ role: "status", className: "sr-only" }));
+    const announcement = () => text(headerStatus());
     const results = { scrollIntoView: vi.fn(), focus: vi.fn() };
     fixture.call.mockResolvedValue(saved);
     await mount(true, {
@@ -1082,7 +1091,7 @@ describe("workflow result location navigation", () => {
 });
 
 describe("workflow run presentation", () => {
-  const review: RepositoryWorkflowJob = {
+  const review = {
     ...job,
     status: "awaiting_review",
     progress: {
@@ -1098,7 +1107,15 @@ describe("workflow run presentation", () => {
       },
     },
     viewerControls: { canApprove: true, canRespond: true, canCancel: true },
-  };
+  } satisfies RepositoryWorkflowJob;
+  const maintainerReview = {
+    ...job,
+    status: "awaiting_review",
+    progress: {
+      ...review.progress,
+      checkpoint: { ...review.progress.checkpoint, role: "maintainer" },
+    },
+  } satisfies RepositoryWorkflowJob;
   it("returns to review without losing feedback, stays closed on refresh, and restores it on request", async () => {
     fixture.call.mockResolvedValue(review);
     await mount();
@@ -1119,7 +1136,7 @@ describe("workflow run presentation", () => {
     expect(fixture.call).toHaveBeenCalledTimes(2);
   });
   const checkpointQuestion = "Who should receive the migration first?";
-  const inputCheckpoint: RepositoryWorkflowJob = {
+  const inputCheckpoint = {
     ...review,
     status: "awaiting_input",
     progress: {
@@ -1134,7 +1151,16 @@ describe("workflow run presentation", () => {
         question: checkpointQuestion,
       },
     },
-  };
+  } satisfies RepositoryWorkflowJob;
+  const maintainerInput = {
+    ...job,
+    status: inputCheckpoint.status,
+    progress: {
+      ...inputCheckpoint.progress,
+      checkpoint: { ...inputCheckpoint.progress.checkpoint, role: "maintainer" },
+    },
+  } satisfies RepositoryWorkflowJob;
+  const noCheckpointAccess = { canApprove: false, canRespond: false, canCancel: false };
   const currentTask = () =>
     renderer!.root
       .findAllByType("section")
@@ -1143,11 +1169,146 @@ describe("workflow run presentation", () => {
     act(async () => {
       currentTask().findByType("form").props.onSubmit({ preventDefault: vi.fn() });
     });
-  const headerStatus = () =>
-    renderer!.root
-      .findAllByType("header")
-      .flatMap((header) => header.findAllByType("span"))
-      .find((span) => span.props.role === "status");
+
+  it("shows the Input question and maintainer requirement without a response form for a member", async () => {
+    fixture.call.mockResolvedValue({
+      ...maintainerInput,
+      viewerControls: noCheckpointAccess,
+    } satisfies RepositoryWorkflowJob);
+    await mount(false);
+
+    expect(text(currentTask())).toContain(checkpointQuestion);
+    expect(text(currentTask())).toContain("Waiting for a repository maintainer to answer.");
+    expect(currentTask().findAllByType("form")).toHaveLength(0);
+    expect(findButton("Submit answer")).toBeUndefined();
+  });
+
+  it("lets a member inspect a maintainer-only Machine review without responding", async () => {
+    fixture.call.mockResolvedValue(maintainerReview);
+    fixture.open.mockResolvedValue({
+      _tag: "Success",
+      value: { environmentId: "original", threadId: "thread" },
+    });
+    await mount(false);
+
+    expect(text(currentTask())).toContain(
+      "Waiting for a repository maintainer to review the result.",
+    );
+    expect(findButton("Request changes")).toBeUndefined();
+    expect(findButton("Approve result")).toBeUndefined();
+    expect(currentTask().findAllByType("form")).toHaveLength(0);
+
+    await press("Inspect saved diff");
+    expect(fixture.select).toHaveBeenCalledWith(
+      { environmentId: "original", threadId: "thread" },
+      "saved-turn",
+    );
+    await press("Open conversation");
+    expect(fixture.navigate).toHaveBeenCalledTimes(2);
+  });
+
+  const unconfirmedAccess = "Response access couldn’t be confirmed. Refresh the run to try again.";
+  const checkingAccess = "Checking who can respond…";
+  const maintainerAnswerRequired = "Waiting for a repository maintainer to answer.";
+
+  it.each([
+    {
+      outcome: "maintainer required",
+      controls: noCheckpointAccess,
+      announcement: maintainerAnswerRequired,
+    },
+    {
+      outcome: "access confirmed",
+      controls: { ...noCheckpointAccess, canRespond: true },
+      announcement: "Your response access is confirmed.",
+    },
+    { outcome: "access unresolved", controls: undefined, announcement: unconfirmedAccess },
+    {
+      outcome: "checkpoint replaced",
+      controls: noCheckpointAccess,
+      announcement: "",
+      replaceCheckpoint: true,
+    },
+  ])(
+    "announces a manual VM checkpoint access check ($outcome), while polling stays quiet",
+    async ({ controls, announcement, replaceCheckpoint }) => {
+      const vmInput = {
+        ...maintainerInput,
+        runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+      } satisfies RepositoryWorkflowJob;
+      fixture.call.mockResolvedValue(vmInput);
+      await mount(false);
+
+      const status = () =>
+        text(
+          renderer!.root.findByProps({
+            role: "status",
+            "aria-label": "Checkpoint response access",
+          }),
+        );
+      expect(text(currentTask())).toContain(checkpointQuestion);
+      expect(text(currentTask())).toContain(unconfirmedAccess);
+      expect(text(currentTask())).not.toContain("repository maintainer");
+      expect(currentTask().findAllByType("form")).toHaveLength(0);
+      expect(status()).toBe("");
+
+      const background = deferred();
+      fixture.call.mockReturnValueOnce(background.promise);
+      await pollRun();
+
+      expect(text(currentTask())).toContain(checkingAccess);
+      expect(status()).toBe("");
+      await act(async () => {
+        background.resolve(vmInput);
+        await background.promise;
+      });
+      expect(status()).toBe("");
+
+      const refreshed = {
+        ...vmInput,
+        ...(controls ? { viewerControls: controls } : {}),
+        progress: {
+          ...vmInput.progress,
+          checkpoint: {
+            ...vmInput.progress.checkpoint,
+            checkpointId: replaceCheckpoint
+              ? "another-checkpoint"
+              : vmInput.progress.checkpoint.checkpointId,
+          },
+        },
+      } satisfies RepositoryWorkflowJob;
+      const reply = deferred();
+      fixture.call.mockResolvedValue(refreshed).mockReturnValueOnce(reply.promise);
+      await press("Refresh run");
+
+      expect(text(currentTask())).toContain(checkpointQuestion);
+      expect(text(currentTask())).toContain(checkingAccess);
+      expect(text(currentTask())).not.toContain(unconfirmedAccess);
+      expect(status()).toBe(checkingAccess);
+
+      // Completing the parent catalog refresh supplies a new object with the same repository scope.
+      await act(() => renderer!.update(view("job", false, false, { ...scope })));
+      expect(status()).toBe(checkingAccess);
+
+      await act(async () => {
+        reply.resolve(refreshed);
+        await reply.promise;
+      });
+
+      expect(text(currentTask())).not.toContain(checkingAccess);
+      expect(status()).toBe(announcement);
+      if (controls?.canRespond) {
+        expect(findButton("Submit answer")).toBeDefined();
+      } else {
+        expect(text(currentTask())).toContain(
+          controls ? maintainerAnswerRequired : unconfirmedAccess,
+        );
+        expect(findButton("Submit answer")).toBeUndefined();
+      }
+      await pollRun();
+      expect(status()).toBe("");
+    },
+  );
 
   it.each(["input", "request_changes"] as const)(
     "shows the exact submitted %s while waiting and preserves a newer draft after acknowledgement",
@@ -1302,8 +1463,9 @@ describe("workflow run presentation", () => {
 
   it("keeps review feedback reachable during a manual hold and shows the role requirement after access changes", async () => {
     const vmReview: RepositoryWorkflowJob = {
-      ...review,
+      ...maintainerReview,
       runtime: { kind: "vm", threadId: ThreadId.make("thread") },
+      viewerControls: review.viewerControls,
     };
     const paused: RepositoryWorkflowJob = {
       ...vmReview,
@@ -1342,9 +1504,10 @@ describe("workflow run presentation", () => {
       ...paused,
       viewerControls: { canApprove: false, canRespond: false, canCancel: true },
     });
+    await act(() => renderer!.update(view("job", false)));
     await pollRun();
 
-    const requirement = "This checkpoint requires a repository maintainer.";
+    const requirement = "Only a repository maintainer can review the result.";
     expect(text(renderer!.toJSON())).toContain(requirement);
     expect(renderer!.root.findAllByType("textarea")).toHaveLength(0);
     expect(
@@ -3035,7 +3198,7 @@ describe("queued workflow recovery", () => {
   it("announces a new blocker in the same status region when a queued run is polled", async () => {
     fixture.call.mockResolvedValue(queued);
     await mount();
-    const status = () => renderer!.root.findByProps({ role: "status" });
+    const status = headerStatus;
     const initialStatus = status();
     expect(initialStatus.children.join("")).toBe("Queued");
 
