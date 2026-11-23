@@ -28,6 +28,76 @@ const conflict = (message: string) => new ThreadVmCapacityConflict({ message });
 export const workflowVmCodexConnectionReady = (sql: PgClient) => sql`x.status='connected'
   AND (x.refresh_started_at IS NULL OR x.refresh_started_at::timestamptz>clock_timestamp()-interval '6 seconds')`;
 
+// Uses c for the capacity request and a for its allocation, like ordered admission.
+const eligibleWorkflowWaiter = (
+  sql: PgClient,
+  linear: OrderedCapacityAdmission["linearWorkflow"],
+) =>
+  sql`EXISTS (
+  SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j
+    ON j.job_id=t.workflow_job_id AND j.organization_id=t.organization_id AND j.repository_id=t.repository_id
+  JOIN relay_codex_vm_connections x ON x.organization_id=j.organization_id
+    AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND ${workflowVmCodexConnectionReady(sql)}
+  LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
+  WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND (
+  (t.operation_id=c.operation_id AND
+    (c.kind<>'create' OR (j.record#>>'{origin,kind}') IS DISTINCT FROM 'automation' OR ${
+      linear
+        ? sql`EXISTS (
+          SELECT 1 FROM relay_workflow_admissions admitted
+          JOIN relay_workflow_repository_grants grant_row ON grant_row.grant_id=admitted.grant_id
+            AND grant_row.repository_id=admitted.repository_id AND grant_row.organization_id=admitted.organization_id
+            AND grant_row.connection_id=admitted.connection_id AND grant_row.generation=admitted.grant_generation
+            AND NOT grant_row.revoked
+          JOIN relay_workflow_connections source ON source.connection_id=admitted.connection_id
+            AND source.organization_id=admitted.organization_id AND source.status='connected'
+            AND source.payload_sealed IS NOT NULL
+          JOIN relay_workflow_authorizations auth ON auth.organization_id=source.organization_id
+            AND auth.application_id=source.application_id AND auth.exchange_lease_until IS NULL
+          WHERE admitted.job_id=j.job_id AND admitted.workflow_id=j.record->>'workflowId'
+            AND admitted.repository_id=j.repository_id AND admitted.organization_id=j.organization_id
+            AND admitted.occurrence_id=j.record#>>'{origin,occurrenceId}'
+            AND source.organization_id=${linear.organizationId}
+            AND source.application_id=${linear.clientId}
+            AND source.application_id=j.record#>>'{origin,source,applicationId}'
+            AND source.workspace_id=j.record#>>'{origin,source,workspaceId}'
+            AND source.connection_id=j.record#>>'{origin,source,connectionId}'
+            AND grant_row.grant_id=j.record#>>'{origin,source,grantId}'
+        )`
+        : sql`false`
+    })
+    AND j.pending_control IS NULL AND ((j.status='queued' AND p.allocation_id IS NULL
+      AND j.record#>>'{queueReason,code}'='vm_waiting_capacity') OR
+      (j.status='preparing' AND p.phase='pending' AND p.workflow_snapshot IS NOT NULL
+        AND p.retry_at<=clock_timestamp())))
+  OR (t.audience='repository' AND j.pending_control->>'responseId'=c.operation_id
+    AND j.pending_control->'checkpointDispatch' IS NULL
+    AND ((((j.status='awaiting_review' AND j.pending_control#>>'{response,operation}' IN ('approve','request_changes'))
+      OR (j.status='awaiting_input' AND j.pending_control#>>'{response,operation}'='input'))
+      AND j.record#>>'{progress,checkpoint,checkpointId}'=j.pending_control#>>'{response,checkpointId}')
+      OR (c.kind='create' AND j.status='paused'
+        AND j.pending_control#>>'{response,operation}'='retry_action'
+        AND EXISTS (SELECT 1 FROM jsonb_array_elements(j.record#>'{progress,actions}') action
+          WHERE action->>'actionId'=j.pending_control#>>'{response,actionId}'
+            AND action->>'stepId'=j.record#>>'{progress,stepId}'
+            AND action->>'generation'=j.record#>>'{progress,generation}'
+            AND action->>'retryable'='true')))
+    AND j.record#>>'{progress,status}'=j.status
+    AND j.record#>>'{progress,revision}'=j.pending_control#>>'{response,expectedRevision}'
+    AND ((c.kind='resume' AND EXISTS (
+      SELECT 1 FROM relay_thread_vm_resumes q WHERE q.operation_id=c.operation_id
+        AND q.allocation_id=a.allocation_id AND q.generation=t.generation AND q.phase='waiting'
+        AND q.retry_at<=clock_timestamp()))
+      OR (c.kind='create' AND t.operation_id=c.operation_id AND EXISTS (
+        SELECT 1 FROM relay_thread_vm_restores q WHERE q.operation_id=c.operation_id
+          AND q.thread_id=t.thread_id AND q.allocation_id=a.allocation_id
+          AND q.serving_requested AND q.host_id=c.host_id
+          AND ((q.generation=t.generation AND q.phase IN ('pending','preparing','prepared'))
+            OR (q.phase='committed' AND q.committed_at IS NOT NULL AND q.target_generation=t.generation
+              AND a.compute_ref IS NULL AND c.compute_ref IS NULL
+              AND q.boot_create_started_at IS NULL AND q.boot_receipt IS NULL
+              AND q.boot_recovery_started_at IS NULL AND q.boot_ingress_recovery_claim_id IS NULL))))))))`;
+
 /** Use inside a transaction that is about to authorize work for the pinned connection. */
 export const lockReadyWorkflowVmCodexConnection = Effect.fnUntraced(function* (
   sql: PgClient,
@@ -117,6 +187,83 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
     ) AS available`;
     return capacity?.available === true;
   });
+  const finishedVmDueToPause = Effect.fn("relay.vm_capacity.finished_vm_due_to_pause")(function* (
+    hostId: string,
+    linear: OrderedCapacityAdmission["linearWorkflow"],
+  ) {
+    const [candidate] = yield* sql<{ allocationId: string }>`WITH charged AS (
+      SELECT c.host_id,a.organization_id,a.resource_kind FROM relay_thread_vm_capacity c
+      JOIN relay_thread_vm_allocations a USING(allocation_id)
+      WHERE c.state IN ('reserved','started')
+    ), org_usage AS (
+      SELECT organization_id,count(*) AS used FROM charged
+      WHERE resource_kind='organization_workflow' GROUP BY organization_id
+    ), waiting AS (
+      SELECT a.organization_id,COALESCE(u.used,0) AS used,
+        COALESCE(policy.max_running_workflow_vms,${DEFAULT_WORKFLOW_VM_LIMIT}) AS vm_limit
+      FROM relay_thread_vm_capacity c JOIN relay_thread_vm_allocations a USING(allocation_id)
+      LEFT JOIN org_usage u USING(organization_id)
+      LEFT JOIN relay_thread_vm_policies policy USING(organization_id)
+      WHERE c.host_id=${hostId} AND c.state='waiting' AND a.state IN ('creating','paused')
+        AND a.runtime_protocol='native-v1' AND a.resource_kind='organization_workflow'
+        AND a.deleted_at IS NULL AND ${eligibleWorkflowWaiter(sql, linear)}
+    ), finished AS (
+      SELECT a.allocation_id,a.organization_id,policy.pause_after_idle_minutes,v.activity,v.observed_at,
+        t.thread_id,t.environment_id,t.generation,v.inactive_work_ids,
+        v.idle_since AS observed_idle_since,
+        CASE WHEN l.renewed_at IS NULL THEN l.attempted_at END AS awaiting_lease_confirmation,
+        GREATEST(v.idle_since,(j.record->>'updatedAt')::timestamptz) AS idle_since
+      FROM relay_thread_vm_capacity c JOIN relay_thread_vm_allocations a USING(allocation_id)
+      JOIN relay_thread_vm_activity v USING(allocation_id)
+      JOIN relay_thread_vm_bindings b USING(allocation_id)
+      JOIN relay_thread_vm_ready ready ON ready.allocation_id=a.allocation_id
+        AND ready.environment_id=b.environment_id AND ready.generation=b.generation
+      JOIN relay_thread_vm_provisions provision ON provision.allocation_id=a.allocation_id
+      LEFT JOIN relay_thread_vm_leases l ON l.allocation_id=a.allocation_id
+      JOIN relay_thread_vm_policies policy ON policy.organization_id=a.organization_id
+      JOIN relay_thread_placements t ON t.thread_id=a.thread_id
+      JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id AND j.organization_id=t.organization_id
+        AND j.repository_id=t.repository_id
+      WHERE c.host_id=${hostId} AND c.state='started' AND c.compute_ref=a.compute_ref
+        AND a.state='running' AND a.deleted_at IS NULL
+        AND a.runtime_protocol='native-v1' AND a.resource_kind='organization_workflow'
+        AND t.audience='repository' AND t.operation_id IS NULL AND t.generation=b.generation
+        AND t.environment_id=b.environment_id AND b.revoked_at IS NULL
+        AND t.organization_id=a.organization_id AND t.repository_id=b.repository_id
+        AND j.status IN ('done','cancelled','failed') AND j.pending_control IS NULL
+        AND j.record#>>'{progress,executionReleased}'='true'
+        AND COALESCE(j.record#>'{progress,resultSaving}','null'::jsonb)='null'::jsonb
+        AND provision.workflow_snapshot IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM relay_thread_commands q
+          WHERE q.thread_id=t.thread_id AND q.receipt_json IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_pauses p
+          WHERE p.allocation_id=a.allocation_id AND p.phase IN ('pending','sealed'))
+        AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_resumes r
+          WHERE r.allocation_id=a.allocation_id AND r.phase IN ('waiting','resuming'))
+        AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_backups x
+          WHERE x.allocation_id=a.allocation_id AND x.phase IN ('pending','creating','captured','verifying','cleanup'))
+    )
+    SELECT f.allocation_id AS "allocationId" FROM finished f
+    WHERE f.activity='idle' AND f.observed_idle_since IS NOT NULL
+      AND f.observed_at >= clock_timestamp()-interval '2 minutes'
+      AND f.idle_since <= clock_timestamp()-interval '10 minutes'
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_execution_admissions e
+        WHERE e.thread_id=f.thread_id AND e.generation=f.generation AND NOT e.completed
+          AND NOT (e.environment_id=f.environment_id AND jsonb_exists(f.inactive_work_ids,e.work_id)))
+      AND (f.idle_since <= clock_timestamp()-make_interval(mins => f.pause_after_idle_minutes)
+        OR (NOT EXISTS (SELECT 1 FROM finished pending WHERE pending.allocation_id<>f.allocation_id
+          AND pending.awaiting_lease_confirmation>=clock_timestamp()-interval '2 minutes')
+        AND EXISTS (SELECT 1 FROM waiting w WHERE w.vm_limit>0 AND (
+          (w.organization_id=f.organization_id AND w.used>=w.vm_limit)
+          OR (w.used<w.vm_limit AND EXISTS (
+            SELECT 1 FROM relay_thread_vm_hosts h WHERE h.host_id=${hostId}
+              AND h.max_running_vms <= (SELECT count(*) FROM charged c WHERE c.host_id=h.host_id)
+          ))
+        ))))
+    ORDER BY f.idle_since,f.allocation_id LIMIT 1`;
+    return candidate?.allocationId ?? null;
+  });
+
   const admitNext = Effect.fn("relay.vm_capacity.admit_next")(function* (
     hostId: string,
     scope: "personal" | "all" | OrderedCapacityAdmission = "personal",
@@ -163,70 +310,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
               scope === "all"
                 ? sql`true`
                 : ordered?.workflowEnabled
-                  ? sql`EXISTS (
-              SELECT 1 FROM relay_thread_placements t JOIN relay_workflow_jobs j
-                ON j.job_id=t.workflow_job_id AND j.organization_id=t.organization_id AND j.repository_id=t.repository_id
-              JOIN relay_codex_vm_connections x ON x.organization_id=j.organization_id
-                AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND ${workflowVmCodexConnectionReady(sql)}
-              LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
-              WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND (
-              (t.operation_id=c.operation_id AND
-                (c.kind<>'create' OR (j.record#>>'{origin,kind}') IS DISTINCT FROM 'automation' OR ${
-                  linear
-                    ? sql`EXISTS (
-                      SELECT 1 FROM relay_workflow_admissions admitted
-                      JOIN relay_workflow_repository_grants grant_row ON grant_row.grant_id=admitted.grant_id
-                        AND grant_row.repository_id=admitted.repository_id AND grant_row.organization_id=admitted.organization_id
-                        AND grant_row.connection_id=admitted.connection_id AND grant_row.generation=admitted.grant_generation
-                        AND NOT grant_row.revoked
-                      JOIN relay_workflow_connections source ON source.connection_id=admitted.connection_id
-                        AND source.organization_id=admitted.organization_id AND source.status='connected'
-                        AND source.payload_sealed IS NOT NULL
-                      JOIN relay_workflow_authorizations auth ON auth.organization_id=source.organization_id
-                        AND auth.application_id=source.application_id AND auth.exchange_lease_until IS NULL
-                      WHERE admitted.job_id=j.job_id AND admitted.workflow_id=j.record->>'workflowId'
-                        AND admitted.repository_id=j.repository_id AND admitted.organization_id=j.organization_id
-                        AND admitted.occurrence_id=j.record#>>'{origin,occurrenceId}'
-                        AND source.organization_id=${linear.organizationId}
-                        AND source.application_id=${linear.clientId}
-                        AND source.application_id=j.record#>>'{origin,source,applicationId}'
-                        AND source.workspace_id=j.record#>>'{origin,source,workspaceId}'
-                        AND source.connection_id=j.record#>>'{origin,source,connectionId}'
-                        AND grant_row.grant_id=j.record#>>'{origin,source,grantId}'
-                    )`
-                    : sql`false`
-                })
-                AND j.pending_control IS NULL AND ((j.status='queued' AND p.allocation_id IS NULL
-                  AND j.record#>>'{queueReason,code}'='vm_waiting_capacity') OR
-                  (j.status='preparing' AND p.phase='pending' AND p.workflow_snapshot IS NOT NULL
-                    AND p.retry_at<=clock_timestamp())))
-              OR (t.audience='repository' AND j.pending_control->>'responseId'=c.operation_id
-                AND j.pending_control->'checkpointDispatch' IS NULL
-                AND ((((j.status='awaiting_review' AND j.pending_control#>>'{response,operation}' IN ('approve','request_changes'))
-                  OR (j.status='awaiting_input' AND j.pending_control#>>'{response,operation}'='input'))
-                  AND j.record#>>'{progress,checkpoint,checkpointId}'=j.pending_control#>>'{response,checkpointId}')
-                  OR (c.kind='create' AND j.status='paused'
-                    AND j.pending_control#>>'{response,operation}'='retry_action'
-                    AND EXISTS (SELECT 1 FROM jsonb_array_elements(j.record#>'{progress,actions}') action
-                      WHERE action->>'actionId'=j.pending_control#>>'{response,actionId}'
-                        AND action->>'stepId'=j.record#>>'{progress,stepId}'
-                        AND action->>'generation'=j.record#>>'{progress,generation}'
-                        AND action->>'retryable'='true')))
-                AND j.record#>>'{progress,status}'=j.status
-                AND j.record#>>'{progress,revision}'=j.pending_control#>>'{response,expectedRevision}'
-                AND ((c.kind='resume' AND EXISTS (
-                  SELECT 1 FROM relay_thread_vm_resumes q WHERE q.operation_id=c.operation_id
-                    AND q.allocation_id=a.allocation_id AND q.generation=t.generation AND q.phase='waiting'
-                    AND q.retry_at<=clock_timestamp()))
-                  OR (c.kind='create' AND t.operation_id=c.operation_id AND EXISTS (
-                    SELECT 1 FROM relay_thread_vm_restores q WHERE q.operation_id=c.operation_id
-                      AND q.thread_id=t.thread_id AND q.allocation_id=a.allocation_id
-                      AND q.serving_requested AND q.host_id=c.host_id
-                      AND ((q.generation=t.generation AND q.phase IN ('pending','preparing','prepared'))
-                        OR (q.phase='committed' AND q.committed_at IS NOT NULL AND q.target_generation=t.generation
-                          AND a.compute_ref IS NULL AND c.compute_ref IS NULL
-                          AND q.boot_create_started_at IS NULL AND q.boot_receipt IS NULL
-                          AND q.boot_recovery_started_at IS NULL AND q.boot_ingress_recovery_claim_id IS NULL))))))))`
+                  ? eligibleWorkflowWaiter(sql, linear)
                   : sql`false`
             }
             AND (SELECT count(*) FROM relay_thread_vm_capacity occupied
@@ -309,6 +393,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
     configure,
     request,
     hasWorkflowSlot,
+    finishedVmDueToPause,
     admitNext,
     beginExecution,
     recordCreated,

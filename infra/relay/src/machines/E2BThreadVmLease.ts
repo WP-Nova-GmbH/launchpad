@@ -42,43 +42,52 @@ export function makeE2BThreadVmLease(
   return Effect.fn("relay.thread_vm.renew_lease")(function* (
     sandboxId: string,
     identity: E2BThreadVmIdentity,
+    pauseOnTimeout = false,
   ) {
     const requestedAt = yield* Clock.currentTimeMillis;
     return yield* Effect.tryPromise({
       try: async (signal) => {
         await inspectE2BThreadVmConnection(settings, sandboxId, identity, transport, signal);
-        await renew(sandboxId, settings.timeoutMs, {
+        const options = {
           apiUrl: settings.apiUrl,
           sandboxUrl: settings.sandboxUrl,
           apiKey: Redacted.value(settings.apiKey),
-          retries: 0,
+          retries: 0 as const,
           requestTimeoutMs: 30_000,
           signal,
-        });
-        const info = await inspect(sandboxId, {
-          apiUrl: settings.apiUrl,
-          apiKey: Redacted.value(settings.apiKey),
-          retries: 0,
-          requestTimeoutMs: 30_000,
-          signal,
-        });
-        if (
-          info.sandboxId !== sandboxId ||
-          info.state !== "running" ||
-          info.metadata["launchpad.managed"] !== "thread-vm-v1" ||
-          info.metadata["launchpad.allocation_id"] !== identity.scope.allocationId ||
-          !threadVmOperationMatches(info.metadata, identity.operationId) ||
-          info.metadata["launchpad.thread_id"] !== identity.scope.threadId ||
-          info.metadata["launchpad.generation"] !== String(identity.scope.generation) ||
-          !Number.isFinite(info.startedAt.getTime()) ||
-          !Number.isFinite(info.endAt.getTime()) ||
-          info.endAt.getTime() <= requestedAt ||
-          info.endAt.getTime() <= info.startedAt.getTime()
-        )
-          throw new Error("E2B did not confirm a live finite VM lease.");
+        };
+        const requireLiveLease = (info: SandboxInfo) => {
+          if (
+            info.sandboxId !== sandboxId ||
+            info.state !== "running" ||
+            info.metadata["launchpad.managed"] !== "thread-vm-v1" ||
+            info.metadata["launchpad.allocation_id"] !== identity.scope.allocationId ||
+            !threadVmOperationMatches(info.metadata, identity.operationId) ||
+            info.metadata["launchpad.thread_id"] !== identity.scope.threadId ||
+            info.metadata["launchpad.generation"] !== String(identity.scope.generation) ||
+            !Number.isFinite(info.startedAt.getTime()) ||
+            !Number.isFinite(info.endAt.getTime()) ||
+            info.endAt.getTime() <= requestedAt ||
+            info.endAt.getTime() <= info.startedAt.getTime()
+          )
+            throw new Error("E2B did not confirm a live finite VM lease.");
+        };
+        let timeoutMs = settings.timeoutMs;
+        if (pauseOnTimeout) {
+          const info = await inspect(sandboxId, options);
+          requireLiveLease(info);
+          if (info.lifecycle?.onTimeout === "pause" && info.lifecycle.autoResume === false) {
+            // Expiry preserves the VM and does not wake it. A retry must not extend a short lease.
+            timeoutMs = 15_000;
+            if (info.endAt.getTime() <= requestedAt + timeoutMs) return "pause_scheduled" as const;
+          }
+        }
+        await renew(sandboxId, timeoutMs, options);
+        requireLiveLease(await inspect(sandboxId, options));
         // Native E2B clamps renewals to the project's continuous-run limit.
         // An accepted shorter deadline is valid; it does not promise that the
         // VM can run beyond that limit without a later pause and explicit wake.
+        return timeoutMs < settings.timeoutMs ? ("pause_scheduled" as const) : undefined;
       },
       catch: () =>
         new ThreadVmComputeError({

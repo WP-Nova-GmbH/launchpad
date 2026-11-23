@@ -86,7 +86,9 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       LEFT JOIN relay_thread_vm_activity v ON v.allocation_id = a.allocation_id
       WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow'
         AND EXISTS(SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id
-          AND j.status IN ('awaiting_review','awaiting_input')))) AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
+          AND (j.status IN ('awaiting_review','awaiting_input')
+            OR (j.status IN ('done','cancelled','failed') AND j.record#>>'{progress,executionReleased}'='true')))))
+        AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
         AND a.deleted_at IS NULL AND p.phase = 'created' AND s.phase = 'ready'
         AND b.revoked_at IS NULL AND b.generation = p.generation
         AND t.environment_id = b.environment_id AND t.generation = p.generation

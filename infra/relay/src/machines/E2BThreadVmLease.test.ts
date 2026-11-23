@@ -46,6 +46,37 @@ const info: SandboxInfo = {
 };
 
 describe("thread VM infrastructure lease", () => {
+  it.effect("shortens only a verified pause-on-expiry VM and preserves a shorter deadline", () =>
+    Effect.gen(function* () {
+      const transport = vi.fn(async () =>
+        Response.json({
+          sandboxID: "sandbox",
+          templateID: "template",
+          state: "running",
+          envdVersion: "1",
+          envdAccessToken: "token",
+          lifecycle: { autoResume: false },
+          metadata: info.metadata,
+        }),
+      );
+      const setTimeout = vi.fn(async (_sandboxId: string, _timeoutMs: number) => {});
+      const now = yield* Clock.currentTimeMillis;
+      const pause: SandboxInfo = { ...info, lifecycle: { onTimeout: "pause", autoResume: false } };
+      const inspect = vi.fn(async (): Promise<SandboxInfo> => pause);
+      const renew = makeE2BThreadVmLease(settings, transport as typeof fetch, setTimeout, inspect);
+      expect(yield* renew("sandbox", identity, true)).toBe("pause_scheduled");
+      expect(setTimeout.mock.calls.map(([, timeout]) => timeout)).toEqual([15_000]);
+      inspect.mockResolvedValue({
+        ...pause,
+        endAt: DateTime.toDateUtc(DateTime.makeUnsafe(now + 10_000)),
+      });
+      expect(yield* renew("sandbox", identity, true)).toBe("pause_scheduled");
+      inspect.mockResolvedValue(info);
+      expect(yield* renew("sandbox", identity, true)).toBeUndefined();
+      expect(setTimeout.mock.calls.map(([, timeout]) => timeout)).toEqual([15_000, 600_000]);
+    }),
+  );
+
   it.effect("renews only a verified running VM without a waking connection", () =>
     Effect.gen(function* () {
       const transport = vi.fn(async () =>

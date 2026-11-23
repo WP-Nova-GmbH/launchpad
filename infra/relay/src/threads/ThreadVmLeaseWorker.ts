@@ -2,6 +2,7 @@ import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import { ThreadId } from "@t3tools/contracts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import type { SandboxInfo } from "e2b";
 import { threadVmOperationMatches } from "../machines/E2BThreadVmRestoreAttempt.ts";
@@ -9,6 +10,8 @@ import { makeThreadVmResumeStore, workflowVmNativePauseCheckpoint } from "./Thre
 import { wakeQueuedThreadVm } from "./ThreadVmWakeAdmission.ts";
 import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import type { MissingWorkflowVmSourceReconciler } from "./ThreadVmFinalSaveStore.ts";
+import type { LinearWorkflowConfiguration } from "../Config.ts";
+import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
 
 interface LeaseCandidate {
   readonly resourceKind: "personal" | "organization_workflow";
@@ -36,7 +39,8 @@ type Renew = (
       readonly generation: number;
     };
   },
-) => Effect.Effect<void, ThreadVmComputeError>;
+  pauseOnTimeout?: boolean,
+) => Effect.Effect<void | "pause_scheduled", ThreadVmComputeError>;
 
 /** Renew running allocations and observe native-paused workflow VMs without waking them. */
 export function makeThreadVmLeaseWorker(
@@ -49,10 +53,20 @@ export function makeThreadVmLeaseWorker(
     ) => Effect.Effect<SandboxInfo | null, ThreadVmComputeError>;
   },
   reconcileMissingSource?: MissingWorkflowVmSourceReconciler,
+  finishedWorkflows?: {
+    readonly linear?: Pick<LinearWorkflowConfiguration, "clientId" | "organizationId"> | undefined;
+  },
 ) {
   const runOne = Effect.fn("relay.thread_vm.lease.run_one")(function* (
     mode: "running" | "paused" = "running",
   ) {
+    const idleFinishedVm =
+      mode === "running" && compute && finishedWorkflows
+        ? yield* makeThreadVmCapacityStore(sql).finishedVmDueToPause(
+            hostId,
+            finishedWorkflows.linear,
+          )
+        : null;
     const [row] = yield* sql<LeaseCandidate>`SELECT a.allocation_id AS "allocationId",
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
       a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation,c.operation_id AS "capacityOperationId",
@@ -75,7 +89,8 @@ export function makeThreadVmLeaseWorker(
           AND p.workflow_snapshot IS NOT NULL AND t.audience='repository' AND t.generation=p.generation))
         AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL
         AND p.phase = 'created'
-        AND (a.state='paused' OR l.renewed_at IS NULL OR l.renewed_at < clock_timestamp() - interval '4 minutes')
+        AND (a.state='paused' OR a.allocation_id=${idleFinishedVm ?? ""} OR l.renewed_at IS NULL
+          OR l.renewed_at < clock_timestamp() - interval '4 minutes')
         AND (l.attempted_at IS NULL OR l.attempted_at < clock_timestamp() - interval '1 minute')
         AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_pauses x
           WHERE x.allocation_id = a.allocation_id AND x.generation = p.generation
@@ -86,27 +101,36 @@ export function makeThreadVmLeaseWorker(
         AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_resumes r
           WHERE r.allocation_id = a.allocation_id AND (r.phase='resuming'
             OR (r.phase='waiting' AND (${mode === "running"} OR r.connect_claim_id IS NOT NULL))))
-      ORDER BY l.attempted_at ASC NULLS FIRST, a.allocation_id LIMIT 1`;
+      ORDER BY (a.allocation_id=${idleFinishedVm ?? ""}) DESC,l.attempted_at ASC NULLS FIRST,a.allocation_id LIMIT 1`;
     if (!row) return false;
+    const retiring = row.allocationId === idleFinishedVm;
+    // Reconcile a short or uncertain expiry on the next sweep, even if
+    // inspecting the now-stopped guest clears the idle observation.
     const claimed = yield* sql`INSERT INTO relay_thread_vm_leases (allocation_id, attempted_at)
       VALUES (${row.allocationId}, clock_timestamp()) ON CONFLICT (allocation_id)
-      DO UPDATE SET attempted_at = clock_timestamp()
+      DO UPDATE SET attempted_at = clock_timestamp(),
+        renewed_at = CASE WHEN ${retiring} THEN NULL ELSE relay_thread_vm_leases.renewed_at END
       WHERE relay_thread_vm_leases.attempted_at IS NULL
         OR relay_thread_vm_leases.attempted_at < clock_timestamp() - interval '1 minute'
       RETURNING allocation_id`;
     if (!claimed.length) return true;
-    const renewed =
-      row.allocationState === "running" &&
-      (yield* renew(row.computeRef, {
-        operationId: row.operationId,
-        templateId: row.templateId,
-        scope: {
-          allocationId: row.allocationId,
-          threadId: ThreadId.make(row.threadId),
-          repositoryId: RelayRepositoryId.make(row.repositoryId),
-          generation: row.generation,
-        },
-      }).pipe(Effect.isSuccess));
+    const identity = {
+      operationId: row.operationId,
+      templateId: row.templateId,
+      scope: {
+        allocationId: row.allocationId,
+        threadId: ThreadId.make(row.threadId),
+        repositoryId: RelayRepositoryId.make(row.repositoryId),
+        generation: row.generation,
+      },
+    };
+    const renewal =
+      row.allocationState === "running"
+        ? yield* (
+            retiring ? renew(row.computeRef, identity, true) : renew(row.computeRef, identity)
+          ).pipe(Effect.option)
+        : Option.none();
+    const renewed = Option.isSome(renewal) && renewal.value !== "pause_scheduled";
     if (!renewed && compute) {
       // Native paused state releases power capacity, without claiming a sealed
       // source or an independently recoverable backup. GET never wakes it.

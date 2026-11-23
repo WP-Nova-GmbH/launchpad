@@ -2711,6 +2711,97 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       );
     }
 
+    it.effect(
+      "releases a finished workflow's only slot after grace and confirmed native pause",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const next = yield* seed({ hostId: f.hostId, organizationId: f.organizationId });
+          const { sql } = f;
+          const computeRef = (yield* makeThreadVmAllocationStore(sql).getAny(f.allocationId))!
+            .computeRef!;
+          const connectionId = NodeCrypto.randomUUID();
+          const pr = "https://github.com/acme/example/pull/1";
+          yield* f.capacity.configure(f.hostId, 1);
+          yield* sql`INSERT INTO relay_organizations VALUES (${f.organizationId},'Organization','2026','2026')`;
+          yield* sql`INSERT INTO relay_codex_vm_connections
+          (organization_id,connection_id,issuer,subject,client_id,status,payload_sealed,expires_at,updated_at)
+          VALUES (${f.organizationId},${connectionId},'issuer','subject','client','connected','sealed','2099-01-01','2026')`;
+          yield* sql`UPDATE relay_workflow_jobs SET status='queued',record=record ||
+          ${sql.json({ status: "queued", queueReason: { code: "vm_waiting_capacity" }, vmAdmission: { codexConnectionId: connectionId } })}
+          WHERE job_id=${next.workflowJobId}`;
+          yield* sql`INSERT INTO relay_workflow_saved_results
+          (result_id,job_id,thread_id,turn_id,revision,result,native_checkpoint_operation_id)
+          VALUES (${NodeCrypto.randomUUID()},${f.workflowJobId},${f.threadId},'test-turn',1,'{"patch":"saved"}','test-checkpoint')`;
+          yield* sql`UPDATE relay_workflow_jobs SET status='done',record=record ||
+          ${sql.json({ status: "done", progress: { status: "done", executionReleased: true, pullRequestUrl: pr } })}
+          || jsonb_build_object('updatedAt',clock_timestamp())
+          WHERE job_id=${f.workflowJobId}`;
+          expect(
+            yield* makeThreadVmActivityWorker(sql, () => Effect.succeed("idle"), f.hostId).runOne(),
+          ).toBe(true);
+          yield* sql`UPDATE relay_thread_vm_activity SET idle_since=clock_timestamp()-interval '12 minutes'
+          WHERE allocation_id=${f.allocationId}`;
+          expect(yield* f.capacity.finishedVmDueToPause(f.hostId, undefined)).toBeNull();
+          yield* sql`UPDATE relay_workflow_jobs SET record=record ||
+          jsonb_build_object('updatedAt',clock_timestamp()-interval '11 minutes') WHERE job_id=${f.workflowJobId}`;
+          yield* f.capacity.configure(f.hostId, 2);
+          expect(yield* f.capacity.finishedVmDueToPause(f.hostId, undefined)).toBeNull();
+          yield* f.capacity.configure(f.hostId, 1);
+          expect(yield* f.capacity.finishedVmDueToPause(f.hostId, undefined)).toBe(f.allocationId);
+          yield* sql`UPDATE relay_codex_vm_connections SET status='reconnect_required'
+          WHERE connection_id=${connectionId}`;
+          expect(yield* f.capacity.finishedVmDueToPause(f.hostId, undefined)).toBeNull();
+          yield* sql`UPDATE relay_codex_vm_connections SET status='connected'
+          WHERE connection_id=${connectionId}`;
+          const paused = pausedSandbox(computeRef, f.allocationId, f.operationId, f.threadId);
+          const leaseModes: Array<boolean | undefined> = [];
+          let sandboxState: "running" | "paused" = "running";
+          const worker = makeThreadVmLeaseWorker(
+            sql,
+            (_id, _identity, pauseOnTimeout) =>
+              Effect.gen(function* () {
+                leaseModes.push(pauseOnTimeout);
+                if (sandboxState === "paused")
+                  return yield* new ThreadVmComputeError({
+                    operation: "lease",
+                    message: "VM is already paused",
+                  });
+                return pauseOnTimeout ? "pause_scheduled" : undefined;
+              }),
+            f.hostId,
+            { inspect: () => Effect.succeed({ ...paused, state: sandboxState }) },
+            undefined,
+            {},
+          );
+          expect(yield* worker.runOne()).toBe(true);
+          expect(leaseModes).toEqual([true]);
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+          expect(yield* next.capacity.admitNext(f.hostId, "all")).toBeNull();
+          sandboxState = "paused";
+          yield* sql`UPDATE relay_thread_vm_activity SET activity='unknown',idle_since=NULL
+          WHERE allocation_id=${f.allocationId}`;
+          yield* sql`UPDATE relay_thread_vm_leases SET attempted_at=clock_timestamp()-interval '2 minutes'
+          WHERE allocation_id=${f.allocationId}`;
+          expect(yield* worker.runOne()).toBe(true);
+          expect((yield* makeThreadVmAllocationStore(sql).getAny(f.allocationId))?.state).toBe(
+            "paused",
+          );
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("released");
+          expect(
+            (yield* next.capacity.admitNext(f.hostId, {
+              workflowEnabled: true,
+              workflowOperationId: next.operationId,
+            }))?.operationId,
+          ).toBe(next.operationId);
+          expect(
+            yield* sql`SELECT j.record#>>'{progress,pullRequestUrl}' AS pr,s.result
+          FROM relay_workflow_jobs j JOIN relay_workflow_saved_results s USING(job_id)
+          WHERE j.job_id=${f.workflowJobId}`,
+          ).toEqual([{ pr, result: { patch: "saved" } }]);
+        }),
+    );
+
     for (const nativeState of ["paused", "deleted"] as const) {
       it.effect(`renews a workflow VM lease and releases capacity when it is ${nativeState}`, () =>
         Effect.gen(function* () {

@@ -537,6 +537,7 @@ export const reconcileThreadVmLeases = Effect.fn("relay.thread_vm.reconcile_leas
 ) {
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
+  const relay = yield* RelayConfiguration;
   const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
   const worker = makeThreadVmLeaseWorker(
     sql,
@@ -544,6 +545,7 @@ export const reconcileThreadVmLeases = Effect.fn("relay.thread_vm.reconcile_leas
     settings.hostId,
     makeE2BThreadVmCompute(settings.compute),
     saves.reconcileMissingWorkflowSource,
+    settings.workflowExecutionEnabled === true ? { linear: relay.linearWorkflow } : undefined,
   );
   for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) break;
   // A backlog of saved workflow VMs must not consume the running lease budget.
