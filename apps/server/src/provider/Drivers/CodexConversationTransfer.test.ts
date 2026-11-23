@@ -239,6 +239,69 @@ it.layer(NodeServices.layer)("Codex conversation transfer", (it) => {
     }),
   );
 
+  it.effect("rebinds VM Codex metadata on a local import, including inherited history", () =>
+    Effect.gen(function* () {
+      const f = yield* graphFixture;
+      const parent = f.prefix.replace(
+        '"session_id":',
+        '"model_provider":"launchpad_vm","session_id":',
+      );
+      yield* f.fs.writeFileString(
+        f.rolloutPath,
+        (yield* f.fs.readFileString(f.rolloutPath)).replace(f.prefix, parent),
+      );
+      const settings = {
+        timestamp: "2026-10-01T12:00:01Z",
+        ordinal: 6,
+        type: "event_msg",
+        payload: {
+          type: "thread_settings_applied",
+          thread_settings: { model_provider_id: "launchpad_vm", model: "gpt-test" },
+        },
+      };
+      yield* f.fs.writeFileString(
+        f.head,
+        (yield* f.fs.readFileString(f.head)).replace(
+          `"end_byte_offset":${Buffer.byteLength(f.prefix)}`,
+          `"end_byte_offset":${Buffer.byteLength(parent)}`,
+        ) +
+          encodeJson(settings) +
+          "\n",
+      );
+      const exported = yield* exportCodexConversation(f.input);
+      const input = {
+        manifest: exported.manifest,
+        rolloutPath: f.path.join(exported.directory, "rollout.jsonl"),
+        codexVersion: version,
+      };
+      const imported = yield* importCodexConversation({
+        ...input,
+        destinationRoot: f.path.join(f.root, "local"),
+        useLocalCodexAccount: true,
+      });
+      const importedParent = yield* f.fs.readFileString(
+        f.path.join(f.path.dirname(imported.rolloutPath), f.path.basename(f.rolloutPath)),
+      );
+      expect(yield* decodeJson(importedParent.split("\n")[0])).toMatchObject({
+        payload: { model_provider: "openai" },
+      });
+      const head = (yield* f.fs.readFileString(imported.rolloutPath)).trimEnd().split("\n");
+      expect(yield* decodeJson(head[0])).toMatchObject({
+        payload: { history_base: { end_byte_offset: Buffer.byteLength(importedParent) } },
+      });
+      expect(yield* decodeJson(head.at(-1)!)).toMatchObject({
+        payload: { thread_settings: { model_provider_id: "openai", model: "gpt-test" } },
+      });
+      expect(imported.resumeCursor.threadId).toBe(nativeId);
+      const guest = yield* importCodexConversation({
+        ...input,
+        destinationRoot: f.path.join(f.root, "guest"),
+      });
+      expect(yield* f.fs.readFileString(guest.rolloutPath)).toContain(encodeJson(settings));
+      expect(yield* f.fs.readFileString(input.rolloutPath)).toContain(encodeJson(settings));
+    }),
+  );
+
   it.effect(
     "blocks a missing child before publishing and a missing prefix before installation",
     () =>

@@ -7,6 +7,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { MANAGED_CODEX_MODEL_PROVIDER } from "../Layers/codexLaunchArgs.ts";
 import {
   parseCodexNativeRollout,
   selectCodexNativeHistory,
@@ -44,6 +45,17 @@ const decodeRolloutRecord = Schema.decodeUnknownEffect(Schema.fromJsonString(Rol
 const decodeObject = Schema.decodeUnknownEffect(Schema.Record(Schema.String, Schema.Unknown));
 const decodeOriginalRecord = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
+const isManagedSessionMetadata = Schema.is(
+  Schema.Struct({ model_provider: Schema.Literal(MANAGED_CODEX_MODEL_PROVIDER) }),
+);
+const isManagedThreadSettings = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("thread_settings_applied"),
+    thread_settings: Schema.Struct({
+      model_provider_id: Schema.Literal(MANAGED_CODEX_MODEL_PROVIDER),
+    }),
+  }),
 );
 const hasChildEvent = Schema.is(Schema.Struct({ type: Schema.Literal("collab_agent_spawn_end") }));
 const isFunctionCall = Schema.is(
@@ -121,9 +133,13 @@ const referencedPaths = Effect.fnUntraced(function* (record: typeof RolloutRecor
   return [];
 });
 
-const readReferences = Effect.fnUntraced(function* (rolloutPath: string) {
+const readRolloutReferences = Effect.fnUntraced(function* (
+  rolloutPath: string,
+  inspectManagedProvider = false,
+) {
   const fs = yield* FileSystem.FileSystem;
   const references = new Set<string>();
+  let usesManagedProvider = false;
   yield* fs.stream(rolloutPath).pipe(
     Stream.decodeText(),
     Stream.splitLines,
@@ -131,6 +147,10 @@ const readReferences = Effect.fnUntraced(function* (rolloutPath: string) {
     Stream.runForEach((line) =>
       Effect.gen(function* () {
         const record = yield* decodeRolloutRecord(line);
+        if (inspectManagedProvider && !usesManagedProvider)
+          usesManagedProvider =
+            (record.type === "session_meta" && isManagedSessionMetadata(record.payload)) ||
+            (record.type === "event_msg" && isManagedThreadSettings(record.payload));
         const paths = yield* referencedPaths(record).pipe(
           Effect.catchTag("SchemaError", fileFailure),
         );
@@ -142,16 +162,16 @@ const readReferences = Effect.fnUntraced(function* (rolloutPath: string) {
       }),
     ),
   );
-  return references;
+  return { references, usesManagedProvider };
 });
 
-/** Only known native file fields are rewritten. Text, tool arguments, IDs and
- * conversation records keep their original values. */
-const relocateReferences = Effect.fnUntraced(function* (
+/** Adapt environment-specific metadata in the verified destination copy. */
+const relocateRollout = Effect.fnUntraced(function* (
   rolloutPath: string,
   locations: ReadonlyMap<string, string>,
+  useLocalCodexAccount: boolean,
 ) {
-  if (!locations.size) return;
+  if (!locations.size && !useLocalCodexAccount) return;
   const fs = yield* FileSystem.FileSystem;
   const temporary = `${rolloutPath}.relocating`;
   yield* fs.stream(rolloutPath).pipe(
@@ -161,6 +181,31 @@ const relocateReferences = Effect.fnUntraced(function* (
     Stream.mapEffect((line) =>
       Effect.gen(function* () {
         const record = yield* decodeRolloutRecord(line);
+        if (useLocalCodexAccount) {
+          if (record.type === "session_meta" && isManagedSessionMetadata(record.payload)) {
+            const original = yield* decodeOriginalRecord(line);
+            const payload = yield* decodeObject(record.payload);
+            return (
+              encodeRecord({ ...original, payload: { ...payload, model_provider: "openai" } }) +
+              "\n"
+            );
+          }
+          if (record.type === "event_msg" && isManagedThreadSettings(record.payload)) {
+            const original = yield* decodeOriginalRecord(line);
+            const payload = yield* decodeObject(record.payload);
+            const settings = yield* decodeObject(record.payload.thread_settings);
+            return (
+              encodeRecord({
+                ...original,
+                payload: {
+                  ...payload,
+                  thread_settings: { ...settings, model_provider_id: "openai" },
+                },
+              }) + "\n"
+            );
+          }
+        }
+        if (!locations.size) return `${line}\n`;
         if (record.type !== "event_msg" && record.type !== "response_item") return `${line}\n`;
         const original = yield* decodeOriginalRecord(line);
         if (record.type === "response_item" && isNativeMessage(record.payload)) {
@@ -326,7 +371,7 @@ const exportReferencedFiles = Effect.fnUntraced(function* (input: {
   const path = yield* Path.Path;
   const references = new Set<string>();
   for (const rollout of input.rolloutPaths ?? [input.rolloutPath])
-    for (const file of yield* readReferences(rollout)) references.add(file);
+    for (const file of (yield* readRolloutReferences(rollout)).references) references.add(file);
   if (references.size > 256) return yield* fileFailure();
   if (!references.size) return [];
   const candidates = yield* Effect.forEach(input.roots, (root) =>
@@ -387,12 +432,18 @@ const importReferencedFiles = Effect.fnUntraced(function* (input: {
   readonly rolloutPaths?: ReadonlyArray<string>;
   readonly home: string;
   readonly finalHomePath: string;
+  readonly useLocalCodexAccount?: true;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const references = new Set<string>();
-  for (const rollout of input.rolloutPaths ?? [input.rolloutPath])
-    for (const file of yield* readReferences(rollout)) references.add(file);
+  const rollouts = input.rolloutPaths ?? [input.rolloutPath];
+  const rebindProvider = new Set<string>();
+  for (const rollout of rollouts) {
+    const result = yield* readRolloutReferences(rollout, input.useLocalCodexAccount);
+    for (const file of result.references) references.add(file);
+    if (result.usesManagedProvider) rebindProvider.add(rollout);
+  }
   const files = input.manifest.files ?? [];
   if (
     (input.manifest.format === "codex-rollout-v1" && files.length > 0) ||
@@ -419,8 +470,8 @@ const importReferencedFiles = Effect.fnUntraced(function* (input: {
     if ((yield* digest(target)) !== file.sha256) return yield* fileFailure();
     locations.set(file.sourcePath, path.join(input.finalHomePath, "native-files", file.name));
   }
-  for (const rollout of input.rolloutPaths ?? [input.rolloutPath])
-    yield* relocateReferences(rollout, locations);
+  for (const rollout of rollouts)
+    yield* relocateRollout(rollout, locations, rebindProvider.has(rollout));
 });
 
 /** Call after the native session has drained and closed; never export a live writer. */
@@ -515,6 +566,7 @@ export const importCodexConversation = Effect.fn("importCodexConversation")(func
   readonly rolloutPath: string;
   readonly destinationRoot: string;
   readonly codexVersion: string;
+  readonly useLocalCodexAccount?: true;
   /** Internal installer may publish this temporary home atomically under this final path. */
   readonly finalHomePath?: string;
 }) {
@@ -563,6 +615,7 @@ export const importCodexConversation = Effect.fn("importCodexConversation")(func
       rolloutPath,
       home,
       finalHomePath: input.finalHomePath ?? home,
+      ...(input.useLocalCodexAccount ? { useLocalCodexAccount: true } : {}),
     });
     return {
       homePath: home,
@@ -713,6 +766,7 @@ const importCodexHistoryGraph = Effect.fnUntraced(function* (input: {
   readonly rolloutPath: string;
   readonly destinationRoot: string;
   readonly finalHomePath?: string;
+  readonly useLocalCodexAccount?: true;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -790,6 +844,7 @@ const importCodexHistoryGraph = Effect.fnUntraced(function* (input: {
       rolloutPaths,
       home,
       finalHomePath: input.finalHomePath ?? home,
+      ...(input.useLocalCodexAccount ? { useLocalCodexAccount: true } : {}),
     });
     const relocated: CodexNativeRollout[] = [];
     for (const [name, file] of installed) {

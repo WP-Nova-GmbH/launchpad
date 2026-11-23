@@ -275,7 +275,7 @@ const validationLayer = it.layer(
 );
 
 validationLayer("CodexAdapterLive validation", (it) => {
-  it.effect("attests failed probe cleanup only when authentication blocks native acquisition", () =>
+  it.effect("attests failed probe cleanup when authentication blocks native acquisition", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const factory = makeRuntimeFactory();
@@ -655,8 +655,9 @@ else {
           yield* fs.writeFileString(requestLog, "");
           const incompatible = yield* realAdapter({ MOCK_RESUME_ERROR: "1" });
           const failed = yield* Effect.flip(incompatible.probeSession(input));
-          NodeAssert.equal(failed._tag, "ProviderAdapterProbeError");
+          NodeAssert.ok(isProbeError(failed));
           NodeAssert.match(failed.message, /incompatible native history/);
+          NodeAssert.equal(failed.cleanupConfirmed, true);
           NodeAssert.equal(yield* incompatible.hasSession(input.threadId), false);
           NodeAssert.equal(
             yield* fs.readFileString(requestLog),

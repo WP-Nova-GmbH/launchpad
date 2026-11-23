@@ -1617,6 +1617,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
           codexVersion: CODEX_CONVERSATION_TRANSFER_VERSION,
           importedAt: yield* now,
           ...(freshCheckoutRoot ? { freshCheckoutRoot } : {}),
+          ...(tracked ? {} : { useLocalCodexAccount: true }),
         }).pipe(Effect.provideContext(context));
         if (freshCheckoutRoot)
           yield* configureThreadVmMoveRepository(owner, freshCheckoutRoot).pipe(

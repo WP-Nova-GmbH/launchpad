@@ -3310,6 +3310,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     Effect.suspend(() => {
       let runtimeEpisode: string | undefined;
       let nativeAcquisitionAttempted = false;
+      let localCleanupConfirmed = false;
       return Effect.scoped(
         Effect.gen(function* () {
           if (sessions.get(input.threadId) && !sessions.get(input.threadId)?.stopped)
@@ -3346,9 +3347,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 }),
             })
             .pipe(
-              Effect.ensuring(
+              Effect.onExit(() =>
                 Effect.suspend(() => probe.stopSession(input.threadId, runtimeEpisode)).pipe(
-                  Effect.orDie,
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      localCleanupConfirmed = !trackWorkloads && runtimeEpisode !== undefined;
+                    }),
+                  ),
                 ),
               ),
             );
@@ -3361,7 +3366,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               threadId: input.threadId,
               detail: cause.message,
               // Native EOF in a VM is not proof that supervised descendants stopped.
-              cleanupConfirmed: !nativeAcquisitionAttempted,
+              cleanupConfirmed: !nativeAcquisitionAttempted || localCleanupConfirmed,
               cause,
             }),
         ),

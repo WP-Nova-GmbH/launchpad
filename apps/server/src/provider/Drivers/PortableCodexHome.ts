@@ -119,6 +119,7 @@ export const installPortableCodexHome = Effect.fn("installPortableCodexHome")(fu
   readonly manifest: unknown;
   readonly rolloutPath: string;
   readonly codexVersion: string;
+  readonly useLocalCodexAccount?: true;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -159,6 +160,7 @@ export const installPortableCodexHome = Effect.fn("installPortableCodexHome")(fu
       destinationRoot: path.dirname(target),
       codexVersion: input.codexVersion,
       finalHomePath: target,
+      ...(input.useLocalCodexAccount ? { useLocalCodexAccount: true } : {}),
     });
     yield* Effect.gen(function* () {
       const receipt = path.join(imported.homePath, "launchpad-state.json");

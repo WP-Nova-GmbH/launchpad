@@ -38,6 +38,7 @@ export const installThreadTransferArchive = Effect.fn("installThreadTransferArch
     readonly codexVersion: string;
     readonly importedAt: IsoDateTime;
     readonly freshCheckoutRoot?: string;
+    readonly useLocalCodexAccount?: true;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const fs = yield* FileSystem.FileSystem;
@@ -110,6 +111,7 @@ export const installThreadTransferArchive = Effect.fn("installThreadTransferArch
                 manifest: staged.manifest.native,
                 rolloutPath: path.join(input.artifactDirectory, "native", "rollout.jsonl"),
                 codexVersion: input.codexVersion,
+                ...(input.useLocalCodexAccount ? { useLocalCodexAccount: true } : {}),
               })
             : null;
         yield* installThreadAttachments({
