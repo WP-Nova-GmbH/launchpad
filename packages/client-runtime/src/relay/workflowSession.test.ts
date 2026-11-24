@@ -31,6 +31,7 @@ import {
   emptyWorkflowJobPageRead,
   beginWorkflowJobPage,
   settleWorkflowJobPage,
+  readWorkflowJobPages,
   beginWorkflowReview,
   beginMachineWorkflowReview,
   recordMachineWorkflowReviewDiff,
@@ -1281,6 +1282,35 @@ describe("whole workflow validation and presentation", () => {
 
 describe("workflow page response ownership", () => {
   const row = (jobId: string) => ({ ...job(), jobId });
+
+  it("keeps the next cursor once an ordinary refresh fills the loaded window", async () => {
+    const page = await readWorkflowJobPages(
+      async (cursor) => {
+        if (cursor === null) return { jobs: [row("a")], nextCursor: "second" };
+        if (cursor === "second") return { jobs: [row("b")], nextCursor: "third" };
+        throw new Error("Read past the loaded window");
+      },
+      { minimumCount: 2 },
+    );
+    expect(page.jobs.map(({ jobId }) => jobId)).toEqual(["a", "b"]);
+    expect(page.nextCursor).toBe("third");
+  });
+
+  it("stops continued restoration if the relay repeats a cursor", async () => {
+    let readSecondPage = false;
+    const page = await readWorkflowJobPages(
+      async (cursor) => {
+        if (cursor === null) return { jobs: [row("a")], nextCursor: "second" };
+        if (readSecondPage) throw new Error("Requested the same cursor twice");
+        readSecondPage = true;
+        return { jobs: [row("b")], nextCursor: "second" };
+      },
+      { continueWhile: () => true },
+    );
+    expect(page.jobs.map(({ jobId }) => jobId)).toEqual(["a", "b"]);
+    expect(page.nextCursor).toBeNull();
+  });
+
   it("rejects old view/scope responses and refresh replaces every loaded page", () => {
     const first = { key: "account:org:repo:active", cursor: null };
     let read = beginWorkflowJobPage(emptyWorkflowJobPageRead, first);

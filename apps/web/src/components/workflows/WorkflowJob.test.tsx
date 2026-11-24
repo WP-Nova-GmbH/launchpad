@@ -49,6 +49,7 @@ import {
   setWorkflowSessionAccount,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry";
+import type { WorkflowRunsReturn } from "./workflowRunsNavigation";
 
 const fixture = vi.hoisted(() => ({
   call: vi.fn(),
@@ -61,6 +62,7 @@ const fixture = vi.hoisted(() => ({
   locationKey: "workflow-run",
   workflowMachineReviewVisitId: undefined as string | undefined,
   workflowReviewReturn: undefined as WorkflowResultCheckpoint | undefined,
+  workflowRunsReturn: undefined as WorkflowRunsReturn | undefined,
 }));
 const fixtureRouter = {
   history: {
@@ -81,6 +83,7 @@ vi.mock("@tanstack/react-router", () => ({
         __TSR_key: string;
         workflowMachineReviewVisitId: string | undefined;
         workflowReviewReturn: WorkflowResultCheckpoint | undefined;
+        workflowRunsReturn: WorkflowRunsReturn | undefined;
       };
     }) => unknown;
   }) =>
@@ -90,6 +93,7 @@ vi.mock("@tanstack/react-router", () => ({
         __TSR_key: fixture.locationKey,
         workflowMachineReviewVisitId: fixture.workflowMachineReviewVisitId,
         workflowReviewReturn: fixture.workflowReviewReturn,
+        workflowRunsReturn: fixture.workflowRunsReturn,
       },
     }),
   Link: ({
@@ -344,11 +348,44 @@ beforeEach(() => {
   fixture.locationKey = "workflow-run";
   fixture.workflowMachineReviewVisitId = undefined;
   fixture.workflowReviewReturn = undefined;
+  fixture.workflowRunsReturn = undefined;
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
   renderer = undefined;
   vi.unstubAllGlobals();
+});
+
+it.each([
+  { label: "History", view: "history", current: true },
+  { label: "Needs attention", view: "attention", current: true },
+  { label: "another run", view: "history", current: false, wrongJob: true },
+  { label: "another scope", view: "history", current: false, wrongScope: true },
+  { label: "a direct link", view: undefined, current: false },
+] as const)("returns from $label to the correct runs list", async (entry) => {
+  const scopeKey = workflowSessionKey(scope, "runs");
+  fixture.workflowRunsReturn = entry.view
+    ? {
+        scopeKey: "wrongScope" in entry ? "other-scope" : scopeKey,
+        view: entry.view,
+        row: { jobId: "wrongJob" in entry ? "other-job" : job.jobId, index: 13 },
+        loadedCount: 20,
+        scrollTop: 360,
+      }
+    : undefined;
+  await mount();
+  await press("Back to runs");
+
+  expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
+    to: "/workflows/$repositoryId",
+    params: { repositoryId: scope.repositoryId },
+    search: { tab: "runs" },
+    state: {
+      workflowRunsReturn: entry.current
+        ? fixture.workflowRunsReturn
+        : { scopeKey, view: "active", row: null, loadedCount: 0, scrollTop: 0 },
+    },
+  });
 });
 
 describe("successful run outcome", () => {
@@ -1016,6 +1053,13 @@ describe("workflow result location navigation", () => {
   );
 
   it("opens conversation and retries the exact completed result at the current destination", async () => {
+    fixture.workflowRunsReturn = {
+      scopeKey: workflowSessionKey(scope, "runs"),
+      view: "history",
+      row: { jobId: job.jobId, index: 13 },
+      loadedCount: 20,
+      scrollTop: 360,
+    };
     fixture.open.mockRejectedValueOnce(new Error("Location unavailable"));
     await mount();
     await press("Inspect result");
@@ -1031,6 +1075,7 @@ describe("workflow result location navigation", () => {
     );
     const destination = fixture.navigate.mock.calls[0]![0];
     expect(destination.params).toEqual({ environmentId: "moved-vm", threadId: "thread" });
+    expect(destination.state({}).workflowRunsReturn).toEqual(fixture.workflowRunsReturn);
     expect(destination.state({}).workflowOrigin).toEqual({
       ...scope,
       jobId: "job",
@@ -1047,9 +1092,9 @@ describe("workflow result location navigation", () => {
     );
     await press("Open conversation");
     expect(fixture.navigate).toHaveBeenCalledTimes(2);
-    expect(
-      fixture.navigate.mock.calls[1]![0].state({}).workflowOrigin.savedDiffCheckpoint,
-    ).toBeUndefined();
+    const conversationState = fixture.navigate.mock.calls[1]![0].state({});
+    expect(conversationState.workflowRunsReturn).toEqual(fixture.workflowRunsReturn);
+    expect(conversationState.workflowOrigin.savedDiffCheckpoint).toBeUndefined();
     expect(job.runtime).toMatchObject({ kind: "machine", environmentId: "original" });
   });
   it("opens the active Machine review at its checkpoint without requiring a VM review visit", async () => {

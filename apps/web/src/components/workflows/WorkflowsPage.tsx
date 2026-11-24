@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
-import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { useLocation, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useState, useCallback, useRef } from "react";
 import {
   RelayRepositoryId,
@@ -66,6 +66,7 @@ import { WorkflowBuilder } from "./WorkflowBuilder";
 import { WorkflowRun } from "./WorkflowRun";
 import { WorkflowJob } from "./WorkflowJob";
 import { WorkflowJobs } from "./WorkflowJobs";
+import { workflowRunsBackLocation } from "./workflowRunsNavigation";
 import { WorkflowRepositoryChooser, WorkflowRepositorySwitcher } from "./WorkflowRepositoryPicker";
 import {
   useWorkflowClient,
@@ -356,6 +357,7 @@ function WorkflowRepositoryView({
   const navigate = useNavigate();
   const params = useParams({ strict: false });
   const search = useSearch({ strict: false });
+  const runsReturn = useLocation({ select: ({ state }) => state.workflowRunsReturn });
   const tab = "tab" in search && search.tab === "runs" ? "runs" : "workflows";
   const workflowId = "workflowId" in params ? params.workflowId : undefined;
   const jobId = "jobId" in params ? params.jobId : undefined;
@@ -651,12 +653,14 @@ function WorkflowRepositoryView({
     };
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Canonical write receipts invalidate the repository catalog, including detached Save completions.
   }, [refresh, catalogRevision]);
-  const back = () =>
-    navigate({
+  const back = () => {
+    if (view === "job") return navigate(workflowRunsBackLocation(scope, jobId, runsReturn));
+    return navigate({
       to: "/workflows/$repositoryId",
       params: { repositoryId: scope.repositoryId },
-      search: { tab: view === "job" ? "runs" : "workflows" },
+      search: { tab: "workflows" },
     });
+  };
   const selectRepository = (repositoryId: RelayRepositoryId) => {
     void navigate({
       to: "/workflows/$repositoryId",
@@ -1335,7 +1339,7 @@ function WorkflowRepositoryView({
       <WorkspacePageHeader electron={isElectron}>
         <h1 className="text-sm font-medium">Workflows</h1>
       </WorkspacePageHeader>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="min-h-0 flex-1 overflow-y-auto" data-workflow-runs-scroll-container>
         <WorkspacePageContainer width="expanded">
           {!(view === "job" && jobId && loaded) ? (
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1448,13 +1452,14 @@ function WorkflowRepositoryView({
                     role="tab"
                     aria-selected={tab === "runs"}
                     variant={tab === "runs" ? "secondary" : "ghost"}
-                    onClick={() =>
-                      navigate({
+                    onClick={() => {
+                      if (tab === "runs") return;
+                      void navigate({
                         to: "/workflows/$repositoryId",
                         params: { repositoryId: scope.repositoryId },
                         search: { tab: "runs" },
-                      })
-                    }
+                      });
+                    }}
                   >
                     Runs
                   </Button>

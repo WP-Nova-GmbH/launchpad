@@ -17,10 +17,12 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { useWorkflowConversation, WorkflowConversationHeader } from "./WorkflowNavigation";
+import type { WorkflowRunsReturn } from "./workflowRunsNavigation";
 
 const fixture = vi.hoisted(() => ({
   origin: undefined as WorkflowResultOrigin | undefined,
   machineReviewVisitId: undefined as string | undefined,
+  runsReturn: undefined as WorkflowRunsReturn | undefined,
   call: vi.fn(),
 }));
 vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => true }));
@@ -39,6 +41,7 @@ vi.mock("@tanstack/react-router", () => ({
       state: {
         workflowOrigin: fixture.origin,
         workflowMachineReviewVisitId: fixture.machineReviewVisitId,
+        workflowRunsReturn: fixture.runsReturn,
       },
     }),
   Link: ({
@@ -50,12 +53,14 @@ vi.mock("@tanstack/react-router", () => ({
     state?: {
       workflowReviewReturn?: WorkflowResultCheckpoint;
       workflowMachineReviewVisitId?: string;
+      workflowRunsReturn?: WorkflowRunsReturn;
     };
   }>) => (
     <a
       href={`#${hash}`}
       data-review-return={state?.workflowReviewReturn?.checkpointId}
       data-review-visit={state?.workflowMachineReviewVisitId}
+      data-runs-return={state?.workflowRunsReturn && JSON.stringify(state.workflowRunsReturn)}
     >
       {children}
     </a>
@@ -117,6 +122,7 @@ beforeEach(() => {
   });
   fixture.origin = origin;
   fixture.machineReviewVisitId = undefined;
+  fixture.runsReturn = undefined;
   fixture.call.mockReset();
   appAtomRegistry.set(managedRelaySessionAtom, {
     accountId: origin.accountId,
@@ -224,11 +230,21 @@ it.each([
   },
 );
 
-it("updates the return link when the review changes while the diff is open", async () => {
+it("keeps the Runs context when the review changes while the diff is open", async () => {
   fixture.machineReviewVisitId = "original-visit";
+  fixture.runsReturn = {
+    scopeKey: workflowSessionKey(origin, "runs"),
+    view: "attention",
+    row: { jobId: origin.jobId, index: 1, nextJobId: "next" },
+    loadedCount: 4,
+    scrollTop: 24,
+  };
   fixture.call.mockResolvedValue(review);
   await mountHeader(review, "awaiting_review");
   expect(renderer!.root.findByType("a").children).toContain("Return to review");
+  expect(renderer!.root.findByType("a").props["data-runs-return"]).toBe(
+    JSON.stringify(fixture.runsReturn),
+  );
   const key = workflowSessionKey(origin, origin.jobId);
   expect(appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.machineReviewVisits).toBeUndefined();
 
@@ -251,5 +267,25 @@ it("updates the return link when the review changes while the diff is open", asy
   expect(renderer!.root.findByType("a").props.href).toBe("#");
   expect(renderer!.root.findByType("a").props["data-review-return"]).toBe(checkpoint.checkpointId);
   expect(renderer!.root.findByType("a").props["data-review-visit"]).toBe("original-visit");
+  expect(renderer!.root.findByType("a").props["data-runs-return"]).toBe(
+    JSON.stringify(fixture.runsReturn),
+  );
   expect(appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.machineReviewVisits).toBeUndefined();
+});
+
+it("omits stale Runs context from a conversation return", async () => {
+  fixture.runsReturn = {
+    scopeKey: workflowSessionKey(origin, "runs"),
+    view: "history",
+    row: { jobId: "another-run", index: 0 },
+    loadedCount: 5,
+    scrollTop: 0,
+  };
+  const { reviewCheckpoint: _checkpoint, ...conversationOrigin } = origin;
+  fixture.origin = conversationOrigin;
+  await mountHeader(null, null);
+
+  const link = renderer!.root.findByType("a");
+  expect(link.children).toContain("Back to run");
+  expect(link.props["data-runs-return"]).toBeUndefined();
 });

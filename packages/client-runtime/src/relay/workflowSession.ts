@@ -1145,19 +1145,25 @@ export async function readWorkflowJobPages(
     cursor = null,
     minimumCount = 0,
     isCurrent = () => true,
+    continueWhile,
   }: {
     cursor?: string | null;
     minimumCount?: number;
     isCurrent?: () => boolean;
+    continueWhile?: (lastJob: RepositoryWorkflowJobSummary) => boolean;
   } = {},
 ): Promise<WorkflowJobPage> {
+  const seenCursors = new Set([cursor]);
   let page = await readPage(cursor);
   const jobs = [...page.jobs];
-  while (page.nextCursor && page.jobs.length && jobs.length < minimumCount && isCurrent()) {
+  while (page.nextCursor && !seenCursors.has(page.nextCursor) && isCurrent()) {
+    const lastJob = page.jobs.at(-1);
+    if (!lastJob || (jobs.length >= minimumCount && !continueWhile?.(lastJob))) break;
+    seenCursors.add(page.nextCursor);
     page = await readPage(page.nextCursor);
     jobs.push(...page.jobs);
   }
-  return { jobs, nextCursor: page.nextCursor };
+  return { jobs, nextCursor: seenCursors.has(page.nextCursor) ? null : page.nextCursor };
 }
 
 /** A list request owns exactly one scope/view and cursor. Refresh replaces all loaded pages. */

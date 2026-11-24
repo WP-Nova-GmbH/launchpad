@@ -21,6 +21,7 @@ import { workflowResultGitAccess } from "../../lib/workflowResultGitAccess";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
+import { workflowRunsReturnForJob } from "./workflowRunsNavigation";
 import { useWorkflowClient, WORKFLOW_REVIEW_ANCHOR } from "./workflowState";
 import {
   sameWorkflowResultCheckpoint,
@@ -104,6 +105,8 @@ export function WorkflowConversationHeader({
 }) {
   const { origin, title, repository, readOnly, status } = conversation;
   const call = useWorkflowClient(origin);
+  const runsReturn = useLocation({ select: ({ state }) => state.workflowRunsReturn });
+  const returnContext = workflowRunsReturnForJob(origin, origin.jobId, runsReturn);
   const review = origin.reviewCheckpoint;
   const machineReviewVisitId = useLocation({
     select: ({ state }) => state.workflowMachineReviewVisitId,
@@ -229,14 +232,15 @@ export function WorkflowConversationHeader({
               to="/workflows/$repositoryId/jobs/$jobId"
               params={{ repositoryId: origin.repositoryId, jobId: origin.jobId }}
               hash={returnToReview ? WORKFLOW_REVIEW_ANCHOR : ""}
-              state={
-                review && !vmReview
+              state={{
+                ...(review && !vmReview
                   ? {
                       workflowReviewReturn: review,
                       workflowMachineReviewVisitId: machineReviewVisitId,
                     }
-                  : {}
-              }
+                  : {}),
+                ...(returnContext ? { workflowRunsReturn: returnContext } : {}),
+              }}
               hashScrollIntoView={false}
             />
           }

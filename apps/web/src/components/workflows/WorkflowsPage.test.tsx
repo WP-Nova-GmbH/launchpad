@@ -51,6 +51,7 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { workflowVmCodexInstanceId } from "../settings/workflowModels";
+import type { WorkflowRunsReturn } from "./workflowRunsNavigation";
 
 const fixture = vi.hoisted(() => ({
   definitions: vi.fn<() => Promise<ReadonlyArray<RepositoryWorkflow>>>(),
@@ -61,6 +62,8 @@ const fixture = vi.hoisted(() => ({
   realDepartureGuard: false,
   tab: "runs",
   workflowId: undefined as string | undefined,
+  jobId: undefined as string | undefined,
+  runsReturn: undefined as WorkflowRunsReturn | undefined,
   supported: false,
   vmAuthoring: undefined as WorkflowCatalog["vmAuthoring"],
   vmExecutionAvailable: false,
@@ -92,11 +95,24 @@ vi.mock("@tanstack/react-router", async () => {
   return {
     ...router,
     useNavigate: () => fixture.navigate,
-    useLocation: () => undefined,
+    useLocation: ({
+      select,
+    }: {
+      select?: (location: {
+        state: { __TSR_key: string; workflowRunsReturn?: WorkflowRunsReturn | undefined };
+      }) => unknown;
+    } = {}) =>
+      select?.({
+        state: { __TSR_key: "workflows-page", workflowRunsReturn: fixture.runsReturn },
+      }),
     useParams: (options: Parameters<typeof router.useParams>[0]) => {
       const readParams = fixture.realDepartureGuard
         ? router.useParams
-        : () => ({ repositoryId: "repository", workflowId: fixture.workflowId });
+        : () => ({
+            repositoryId: "repository",
+            workflowId: fixture.workflowId,
+            jobId: fixture.jobId,
+          });
       return readParams(options);
     },
     useSearch: () => ({ tab: fixture.tab }),
@@ -478,6 +494,8 @@ beforeEach(() => {
   fixture.realDepartureGuard = false;
   fixture.tab = "runs";
   fixture.workflowId = undefined;
+  fixture.jobId = undefined;
+  fixture.runsReturn = undefined;
   fixture.supported = false;
   fixture.vmAuthoring = undefined;
   fixture.vmExecutionAvailable = false;
@@ -668,6 +686,42 @@ const serve = Effect.gen(function* () {
     Queue.take(reads).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
   ).pipe(Effect.forkScoped);
 });
+
+it.effect("keeps the Runs list context when leaving a Run while the catalog loads", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      const metadata = deferred<ReadonlyArray<RepositoryWorkflow>>();
+      fixture.jobId = "older-run";
+      fixture.runsReturn = {
+        scopeKey: workflowSessionKey(starterScope, "runs"),
+        view: "history",
+        row: { jobId: fixture.jobId, index: 24 },
+        loadedCount: 40,
+        scrollTop: 800,
+      };
+      fixture.definitions.mockReturnValueOnce(metadata.promise);
+      await act(() => {
+        renderer = create(
+          <AppAtomRegistryProvider>
+            <WorkflowsPage view="job" />
+          </AppAtomRegistryProvider>,
+        );
+      });
+
+      await press("← Back to runs", false);
+      expect(fixture.navigate).toHaveBeenCalledWith({
+        to: "/workflows/$repositoryId",
+        params: { repositoryId },
+        search: { tab: "runs" },
+        state: { workflowRunsReturn: fixture.runsReturn },
+      });
+
+      await act(async () => metadata.resolve([workflow]));
+    });
+  }),
+);
+
 async function mountCatalog(
   view: "catalog" | "builder" = "catalog",
   options: Parameters<typeof create>[1] = {
@@ -686,6 +740,50 @@ async function mountCatalog(
     await Promise.all(deliveries);
   });
 }
+
+it.effect("keeps restored History in place when the selected Runs tab is clicked again", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.runsReturn = {
+        scopeKey: workflowSessionKey(starterScope, "runs"),
+        view: "history",
+        row: { jobId: "Older release", index: 1 },
+        loadedCount: 2,
+        scrollTop: 240,
+      };
+      fixture.definitions.mockResolvedValue([workflow]);
+      fixture.page
+        .mockResolvedValueOnce({ jobs: [row("Recent release")], nextCursor: "older" })
+        .mockResolvedValueOnce({ jobs: [row("Older release")], nextCursor: null });
+      await act(() => {
+        renderer = create(
+          <AppAtomRegistryProvider>
+            <WorkflowsPage />
+          </AppAtomRegistryProvider>,
+        );
+      });
+      // Catalog load, History load, and the next page settle in successive reads.
+      for (let start = 0; start < deliveries.length;) {
+        const pending = deliveries.slice(start);
+        start += pending.length;
+        await act(async () => {
+          await Promise.all(pending);
+        });
+      }
+
+      expect(button("History").props["aria-pressed"]).toBe(true);
+      expect(content()).toContain("Older release");
+      await press("Runs");
+
+      expect(fixture.navigate).not.toHaveBeenCalled();
+      expect(fixture.page).toHaveBeenCalledTimes(2);
+      expect(button("History").props["aria-pressed"]).toBe(true);
+      expect(content()).toContain("Older release");
+    });
+  }),
+);
+
 const vmWorkflow: RepositoryWorkflow = {
   ...workflow,
   definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },

@@ -112,6 +112,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { searchableSetting } from "../settings/settingsSearch";
 import { WorkflowProgress } from "./WorkflowProgress";
+import { workflowRunsBackLocation, workflowRunsReturnForJob } from "./workflowRunsNavigation";
 import {
   WORKFLOW_REVIEW_ANCHOR,
   useWorkflowClient,
@@ -345,6 +346,7 @@ export function WorkflowJob({
     select: ({ state }) => state?.workflowReviewReturn,
   });
   const returnVisitId = useLocation({ select: ({ state }) => state.workflowMachineReviewVisitId });
+  const runsReturn = useLocation({ select: ({ state }) => state.workflowRunsReturn });
   const runEntryKey = useLocation({ select: ({ state }) => state.__TSR_key ?? state.key });
   const isRunEntryCurrent = useCallback(() => {
     const { state } = history.location;
@@ -887,6 +889,7 @@ export function WorkflowJob({
           ...previous,
           workflowMachineReviewSource: undefined,
           workflowMachineReviewVisitId: machineReviewVisitId,
+          workflowRunsReturn: workflowRunsReturnForJob(scope, jobId, runsReturn),
           workflowOrigin: {
             ...scope,
             jobId,
@@ -923,12 +926,7 @@ export function WorkflowJob({
       kind: checkpoint.kind === "input" ? "input" : "review",
     });
   };
-  const backToRuns = () =>
-    navigate({
-      to: "/workflows/$repositoryId",
-      params: { repositoryId: scope.repositoryId },
-      search: { tab: "runs" },
-    });
+  const backToRuns = () => navigate(workflowRunsBackLocation(scope, jobId, runsReturn));
   const refreshRun = () => {
     refreshCatalog();
     void refresh(
