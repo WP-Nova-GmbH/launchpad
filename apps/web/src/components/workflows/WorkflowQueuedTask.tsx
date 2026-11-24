@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import type { Ref } from "react";
-import { ClockIcon, LinkIcon, Settings2Icon, TriangleAlertIcon } from "lucide-react";
-import type { WorkflowQueueReason } from "@t3tools/contracts/workflows";
+import { ClockIcon, LinkIcon, Settings2Icon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
+import type { RepositoryWorkflowJob, WorkflowQueueReason } from "@t3tools/contracts/workflows";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
 
@@ -9,6 +9,8 @@ type QueuedTask = {
   title: string;
   description: string;
   relayDetails: readonly string[];
+  warning?: true;
+  icon?: typeof ClockIcon;
   recovery?: {
     label: string;
     hash: "workflow-vms" | "workflow-sources";
@@ -16,7 +18,7 @@ type QueuedTask = {
   };
 };
 
-export const workflowQueuedTasks: Partial<Record<WorkflowQueueReason["code"], QueuedTask>> = {
+const workflowQueuedTasks: Partial<Record<WorkflowQueueReason["code"], QueuedTask>> = {
   vm_waiting_capacity: {
     title: "Waiting for a VM slot",
     relayDetails: ["Waiting for a VM slot.", "Waiting for a workflow VM slot."],
@@ -38,8 +40,56 @@ export const workflowQueuedTasks: Partial<Record<WorkflowQueueReason["code"], Qu
   },
 };
 
+const machineQueuedTasks: Partial<Record<WorkflowQueueReason["code"], QueuedTask>> = {
+  environment_offline: {
+    title: "Machine is offline",
+    relayDetails: ["Waiting for the selected environment to reconnect."],
+    description: "Launchpad will retry automatically when the Machine reconnects.",
+    warning: true,
+    icon: WifiOffIcon,
+  },
+  environment_busy: {
+    title: "Machine is busy",
+    relayDetails: [
+      "Waiting for the selected environment to become available.",
+      "Waiting for the selected environment.",
+      "Another workflow is executing on this environment.",
+    ],
+    description: "Launchpad will retry automatically when the Machine is available.",
+  },
+  environment_update: {
+    title: "Machine update required",
+    relayDetails: [
+      "Update the selected environment to support this workflow.",
+      "Update this environment before running automatic workflows.",
+      "Update this environment to a version that supports repository workflows.",
+    ],
+    description:
+      "Update Launchpad on the Machine. If it’s already up to date, change the workflow’s target to a supported Machine or ask a maintainer. This run will retry automatically.",
+    warning: true,
+  },
+};
+
+export function workflowQueuedTask(job: RepositoryWorkflowJob, detail: string | null | undefined) {
+  const code = job.queueReason?.code;
+  if (
+    !code ||
+    (job.status !== "queued" && !(job.status === "preparing" && code === "source_reconnect"))
+  ) {
+    return undefined;
+  }
+
+  const targetKind = job.runtime?.kind ?? job.workflow?.definition.target.kind;
+  const origin = job.origin?.kind ?? job.originSummary?.kind;
+  // Machine runs can be queued before the relay records a target or runtime.
+  const machine = !job.vmAdmission && (targetKind ? targetKind === "machine" : !!origin);
+  const task = workflowQueuedTasks[code] ?? (machine ? machineQueuedTasks[code] : undefined);
+  // A failed retry can leave the queue reason intact while recording a new diagnostic.
+  return task && (!detail || task.relayDetails.includes(detail)) ? task : undefined;
+}
+
 export function WorkflowQueuedTask({
-  task: { title, description, recovery },
+  task: { title, description, recovery, warning, icon },
   organizationAdmin,
   recoveryLinkRef,
 }: {
@@ -47,10 +97,15 @@ export function WorkflowQueuedTask({
   organizationAdmin: boolean;
   recoveryLinkRef: Ref<HTMLAnchorElement>;
 }) {
-  const StatusIcon = recovery ? TriangleAlertIcon : ClockIcon;
+  const needsAttention = warning || recovery;
+  const StatusIcon = icon ?? (needsAttention ? TriangleAlertIcon : ClockIcon);
 
   return (
-    <Alert variant={recovery ? "warning" : "default"} controlAlignment="first-line" role="group">
+    <Alert
+      variant={needsAttention ? "warning" : "default"}
+      controlAlignment="first-line"
+      role="group"
+    >
       <StatusIcon aria-hidden />
       <AlertTitle role="heading" aria-level={2}>
         {title}

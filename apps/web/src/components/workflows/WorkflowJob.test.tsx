@@ -3995,6 +3995,137 @@ describe("queued workflow recovery", () => {
     });
   });
 
+  const unboundAutomaticRun = {
+    ...queued,
+    origin: {
+      kind: "automation",
+      organizationId: scope.organizationId,
+      repositoryId: scope.repositoryId,
+      workflowId: job.workflowId,
+      source: {
+        provider: "linear",
+        applicationId: "linear-app",
+        workspaceId: "workspace",
+        connectionId: "connection",
+        grantId: "grant",
+      },
+      occurrenceId: "occurrence",
+    },
+  } satisfies RepositoryWorkflowJob;
+
+  const unboundManualRun = {
+    ...queued,
+    origin: { kind: "manual", userId: scope.accountId },
+    viewerControls: undefined,
+  } satisfies RepositoryWorkflowJob;
+
+  it.each([
+    {
+      run: unboundAutomaticRun,
+      code: "environment_offline",
+      detail: "Waiting for the selected environment to reconnect.",
+      title: "Machine is offline",
+      guidance: "Launchpad will retry automatically when the Machine reconnects.",
+    },
+    {
+      run: unboundAutomaticRun,
+      code: "environment_busy",
+      detail: "Another workflow is executing on this environment.",
+      title: "Machine is busy",
+      guidance: "Launchpad will retry automatically when the Machine is available.",
+    },
+    {
+      run: unboundAutomaticRun,
+      code: "environment_update",
+      detail: "Update this environment before running automatic workflows.",
+      title: "Machine update required",
+      guidance: "Update Launchpad on the Machine",
+    },
+    {
+      run: unboundManualRun,
+      code: "environment_offline",
+      detail: "Waiting for the selected environment to reconnect.",
+      title: "Machine is offline",
+      guidance: "Launchpad will retry automatically when the Machine reconnects.",
+    },
+    {
+      run: unboundManualRun,
+      code: "environment_busy",
+      detail: "Another workflow is executing on this environment.",
+      title: "Machine is busy",
+      guidance: "Launchpad will retry automatically when the Machine is available.",
+    },
+    {
+      run: unboundManualRun,
+      code: "environment_update",
+      detail: "Update this environment to a version that supports repository workflows.",
+      title: "Machine update required",
+      guidance: "change the workflow’s target to a supported Machine or ask a maintainer",
+    },
+  ] as const)(
+    "shows the Machine blocker for $code on a $run.origin.kind run before execution starts",
+    async ({ run, code, detail, title, guidance }) => {
+      fixture.call.mockResolvedValue(run);
+      await mount();
+      const status = headerStatus();
+
+      fixture.call.mockResolvedValue({
+        ...run,
+        detail,
+        queueReason: { code, retryAt: null },
+      });
+      await pollRun();
+
+      const content = text(renderer!.toJSON());
+      expect(content).toContain(title);
+      expect(content).toContain(guidance);
+      expect(content).not.toContain("Waiting for execution");
+      expect(content).not.toContain("Waiting for an execution target");
+      expect(content).not.toContain(detail);
+      expect(headerStatus()).toBe(status);
+      expect(text(status)).toContain(title);
+    },
+  );
+
+  it.each([unboundAutomaticRun, unboundManualRun])(
+    "keeps the generic blocker for a $origin.kind VM waiting to connect",
+    async (run) => {
+      const detail = "Waiting for the selected environment to reconnect.";
+      fixture.call.mockResolvedValue({
+        ...run,
+        vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
+        detail,
+        queueReason: { code: "environment_offline", retryAt: null },
+      });
+      await mount();
+
+      const content = text(renderer!.toJSON());
+      expect(content).toContain(detail);
+      expect(content).not.toContain("Machine is offline");
+    },
+  );
+
+  it("keeps a manual Machine diagnostic unless the typed blocker still matches", async () => {
+    const detail = "Another workflow is executing on this environment.";
+    fixture.call.mockResolvedValue({ ...unboundManualRun, detail });
+    await mount();
+
+    const content = () => text(renderer!.toJSON());
+    expect(content()).toContain(detail);
+    expect(content()).not.toContain("Machine is busy");
+
+    const newerDetail = "Waiting for the selected environment to reconnect or acknowledge the job.";
+    fixture.call.mockResolvedValue({
+      ...unboundManualRun,
+      detail: newerDetail,
+      queueReason: { code: "environment_busy", retryAt: null },
+    });
+    await pollRun();
+
+    expect(content()).toContain(newerDetail);
+    expect(content()).not.toContain("Machine is busy");
+  });
+
   const linearReconnect = {
     code: "source_reconnect",
     title: "Linear needs reconnecting",

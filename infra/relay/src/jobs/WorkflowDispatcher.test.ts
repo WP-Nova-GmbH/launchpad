@@ -11,8 +11,12 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as HttpClientError from "effect/unstable/http/HttpClientError";
+import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
+import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import {
   EnvironmentConnector,
+  EnvironmentMintRequestFailed,
   EnvironmentMintRequestTimedOut,
 } from "../environments/EnvironmentConnector.ts";
 import { Machines, type MachineRecord } from "../machines/Machines.ts";
@@ -144,6 +148,10 @@ const harness = Effect.gen(function* () {
     | "pause-waiting"
     | "cancel_during_approve"
   >("online");
+  const dispatchFailure = yield* Ref.make<{
+    operation: "status" | "start";
+    error: EnvironmentMintRequestFailed;
+  } | null>(null);
   const permissionOutage = yield* Ref.make(false);
   const role = yield* Ref.make<"maintainer" | "developer" | null>("maintainer");
   const reply = yield* Ref.make<WorkflowControlResult | null>(null);
@@ -274,6 +282,9 @@ const harness = Effect.gen(function* () {
         Effect.gen(function* () {
           if (input.workflowControl)
             yield* Ref.update(controls, (all) => [...all, input.workflowControl!]);
+          const failure = yield* Ref.get(dispatchFailure);
+          if (failure && input.workflowControl?.operation === failure.operation)
+            return yield* failure.error;
           const current = yield* Ref.get(mode);
           if (current === "pause-waiting") {
             const prior = (yield* Ref.get(row)).record.progress!;
@@ -447,6 +458,7 @@ const harness = Effect.gen(function* () {
     repositoryAvailable,
     target,
     mode,
+    dispatchFailure,
     offers,
     controls,
     role,
@@ -810,14 +822,116 @@ it.effect("retains offline jobs and negotiates capability before creating an off
   Effect.gen(function* () {
     const h = yield* harness;
     yield* Ref.set(h.mode, "offline");
-    assert.strictEqual((yield* h.refresh)?.status, "queued");
-    assert.isNull((yield* Ref.get(h.row)).record.workflow);
-    yield* Ref.set(h.mode, "old");
-    yield* h.refresh;
+    const offline = yield* h.refresh;
+    assert.strictEqual(offline?.status, "queued");
+    assert.isNull(offline?.workflow);
+    assert.deepStrictEqual(offline?.queueReason, { code: "environment_offline", retryAt: null });
+    assert.strictEqual(offline?.detail, "Waiting for the selected environment to reconnect.");
     assert.strictEqual((yield* Ref.get(h.offers)).length, 0);
-    assert.include((yield* Ref.get(h.row)).record.detail!, "Update this environment");
+    yield* Ref.set(h.mode, "old");
+    const updateRequired = yield* h.refresh;
+    assert.strictEqual(updateRequired?.status, "queued");
+    assert.deepStrictEqual(updateRequired?.queueReason, {
+      code: "environment_update",
+      retryAt: null,
+    });
+    assert.strictEqual((yield* Ref.get(h.offers)).length, 0);
+    assert.include(updateRequired!.detail!, "Update this environment");
     yield* Ref.set(h.mode, "online");
-    assert.strictEqual((yield* h.refresh)?.status, "running");
+    const running = yield* h.refresh;
+    assert.strictEqual(running?.status, "running");
+    assert.isUndefined(running?.queueReason);
+  }),
+);
+
+const workflowRequest = HttpClientRequest.post("https://env.example/api/t3-connect/workflow-job");
+const wrapDispatchFailure = (cause: unknown) =>
+  new EnvironmentMintRequestFailed({
+    environmentId: "env-1",
+    operation: "dispatch-job",
+    cause,
+  });
+const workflowResponse = (status: number) =>
+  HttpClientResponse.fromWeb(workflowRequest, new Response("Unavailable", { status }));
+
+it.effect.each([
+  {
+    name: "transport failure",
+    reason: new HttpClientError.TransportError({ request: workflowRequest }),
+  },
+  ...[502, 503, 504, 530].map((status) => ({
+    name: "HTTP " + status,
+    reason: new HttpClientError.DecodeError({
+      request: workflowRequest,
+      response: workflowResponse(status),
+    }),
+  })),
+])("queues manual Machine runs as offline after a preflight $name", ({ reason }) =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.set(h.dispatchFailure, {
+      operation: "status" as const,
+      error: wrapDispatchFailure(new HttpClientError.HttpClientError({ reason })),
+    });
+
+    const offline = yield* h.refresh;
+    assert.strictEqual(offline?.status, "queued");
+    assert.deepStrictEqual(offline?.queueReason, { code: "environment_offline", retryAt: null });
+    assert.strictEqual(offline?.detail, "Waiting for the selected environment to reconnect.");
+    assert.deepStrictEqual(
+      (yield* Ref.get(h.controls)).map(({ operation }) => operation),
+      ["status"],
+    );
+    yield* Ref.set(h.dispatchFailure, null);
+    const running = yield* h.refresh;
+    assert.strictEqual(running?.status, "running");
+    assert.isUndefined(running?.queueReason);
+  }),
+);
+
+it.effect.each([
+  {
+    name: "a rejected preflight request",
+    operation: "status",
+    error: wrapDispatchFailure(
+      new HttpClientError.HttpClientError({
+        reason: new HttpClientError.StatusCodeError({
+          request: workflowRequest,
+          response: workflowResponse(403),
+        }),
+      }),
+    ),
+    status: "queued",
+  },
+  {
+    name: "a local preflight failure",
+    operation: "status",
+    error: wrapDispatchFailure(new Error("Could not sign the dispatch request.")),
+    status: "queued",
+  },
+  {
+    name: "an unconfirmed start with a gateway failure",
+    operation: "start",
+    error: wrapDispatchFailure(
+      new HttpClientError.HttpClientError({
+        reason: new HttpClientError.DecodeError({
+          request: workflowRequest,
+          response: workflowResponse(502),
+        }),
+      }),
+    ),
+    status: "dispatching",
+  },
+] as const)("keeps the existing diagnostic for $name", ({ operation, error, status }) =>
+  Effect.gen(function* () {
+    const h = yield* harness;
+    yield* Ref.set(h.dispatchFailure, { operation, error });
+
+    const result = yield* h.refresh;
+    assert.strictEqual(result?.status, status);
+    assert.isUndefined(result?.queueReason);
+    assert.include(result!.detail!, "reconnect or acknowledge");
+    if (operation === "start") assert.strictEqual(result?.workflow?.revision, workflow.revision);
   }),
 );
 
@@ -838,8 +952,10 @@ it.effect(
     Effect.gen(function* () {
       const h = yield* harness;
       yield* Ref.set(h.mode, "lost_start");
-      yield* h.refresh;
-      assert.strictEqual((yield* Ref.get(h.row)).record.status, "dispatching");
+      const unconfirmed = yield* h.refresh;
+      assert.strictEqual(unconfirmed?.status, "dispatching");
+      assert.isUndefined(unconfirmed?.queueReason);
+      assert.include(unconfirmed!.detail!, "reconnect or acknowledge");
       yield* Ref.update(h.definition, (value) => ({ ...value, revision: 2 }));
       yield* Ref.set(h.mode, "online");
       yield* h.refresh;
@@ -849,8 +965,16 @@ it.effect(
       );
       const busy = yield* harness;
       yield* Ref.set(busy.mode, "busy");
-      yield* busy.refresh;
-      assert.isNull((yield* Ref.get(busy.row)).record.workflow);
+      const waiting = yield* busy.refresh;
+      assert.strictEqual(waiting?.status, "queued");
+      assert.isNull(waiting?.workflow);
+      assert.deepStrictEqual(waiting?.queueReason, { code: "environment_busy", retryAt: null });
+      yield* Ref.set(busy.target, null);
+      const invalidTarget = yield* busy.refresh;
+      assert.strictEqual(invalidTarget?.status, "queued");
+      assert.isUndefined(invalidTarget?.queueReason);
+      assert.include(invalidTarget!.detail!, "Choose an enrolled organization environment");
+      yield* Ref.set(busy.target, machine);
       yield* Ref.update(busy.definition, (value) => ({ ...value, revision: 2 }));
       yield* Ref.set(busy.mode, "online");
       yield* busy.refresh;
@@ -1214,6 +1338,7 @@ it.effect(
       }));
       const unsupported = yield* h.refresh;
       assert.equal(unsupported?.status, "queued");
+      assert.equal(unsupported?.queueReason?.code, "environment_update");
       assert.equal((yield* Ref.get(h.offers)).length, 0);
       yield* Ref.set(h.mode, "publishing");
       assert.equal((yield* h.refresh)?.status, "running");

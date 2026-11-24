@@ -14,6 +14,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import { RelayDb } from "../db.ts";
@@ -41,7 +42,10 @@ import {
   workflowPublishingCancellationOutcome,
 } from "../threads/WorkflowVmPublishingRecovery.ts";
 import { queueReasonText } from "../workflowSources/IssueContext.ts";
-import { EnvironmentConnector } from "../environments/EnvironmentConnector.ts";
+import {
+  EnvironmentConnector,
+  type EnvironmentConnectorError,
+} from "../environments/EnvironmentConnector.ts";
 import { requireMaintainableRepository, requireVisibleRepository } from "../http/TenancyApi.ts";
 import { Organizations } from "../tenancy/Organizations.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
@@ -68,6 +72,22 @@ const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const sameResultSaving = Schema.toEquivalence(Schema.UndefinedOr(WorkflowResultSaving));
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 const isWorkflowQueued = Schema.is(WorkflowQueued);
+
+function isMachinePreflightUnavailable(error: EnvironmentConnectorError) {
+  if (error._tag === "EnvironmentMintRequestTimedOut") return true;
+  if (
+    error._tag !== "EnvironmentMintRequestFailed" ||
+    !HttpClientError.isHttpClientError(error.cause)
+  )
+    return false;
+  const { reason } = error.cause;
+  // Cloudflare can return HTTP 530 when a managed tunnel is disconnected.
+  return (
+    reason._tag === "TransportError" ||
+    ((reason._tag === "StatusCodeError" || reason._tag === "DecodeError") &&
+      [502, 503, 504, 530].includes(reason.response.status))
+  );
+}
 
 type CheckpointDispatch = NonNullable<
   NonNullable<WorkflowJobRecord["pendingControl"]>["checkpointDispatch"]
@@ -326,6 +346,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             row!,
             {
               ...job,
+              queueReason: undefined,
               detail: "The workflow is archived or unavailable. Restore it or cancel this job.",
               updatedAt: now,
             },
@@ -349,23 +370,35 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           repositoryId: job.repositoryId,
           projectId: machineTarget.projectId,
         };
-        const probe = yield* connector.dispatchJob({
-          ...dispatchIdentity(),
-          environmentId: machineTarget.environmentId,
-          jobId: RelayJobId.make(jobId),
-          repositoryCanonicalKey: canonicalKey,
-          baseBranch: "HEAD",
-          instruction: job.instruction,
-          workflowControl: { ...binding, operation: "status" },
-        });
+        const probe = yield* connector
+          .dispatchJob({
+            ...dispatchIdentity(),
+            environmentId: machineTarget.environmentId,
+            jobId: RelayJobId.make(jobId),
+            repositoryCanonicalKey: canonicalKey,
+            baseBranch: "HEAD",
+            instruction: job.instruction,
+            workflowControl: { ...binding, operation: "status" },
+          })
+          .pipe(Effect.catchIf(isMachinePreflightUnavailable, () => Effect.succeed(null)));
+        if (probe === null)
+          return (yield* update(row!, {
+            ...job,
+            queueReason: { code: "environment_offline", retryAt: null },
+            detail: queueReasonText.environment_offline,
+            updatedAt: now,
+          })).record;
         if (
           !probe.workflowResult ||
           probe.workflowResult.protocol < protocol ||
           publishing.some((step) => !probe.workflowResult?.actions?.includes(step.action))
         )
-          return yield* new WorkflowInvalidError({
-            message: "Update this environment to a version that supports repository workflows.",
-          });
+          return (yield* update(row!, {
+            ...job,
+            queueReason: { code: "environment_update", retryAt: null },
+            detail: "Update this environment to a version that supports repository workflows.",
+            updatedAt: now,
+          })).record;
         if (probe.workflowResult.progress !== null)
           return yield* new WorkflowInvalidError({
             message: "Unexpected job acceptance before this workflow was offered.",
@@ -381,6 +414,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           workflow,
           requiredProtocol: protocol,
           status: "dispatching",
+          queueReason: undefined,
           detail: "Offering this workflow to its environment.",
           updatedAt: now,
         };
@@ -853,21 +887,16 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       mayRetireOffer &&
       ["busy", "unavailable", "missing"].includes(outcome.outcome)
     ) {
+      const automatic = origin.kind === "automation";
+      const code =
+        outcome.outcome === "busy" ? "environment_busy" : automatic ? "target_invalid" : undefined;
       row = yield* update(
         { ...row!, repositoryCanonicalKey: null },
         {
           ...clearUnacceptedOffer(job),
-          ...(origin.kind === "automation"
-            ? {
-                queueReason: {
-                  code:
-                    outcome.outcome === "busy"
-                      ? ("environment_busy" as const)
-                      : ("target_invalid" as const),
-                  retryAt: Date.parse(now) + 30_000,
-                },
-              }
-            : {}),
+          queueReason: code
+            ? { code, retryAt: automatic ? Date.parse(now) + 30_000 : null }
+            : undefined,
           detail: outcome.detail ?? "Waiting for the selected environment.",
           updatedAt: now,
         },
@@ -949,7 +978,16 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             : "Waiting for the selected environment to reconnect or acknowledge the job.";
         return (yield* update(
           latest,
-          { ...latest.record, detail, updatedAt: DateTime.formatIso(yield* DateTime.now) },
+          {
+            ...latest.record,
+            ...(latest.submitterUserId !== null &&
+            !latest.record.vmAdmission &&
+            latest.record.workflow === null
+              ? { queueReason: undefined }
+              : {}),
+            detail,
+            updatedAt: DateTime.formatIso(yield* DateTime.now),
+          },
           latest.pendingControl,
           false,
         )).record;

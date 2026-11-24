@@ -35,7 +35,7 @@ import {
   WorkflowUnsentDrafts,
   type RetainedCheckpointDraft,
 } from "./WorkflowCheckpoints";
-import { WorkflowQueuedTask, workflowQueuedTasks } from "./WorkflowQueuedTask";
+import { WorkflowQueuedTask, workflowQueuedTask } from "./WorkflowQueuedTask";
 import { WorkflowVmRecoveryStatus, workflowVmRecoveryTask } from "./WorkflowVmRecovery";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import {
@@ -1261,18 +1261,7 @@ export function WorkflowJob({
   const canPauseRun = canConfigure && manualState.canPause;
   const cancellationNeedsAttention =
     selectedJob.progress?.retryableCancellation === true && !manualState.responsePending;
-  const queueReason = selectedJob.queueReason?.code;
-  const queueReasonTask =
-    queueReason &&
-    (selectedJob.status === "queued" ||
-      (selectedJob.status === "preparing" && queueReason === "source_reconnect"))
-      ? workflowQueuedTasks[queueReason]
-      : undefined;
-  // The dispatcher can update the detail after a failed retry while retaining the queue reason.
-  const queuedTask =
-    queueReasonTask && (!detail || queueReasonTask.relayDetails.includes(detail))
-      ? queueReasonTask
-      : undefined;
+  const queuedTask = workflowQueuedTask(selectedJob, detail);
   const preparationFailed =
     paused &&
     selectedJob.progress?.status === "paused" &&
