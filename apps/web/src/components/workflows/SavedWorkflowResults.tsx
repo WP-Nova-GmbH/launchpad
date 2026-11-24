@@ -68,7 +68,10 @@ import { cn, randomUUID } from "../../lib/utils";
 import { DiffFileTree } from "../diffs/DiffFileTree";
 import { diffFileTreeEntries, diffFileTreePathAliases } from "../diffs/diffFileTree.logic";
 import { StyledDiffCodeView } from "../diffs/StyledDiffCodeView";
-import { SavedConversationMessage } from "../chat/SavedConversationMessage";
+import {
+  SavedConversationMessage,
+  type AttachmentDownloadState,
+} from "../chat/SavedConversationMessage";
 import {
   AlertDialog,
   AlertDialogDescription,
@@ -89,6 +92,7 @@ import { WorkflowRequestNotSentError } from "./workflowOperations";
 const sameSavedResult = Schema.toEquivalence(WorkflowSavedResult);
 const isRequestFailed = Schema.is(ManagedRelay.ManagedRelayRequestFailedError);
 const isNotFound = Schema.is(Schema.Struct({ cause: RelayTenancyNotFoundError }));
+const noAttachmentDownloads: ReadonlyMap<string, AttachmentDownloadState> = new Map();
 
 type DeletionTarget = { relayUrl: string; threadId: ThreadId; generation: number };
 type HistoryRequest = { key: string; scope: string; epoch: number };
@@ -234,7 +238,7 @@ export function SavedWorkflowResults({
     more: boolean;
     detail: string;
   } | null>(null);
-  const [attachmentError, setAttachmentError] = useState<ChatAttachment | null>(null);
+  const [attachmentDownloads, setAttachmentDownloads] = useState(noAttachmentDownloads);
   const [historyRead, setHistoryRead] = useState<HistoryRead | null>(null);
   const [readingIndex, setReadingIndex] = useState(false);
   const [readingChanges, setReadingChanges] = useState(false);
@@ -253,7 +257,6 @@ export function SavedWorkflowResults({
   const changesRetryButton = useRef<HTMLButtonElement>(null);
   const conversationPageButton = useRef<HTMLButtonElement>(null);
   const conversationEnd = useRef<HTMLDivElement>(null);
-  const attachmentRetryButton = useRef<HTMLButtonElement>(null);
   const restorePageRetryFocus = useRef(false);
   const restoreReadFocus = useCallback(
     (button: HTMLButtonElement | null) => {
@@ -386,7 +389,7 @@ export function SavedWorkflowResults({
     latestContentRead.current = contentRead;
     setConversation(null);
     setConversationError(null);
-    setAttachmentError(null);
+    setAttachmentDownloads(noAttachmentDownloads);
     setReadingConversation(null);
     setChangesError(null);
     return () => {
@@ -395,6 +398,14 @@ export function SavedWorkflowResults({
     };
   }, [contentRead]);
   const clearSavedResults = useCallback(() => {
+    const section = savedResults.current;
+    const focused = section?.ownerDocument?.activeElement;
+    if (
+      section &&
+      focused?.hasAttribute("data-saved-attachment-download") &&
+      section.contains(focused)
+    )
+      section.focus({ preventScroll: true });
     indexEpoch.current++;
     inFlightHistory.current = null;
     setHistoryRead(null);
@@ -407,7 +418,7 @@ export function SavedWorkflowResults({
     setConversation(null);
     setChangesError(null);
     setConversationError(null);
-    setAttachmentError(null);
+    setAttachmentDownloads(noAttachmentDownloads);
     setIndexError(null);
     setIndex(null);
     setSelected(null);
@@ -417,7 +428,7 @@ export function SavedWorkflowResults({
     setReadingIndex(false);
     setReadingChanges(false);
     setReadingConversation(null);
-  }, [reader]);
+  }, [reader, savedResults]);
   const recoverContentRead = useCallback(
     async (
       read: NonNullable<typeof contentRead>,
@@ -989,8 +1000,8 @@ export function SavedWorkflowResults({
     const owns = () => active.current && contentRead === latestContentRead.current;
     const epoch = indexEpoch.current;
     let relayChanged = false;
-    if (attachmentError?.id === file.id) restoreReadFocus(attachmentRetryButton.current);
-    setAttachmentError((previous) => (previous?.id === file.id ? null : previous));
+    setAttachmentDownloads((previous) => new Map(previous).set(file.id, "downloading"));
+    let failed = false;
     try {
       const bytes = await contentRead.call((client, token) => {
         relayChanged = client.relayUrl !== contentRead.relayUrl;
@@ -1014,10 +1025,17 @@ export function SavedWorkflowResults({
       link.click();
       URL.revokeObjectURL(url);
     } catch (cause) {
-      if (!(await recoverContentRead(contentRead, epoch, cause, relayChanged)) && owns())
-        setAttachmentError(file);
+      failed = !(await recoverContentRead(contentRead, epoch, cause, relayChanged));
     } finally {
       if (requests.get(file.id) === contentRead) requests.delete(file.id);
+      if (owns()) {
+        setAttachmentDownloads((previous) => {
+          const next = new Map(previous);
+          if (failed) next.set(file.id, "failed");
+          else next.delete(file.id);
+          return next;
+        });
+      }
     }
   };
   const moreResults = async () => {
@@ -1141,7 +1159,7 @@ export function SavedWorkflowResults({
     deletionStatus.current?.focus();
     setChangesError(null);
     setConversationError(null);
-    setAttachmentError(null);
+    setAttachmentDownloads(noAttachmentDownloads);
     setIndexError(null);
     refreshDeletionTarget();
   };
@@ -1548,23 +1566,6 @@ export function SavedWorkflowResults({
         ) : null}
         {result && view === "conversation" ? (
           <>
-            {attachmentError ? (
-              <WorkflowAlert
-                title="Couldn’t download the attachment"
-                actions={
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    ref={attachmentRetryButton}
-                    onClick={() => void download(attachmentError)}
-                  >
-                    Retry download
-                  </Button>
-                }
-              >
-                {attachmentError.name}
-              </WorkflowAlert>
-            ) : null}
             {conversationError && !conversationError.more ? (
               <WorkflowAlert
                 title="Couldn’t load the conversation"
@@ -1589,6 +1590,7 @@ export function SavedWorkflowResults({
                     key={message.id}
                     message={message}
                     busy={readingConversation !== null}
+                    attachmentDownloads={attachmentDownloads}
                     onDownload={download}
                   />
                 ))}

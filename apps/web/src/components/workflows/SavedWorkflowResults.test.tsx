@@ -17,7 +17,7 @@ import {
   RelayTenancyNotFoundError,
   type RelayThreadHistoryPage,
 } from "@t3tools/contracts/relay";
-import { OrchestrationEvent, ThreadId, type ChatAttachment } from "@t3tools/contracts";
+import { OrchestrationEvent, ThreadId } from "@t3tools/contracts";
 import type { RepositoryWorkflowJob, WorkflowSavedResult } from "@t3tools/contracts/workflows";
 import {
   setWorkflowSessionAccount,
@@ -126,24 +126,6 @@ vi.mock("../diffs/DiffFileTree", () => ({
         ),
       ),
     ),
-}));
-vi.mock("../chat/SavedConversationMessage", () => ({
-  SavedConversationMessage: ({
-    message,
-    onDownload,
-  }: {
-    message: { text: string; attachments?: ReadonlyArray<ChatAttachment> };
-    onDownload: (attachment: ChatAttachment) => void;
-  }) => (
-    <>
-      <p>{message.text}</p>
-      {message.attachments?.map((attachment) => (
-        <button key={attachment.id} onClick={() => onDownload(attachment)}>
-          {attachment.name}
-        </button>
-      ))}
-    </>
-  ),
 }));
 vi.mock("../../hooks/useSettings", () => ({
   useClientSettings: () => ({ diffLayout: "split" }),
@@ -1436,6 +1418,7 @@ it.each(["open popup", "closed trigger", "elsewhere"] as const)(
       const focusTarget = () => {
         const node = {
           ownerDocument,
+          hasAttribute: () => false,
           focus: vi.fn(() => {
             ownerDocument.activeElement = node;
           }),
@@ -2003,13 +1986,13 @@ it("checks a later ambiguous denial even while an earlier access check is pendin
     await mount(completedJob);
     await press("Conversation");
     await act(async () => {
-      void findButton("release-notes.txt")!.props.onClick();
+      void findButton("Download release-notes.txt")!.props.onClick();
     });
     expect(fixture.list).toHaveBeenCalledTimes(2);
     expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
 
     await act(async () => {
-      void findButton("rollback-steps.txt")!.props.onClick();
+      void findButton("Download rollback-steps.txt")!.props.onClick();
     });
     expect(fixture.list).toHaveBeenCalledTimes(3);
     expect(findPicker()).toBeUndefined();
@@ -2017,49 +2000,199 @@ it("checks a later ambiguous denial even while an earlier access check is pendin
 
     await act(() => firstProof.resolve(accessibleIndex));
     expect(findPicker()).toBeUndefined();
-    expect(findButton("release-notes.txt")).toBeUndefined();
+    expect(findButton("Download release-notes.txt")).toBeUndefined();
     expect(findButton("Retry download")).toBeUndefined();
     expect(findButton("Retry loading results")).toBeDefined();
   }));
 
-it("coalesces concurrent downloads of the same attachment and allows retry after failure", () =>
+it("keeps concurrent attachment downloads and retries independent", () =>
   withClient(async () => {
-    const attachment = {
+    const attachments = ["release-report", "rollback-steps"].map((id) => ({
       type: "file",
-      id: "release-report",
-      name: "release-report.txt",
+      id,
+      name: `${id}.txt`,
       mimeType: "text/plain",
       sizeBytes: 1,
-    };
-    const attempt = deferred<Uint8Array>();
+    }));
+    const reportDownload = deferred<Uint8Array>();
+    const rollbackDownload = deferred<Uint8Array>();
     fixture.history.mockResolvedValue({
-      entries: [savedConversationStart(), savedMessage(2, "Release report", [attachment])],
+      entries: [savedConversationStart(), savedMessage(2, "Release report", attachments)],
     } satisfies RelayThreadHistoryPage);
-    fixture.download.mockReturnValueOnce(attempt.promise);
+    fixture.download
+      .mockReturnValueOnce(reportDownload.promise)
+      .mockReturnValueOnce(rollbackDownload.promise);
     const link = { click: vi.fn(), href: "", download: "" };
     vi.stubGlobal("document", { ...document, createElement: vi.fn(() => link) });
     await mount(completedJob);
     await press("Conversation");
     await act(() => {
-      const download = findButton(attachment.name)!.props.onClick;
+      const download = findButton("Download release-report.txt")!.props.onClick;
       void download();
       void download();
     });
 
+    expect(findButton("Downloading… release-report.txt")?.props["aria-disabled"]).toBe(true);
+    expect(findButton("Download rollback-steps.txt")!.props["aria-disabled"]).toBeFalsy();
     expect(fixture.download).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         resultId: result.resultId,
-        attachmentId: attachment.id,
+        attachmentId: "release-report",
       }),
     );
-    await act(() => attempt.reject(new Error("Download timed out.")));
 
-    await press("Retry download");
-    expect(fixture.download).toHaveBeenCalledTimes(2);
+    await act(() => {
+      void findButton("Download rollback-steps.txt")!.props.onClick();
+    });
+    expect(findButton("Downloading… rollback-steps.txt")).toBeDefined();
+    await act(() => reportDownload.reject(new Error("Download timed out.")));
+    expect(findButton("Retry download release-report.txt")).toBeDefined();
+    expect(findButton("Downloading… rollback-steps.txt")).toBeDefined();
+    await act(() => rollbackDownload.reject(new Error("Download timed out.")));
+    expect(findButton("Retry download release-report.txt")).toBeDefined();
+    expect(findButton("Retry download rollback-steps.txt")).toBeDefined();
+
+    await press("Retry download release-report.txt");
+    expect(fixture.download.mock.calls.map(([input]) => input.attachmentId)).toEqual([
+      "release-report",
+      "rollback-steps",
+      "release-report",
+    ]);
     expect(link.click).toHaveBeenCalledOnce();
-    expect(link.download).toBe(attachment.name);
-    expect(findButton("Retry download")).toBeUndefined();
+    expect(link.download).toBe("release-report.txt");
+    expect(findButton("Download release-report.txt")).toBeDefined();
+    expect(findButton("Retry download rollback-steps.txt")).toBeDefined();
     expect(JSON.stringify(renderer.toJSON())).toContain("Release report");
+  }));
+
+it.each(["the retried file", "another attachment", "another pane"] as const)(
+  "handles focus on %s when attachment recovery clears saved results",
+  (focusLocation) =>
+    withClient(async () => {
+      const accessibleIndex = {
+        results: [result],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+      };
+      const accessCheck = deferred<typeof accessibleIndex>();
+      fixture.list.mockResolvedValueOnce(accessibleIndex).mockReturnValueOnce(accessCheck.promise);
+      fixture.download
+        .mockRejectedValueOnce(new Error("Download timed out."))
+        .mockRejectedValueOnce(savedThreadNotFound("read saved thread attachment"));
+      const attachments = ["release-notes", "rollback-steps"].map((id) => ({
+        type: "file",
+        id,
+        name: `${id}.txt`,
+        mimeType: "text/plain",
+        sizeBytes: 1,
+      }));
+      fixture.history.mockResolvedValue({
+        entries: [savedConversationStart(), savedMessage(2, "Release report", attachments)],
+      } satisfies RelayThreadHistoryPage);
+
+      const body = {};
+      const ownerDocument = { ...document, body, activeElement: body };
+      const downloadMarker = "data-saved-attachment-download";
+      const focusTarget = (attributes: Record<string, unknown> = {}) => {
+        const node = {
+          ownerDocument,
+          hasAttribute: (name: string) => attributes[name] !== undefined,
+          focus: vi.fn(() => {
+            ownerDocument.activeElement = node;
+          }),
+        };
+        return node;
+      };
+      const inside = new Set<object>();
+      const pane = Object.assign(focusTarget(), {
+        contains: (node: object) => inside.has(node),
+      });
+      await mount(completedJob, true, {
+        createNodeMock: ({ props }) => {
+          const host = props as { "aria-label"?: string };
+          return host["aria-label"] === "Saved workflow results" ? pane : null;
+        },
+      });
+      await press("Conversation");
+
+      await press("Download release-notes.txt");
+      const current = focusTarget(findButton("Retry download release-notes.txt")!.props);
+      const sibling = focusTarget(findButton("Download rollback-steps.txt")!.props);
+      // A download button in another pane must keep focus even with the same marker.
+      const outside = focusTarget({ [downloadMarker]: "" });
+      inside.add(current);
+      inside.add(sibling);
+
+      current.focus();
+      await press("Retry download release-notes.txt");
+      expect(findButton("Downloading… release-notes.txt")).toBeDefined();
+      expect(fixture.list).toHaveBeenCalledTimes(2);
+      expect(pane.focus).not.toHaveBeenCalled();
+      if (focusLocation === "another attachment") sibling.focus();
+      if (focusLocation === "another pane") outside.focus();
+      await act(() => accessCheck.reject(savedThreadNotFound("listSavedWorkflowResults")));
+
+      expect(findButton("Retry loading results")).toBeDefined();
+      expect(findButton("Downloading… release-notes.txt")).toBeUndefined();
+      expect(findButton("Download rollback-steps.txt")).toBeUndefined();
+      if (focusLocation === "another pane") {
+        expect(pane.focus).not.toHaveBeenCalled();
+        expect(ownerDocument.activeElement).toBe(outside);
+      } else {
+        expect(pane.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+        expect(ownerDocument.activeElement).toBe(pane);
+      }
+    }),
+);
+
+it("retries a failed attachment while fetching more saved messages", () =>
+  withClient(async () => {
+    const attachments = ["release-notes", "rollback-steps"].map((id) => ({
+      type: "file",
+      id,
+      name: `${id}.txt`,
+      mimeType: "text/plain",
+      sizeBytes: 1,
+    }));
+    const nextPage = deferred<RelayThreadHistoryPage>();
+    fixture.history
+      .mockResolvedValueOnce({
+        entries: [
+          savedConversationStart(),
+          savedMessage(2, "Release report", attachments),
+          ...Array.from({ length: 198 }, (_, index) =>
+            historyEntry(index + 3, "thread.meta-updated", { title: "Release notes" }),
+          ),
+        ],
+      } satisfies RelayThreadHistoryPage)
+      .mockReturnValueOnce(nextPage.promise);
+    fixture.download.mockRejectedValueOnce(new Error("Download timed out."));
+    const link = { click: vi.fn(), href: "", download: "" };
+    vi.stubGlobal("document", { ...document, createElement: vi.fn(() => link) });
+
+    await mount(completedJob);
+    await press("Conversation");
+    await press("Download release-notes.txt");
+    await press("Load more messages");
+
+    expect(findButton("Loading more messages…")).toBeDefined();
+    expect(findButton("Retry download release-notes.txt")!.props["aria-disabled"]).toBeFalsy();
+    expect(findButton("Download rollback-steps.txt")!.props["aria-disabled"]).toBe(true);
+    await press("Download rollback-steps.txt");
+    expect(fixture.download).toHaveBeenCalledOnce();
+
+    await press("Retry download release-notes.txt");
+    expect(fixture.download.mock.calls.map(([input]) => input.attachmentId)).toEqual([
+      "release-notes",
+      "release-notes",
+    ]);
+    expect(link.click).toHaveBeenCalledOnce();
+    expect(link.download).toBe("release-notes.txt");
+    expect(findButton("Loading more messages…")).toBeDefined();
+    await act(() => nextPage.resolve({ entries: [] }));
+    expect(findButton("Loading more messages…")).toBeUndefined();
+    expect(findButton("Download rollback-steps.txt")!.props["aria-disabled"]).toBeFalsy();
   }));
 
 it("retries the failed conversation page without replacing the messages already shown", () =>
