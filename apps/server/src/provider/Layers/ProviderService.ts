@@ -1,11 +1,18 @@
 import { ownershipReleased } from "../../jobs/workflowOwnership.ts";
 import { ProviderEventBarrier, type ProviderIngestionEvent } from "../ProviderEventBarrier.ts";
 import { exportUnstartedPortableCodexConversation } from "../Drivers/PortableCodexHome.ts";
+import { exportWorkflowCodexConversation } from "../Drivers/WorkflowCodexConversation.ts";
 import { assertThreadTransferRuntime } from "../../persistence/ThreadTransferRuntime.ts";
-import { VmControlSpawner, VmWorkloadTracking, WorkflowVmGuest } from "../../vmWorkloadCommand.ts";
+import {
+  VmControlSpawner,
+  VmWorkloadTracking,
+  WorkflowVmGuest,
+  workflowVmBaseEnvironment,
+} from "../../vmWorkloadCommand.ts";
 import {
   inspectVmWorkloads,
   inspectWorkflowVmRecovery,
+  withSealedVmWorkloads,
   VmWorkloadError,
   type VmHarnessStopAdmission,
 } from "../../vmWorkload.ts";
@@ -4184,12 +4191,37 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ),
     );
 
+  const checkpointAttachmentPaths = Effect.fnUntraced(function* (
+    store: OrchestrationEventStore["Service"],
+    threadId: string,
+    through: number,
+  ) {
+    const attachments = yield* collectThreadAttachmentReferences(
+      threadId,
+      store.readAggregateRange({
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        fromSequenceExclusive: 0,
+        toSequenceInclusive: through,
+        limit: Number.MAX_SAFE_INTEGER,
+      }),
+    );
+    return attachments.flatMap((attachment) => {
+      const file = resolveAttachmentPath({
+        attachmentsDir: serverConfig.attachmentsDir,
+        attachment,
+      });
+      return file ? [file] : [];
+    });
+  });
+
   const captureConversation = Effect.fn("ProviderService.captureConversation")(function* (
     input: Parameters<NonNullable<ProviderServiceMethod<"checkpointConversation">>>[0],
     workflow?: {
       authorize: Effect.Effect<void, ProviderValidationError>;
       nativeThreadId: string;
       cwd: string;
+      finished?: true;
     },
   ) {
     return yield* nativeCheckpoints
@@ -4212,8 +4244,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         },
         (artifactRoot) =>
           Effect.gen(function* () {
-            // Workflow pause only copies the already settled archive. Routing a
-            // provider here would require open execution on the sealed source.
+            // Routing a provider would require open execution on the sealed source.
             const routed =
               workflow && input.captureOperationId !== undefined
                 ? null
@@ -4252,11 +4283,55 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   "Final recovery requires a stopped Codex binding and its settled native checkpoint.",
                 );
               const cursor = yield* decodeCheckpointCursor(binding.value.resumeCursor);
-              if (workflow && (!point || cursor.threadId !== workflow.nativeThreadId))
+              if (workflow && cursor.threadId !== workflow.nativeThreadId)
                 return yield* toValidationError(
                   "checkpointConversation",
-                  "The workflow's settled native checkpoint is unavailable.",
+                  "The stopped native conversation identity changed.",
                 );
+              // Human follow-ups leave the published workflow result alone. Their
+              // stopped rollout can be saved under the existing pause seal.
+              if (!point && workflow?.finished) {
+                const [settled] = yield* checkpointSql<{ turnId: string }>`
+                  SELECT turn_id AS "turnId" FROM projection_turns
+                  WHERE thread_id=${input.threadId} AND completed_at IS NOT NULL
+                    AND state NOT IN ('pending','running') AND turn_id IS NOT NULL
+                  ORDER BY requested_at DESC,row_id DESC LIMIT 1`;
+                if (
+                  settled?.turnId !== input.turnId ||
+                  fence.frozenSequence === null ||
+                  Option.isNone(checkpointEvents)
+                )
+                  return yield* toValidationError(
+                    "checkpointConversation",
+                    "Final recovery needs the latest settled follow-up and its frozen history.",
+                  );
+                const referencedFiles = yield* checkpointAttachmentPaths(
+                  checkpointEvents.value,
+                  input.threadId,
+                  fence.frozenSequence,
+                );
+                return yield* withSealedVmWorkloads(
+                  input.captureOperationId,
+                  Effect.gen(function* () {
+                    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+                    const archive = yield* exportWorkflowCodexConversation(spawner, {
+                      codexHome: workflowVmBaseEnvironment.CODEX_HOME,
+                      threadId: workflow.nativeThreadId,
+                      artifactRoot,
+                      referencedFileRoots: [workflow.cwd],
+                      referencedFiles,
+                    });
+                    return {
+                      directory: archive.directory,
+                      nativeThreadId: archive.manifest.threadId,
+                    };
+                  }),
+                  undefined,
+                  true,
+                ).pipe(
+                  Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, processSpawner),
+                );
+              }
               if (!point) {
                 if (!routed)
                   return yield* toValidationError(
@@ -4287,26 +4362,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   routed.adapter.checkpointConversation &&
                   Option.isSome(checkpointEvents)
                 ) {
-                  const attachments = yield* collectThreadAttachmentReferences(
+                  const referencedFiles = yield* checkpointAttachmentPaths(
+                    checkpointEvents.value,
                     input.threadId,
-                    checkpointEvents.value.readAggregateRange({
-                      aggregateKind: "thread",
-                      aggregateId: input.threadId,
-                      fromSequenceExclusive: 0,
-                      toSequenceInclusive: fence.frozenSequence!,
-                    }),
+                    fence.frozenSequence!,
                   );
                   const archive = yield* routed.adapter.checkpointConversation({
                     threadId: input.threadId,
                     artifactRoot,
                     stoppedSource: { nativeThreadId: cursor.threadId, cwd },
-                    referencedFiles: attachments.flatMap((attachment) => {
-                      const file = resolveAttachmentPath({
-                        attachmentsDir: serverConfig.attachmentsDir,
-                        attachment,
-                      });
-                      return file ? [file] : [];
-                    }),
+                    referencedFiles,
                   });
                   if (archive.nativeThreadId !== cursor.threadId)
                     return yield* toValidationError(
@@ -4443,22 +4508,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 },
                 input.threadId,
               );
-            const attachments = yield* collectThreadAttachmentReferences(
+            const referencedFiles = yield* checkpointAttachmentPaths(
+              checkpointEvents.value,
               input.threadId,
-              checkpointEvents.value.readAggregateRange({
-                aggregateKind: "thread",
-                aggregateId: input.threadId,
-                fromSequenceExclusive: 0,
-                toSequenceInclusive: Number.MAX_SAFE_INTEGER,
-              }),
+              Number.MAX_SAFE_INTEGER,
             );
-            const referencedFiles = attachments.flatMap((attachment) => {
-              const file = resolveAttachmentPath({
-                attachmentsDir: serverConfig.attachmentsDir,
-                attachment,
-              });
-              return file ? [file] : [];
-            });
             return yield* capture({
               threadId: input.threadId,
               artifactRoot,
@@ -4544,6 +4598,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             "checkpointConversation",
             "Native provider history cannot leave a workflow VM.",
           );
+        const finished = checkpoint.finishedWorkspaceRevision !== undefined;
         if (!workflowGuest || !vmWorkloads || Option.isNone(secretStore)) return yield* invalid();
         const vm = yield* readInstalledThreadVm().pipe(
           Effect.provideService(ServerSecretStore, secretStore.value),
@@ -4576,14 +4631,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             !run ||
             !run.worktreePath ||
             run.providerContinuation?.driver !== "codex" ||
-            (run.progress.checkpoint?.kind === "review" &&
+            (!finished &&
+              run.progress.checkpoint?.kind === "review" &&
               run.progress.checkpoint.turnId !== input.turnId) ||
             !runtime ||
             !hasDrainedWorkflowWriter(runtime) ||
             runtime.provider !== "codex" ||
             runtime.providerInstanceId !== run.modelSelection.instanceId ||
-            metadata?.workflowJobId !== binding.jobId ||
-            metadata.continuationKey !== run.providerContinuation.continuationKey ||
+            (metadata?.workflowJobId !== binding.jobId &&
+              (!finished || metadata?.workflowJobId !== undefined)) ||
+            metadata?.continuationKey !== run.providerContinuation.continuationKey ||
             Predicate.hasProperty(runtime.runtimePayload, "workflowVmCancellation")
           )
             return yield* invalid();
@@ -4595,6 +4652,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const native = yield* verify();
         yield* captureConversation(input, {
           ...native,
+          ...(finished ? { finished: true as const } : {}),
           authorize: verify().pipe(
             Effect.flatMap((current) =>
               current.nativeThreadId === native.nativeThreadId && current.cwd === native.cwd

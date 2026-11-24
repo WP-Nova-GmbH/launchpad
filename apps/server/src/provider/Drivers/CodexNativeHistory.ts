@@ -59,6 +59,8 @@ const decodeSpawnOutput = Schema.decodeUnknownSync(Schema.fromJsonString(SpawnOu
 const filename =
   /^rollout-\d{4}-\d{2}-\d{2}T[\d-]+-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?\.jsonl$/iu;
 
+export const codexNativeRolloutConversationId = (name: string) => filename.exec(name)?.[1];
+
 export class CodexNativeHistoryError extends Schema.TaggedError<CodexNativeHistoryError>()(
   "CodexNativeHistoryError",
   { message: Schema.String },

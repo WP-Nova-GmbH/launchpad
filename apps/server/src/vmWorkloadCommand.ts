@@ -314,13 +314,17 @@ export function makeVmWorkloadSpawner(
       )
         throw new Error("Unsupported workflow workload launch");
       const git = executable === "git" || executable === "/usr/bin/git";
-      const codexRecoveryRead =
-        cwd === workflowVmBaseEnvironment.CODEX_HOME &&
+      const checkpointReader =
         executable === "/usr/bin/python3" &&
         args.length === 3 &&
         args[0] === "-IS" &&
-        args[1] === "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py" &&
-        args[2] === "capture";
+        args[1] === "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py";
+      const codexHome = cwd === workflowVmBaseEnvironment.CODEX_HOME;
+      const conversationFiles = checkpointReader && args[2] === "conversation-files";
+      if (conversationFiles && !codexHome)
+        throw new Error("Workflow native conversation lookup requires the workflow Codex home.");
+      const codexRecoveryRead =
+        codexHome && checkpointReader && (args[2] === "capture" || conversationFiles);
       if (admission && (!workflow || !(git || codexRecoveryRead) || kind !== "process"))
         throw new Error("Workflow VM workload admission is sealed");
       return ChildProcess.make(

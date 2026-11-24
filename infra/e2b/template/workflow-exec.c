@@ -23,6 +23,7 @@
 #define COORDINATOR_ID 1000
 #define WORKFLOW_ID 10001
 #define WORKFLOW_HOME "/home/launchpad-workflow"
+#define WORKFLOW_CODEX_HOME WORKFLOW_HOME "/.codex"
 #define WORKFLOW_MARKER "/etc/launchpad/workflow-guest"
 #define WORKLOAD_HELPER "/opt/launchpad/bin/launchpad-workload"
 #define CHECKPOINT_PYTHON "/opt/launchpad/bin/launchpad-workflow-reader-python"
@@ -330,7 +331,8 @@ int main(int argc, char **argv) {
             if (strcmp(argv[1], "exec-provider") == 0) exec_workload(argv[2], argv + 4, provider);
         }
         if (argc == 4 && strcmp(argv[1], "exec-checkpoint-reader") == 0 &&
-            (strcmp(argv[3], "capture") == 0 || strcmp(argv[3], "exclude") == 0)) {
+            (strcmp(argv[3], "capture") == 0 || strcmp(argv[3], "exclude") == 0 ||
+             (strcmp(argv[3], "conversation-files") == 0 && strcmp(argv[2], WORKFLOW_CODEX_HOME) == 0))) {
             char *command[] = {CHECKPOINT_PYTHON, "-IS", CHECKPOINT_READER, argv[3], NULL};
             exec_workload(argv[2], command, checkpoint_reader);
         }

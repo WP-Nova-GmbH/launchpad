@@ -7287,7 +7287,7 @@ const checkpointHistoryFixture = Effect.fnUntraced(function* (threadId: ThreadId
   );
   const file = NodePath.join(config.attachmentsDir, attachmentRelativePath(attachment)!);
   NodeFS.writeFileSync(file, "notes");
-  return { attachment, file };
+  return { attachment, file, append };
 });
 const decodeVmCheckpointSettings = Schema.decodeSync(CodexSettings);
 it.effect.each(["success", "stop-failure", "drain-failure"] as const)(
@@ -10504,7 +10504,7 @@ it.effect.each([
 
 import { workflowPromptId } from "../../jobs/workflowSequence.ts";
 const makeWorkflowCaptureFixture = Effect.fnUntraced(function* (
-  options: { externalIngestion?: boolean } = {},
+  options: { externalIngestion?: boolean; sealedRecoveryOperation?: string } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -10545,6 +10545,79 @@ const makeWorkflowCaptureFixture = Effect.fnUntraced(function* (
       ),
     );
   });
+  const sealedReads: string[] = [];
+  const sealedBy = options.sealedRecoveryOperation
+    ? NodeCrypto.createHash("sha256")
+        .update(options.sealedRecoveryOperation)
+        .digest("hex")
+        .slice(0, 32)
+    : undefined;
+  const workloadControl = sealedBy
+    ? ChildProcessSpawner.make(
+        Effect.fnUntraced(function* (command) {
+          if (!ChildProcess.isStandardCommand(command))
+            return yield* Effect.die("Unexpected sealed workload pipeline");
+          const [action, boot, operation, epoch, , kind, cwd, separator, binary, ...args] =
+            command.args;
+          const bootId = "cb7c9212-2128-478f-9d11-6e4c8ed6f882";
+          assert.equal(command.command, "/opt/launchpad/bin/launchpad-workload");
+          if (action === "inspect")
+            return ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(1),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              isRunning: Effect.succeed(false),
+              kill: () => Effect.void,
+              unref: Effect.succeed(Effect.void),
+              stdin: Sink.drain,
+              stdout: Stream.encodeText(
+                Stream.make(encodeJson({ bootId, epoch: 1, sealedBy, groups: [], stopped: true })),
+              ),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            });
+          assert.deepEqual(
+            { action, boot, operation, epoch, kind, cwd, separator, binary },
+            {
+              action: "run-workflow-transfer",
+              boot: bootId,
+              operation: sealedBy,
+              epoch: "1",
+              kind: "process",
+              cwd: privateHome,
+              separator: "--",
+              binary: "/usr/bin/python3",
+            },
+          );
+          assert.deepEqual(args.slice(0, 2), [
+            "-IS",
+            "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py",
+          ]);
+          sealedReads.push(args[2]!);
+          // Run the installed reader against the fixture's equivalent Codex home.
+          return yield* rawSpawner.spawn(
+            ChildProcess.make(
+              binary!,
+              [
+                "-IS",
+                "-c",
+                [
+                  "import runpy, sys",
+                  "main = runpy.run_path(sys.argv[1])['main']",
+                  "main.__globals__['CODEX_HOME'] = sys.argv[2]",
+                  "main(sys.argv[3], sys.stdin.buffer, sys.stdout.buffer)",
+                ].join("\n"),
+                checkpointReader,
+                home,
+                args[2]!,
+              ],
+              { ...command.options, cwd: home },
+            ),
+          );
+        }),
+      )
+    : undefined;
   yield* fs.makeDirectory(path.dirname(rollout), { recursive: true });
   yield* fs.writeFileString(
     rollout,
@@ -10673,6 +10746,7 @@ const makeWorkflowCaptureFixture = Effect.fnUntraced(function* (
   const fixture = makeProviderServiceLayer({
     vmWorkloads: true,
     workflowGuest: true,
+    ...(workloadControl ? { workloadControl } : {}),
     nativeHistory: true,
     configLayer,
     workflowStoreLayer: WorkflowRunStoreLayer.pipe(
@@ -10739,6 +10813,8 @@ const makeWorkflowCaptureFixture = Effect.fnUntraced(function* (
     home,
     rollout,
     requests,
+    sealedReads,
+    workloadControl,
     gateRead: (effect: Effect.Effect<void>) => {
       beforeRead = effect;
     },
@@ -10881,6 +10957,160 @@ it.effect("only copies a stopped workflow's native checkpoint for its exact froz
       assert.deepEqual(f.counts(), { opens: 0, sends: 0, closes: 0 });
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "captures the latest stopped Codex follow-up without changing the finished workflow result",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const operationId = NodeCrypto.randomUUID();
+        const f = yield* makeWorkflowCaptureFixture({ sealedRecoveryOperation: operationId });
+        const path = yield* Path.Path;
+        const threadId = f.binding.threadId;
+        const agentTurn = asTurnId("turn-1");
+        const followUpTurn = asTurnId("turn-2");
+        const native = makeThreadNativeCheckpoint(f.sql);
+        const original = yield* native.capture(
+          { threadId, turnId: agentTurn, artifactRoot: path.join(f.root, "checkpoints") },
+          Effect.fnUntraced(function* (stage) {
+            const directory = path.join(stage, "conversation");
+            yield* f.fs.makeDirectory(directory);
+            yield* f.fs.writeFileString(path.join(directory, "manifest.json"), "{}");
+            yield* f.fs.copyFile(f.rollout, path.join(directory, "rollout.jsonl"));
+            return { directory, nativeThreadId: nativeIdForCheckpoint };
+          }),
+        );
+        assert.isNotNull(original);
+        const originalBytes = yield* f.fs.readFileString(
+          path.join(original!.directory, "rollout.jsonl"),
+        );
+        yield* f.store.save({
+          ...f.run,
+          executionReserved: false,
+          progress: {
+            ...f.run.progress,
+            revision: f.run.progress.revision + 1,
+            status: "done",
+            executionReleased: true,
+          },
+        });
+        yield* f.sql`UPDATE workflow_result_outbox SET status='acknowledged' WHERE job_id=${f.binding.jobId}`;
+        const finishedRun = yield* f.store.get(f.binding.jobId);
+        const [publication] = yield* f.sql<{
+          id: string;
+          revision: number;
+          sourceSequence: number;
+        }>`
+          SELECT publication_id AS id,revision,source_sequence AS "sourceSequence"
+          FROM workflow_result_outbox WHERE job_id=${f.binding.jobId} ORDER BY revision DESC LIMIT 1`;
+        assert.isDefined(publication);
+
+        const latestMessage = "Native history from the completed follow-up";
+        const source = yield* f.fs.readFileString(f.rollout);
+        yield* f.fs.writeFileString(
+          f.rollout,
+          source +
+            encodeJson({
+              type: "response_item",
+              payload: {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: latestMessage }],
+              },
+            }) +
+            "\n",
+        );
+        const at = "2026-10-12T10:03:00.000Z";
+        const followUp = yield* f.history.append(
+          "thread.message-sent",
+          {
+            threadId,
+            messageId: "finished-workflow-follow-up",
+            role: "assistant",
+            text: latestMessage,
+            streaming: false,
+            turnId: followUpTurn,
+            createdAt: at,
+            updatedAt: at,
+          },
+          "finished-workflow-follow-up",
+        );
+        yield* f.sql`INSERT INTO projection_turns (
+          thread_id,turn_id,state,requested_at,completed_at,checkpoint_status,checkpoint_files_json
+        ) VALUES
+          (${threadId},${agentTurn},'completed','2026-10-12T10:01:00.000Z','2026-10-12T10:02:00.000Z','ready','[]'),
+          (${threadId},${followUpTurn},'completed','2026-10-12T10:02:00.000Z',${at},NULL,'[]')`;
+        yield* f.sql`INSERT INTO provider_session_runtime (
+          thread_id,provider_name,provider_instance_id,adapter_key,runtime_mode,status,last_seen_at,
+          resume_cursor_json,runtime_payload_json
+        ) VALUES (${threadId},'codex','codex','codex','full-access','stopped',${at},
+          ${encodeJson({ threadId: nativeIdForCheckpoint, resumePolicy: "require-existing" })},
+          ${encodeJson({
+            cwd: f.root,
+            stoppedRuntimeEventsDrained: true,
+            providerContinuation: {
+              ...f.run.providerContinuation,
+              runtimeEpisode: "released-follow-up-episode",
+            },
+          })})`;
+        assert.isNull(yield* native.get(threadId, f.binding.generation, followUpTurn));
+        assert.isAbove(followUp.sequence, publication!.sourceSequence);
+        yield* f.sql`UPDATE thread_execution_fences SET operation_id=${operationId},phase='frozen',
+          frozen_sequence=${followUp.sequence} WHERE thread_id=${threadId}`;
+        const input = {
+          threadId,
+          turnId: followUpTurn,
+          captureOperationId: operationId,
+          workflowCheckpoint: {
+            jobId: f.binding.jobId,
+            checkpointId: publication!.id,
+            checkpointGeneration: 0,
+            publicationId: publication!.id,
+            publicationRevision: publication!.revision,
+            finishedWorkspaceRevision: 1,
+          },
+        };
+        const maintenance = yield* Semaphore.make(1);
+        const capture = (captureOperationId: string) =>
+          f.provider.checkpointConversation!({ ...input, captureOperationId }).pipe(
+            Effect.provideService(VmWorkloadTracking, true),
+            Effect.provideService(VmControlSpawner, f.workloadControl),
+            Effect.provideService(VmWorkloadMaintenance, maintenance),
+          );
+        yield* Effect.flip(capture(NodeCrypto.randomUUID()));
+        yield* f.sql`UPDATE provider_session_runtime SET runtime_payload_json=json_set(
+          runtime_payload_json,'$.stoppedRuntimeEventsDrained',json('false')) WHERE thread_id=${threadId}`;
+        yield* Effect.flip(capture(operationId));
+        assert.isEmpty(f.sealedReads);
+        yield* f.sql`UPDATE provider_session_runtime SET runtime_payload_json=json_set(
+          runtime_payload_json,'$.stoppedRuntimeEventsDrained',json('true')) WHERE thread_id=${threadId}`;
+        yield* capture(operationId);
+        const [point] = yield* f.sql<{ directory: string; sourceSequence: number; turnId: string }>`
+          SELECT directory,source_sequence AS "sourceSequence",turn_id AS "turnId"
+          FROM thread_native_checkpoints WHERE thread_id=${threadId}
+          AND capture_operation_id=${operationId}`;
+        assert.isDefined(point);
+        assert.equal(point!.turnId, followUpTurn);
+        assert.equal(point!.sourceSequence, followUp.sequence);
+        assert.include(
+          yield* f.fs.readFileString(path.join(point!.directory, "rollout.jsonl")),
+          latestMessage,
+        );
+        assert.equal(
+          yield* f.fs.readFileString(path.join(original!.directory, "rollout.jsonl")),
+          originalBytes,
+        );
+        const [attachments] = yield* f.sql<{ sourceSequence: number }>`
+          SELECT source_sequence AS "sourceSequence" FROM thread_attachment_checkpoints
+          WHERE thread_id=${threadId} AND checkpoint_id=${`frozen:${operationId}`}`;
+        assert.equal(attachments?.sourceSequence, followUp.sequence);
+        assert.deepEqual(yield* f.store.get(f.binding.jobId), finishedRun);
+        yield* capture(operationId);
+        assert.deepEqual(f.sealedReads, ["conversation-files", "capture"]);
+        assert.deepEqual(f.counts(), { opens: 0, sends: 0, closes: 0 });
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect(

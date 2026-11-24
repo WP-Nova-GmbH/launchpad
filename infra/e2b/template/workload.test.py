@@ -1053,6 +1053,7 @@ int main(void) {
 #define STDIN_FILENO 0
 #define CHECKPOINT_PYTHON "python"
 #define CHECKPOINT_READER "reader"
+#define WORKFLOW_CODEX_HOME "/home/launchpad-workflow/.codex"
 #define WORKFLOW_GIT "git"
 #define SETUP_OWNER "owner"
 enum workload_kind { ordinary, provider, checkpoint_reader, workflow_git, setup_owner };
@@ -1067,7 +1068,14 @@ static int duplicate_fd(int a,int b){(void)a;(void)b;return -1;}
 static int close(int fd){(void)fd;return 0;}
 static int prepare_workspace(void){return -1;}
 static int open_setup_script(char *s){(void)s;return -1;}
-static int exec_workload(char *cwd,char **cmd,enum workload_kind kind){(void)cwd;(void)cmd;(void)kind;return -1;}
+static int reader_calls=0;
+static int exec_workload(char *cwd,char **cmd,enum workload_kind kind){
+ assert(kind==checkpoint_reader);
+ assert(!strcmp(cwd,WORKFLOW_CODEX_HOME));
+ assert(!strcmp(cmd[3],"conversation-files"));
+ reader_calls++;
+ return -1;
+}
 static char *action;
 static int action_count;
 static int exec_control(int count,char **args){assert(count==action_count);assert(!strcmp(args[0],action));calls++;return -1;}
@@ -1094,6 +1102,10 @@ int main(void){
  uid=1000;euid=0;marked=1;broker_main(4,marker);assert(marker_calls==0);
  uid=0;euid=0;broker_main(5,marker);assert(marker_calls==0);
  broker_main(4,marker);assert(marker_calls==1);
+ char *reader[]={"broker","exec-checkpoint-reader",WORKFLOW_CODEX_HOME,"conversation-files",NULL};
+ uid=1000;euid=0;marked=1;broker_main(4,reader);assert(reader_calls==1);
+ reader[2]="/workspace/project";broker_main(4,reader);assert(reader_calls==1);
+ uid=10001;reader[2]=WORKFLOW_CODEX_HOME;broker_main(4,reader);assert(reader_calls==1);
  return 0;
 }
 '''
@@ -1191,6 +1203,8 @@ class WorkflowWorkloadTest(unittest.TestCase):
         home = '/home/launchpad-workflow/.codex'
         reader = ['--', '/usr/bin/python3', '-IS', str(workload.CHECKPOINT_READER)]
         for command in ([*prefix, self.cwd, *reader, 'capture'],
+                        [*prefix, self.cwd, *reader, 'conversation-files'],
+                        [*prefix, home, *reader, 'conversation-files', 'other-argument'],
                         [*prefix, home, *reader, 'exclude']):
             with self.assertRaisesRegex(ValueError, 'Invalid sealed workflow maintenance command'):
                 workload.main(command)
@@ -1202,10 +1216,10 @@ class WorkflowWorkloadTest(unittest.TestCase):
             mock.patch.object(os, 'execv', side_effect=RuntimeError('exec captured')) as execute,
         ):
             with self.assertRaisesRegex(RuntimeError, 'exec captured'):
-                workload.main([*prefix, home, *reader, 'capture'])
+                workload.main([*prefix, home, *reader, 'conversation-files'])
         execute.assert_called_once_with(
             workload.WORKFLOW_EXEC,
-            [workload.WORKFLOW_EXEC, 'exec-checkpoint-reader', home, 'capture'],
+            [workload.WORKFLOW_EXEC, 'exec-checkpoint-reader', home, 'conversation-files'],
         )
 
     def test_signal_matches_current_group_and_leader_or_kills_only_owned_descendants(self):

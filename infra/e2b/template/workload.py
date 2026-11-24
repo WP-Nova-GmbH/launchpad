@@ -28,6 +28,7 @@ DUMP_POLICY = Path('/proc/sys/fs/suid_dumpable')
 WORKFLOW_NATIVE_MODE = 0o751
 CHECKPOINT_PYTHON = Path('/opt/launchpad/bin/launchpad-workflow-reader-python')
 CHECKPOINT_READER = Path('/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py')
+WORKFLOW_CODEX_HOME = '/home/launchpad-workflow/.codex'
 WORKFLOW_GIT = Path('/opt/launchpad/bin/launchpad-workflow-git')
 RESOURCE_MONITOR = Path('/opt/launchpad/server/resource-monitor/t3-resource-monitor')
 WORKFLOW_SETUP_OWNER = Path('/opt/launchpad/bin/launchpad-workflow-setup-owner')
@@ -1027,8 +1028,9 @@ def main(args):
                           command[0] in ("git", "/usr/bin/git") and
                           command[1:len(git_prefix) + 1] == git_prefix and
                           tuple(command[len(git_prefix) + 1:]) in git_queries)
-            codex_recovery = (cwd == "/home/launchpad-workflow/.codex" and
-                              command == ["/usr/bin/python3", "-IS", str(CHECKPOINT_READER), "capture"])
+            codex_recovery = (cwd == WORKFLOW_CODEX_HOME and len(command) == 4 and
+                              command[:3] == ["/usr/bin/python3", "-IS", str(CHECKPOINT_READER)] and
+                              command[3] in {"capture", "conversation-files"})
             if kind != "process" or not os.path.isabs(cwd) or not (sealed_git or codex_recovery):
                 raise ValueError("Invalid sealed workflow maintenance command")
         elif transfer:
@@ -1084,7 +1086,8 @@ def main(args):
                 os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-git', cwd, '--', *command[1:]])
             if kind == 'process' and command[:3] == ['/usr/bin/python3', '-IS', str(CHECKPOINT_READER)]:
                 require_workflow_dump_policy()
-                if len(command) != 4 or command[3] not in {'capture', 'exclude'}:
+                if (len(command) != 4 or command[3] not in {'capture', 'exclude', 'conversation-files'}
+                        or (command[3] == 'conversation-files' and cwd != WORKFLOW_CODEX_HOME)):
                     raise RuntimeError('Invalid workflow checkpoint reader launch')
                 require_workflow_executable(immutable(CHECKPOINT_PYTHON))
                 immutable(CHECKPOINT_READER)

@@ -5,11 +5,15 @@ import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as ProcessRunner from "../../processRunner.ts";
 import { VmCoordinatorProcess } from "../../vmWorkloadCommand.ts";
-import { stageWorkflowCheckpoint } from "../../vcs/WorkflowCheckpointReader.ts";
+import {
+  listWorkflowConversationFiles,
+  stageWorkflowCheckpoint,
+} from "../../vcs/WorkflowCheckpointReader.ts";
 import {
   exportCodexConversation,
   CodexConversationTransferError,
 } from "./CodexConversationTransfer.ts";
+import { codexNativeRolloutConversationId } from "./CodexNativeHistory.ts";
 
 // The isolated interpreter lists only conversation data, never config or auth.
 // Native graph validation and attachment provenance remain in the normal exporter.
@@ -67,37 +71,51 @@ const decodeFiles = Schema.decodeEffect(Schema.fromJsonString(Schema.Array(Schem
 export const exportWorkflowCodexConversation = Effect.fn("exportWorkflowCodexConversation")(
   function* (
     spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
-    input: Parameters<typeof exportCodexConversation>[0],
+    input: Omit<Parameters<typeof exportCodexConversation>[0], "rolloutPath"> & {
+      readonly rolloutPath?: string;
+    },
   ) {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const home = path.resolve(input.codexHome);
-    const relative = path.relative(home, path.resolve(input.rolloutPath));
+    const relative = input.rolloutPath && path.relative(home, path.resolve(input.rolloutPath));
     const failure = () =>
       new CodexConversationTransferError({
         message: "The workflow's native conversation could not be read.",
       });
     if (
-      relative.startsWith("..") ||
-      path.isAbsolute(relative) ||
+      (relative !== undefined && (relative.startsWith("..") || path.isAbsolute(relative))) ||
       path.resolve(input.artifactRoot) === home ||
       path.resolve(input.artifactRoot).startsWith(`${home}${path.sep}`)
     )
       return yield* failure();
-    const runner = yield* ProcessRunner.make().pipe(
-      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    );
-    const listing = yield* runner.run({
-      command: "/usr/bin/python3",
-      args: ["-IS", "-c", listConversationFiles, input.threadId],
-      cwd: home,
-      env: {},
-      maxOutputBytes: 4 * 1024 * 1024,
-    });
-    if (listing.code !== 0) return yield* failure();
-    const files = yield* decodeFiles(listing.stdout);
+    const files = yield* relative === undefined
+      ? listWorkflowConversationFiles(spawner, home, input.threadId)
+      : Effect.gen(function* () {
+          const runner = yield* ProcessRunner.make().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          );
+          const listing = yield* runner.run({
+            command: "/usr/bin/python3",
+            args: ["-IS", "-c", listConversationFiles, input.threadId],
+            cwd: home,
+            env: {},
+            maxOutputBytes: 4 * 1024 * 1024,
+          });
+          if (listing.code !== 0) return yield* failure();
+          return yield* decodeFiles(listing.stdout);
+        });
+    const roots =
+      relative === undefined
+        ? files.filter(
+            (file) =>
+              !file.startsWith("native-files/") &&
+              codexNativeRolloutConversationId(path.basename(file)) === input.threadId,
+          )
+        : [relative];
     if (
-      !files.includes(relative) ||
+      roots.length !== 1 ||
+      !files.includes(roots[0]!) ||
       files.length > 512 ||
       files.some((file) => !/^(?:sessions|archived_sessions|native-files)\//u.test(file))
     )
@@ -131,9 +149,10 @@ export const exportWorkflowCodexConversation = Effect.fn("exportWorkflowCodexCon
       stream: (file, options) => fs.stream(source(file), options),
       copyFile: (file, destination) => fs.copyFile(source(file), destination),
     };
-    return yield* exportCodexConversation(input).pipe(
-      Effect.provideService(FileSystem.FileSystem, snapshotFs),
-    );
+    return yield* exportCodexConversation({
+      ...input,
+      rolloutPath: path.join(home, roots[0]!),
+    }).pipe(Effect.provideService(FileSystem.FileSystem, snapshotFs));
   },
   Effect.provideService(VmCoordinatorProcess, false),
   Effect.scoped,
