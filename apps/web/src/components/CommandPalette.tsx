@@ -196,6 +196,7 @@ import {
 } from "../state/server";
 import { deriveProviderInstanceEntries, type ProviderInstanceEntry } from "../providerInstances";
 import { resolveShortcutCommand, threadJumpIndexFromCommand } from "../keybindings";
+import { isWindowAlertDialogOpen } from "../lib/windowAlertDialog";
 import { CommandDialog, CommandDialogPopup, CommandFooterAction } from "./ui/command";
 import { Button } from "./ui/button";
 import { Kbd, KbdGroup } from "./ui/kbd";
@@ -567,7 +568,7 @@ export function CommandPalette({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!state.open || mode === "command") return;
     const onEscapeKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.isComposing || event.key !== "Escape") return;
+      if (event.isComposing || event.key !== "Escape" || isWindowAlertDialogOpen()) return;
       event.preventDefault();
       event.stopPropagation();
       toggleMode("command");

@@ -4,6 +4,7 @@ import {
   type WorkflowResponseSummary,
   type WorkflowStep,
 } from "@t3tools/contracts/workflows";
+import type { WorkflowResponseContext } from "@t3tools/client-runtime/relay/workflow-session";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -126,6 +127,7 @@ export interface RetainedCheckpointDraft {
   readonly id: string;
   readonly text: string;
   readonly deliveryUnconfirmed: boolean;
+  readonly context?: WorkflowResponseContext | undefined;
 }
 
 function DraftRow({

@@ -73,6 +73,7 @@ import {
   activateWorkflowJobView,
   beginWorkflowJobRequest,
   recordWorkflowResponse,
+  setWorkflowResponseDraft,
   settleWorkflowJobRequest,
   invalidateWorkflowJobRead,
   emptyWorkflowJobRead,
@@ -813,13 +814,11 @@ export function WorkflowJob({
   const setResponse = (text: string) => {
     if (!checkpoint) return;
     keepPausedFeedbackOpenOnResume();
-    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
-      ...state,
-      responses: {
-        ...state.responses,
-        [key]: { ...state.responses[key], [checkpoint.checkpointId]: text },
-      },
-    }));
+    setWorkflowResponseDraft(appAtomRegistry, scope, jobId, checkpoint.checkpointId, text, {
+      workflowName: selectedJob?.workflow?.definition.name ?? null,
+      stepTitle: checkpointStep?.title ?? null,
+      kind: checkpoint.kind === "input" ? "input" : "review",
+    });
   };
   const backToRuns = () =>
     navigate({
@@ -987,34 +986,32 @@ export function WorkflowJob({
       id,
       text,
       deliveryUnconfirmed: drafts.submitted[key]?.[id]?.text === text,
+      context: drafts.responseContexts?.[key]?.[id],
     }));
   const changeRetainedDraft = (draft: RetainedCheckpointDraft, restore: boolean) => {
     const currentReads = appAtomRegistry.get(workflowJobReadAtom);
     const currentJob = currentReads.jobs[key]?.job;
     if (currentReads.activeKey !== key || !currentJob) return false;
 
-    let changed = false;
-    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
-      const current = state.responses[key] ?? {};
-      const existing = current[draft.id];
-      if (restore ? existing !== undefined : existing !== draft.text) return state;
+    const state = appAtomRegistry.get(workflowDraftAtom);
+    const current = state.responses[key] ?? {};
+    const existing = current[draft.id];
+    if (restore ? existing !== undefined : existing !== draft.text) return false;
 
-      const next = { ...current };
-      if (restore) {
-        next[draft.id] = draft.text;
-        const submission = state.submitted[key]?.[draft.id];
-        if (
-          submission &&
-          clearAcknowledgedWorkflowDraft(next, submission, currentJob.progress) !== next
-        )
-          return state;
-      } else {
-        delete next[draft.id];
-      }
-      changed = true;
-      return { ...state, responses: { ...state.responses, [key]: next } };
-    });
-    return changed;
+    const submission = state.submitted[key]?.[draft.id];
+    if (restore && submission) {
+      const next = { ...current, [draft.id]: draft.text };
+      if (clearAcknowledgedWorkflowDraft(next, submission, currentJob.progress) !== next)
+        return false;
+    }
+    return setWorkflowResponseDraft(
+      appAtomRegistry,
+      scope,
+      jobId,
+      draft.id,
+      restore ? draft.text : null,
+      draft.context,
+    );
   };
   const stepIndex =
     selectedJob.workflow?.definition.steps.findIndex((step) => step.id === checkpointStep?.id) ??

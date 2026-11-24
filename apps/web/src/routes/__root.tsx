@@ -17,7 +17,7 @@ import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 
 import { APP_BASE_NAME, APP_DISPLAY_NAME, APP_STAGE_LABEL, APP_VERSION } from "../branding";
 import { resolveServerBackedAppDisplayName } from "../branding.logic";
-import { WorkflowDraftUnloadGuard } from "../components/workflows/WorkflowNavigation";
+import { WorkflowWindowCloseGuard } from "../components/workflows/WorkflowWindowCloseGuard";
 import { AppSidebarLayout } from "../components/AppSidebarLayout";
 import { CommandPalette } from "../components/CommandPalette";
 import { CustomSnoozeDialogHost } from "../components/CustomSnoozeDialog";
@@ -201,7 +201,7 @@ function RootRouteView() {
   const appShell = (
     <CommandPalette>
       <AppSidebarLayout>
-        <WorkflowDraftUnloadGuard />
+        <WorkflowWindowCloseGuard />
         <Outlet />
       </AppSidebarLayout>
     </CommandPalette>

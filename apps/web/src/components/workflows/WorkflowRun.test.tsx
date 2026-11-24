@@ -665,6 +665,161 @@ describe("VM Run submission recovery", () => {
     },
   );
 
+  it.each(["Machine target", "gate closed", "archived"] as const)(
+    "checks the earlier VM receipt independently with %s",
+    async (condition) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const initial = { ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call };
+      const receipt = deferred<RepositoryWorkflowJob>();
+      read
+        .mockRejectedValueOnce(new Error("Original reply lost"))
+        .mockRejectedValueOnce(new Error("Newer reply lost"))
+        .mockRejectedValueOnce(new Error("No matching receipt yet"))
+        .mockReturnValueOnce(receipt.promise);
+      await mount(initial);
+      await submit();
+      const original = runWorkflow.mock.calls[0]![0].payload;
+      await edit("Instructions for the additional run");
+      const latest =
+        condition === "Machine target"
+          ? { ...initial, workflow }
+          : condition === "archived"
+            ? { ...initial, workflow: { ...vmWorkflow, archived: true } }
+            : { ...initial, vmExecutionAvailable: false };
+      if (condition === "Machine target") await update(latest);
+      await startSeparateRun();
+      const foreground = draft().operation;
+      await edit("Instructions for the next draft");
+      await update(latest);
+
+      await press("Check submission");
+      expect(runWorkflow.mock.calls[2]![0].payload).toEqual({ ...original, replayOnly: true });
+      expect(visibleText(renderer!.root)).toContain("No matching receipt yet");
+      expect(draft().operation).toBe(foreground);
+      await press("Check submission");
+      expect(runWorkflow.mock.calls[3]![0].payload).toEqual({ ...original, replayOnly: true });
+      expect(draft().earlierUnconfirmedRuns?.[0]?.state).toBe("pending");
+
+      await unmount();
+      await mount(latest);
+      expect(visibleText(renderer!.root)).toContain("Checking for a receipt");
+      expect(button("Check submission").props["aria-disabled"]).toBe(true);
+      await press("Check submission");
+      expect(runWorkflow).toHaveBeenCalledTimes(4);
+
+      await accept(receipt, job);
+      expect(draft()).toMatchObject({
+        instruction: "Instructions for the next draft",
+        operation: foreground,
+        error: "Newer reply lost",
+        startedJobId: job.jobId,
+      });
+      expect(draft().earlierUnconfirmedRuns).toBeUndefined();
+      expect(navigate).not.toHaveBeenCalled();
+      expect(button("Check submission")).toBeUndefined();
+      await press("View started run");
+      expect(navigate).toHaveBeenCalledExactlyOnceWith({
+        to: "/workflows/$repositoryId/jobs/$jobId",
+        params: { repositoryId: scope.repositoryId, jobId: job.jobId },
+      });
+    },
+  );
+
+  it.each(["unconfirmed", "rejected"] as const)(
+    "keeps each recovery action unique when an additional run is pending and then %s",
+    async (outcome) => {
+      const { call } = captureSubmissions();
+      const reply = deferred<void>();
+      const rejection =
+        outcome === "unconfirmed"
+          ? new Error("Third reply lost")
+          : new ManagedRelay.ManagedRelayRequestFailedError({
+              action: "runWorkflow",
+              cause: new WorkflowInvalidError({ message: "Third run could not start." }),
+            });
+      read
+        .mockRejectedValueOnce(new Error("Original reply lost"))
+        .mockRejectedValueOnce(new Error("Second reply lost"))
+        .mockReturnValueOnce(
+          reply.promise.then(() => {
+            throw rejection;
+          }),
+        );
+      await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call });
+      await submit();
+      await edit("Second instructions");
+      await startSeparateRun();
+      await edit("Third instructions");
+
+      const earlierRows = () => renderer!.root.findAllByType("li").map(visibleText);
+      await startSeparateRun();
+      expect(messages("status").map(visibleText)).toContain(
+        "Waiting for confirmation of the additional run.",
+      );
+      expect(earlierRows()).toEqual([expect.stringContaining("Run A")]);
+      const recovery = button("Retry previous submission");
+      expect(recovery.props["aria-disabled"]).toBe(true);
+      expect(visibleText(renderer!.root)).toContain("Second instructions");
+
+      await accept(reply, undefined);
+
+      if (outcome === "rejected") {
+        expect(earlierRows()).toEqual([expect.stringContaining("Run A")]);
+        expect(button("Retry previous submission")).toBe(recovery);
+        expect(recovery.props["aria-disabled"]).toBeUndefined();
+        expect(draft().operation?.instruction).toBe("Second instructions");
+      } else {
+        expect(earlierRows()).toEqual([
+          expect.stringContaining("Run A"),
+          expect.stringContaining("Second instructions"),
+        ]);
+        expect(draft().operation?.instruction).toBe("Third instructions");
+      }
+    },
+  );
+
+  it("focuses the confirmed earlier run when its focused check action disappears", async () => {
+    const { call } = captureSubmissions();
+    const receipt = deferred<RepositoryWorkflowJob>();
+    read
+      .mockRejectedValueOnce(new Error("Original reply lost"))
+      .mockRejectedValueOnce(new Error("Newer reply lost"))
+      .mockReturnValueOnce(receipt.promise);
+    const body = {};
+    const ownerDocument: { activeElement: object; body: object } = { activeElement: body, body };
+    const focusedCheck = { ownerDocument };
+    const startedRun = { focus: () => (ownerDocument.activeElement = startedRun) };
+    const newerRecovery = { focus: () => (ownerDocument.activeElement = newerRecovery) };
+    await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call }, false, {
+      createNodeMock(element) {
+        const { children } = element.props as PropsWithChildren;
+        if (element.type === "li")
+          return { ownerDocument, contains: (node: object) => node === focusedCheck };
+        if (element.type === "button" && children === "View started run") {
+          if (ownerDocument.activeElement === focusedCheck) ownerDocument.activeElement = body;
+          return startedRun;
+        }
+        if (
+          element.type === "button" &&
+          Array.isArray(children) &&
+          children.includes("Retry previous submission")
+        )
+          return newerRecovery;
+        return null;
+      },
+    });
+    await submit();
+    await edit("A different run");
+    await startSeparateRun();
+    ownerDocument.activeElement = focusedCheck;
+    await press("Check submission");
+    await accept(receipt, job);
+
+    expect(button("Retry previous submission")).toBeDefined();
+    expect(ownerDocument.activeElement).toBe(startedRun);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it.each(["vm", "machine"] as const)(
     "confirms a separate %s Run and preserves original VM recovery if it is rejected",
     async (targetKind) => {

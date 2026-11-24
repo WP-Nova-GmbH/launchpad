@@ -1,6 +1,8 @@
 import { ApprovalRequestId } from "@t3tools/contracts";
+import { act } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vite-plus/test";
+import { create, type ReactTestRenderer } from "react-test-renderer";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import type { PendingUserInput } from "../../session-logic";
@@ -38,6 +40,57 @@ function renderPanel(pendingUserInput: PendingUserInput = prompt) {
 }
 
 describe("ComposerPendingUserInputPanel", () => {
+  it("leaves number keys alone until the foreground window confirmation closes", async () => {
+    vi.useFakeTimers();
+    const querySelector = vi.fn().mockReturnValue({});
+    const browserDocument = Object.assign(new EventTarget(), { querySelector });
+    const onToggleOption = vi.fn();
+    const onAdvance = vi.fn();
+    let renderer: ReactTestRenderer | undefined;
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("document", browserDocument);
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    vi.stubGlobal("HTMLElement", class extends EventTarget {});
+    vi.stubGlobal("HTMLInputElement", class extends HTMLElement {});
+    vi.stubGlobal("HTMLTextAreaElement", class extends HTMLElement {});
+
+    const pressFirstOption = async () => {
+      const event = Object.assign(new Event("keydown", { cancelable: true }), { key: "1" });
+      await act(() => browserDocument.dispatchEvent(event));
+      await act(() => vi.advanceTimersByTime(200));
+      return event.defaultPrevented;
+    };
+
+    try {
+      await act(() => {
+        renderer = create(
+          <ComposerPendingUserInputPanel
+            pendingUserInputs={[prompt]}
+            respondingRequestIds={[]}
+            answers={{}}
+            questionIndex={0}
+            onToggleOption={onToggleOption}
+            onAdvance={onAdvance}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+
+      expect(await pressFirstOption()).toBe(false);
+      expect(onToggleOption).not.toHaveBeenCalled();
+      expect(onAdvance).not.toHaveBeenCalled();
+
+      querySelector.mockReturnValue(null);
+      expect(await pressFirstOption()).toBe(true);
+      expect(onToggleOption).toHaveBeenCalledWith("question-1", "Incremental");
+      expect(onAdvance).toHaveBeenCalledOnce();
+    } finally {
+      await act(() => renderer?.unmount());
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
   it("renders the header as a disclosure control for the question body", () => {
     const markup = renderPanel();
 

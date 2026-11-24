@@ -14,6 +14,7 @@ import {
   WorkflowDefinition as WorkflowDefinitionSchema,
   WorkflowAutomation as WorkflowAutomationSchema,
   WorkflowStep as WorkflowStepSchema,
+  isTerminalWorkflowJob,
   workflowDefinitionError,
   workflowPublishingPrerequisites,
 } from "@t3tools/contracts/workflows";
@@ -85,13 +86,18 @@ export interface WorkflowEditorDraft {
 
 export interface WorkflowRunDraft {
   readonly instruction: string;
+  readonly workflowName?: string;
   readonly operation: {
     readonly requestId: string;
     readonly state: "pending" | "uncertain";
     readonly instruction: string;
     /** VM requests replay the captured payload. Machine submissions retain their existing retry flow. */
     readonly targetKind?: "vm";
+    readonly receiptError?: string | undefined;
   } | null;
+  readonly earlierUnconfirmedRuns?:
+    | ReadonlyArray<NonNullable<WorkflowRunDraft["operation"]>>
+    | undefined;
   /** Submission context retained while leaving and reopening the Run view. */
   readonly recovery?:
     | {
@@ -113,6 +119,13 @@ interface WorkflowSessionSubmission extends WorkflowDraftSubmission {
   readonly requestEpoch?: number;
   readonly acceptedPending?: true;
   readonly acceptedPendingResponseId?: string;
+  readonly pendingResponseUnconfirmed?: true | undefined;
+}
+
+export interface WorkflowResponseContext {
+  readonly workflowName: string | null;
+  readonly stepTitle: string | null;
+  readonly kind: "input" | "review";
 }
 
 export interface WorkflowDraftState {
@@ -121,6 +134,7 @@ export interface WorkflowDraftState {
   readonly newWorkflowIds: Record<string, string>;
   readonly runs: Record<string, WorkflowRunDraft>;
   readonly responses: Record<string, Record<string, string>>;
+  readonly responseContexts?: Record<string, Record<string, WorkflowResponseContext>>;
   readonly manual: Record<string, WorkflowManualSubmission>;
   readonly submitted: Record<string, Record<string, WorkflowSessionSubmission>>;
   readonly reviews: Record<string, WorkflowReviewVisit>;
@@ -230,6 +244,7 @@ export function clearWorkflowScope(registry: AtomRegistry.AtomRegistry, scope: W
     newWorkflowIds: remove(state.newWorkflowIds),
     runs: remove(state.runs),
     responses: remove(state.responses),
+    ...(state.responseContexts ? { responseContexts: remove(state.responseContexts) } : {}),
     manual: remove(state.manual),
     submitted: remove(state.submitted),
     reviews: remove(state.reviews),
@@ -508,14 +523,211 @@ export const sameWorkflowDefinition = Schema.toEquivalence(WorkflowDefinitionSch
 const decodeWorkflowDefinition = Schema.decodeExit(WorkflowDefinitionSchema);
 const decodeWorkflowStep = Schema.decodeExit(WorkflowStepSchema);
 
-export function hasUnsavedWorkflowWork(state: WorkflowDraftState) {
+function workflowCloseSaveKind(
+  draft: WorkflowEditorDraft,
+  operation: NonNullable<WorkflowEditorDraft["operation"]>,
+) {
+  return operation.archived && draft.baseline?.archived === false
+    ? "archive"
+    : !operation.archived && draft.baseline?.archived === true
+      ? "restore"
+      : "save";
+}
+
+function workflowSaveKnownFailure(draft: WorkflowEditorDraft) {
   return (
-    Object.values(state.editors).some((draft) => workflowEditorDirty(draft) || !!draft.operation) ||
+    draft.operation?.state === "uncertain" &&
+    (draft.saveRecovery === "conflict" || draft.saveRecovery === "retryable")
+  );
+}
+
+function workflowEditorHasCloseWork(draft: WorkflowEditorDraft) {
+  const operation = draft.operation;
+  return (
+    workflowEditorDirty(draft) ||
+    (!!operation &&
+      (!workflowSaveKnownFailure(draft) || workflowCloseSaveKind(draft, operation) === "save"))
+  );
+}
+
+export function hasUnsavedWorkflowWork(state: WorkflowDraftState, reads?: WorkflowReadState) {
+  const jobs = state.accountId && state.accountId === reads?.accountId ? reads.jobs : {};
+  return (
+    Object.values(state.editors).some(workflowEditorHasCloseWork) ||
     Object.values(state.runs).some((draft) => !!draft.instruction || !!draft.operation) ||
-    Object.values(state.responses).some((drafts) =>
-      Object.values(drafts).some((text) => !!text.trim()),
+    Object.entries(state.responses).some(([jobKey, drafts]) =>
+      Object.entries(drafts).some(
+        ([checkpointId, text]) =>
+          !!text.trim() &&
+          !durablyQueuedWorkflowResponse(state, jobKey, checkpointId, text, jobs[jobKey]?.job),
+      ),
     )
   );
+}
+
+function workflowQueueReceiptWithdrawn(
+  submission: WorkflowSessionSubmission,
+  job: RepositoryWorkflowJob,
+) {
+  if (job.status === "cancelling" || isTerminalWorkflowJob(job.status)) return true;
+  const sameCheckpoint = job.progress?.checkpoint?.checkpointId === submission.checkpointId;
+  // History can be truncated or evicted. After the queue identity disappears, only
+  // an exact acknowledgement can clear the draft.
+  if (
+    submission.acceptedPendingResponseId &&
+    (!sameCheckpoint || job.pendingResponseId !== submission.acceptedPendingResponseId)
+  )
+    return true;
+  return (
+    sameCheckpoint &&
+    (job.responsePending === false ||
+      (job.pendingResponseOperation !== undefined &&
+        job.pendingResponseOperation !== submission.operation))
+  );
+}
+
+function durablyQueuedWorkflowResponse(
+  state: WorkflowDraftState,
+  jobKey: string,
+  checkpointId: string,
+  text: string,
+  job: RepositoryWorkflowJob | null | undefined,
+) {
+  const submission = state.submitted[jobKey]?.[checkpointId];
+  if (!state.accountId || submission?.userId !== state.accountId || submission.text !== text)
+    return false;
+  // Legacy Machine acknowledgements do not identify whose exact response is still queued.
+  return (
+    !!submission.acceptedPendingResponseId &&
+    (job ? !workflowQueueReceiptWithdrawn(submission, job) : !submission.pendingResponseUnconfirmed)
+  );
+}
+
+export interface WorkflowCloseSummary {
+  readonly edits: ReadonlyArray<{ key: string; name: string | null }>;
+  readonly runDrafts: ReadonlyArray<{ key: string; workflowName: string | null }>;
+  readonly responses: ReadonlyArray<{
+    jobKey: string;
+    checkpointId: string;
+    workflowName: string | null;
+    stepTitle: string | null;
+    kind: "input" | "review" | null;
+    deliveryUnconfirmed: boolean;
+  }>;
+  readonly requests: ReadonlyArray<{
+    key: string;
+    requestId: string;
+    workflowName: string | null;
+    kind: "save" | "archive" | "restore" | "run";
+    state: "pending" | "uncertain";
+    runPosition?: { number: number; total: number };
+  }>;
+}
+
+/** Summarize what closing the window could discard without exposing draft content. */
+export function summarizeWorkflowClose(
+  state: WorkflowDraftState,
+  reads: WorkflowReadState,
+): WorkflowCloseSummary {
+  const edits: Array<WorkflowCloseSummary["edits"][number]> = [];
+  const runDrafts: Array<WorkflowCloseSummary["runDrafts"][number]> = [];
+  const responses: Array<WorkflowCloseSummary["responses"][number]> = [];
+  const requests: Array<WorkflowCloseSummary["requests"][number]> = [];
+  const jobs = state.accountId && state.accountId === reads.accountId ? reads.jobs : {};
+
+  for (const [key, draft] of Object.entries(state.editors)) {
+    const name = draft.definition.name.trim() || draft.baseline?.definition.name.trim() || null;
+    const operation = draft.operation;
+    if (operation && !workflowSaveKnownFailure(draft)) {
+      const kind = workflowCloseSaveKind(draft, operation);
+      requests.push({
+        key,
+        requestId: operation.requestId,
+        workflowName: operation.definition.name.trim() || name,
+        kind,
+        state: operation.state,
+      });
+      const savedAutomation = operation.includesAutomation
+        ? operation.automation
+        : draft.baseline?.automation;
+      const unsentEdits =
+        kind === "archive"
+          ? workflowEditorDirty(draft)
+          : !sameWorkflowDefinition(draft.definition, operation.definition) ||
+            !sameWorkflowAutomation(workflowDraftAutomation(draft), savedAutomation);
+      if (unsentEdits) edits.push({ key, name });
+    } else if (workflowEditorHasCloseWork(draft)) {
+      edits.push({ key, name });
+    }
+  }
+
+  for (const [key, draft] of Object.entries(state.runs)) {
+    if (!draft.instruction && !draft.operation) continue;
+    const workflowName =
+      draft.workflowName?.trim() ||
+      state.editors[key]?.definition.name.trim() ||
+      state.editors[key]?.baseline?.definition.name.trim() ||
+      null;
+    const operation = draft.operation;
+    if (operation) {
+      const earlier =
+        draft.earlierUnconfirmedRuns ??
+        (draft.recovery?.kind === "additional" ? [draft.recovery.previous] : []);
+      const attempts = new Map(earlier.map((run) => [run.requestId, run]));
+      attempts.delete(operation.requestId);
+      attempts.set(operation.requestId, operation);
+      let index = 0;
+      for (const run of attempts.values()) {
+        index += 1;
+        requests.push({
+          key,
+          requestId: run.requestId,
+          workflowName,
+          kind: "run",
+          state: run.state,
+          ...(attempts.size > 1 ? { runPosition: { number: index, total: attempts.size } } : {}),
+        });
+      }
+    }
+    if (draft.instruction && draft.instruction !== operation?.instruction)
+      runDrafts.push({ key, workflowName });
+  }
+
+  for (const [jobKey, drafts] of Object.entries(state.responses)) {
+    const job = jobs[jobKey]?.job;
+    for (const [checkpointId, draft] of Object.entries(drafts)) {
+      if (!draft.trim()) continue;
+      const current = job?.progress?.checkpoint;
+      const checkpoint = current?.checkpointId === checkpointId ? current : null;
+      const recorded = job?.progress?.responses?.find(
+        (entry) => entry.checkpointId === checkpointId,
+      );
+      const submitted = state.submitted[jobKey]?.[checkpointId];
+      if (durablyQueuedWorkflowResponse(state, jobKey, checkpointId, draft, job)) continue;
+      const context = state.responseContexts?.[jobKey]?.[checkpointId];
+      const operation = recorded?.operation ?? submitted?.operation;
+      const kind = checkpoint
+        ? checkpoint.kind === "input"
+          ? "input"
+          : "review"
+        : operation === "input"
+          ? "input"
+          : operation === "request_changes" || operation === "approve"
+            ? "review"
+            : (context?.kind ?? null);
+      const stepId = checkpoint?.stepId ?? recorded?.stepId;
+      const step = job?.workflow?.definition.steps.find((entry) => entry.id === stepId);
+      responses.push({
+        jobKey,
+        checkpointId,
+        workflowName: job?.workflow?.definition.name.trim() || context?.workflowName || null,
+        stepTitle: step?.title.trim() || context?.stepTitle || null,
+        kind,
+        deliveryUnconfirmed: submitted?.userId === state.accountId && submitted?.text === draft,
+      });
+    }
+  }
+  return { edits, runDrafts, responses, requests };
 }
 
 /** Validate unmounted steps too; the selected inspector's DOM is not the definition. */
@@ -674,41 +886,80 @@ export function settleWorkflowJobRequest(
       },
     },
   });
-  if (accepted)
+  const settledJob = accepted && !accessLost ? result : undefined;
+  if (settledJob || accessLost)
     updateWorkflowDrafts(registry, request.accountId, (drafts) => {
       const previousResponses = drafts.responses[request.key] ?? {};
       let responses = previousResponses;
       const submissions = drafts.submitted[request.key];
-      for (const submission of Object.values(submissions ?? {}))
-        responses = clearAcknowledgedWorkflowDraft(responses, submission, result.progress);
+      if (settledJob)
+        for (const submission of Object.values(submissions ?? {}))
+          responses = clearAcknowledgedWorkflowDraft(responses, submission, settledJob.progress);
 
-      const pendingId = result.responsePending
-        ? result.progress?.checkpoint?.checkpointId
+      const pendingId = settledJob?.responsePending
+        ? settledJob.progress?.checkpoint?.checkpointId
         : undefined;
       const submission = pendingId ? submissions?.[pendingId] : undefined;
       const receipt =
-        result.runtime?.kind === "vm"
-          ? result.pendingResponseId && { acceptedPendingResponseId: result.pendingResponseId }
+        settledJob?.runtime?.kind === "vm"
+          ? settledJob.pendingResponseId && {
+              acceptedPendingResponseId: settledJob.pendingResponseId,
+            }
           : { acceptedPending: true as const };
       // Only the reply to this send can attribute the queued response to this viewer.
-      const acceptedPending =
+      let settledSubmissions =
         receipt &&
         pendingId &&
         previous.mutation &&
         submission?.requestEpoch === request.epoch &&
-        submission.operation === result.pendingResponseOperation
+        submission.operation === settledJob?.pendingResponseOperation
           ? { ...submissions, [pendingId]: { ...submission, ...receipt } }
-          : undefined;
-      if (responses === previousResponses && !acceptedPending) return drafts;
+          : submissions;
+      for (const [checkpointId, recorded] of Object.entries(settledSubmissions ?? {})) {
+        const unconfirmed =
+          accessLost ||
+          (settledJob !== undefined && workflowQueueReceiptWithdrawn(recorded, settledJob));
+        const exactReceipt = recorded.acceptedPendingResponseId !== undefined;
+        const changed = exactReceipt
+          ? unconfirmed !== !!recorded.pendingResponseUnconfirmed
+          : unconfirmed && recorded.acceptedPending;
+        if (!changed) continue;
+        if (!settledSubmissions || settledSubmissions === submissions)
+          settledSubmissions = Object.assign({}, settledSubmissions);
+        if (exactReceipt) {
+          // A withdrawn cancellation can restore this exact queue identity.
+          settledSubmissions[checkpointId] = {
+            ...recorded,
+            pendingResponseUnconfirmed: unconfirmed || undefined,
+          };
+        } else {
+          const { acceptedPending: _queued, ...withoutReceipt } = recorded;
+          settledSubmissions[checkpointId] = withoutReceipt;
+        }
+      }
+      if (responses === previousResponses && settledSubmissions === submissions) return drafts;
+      let responseContexts = drafts.responseContexts;
+      const previousContexts = responseContexts?.[request.key];
+      if (responses !== previousResponses && previousContexts) {
+        responseContexts = { ...responseContexts };
+        const retainedContexts = Object.fromEntries(
+          Object.entries(previousContexts).filter(([checkpointId]) =>
+            Object.hasOwn(responses, checkpointId),
+          ),
+        );
+        if (Object.keys(retainedContexts).length) responseContexts[request.key] = retainedContexts;
+        else delete responseContexts[request.key];
+      }
       return {
         ...drafts,
         responses:
           responses === previousResponses
             ? drafts.responses
             : { ...drafts.responses, [request.key]: responses },
-        submitted: acceptedPending
-          ? { ...drafts.submitted, [request.key]: acceptedPending }
+        submitted: settledSubmissions
+          ? { ...drafts.submitted, [request.key]: settledSubmissions }
           : drafts.submitted,
+        ...(responseContexts ? { responseContexts } : {}),
       };
     });
   return accepted;
@@ -731,6 +982,34 @@ export function activateWorkflowJobView(
     ]),
   );
   registry.set(workflowJobReadAtom, { ...state, activeKey: key, jobs });
+}
+
+/** Keep labels for local responses even after the full job snapshot is released. */
+export function setWorkflowResponseDraft(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  jobId: string,
+  checkpointId: string,
+  text: string | null,
+  context?: WorkflowResponseContext,
+) {
+  const key = workflowSessionKey(scope, jobId);
+  return updateWorkflowDrafts(registry, scope.accountId, (state) => {
+    const drafts = { ...state.responses[key] };
+    if (text === null) delete drafts[checkpointId];
+    else drafts[checkpointId] = text;
+    const responses = { ...state.responses };
+    if (Object.keys(drafts).length) responses[key] = drafts;
+    else delete responses[key];
+
+    const contexts = { ...state.responseContexts?.[key] };
+    if (text?.trim() && context) contexts[checkpointId] = context;
+    else delete contexts[checkpointId];
+    const responseContexts = { ...state.responseContexts };
+    if (Object.keys(contexts).length) responseContexts[key] = contexts;
+    else delete responseContexts[key];
+    return { ...state, responses, responseContexts };
+  });
 }
 
 /** A later read can prove a response accepted even when its original reply was lost. */

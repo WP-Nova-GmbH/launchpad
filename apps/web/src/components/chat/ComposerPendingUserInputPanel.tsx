@@ -8,6 +8,7 @@ import {
 import { CheckIcon } from "lucide-react";
 import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
 import { cn } from "~/lib/utils";
+import { isWindowAlertDialogOpen } from "../../lib/windowAlertDialog";
 import { ComposerBanner } from "./ComposerBanner";
 
 interface PendingUserInputPanelProps {
@@ -157,7 +158,7 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       const optionIndex = digit - 1;
       if (optionIndex >= activeQuestion.options.length) return;
       const option = activeQuestion.options[optionIndex];
-      if (!option) return;
+      if (!option || isWindowAlertDialogOpen()) return;
       event.preventDefault();
       handleOptionSelection(activeQuestion.id, option.value ?? option.label);
     };

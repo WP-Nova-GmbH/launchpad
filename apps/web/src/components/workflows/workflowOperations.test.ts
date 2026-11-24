@@ -11,7 +11,9 @@ import {
 import { ManagedRelay } from "@t3tools/client-runtime/relay";
 import {
   setWorkflowSessionAccount,
+  summarizeWorkflowClose,
   workflowDraftAtom,
+  workflowJobReadAtom,
   discardWorkflowEditor,
   clearWorkflowScope,
   workflowEditorDirty,
@@ -230,6 +232,117 @@ describe("workflow writes surviving navigation", () => {
     expect(draft?.operation?.state).toBe("uncertain");
     expect(draft?.vmStartFailure).toBeUndefined();
   });
+  it("retains both unconfirmed runs after an additional reply is lost and resolves each separately", async () => {
+    const run = () => appAtomRegistry.get(workflowDraftAtom).runs[key]!;
+    const requestIds = () =>
+      summarizeWorkflowClose(
+        appAtomRegistry.get(workflowDraftAtom),
+        appAtomRegistry.get(workflowJobReadAtom),
+      )
+        .requests.filter((entry) => entry.kind === "run")
+        .map((entry) => entry.requestId);
+    const editInstructions = (instruction: string) =>
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        runs: { ...state.runs, [key]: { ...run(), instruction } },
+      }));
+    const lostReply = async () => {
+      throw new Error("Reply lost");
+    };
+    const start = { kind: "start", targetKind: "vm" } as const;
+    const additional = { ...start, replaceUncertain: true };
+    await runWorkflowDraft(scope, saved.workflowId, start, lostReply);
+    const originalId = run().operation!.requestId;
+    editInstructions("Additional task");
+    await runWorkflowDraft(scope, saved.workflowId, additional, lostReply);
+    const additionalId = run().operation!.requestId;
+    expect(requestIds()).toEqual([originalId, additionalId]);
+
+    editInstructions("Third task");
+    await runWorkflowDraft(scope, saved.workflowId, additional, async () => {
+      throw new ManagedRelay.ManagedRelayRequestFailedError({
+        action: "runWorkflow",
+        cause: new WorkflowInvalidError({ message: "The checkout is unavailable." }),
+      });
+    });
+    expect(requestIds()).toEqual([originalId, additionalId]);
+
+    const recover = { kind: "recover", replayOnly: true } as const;
+    const readReceipt = vi.fn(async () => job);
+    await runWorkflowDraft(scope, saved.workflowId, recover, readReceipt);
+    expect(readReceipt).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        requestId: additionalId,
+        instruction: "Additional task",
+        replayOnly: true,
+      }),
+    );
+    expect(requestIds()).toEqual([originalId]);
+    expect(run().startedJobId).toBe(job.jobId);
+
+    await runWorkflowDraft(scope, saved.workflowId, recover, readReceipt);
+    expect(readReceipt).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        requestId: originalId,
+        instruction: "Task",
+        replayOnly: true,
+      }),
+    );
+    expect(requestIds()).toEqual([]);
+    expect(run()).toMatchObject({ operation: null, instruction: "Third task" });
+  });
+  it("confirms only the selected earlier submission when there are several", async () => {
+    const original = {
+      requestId: "first",
+      instruction: "Original task",
+      targetKind: "vm",
+      state: "uncertain",
+    } as const;
+    const second = { ...original, requestId: "second", instruction: "Second task" };
+    const latest = { requestId: "latest", instruction: "Latest task", state: "uncertain" } as const;
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      runs: {
+        ...state.runs,
+        [key]: {
+          ...state.runs[key]!,
+          operation: latest,
+          earlierUnconfirmedRuns: [original, second],
+        },
+      },
+    }));
+
+    const receipt = vi.fn(async () => job);
+    await runWorkflowDraft(
+      scope,
+      saved.workflowId,
+      { kind: "check-earlier", requestId: "first" },
+      receipt,
+    );
+    expect(receipt).toHaveBeenCalledExactlyOnceWith({
+      workflowId: saved.workflowId,
+      instruction: original.instruction,
+      requestId: original.requestId,
+      expectedTargetKind: "vm",
+      replayOnly: true,
+    });
+    expect(appAtomRegistry.get(workflowDraftAtom).runs[key]).toMatchObject({
+      instruction: "Task",
+      operation: latest,
+      earlierUnconfirmedRuns: [second],
+      startedJobId: job.jobId,
+    });
+    expect(
+      summarizeWorkflowClose(
+        appAtomRegistry.get(workflowDraftAtom),
+        appAtomRegistry.get(workflowJobReadAtom),
+      ).requests,
+    ).toMatchObject([
+      { requestId: second.requestId, runPosition: { number: 1, total: 2 } },
+      { requestId: latest.requestId, runPosition: { number: 2, total: 2 } },
+    ]);
+  });
+
   it("discards a previous account's late Run result", async () => {
     const result = deferred<RepositoryWorkflowJob>();
     const pending = runWorkflowDraft(

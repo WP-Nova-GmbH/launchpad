@@ -329,6 +329,75 @@ export async function saveWorkflowDraft(
   }
 }
 
+export function workflowRunPending(draft: WorkflowRunDraft | undefined) {
+  return (
+    draft?.operation?.state === "pending" ||
+    !!draft?.earlierUnconfirmedRuns?.some((run) => run.state === "pending")
+  );
+}
+
+export function hasWorkflowRunSubmission(
+  draft: WorkflowRunDraft | undefined,
+  canStartRun: boolean,
+) {
+  return (
+    draft?.operation?.targetKind === "vm" ||
+    !!draft?.earlierUnconfirmedRuns?.some((run) => run.targetKind === "vm") ||
+    (!canStartRun && draft?.operation?.state === "uncertain")
+  );
+}
+
+type RunOperation = NonNullable<WorkflowRunDraft["operation"]>;
+type StartRun = (payload: typeof RunRepositoryWorkflow.Type) => Promise<RepositoryWorkflowJob>;
+
+async function checkEarlierWorkflowRun(
+  scope: WorkflowScope,
+  id: string,
+  attempt: RunOperation,
+  start: StartRun,
+) {
+  const key = workflowSessionKey(scope, id);
+  const pending = { ...attempt, state: "pending", receiptError: undefined } satisfies RunOperation;
+  const replaceAttempt = (expected: RunOperation, next: RunOperation | null, jobId?: string) => {
+    let applied = false;
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+      const draft = state.runs[key];
+      if (!draft?.earlierUnconfirmedRuns?.includes(expected)) return state;
+      applied = true;
+      const remaining = draft.earlierUnconfirmedRuns.flatMap((run) =>
+        run === expected ? (next ? [next] : []) : [run],
+      );
+      return {
+        ...state,
+        runs: {
+          ...state.runs,
+          [key]: {
+            ...draft,
+            earlierUnconfirmedRuns: remaining.length ? remaining : undefined,
+            startedJobId: jobId ?? draft.startedJobId,
+          },
+        },
+      };
+    });
+    return applied;
+  };
+
+  if (!replaceAttempt(attempt, pending)) return null;
+  try {
+    const job = await start({
+      workflowId: id,
+      instruction: attempt.instruction,
+      expectedTargetKind: "vm",
+      requestId: attempt.requestId,
+      replayOnly: true,
+    });
+    return replaceAttempt(pending, null, job.jobId) ? job : null;
+  } catch (cause) {
+    replaceAttempt(pending, { ...attempt, receiptError: workflowError(cause) });
+    return null;
+  }
+}
+
 export async function runWorkflowDraft(
   scope: WorkflowScope,
   id: string,
@@ -339,14 +408,22 @@ export async function runWorkflowDraft(
         replaceUncertain?: boolean;
         retryStart?: boolean;
       }
-    | { kind: "recover"; replayOnly: boolean },
-  start: (payload: typeof RunRepositoryWorkflow.Type) => Promise<RepositoryWorkflowJob>,
+    | { kind: "recover"; replayOnly: boolean }
+    | { kind: "check-earlier"; requestId: string },
+  start: StartRun,
 ) {
   const key = workflowSessionKey(scope, id);
   const draft = appAtomRegistry.get(workflowDraftAtom).runs[key];
-  if (!draft || draft.operation?.state === "pending") return null;
+  if (!draft || workflowRunPending(draft)) return null;
+  if (intent.kind === "check-earlier") {
+    const attempt = draft.earlierUnconfirmedRuns?.find(
+      (run) => run.requestId === intent.requestId && run.targetKind === "vm",
+    );
+    return attempt ? checkEarlierWorkflowRun(scope, id, attempt, start) : null;
+  }
   const previous = draft.operation;
   const previousVm = previous?.targetKind === "vm" ? previous : null;
+  let earlierUnconfirmedRuns = draft.earlierUnconfirmedRuns;
   let operation: NonNullable<typeof draft.operation>;
   let recovery: WorkflowRunDraft["recovery"];
   if (intent.kind === "recover") {
@@ -355,7 +432,10 @@ export async function runWorkflowDraft(
     recovery = { kind: "retry", previous: previousVm, replayOnly: intent.replayOnly };
   } else {
     if ((previousVm && !intent.replaceUncertain) || !draft.instruction.trim()) return null;
-    if (previous && intent.replaceUncertain) recovery = { kind: "additional", previous };
+    if (previous && intent.replaceUncertain) {
+      recovery = { kind: "additional", previous };
+      earlierUnconfirmedRuns = [...(earlierUnconfirmedRuns ?? []), previous];
+    }
     operation = {
       requestId: randomUUID(),
       state: "pending",
@@ -377,6 +457,7 @@ export async function runWorkflowDraft(
         [key]: {
           ...draft,
           operation,
+          earlierUnconfirmedRuns,
           recovery,
           error: null,
           startedJobId: null,
@@ -400,6 +481,9 @@ export async function runWorkflowDraft(
       const current = state.runs[key];
       if (current?.operation !== operation) return state;
       applied = true;
+      // A receipt resolves the submitted run. Earlier submissions may still need checking.
+      const earlier = current.earlierUnconfirmedRuns;
+      const remaining = earlier?.slice(0, -1);
       return {
         ...state,
         runs: {
@@ -407,7 +491,8 @@ export async function runWorkflowDraft(
           [key]: {
             ...current,
             instruction: current.instruction === operation.instruction ? "" : current.instruction,
-            operation: null,
+            operation: earlier?.at(-1) ?? null,
+            earlierUnconfirmedRuns: remaining?.length ? remaining : undefined,
             recovery: undefined,
             startedJobId: job.jobId,
             error: null,
@@ -440,6 +525,9 @@ export async function runWorkflowDraft(
           [key]: {
             ...current,
             operation: rejected ? previous : { ...operation, state: "uncertain" },
+            earlierUnconfirmedRuns: rejected
+              ? draft.earlierUnconfirmedRuns
+              : current.earlierUnconfirmedRuns,
             recovery:
               rejected && recovery?.kind === "additional"
                 ? { kind: "additional-rejected" }

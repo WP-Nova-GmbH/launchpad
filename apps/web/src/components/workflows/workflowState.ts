@@ -28,7 +28,7 @@ import {
   resolveRelayClerkTokenOptions,
 } from "../../cloud/publicConfig";
 import { requestConfirmDialog } from "../../confirmDialog";
-import { WorkflowRequestNotSentError } from "./workflowOperations";
+import { WorkflowRequestNotSentError, workflowRunPending } from "./workflowOperations";
 
 export const WORKFLOW_REVIEW_ANCHOR = "workflow-review";
 
@@ -136,7 +136,7 @@ export const editWorkflowRun = (
   updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
     const key = workflowSessionKey(scope, id);
     const draft = state.runs[key];
-    return draft?.operation?.state === "pending"
+    return workflowRunPending(draft)
       ? state
       : {
           ...state,
@@ -271,4 +271,9 @@ export function useActiveWorkflowView() {
   return active;
 }
 
-export { saveWorkflowDraft, runWorkflowDraft } from "./workflowOperations";
+export {
+  hasWorkflowRunSubmission,
+  saveWorkflowDraft,
+  runWorkflowDraft,
+  workflowRunPending,
+} from "./workflowOperations";

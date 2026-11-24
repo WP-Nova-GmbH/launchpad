@@ -84,6 +84,12 @@ contextBridge.exposeInMainWorld("desktopBridge", {
     ipcRenderer.on(IpcChannels.TRACKPAD_SCROLL_END_CHANNEL, handler);
     return () => ipcRenderer.removeListener(IpcChannels.TRACKPAD_SCROLL_END_CHANNEL, handler);
   },
+  onWindowCloseBlocked: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on(IpcChannels.WINDOW_CLOSE_BLOCKED_CHANNEL, handler);
+    return () => ipcRenderer.removeListener(IpcChannels.WINDOW_CLOSE_BLOCKED_CHANNEL, handler);
+  },
+  confirmWindowClose: () => ipcRenderer.invoke(IpcChannels.CONFIRM_WINDOW_CLOSE_CHANNEL),
   getSystemLocale: () => {
     const result = ipcRenderer.sendSync(IpcChannels.GET_SYSTEM_LOCALE_CHANNEL);
     return typeof result === "string" ? result : null;

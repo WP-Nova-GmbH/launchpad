@@ -73,6 +73,7 @@ import {
   workflowError,
   savedWorkflowDraft,
   restoreCheckoutIssue,
+  hasWorkflowRunSubmission,
   newWorkflowDraft,
   copiedWorkflowDraft,
   workflowCopyNeedsCheckout,
@@ -832,9 +833,7 @@ function WorkflowRepositoryView({
             const restoreHint = `workflow-restore-${workflow.workflowId}`;
             const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
             const canStartRun = !archived && !vmUnavailable;
-            const hasRunSubmission =
-              runDraft?.operation?.targetKind === "vm" ||
-              (!canStartRun && runDraft?.operation?.state === "uncertain");
+            const hasRunSubmission = hasWorkflowRunSubmission(runDraft, canStartRun);
             const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
             const runLabel = hasRunSubmission
               ? "View run submission"

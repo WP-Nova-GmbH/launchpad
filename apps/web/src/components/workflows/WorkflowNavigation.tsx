@@ -11,8 +11,6 @@ import {
 } from "@t3tools/contracts/workflows";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
-  workflowDraftAtom,
-  hasUnsavedWorkflowWork,
   workflowJobReadAtom,
   workflowSessionKey,
   workflowStatusLabel,
@@ -37,24 +35,6 @@ declare module "@tanstack/react-router" {
     workflowOrigin?: WorkflowResultOrigin | undefined;
     workflowReviewReturn?: WorkflowResultCheckpoint | undefined;
   }
-}
-
-/** Mounted with the application shell so draft protection also covers result inspection. */
-export function WorkflowDraftUnloadGuard() {
-  const drafts = useAtomValue(workflowDraftAtom);
-  const dirty = hasUnsavedWorkflowWork(drafts);
-  useEffect(() => {
-    if (!dirty) return;
-    const warn = (event: BeforeUnloadEvent) => {
-      if (isElectron && window.confirm("Close this window and discard unsaved workflow drafts?"))
-        return;
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
-  }, [dirty]);
-  return null;
 }
 
 export function useWorkflowConversation({

@@ -86,6 +86,7 @@ import {
   selectWorkflowStep,
   savedWorkflowDraft,
   restoreCheckoutIssue,
+  hasWorkflowRunSubmission,
   newWorkflowDraft,
   saveWorkflowDraft,
   confirmWorkflow,
@@ -809,9 +810,7 @@ function WorkflowBuilderEditor({
     savedTarget.baseBranch === branchFailure.branch
       ? branchFailure.branch
       : undefined;
-  const hasRunSubmission =
-    runDraft?.operation?.targetKind === "vm" ||
-    ((archived || vmRunUnavailable) && runDraft?.operation?.state === "uncertain");
+  const hasRunSubmission = hasWorkflowRunSubmission(runDraft, !archived && !vmRunUnavailable);
   return (
     <WorkflowBuilderWorkspace
       repositoryName={repositoryName}

@@ -1759,10 +1759,18 @@ describe("workflow run presentation", () => {
       const key = workflowSessionKey(scope, job.jobId);
       const original = "Earlier feedback";
       const untouched = { checkpoint: "Current feedback", another: "Another retained draft" };
+      const context = {
+        workflowName: "Triage",
+        stepTitle: "Earlier Review",
+        kind: "review",
+      } as const;
       const currentDrafts = () => appAtomRegistry.get(workflowDraftAtom).responses[key];
+      const earlierContext = () =>
+        appAtomRegistry.get(workflowDraftAtom).responseContexts?.[key]?.earlier;
       updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
         ...state,
         responses: { [key]: { ...untouched, earlier: original } },
+        responseContexts: { [key]: { earlier: context } },
         submitted: {
           [key]: {
             earlier: {
@@ -1798,6 +1806,7 @@ describe("workflow run presentation", () => {
       await discardEarlier();
       await discardEarlier();
       expect(currentDrafts()).toEqual(untouched);
+      expect(earlierContext()).toBeUndefined();
       expect(text(renderer!.toJSON())).toContain("Draft discarded");
       expect(fixture.call).toHaveBeenCalledTimes(reads);
 
@@ -1837,6 +1846,7 @@ describe("workflow run presentation", () => {
           ? untouched
           : { ...untouched, earlier: stateAtUndo === "newer draft" ? "New feedback" : original },
       );
+      expect(earlierContext()).toEqual(stateAtUndo === "no conflict" ? context : undefined);
     },
   );
 

@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentId, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
 import { RelayTenancyForbiddenError, RelayRepositoryId } from "@t3tools/contracts/relay";
-import type { RepositoryWorkflowJob, WorkflowDefinition } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_RESPONSE_SUMMARY_COUNT_LIMIT,
+  WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT,
+  type RepositoryWorkflowJob,
+  type WorkflowDefinition,
+} from "@t3tools/contracts/workflows";
 import {
   activateWorkflowJobView,
   beginWorkflowJobRequest,
@@ -13,6 +18,7 @@ import {
   workflowDraftAtom,
   sameWorkflowAutomation,
   workflowEditorDirty,
+  hasUnsavedWorkflowWork,
   discardWorkflowEditor,
   workflowSessionKey,
   setWorkflowSessionAccount,
@@ -30,6 +36,8 @@ import {
   recordWorkflowReviewDiff,
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
+  setWorkflowResponseDraft,
+  summarizeWorkflowClose,
   workflowReviewApprovalState,
 } from "./workflowSession.ts";
 
@@ -86,6 +94,591 @@ const setup = () => {
 };
 afterEach(() => {
   for (const registry of registries.splice(0)) registry.dispose();
+});
+
+describe("workflow window close details", () => {
+  it("keeps unsaved work separate from the contents of pending or unconfirmed requests", () => {
+    const registry = setup();
+    const baseline = {
+      workflowId: "workflow",
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      archived: false,
+      revision: 1,
+      definition,
+      createdAt: "2026-10-13T00:00:00Z",
+      updatedAt: "2026-10-13T00:00:00Z",
+    };
+    const editor = {
+      workflowId: baseline.workflowId,
+      definition,
+      baseline,
+      selectedStepId: "",
+      targetConfirmed: true,
+      operation: null,
+      error: null,
+    };
+    const captured = { ...definition, name: "Captured Save" };
+    const save = {
+      requestId: "save",
+      definition: captured,
+      archived: false,
+      expectedRevision: baseline.revision,
+    };
+    const pendingSave = workflowSessionKey(scope, "pending-save");
+    const uncertainSave = workflowSessionKey(scope, "uncertain-save");
+    const failedSave = workflowSessionKey(scope, "failed-save");
+    const archive = workflowSessionKey(scope, "archive");
+    const restore = workflowSessionKey(scope, "restore");
+    const pendingRun = workflowSessionKey(scope, "pending-run");
+    const uncertainRun = workflowSessionKey(scope, "uncertain-run");
+    const retryRun = workflowSessionKey(scope, "retry-run");
+    const repeatedRun = workflowSessionKey(scope, "repeated-run");
+    const localRun = workflowSessionKey(scope, "local-run");
+    const run = { startedJobId: null, error: null };
+    const originalRun = {
+      requestId: "original-run",
+      state: "uncertain" as const,
+      instruction: "previous captured instruction",
+      targetKind: "vm" as const,
+    };
+    updateWorkflowDrafts(registry, scope.accountId, (state) => ({
+      ...state,
+      editors: {
+        [workflowSessionKey(scope, "clean")]: editor,
+        [pendingSave]: {
+          ...editor,
+          definition: captured,
+          operation: { ...save, state: "pending" },
+        },
+        [uncertainSave]: {
+          ...editor,
+          definition: { ...definition, name: "Later edit" },
+          operation: { ...save, state: "uncertain" },
+        },
+        [failedSave]: {
+          ...editor,
+          definition: captured,
+          operation: { ...save, state: "uncertain" },
+          saveRecovery: "retryable",
+        },
+        [archive]: {
+          ...editor,
+          operation: {
+            ...save,
+            requestId: "archive",
+            definition,
+            state: "pending",
+            archived: true,
+          },
+        },
+        [restore]: {
+          ...editor,
+          baseline: { ...baseline, archived: true },
+          operation: { ...save, requestId: "restore", definition, state: "uncertain" },
+        },
+      },
+      runs: {
+        [pendingRun]: {
+          ...run,
+          workflowName: "Weekly publish",
+          instruction: "same captured instruction",
+          recovery: { kind: "additional", previous: originalRun },
+          operation: {
+            requestId: "pending-run",
+            state: "pending",
+            instruction: "same captured instruction",
+          },
+        },
+        [uncertainRun]: {
+          ...run,
+          instruction: "private unsent edit",
+          operation: {
+            requestId: "uncertain-run",
+            state: "uncertain",
+            instruction: "private submitted instruction",
+          },
+        },
+        [retryRun]: {
+          ...run,
+          instruction: originalRun.instruction,
+          operation: { ...originalRun, state: "pending" },
+          recovery: { kind: "retry", previous: originalRun, replayOnly: true },
+        },
+        [repeatedRun]: {
+          ...run,
+          instruction: "current instructions",
+          operation: {
+            ...originalRun,
+            requestId: "latest",
+            instruction: "current instructions",
+          },
+          earlierUnconfirmedRuns: [
+            originalRun,
+            originalRun,
+            { ...originalRun, requestId: "second" },
+            { ...originalRun, requestId: "latest" },
+          ],
+        },
+        [localRun]: { ...run, instruction: "private local instruction", operation: null },
+      },
+    }));
+
+    expect(
+      summarizeWorkflowClose(registry.get(workflowDraftAtom), registry.get(workflowJobReadAtom)),
+    ).toEqual({
+      edits: [
+        { key: uncertainSave, name: "Later edit" },
+        { key: failedSave, name: "Captured Save" },
+      ],
+      runDrafts: [
+        { key: uncertainRun, workflowName: null },
+        { key: localRun, workflowName: null },
+      ],
+      requests: [
+        {
+          key: pendingSave,
+          requestId: "save",
+          workflowName: "Captured Save",
+          kind: "save",
+          state: "pending",
+        },
+        {
+          key: uncertainSave,
+          requestId: "save",
+          workflowName: "Captured Save",
+          kind: "save",
+          state: "uncertain",
+        },
+        {
+          key: archive,
+          requestId: "archive",
+          workflowName: "Implementation",
+          kind: "archive",
+          state: "pending",
+        },
+        {
+          key: restore,
+          requestId: "restore",
+          workflowName: "Implementation",
+          kind: "restore",
+          state: "uncertain",
+        },
+        {
+          key: pendingRun,
+          requestId: "original-run",
+          workflowName: "Weekly publish",
+          kind: "run",
+          state: "uncertain",
+          runPosition: { number: 1, total: 2 },
+        },
+        {
+          key: pendingRun,
+          requestId: "pending-run",
+          workflowName: "Weekly publish",
+          kind: "run",
+          state: "pending",
+          runPosition: { number: 2, total: 2 },
+        },
+        {
+          key: uncertainRun,
+          requestId: "uncertain-run",
+          workflowName: null,
+          kind: "run",
+          state: "uncertain",
+        },
+        {
+          key: retryRun,
+          requestId: "original-run",
+          workflowName: null,
+          kind: "run",
+          state: "pending",
+        },
+        {
+          key: repeatedRun,
+          requestId: "original-run",
+          workflowName: null,
+          kind: "run",
+          state: "uncertain",
+          runPosition: { number: 1, total: 3 },
+        },
+        {
+          key: repeatedRun,
+          requestId: "second",
+          workflowName: null,
+          kind: "run",
+          state: "uncertain",
+          runPosition: { number: 2, total: 3 },
+        },
+        {
+          key: repeatedRun,
+          requestId: "latest",
+          workflowName: null,
+          kind: "run",
+          state: "uncertain",
+          runPosition: { number: 3, total: 3 },
+        },
+      ],
+      responses: [],
+    });
+  });
+
+  it.each([false, true])(
+    "does not guard a known failed archive or restore with no local edits (was archived: %s)",
+    (archived) => {
+      const registry = setup();
+      const workflowId = "workflow";
+      const key = workflowSessionKey(scope, workflowId);
+      const baseline = {
+        workflowId,
+        repositoryId: scope.repositoryId,
+        organizationId: scope.organizationId,
+        definition,
+        archived,
+        revision: 1,
+        createdAt: "2026-10-13T00:00:00Z",
+        updatedAt: "2026-10-13T00:00:00Z",
+      };
+      const editor = {
+        workflowId,
+        definition,
+        baseline,
+        selectedStepId: "",
+        targetConfirmed: true,
+        operation: {
+          requestId: "change",
+          state: "uncertain" as const,
+          definition,
+          archived: !archived,
+          expectedRevision: baseline.revision,
+        },
+        saveRecovery: "conflict" as const,
+        error: null,
+      };
+      const update = (nextDefinition: WorkflowDefinition) =>
+        updateWorkflowDrafts(registry, scope.accountId, (drafts) => ({
+          ...drafts,
+          editors: { [key]: { ...editor, definition: nextDefinition } },
+        }));
+      const state = () => registry.get(workflowDraftAtom);
+      const reads = () => registry.get(workflowJobReadAtom);
+      update(definition);
+      expect(hasUnsavedWorkflowWork(state(), reads())).toBe(false);
+      expect(summarizeWorkflowClose(state(), reads())).toEqual({
+        edits: [],
+        runDrafts: [],
+        responses: [],
+        requests: [],
+      });
+
+      update({ ...definition, name: "Retained edit" });
+      expect(hasUnsavedWorkflowWork(state(), reads())).toBe(true);
+      expect(summarizeWorkflowClose(state(), reads()).edits).toEqual([
+        { key, name: "Retained edit" },
+      ]);
+    },
+  );
+
+  it("identifies retained checkpoint drafts without revealing their text or using another account's context", () => {
+    const registry = setup();
+    const jobKey = workflowSessionKey(scope, "job");
+    const current = job();
+    const workflow = {
+      workflowId: current.workflowId,
+      repositoryId: scope.repositoryId,
+      organizationId: scope.organizationId,
+      archived: false,
+      revision: 1,
+      definition,
+      createdAt: current.createdAt,
+      updatedAt: current.updatedAt,
+    };
+    settleWorkflowJobRequest(registry, beginWorkflowJobRequest(registry, scope, current.jobId)!, {
+      ...current,
+      workflow,
+      progress: {
+        ...current.progress!,
+        checkpoint: {
+          checkpointId: "review",
+          stepId: "review",
+          turnId: "turn",
+          checkpointRef: "ref",
+          checkpointTurnCount: 1,
+        },
+      },
+    });
+    const draftText = "Private response";
+    updateWorkflowDrafts(registry, scope.accountId, (state) => ({
+      ...state,
+      responses: { [jobKey]: { review: draftText, blank: " ", previous: "Edited input" } },
+    }));
+    recordWorkflowResponse(registry, scope, current.jobId, {
+      checkpointId: "review",
+      operation: "request_changes",
+      userId: scope.accountId,
+      text: draftText,
+    });
+    recordWorkflowResponse(registry, scope, current.jobId, {
+      checkpointId: "previous",
+      operation: "input",
+      userId: scope.accountId,
+      text: "Earlier input",
+    });
+    const state = registry.get(workflowDraftAtom);
+    const reads = registry.get(workflowJobReadAtom);
+    expect(summarizeWorkflowClose(state, reads).responses).toEqual([
+      {
+        jobKey,
+        checkpointId: "review",
+        workflowName: "Implementation",
+        stepTitle: "Review",
+        kind: "review",
+        deliveryUnconfirmed: true,
+      },
+      {
+        jobKey,
+        checkpointId: "previous",
+        workflowName: "Implementation",
+        stepTitle: null,
+        kind: "input",
+        deliveryUnconfirmed: false,
+      },
+    ]);
+    expect(
+      summarizeWorkflowClose(state, { ...reads, accountId: "different" }).responses[0],
+    ).toEqual({
+      jobKey,
+      checkpointId: "review",
+      workflowName: null,
+      stepTitle: null,
+      kind: "review",
+      deliveryUnconfirmed: true,
+    });
+
+    const context = {
+      workflowName: "Implementation",
+      stepTitle: "Review",
+      kind: "review",
+    } as const;
+    setWorkflowResponseDraft(registry, scope, current.jobId, "review", draftText, context);
+    activateWorkflowJobView(registry, scope, "another-job");
+    expect(registry.get(workflowJobReadAtom).jobs[jobKey]?.job).toBeNull();
+    expect(
+      summarizeWorkflowClose(registry.get(workflowDraftAtom), registry.get(workflowJobReadAtom))
+        .responses[0],
+    ).toMatchObject(context);
+
+    setWorkflowResponseDraft(registry, scope, current.jobId, "review", " ", context);
+    expect(registry.get(workflowDraftAtom).responses[jobKey]?.review).toBe(" ");
+    expect(registry.get(workflowDraftAtom).responseContexts?.[jobKey]?.review).toBeUndefined();
+    setWorkflowResponseDraft(registry, scope, current.jobId, "review", "", context);
+    expect(registry.get(workflowDraftAtom).responses[jobKey]?.review).toBe("");
+    setWorkflowResponseDraft(registry, scope, current.jobId, "review", draftText, context);
+    clearWorkflowScope(registry, scope);
+    expect(registry.get(workflowDraftAtom).responseContexts?.[jobKey]).toBeUndefined();
+  });
+
+  it.each([
+    ["machine", "same operation"],
+    ["machine", "cancelling"],
+    ["machine", "cancelled"],
+    ["vm", "cancelling"],
+    ["vm", "restored after cancellation"],
+    ["vm", "cancelled"],
+    ["vm", "access lost"],
+    ["vm", "queue withdrawn"],
+    ["vm", "replacement"],
+    ["vm", "hidden replacement"],
+    ["vm", "advanced to another author's response"],
+    ["vm", "advanced to changed response"],
+    ["vm", "truncated history"],
+    ["vm", "evicted history"],
+    ["vm", "applied"],
+  ] as const)("protects exact response content when a %s receipt is %s", (kind, event) => {
+    const registry = setup();
+    const current = job();
+    const draftText =
+      event === "truncated history"
+        ? "x".repeat(WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT + 1)
+        : "Private response";
+    const checkpointId = "review";
+    const context = {
+      workflowName: "Implementation",
+      stepTitle: "Review",
+      kind: "review",
+    } as const;
+    const state = () => registry.get(workflowDraftAtom);
+    const reads = () => registry.get(workflowJobReadAtom);
+    setWorkflowResponseDraft(registry, scope, current.jobId, checkpointId, draftText, context);
+    const request = beginWorkflowJobRequest(registry, scope, current.jobId, "request_changes")!;
+    recordWorkflowResponse(registry, scope, current.jobId, {
+      checkpointId,
+      operation: "request_changes",
+      userId: scope.accountId,
+      text: draftText,
+      requestEpoch: request.epoch,
+    });
+    expect(hasUnsavedWorkflowWork(state(), reads())).toBe(true);
+    expect(summarizeWorkflowClose(state(), reads()).responses[0]?.deliveryUnconfirmed).toBe(true);
+
+    const accepted = {
+      ...current,
+      status: "awaiting_review",
+      runtime: kind === "vm" ? { kind, threadId: ThreadId.make("thread") } : current.runtime,
+      responsePending: true,
+      pendingResponseOperation: "request_changes",
+      ...(kind === "vm" ? { pendingResponseId: "queued" } : {}),
+      progress: {
+        ...current.progress!,
+        status: "awaiting_review",
+        checkpoint: {
+          checkpointId,
+          turnId: "turn",
+          checkpointRef: "ref",
+          checkpointTurnCount: 1,
+        },
+      },
+    } satisfies RepositoryWorkflowJob;
+    expect(settleWorkflowJobRequest(registry, request, accepted)).toBe(true);
+    if (kind === "machine")
+      expect(
+        state().submitted[workflowSessionKey(scope, current.jobId)]?.[checkpointId]
+          ?.acceptedPending,
+      ).toBe(true);
+    expect(hasUnsavedWorkflowWork(state(), reads())).toBe(kind === "machine");
+    expect(summarizeWorkflowClose(state(), reads()).responses).toHaveLength(
+      kind === "machine" ? 1 : 0,
+    );
+
+    activateWorkflowJobView(registry, scope, "another-job");
+    expect(hasUnsavedWorkflowWork(state(), reads())).toBe(kind === "machine");
+    activateWorkflowJobView(registry, scope, current.jobId);
+    const {
+      pendingResponseId: _identity,
+      pendingResponseOperation: _operation,
+      ...withoutReceipt
+    } = accepted;
+    const applied = {
+      checkpointId,
+      stepId: "review",
+      generation: 1,
+      operation: "request_changes" as const,
+      userId: scope.accountId,
+      text: draftText,
+      createdAt: current.updatedAt,
+    };
+    const next = beginWorkflowJobRequest(registry, scope, current.jobId)!;
+    if (event === "access lost") {
+      expect(settleWorkflowJobRequest(registry, next, "Access lost", true)).toBe(false);
+    } else if (event === "applied") {
+      expect(
+        settleWorkflowJobRequest(registry, next, {
+          ...withoutReceipt,
+          status: "done",
+          responsePending: false,
+          progress: {
+            ...accepted.progress,
+            status: "done",
+            checkpoint: null,
+            responses: [applied],
+          },
+        }),
+      ).toBe(true);
+      expect(hasUnsavedWorkflowWork(state(), reads())).toBe(false);
+      expect(
+        state().responses[workflowSessionKey(scope, current.jobId)]?.[checkpointId],
+      ).toBeUndefined();
+      return;
+    } else if (
+      event === "advanced to another author's response" ||
+      event === "advanced to changed response" ||
+      event === "truncated history" ||
+      event === "evicted history"
+    ) {
+      const otherResponse =
+        event === "advanced to another author's response"
+          ? { ...applied, userId: "another-member" }
+          : {
+              ...applied,
+              text:
+                event === "truncated history"
+                  ? draftText.slice(0, WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT)
+                  : "Changed by this account",
+            };
+      expect(
+        settleWorkflowJobRequest(registry, next, {
+          ...withoutReceipt,
+          responsePending: false,
+          progress: {
+            ...accepted.progress,
+            revision: accepted.progress.revision + 1,
+            checkpoint: { ...accepted.progress.checkpoint, checkpointId: "next-checkpoint" },
+            responses:
+              event === "evicted history"
+                ? Array.from({ length: WORKFLOW_RESPONSE_SUMMARY_COUNT_LIMIT }, (_, index) => ({
+                    ...otherResponse,
+                    checkpointId: `later-checkpoint-${index}`,
+                  }))
+                : [otherResponse],
+          },
+        }),
+      ).toBe(true);
+    } else {
+      const result =
+        event === "same operation"
+          ? accepted
+          : event === "cancelling" || event === "restored after cancellation"
+            ? { ...withoutReceipt, status: "cancelling" as const }
+            : event === "cancelled"
+              ? {
+                  ...withoutReceipt,
+                  status: "cancelled" as const,
+                  progress: null,
+                  responsePending: false,
+                }
+              : event === "replacement"
+                ? { ...accepted, pendingResponseId: "different-response" }
+                : event === "hidden replacement"
+                  ? { ...withoutReceipt, pendingResponseOperation: "request_changes" as const }
+                  : { ...withoutReceipt, responsePending: false };
+      expect(settleWorkflowJobRequest(registry, next, result)).toBe(true);
+    }
+
+    expect(hasUnsavedWorkflowWork(state(), reads())).toBe(true);
+    activateWorkflowJobView(registry, scope, "another-job");
+    expect(summarizeWorkflowClose(state(), reads()).responses[0]?.deliveryUnconfirmed).toBe(true);
+    expect(state().responses[workflowSessionKey(scope, current.jobId)]?.[checkpointId]).toBe(
+      draftText,
+    );
+
+    if (event === "restored after cancellation") {
+      activateWorkflowJobView(registry, scope, current.jobId);
+      const read = beginWorkflowJobRequest(registry, scope, current.jobId)!;
+      expect(settleWorkflowJobRequest(registry, read, accepted)).toBe(true);
+      expect(hasUnsavedWorkflowWork(state(), reads())).toBe(false);
+      activateWorkflowJobView(registry, scope, "another-job");
+      expect(hasUnsavedWorkflowWork(state(), reads())).toBe(false);
+      expect(summarizeWorkflowClose(state(), reads()).responses).toEqual([]);
+    }
+
+    setWorkflowResponseDraft(
+      registry,
+      scope,
+      current.jobId,
+      checkpointId,
+      "Edited response",
+      context,
+    );
+    expect(hasUnsavedWorkflowWork(state(), reads())).toBe(true);
+    expect(summarizeWorkflowClose(state(), reads()).responses).toEqual([
+      {
+        ...context,
+        jobKey: workflowSessionKey(scope, current.jobId),
+        checkpointId,
+        deliveryUnconfirmed: false,
+      },
+    ]);
+  });
 });
 
 describe("workflow session and request ownership", () => {

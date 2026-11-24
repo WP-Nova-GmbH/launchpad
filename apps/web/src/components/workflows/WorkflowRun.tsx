@@ -40,6 +40,7 @@ import {
   useActiveWorkflowView,
   editWorkflowRun,
   runWorkflowDraft,
+  workflowRunPending,
 } from "./workflowState";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
@@ -65,6 +66,11 @@ type AdditionalRunConfirmation = {
   draft: WorkflowRunDraft;
   context: string;
 };
+
+type RunSubmission =
+  | { kind: "start"; confirmed?: AdditionalRunConfirmation }
+  | { kind: "recover" }
+  | { kind: "check-earlier"; requestId: string };
 
 // A reopened Run view can observe a change before an earlier form's request is sent.
 const latestAdditionalRunContexts = new WeakMap<
@@ -115,14 +121,6 @@ function WorkflowRunForm({
       if (focused && node.contains(focused)) removedRecoveryFocus.current = focused;
     };
   }, []);
-  useLayoutEffect(() => {
-    const previous = removedRecoveryFocus.current;
-    if (!previous) return;
-    removedRecoveryFocus.current = null;
-    const { activeElement, body } = previous.ownerDocument;
-    if (activeElement === previous || activeElement === body)
-      (recoveryControl.current ?? startedRunControl.current ?? runHeading.current)?.focus();
-  });
   useLayoutEffect(
     () => () => {
       // Invalidate callbacks when the next form commits, before passive cleanup.
@@ -135,6 +133,23 @@ function WorkflowRunForm({
   const key = workflowSessionKey(scope, workflow.workflowId);
   const draft =
     (drafts.accountId === scope.accountId ? drafts.runs[key] : undefined) ?? emptyWorkflowRun;
+  const previousStartedJobId = useRef(draft.startedJobId);
+  useLayoutEffect(() => {
+    const confirmedRun = draft.startedJobId && draft.startedJobId !== previousStartedJobId.current;
+    previousStartedJobId.current = draft.startedJobId;
+    const previous = removedRecoveryFocus.current;
+    if (!previous) return;
+    removedRecoveryFocus.current = null;
+    const { activeElement, body } = previous.ownerDocument;
+    if (activeElement === previous || activeElement === body) {
+      const target =
+        (confirmedRun ? startedRunControl.current : null) ??
+        recoveryControl.current ??
+        startedRunControl.current ??
+        runHeading.current;
+      target?.focus();
+    }
+  });
   const editor = drafts.accountId === scope.accountId ? drafts.editors[key] : undefined;
   const unsavedDefinition =
     !!editor && !sameWorkflowDefinition(editor.definition, workflow.definition);
@@ -156,7 +171,8 @@ function WorkflowRunForm({
     (project) =>
       project.environmentId === machine?.environmentId && project.projectId === machine?.projectId,
   );
-  const pending = draft.operation?.state === "pending";
+  const submissionPending = draft.operation?.state === "pending";
+  const pending = workflowRunPending(draft);
   const uncertain = draft.operation?.state === "uncertain";
   const runBlocked = vmUnavailable || workflow.archived;
   const rejectedRevision = draft.vmStartFailureRevision;
@@ -172,7 +188,7 @@ function WorkflowRunForm({
         !sameRejectedBranch));
   const retryingStart =
     savedTarget.kind === "vm" &&
-    pending &&
+    submissionPending &&
     draft.vmStartFailure?.kind === "github-verification-temporary";
   const vmStartFailure =
     !runBlocked && (retryingStart || (draft.error && !draft.operation && !staleVmStartFailure))
@@ -189,9 +205,11 @@ function WorkflowRunForm({
   const canRetryStart = vmStartFailure?.kind === "github-verification-temporary";
   const replayOnly = runBlocked || savedTarget.kind !== "vm";
   const pendingRecovery =
-    pending && draft.recovery?.kind !== "additional-rejected" ? draft.recovery : undefined;
+    submissionPending && draft.recovery?.kind !== "additional-rejected"
+      ? draft.recovery
+      : undefined;
   const checkOnly = pendingRecovery?.kind === "retry" ? pendingRecovery.replayOnly : replayOnly;
-  const checkingPrevious = pending && checkOnly && draft.operation?.targetKind === "vm";
+  const checkingPrevious = submissionPending && checkOnly && draft.operation?.targetKind === "vm";
   const confirmationContext = JSON.stringify([
     workflow.revision,
     runBlocked,
@@ -230,6 +248,7 @@ function WorkflowRunForm({
       submission.current ||
       confirmationRequest.current ||
       runBlocked ||
+      workflowRunPending(current) ||
       current?.operation?.state !== "uncertain" ||
       !current.instruction.trim()
     )
@@ -238,7 +257,8 @@ function WorkflowRunForm({
     confirmationRequest.current = request;
     setConfirmation(request);
   };
-  const submit = async (recover: boolean, confirmed?: AdditionalRunConfirmation) => {
+  const submit = async (intent: RunSubmission) => {
+    const confirmed = intent.kind === "start" ? intent.confirmed : undefined;
     const state = appAtomRegistry.get(workflowDraftAtom);
     const current = state.runs[key];
     if (
@@ -247,15 +267,14 @@ function WorkflowRunForm({
       submission.current ||
       confirmationRequest.current ||
       !current ||
-      current.operation?.state === "pending"
+      workflowRunPending(current)
     )
       return;
-    if (recover) {
-      if (current.operation?.targetKind !== "vm") return;
-    } else if (
-      !current.instruction.trim() ||
-      runBlocked ||
-      (current.operation?.state === "uncertain" ? current !== confirmed?.draft : !!confirmed)
+    if (
+      intent.kind === "start" &&
+      (!current.instruction.trim() ||
+        runBlocked ||
+        (current.operation?.state === "uncertain" ? current !== confirmed?.draft : !!confirmed))
     )
       return;
     const request = { draft: current };
@@ -268,14 +287,16 @@ function WorkflowRunForm({
       const job = await runWorkflowDraft(
         scope,
         workflow.workflowId,
-        recover
-          ? { kind: "recover", replayOnly }
-          : {
+        intent.kind === "start"
+          ? {
               kind: "start",
               targetKind: savedTarget.kind,
               replaceUncertain: !!confirmed,
               retryStart: canRetryStart,
-            },
+            }
+          : intent.kind === "recover"
+            ? { kind: "recover", replayOnly }
+            : intent,
         (payload) => {
           const operation = confirmed
             ? appAtomRegistry.get(workflowDraftAtom).runs[key]?.operation
@@ -302,7 +323,10 @@ function WorkflowRunForm({
       );
       if (!ownsSubmission()) return;
       const latest = appAtomRegistry.get(workflowDraftAtom).runs[key];
-      if (job && (!recover || !latest?.instruction.trim()))
+      if (
+        job &&
+        (intent.kind === "start" || (intent.kind === "recover" && !latest?.instruction.trim()))
+      )
         void navigate({
           to: "/workflows/$repositoryId/jobs/$jobId",
           params: { repositoryId: scope.repositoryId, jobId: job.jobId },
@@ -313,7 +337,7 @@ function WorkflowRunForm({
   };
   const previousSubmission = uncertain
     ? draft.operation
-    : pending
+    : submissionPending
       ? (pendingRecovery?.previous ??
         (checkingPrevious || draft.operation?.instruction !== draft.instruction
           ? draft.operation
@@ -322,7 +346,7 @@ function WorkflowRunForm({
   const originalVm = previousSubmission?.targetKind === "vm";
   const additionalRejected =
     uncertain && draft.recovery?.kind === "additional-rejected" && !!draft.error;
-  const waitingForSubmission = pending
+  const waitingForSubmission = submissionPending
     ? pendingRecovery?.kind === "additional"
       ? "Waiting for confirmation of the additional run."
       : checkingPrevious
@@ -457,15 +481,19 @@ function WorkflowRunForm({
   ) : null;
   const recovery = previousSubmission ? (
     <WorkflowAlert
-      title={pending ? "Waiting for submission confirmation" : "Previous submission not confirmed"}
-      variant={pending ? "info" : "warning"}
-      announce={!pending && !additionalRejected}
+      title={
+        submissionPending
+          ? "Waiting for submission confirmation"
+          : "Previous submission not confirmed"
+      }
+      variant={submissionPending ? "info" : "warning"}
+      announce={!submissionPending && !additionalRejected}
     >
       <div ref={registerRecoveryRegion} className="space-y-2.5">
-        <p role="status" className={pending ? undefined : "sr-only"}>
+        <p role="status" className={submissionPending ? undefined : "sr-only"}>
           {waitingForSubmission}
         </p>
-        {!pending ? (
+        {!submissionPending ? (
           <p>
             {originalVm
               ? replayOnly
@@ -481,7 +509,7 @@ function WorkflowRunForm({
           aria-disabled={pending || confirming || undefined}
           onClick={() => {
             if (pending || submission.current || confirmationRequest.current) return;
-            if (originalVm) void submit(true);
+            if (originalVm) void submit({ kind: "recover" });
             else checkRuns();
           }}
         >
@@ -509,6 +537,53 @@ function WorkflowRunForm({
           </details>
         ) : null}
       </div>
+    </WorkflowAlert>
+  ) : null;
+  const earlierVmAttempts = draft.earlierUnconfirmedRuns?.filter(
+    (run) => run.targetKind === "vm" && run.requestId !== previousSubmission?.requestId,
+  );
+  const earlierRecovery = earlierVmAttempts?.length ? (
+    <WorkflowAlert title="Earlier VM submissions" variant="warning" announce={false}>
+      <p>Check whether each submission was accepted.</p>
+      <ol className="mt-2 space-y-2">
+        {earlierVmAttempts.map((attempt, index) => (
+          <li
+            key={attempt.requestId}
+            ref={registerRecoveryRegion}
+            className="space-y-1.5 border-t border-current/15 pt-2"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-medium">VM submission {index + 1}</span>
+              <Button
+                type="button"
+                size="sm-multiline"
+                aria-label={`Check submission ${index + 1}`}
+                aria-disabled={pending || confirming || undefined}
+                onClick={() => void submit({ kind: "check-earlier", requestId: attempt.requestId })}
+              >
+                <RefreshCwIcon aria-hidden />
+                Check submission
+              </Button>
+            </div>
+            <details open={attempt.instruction.length < 400}>
+              <summary className="cursor-pointer">Submitted instructions</summary>
+              <p className="mt-1.5 whitespace-pre-wrap wrap-anywhere">{attempt.instruction}</p>
+            </details>
+            <p
+              role="status"
+              className={
+                attempt.state === "pending" || attempt.receiptError ? "wrap-anywhere" : "sr-only"
+              }
+            >
+              {attempt.state === "pending"
+                ? "Checking for a receipt…"
+                : attempt.receiptError
+                  ? `Submission not confirmed. ${attempt.receiptError}`
+                  : ""}
+            </p>
+          </li>
+        ))}
+      </ol>
     </WorkflowAlert>
   ) : null;
   const startedJob = draft.startedJobId ? (
@@ -553,6 +628,7 @@ function WorkflowRunForm({
             : "Running VM workflows is not available yet."}
         </WorkflowAlert>
         {recovery}
+        {earlierRecovery}
         {additionalRunError}
         {draft.instruction.trim() ? (
           <label className="block space-y-2">
@@ -577,6 +653,7 @@ function WorkflowRunForm({
           editWorkflowRun(scope, workflow.workflowId, (current) => ({
             ...current,
             instruction: event.target.value,
+            workflowName: workflow.definition.name,
           }))
         }
       />
@@ -587,7 +664,7 @@ function WorkflowRunForm({
       className="mx-auto w-full max-w-xl space-y-5"
       onSubmit={(event) => {
         event.preventDefault();
-        void submit(false);
+        void submit({ kind: "start" });
       }}
     >
       <header className="space-y-4">
@@ -701,6 +778,7 @@ function WorkflowRunForm({
       ) : null}
       {error}
       {recovery}
+      {earlierRecovery}
       {startedJob}
       {additionalRunError}
       {previousSubmission ? (
@@ -780,7 +858,7 @@ function WorkflowRunForm({
               onClick={() => {
                 if (!confirming || confirmationRequest.current !== confirmation) return;
                 closeConfirmation();
-                void submit(false, confirmation);
+                void submit({ kind: "start", confirmed: confirmation });
               }}
             >
               Start an additional run
