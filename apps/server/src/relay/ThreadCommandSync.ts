@@ -58,6 +58,31 @@ interface Delivery {
   readonly receiptJson: string | null;
 }
 
+/** Resolve a provider response against the authenticated relay delivery, including after replay. */
+export const readRelayProviderResponseActor = Effect.fnUntraced(function* (
+  sql: SqlClient.SqlClient,
+  response: {
+    readonly commandId: string;
+    readonly threadId: string;
+    readonly requestId: string;
+    readonly type: "thread.approval.respond" | "thread.user-input.respond";
+  },
+) {
+  const [delivery] = yield* sql<{ entryJson: string }>`SELECT entry_json AS "entryJson"
+    FROM thread_relay_command_deliveries WHERE command_id=${response.commandId}
+      AND thread_id=${response.threadId}`;
+  if (!delivery) return undefined;
+  const entry = yield* decodeEntry(delivery.entryJson);
+  if (
+    entry.commandId !== response.commandId ||
+    entry.threadId !== response.threadId ||
+    entry.command.type !== response.type ||
+    entry.command.requestId !== response.requestId
+  )
+    return undefined;
+  return entry.actor.userId;
+});
+
 /** Local delivery intent precedes normalization; only durable receipts may settle the remote inbox. */
 export function makeThreadCommandSync(
   sql: SqlClient.SqlClient,

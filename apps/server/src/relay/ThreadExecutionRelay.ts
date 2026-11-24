@@ -29,6 +29,16 @@ export const CurrentWorkflowVmFollowUpActor = Context.Reference<string | undefin
   { defaultValue: () => undefined },
 );
 
+export const CurrentWorkflowVmFollowUpResponse = Context.Reference<
+  | {
+      readonly threadId: string;
+      readonly workId: string;
+      readonly userId: string;
+      readonly commandId: string;
+    }
+  | undefined
+>("t3/relay/CurrentWorkflowVmFollowUpResponse", { defaultValue: () => undefined });
+
 export interface ThreadWorkIdentity {
   readonly threadId: string;
   readonly workId: string;
@@ -153,6 +163,11 @@ export function makeThreadExecutionRelay(
           return admitted.decision === "start" ? ("ordinary" as const) : admitted.decision;
         }),
       );
+    const response = yield* CurrentWorkflowVmFollowUpResponse;
+    const matchingResponse =
+      response?.threadId === input.threadId && response.workId === work.workId
+        ? response
+        : undefined;
     const prior = yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* recheckScope(input.threadId, scope);
@@ -181,24 +196,45 @@ export function makeThreadExecutionRelay(
             });
           // The relay lease remains outstanding. Only the durable negative
           // dispatch receipt permits reusing it without replaying uncertain work.
-          return "start" as const;
+          return matchingResponse ? ("revalidate-response" as const) : ("start" as const);
         }
         return reserved;
       }),
     );
-    if (typeof prior === "string") return prior;
-    if (prior.completed) return "completed" as const;
-    if (prior.started) return "reconcile" as const;
-    const followUpUserId = work.followUpUserId ?? (yield* CurrentWorkflowVmFollowUpActor);
-    const grant = yield* authority.admit({
-      ...work,
-      ...(followUpUserId ? { followUpUserId } : {}),
-    });
+    if (prior !== "revalidate-response") {
+      if (typeof prior === "string") return prior;
+      if (prior.completed) return "completed" as const;
+      if (prior.started) return "reconcile" as const;
+    }
+    const followUpUserId =
+      work.followUpUserId ?? matchingResponse?.userId ?? (yield* CurrentWorkflowVmFollowUpActor);
+    const followUpCommandId = work.followUpCommandId ?? matchingResponse?.commandId;
+    const grant = yield* authority
+      .admit({
+        ...work,
+        ...(followUpUserId ? { followUpUserId } : {}),
+        ...(followUpCommandId ? { followUpCommandId } : {}),
+      })
+      .pipe(
+        Effect.onError(() =>
+          prior === "revalidate-response"
+            ? captures.reject(captures.admissionId(input)).pipe(Effect.orDie)
+            : Effect.void,
+        ),
+      );
     if (grant.completed) {
       yield* fence.completeWork(work);
       yield* captures.complete(captures.admissionId(input));
       yield* fence.acknowledgeWork(work);
       return "completed" as const;
+    }
+    if (prior === "revalidate-response") {
+      if ((yield* getPlacement(input.threadId))?.phase === "active") return "start" as const;
+      yield* captures.reject(captures.admissionId(input));
+      return yield* new ThreadExecutionFenceError({
+        threadId: input.threadId,
+        detail: "The thread is not accepting a rejected invocation retry here.",
+      });
     }
     const decision = yield* fence.startReservedWork(work);
     if (decision === "held") {

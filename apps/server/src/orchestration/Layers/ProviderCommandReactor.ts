@@ -53,8 +53,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { WorkflowRunStore, type WorkflowRun } from "../../jobs/WorkflowRunStore.ts";
+import { readRelayProviderResponseActor } from "../../relay/ThreadCommandSync.ts";
 import {
   CurrentWorkflowVmFollowUpActor,
+  CurrentWorkflowVmFollowUpResponse,
   ThreadExecutionRelayError,
 } from "../../relay/ThreadExecutionRelay.ts";
 import {
@@ -2910,11 +2912,36 @@ const make = Effect.gen(function* () {
   ) {
     if (retryingWorkflowResponses.has(event.eventId)) return;
     const threadId = event.payload.threadId;
-    const run = event.commandId?.startsWith("server:supervisor:")
-      ? yield* workflows.getByThread(threadId)
-      : null;
-    const liveSessionOnly = run?.runtime.kind === "vm" ? { liveSessionOnly: true } : undefined;
+    const commandId = event.commandId;
+    const supervisor = commandId?.startsWith("server:supervisor:");
+    const run = supervisor ? yield* workflows.getByThread(threadId) : null;
+    const actor =
+      !supervisor && commandId && (yield* WorkflowVmGuest)
+        ? yield* readRelayProviderResponseActor(sql, {
+            commandId,
+            threadId,
+            requestId: event.payload.requestId,
+            type:
+              event.type === "thread.approval-response-requested"
+                ? "thread.approval.respond"
+                : "thread.user-input.respond",
+          })
+        : undefined;
+    const operation =
+      event.type === "thread.approval-response-requested" ? "approval" : "user-input";
+    const followUpResponse =
+      commandId && actor
+        ? {
+            threadId,
+            workId: `provider:${operation}:${event.payload.requestId}`,
+            userId: actor,
+            commandId,
+          }
+        : undefined;
+    const liveSessionOnly =
+      followUpResponse || run?.runtime.kind === "vm" ? { liveSessionOnly: true } : undefined;
     yield* send(liveSessionOnly).pipe(
+      Effect.provideService(CurrentWorkflowVmFollowUpResponse, followUpResponse),
       Effect.catchCause((cause) =>
         Effect.gen(function* () {
           if (Cause.hasInterruptsOnly(cause)) return yield* Effect.interrupt;
