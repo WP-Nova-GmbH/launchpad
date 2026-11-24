@@ -304,8 +304,17 @@ describe("relay DPoP failure mapping", () => {
   });
 });
 
+const workflowVmRoutes = [
+  "attempt",
+  "review-secrets",
+  "publishing",
+  "follow-up/ready",
+  "follow-up/environment",
+  "follow-up-publishing",
+] as const;
+
 describe("relay environment authentication", () => {
-  it.effect.each(["attempt", "review-secrets", "publishing"] as const)(
+  it.effect.each(workflowVmRoutes)(
     "authorizes only the assigned VM thread's workflow/%s requests",
     (endpoint) => {
       const principal = {

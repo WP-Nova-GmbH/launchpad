@@ -72,6 +72,13 @@ export function threadVmCredentialAllows(
     return parts.length === 8 && parts[6] === "artifacts" && isArtifactId(parts[7]);
   if (method !== "POST") return false;
   if (parts.length === 7) return ["history", "final-save", "pause", "restore"].includes(parts[6]!);
+  if (parts.length === 9)
+    return (
+      parts[6] === "workflow" &&
+      parts[7] === "follow-up" &&
+      (parts[8] === "ready" || parts[8] === "environment") &&
+      input.threadVm.threadId.startsWith("workflow:")
+    );
   if (parts.length !== 8) return false;
   return (
     (parts[6] === "checkpoints" && ["native", "attachments"].includes(parts[7]!)) ||
@@ -89,7 +96,7 @@ export function threadVmCredentialAllows(
     (parts[6] === "workflow" &&
       ["attempt", "review-secrets", "result", "result-reservation"].includes(parts[7]!)) ||
     (parts[6] === "workflow" &&
-      parts[7] === "publishing" &&
+      (parts[7] === "publishing" || parts[7] === "follow-up-publishing") &&
       input.threadVm.threadId.startsWith("workflow:")) ||
     (parts[6] === "commands" && (parts[7] === "next" || parts[7] === "ack")) ||
     (parts[6] === "work" && (parts[7] === "admit" || parts[7] === "complete"))
