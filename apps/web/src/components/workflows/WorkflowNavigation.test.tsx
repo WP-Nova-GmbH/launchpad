@@ -6,7 +6,10 @@ import { EnvironmentId, ProjectId, ThreadId, type ThreadWorkflowJob } from "@t3t
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import type { RepositoryWorkflowJob } from "@t3tools/contracts/workflows";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
-import type { WorkflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
+import type {
+  WorkflowResultCheckpoint,
+  WorkflowResultOrigin,
+} from "@t3tools/client-runtime/relay/workflow-result";
 import {
   emptyWorkflowJobRead,
   workflowJobReadAtom,
@@ -17,6 +20,7 @@ import { useWorkflowConversation, WorkflowConversationHeader } from "./WorkflowN
 
 const fixture = vi.hoisted(() => ({
   origin: undefined as WorkflowResultOrigin | undefined,
+  machineReviewVisitId: undefined as string | undefined,
   call: vi.fn(),
 }));
 vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => true }));
@@ -31,9 +35,30 @@ vi.mock("./workflowState", () => ({
 }));
 vi.mock("@tanstack/react-router", () => ({
   useLocation: ({ select }: { select: (location: object) => unknown }) =>
-    select({ state: { workflowOrigin: fixture.origin } }),
-  Link: ({ hash, children }: PropsWithChildren<{ hash: string }>) => (
-    <a href={`#${hash}`}>{children}</a>
+    select({
+      state: {
+        workflowOrigin: fixture.origin,
+        workflowMachineReviewVisitId: fixture.machineReviewVisitId,
+      },
+    }),
+  Link: ({
+    hash,
+    state,
+    children,
+  }: PropsWithChildren<{
+    hash: string;
+    state?: {
+      workflowReviewReturn?: WorkflowResultCheckpoint;
+      workflowMachineReviewVisitId?: string;
+    };
+  }>) => (
+    <a
+      href={`#${hash}`}
+      data-review-return={state?.workflowReviewReturn?.checkpointId}
+      data-review-visit={state?.workflowMachineReviewVisitId}
+    >
+      {children}
+    </a>
   ),
 }));
 
@@ -91,6 +116,7 @@ beforeEach(() => {
     removeEventListener: vi.fn(),
   });
   fixture.origin = origin;
+  fixture.machineReviewVisitId = undefined;
   fixture.call.mockReset();
   appAtomRegistry.set(managedRelaySessionAtom, {
     accountId: origin.accountId,
@@ -199,9 +225,12 @@ it.each([
 );
 
 it("updates the return link when the review changes while the diff is open", async () => {
+  fixture.machineReviewVisitId = "original-visit";
   fixture.call.mockResolvedValue(review);
   await mountHeader(review, "awaiting_review");
   expect(renderer!.root.findByType("a").children).toContain("Return to review");
+  const key = workflowSessionKey(origin, origin.jobId);
+  expect(appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.machineReviewVisits).toBeUndefined();
 
   fixture.call.mockResolvedValue({
     ...review,
@@ -220,4 +249,7 @@ it("updates the return link when the review changes while the diff is open", asy
   ).toBe(true);
   expect(renderer!.root.findByType("a").children).toContain("Back to run");
   expect(renderer!.root.findByType("a").props.href).toBe("#");
+  expect(renderer!.root.findByType("a").props["data-review-return"]).toBe(checkpoint.checkpointId);
+  expect(renderer!.root.findByType("a").props["data-review-visit"]).toBe("original-visit");
+  expect(appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.machineReviewVisits).toBeUndefined();
 });

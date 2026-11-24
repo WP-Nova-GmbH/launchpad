@@ -21,6 +21,7 @@ import {
   OrchestrationDispatchCommandError,
   ProjectId,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
@@ -34,6 +35,8 @@ import {
 import {
   activateWorkflowJobView,
   beginWorkflowJobRequest,
+  beginMachineWorkflowReview,
+  recordMachineWorkflowReviewDiff,
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
   beginWorkflowReview,
@@ -55,21 +58,39 @@ const fixture = vi.hoisted(() => ({
   select: vi.fn(),
   panel: vi.fn(),
   locationHash: "",
+  locationKey: "workflow-run",
+  workflowMachineReviewVisitId: undefined as string | undefined,
   workflowReviewReturn: undefined as WorkflowResultCheckpoint | undefined,
 }));
+const fixtureRouter = {
+  history: {
+    get location() {
+      return { state: { __TSR_key: fixture.locationKey } };
+    },
+  },
+};
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
+  useRouter: () => fixtureRouter,
   useLocation: ({
     select,
   }: {
     select: (location: {
       hash: string;
-      state: { workflowReviewReturn: WorkflowResultCheckpoint | undefined };
+      state: {
+        __TSR_key: string;
+        workflowMachineReviewVisitId: string | undefined;
+        workflowReviewReturn: WorkflowResultCheckpoint | undefined;
+      };
     }) => unknown;
   }) =>
     select({
       hash: fixture.locationHash,
-      state: { workflowReviewReturn: fixture.workflowReviewReturn },
+      state: {
+        __TSR_key: fixture.locationKey,
+        workflowMachineReviewVisitId: fixture.workflowMachineReviewVisitId,
+        workflowReviewReturn: fixture.workflowReviewReturn,
+      },
     }),
   Link: ({
     to,
@@ -320,6 +341,8 @@ beforeEach(() => {
   fixture.select.mockReset();
   fixture.panel.mockReset();
   fixture.locationHash = "";
+  fixture.locationKey = "workflow-run";
+  fixture.workflowMachineReviewVisitId = undefined;
   fixture.workflowReviewReturn = undefined;
 });
 afterEach(async () => {
@@ -559,6 +582,55 @@ describe("workflow result location navigation", () => {
       .findAllByType("button")
       .find((b) => b.props.children === "Approve result")!;
     expect(approval.props.disabled).toBe(true);
+  });
+
+  it("keeps the VM review check neutral for a member who cannot approve", async () => {
+    const review = {
+      ...vmReview,
+      progress: {
+        ...vmReview.progress,
+        checkpoint: {
+          ...workflowResultCheckpoint(vmReview.progress.checkpoint)!,
+          checkpointRef: "ref",
+          kind: "review",
+          role: "maintainer",
+        },
+      },
+      viewerControls: { canApprove: false, canRespond: false, canCancel: false },
+    } satisfies RepositoryWorkflowJob;
+    fixture.call.mockResolvedValue(review);
+    await mount(false);
+
+    const pending = deferred();
+    fixture.call.mockReturnValueOnce(pending.promise);
+    await act(() =>
+      beginWorkflowReview(
+        appAtomRegistry,
+        scope,
+        review.jobId,
+        "read-only-review",
+        workflowResultCheckpoint(review.progress.checkpoint)!,
+      ),
+    );
+    await pollRun();
+
+    expect(text(renderer!.toJSON())).toContain(
+      "Checking whether the result you inspected is still current.",
+    );
+    expect(text(renderer!.toJSON())).not.toContain("Approval is available");
+    expect(findButton("Approve result")).toBeUndefined();
+
+    await act(() =>
+      pending.resolve({
+        ...review,
+        progress: { ...review.progress, revision: review.progress.revision - 1 },
+      }),
+    );
+    expect(text(renderer!.toJSON())).toContain(
+      "Retry the check to see if the result you inspected is still current.",
+    );
+    expect(text(renderer!.toJSON())).not.toContain("Approval needs a fresh check");
+    expect(findButton("Retry check")).toBeDefined();
   });
 
   it("keeps a previously inspected version from approving a new VM review", async () => {
@@ -1043,31 +1115,147 @@ describe("workflow result location navigation", () => {
       expect(section.focus).toHaveBeenCalledTimes(movedFocus ? 0 : 1);
     },
   );
-  it.each([false, true])(
-    "checks the returned checkpoint against a fresh read before moving focus (changed: %s)",
-    async (changed) => {
-      const reply = deferred();
-      const review = {
-        ...job,
+  function cacheMachineReview() {
+    const review = {
+      ...job,
+      status: "awaiting_review",
+      progress: {
+        ...job.progress!,
         status: "awaiting_review",
-        progress: { ...job.progress!, status: "awaiting_review" },
-      } satisfies RepositoryWorkflowJob;
-      activateWorkflowJobView(appAtomRegistry, scope, job.jobId);
-      const request = beginWorkflowJobRequest(appAtomRegistry, scope, job.jobId)!;
-      settleWorkflowJobRequest(appAtomRegistry, request, review);
-      fixture.locationHash = "workflow-review";
-      fixture.workflowReviewReturn = workflowResultCheckpoint(review.progress.checkpoint);
+        checkpoint: {
+          checkpointId: "checkpoint",
+          turnId: "saved-turn",
+          checkpointRef: "ref",
+          checkpointTurnCount: 3,
+          kind: "review",
+          role: "member",
+        },
+      },
+      viewerControls: { canApprove: true, canRespond: true, canCancel: true },
+    } satisfies RepositoryWorkflowJob;
+    activateWorkflowJobView(appAtomRegistry, scope, job.jobId);
+    const request = beginWorkflowJobRequest(appAtomRegistry, scope, job.jobId)!;
+    settleWorkflowJobRequest(appAtomRegistry, request, review);
+    return review;
+  }
+  function recordMachineDiff(
+    checkpoint: WorkflowResultCheckpoint,
+    visitId: string,
+    targetTurnId = checkpoint.turnId,
+  ) {
+    const threadId = ThreadId.make("thread");
+    recordMachineWorkflowReviewDiff(
+      appAtomRegistry,
+      { ...scope, jobId: job.jobId, threadId, reviewCheckpoint: checkpoint },
+      visitId,
+      {
+        threadId,
+        fromTurnCount: checkpoint.checkpointTurnCount - 1,
+        toTurnCount: checkpoint.checkpointTurnCount,
+        targetTurnId: TurnId.make(targetTurnId),
+        diff: "",
+        completeWorkflowReview: true,
+      },
+    );
+  }
+  function returnToMachineReview() {
+    const review = cacheMachineReview();
+    const checkpoint = workflowResultCheckpoint(review.progress.checkpoint)!;
+    const visitId = "inspected-review";
+    beginMachineWorkflowReview(
+      appAtomRegistry,
+      scope,
+      job.jobId,
+      visitId,
+      "source-run",
+      checkpoint,
+    );
+    recordMachineDiff(checkpoint, visitId);
+    fixture.locationHash = "workflow-review";
+    fixture.workflowMachineReviewVisitId = visitId;
+    fixture.workflowReviewReturn = checkpoint;
+    return review;
+  }
+  it.each([false, true])(
+    "handles focus on a direct jump between returns to the same review (focus moved: %s)",
+    async (movedFocus) => {
+      const review = returnToMachineReview();
+      const body = {};
+      const ownerDocument = { body, activeElement: body };
+      const section = { ownerDocument, scrollIntoView: vi.fn(), focus: vi.fn() };
+      fixture.call.mockResolvedValue(review);
+      await mount(true, {
+        createNodeMock: ({ props }) =>
+          (props as { id?: string }).id === "workflow-review" ? section : null,
+      });
+      expect(section.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+
+      const reply = deferred();
+      fixture.call.mockReturnValueOnce(reply.promise);
+      await act(() => {
+        fixture.locationKey = "earlier-review-return";
+        renderer!.update(view());
+      });
+      expect(text(renderer!.toJSON())).toContain("Checking the current review");
+      expect(section.focus).toHaveBeenCalledTimes(1);
+
+      if (movedFocus) ownerDocument.activeElement = {};
+      await act(async () => reply.resolve(review));
+      const expectedFocusCount = movedFocus ? 1 : 2;
+      expect(section.focus).toHaveBeenCalledTimes(expectedFocusCount);
+      expect(section.scrollIntoView).toHaveBeenCalledTimes(expectedFocusCount);
+
+      ownerDocument.activeElement = body;
+      await pollRun();
+      expect(section.focus).toHaveBeenCalledTimes(expectedFocusCount);
+    },
+  );
+  it.each([
+    "same checkpoint",
+    "changed checkpoint",
+    "earlier explicit link",
+    "earlier Browser Back",
+  ] as const)(
+    "checks the returned checkpoint before moving focus or allowing approval (%s)",
+    async (returnPath) => {
+      const reply = deferred();
+      const review = returnToMachineReview();
 
       const refreshed = {
         ...review,
         progress: {
           ...review.progress,
           revision: review.progress.revision + 1,
-          checkpoint: changed
-            ? { ...review.progress.checkpoint!, checkpointId: "later" }
-            : review.progress.checkpoint,
+          checkpoint:
+            returnPath !== "same checkpoint"
+              ? {
+                  ...review.progress.checkpoint,
+                  checkpointId: "later",
+                  turnId: "updated-review-turn",
+                  checkpointTurnCount: 4,
+                }
+              : review.progress.checkpoint,
         },
       } satisfies RepositoryWorkflowJob;
+      if (returnPath === "earlier explicit link" || returnPath === "earlier Browser Back") {
+        const latest = workflowResultCheckpoint(refreshed.progress.checkpoint)!;
+        const latestVisitId = "latest-inspected-review";
+        beginMachineWorkflowReview(
+          appAtomRegistry,
+          scope,
+          job.jobId,
+          latestVisitId,
+          "other-return-entry",
+          latest,
+        );
+        recordMachineDiff(latest, latestVisitId);
+        fixture.workflowMachineReviewVisitId = undefined;
+        if (returnPath === "earlier Browser Back") {
+          fixture.locationKey = "source-run";
+          fixture.locationHash = "";
+          fixture.workflowReviewReturn = undefined;
+        }
+      }
       fixture.call.mockReturnValueOnce(reply.promise).mockResolvedValue(refreshed);
       const body = {};
       const ownerDocument = { body, activeElement: body };
@@ -1081,16 +1269,316 @@ describe("workflow result location navigation", () => {
               ? section
               : null,
       });
-      expect(findButton("Inspect saved diff")).toBeDefined();
+      expect(text(renderer!.toJSON())).toContain("Checking the current review");
+      expect(findButton("Approve result").props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.call).toHaveBeenCalledTimes(1);
       expect(section.focus).not.toHaveBeenCalled();
       expect(heading.focus).not.toHaveBeenCalled();
 
       await act(async () => reply.resolve(refreshed));
 
-      const target = changed ? heading : section;
-      expect(target.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "start" });
-      expect(target.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
-      expect((changed ? section : heading).focus).not.toHaveBeenCalled();
+      const changed = returnPath !== "same checkpoint";
+      if (returnPath === "earlier Browser Back") {
+        expect(heading.focus).not.toHaveBeenCalled();
+        expect(section.focus).not.toHaveBeenCalled();
+      } else {
+        const target = changed ? heading : section;
+        expect(target.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "start" });
+        expect(target.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+        expect((changed ? section : heading).focus).not.toHaveBeenCalled();
+      }
+      expect(text(renderer!.toJSON())).not.toContain("Checking the current review");
+      if (changed) {
+        expect(text(renderer!.toJSON())).toContain("Review changed");
+        expect(findButton("Approve result").props.disabled).toBe(true);
+        await press("Approve result");
+        expect(fixture.call).toHaveBeenCalledTimes(1);
+
+        await press("Inspect updated diff");
+        expect(fixture.select).toHaveBeenCalledWith(
+          { environmentId: "moved-vm", threadId: "thread" },
+          "updated-review-turn",
+        );
+        expect(
+          fixture.navigate.mock.calls[0]![0].state({}).workflowOrigin.reviewCheckpoint,
+        ).toEqual(workflowResultCheckpoint(refreshed.progress.checkpoint));
+      } else {
+        expect(text(renderer!.toJSON())).not.toContain("Review changed");
+        expect(findButton("Approve result").props.disabled).not.toBe(true);
+      }
+    },
+  );
+  it("uses the exact earlier visit proof for an explicit return to the same checkpoint", async () => {
+    const review = returnToMachineReview();
+    const checkpoint = workflowResultCheckpoint(review.progress.checkpoint)!;
+    beginMachineWorkflowReview(
+      appAtomRegistry,
+      scope,
+      job.jobId,
+      "another-uninspected-visit",
+      "other-entry",
+      checkpoint,
+    );
+    fixture.call.mockResolvedValue(review);
+    await mount();
+
+    expect(text(renderer!.toJSON())).not.toContain("Current diff needs inspection");
+    expect(findButton("Approve result").props.disabled).not.toBe(true);
+  });
+  it.each(["unloaded diff", "wrong turn", "visible matching diff"] as const)(
+    "gates approval after Browser Back to the first Run entry (%s)",
+    async (diffState) => {
+      const review = cacheMachineReview();
+      const checkpoint = workflowResultCheckpoint(review.progress.checkpoint)!;
+      fixture.call.mockResolvedValue(review);
+      fixture.open.mockResolvedValue(
+        Exit.succeed({ environmentId: "original", threadId: "thread" }),
+      );
+      await mount();
+      await press("Inspect saved diff");
+
+      const destination = fixture.navigate.mock.calls[0]![0].state({});
+      expect(destination.workflowOrigin.reviewCheckpoint).toEqual(checkpoint);
+      expect(destination.workflowMachineReviewVisitId).toEqual(expect.any(String));
+      if (diffState === "wrong turn") {
+        recordMachineDiff(checkpoint, destination.workflowMachineReviewVisitId, "earlier-turn");
+      } else if (diffState === "visible matching diff") {
+        recordMachineDiff(checkpoint, destination.workflowMachineReviewVisitId);
+      }
+
+      await act(() => renderer!.unmount());
+      renderer = undefined;
+      const fresh = deferred();
+      fixture.call.mockClear().mockReturnValueOnce(fresh.promise);
+      await mount();
+
+      expect(text(renderer!.toJSON())).toContain("Checking the current review");
+      expect(findButton("Approve result").props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.call).toHaveBeenCalledTimes(1);
+
+      await act(async () => fresh.resolve(review));
+      expect(text(renderer!.toJSON())).not.toContain("Checking the current review");
+      if (diffState === "visible matching diff") {
+        expect(findButton("Approve result").props.disabled).not.toBe(true);
+      } else {
+        expect(text(renderer!.toJSON())).toContain("Current diff needs inspection");
+        expect(findButton("Inspect saved diff").props.disabled).not.toBe(true);
+        expect(findButton("Approve result").props.disabled).toBe(true);
+        await press("Approve result");
+        expect(fixture.call).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
+  it.each(["proof cleared", "freshly inspected", "review changed"] as const)(
+    "checks the original Machine visit after reload and Back (%s)",
+    async (outcome) => {
+      const review = cacheMachineReview();
+      const checkpoint = workflowResultCheckpoint(review.progress.checkpoint)!;
+      const originalHistoryState = {
+        __TSR_key: fixture.locationKey,
+        __TSR_index: 3,
+        unrelatedState: true,
+      };
+      let sourceState: unknown = originalHistoryState;
+      const history = {
+        get state() {
+          return sourceState;
+        },
+        replaceState: vi.fn((state: unknown) => {
+          sourceState = structuredClone(state);
+        }),
+      };
+      Object.assign(window, { history });
+      fixture.call.mockResolvedValue(review);
+      await mount();
+      await press("Inspect saved diff");
+
+      const destination = fixture.navigate.mock.calls[0]![0].state(sourceState);
+      expect(destination.workflowMachineReviewSource).toBeUndefined();
+      recordMachineDiff(checkpoint, destination.workflowMachineReviewVisitId);
+      expect(history.replaceState).toHaveBeenCalledTimes(1);
+      expect(sourceState).toEqual({
+        ...originalHistoryState,
+        workflowMachineReviewSource: {
+          runKey: workflowSessionKey(scope, job.jobId),
+          id: destination.workflowMachineReviewVisitId,
+          checkpoint,
+        },
+      });
+
+      await act(() => renderer!.unmount());
+      renderer = undefined;
+      setWorkflowSessionAccount(appAtomRegistry, null);
+      setWorkflowSessionAccount(appAtomRegistry, scope.accountId);
+      if (outcome !== "proof cleared")
+        recordMachineDiff(checkpoint, destination.workflowMachineReviewVisitId);
+      const fresh = deferred();
+      fixture.call.mockClear().mockReturnValueOnce(fresh.promise);
+      await mount();
+      expect(findButton("Approve result")).toBeUndefined();
+
+      await act(() =>
+        fresh.resolve(
+          outcome === "review changed"
+            ? {
+                ...review,
+                progress: {
+                  ...review.progress,
+                  revision: review.progress.revision + 1,
+                  checkpoint: {
+                    ...review.progress.checkpoint,
+                    checkpointId: "new-review",
+                    turnId: "new-turn",
+                  },
+                },
+              }
+            : review,
+        ),
+      );
+
+      if (outcome === "freshly inspected") {
+        expect(findButton("Approve result").props.disabled).not.toBe(true);
+        expect(text(renderer!.toJSON())).not.toContain("Current diff needs inspection");
+        const respond = vi.fn().mockResolvedValue(review);
+        fixture.call.mockImplementationOnce((operation) =>
+          operation({ respondToWorkflowJob: respond }, "token"),
+        );
+        await press("Approve result");
+        expect(respond).toHaveBeenCalledWith(
+          expect.objectContaining({
+            payload: {
+              operation: "approve",
+              checkpointId: checkpoint.checkpointId,
+              expectedRevision: review.progress.revision,
+            },
+          }),
+        );
+        return;
+      }
+      expect(text(renderer!.toJSON())).toContain(
+        outcome === "review changed" ? "Review changed" : "Current diff needs inspection",
+      );
+      expect(findButton("Approve result").props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.call).toHaveBeenCalledTimes(1);
+    },
+  );
+  it("does not open a Machine review diff after leaving its Run history entry", async () => {
+    const review = cacheMachineReview();
+    const opening = deferred();
+    fixture.call.mockResolvedValue(review);
+    fixture.open.mockReturnValueOnce(opening.promise);
+    await mount();
+    await press("Inspect saved diff");
+
+    fixture.locationKey = "other-run-entry";
+    await act(async () => {
+      opening.resolve(Exit.succeed({ environmentId: "original", threadId: "thread" }));
+      await opening.promise;
+    });
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    expect(fixture.select).not.toHaveBeenCalled();
+  });
+  it("clears an old diff open and checks a new history entry for the same Run immediately", async () => {
+    const review = cacheMachineReview();
+    const checkpoint = workflowResultCheckpoint(review.progress.checkpoint)!;
+    const oldOpening = deferred();
+    const oldRead = deferred();
+    const fresh = deferred();
+    fixture.call
+      .mockResolvedValueOnce(review)
+      .mockReturnValueOnce(oldRead.promise)
+      .mockReturnValueOnce(fresh.promise);
+    fixture.open.mockReturnValueOnce(oldOpening.promise);
+    await mount();
+    await press("Inspect saved diff");
+    expect(findButton("Opening saved diff…")).toBeDefined();
+    await pollRun();
+
+    await act(() => {
+      beginMachineWorkflowReview(
+        appAtomRegistry,
+        scope,
+        job.jobId,
+        "returned-visit",
+        "original-visit-source",
+        checkpoint,
+      );
+      recordMachineDiff(checkpoint, "returned-visit");
+      fixture.locationKey = "other-run-entry";
+      fixture.locationHash = "workflow-review";
+      fixture.workflowReviewReturn = checkpoint;
+      fixture.workflowMachineReviewVisitId = "returned-visit";
+      renderer!.update(view());
+    });
+
+    expect(fixture.call).toHaveBeenCalledTimes(3);
+    expect(findButton("Opening saved diff…")).toBeUndefined();
+    expect(text(renderer!.toJSON())).toContain("Checking the current review");
+    expect(findButton("Approve result").props.disabled).toBe(true);
+
+    const staleInstruction = "Only from the older history entry";
+    await act(async () => oldRead.resolve({ ...review, instruction: staleInstruction }));
+    expect(text(renderer!.toJSON())).not.toContain(staleInstruction);
+    expect(findButton("Approve result").props.disabled).toBe(true);
+
+    await act(async () => fresh.resolve(review));
+    expect(findButton("Approve result").props.disabled).not.toBe(true);
+    const currentOpening = deferred();
+    fixture.open.mockReturnValueOnce(currentOpening.promise);
+    await press("Inspect saved diff");
+    expect(fixture.open).toHaveBeenCalledTimes(2);
+
+    const location = Exit.succeed({ environmentId: "original", threadId: "thread" });
+    await act(async () => oldOpening.resolve(location));
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    expect(findButton("Opening saved diff…")).toBeDefined();
+
+    await act(async () => currentOpening.resolve(location));
+    expect(fixture.navigate).toHaveBeenCalledOnce();
+  });
+  it.each(["transport failure", "stale response"])(
+    "keeps approval blocked after a failed return check until a successful retry (%s)",
+    async (failure) => {
+      const review = returnToMachineReview();
+      const retry = deferred();
+      if (failure === "transport failure") {
+        fixture.call.mockRejectedValueOnce(new Error("Could not reach the relay"));
+      } else {
+        fixture.call.mockResolvedValueOnce({
+          ...review,
+          progress: { ...review.progress, revision: review.progress.revision - 1 },
+        } satisfies RepositoryWorkflowJob);
+      }
+      fixture.call.mockReturnValueOnce(retry.promise).mockResolvedValue(review);
+      await mount();
+
+      const notice = renderer!.root
+        .findAllByProps({ role: "alert" })
+        .find((alert) => text(alert).includes("Couldn’t verify the current review"));
+      expect(text(notice ?? null)).toContain(
+        failure === "transport failure"
+          ? "Could not reach the relay"
+          : "Approval needs a fresh check of the result you inspected.",
+      );
+      expect(findButton("Approve result").props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.call).toHaveBeenCalledTimes(1);
+
+      await press("Retry check");
+      expect(fixture.call).toHaveBeenCalledTimes(2);
+      expect(text(renderer!.toJSON())).toContain("Checking the current review");
+      expect(text(renderer!.toJSON())).not.toContain("Couldn’t verify the current review");
+      expect(findButton("Approve result").props.disabled).toBe(true);
+      await press("Approve result");
+      expect(fixture.call).toHaveBeenCalledTimes(2);
+
+      await act(async () => retry.resolve(review));
+      expect(text(renderer!.toJSON())).not.toContain("Couldn’t verify the current review");
+      expect(findButton("Retry check")).toBeUndefined();
+      expect(findButton("Approve result").props.disabled).not.toBe(true);
     },
   );
   it.each([

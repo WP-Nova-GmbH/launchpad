@@ -13,9 +13,12 @@ export function buildDiffPanelCheckpointTarget(
     "reviewBlocked" | "reviewCheckpoint" | "savedDiffCheckpoint" | "workflowReview"
   >,
   viewId: string,
+  machineReviewVisitId?: string,
 ) {
   const { reviewBlocked, reviewCheckpoint, savedDiffCheckpoint, workflowReview } = scope;
   const checkpoint = reviewCheckpoint ?? savedDiffCheckpoint;
+  const machineVisit = reviewCheckpoint && !workflowReview ? machineReviewVisitId : undefined;
+  const visitId = workflowReview?.visitId ?? machineVisit;
   const turnCount = checkpoint?.checkpointTurnCount ?? input.checkpointTurnCount ?? null;
   return {
     environmentId: reviewBlocked ? null : input.environmentId,
@@ -24,8 +27,9 @@ export function buildDiffPanelCheckpointTarget(
     toTurnCount: turnCount,
     ignoreWhitespace: input.ignoreWhitespace,
     strictWorkflowReview: workflowReview !== null,
+    requireComplete: !!machineVisit,
     expectedTurnId: checkpoint ? TurnId.make(checkpoint.turnId) : undefined,
-    requestKey: workflowReview ? `${workflowReview.visitId}:${viewId}` : undefined,
+    requestKey: visitId ? `${visitId}:${viewId}` : undefined,
   };
 }
 

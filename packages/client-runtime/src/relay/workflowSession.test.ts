@@ -32,6 +32,8 @@ import {
   beginWorkflowJobPage,
   settleWorkflowJobPage,
   beginWorkflowReview,
+  beginMachineWorkflowReview,
+  recordMachineWorkflowReviewDiff,
   bindWorkflowReviewPlacement,
   recordWorkflowReviewDiff,
   recordSavedWorkflowReviewDiff,
@@ -748,6 +750,100 @@ describe("workflow session and request ownership", () => {
     expect(state()).toBe("allowed");
     clearWorkflowScope(registry, scope);
     expect(registry.get(workflowDraftAtom).reviews[key]).toBeUndefined();
+  });
+
+  it("keeps exact Machine review inspection scoped to the visit and history entry", () => {
+    const registry = setup();
+    const initial = job();
+    const checkpoint = { checkpointId: "review", turnId: "turn-2", checkpointTurnCount: 2 };
+    const current = {
+      ...initial,
+      status: "awaiting_review",
+      progress: {
+        ...initial.progress!,
+        status: "awaiting_review",
+        checkpoint: { ...checkpoint, checkpointRef: "ref" },
+      },
+    } satisfies RepositoryWorkflowJob;
+    const threadId = current.progress.threadId;
+    const origin = { ...scope, jobId: current.jobId, threadId, reviewCheckpoint: checkpoint };
+    const exact = {
+      threadId,
+      targetTurnId: TurnId.make(checkpoint.turnId),
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      diff: "",
+      completeWorkflowReview: true as const,
+    };
+    const { completeWorkflowReview: _complete, ...partial } = exact;
+    const previousRead = beginWorkflowJobRequest(registry, scope, current.jobId)!;
+    expect(settleWorkflowJobRequest(registry, previousRead, current)).toBe(true);
+    const read = () =>
+      registry.get(workflowJobReadAtom).jobs[workflowSessionKey(scope, current.jobId)];
+    beginMachineWorkflowReview(registry, scope, current.jobId, "old", "old-entry", checkpoint);
+    beginMachineWorkflowReview(registry, scope, current.jobId, "active", "entry", checkpoint);
+    expect(read()?.machineReviewVisits?.active).toEqual({
+      id: "active",
+      sourceEntryKey: "entry",
+      checkpoint,
+      inspected: false,
+    });
+
+    for (const [label, candidate, visitId, diff] of [
+      ["another account", { ...origin, accountId: "other" }, "active", exact],
+      ["VM review visit", { ...origin, reviewVisitId: "vm-visit" }, "active", exact],
+      [
+        "another checkpoint",
+        { ...origin, reviewCheckpoint: { ...checkpoint, checkpointId: "older" } },
+        "active",
+        exact,
+      ],
+      ["another thread", origin, "active", { ...exact, threadId: ThreadId.make("other") }],
+      ["another turn", origin, "active", { ...exact, targetTurnId: TurnId.make("other") }],
+      ["wrong start of range", origin, "active", { ...exact, fromTurnCount: 0 }],
+      ["wrong end of range", origin, "active", { ...exact, toTurnCount: 3 }],
+      ["incomplete diff", origin, "active", { ...partial, diff: "Partial patch" }],
+    ] as const) {
+      recordMachineWorkflowReviewDiff(registry, candidate, visitId, diff);
+      expect(read()?.machineReviewVisits?.active?.inspected, label).toBe(false);
+    }
+
+    recordMachineWorkflowReviewDiff(registry, origin, "old", exact);
+    expect(read()?.machineReviewVisits?.old).toMatchObject({
+      sourceEntryKey: "old-entry",
+      inspected: true,
+    });
+    expect(read()?.machineReviewVisits?.active?.inspected).toBe(false);
+
+    recordMachineWorkflowReviewDiff(registry, origin, "active", exact);
+    expect(read()?.machineReviewVisits?.active?.inspected).toBe(true);
+    expect(read()?.acceptedReadEpoch).toBe(previousRead.epoch);
+
+    activateWorkflowJobView(registry, scope, "another-job");
+    expect(read()?.job).toBeNull();
+    expect(read()?.machineReviewVisits?.active?.inspected).toBe(true);
+    activateWorkflowJobView(registry, scope, current.jobId);
+    const returned = beginWorkflowJobRequest(registry, scope, current.jobId)!;
+    expect(settleWorkflowJobRequest(registry, returned, current)).toBe(true);
+    expect(read()?.acceptedReadEpoch).toBe(returned.epoch);
+    expect(read()?.machineReviewVisits?.active).toMatchObject({
+      sourceEntryKey: "entry",
+      inspected: true,
+    });
+
+    const reloaded = setup();
+    const reloadedRead = () =>
+      reloaded.get(workflowJobReadAtom).jobs[workflowSessionKey(scope, current.jobId)];
+    recordMachineWorkflowReviewDiff(reloaded, { ...origin, accountId: "other" }, "active", exact);
+    recordMachineWorkflowReviewDiff(reloaded, origin, "active", partial);
+    recordMachineWorkflowReviewDiff(reloaded, origin, "active", { ...exact, fromTurnCount: 0 });
+    expect(reloaded.get(workflowJobReadAtom).jobs).toEqual({});
+    recordMachineWorkflowReviewDiff(reloaded, origin, "active", exact);
+    expect(reloadedRead()).toMatchObject({
+      job: null,
+      acceptedReadEpoch: 0,
+      machineReviewVisits: { active: { checkpoint, inspected: true } },
+    });
   });
 
   it("accepts only the current complete saved Agent result and requires a fresh job read", () => {

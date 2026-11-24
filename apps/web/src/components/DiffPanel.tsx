@@ -4,7 +4,10 @@ import type { FileDiffContentsLoader, FileDiffMetadata } from "@pierre/diffs";
 import { useLocation, useParams } from "@tanstack/react-router";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { workflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
-import { recordWorkflowReviewDiff } from "@t3tools/client-runtime/relay/workflow-session";
+import {
+  recordMachineWorkflowReviewDiff,
+  recordWorkflowReviewDiff,
+} from "@t3tools/client-runtime/relay/workflow-session";
 import { portableThreadClientRouteAtom } from "@t3tools/client-runtime/relay/portableThreadLibrary";
 import { isCompleteWorkflowReviewDiff } from "@t3tools/client-runtime/state/threads";
 import {
@@ -168,6 +171,9 @@ export default function DiffPanel({
   });
   const activeThreadId = routeThreadRef?.threadId ?? null;
   const routeOrigin = useLocation({ select: (location) => location.state.workflowOrigin });
+  const machineReviewVisitId = useLocation({
+    select: ({ state }) => state.workflowMachineReviewVisitId,
+  });
   const declaredReviewVisitId = routeOrigin?.reviewVisitId;
   const session = useAtomValue(managedRelaySessionAtom);
   const origin = useMemo(
@@ -338,18 +344,21 @@ export default function DiffPanel({
     },
     diffScope,
     diffViewId,
+    machineReviewVisitId,
   );
   const {
     strictWorkflowReview,
+    requireComplete: completeMachineReview,
     expectedTurnId,
     requestKey: workflowReviewRequestKey,
   } = checkpointTarget;
+  const completeReviewRequired = strictWorkflowReview || completeMachineReview;
   const activeCheckpointDiff = useCheckpointDiff(checkpointTarget, {
     enabled:
       !reviewBlocked &&
       (strictWorkflowReview || isGitRepo) &&
       selectedTurn !== undefined &&
-      (!origin?.reviewVisitId || visible),
+      ((!origin?.reviewVisitId && !completeMachineReview) || visible),
   });
   const {
     data: checkpointResult,
@@ -368,13 +377,36 @@ export default function DiffPanel({
     checkpointResult !== null &&
     "targetTurnId" in checkpointResult &&
     checkpointResult.targetTurnId === expectedTurnId;
-  const verifiedReviewDiff = strictWorkflowReview
+  const verifiedReviewDiff = completeReviewRequired
     ? completeWorkflowDiff !== null
     : checkpointMatchesReview;
+  const machineReviewDiff = completeMachineReview ? completeWorkflowDiff : null;
+  useEffect(() => {
+    if (!visible || !origin || !machineReviewVisitId || !machineReviewDiff) return;
+    const recordVisible = () => {
+      if (
+        document.visibilityState === "hidden" ||
+        appAtomRegistry.get(managedRelaySessionAtom) !== session
+      )
+        return;
+      recordMachineWorkflowReviewDiff(
+        appAtomRegistry,
+        origin,
+        machineReviewVisitId,
+        machineReviewDiff,
+      );
+    };
+    recordVisible();
+    document.addEventListener("visibilitychange", recordVisible);
+    return () => document.removeEventListener("visibilitychange", recordVisible);
+  }, [machineReviewDiff, machineReviewVisitId, origin, session, visible]);
   const workflowDiffError =
     expectedTurnId && !checkpointPending && !verifiedReviewDiff
-      ? strictWorkflowReview
-        ? (checkpointError ?? "A complete checkpoint diff is unavailable.")
+      ? completeReviewRequired
+        ? (checkpointError ??
+          (completeMachineReview
+            ? "The Machine didn’t return a complete diff. Update the Machine server and retry."
+            : "A complete checkpoint diff is unavailable."))
         : diffScope.savedDiffCheckpoint
           ? "Could not verify the saved diff. Return to the run to try again."
           : "Could not verify the review checkpoint. Return to the run to check the current review."
@@ -382,6 +414,7 @@ export default function DiffPanel({
   useEffect(() => {
     if (
       !visible ||
+      !strictWorkflowReview ||
       !workflowReviewRequestKey ||
       !origin ||
       !routeThreadRef ||
@@ -403,7 +436,15 @@ export default function DiffPanel({
     recordVisibleDiff();
     document.addEventListener("visibilitychange", recordVisibleDiff);
     return () => document.removeEventListener("visibilitychange", recordVisibleDiff);
-  }, [completeWorkflowDiff, origin, routeThreadRef, session, visible, workflowReviewRequestKey]);
+  }, [
+    completeWorkflowDiff,
+    origin,
+    routeThreadRef,
+    session,
+    strictWorkflowReview,
+    visible,
+    workflowReviewRequestKey,
+  ]);
   const primaryBranchDiffPreview = useEnvironmentQuery(
     checkoutDiffSelected && activeThread && activeCwd
       ? reviewEnvironment.diffPreview({
@@ -529,7 +570,7 @@ export default function DiffPanel({
   ];
   const gitDiff = selectedGitSource?.diff;
 
-  const selectedPatch = strictWorkflowReview
+  const selectedPatch = completeReviewRequired
     ? completeWorkflowDiff?.diff
     : selectedTurn
       ? !expectedTurnId || checkpointMatchesReview
@@ -557,9 +598,9 @@ export default function DiffPanel({
         ? null
         : getRenderablePatch(selectedPatch, `diff-panel:${resolvedTheme}`, {
             compactPartialHunkOffsets: selectedTurnId === null,
-            preservePatchWhitespace: strictWorkflowReview,
+            preservePatchWhitespace: completeReviewRequired,
           }),
-    [lazySource, resolvedTheme, selectedPatch, selectedTurnId, strictWorkflowReview],
+    [lazySource, resolvedTheme, selectedPatch, selectedTurnId, completeReviewRequired],
   );
   const fileStats = useMemo(
     () => new Map(lazySource?.files?.map((file) => [file.path, file])),
@@ -1096,7 +1137,7 @@ export default function DiffPanel({
             {wordWrap ? "Disable line wrapping" : "Enable line wrapping"}
           </TooltipPopup>
         </Tooltip>
-        {!strictWorkflowReview && (
+        {!completeReviewRequired && (
           <Tooltip>
             <TooltipTrigger
               render={

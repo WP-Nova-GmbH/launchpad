@@ -9400,6 +9400,45 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("explains why an oversized Machine review diff cannot be inspected", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          checkpointDiffQuery: {
+            getTurnDiff: () =>
+              Effect.fail(
+                new VcsProcessOutputLimitError({
+                  operation: "GitVcsDriver.checkpoints.diffCheckpoints",
+                  command: "git diff",
+                  cwd: "/tmp/repo",
+                  stream: "stdout",
+                  maxBytes: 10_000_000,
+                  observedBytes: 10_000_001,
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const failure = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.flip(
+            client[ORCHESTRATION_WS_METHODS.getTurnDiff]({
+              threadId: ThreadId.make("machine-review-thread"),
+              fromTurnCount: 0,
+              toTurnCount: 1,
+              expectedTurnId: TurnId.make("machine-review-turn"),
+              requireComplete: true,
+            }),
+          ),
+        ),
+      );
+      assert.equal(failure._tag, "OrchestrationGetTurnDiffError");
+      assert.match(failure.message, /too large to review.*Request a smaller change/);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("opens a finished workflow VM result and fences live checkout actions", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("workflow:finished");

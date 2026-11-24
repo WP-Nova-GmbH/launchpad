@@ -46,7 +46,7 @@ import {
   useMemo,
   type RefObject,
 } from "react";
-import { Link, useLocation, useNavigate } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate, useRouter } from "@tanstack/react-router";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openPortableThreadChat } from "../../state/threads";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -71,6 +71,7 @@ import {
   workflowSessionKey,
   updateWorkflowDrafts,
   activateWorkflowJobView,
+  beginMachineWorkflowReview,
   beginWorkflowJobRequest,
   recordWorkflowResponse,
   setWorkflowResponseDraft,
@@ -128,6 +129,22 @@ type MachineResultOpening = { destination: MachineResultDestination } & (
   | { status: "opening" }
   | { status: "failed"; detail: string }
 );
+
+interface MachineReviewSourceEntry {
+  readonly __TSR_key?: string;
+  readonly key?: string;
+  readonly workflowMachineReviewSource?: {
+    readonly runKey: string;
+    readonly id: string;
+    readonly checkpoint: WorkflowResultCheckpoint;
+  };
+}
+
+function currentMachineReviewSourceEntry(entryKey: string | undefined) {
+  if (!entryKey) return undefined;
+  const state = globalThis.window?.history?.state as MachineReviewSourceEntry | null | undefined;
+  return (state?.__TSR_key ?? state?.key) === entryKey ? state : undefined;
+}
 
 const checkingCheckpointAccess = "Checking who can respond…";
 const unconfirmedCheckpointAccess =
@@ -322,11 +339,17 @@ export function WorkflowJob({
   refreshCatalog: () => void;
 }) {
   const navigate = useNavigate();
+  const { history } = useRouter();
   const returningToReview = useLocation({ select: ({ hash }) => hash === WORKFLOW_REVIEW_ANCHOR });
   const returnCheckpoint = useLocation({
-    select: ({ hash, state }) =>
-      hash === WORKFLOW_REVIEW_ANCHOR ? state?.workflowReviewReturn : undefined,
+    select: ({ state }) => state?.workflowReviewReturn,
   });
+  const returnVisitId = useLocation({ select: ({ state }) => state.workflowMachineReviewVisitId });
+  const runEntryKey = useLocation({ select: ({ state }) => state.__TSR_key ?? state.key });
+  const isRunEntryCurrent = useCallback(() => {
+    const { state } = history.location;
+    return (state.__TSR_key ?? state.key) === runEntryKey;
+  }, [history, runEntryKey]);
   const openResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
   const [machineResult, setMachineResult] = useState<MachineResultOpening | null>(null);
   const openingResult = machineResult?.status === "opening" ? machineResult.destination.kind : null;
@@ -343,17 +366,21 @@ export function WorkflowJob({
   const reads = useWorkflowJobReads();
   const drafts = useWorkflowDrafts();
   const key = workflowSessionKey(scope, jobId);
-  const reviewReturn = useMemo(
-    () =>
-      returnCheckpoint
-        ? {
-            key,
-            checkpoint: returnCheckpoint,
-            after: appAtomRegistry.get(workflowJobReadAtom).sequence,
-          }
-        : null,
-    [key, returnCheckpoint],
-  );
+  const reviewReturn = useMemo(() => {
+    const state = appAtomRegistry.get(workflowJobReadAtom);
+    // Capture on entry. Opening a diff must not make this view its own return.
+    const historyVisit = runEntryKey
+      ? Object.values(state.jobs[key]?.machineReviewVisits ?? {}).findLast(
+          (visit) => visit.sourceEntryKey === runEntryKey,
+        )
+      : undefined;
+    const source = currentMachineReviewSourceEntry(runEntryKey)?.workflowMachineReviewSource;
+    const visit = historyVisit ?? (source?.runKey === key ? source : undefined);
+    const checkpoint = visit?.checkpoint ?? returnCheckpoint;
+    return checkpoint
+      ? { checkpoint, visitId: visit?.id ?? returnVisitId, after: state.sequence }
+      : null;
+  }, [key, runEntryKey, returnCheckpoint, returnVisitId]);
   const runHeading = useRef<HTMLHeadingElement>(null);
   const conversationButton = useRunActionFocus(
     key,
@@ -365,7 +392,8 @@ export function WorkflowJob({
   );
   const resumeButton = useRunActionFocus(key);
   const reviewSection = useRef<HTMLElement>(null);
-  const handledReviewReturn = useRef<string | null>(null);
+  const retryReviewCheckButton = useRunActionFocus(key, reviewSection);
+  const handledReviewReturn = useRef<{ key: string; entryKey: string | undefined } | null>(null);
   const checkpointForm = useRunActionFocus<HTMLFormElement>(key, runHeading);
   const retryCompletionButton = useRunActionFocus(key, runHeading);
   const retrySavingButton = useRunActionFocus(key, runHeading);
@@ -398,21 +426,26 @@ export function WorkflowJob({
     selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime.environmentId : undefined;
   const resultThreadId =
     selectedJob?.progress?.hasThread === false ? undefined : selectedJob?.progress?.threadId;
-  const resultRequest = useRef<{ key: string } | null>(null);
+  const resultRequest = useRef<{
+    key: string;
+    entryKey: string | undefined;
+    review: boolean;
+  } | null>(null);
   useLayoutEffect(() => {
     if (!resultEnvironmentId || !resultThreadId) return;
     return () => {
-      if (resultRequest.current?.key === key) resultRequest.current = null;
+      const request = resultRequest.current;
+      if (request?.key === key && request.entryKey === runEntryKey) resultRequest.current = null;
       setMachineResult(null);
       restoreOpeningFocus.current = false;
     };
-  }, [key, resultEnvironmentId, resultThreadId]);
+  }, [key, runEntryKey, resultEnvironmentId, resultThreadId]);
   useLayoutEffect(() => {
     if (!openingResult || !restoreOpeningFocus.current) return;
     restoreOpeningFocus.current = false;
-    const target = resultActions.current?.querySelector<HTMLButtonElement>(
-      'button[aria-busy="true"]',
-    );
+    const target = (
+      reviewSection.current ?? resultActions.current
+    )?.querySelector<HTMLButtonElement>('button[aria-busy="true"]');
     if (target && target.ownerDocument.activeElement === target.ownerDocument.body) target.focus();
   }, [openingResult]);
   const manualState = workflowManualControlState(selectedJob);
@@ -462,9 +495,8 @@ export function WorkflowJob({
   const waitingForSavedReviewRender =
     vmReview &&
     !matchesSavedReviewRender(savedReviewRender, savedReviewKey, drafts.reviews[key]?.id);
-  const reviewApproval = workflowReviewApprovalState(drafts.reviews[key], read);
-  const reviewChanged = reviewApproval === "inspect";
-  const checkingReturnedReview = reviewApproval === "checking";
+  const reviewVisit = drafts.reviews[key];
+  const reviewApproval = workflowReviewApprovalState(reviewVisit, read);
   const viewerControls = workflowViewerControls(selectedJob, canConfigure);
   const cancelling = selectedJob?.status === "cancelling";
   const terminal = !!selectedJob && isTerminalWorkflowJob(selectedJob.status);
@@ -514,26 +546,55 @@ export function WorkflowJob({
     !returnReadAccepted &&
     (read.epoch <= reviewReturn.after || read.reading || read.mutation);
   const reviewAtReturn = reviewReturn ? workflowResultCheckpoint(checkpoint) : undefined;
-  const expectedReviewOnReturn =
+  const matchesReviewOnReturn =
     !reviewReturn ||
     (returnReadAccepted &&
       reviewAtReturn &&
       sameWorkflowResultCheckpoint(reviewAtReturn, reviewReturn.checkpoint));
+  const returnedMachineReview = reviewReturn?.visitId
+    ? read.machineReviewVisits?.[reviewReturn.visitId]
+    : undefined;
+  const reviewInspectedOnReturn =
+    !reviewReturn ||
+    (returnedMachineReview?.inspected &&
+      sameWorkflowResultCheckpoint(returnedMachineReview.checkpoint, reviewReturn.checkpoint));
+  const returnCheckpointChanged =
+    showingReview && !!reviewReturn && returnReadAccepted && !matchesReviewOnReturn;
+  const canApproveReturnedReview = matchesReviewOnReturn && reviewInspectedOnReturn;
+  const reviewNeedsInspection =
+    reviewApproval === "inspect" ||
+    (showingReview && returnReadAccepted && !canApproveReturnedReview);
+  const checkingReturnedReview =
+    reviewApproval === "checking" || (showingReview && !returnReadAccepted);
   useLayoutEffect(() => {
     if (!returningToReview) {
       handledReviewReturn.current = null;
       return;
     }
-    if (!runLoaded || returnReadPending || handledReviewReturn.current === key) return;
+    const handled = handledReviewReturn.current;
+    if (
+      !runLoaded ||
+      returnReadPending ||
+      (handled?.key === key && handled.entryKey === runEntryKey)
+    )
+      return;
     const target =
-      showingReview && expectedReviewOnReturn ? reviewSection.current : runHeading.current;
+      showingReview && matchesReviewOnReturn ? reviewSection.current : runHeading.current;
     if (!target) return;
-    handledReviewReturn.current = key;
+    handledReviewReturn.current = { key, entryKey: runEntryKey };
     const { activeElement, body } = target.ownerDocument;
     if (activeElement !== body && activeElement !== target) return;
     target.scrollIntoView({ block: "start" });
     target.focus({ preventScroll: true });
-  }, [key, returningToReview, runLoaded, returnReadPending, showingReview, expectedReviewOnReturn]);
+  }, [
+    key,
+    runEntryKey,
+    returningToReview,
+    runLoaded,
+    returnReadPending,
+    showingReview,
+    matchesReviewOnReturn,
+  ]);
   useLayoutEffect(() => {
     if (feedbackFocus.current === "input") feedbackInput.current?.focus();
     if (feedbackFocus.current === "button") feedbackButton.current?.focus();
@@ -542,6 +603,7 @@ export function WorkflowJob({
   const busy = !!read.mutation;
   const refresh = useCallback(
     async (onStart?: (epoch: number) => void) => {
+      if (!isRunEntryCurrent()) return;
       const request = beginWorkflowJobRequest(appAtomRegistry, scope, jobId);
       if (!request) return;
       onStart?.(request.epoch);
@@ -562,12 +624,13 @@ export function WorkflowJob({
         );
       }
     },
-    [call, scope, jobId],
+    [call, scope, jobId, isRunEntryCurrent],
   );
   useLayoutEffect(() => {
+    if (!isRunEntryCurrent()) return;
     activateWorkflowJobView(appAtomRegistry, scope, jobId);
     requireFreshWorkflowReviewRead(appAtomRegistry, scope, jobId);
-  }, [scope, jobId]);
+  }, [scope, jobId, isRunEntryCurrent]);
   useEffect(() => {
     if (read.mutation) return;
     void refresh();
@@ -625,6 +688,12 @@ export function WorkflowJob({
         (!viewerControls.canApprove ||
           (finishing && !completionRetryable) ||
           currentRead.job !== selectedJob ||
+          (showingReview &&
+            (!canApproveReturnedReview ||
+              resultRequest.current?.review ||
+              (reviewReturn?.visitId &&
+                currentRead.machineReviewVisits?.[reviewReturn.visitId] !==
+                  returnedMachineReview))) ||
           (vmReview &&
             !matchesSavedReviewRender(
               currentSavedReviewRender.current,
@@ -741,6 +810,7 @@ export function WorkflowJob({
   };
   const inspect = async (destination: MachineResultDestination) => {
     if (
+      !isRunEntryCurrent() ||
       !resultEnvironmentId ||
       !resultThreadId ||
       resultRequest.current ||
@@ -748,12 +818,17 @@ export function WorkflowJob({
     )
       return;
     const session = appAtomRegistry.get(managedRelaySessionAtom);
-    const request = { key };
+    const request = {
+      key,
+      entryKey: runEntryKey,
+      review: destination.kind === "diff" && destination.review,
+    };
     resultRequest.current = request;
     const owns = () => {
       const current = appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.job;
       return (
         resultRequest.current === request &&
+        isRunEntryCurrent() &&
         appAtomRegistry.get(managedRelaySessionAtom) === session &&
         current?.runtime?.kind === "machine" &&
         current.runtime.environmentId === resultEnvironmentId &&
@@ -775,7 +850,33 @@ export function WorkflowJob({
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
       const { environmentId, threadId, workflowVmGeneration } = result.value;
       const params = { environmentId, threadId };
+      const machineReviewVisitId =
+        destination.kind === "diff" && destination.review ? randomUUID() : undefined;
       if (destination.kind === "diff") {
+        if (machineReviewVisitId) {
+          beginMachineWorkflowReview(
+            appAtomRegistry,
+            scope,
+            jobId,
+            machineReviewVisitId,
+            runEntryKey,
+            destination.checkpoint,
+          );
+          const sourceEntry = currentMachineReviewSourceEntry(runEntryKey);
+          // Keep the router's entry key and index. Inspection evidence stays in memory.
+          if (sourceEntry)
+            window.history.replaceState(
+              {
+                ...sourceEntry,
+                workflowMachineReviewSource: {
+                  runKey: key,
+                  id: machineReviewVisitId,
+                  checkpoint: destination.checkpoint,
+                },
+              } satisfies MachineReviewSourceEntry,
+              "",
+            );
+        }
         useDiffPanelStore.getState().selectTurn(params, TurnId.make(destination.checkpoint.turnId));
         useRightPanelStore.getState().open(params, "diff");
       }
@@ -784,6 +885,8 @@ export function WorkflowJob({
         params,
         state: (previous) => ({
           ...previous,
+          workflowMachineReviewSource: undefined,
+          workflowMachineReviewVisitId: machineReviewVisitId,
           workflowOrigin: {
             ...scope,
             jobId,
@@ -975,6 +1078,19 @@ export function WorkflowJob({
     (finishing
       ? (canConfigure || manualState.status === "awaiting_review") && completionRetryable
       : manualState.status === "awaiting_review");
+  const showReviewReturnStatus =
+    showingReview &&
+    !manualHold &&
+    !composingFeedback &&
+    !checkpointResponsePending &&
+    !approvalPending &&
+    (!vmReview || reviewingCurrentResult);
+  const showReviewCheck = showReviewReturnStatus && checkingReturnedReview;
+  const reviewReadAfter = Math.max(reviewReturn?.after ?? -1, reviewVisit?.readAfterEpoch ?? -1);
+  const reviewCheckFailed =
+    showReviewCheck && !read.reading && !busy && (!!read.error || read.epoch > reviewReadAfter);
+  const showReviewInspection =
+    showReviewReturnStatus && approval && !!machine && reviewNeedsInspection && !showReviewCheck;
   const oldDrafts = Object.entries(responseDrafts)
     .filter(([id, text]) => {
       if (!text.trim()) return false;
@@ -1087,7 +1203,7 @@ export function WorkflowJob({
               recovery.retrying ||
               manualState.responsePending ||
               (!hasResultSave &&
-                (reviewChanged ||
+                (reviewNeedsInspection ||
                   checkingReturnedReview ||
                   waitingForSavedReviewRender ||
                   manualState.checkpointBlocked))
@@ -1249,40 +1365,44 @@ export function WorkflowJob({
     failedDestination?.kind === "diff" &&
     diffCheckpoint !== undefined &&
     !sameWorkflowResultCheckpoint(failedDestination.checkpoint, diffCheckpoint);
+  const inspectDiffAction =
+    resultEnvironmentId &&
+    resultThreadId &&
+    (openingResult === "diff" ||
+      (!composingFeedback && diffCheckpoint && (!failedDiff || earlierDiff))) ? (
+      <Button
+        ref={inspectResultButton}
+        variant={
+          (waiting && !input && !checkpointResponsePending) || (completed && !pullRequestUrl)
+            ? "default"
+            : "outline"
+        }
+        aria-busy={openingResult === "diff" || undefined}
+        aria-disabled={openingResult === "diff" || undefined}
+        disabled={openingResult === "conversation" || (!openingResult && checkingReturnedReview)}
+        onClick={() => {
+          if (diffCheckpoint)
+            void inspect({ kind: "diff", checkpoint: diffCheckpoint, review: showingReview });
+        }}
+      >
+        {openingResult === "diff" ? (
+          <Spinner aria-hidden />
+        ) : completed ? (
+          <FileDiffIcon aria-hidden />
+        ) : null}
+        {openingResult === "diff"
+          ? resultOpeningLabel
+          : completed
+            ? "Inspect result"
+            : showReviewInspection && returnCheckpointChanged
+              ? "Inspect updated diff"
+              : "Inspect saved diff"}
+      </Button>
+    ) : null;
   const conversationActions =
     resultEnvironmentId && resultThreadId && (!composingFeedback || openingResult) ? (
       <div ref={resultActions} className="flex min-w-0 flex-wrap gap-2 empty:hidden">
-        {openingResult === "diff" ||
-        (!composingFeedback && diffCheckpoint && (!failedDiff || earlierDiff)) ? (
-          <Button
-            ref={inspectResultButton}
-            variant={
-              (waiting && !input && !checkpointResponsePending) || (completed && !pullRequestUrl)
-                ? "default"
-                : "outline"
-            }
-            aria-busy={openingResult === "diff" || undefined}
-            aria-disabled={openingResult === "diff" || undefined}
-            disabled={
-              openingResult === "conversation" || (!openingResult && checkingReturnedReview)
-            }
-            onClick={() => {
-              if (diffCheckpoint)
-                void inspect({ kind: "diff", checkpoint: diffCheckpoint, review: showingReview });
-            }}
-          >
-            {openingResult === "diff" ? (
-              <Spinner aria-hidden />
-            ) : completed ? (
-              <FileDiffIcon aria-hidden />
-            ) : null}
-            {openingResult === "diff"
-              ? resultOpeningLabel
-              : completed
-                ? "Inspect result"
-                : "Inspect saved diff"}
-          </Button>
-        ) : null}
+        {!showReviewInspection ? inspectDiffAction : null}
         {openingResult === "conversation" ||
         (!composingFeedback && failedDestination?.kind !== "conversation") ? (
           <Button
@@ -1592,7 +1712,7 @@ export function WorkflowJob({
           </Tooltip>
         </div>
       </header>
-      {read.error ? (
+      {read.error && !showReviewCheck ? (
         <WorkflowAlert
           title="Could not refresh this run"
           actions={
@@ -1894,19 +2014,6 @@ export function WorkflowJob({
           !(pausedBeforeStep && detail === "Waiting for executor capacity.") ? (
             <p className="text-sm text-muted-foreground">{detail}</p>
           ) : null}
-          {!cancelling &&
-          !hasResultSave &&
-          ((reviewChanged && selectedJob.runtime?.kind !== "vm") ||
-            (checkingReturnedReview && reviewingCurrentResult && !read.error)) ? (
-            <WorkflowAlert
-              title={reviewChanged ? "Review changed" : "Checking the current review"}
-              variant={reviewChanged ? "warning" : "info"}
-            >
-              {reviewChanged
-                ? "Review changed. Inspect the current diff before approving."
-                : "Checking the current review…"}
-            </WorkflowAlert>
-          ) : null}
           {waiting &&
           !manualHold &&
           !input &&
@@ -1930,6 +2037,7 @@ export function WorkflowJob({
               canConfigure={canConfigure}
               onReviewTargetChange={setReviewingCurrentResult}
               onReviewRenderChange={onSavedReviewRenderChange}
+              showSupersededReviewApproval={approval && !manualHold && !confirmationPending}
               onResultsAvailableChange={completed ? onSavedResultsAvailableChange : undefined}
               showCancellationDetail={publishingCancellationDetail === undefined}
               resultsRef={savedResults}
@@ -1974,6 +2082,45 @@ export function WorkflowJob({
               {resultError.detail}
             </WorkflowAlert>
           ) : null}
+          {showReviewCheck ? (
+            reviewCheckFailed ? (
+              <WorkflowAlert
+                title="Couldn’t verify the current review"
+                actions={
+                  <Button
+                    ref={retryReviewCheckButton}
+                    type="button"
+                    size="sm"
+                    onClick={() => void refresh()}
+                  >
+                    <RotateCwIcon aria-hidden />
+                    Retry check
+                  </Button>
+                }
+              >
+                {read.error ??
+                  (approval
+                    ? "Approval needs a fresh check of the result you inspected."
+                    : "Retry the check to see if the result you inspected is still current.")}
+              </WorkflowAlert>
+            ) : (
+              <WorkflowAlert title="Checking the current review" variant="info">
+                {approval
+                  ? "Approval is available once the result you inspected is confirmed current."
+                  : "Checking whether the result you inspected is still current."}
+              </WorkflowAlert>
+            )
+          ) : showReviewInspection ? (
+            <WorkflowAlert
+              title={returnCheckpointChanged ? "Review changed" : "Current diff needs inspection"}
+              variant="warning"
+              actions={inspectDiffAction}
+            >
+              {returnCheckpointChanged
+                ? "Open the current diff before approving."
+                : "Let the saved diff load before returning to approve."}
+            </WorkflowAlert>
+          ) : null}
           {!recovery &&
           (approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
           !manualHold &&
@@ -1993,8 +2140,9 @@ export function WorkflowJob({
                   }
                   disabled={
                     busy ||
-                    reviewChanged ||
+                    reviewNeedsInspection ||
                     checkingReturnedReview ||
+                    (!!machine && openingResult === "diff") ||
                     waitingForSavedReviewRender ||
                     manualState.checkpointBlocked ||
                     approvalPending

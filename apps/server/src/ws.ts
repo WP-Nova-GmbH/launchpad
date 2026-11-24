@@ -2479,7 +2479,11 @@ const makeWsRpcLayer = (
                   cause._tag === "CheckpointWorkflowPinUnavailableError"
                 ) {
                   message = cause.message;
-                } else if (input.strictWorkflowReview || access.workflowVm) {
+                } else if (
+                  input.strictWorkflowReview ||
+                  input.requireComplete ||
+                  access.workflowVm
+                ) {
                   if (cause._tag === "VcsProcessExitError") {
                     message =
                       "The saved workflow checkpoint could not be read. Refresh the run, or cancel it and start again.";

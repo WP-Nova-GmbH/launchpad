@@ -34,6 +34,7 @@ declare module "@tanstack/react-router" {
   interface HistoryState {
     workflowOrigin?: WorkflowResultOrigin | undefined;
     workflowReviewReturn?: WorkflowResultCheckpoint | undefined;
+    workflowMachineReviewVisitId?: string | undefined;
   }
 }
 
@@ -104,7 +105,12 @@ export function WorkflowConversationHeader({
   const { origin, title, repository, readOnly, status } = conversation;
   const call = useWorkflowClient(origin);
   const review = origin.reviewCheckpoint;
-  const vmReview = origin.workflowVmResultReader === true || origin.reviewVisitId !== undefined;
+  const machineReviewVisitId = useLocation({
+    select: ({ state }) => state.workflowMachineReviewVisitId,
+  });
+  const vmReview =
+    !machineReviewVisitId &&
+    (origin.workflowVmResultReader === true || origin.reviewVisitId !== undefined);
   const reviewReadSource = useMemo(
     () =>
       review &&
@@ -223,7 +229,14 @@ export function WorkflowConversationHeader({
               to="/workflows/$repositoryId/jobs/$jobId"
               params={{ repositoryId: origin.repositoryId, jobId: origin.jobId }}
               hash={returnToReview ? WORKFLOW_REVIEW_ANCHOR : ""}
-              state={returnToReview && !vmReview ? { workflowReviewReturn: review } : {}}
+              state={
+                review && !vmReview
+                  ? {
+                      workflowReviewReturn: review,
+                      workflowMachineReviewVisitId: machineReviewVisitId,
+                    }
+                  : {}
+              }
               hashScrollIntoView={false}
             />
           }

@@ -38,6 +38,7 @@ import {
   beginWorkflowReview,
   recordSavedWorkflowReviewDiff,
   requireFreshWorkflowReviewRead,
+  workflowDraftAtom,
   workflowJobAccessLost,
   type WorkflowScope,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -143,6 +144,7 @@ export function SavedWorkflowResults({
   onReviewRenderChange,
   onResultsAvailableChange,
   showCancellationDetail = true,
+  showSupersededReviewApproval,
   resultsRef,
 }: {
   scope: WorkflowScope;
@@ -153,6 +155,7 @@ export function SavedWorkflowResults({
   onReviewRenderChange?: (checkpoint: WorkflowResultCheckpoint | null) => void;
   onResultsAvailableChange?: ((available: boolean) => void) | undefined;
   showCancellationDetail?: boolean;
+  showSupersededReviewApproval?: boolean;
   resultsRef?: RefObject<HTMLElement | null>;
 }) {
   const call = useWorkflowClient(scope);
@@ -173,6 +176,7 @@ export function SavedWorkflowResults({
   } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [browsingHistory, setBrowsingHistory] = useState(false);
+  const [previousCurrentReview, setPreviousCurrentReview] = useState<string | null>(null);
   // A run that ends while someone is reading keeps its result viewer open.
   const [partialResultOpen, setPartialResultOpen] = useState(job.status !== "cancelled");
   const selectedRef = useRef<string | null>(null);
@@ -212,6 +216,7 @@ export function SavedWorkflowResults({
   const busy = readingChanges || readingConversation !== null;
   const [retry, setRetry] = useState(0);
   const [indexRetry, setIndexRetry] = useState(0);
+  const reviewRefreshRequested = useRef(false);
   const [changesRetry, setChangesRetry] = useState(0);
   const [deletion, setDeletion] = useState<DeletionState | null>(null);
   const deletionInFlight = useRef(false);
@@ -230,6 +235,12 @@ export function SavedWorkflowResults({
         savedResults.current?.focus({ preventScroll: true });
     },
     [savedResults],
+  );
+  const reviewResultAction = useCallback(
+    (button: HTMLButtonElement | null) => {
+      if (button) return () => restoreReadFocus(button);
+    },
+    [restoreReadFocus],
   );
   useLayoutEffect(() => {
     if (!restorePageRetryFocus.current) return;
@@ -375,6 +386,8 @@ export function SavedWorkflowResults({
     setIndex(null);
     setSelected(null);
     setBrowsingHistory(false);
+    setPreviousCurrentReview(null);
+    reviewRefreshRequested.current = false;
     setReadingIndex(false);
     setReadingChanges(false);
     setReadingConversation(null);
@@ -429,9 +442,27 @@ export function SavedWorkflowResults({
     },
     [clearSavedResults, scope.repositoryId, job.jobId],
   );
-  const clearInaccessibleResults = useEffectEvent(clearSavedResults);
+  const handleIndexFailure = useEffectEvent(
+    (
+      cause: unknown,
+      requestedRelayUrl: string | undefined,
+      checkingDeletion: boolean,
+      reviewRefreshRequested: boolean,
+    ) => {
+      // The explicit review refresh keeps the open read-only result when local sign-in
+      // fails before the request is sent, while the same account still owns the view.
+      const canKeepIndex =
+        appAtomRegistry.get(workflowDraftAtom).accountId === scope.accountId &&
+        (requestedRelayUrl !== undefined
+          ? requestedRelayUrl === index?.relayUrl
+          : reviewRefreshRequested);
+      if (checkingDeletion || !canKeepIndex || workflowJobAccessLost(cause)) clearSavedResults();
+      setIndexError(cause instanceof Error ? cause.message : "Could not read saved results.");
+    },
+  );
   useEffect(() => {
     if (deleted || waitingForThread) {
+      reviewRefreshRequested.current = false;
       setReadingIndex(false);
       return;
     }
@@ -440,6 +471,7 @@ export function SavedWorkflowResults({
     let requestedRelayUrl: string | undefined;
     const epoch = indexEpoch.current;
     const checkedIntent = deletionIndexCheck.current;
+    const requestedReviewRefresh = reviewRefreshRequested.current;
     void call((client, token) => {
       requestedRelayUrl = client.relayUrl;
       return client
@@ -514,21 +546,14 @@ export function SavedWorkflowResults({
         }
       })
       .catch((cause) => {
-        if (current && epoch === indexEpoch.current) {
-          if (workflowJobAccessLost(cause)) {
-            clearInaccessibleResults();
-          } else if (completed && !checkedIntent && requestedRelayUrl) {
-            setIndex((previous) => (previous?.relayUrl === requestedRelayUrl ? previous : null));
-          } else {
-            setIndex(null);
-            setLoaded(null);
-            setConversation(null);
-          }
-          setIndexError(cause instanceof Error ? cause.message : "Could not read saved results.");
-        }
+        if (current && epoch === indexEpoch.current)
+          handleIndexFailure(cause, requestedRelayUrl, !!checkedIntent, requestedReviewRefresh);
       })
       .finally(() => {
-        if (current && epoch === indexEpoch.current) setReadingIndex(false);
+        if (current && epoch === indexEpoch.current) {
+          reviewRefreshRequested.current = false;
+          setReadingIndex(false);
+        }
       });
     return () => {
       current = false;
@@ -588,14 +613,15 @@ export function SavedWorkflowResults({
     setSelected(id);
   };
   const returnToCurrent = () => {
+    if (!currentResult) {
+      if (readingIndex || reviewRefreshRequested.current) return;
+      reviewRefreshRequested.current = true;
+      setIndexRetry((n) => n + 1);
+      return;
+    }
     setView("changes");
     changesTab.current?.focus();
-    if (currentResult) {
-      selectResult(currentResult.resultId);
-    } else {
-      setBrowsingHistory(false);
-      setRetry((n) => n + 1);
-    }
+    selectResult(currentResult.resultId);
   };
   const saving = job.progress?.resultSaving?.state;
   const resultSavePending = saving === "saving" || saving === "failed";
@@ -603,6 +629,13 @@ export function SavedWorkflowResults({
   const canVerifyResult = !resultSavePending && (reviewAvailable || retryableCompletion);
   const showFinalResultLink = retryableCompletion && currentResult && !resultSavePending;
   const isCurrentReview = reviewingCurrent && reviewAvailable;
+  const scopedResult = result && resultsScope ? `${resultsScope}:${result.resultId}` : null;
+  if (isCurrentReview && scopedResult && scopedResult !== previousCurrentReview)
+    setPreviousCurrentReview(scopedResult);
+  const reviewChanged = scopedResult !== null && scopedResult === previousCurrentReview;
+  const reviewIndexError = reviewAvailable && result && !currentResult ? indexError : null;
+  const reviewIndexPending = !currentResult && readingIndex;
+  const refreshReviewLabel = reviewIndexPending ? "Refreshing results…" : "Refresh results";
   const resultLabel = isCurrentReview
     ? "Current review result"
     : reviewingCurrent
@@ -1147,7 +1180,7 @@ export function SavedWorkflowResults({
           />
         ) : null}
       </header>
-      {indexError && deletion?.state !== "checking" ? (
+      {indexError && !reviewIndexError && deletion?.state !== "checking" ? (
         <WorkflowAlert
           title={result ? "Couldn’t refresh the results list" : "Couldn’t load the results list"}
           actions={
@@ -1168,23 +1201,25 @@ export function SavedWorkflowResults({
           {indexError}
         </WorkflowAlert>
       ) : null}
-      {reviewAvailable && result && !reviewingCurrent ? (
+      {reviewAvailable && result && !reviewingCurrent && browsingHistory ? (
         <WorkflowAlert
-          title={browsingHistory ? "Earlier result" : "A newer result needs review"}
+          title="Earlier result"
           variant="info"
           actions={
-            <Button size="sm" variant="outline" onClick={returnToCurrent}>
-              {currentResult
-                ? browsingHistory
-                  ? "Return to current review"
-                  : "Review latest"
-                : "Refresh results"}
+            <Button
+              ref={reviewResultAction}
+              size="sm"
+              variant="outline"
+              aria-disabled={reviewIndexPending || undefined}
+              aria-busy={reviewIndexPending || undefined}
+              onClick={returnToCurrent}
+            >
+              {currentResult ? "Return to current review" : refreshReviewLabel}
             </Button>
           }
         >
-          {browsingHistory
-            ? "Decisions apply to the current review."
-            : "Your opened result has been kept in place. Open the current result before deciding."}
+          <p>Decisions apply to the current review.</p>
+          {reviewIndexError ? <p>{reviewIndexError}</p> : null}
         </WorkflowAlert>
       ) : null}
       {showFinalResultLink && result && !reviewingCurrent ? (
@@ -1413,6 +1448,39 @@ export function SavedWorkflowResults({
           </>
         ) : null}
       </div>
+      {reviewAvailable && result && !reviewingCurrent && !browsingHistory ? (
+        <WorkflowAlert
+          title={
+            reviewChanged
+              ? "Review changed"
+              : currentResult
+                ? "Current review result ready"
+                : "Waiting for the current review result"
+          }
+          variant={reviewChanged ? "warning" : "info"}
+          actions={
+            <>
+              <Button
+                ref={reviewResultAction}
+                size="sm"
+                aria-disabled={reviewIndexPending || undefined}
+                aria-busy={reviewIndexPending || undefined}
+                onClick={returnToCurrent}
+              >
+                {currentResult ? "Review latest result" : refreshReviewLabel}
+              </Button>
+              {showSupersededReviewApproval ? (
+                <Button size="sm" variant="outline" disabled>
+                  Approve result
+                </Button>
+              ) : null}
+            </>
+          }
+        >
+          <p>You’re viewing an earlier result. Review decisions apply to the current result.</p>
+          {reviewIndexError ? <p>{reviewIndexError}</p> : null}
+        </WorkflowAlert>
+      ) : null}
     </div>
   );
   return (

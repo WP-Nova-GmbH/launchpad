@@ -38,7 +38,10 @@ import {
   type WorkflowResultCheckpoint,
   type WorkflowResultOrigin,
 } from "./workflowResult.ts";
-import { isCompleteWorkflowReviewDiff } from "../state/checkpointDiff.ts";
+import {
+  isCompleteWorkflowReviewDiff,
+  type CheckpointDiffResult,
+} from "../state/checkpointDiff.ts";
 
 export interface WorkflowScope {
   readonly accountId: string;
@@ -156,6 +159,17 @@ interface WorkflowReviewVisit {
 
 export interface WorkflowJobRead {
   readonly job: RepositoryWorkflowJob | null;
+  readonly machineReviewVisits?: Readonly<
+    Record<
+      string,
+      {
+        readonly id: string;
+        readonly sourceEntryKey: string | undefined;
+        readonly checkpoint: WorkflowResultCheckpoint;
+        readonly inspected: boolean;
+      }
+    >
+  >;
   readonly highestRevision: number;
   readonly epoch: number;
   readonly acceptedReadEpoch: number;
@@ -982,6 +996,79 @@ export function activateWorkflowJobView(
     ]),
   );
   registry.set(workflowJobReadAtom, { ...state, activeKey: key, jobs });
+}
+
+/** Identify the exact Machine diff opened from this Run history entry. */
+export function beginMachineWorkflowReview(
+  registry: AtomRegistry.AtomRegistry,
+  scope: WorkflowScope,
+  jobId: string,
+  id: string,
+  sourceEntryKey: string | undefined,
+  checkpoint: WorkflowResultCheckpoint,
+) {
+  const state = registry.get(workflowJobReadAtom);
+  const key = workflowSessionKey(scope, jobId);
+  const read = state.jobs[key];
+  if (state.accountId !== scope.accountId || read?.job?.runtime?.kind !== "machine") return;
+  registry.set(workflowJobReadAtom, {
+    ...state,
+    jobs: {
+      ...state.jobs,
+      [key]: {
+        ...read,
+        machineReviewVisits: {
+          ...read.machineReviewVisits,
+          [id]: { id, sourceEntryKey, checkpoint, inspected: false },
+        },
+      },
+    },
+  });
+}
+
+/** Record the visible, complete diff for the Machine visit carried by the route. */
+export function recordMachineWorkflowReviewDiff(
+  registry: AtomRegistry.AtomRegistry,
+  origin: WorkflowResultOrigin,
+  visitId: string,
+  diff: CheckpointDiffResult,
+) {
+  const state = registry.get(workflowJobReadAtom);
+  const key = workflowSessionKey(origin, origin.jobId);
+  const read = state.jobs[key] ?? emptyWorkflowJobRead;
+  const visit = read.machineReviewVisits?.[visitId];
+  const checkpoint = origin.reviewCheckpoint;
+  if (
+    state.accountId !== origin.accountId ||
+    origin.reviewVisitId !== undefined ||
+    read.job?.runtime?.kind === "vm" ||
+    (read.job?.progress && read.job.progress.threadId !== origin.threadId) ||
+    !checkpoint ||
+    (visit && (visit.inspected || !sameWorkflowResultCheckpoint(visit.checkpoint, checkpoint))) ||
+    diff.threadId !== origin.threadId ||
+    !isCompleteWorkflowReviewDiff(diff, checkpoint.turnId) ||
+    diff.toTurnCount !== checkpoint.checkpointTurnCount ||
+    diff.fromTurnCount !== diff.toTurnCount - 1
+  )
+    return;
+  registry.set(workflowJobReadAtom, {
+    ...state,
+    jobs: {
+      ...state.jobs,
+      [key]: {
+        ...read,
+        machineReviewVisits: {
+          ...read.machineReviewVisits,
+          [visitId]: {
+            id: visitId,
+            sourceEntryKey: visit?.sourceEntryKey,
+            checkpoint,
+            inspected: true,
+          },
+        },
+      },
+    },
+  });
 }
 
 /** Keep labels for local responses even after the full job snapshot is released. */

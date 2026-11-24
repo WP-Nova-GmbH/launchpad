@@ -23,6 +23,7 @@ export interface CheckpointDiffTarget {
   readonly toTurnCount: number | null;
   readonly ignoreWhitespace: boolean;
   readonly strictWorkflowReview?: boolean;
+  readonly requireComplete?: boolean;
   readonly expectedTurnId?: TurnId | undefined;
   /** Isolates a live workflow inspection from ordinary cached reads of the same range. */
   readonly requestKey?: string | undefined;
@@ -36,11 +37,13 @@ export function buildCheckpointDiffTargets(target: CheckpointDiffTarget) {
     toTurnCount,
     requestKey,
     strictWorkflowReview,
+    requireComplete,
     expectedTurnId,
   } = target;
   if (environmentId === null || threadId === null || fromTurnCount === null || toTurnCount === null)
     return { fullThread: null, turn: null } as const;
-  if (strictWorkflowReview && !expectedTurnId) return { fullThread: null, turn: null } as const;
+  if ((strictWorkflowReview || requireComplete) && !expectedTurnId)
+    return { fullThread: null, turn: null } as const;
 
   const query = { environmentId, ...(requestKey ? { cacheScope: requestKey } : {}) };
   if (fromTurnCount === 0 && !expectedTurnId)
@@ -60,8 +63,9 @@ export function buildCheckpointDiffTargets(target: CheckpointDiffTarget) {
         threadId,
         fromTurnCount,
         toTurnCount,
-        ignoreWhitespace: strictWorkflowReview ? false : target.ignoreWhitespace,
+        ignoreWhitespace: strictWorkflowReview || requireComplete ? false : target.ignoreWhitespace,
         ...(strictWorkflowReview ? { strictWorkflowReview: true } : {}),
+        ...(requireComplete ? { requireComplete: true } : {}),
         ...(expectedTurnId ? { expectedTurnId } : {}),
       },
     },

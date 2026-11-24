@@ -268,7 +268,14 @@ const savedMessage = (cursor: number, text: string, attachments?: ReadonlyArray<
     createdAt: result.createdAt,
   });
 let renderer: ReactTestRenderer;
-const view = (currentJob = job, canConfigure = true, showCancellationDetail = true) =>
+const view = (
+  currentJob = job,
+  canConfigure = true,
+  options: Pick<
+    Parameters<typeof SavedWorkflowResults>[0],
+    "showCancellationDetail" | "showSupersededReviewApproval"
+  > = {},
+) =>
   createElement(
     AppAtomRegistryProvider,
     null,
@@ -279,7 +286,7 @@ const view = (currentJob = job, canConfigure = true, showCancellationDetail = tr
       canConfigure,
       onReviewTargetChange: fixture.target,
       onReviewRenderChange: fixture.renderChange,
-      showCancellationDetail,
+      ...options,
     }),
   );
 async function mount(
@@ -1227,10 +1234,12 @@ it("keeps earlier results read-only and returns to the exact current review", ()
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(true);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only"');
+    await act(() => renderer.update(view(job, true, { showSupersededReviewApproval: true })));
     await selectSavedResult(earlier.resultId);
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(false);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only result"');
+    expect(findButton("Approve result")).toBeUndefined();
     await press("Return to current review");
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
     expect(fixture.target).toHaveBeenLastCalledWith(true);
@@ -1238,7 +1247,7 @@ it("keeps earlier results read-only and returns to the exact current review", ()
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.refresh).toHaveBeenCalledTimes(2);
   }));
-it("keeps an opened diff in place when a new checkpoint arrives until Review latest", () =>
+it("keeps the open diff while finding and switching to the new review", () =>
   withClient(async () => {
     const earlier = {
       ...result,
@@ -1266,13 +1275,15 @@ it("keeps an opened diff in place when a new checkpoint arrives until Review lat
       checkpointRef: "new-ref",
       createdAt: "2026-11-10T11:15:00Z",
     };
-    fixture.list.mockResolvedValue({
+    const nextPage = {
       results: [next, result],
       nextCursor: null,
       threadId: "thread",
       generation: 1,
       relayUrl: "https://relay.invalid",
-    });
+    };
+    fixture.list.mockRejectedValueOnce(new Error("Could not refresh the current review."));
+    fixture.list.mockResolvedValue(nextPage);
     fixture.read.mockImplementation(({ resultId }: { resultId: string }) =>
       Promise.resolve({ result: resultId === next.resultId ? next : result, patch }),
     );
@@ -1289,14 +1300,157 @@ it("keeps an opened diff in place when a new checkpoint arrives until Review lat
         },
       },
     };
-    await act(() => renderer.update(view(nextJob)));
+    await act(() => renderer.update(view(nextJob, true, { showSupersededReviewApproval: true })));
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
-    expect(JSON.stringify(renderer.toJSON())).toContain("A newer result needs review");
+    const content = JSON.stringify(renderer.toJSON());
+    expect(content).toContain("Review changed");
+    expect(content).toContain("Could not refresh the current review.");
+    expect(content.indexOf("Review changed")).toBeGreaterThan(content.indexOf('"type":"pre"'));
+    expect(findButton("Approve result")?.props.disabled).toBe(true);
     expect(fixture.target).toHaveBeenLastCalledWith(false);
-    await press("Review latest");
+    expect(findButton("Review latest result")).toBeUndefined();
+    expect(findButton("Retry loading results")).toBeUndefined();
+
+    const resultsRefresh = deferred<typeof nextPage>();
+    const indexReads = fixture.list.mock.calls.length;
+    const diffReads = fixture.read.mock.calls.length;
+    fixture.list.mockReturnValueOnce(resultsRefresh.promise);
+    await press("Refresh results");
+    expect(findButton("Refreshing results…")?.props["aria-disabled"]).toBe(true);
+    await press("Refreshing results…");
+    expect(fixture.list).toHaveBeenCalledTimes(indexReads + 1);
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+
+    await act(() => resultsRefresh.resolve(nextPage));
+    expect(JSON.stringify(renderer.toJSON())).not.toContain(
+      "Could not refresh the current review.",
+    );
+    expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
+    expect(fixture.read).toHaveBeenCalledTimes(diffReads);
+    await act(() => renderer.update(view(nextJob)));
+    expect(findButton("Approve result")).toBeUndefined();
+    await press("Review latest result");
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(next.resultId);
     expect(fixture.target).toHaveBeenLastCalledWith(true);
+    expect(findButton("Approve result")).toBeUndefined();
   }));
+it.each(["access lost", "relay changed", "no relay identified"] as const)(
+  "clears the open result when a review index refresh fails with %s",
+  (failure) =>
+    withClient(async (client) => {
+      await mount();
+      const diff = renderer.root.findByType("pre");
+      expect(diff.props.items[0].id).toContain(result.resultId);
+      await act(() => diff.props.options.onPostRender());
+      expect(fixture.renderChange).toHaveBeenLastCalledWith(
+        expect.objectContaining({ checkpointId: job.progress!.checkpoint!.checkpointId }),
+      );
+
+      if (failure === "no relay identified") {
+        fixture.call.mockRejectedValueOnce(new WorkflowRequestNotSentError("Could not sign in."));
+      } else {
+        if (failure === "relay changed") client.relayUrl = "https://other-relay.invalid";
+        fixture.list.mockRejectedValueOnce(
+          failure === "relay changed"
+            ? new Error("The connected relay is temporarily unavailable.")
+            : ManagedRelay.relayRequestError("listSavedWorkflowResults")(
+                new RelayTenancyNotFoundError({
+                  code: "tenancy_not_found",
+                  reason: "thread_not_found",
+                  traceId: "hidden-thread",
+                }),
+              ),
+        );
+      }
+      await act(() =>
+        renderer.update(
+          view({
+            ...job,
+            progress: {
+              ...job.progress!,
+              revision: 2,
+              resultSaving: {
+                publicationId: "77777777-7777-4777-8777-777777777777",
+                resultId: result.resultId,
+                state: "saved",
+                detail: null,
+                retryable: false,
+              },
+            },
+          }),
+        ),
+      );
+
+      expect(renderer.root.findAllByType("pre")).toHaveLength(0);
+      expect(fixture.renderChange).toHaveBeenLastCalledWith(null);
+      expect(findPicker()).toBeUndefined();
+      expect(findButton("Retry loading results")).toBeDefined();
+      expect(findButton("Refresh results")).toBeUndefined();
+    }),
+);
+it.each(["same relay", "local sign-in"] as const)(
+  "keeps the first review fallback and open conversation when a manual refresh fails at %s",
+  (failure) =>
+    withClient(async () => {
+      const earlier = {
+        ...result,
+        resultId: "33333333-3333-4333-8333-333333333333",
+        turnId: "earlier",
+      };
+      fixture.list.mockResolvedValue({
+        results: [earlier],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+      });
+      fixture.read.mockResolvedValue({ result: earlier, patch });
+      fixture.history.mockResolvedValue({
+        entries: [savedConversationStart(), savedMessage(2, "Earlier conversation")],
+      } satisfies RelayThreadHistoryPage);
+      const body = {};
+      const ownerDocument = { body, activeElement: body };
+      const refreshAction = { ownerDocument };
+      const changesTab = { focus: vi.fn() };
+      await mount(job, true, {
+        createNodeMock: ({ type, props }) => {
+          if (type !== "button") return null;
+          const { children } = props as { children?: unknown };
+          if (children === "Refresh results") return refreshAction;
+          if (children === "Changes") return changesTab;
+          return null;
+        },
+      });
+      expect(JSON.stringify(renderer.toJSON())).toContain("Waiting for the current review result");
+      expect(JSON.stringify(renderer.toJSON())).not.toContain("Review changed");
+      await press("Conversation");
+      ownerDocument.activeElement = refreshAction;
+      const failedRefresh = deferred<never>();
+      if (failure === "local sign-in") fixture.call.mockReturnValueOnce(failedRefresh.promise);
+      else fixture.list.mockReturnValueOnce(failedRefresh.promise);
+      await press("Refresh results");
+      expect(findButton("Conversation")?.props["aria-selected"]).toBe(true);
+      expect(JSON.stringify(renderer.toJSON())).toContain("Earlier conversation");
+      expect(ownerDocument.activeElement).toBe(refreshAction);
+      expect(changesTab.focus).not.toHaveBeenCalled();
+
+      const message =
+        failure === "local sign-in" ? "Could not sign in." : "Could not reach the relay.";
+      await act(() =>
+        failedRefresh.reject(
+          failure === "local sign-in"
+            ? new WorkflowRequestNotSentError(message)
+            : new Error(message),
+        ),
+      );
+      expect(JSON.stringify(renderer.toJSON())).toContain(message);
+      expect(JSON.stringify(renderer.toJSON())).toContain("Earlier conversation");
+      expect(findButton("Conversation")?.props["aria-selected"]).toBe(true);
+      expect(findButton("Refresh results")?.props["aria-disabled"]).toBeUndefined();
+      expect(findButton("Retry loading results")).toBeUndefined();
+      expect(fixture.history).toHaveBeenCalledTimes(1);
+      expect(ownerDocument.activeElement).toBe(refreshAction);
+    }),
+);
 it.each(["awaiting_review", "finishing"] as const)(
   "keeps the exact saved diff inspectable without prompting for another review during %s completion",
   (status) =>
@@ -1367,7 +1521,7 @@ it.each(["awaiting_review", "finishing"] as const)(
       await selectSavedResult(earlier.resultId);
       expect(renderer.root.findByType("pre").props.items[0].id).toContain(earlier.resultId);
       const content = JSON.stringify(renderer.toJSON());
-      expect(content).not.toContain("A newer result needs review");
+      expect(content).not.toContain("Review changed");
       expect(content).not.toContain("Return to current review");
       expect(content).not.toContain("Decisions apply to the current review");
       await press("Open result for final checks");
@@ -1710,7 +1864,7 @@ it.each([
               progress: { ...job.progress!, status: "cancelled", checkpoint: null },
             },
             true,
-            showCancellationDetail,
+            { showCancellationDetail },
           ),
         );
       });

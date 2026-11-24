@@ -251,6 +251,28 @@ describe("diffPanelStore", () => {
           },
         },
       });
+
+      const approvalTarget = buildDiffPanelCheckpointTarget(
+        { ...THREAD_REF, checkpointTurnCount: undefined, ignoreWhitespace: true },
+        scope,
+        "panel",
+        "machine-visit",
+      );
+      expect(buildCheckpointDiffTargets(approvalTarget)).toEqual({
+        fullThread: null,
+        turn: {
+          environmentId: THREAD_REF.environmentId,
+          cacheScope: "machine-visit:panel",
+          input: {
+            threadId: THREAD_REF.threadId,
+            fromTurnCount: count - 1,
+            toTurnCount: count,
+            ignoreWhitespace: false,
+            requireComplete: true,
+            expectedTurnId: turnId,
+          },
+        },
+      });
     },
   );
 

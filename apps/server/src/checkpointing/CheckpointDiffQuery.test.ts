@@ -155,7 +155,7 @@ describe("CheckpointDiffQuery.layer", () => {
   );
 
   it.effect(
-    "uses immutable pins for strict reviews and verifies Machine review identity before reading refs",
+    "requires full patches for VM and Machine approval using their respective checkpoint refs",
     () =>
       Effect.gen(function* () {
         const projectId = ProjectId.make("project-1");
@@ -266,35 +266,43 @@ describe("CheckpointDiffQuery.layer", () => {
           ),
         );
 
-        const { result, strictResult, machineResult } = yield* Effect.gen(function* () {
-          const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
-          const input = {
-            threadId,
-            fromTurnCount: 0,
-            toTurnCount: 1,
-            ignoreWhitespace: true,
-          };
-          const result = yield* query.getTurnDiff(input);
-          const strict = { ...input, strictWorkflowReview: true, expectedTurnId };
-          const strictResult = yield* query.getTurnDiff(strict);
-          const mismatchedTurn = yield* Effect.flip(
-            query.getTurnDiff({ ...strict, expectedTurnId: TurnId.make("reused-count") }),
-          );
-          expect(mismatchedTurn._tag).toBe("CheckpointWorkflowPinUnavailableError");
-          const oldRequest = yield* Effect.flip(
-            query.getTurnDiff({ ...input, strictWorkflowReview: true }),
-          );
-          expect(oldRequest._tag).toBe("CheckpointWorkflowPinUnavailableError");
-          pinAvailable = false;
-          const missingPin = yield* Effect.flip(query.getTurnDiff(strict));
-          expect(missingPin._tag).toBe("CheckpointWorkflowPinUnavailableError");
-          const wrongMachineTurn = yield* Effect.flip(
-            query.getTurnDiff({ ...input, expectedTurnId: TurnId.make("replaced-machine-turn") }),
-          );
-          expect(wrongMachineTurn._tag).toBe("CheckpointWorkflowPinUnavailableError");
-          const machineResult = yield* query.getTurnDiff({ ...input, expectedTurnId });
-          return { result, strictResult, machineResult };
-        }).pipe(Effect.provide(layer));
+        const { result, strictResult, machineResult, machineApproval } = yield* Effect.gen(
+          function* () {
+            const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
+            const input = {
+              threadId,
+              fromTurnCount: 0,
+              toTurnCount: 1,
+              ignoreWhitespace: true,
+            };
+            const result = yield* query.getTurnDiff(input);
+            const strict = { ...input, strictWorkflowReview: true, expectedTurnId };
+            const strictResult = yield* query.getTurnDiff(strict);
+            const mismatchedTurn = yield* Effect.flip(
+              query.getTurnDiff({ ...strict, expectedTurnId: TurnId.make("reused-count") }),
+            );
+            expect(mismatchedTurn._tag).toBe("CheckpointWorkflowPinUnavailableError");
+            const oldRequest = yield* Effect.flip(
+              query.getTurnDiff({ ...input, strictWorkflowReview: true }),
+            );
+            expect(oldRequest._tag).toBe("CheckpointWorkflowPinUnavailableError");
+            pinAvailable = false;
+            const missingPin = yield* Effect.flip(query.getTurnDiff(strict));
+            expect(missingPin._tag).toBe("CheckpointWorkflowPinUnavailableError");
+            const wrongMachineTurn = yield* Effect.flip(
+              query.getTurnDiff({ ...input, expectedTurnId: TurnId.make("replaced-machine-turn") }),
+            );
+            expect(wrongMachineTurn._tag).toBe("CheckpointWorkflowPinUnavailableError");
+            const machineResult = yield* query.getTurnDiff({ ...input, expectedTurnId });
+            const machine = { ...input, expectedTurnId, requireComplete: true };
+            const wrongMachineRange = yield* Effect.flip(
+              query.getTurnDiff({ ...machine, fromTurnCount: 1 }),
+            );
+            expect(wrongMachineRange._tag).toBe("CheckpointWorkflowPinUnavailableError");
+            const machineApproval = yield* query.getTurnDiff(machine);
+            return { result, strictResult, machineResult, machineApproval };
+          },
+        ).pipe(Effect.provide(layer));
 
         const expectedFromRef = checkpointRefForThreadTurn(threadId, 0);
         expect(diffCheckpointsCalls).toEqual([
@@ -317,6 +325,13 @@ describe("CheckpointDiffQuery.layer", () => {
             toCheckpointRef,
             ignoreWhitespace: true,
           },
+          {
+            cwd: "/tmp/workspace",
+            fromCheckpointRef: expectedFromRef,
+            toCheckpointRef,
+            ignoreWhitespace: false,
+            requireComplete: true,
+          },
         ]);
         expect(result).toEqual({
           threadId,
@@ -333,6 +348,7 @@ describe("CheckpointDiffQuery.layer", () => {
           targetTurnId: expectedTurnId,
         });
         expect(machineResult).toEqual({ ...result, targetTurnId: expectedTurnId });
+        expect(machineApproval).toEqual(strictResult);
       }),
   );
 

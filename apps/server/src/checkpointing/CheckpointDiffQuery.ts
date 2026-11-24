@@ -231,8 +231,9 @@ export const make = Effect.gen(function* () {
     function* (input) {
       const operation = "CheckpointDiffQuery.getTurnDiff";
       const strictWorkflowReview = input.strictWorkflowReview === true;
+      const requireComplete = strictWorkflowReview || input.requireComplete === true;
       const expectedTurnId = input.expectedTurnId;
-      const ignoreWhitespace = !strictWorkflowReview && (input.ignoreWhitespace ?? true);
+      const ignoreWhitespace = !requireComplete && (input.ignoreWhitespace ?? true);
       yield* Effect.annotateCurrentSpan({
         "checkpoint.thread_id": input.threadId,
         "checkpoint.from_turn_count": input.fromTurnCount,
@@ -241,7 +242,7 @@ export const make = Effect.gen(function* () {
       });
 
       if (
-        !strictWorkflowReview &&
+        !requireComplete &&
         expectedTurnId === undefined &&
         input.fromTurnCount === input.toTurnCount
       ) {
@@ -302,15 +303,19 @@ export const make = Effect.gen(function* () {
           turnCount: input.toTurnCount,
         });
       if (
-        (strictWorkflowReview || expectedTurnId !== undefined) &&
+        requireComplete &&
+        (expectedTurnId === undefined || input.fromTurnCount !== input.toTurnCount - 1)
+      )
+        return yield* unavailable();
+      if (
+        expectedTurnId !== undefined &&
         (targetCheckpoint?.turnId !== expectedTurnId || targetCheckpoint?.status !== "ready")
       )
         return yield* unavailable();
 
       const binding = yield* workflowRuns.getVmBindingForThread(input.threadId);
       if (strictWorkflowReview) {
-        if (!targetCheckpoint || input.fromTurnCount !== input.toTurnCount - 1)
-          return yield* unavailable();
+        if (!targetCheckpoint) return yield* unavailable();
         const pin = yield* workflowRuns.getCheckpointPinForTurn(
           input.threadId,
           targetCheckpoint.turnId,
@@ -362,7 +367,7 @@ export const make = Effect.gen(function* () {
         toCheckpointRef,
         fallbackFromToHead: false,
         ignoreWhitespace,
-        ...(strictWorkflowReview ? { requireComplete: true } : {}),
+        ...(requireComplete ? { requireComplete: true } : {}),
         ...(binding ? { pinned: true } : {}),
       }).pipe(Effect.withSpan("checkpoint.turnDiff.diffCheckpoints"));
       yield* verifySharedPatch(binding, diff);
@@ -370,7 +375,7 @@ export const make = Effect.gen(function* () {
       const turnDiff = {
         ...buildTurnDiffResult(input, diff),
         ...(expectedTurnId !== undefined ? { targetTurnId: expectedTurnId } : {}),
-        ...(strictWorkflowReview ? { completeWorkflowReview: true as const } : {}),
+        ...(requireComplete ? { completeWorkflowReview: true as const } : {}),
       };
       if (!isTurnDiffResult(turnDiff)) {
         return yield* new CheckpointDiffResultInvalidError({

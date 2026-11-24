@@ -2837,6 +2837,8 @@ export const OrchestrationGetTurnDiffInput = TurnCountRange.mapFields(
     threadId: ThreadId,
     ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
     strictWorkflowReview: Schema.optionalKey(Schema.Boolean),
+    // Request an unfiltered, single-turn patch without requiring a VM checkpoint pin.
+    requireComplete: Schema.optionalKey(Schema.Boolean),
     expectedTurnId: Schema.optionalKey(TurnId),
   }),
   { unsafePreserveChecks: true },
