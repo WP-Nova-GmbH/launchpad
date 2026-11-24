@@ -1799,6 +1799,104 @@ describe("workflow result location navigation", () => {
   });
 });
 
+describe("manual run instructions", () => {
+  const running = {
+    ...job,
+    origin: { kind: "manual", userId: scope.accountId },
+    status: "running",
+    progress: { ...job.progress!, status: "running", checkpoint: null },
+  } satisfies RepositoryWorkflowJob;
+
+  function instructions() {
+    const heading = renderer!.root
+      .findAllByType("h2")
+      .find((node) => text(node) === "Run instructions");
+    expect(heading).toBeDefined();
+    const section = renderer!.root
+      .findAllByType("section")
+      .find((node) => node.props["aria-labelledby"] === heading!.props.id);
+    expect(section).toBeDefined();
+    return section!;
+  }
+
+  it("shows short multiline instructions below the active task without a disclosure", async () => {
+    const instruction = "Draft the release notes.\nFlag any breaking changes.";
+    fixture.call.mockResolvedValue({ ...running, instruction });
+    await mount();
+
+    const section = instructions();
+    expect(text(section)).toContain(instruction);
+    expect(section.findAllByType("button")).toHaveLength(0);
+    const task = renderer!.root.findByProps({ "aria-label": "Current workflow task" });
+    const sections = renderer!.root.findAllByType("section");
+    expect(sections.indexOf(task)).toBeLessThan(sections.indexOf(section));
+    for (const header of renderer!.root.findAllByType("header")) {
+      expect(text(header)).not.toContain(instruction);
+    }
+  });
+
+  it.each([
+    ["running", "Running"],
+    ["done", "Workflow completed"],
+  ] as const)(
+    "places instructions between the %s VM task summary and saved results",
+    async (status, summary) => {
+      const instruction = "Draft the release notes.";
+      fixture.call.mockResolvedValue({
+        ...running,
+        instruction,
+        runtime: { kind: "vm", threadId: running.progress.threadId },
+        status,
+        progress: { ...running.progress, status },
+      } satisfies RepositoryWorkflowJob);
+      await mount();
+
+      const task = renderer!.root.findByProps({ "aria-label": "Current workflow task" });
+      const results = renderer!.root.findByProps({ "aria-label": "Saved workflow results" });
+      const section = instructions();
+      const sections = renderer!.root.findAllByType("section");
+      expect(text(task)).toContain(summary);
+      expect(sections.indexOf(task)).toBeLessThan(sections.indexOf(section));
+      expect(sections.indexOf(section)).toBeLessThan(sections.indexOf(results));
+    },
+  );
+
+  it("opens long instructions verbatim and starts collapsed on another run", async () => {
+    const introduction = "Prepare the release notes for v0.9.0.";
+    const instruction = [
+      introduction,
+      "",
+      "1. Review the changes merged since v0.8.0 and group them by feature, fix, or maintenance.",
+      "2. Call out breaking changes and document any upgrade steps.",
+      "3. Check the new settings and keyboard shortcuts against the desktop beta.",
+      "4. Link to pull requests when they explain a user-facing change.",
+      "",
+      "Keep the draft in CHANGELOG.md and leave it ready for review.",
+    ].join("\n");
+    fixture.call.mockResolvedValue({ ...running, instruction });
+    await mount();
+
+    expect(text(instructions())).toContain(introduction);
+    expect(text(instructions())).not.toContain("CHANGELOG.md");
+    expect(findButton("Show full instructions").props["aria-expanded"]).toBe(false);
+    await press("Show full instructions");
+    expect(text(instructions())).toContain(instruction);
+    expect(findButton("Hide full instructions").props["aria-expanded"]).toBe(true);
+    await press("Hide full instructions");
+    expect(text(instructions())).not.toContain("CHANGELOG.md");
+
+    await press("Show full instructions");
+    await press("Refresh run");
+    expect(text(instructions())).toContain(instruction);
+
+    fixture.locationKey = "other-run-entry";
+    fixture.call.mockResolvedValue({ ...running, jobId: "other-run", instruction });
+    await act(async () => renderer!.update(view("other-run")));
+    expect(findButton("Show full instructions").props["aria-expanded"]).toBe(false);
+    expect(text(instructions())).not.toContain("CHANGELOG.md");
+  });
+});
+
 describe("workflow run presentation", () => {
   const review = {
     ...job,

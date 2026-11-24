@@ -29,6 +29,7 @@ import {
   type WorkflowRecoveryOperation,
 } from "./WorkflowCompletionRecovery";
 import { WorkflowIssueDetails } from "./WorkflowIssueDetails";
+import { WorkflowRunInstructions } from "./WorkflowRunInstructions";
 import {
   WorkflowCheckpointHistory,
   WorkflowUnsentDrafts,
@@ -1248,6 +1249,12 @@ export function WorkflowJob({
   const statusLabel = workflowStatusLabel(selectedJob.status);
   const runName = selectedJob.workflow?.definition.name ?? "Workflow run";
   const runIssue = selectedJob.issueSnapshot ?? selectedJob.event;
+  const runOrigin = selectedJob.origin?.kind ?? selectedJob.originSummary?.kind;
+  const manualRun = runOrigin === "manual" || (runOrigin === undefined && !runIssue);
+  const vmRun = vmReview || !!selectedJob.vmAdmission;
+  const runInstructions = manualRun ? (
+    <WorkflowRunInstructions key={`instructions:${key}`} instruction={selectedJob.instruction} />
+  ) : null;
   const runContext = runIssue
     ? `${runIssue.identifier} ${runIssue.title}`
     : selectedJob.instruction;
@@ -1683,7 +1690,7 @@ export function WorkflowJob({
             ) : null}
           </div>
         </div>
-        <WorkflowIssueDetails key={key} job={selectedJob} />
+        {!manualRun ? <WorkflowIssueDetails key={key} job={selectedJob} /> : null}
         {selectedJob.origin?.kind === "automation" ? (
           <p className="mt-1 text-xs text-muted-foreground">Started by workflow</p>
         ) : null}
@@ -2026,6 +2033,7 @@ export function WorkflowJob({
                 : "Approval completes this workflow."}
             </p>
           ) : null}
+          {vmRun ? runInstructions : null}
           {!composingFeedback && selectedJob.runtime?.kind === "vm" ? (
             <SavedWorkflowResults
               key={`${scope.accountId}:${scope.repositoryId}:${jobId}`}
@@ -2175,6 +2183,7 @@ export function WorkflowJob({
             </div>
           ) : null}
         </section>
+        {vmRun ? null : runInstructions}
         <WorkflowUnsentDrafts
           key={`drafts:${key}`}
           drafts={oldDrafts}

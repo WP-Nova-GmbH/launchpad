@@ -49,6 +49,7 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
+import { cn } from "../../lib/utils";
 import { searchableSetting } from "../settings/settingsSearch";
 import { Button } from "../ui/button";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
@@ -1339,7 +1340,13 @@ function WorkflowRepositoryView({
       <WorkspacePageHeader electron={isElectron}>
         <h1 className="text-sm font-medium">Workflows</h1>
       </WorkspacePageHeader>
-      <div className="min-h-0 flex-1 overflow-y-auto" data-workflow-runs-scroll-container>
+      <div
+        className={cn(
+          "min-h-0 flex-1 overflow-y-auto",
+          view === "job" && "scrollbar-gutter-stable",
+        )}
+        data-workflow-runs-scroll-container
+      >
         <WorkspacePageContainer width="expanded">
           {!(view === "job" && jobId && loaded) ? (
             <div className="flex flex-wrap items-center justify-between gap-3">
