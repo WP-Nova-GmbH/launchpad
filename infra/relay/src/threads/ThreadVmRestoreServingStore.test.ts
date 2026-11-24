@@ -106,6 +106,55 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
             }),
           ),
       );
+      it.effect("retries an interrupted snapshot lookup without searching for a native boot", () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* nativeRestoreFixture();
+            yield* f.commit;
+            yield* f.sql`UPDATE relay_thread_vm_restores SET error_code='snapshot_unconfirmed'
+                WHERE operation_id=${f.input.operationId}`;
+            const checking = yield* Deferred.make<void>();
+            const checkingWorker = f.worker({
+              restore: {
+                resolveSource: () =>
+                  Deferred.succeed(checking, undefined).pipe(Effect.andThen(Effect.never)),
+              },
+              createFromSnapshot: () => Effect.die("Snapshot validation must finish before create"),
+            });
+            const stoppedWorker = yield* Effect.forkScoped(checkingWorker.runOne());
+            yield* Deferred.await(checking);
+            expect(yield* f.restores.get(f.input.operationId)).toMatchObject({
+              phase: "committed",
+              bootCreateStarted: false,
+              bootReceipt: null,
+            });
+            yield* Fiber.interrupt(stoppedWorker);
+            yield* f.sql`UPDATE relay_thread_vm_restores SET claim_until=clock_timestamp()-interval '1 second'
+                WHERE operation_id=${f.input.operationId}`;
+
+            expect(
+              yield* f
+                .worker({
+                  findOperation: () => Effect.die("No create was issued before interruption"),
+                  createFromSnapshot: () =>
+                    Effect.gen(function* () {
+                      expect(yield* f.restores.get(f.input.operationId)).toMatchObject({
+                        phase: "creating",
+                        bootCreateStarted: true,
+                        errorCode: null,
+                      });
+                      return yield* f.compute.createFromSnapshot();
+                    }).pipe(Effect.orDie),
+                })
+                .runOne(),
+            ).toBe(true);
+            expect(yield* f.restores.get(f.input.operationId)).toMatchObject({
+              phase: "booted",
+              bootReceipt: { sandboxId: f.sandboxId },
+            });
+          }),
+        ),
+      );
       it.effect(
         "lost create response never dispatches a second create and holds quota across claims",
         () =>

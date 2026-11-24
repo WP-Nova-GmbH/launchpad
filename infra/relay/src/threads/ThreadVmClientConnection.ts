@@ -2,6 +2,7 @@ import { ThreadId } from "@t3tools/contracts";
 import type {
   RelayManagedEndpoint,
   RelayCloudEnvironmentHealthProofPayload,
+  RelayWorkflowVmFollowUpConnection,
 } from "@t3tools/contracts/relay";
 import {
   normalizeRelayIssuer,
@@ -53,7 +54,11 @@ export const DevThreadVmClientEndpoint = Context.Reference<
 
 /** A recorded VM identity never falls through to personal-link or organization-machine access. */
 const resolveThreadVmEndpoint = Effect.fn("relay.thread_vm_client.resolve")(function* (
-  input: { userId: string; environmentId: string },
+  input: {
+    userId: string;
+    environmentId: string;
+    workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
+  },
   operation: "connect" | "status",
   transport: typeof fetch,
 ) {
@@ -64,11 +69,14 @@ const resolveThreadVmEndpoint = Effect.fn("relay.thread_vm_client.resolve")(func
   }>`SELECT b.thread_id AS "threadId", coalesce(t.audience='repository',false) AS workflow
     FROM relay_thread_vm_bindings b LEFT JOIN relay_thread_placements t ON t.thread_id=b.thread_id
     WHERE b.environment_id = ${input.environmentId}`;
+  if (input.workflowFollowUp && !binding?.workflow)
+    return yield* new ThreadVmConnectionUnavailable();
   if (!binding) return null;
   const threadId = ThreadId.make(binding.threadId);
   const settings = yield* RelayConfiguration;
   const readTarget = binding.workflow
-    ? authorizeWorkflowVmViewerConnection
+    ? (userId: string, threadId: ThreadId) =>
+        authorizeWorkflowVmViewerConnection(userId, threadId, input.workflowFollowUp)
     : operation === "connect"
       ? authorizeThreadVmConnection
       : authorizeThreadVmStatus;
@@ -140,6 +148,7 @@ export const connectThreadVmIfBound = Effect.fn("relay.thread_vm_client.connect"
       environmentId: string;
       clientProofKeyThumbprint: string;
       deviceId?: string;
+      workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
     },
     transport: typeof fetch = fetch,
   ) {

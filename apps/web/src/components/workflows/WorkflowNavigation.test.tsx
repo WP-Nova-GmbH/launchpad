@@ -15,10 +15,13 @@ import {
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { useWorkflowConversation, WorkflowConversationHeader } from "./WorkflowNavigation";
 
+vi.mock("../../state/workflowVmFollowUp", () => ({ pushWorkflowVmFollowUp: "follow-up-push" }));
 const fixture = vi.hoisted(() => ({
   origin: undefined as WorkflowResultOrigin | undefined,
   call: vi.fn(),
+  push: vi.fn(),
 }));
+vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => fixture.push }));
 vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => true }));
 vi.mock("../../cloud/managedRelayState", () => ({
   useManagedRelayOrganizationCatalog: () => ({
@@ -71,11 +74,21 @@ const review = {
 } satisfies RepositoryWorkflowJob;
 
 function Header({ threadJob }: { threadJob: typeof ThreadWorkflowJob.Type | null | undefined }) {
+  const generation = fixture.origin?.workflowVmFollowUpGeneration;
   const conversation = useWorkflowConversation({
+    environmentId: EnvironmentId.make("machine"),
+    origin: fixture.origin ?? null,
     threadId: origin.threadId,
     threadTitle: "Run",
     threadJob,
-    capabilities: undefined,
+    followUp: generation !== undefined,
+    capabilities:
+      generation === undefined
+        ? undefined
+        : {
+            repositoryIdentity: true,
+            workflowVmFollowUp: { threadId: origin.threadId, generation },
+          },
   });
   return conversation ? <WorkflowConversationHeader conversation={conversation} /> : null;
 }
@@ -92,6 +105,7 @@ beforeEach(() => {
   });
   fixture.origin = origin;
   fixture.call.mockReset();
+  fixture.push.mockReset();
   appAtomRegistry.set(managedRelaySessionAtom, {
     accountId: origin.accountId,
     readClerkToken: () => Effect.succeed("token"),
@@ -220,4 +234,29 @@ it("updates the return link when the review changes while the diff is open", asy
   ).toBe(true);
   expect(renderer!.root.findByType("a").children).toContain("Back to run");
   expect(renderer!.root.findByType("a").props.href).toBe("#");
+});
+
+it("checks the same push and shows a conflict even when the receipt has no detail", async () => {
+  fixture.origin = { ...origin, workflowVmFollowUpGeneration: 3 };
+  const receipt = { operationId: "receipt", branch: "launchpad/run", detail: null };
+  fixture.push
+    .mockResolvedValueOnce({ _tag: "Success", value: { ...receipt, status: "pending" } })
+    .mockResolvedValueOnce({ _tag: "Success", value: { ...receipt, status: "conflict" } });
+  await mountHeader(null, "done");
+
+  const click = (label: string) =>
+    act(async () => {
+      const button = renderer!.root
+        .findAllByType("button")
+        .find((node) => node.children.includes(label));
+      expect(button).toBeDefined();
+      button!.props.onClick();
+    });
+  await click("Push");
+  await click("Check push");
+
+  expect(fixture.push.mock.calls[1]?.[0].input.operationId).toBe("receipt");
+  expect(renderer!.root.findByProps({ role: "alert" }).children).toContain(
+    "The workflow branch changed on GitHub.",
+  );
 });

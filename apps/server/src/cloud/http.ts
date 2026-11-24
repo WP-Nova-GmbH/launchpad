@@ -11,6 +11,9 @@ import {
   AuthRelayWriteScope,
   AuthStandardClientScopes,
   AuthOrchestrationReadScope,
+  AuthOrchestrationOperateScope,
+  AuthTerminalOperateScope,
+  AuthWorkflowVmFollowUpScope,
   EnvironmentCloudEndpointUnavailableError,
   EnvironmentCloudLinkStateResult,
   EnvironmentCloudRelayConfigResult,
@@ -1676,23 +1679,37 @@ export const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCrede
       });
     }
     const proof = proofOption.value;
-    yield* repositoryAccess
-      .requireMember({
-        user: {
-          userId: proof.sub,
-          displayName: proof.name ?? null,
-          imageUrl: proof.picture ?? null,
-          ...(proof.email ? { email: proof.email } : {}),
-        },
-      })
-      .pipe(
-        Effect.mapError(
-          () =>
-            new EnvironmentHttpUnauthorizedError({
-              message: "Repository policy is unavailable or access was removed.",
-            }),
-        ),
-      );
+    const actor = {
+      user: {
+        userId: proof.sub,
+        displayName: proof.name ?? null,
+        imageUrl: proof.picture ?? null,
+        ...(proof.email ? { email: proof.email } : {}),
+      },
+    };
+    const followUp = repositoryAccess.workflowFollowUp;
+    if (
+      proof.workflowFollowUp &&
+      (!vm ||
+        !followUp ||
+        proof.workflowFollowUp.threadId !== followUp.threadId ||
+        proof.workflowFollowUp.generation !== followUp.generation)
+    )
+      return yield* new EnvironmentHttpUnauthorizedError({
+        message: "Workflow VM follow-up connection is unavailable.",
+      });
+    yield* (
+      proof.workflowFollowUp && followUp
+        ? followUp.prepareActor(actor)
+        : repositoryAccess.requireMember(actor)
+    ).pipe(
+      Effect.mapError(
+        () =>
+          new EnvironmentHttpUnauthorizedError({
+            message: "Repository policy is unavailable or access was removed.",
+          }),
+      ),
+    );
 
     const jtiSecretName = `${CLOUD_MINT_JTI_PREFIX}${proof.jti}`;
     const nonceSecretName = `${CLOUD_MINT_NONCE_PREFIX}${proof.nonce}`;
@@ -1711,7 +1728,16 @@ export const cloudMintCredentialHandler = Effect.fn("environment.cloud.mintCrede
     // The relay vouched for `sub`; carrying the person into the session is
     // what lets a shared executor say who wrote what.
     const issued = yield* dependencies.environmentAuth.createPairingLink({
-      scopes: repositoryAccess.workflowVm ? [AuthOrchestrationReadScope] : AuthStandardClientScopes,
+      scopes: proof.workflowFollowUp
+        ? [
+            AuthOrchestrationReadScope,
+            AuthOrchestrationOperateScope,
+            AuthTerminalOperateScope,
+            AuthWorkflowVmFollowUpScope,
+          ]
+        : repositoryAccess.workflowVm
+          ? [AuthOrchestrationReadScope]
+          : AuthStandardClientScopes,
       subject: "cloud-connect",
       ttl: Duration.minutes(2),
       label: "Launchpad Connect connect",

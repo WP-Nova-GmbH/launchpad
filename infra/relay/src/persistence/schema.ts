@@ -82,6 +82,53 @@ export const relayWorkflowRecoveryHeads = pgTable("relay_workflow_recovery_heads
   revision: integer("revision").notNull(),
 });
 
+export const relayWorkflowVmFollowUps = pgTable("relay_workflow_vm_follow_ups", {
+  jobId: varchar("job_id", { length: 64 })
+    .primaryKey()
+    .references(() => relayWorkflowJobs.jobId, { onDelete: "cascade" }),
+  workspaceRevision: bigint("workspace_revision", { mode: "number" }).notNull().default(0),
+  operationId: text("operation_id"),
+  actorUserId: text("actor_user_id"),
+  allocationId: text("allocation_id"),
+  generation: integer("generation"),
+  requestedAt: timestamp("requested_at", { withTimezone: true }),
+  openUntil: timestamp("open_until", { withTimezone: true }),
+  interactiveReadyGeneration: integer("interactive_ready_generation"),
+  reclaimOperationId: text("reclaim_operation_id"),
+  reclaimFallback: boolean("reclaim_fallback").notNull().default(false),
+});
+
+export const relayWorkflowVmFollowUpBaselines = pgTable("relay_workflow_vm_follow_up_baselines", {
+  jobId: varchar("job_id", { length: 64 })
+    .primaryKey()
+    .references(() => relayWorkflowJobs.jobId, { onDelete: "cascade" }),
+  branch: text("branch").notNull(),
+  sha: text("sha").notNull(),
+  treeSha: text("tree_sha").notNull(),
+  baseSha: text("base_sha").notNull(),
+});
+
+export const relayWorkflowVmFollowUpPushes = pgTable(
+  "relay_workflow_vm_follow_up_pushes",
+  {
+    operationId: text("operation_id").primaryKey(),
+    jobId: varchar("job_id", { length: 64 })
+      .notNull()
+      .references(() => relayWorkflowJobs.jobId, { onDelete: "cascade" }),
+    actorUserId: text("actor_user_id").notNull(),
+    generation: integer("generation").notNull(),
+    status: text("status").notNull(),
+    record: jsonb("record").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("workflow_vm_one_follow_up_push")
+      .on(table.jobId)
+      .where(sql`status IN ('preparing','armed','pending')`),
+  ],
+);
+
 export const relayWorkflowVmPublications = pgTable(
   "relay_workflow_vm_publications",
   {
@@ -979,7 +1026,7 @@ export const relayWorkflowRunConfigurations = pgTable(
     threadId: varchar("thread_id", { length: 191 }).notNull(),
     sourceRevision: integer("source_revision").notNull(),
     hasSecrets: boolean("has_secrets").notNull(),
-    sealedPayload: text("sealed_payload").notNull(),
+    sealedPayload: text("sealed_payload"),
   },
   (table) => [
     foreignKey({
@@ -1685,7 +1732,7 @@ export const relayThreadVmSavedDisks = pgTable(
     ),
     uniqueIndex("idx_relay_thread_vm_saved_disks_current")
       .on(table.threadId)
-      .where(sql`${table.phase} IN ('available','restoring','expiring')`),
+      .where(sql`${table.phase} IN ('available','restoring')`),
     index("idx_relay_thread_vm_saved_disks_expiry").on(table.hostId, table.phase, table.savedAt),
   ],
 );
@@ -1701,7 +1748,7 @@ export const relayThreadArtifacts = pgTable(
     operationId: varchar("operation_id", { length: 64 }).notNull(),
     kind: varchar("kind", { length: 16 })
       .notNull()
-      .$type<"workspace" | "native" | "attachment" | "history" | "manifest">(),
+      .$type<"workspace" | "native" | "attachment" | "history" | "manifest" | "follow-up-push">(),
     storageKey: varchar("storage_key", { length: 191 }).notNull().unique(),
     sha256: varchar("sha256", { length: 64 }).notNull(),
     sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
@@ -1721,7 +1768,7 @@ export const relayThreadArtifacts = pgTable(
     check("relay_thread_artifacts_size", sql`${table.sizeBytes} >= 0`),
     check(
       "relay_thread_artifacts_kind",
-      sql`${table.kind} IN ('workspace','native','attachment','history','manifest')`,
+      sql`${table.kind} IN ('workspace','native','attachment','history','manifest','follow-up-push')`,
     ),
     check(
       "relay_thread_artifacts_state",

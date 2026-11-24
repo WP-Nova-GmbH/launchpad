@@ -258,30 +258,52 @@ export const make = Effect.gen(function* () {
         return next;
       }),
     );
+    const writeJob = db
+      .update(relayWorkflowJobs)
+      .set({
+        record,
+        status: record.status,
+        repositoryCanonicalKey: previous.repositoryCanonicalKey,
+        pendingControl,
+        revision: previous.revision + 1,
+        ...(releaseLease ? { leaseUntil: null } : {}),
+      })
+      .where(
+        and(
+          eq(relayWorkflowJobs.jobId, previous.jobId),
+          eq(relayWorkflowJobs.revision, previous.revision),
+          ...(expectedLease === undefined
+            ? []
+            : [
+                eq(relayWorkflowJobs.leaseUntil, expectedLease),
+                sql`${relayWorkflowJobs.leaseUntil}::timestamptz > clock_timestamp()`,
+              ]),
+        ),
+      )
+      .returning();
+    const startsSavedRetention =
+      record.runtime?.kind === "vm" &&
+      isTerminalWorkflowJob(record.status) &&
+      record.progress?.executionReleased === true &&
+      (!isTerminalWorkflowJob(previous.record.status) ||
+        previous.record.progress?.executionReleased !== true);
     const rows = yield* persist(
-      db
-        .update(relayWorkflowJobs)
-        .set({
-          record,
-          status: record.status,
-          repositoryCanonicalKey: previous.repositoryCanonicalKey,
-          pendingControl,
-          revision: previous.revision + 1,
-          ...(releaseLease ? { leaseUntil: null } : {}),
-        })
-        .where(
-          and(
-            eq(relayWorkflowJobs.jobId, previous.jobId),
-            eq(relayWorkflowJobs.revision, previous.revision),
-            ...(expectedLease === undefined
-              ? []
-              : [
-                  eq(relayWorkflowJobs.leaseUntil, expectedLease),
-                  sql`${relayWorkflowJobs.leaseUntil}::timestamptz > clock_timestamp()`,
-                ]),
-          ),
-        )
-        .returning(),
+      startsSavedRetention
+        ? db.$client.withTransaction(
+            Effect.gen(function* () {
+              const changed = yield* writeJob;
+              if (changed.length > 0) {
+                yield* db.$client`UPDATE relay_thread_vm_saved_disks d
+                  SET saved_at=clock_timestamp()
+                  FROM relay_thread_placements p
+                  WHERE p.workflow_job_id=${previous.jobId} AND p.audience='repository'
+                    AND p.thread_id=d.thread_id AND p.generation=d.generation
+                    AND d.phase='available'`;
+              }
+              return changed;
+            }),
+          )
+        : writeJob,
     );
     if (rows.length === 0)
       return yield* new WorkflowConflictError({

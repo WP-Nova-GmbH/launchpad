@@ -38,6 +38,7 @@ import * as Effect from "effect/Effect";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { RelayDb } from "../db.ts";
 import { GithubApp } from "../tenancy/GithubApp.ts";
+import { recordWorkflowVmFollowUpWork } from "../threads/WorkflowVmFollowUpState.ts";
 import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import { makeThreadJournalStore } from "../threads/ThreadJournalStore.ts";
 import { relayInternalErrorResponse, appendRelayCredentialResponseHeaders } from "./Api.ts";
@@ -48,14 +49,21 @@ import { RelaySecretBox } from "../auth/SecretBox.ts";
 import {
   authorizeWorkflowVmGuest,
   isWorkflowVmThread,
-  requireWorkflowVmViewer,
   withWorkflowVmGuest,
 } from "../jobs/WorkflowVmBinding.ts";
 import {
   readWorkflowRunReviewSecrets,
+  readWorkflowRunFollowUpConfiguration,
   resolveWorkflowRunAttemptConfiguration,
 } from "../jobs/WorkflowRunConfiguration.ts";
+import {
+  requireWorkflowVmFollowUpActor,
+  requireWorkflowVmFollowUpWorkspace,
+  requireWorkflowVmLiveViewer,
+} from "../jobs/WorkflowVmFollowUpAccess.ts";
+import { readWorkflowVmFollowUpPublishedHead } from "../jobs/WorkflowVmFollowUpPush.ts";
 import { handleWorkflowVmPublishing } from "../jobs/WorkflowVmPublishing.ts";
+import { handleWorkflowVmFollowUpPush } from "../jobs/WorkflowVmFollowUpPush.ts";
 import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
 
 type Owner = {
@@ -336,7 +344,7 @@ export const confirmInitialVmActivation = Effect.fn(
 
 /** A guest may validate a client only for its own private thread and current placement. */
 export const checkThreadVmClientAccess = Effect.fn("relay.api.thread_environment.client_access")(
-  function* (input: Owner & { readonly userId: string }) {
+  function* (input: Owner & { readonly userId: string; readonly workflowFollowUp?: true }) {
     const principal = yield* RelayEnvironmentPrincipal;
     const vmScope = principal.threadVm;
     if (!vmScope) return yield* tenancyNotFound("thread_not_found");
@@ -346,7 +354,16 @@ export const checkThreadVmClientAccess = Effect.fn("relay.api.thread_environment
         .withTransaction(
           Effect.gen(function* () {
             const { binding } = yield* authorizeWorkflowVmGuest(input);
-            yield* requireWorkflowVmViewer(sql, binding, input.userId);
+            const followUp = yield* Effect.gen(function* () {
+              if (!input.workflowFollowUp) {
+                yield* requireWorkflowVmLiveViewer(sql, binding, input.userId);
+                return null;
+              }
+              yield* requireWorkflowVmFollowUpActor(sql, binding, input.userId);
+              const { ready } = yield* requireWorkflowVmFollowUpWorkspace(sql, binding, "prepare");
+              const published = yield* readWorkflowVmFollowUpPublishedHead(sql, binding.jobId);
+              return { ...published, jobId: binding.jobId, ready };
+            });
             return {
               environmentId: binding.environmentId,
               threadId: binding.threadId,
@@ -354,11 +371,13 @@ export const checkThreadVmClientAccess = Effect.fn("relay.api.thread_environment
               repositoryId: RelayRepositoryId.make(binding.repositoryId),
               generation: binding.generation,
               userId: input.userId,
+              ...(followUp ? { workflowFollowUp: followUp } : {}),
             };
           }),
         )
         .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
     }
+    if (input.workflowFollowUp) return yield* tenancyNotFound("thread_not_found");
     return yield* withEnvironmentThread(
       input,
       false,
@@ -380,6 +399,50 @@ export const checkThreadVmClientAccess = Effect.fn("relay.api.thread_environment
       ),
     );
   },
+);
+
+export const confirmWorkflowVmFollowUpReady = Effect.fnUntraced(
+  function* (input: Owner & { readonly userId: string; readonly workId: string }) {
+    const sql = (yield* RelayDb).$client;
+    return yield* withWorkflowVmGuest(input, "active", ({ binding }) =>
+      Effect.gen(function* () {
+        if (!input.workId.startsWith("workspace:follow-up-prepare:"))
+          return yield* tenancyConflict("thread_placement_changed");
+        yield* requireWorkflowVmFollowUpActor(sql, binding, input.userId);
+        yield* requireWorkflowVmFollowUpWorkspace(sql, binding, "prepare");
+        const [updated] = yield* sql`UPDATE relay_workflow_vm_follow_ups f
+        SET interactive_ready_generation=${binding.generation}
+        WHERE f.job_id=${binding.jobId} AND EXISTS (
+          SELECT 1 FROM relay_thread_execution_admissions e WHERE e.thread_id=${binding.threadId}
+          AND e.environment_id=${binding.environmentId} AND e.generation=${binding.generation}
+          AND e.work_id=${input.workId} AND NOT e.completed
+        ) RETURNING f.job_id`;
+        if (!updated) return yield* tenancyConflict("thread_placement_changed");
+        return { ok: true as const };
+      }),
+    );
+  },
+  Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
+);
+
+export const readThreadVmFollowUpEnvironment = Effect.fnUntraced(
+  function* (input: Owner & { readonly userId: string }) {
+    const sql = (yield* RelayDb).$client;
+    const box = yield* RelaySecretBox;
+    yield* appendRelayCredentialResponseHeaders;
+    return yield* withWorkflowVmGuest(input, "active", ({ binding }) =>
+      Effect.gen(function* () {
+        yield* requireWorkflowVmFollowUpActor(sql, binding, input.userId);
+        yield* requireWorkflowVmFollowUpWorkspace(sql, binding);
+        return yield* readWorkflowRunFollowUpConfiguration(sql, box, binding).pipe(
+          Effect.catchTag("WorkflowRunConfigurationError", () =>
+            relayInternalErrorResponse("persistence_failed"),
+          ),
+        );
+      }),
+    );
+  },
+  Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
 );
 
 export const readThreadVmReviewSecrets = Effect.fnUntraced(
@@ -409,12 +472,36 @@ export const nextPortableThreadCommand = Effect.fn("relay.api.thread_environment
     yield* isWorkflowVmThread(sql, input.threadId).pipe(
       Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
     )
-  ) {
-    yield* authorizeWorkflowVmGuest(input, "enrolled").pipe(
-      Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
-    );
-    return null;
-  }
+  )
+    return yield* withWorkflowVmGuest(input, "enrolled", ({ binding, active }) =>
+      Effect.gen(function* () {
+        if (!active) return null;
+        const journal = makeThreadJournalStore(sql);
+        const entry = yield* journal.next(input);
+        if (!entry) return null;
+        const allowed = yield* requireWorkflowVmFollowUpActor(
+          sql,
+          binding,
+          entry.actor.userId,
+        ).pipe(
+          Effect.as(true),
+          Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(false)),
+        );
+        if (!allowed || entry.acceptedGeneration !== binding.generation) {
+          yield* journal.acknowledge({
+            ...input,
+            commandId: entry.commandId,
+            receipt: {
+              status: "rejected",
+              detail: "This workflow VM follow-up command is no longer authorized.",
+            },
+          });
+          return null;
+        }
+        yield* requireWorkflowVmFollowUpWorkspace(sql, binding);
+        return entry;
+      }),
+    ).pipe(Effect.catchTags(mapEncodedJournalErrors));
   return yield* withEnvironmentThread(input, true, makeThreadJournalStore(sql).next(input)).pipe(
     Effect.catchTag("ThreadPlacementConflict", () => tenancyConflict("thread_placement_changed")),
   );
@@ -429,10 +516,16 @@ export const acknowledgePortableThreadCommand = Effect.fn(
   },
 ) {
   const sql = (yield* RelayDb).$client;
-  yield* withEnvironmentThread(input, false, makeThreadJournalStore(sql).acknowledge(input)).pipe(
+  const acknowledge = makeThreadJournalStore(sql).acknowledge(input);
+  yield* Effect.gen(function* () {
+    if (yield* isWorkflowVmThread(sql, input.threadId))
+      return yield* withWorkflowVmGuest(input, "enrolled", () => acknowledge);
+    return yield* withEnvironmentThread(input, false, acknowledge);
+  }).pipe(
     Effect.catchTags({
       ThreadPlacementConflict: mapJournalErrors.ThreadPlacementConflict,
       SchemaError: mapEncodedJournalErrors.SchemaError,
+      SqlError: mapJournalErrors.SqlError,
     }),
   );
   return { ok: true as const };
@@ -472,13 +565,41 @@ export const confirmPortableThreadHistoryThrough = Effect.fn(
   return { sourceSequence };
 });
 export const admitPortableThreadWork = Effect.fn("relay.api.thread_environment.admit")(function* (
-  input: Owner & { readonly workId: string },
+  input: Owner & {
+    readonly workId: string;
+    readonly followUpUserId?: string;
+    readonly followUpCommandId?: string;
+    readonly followUpPreparing?: true;
+  },
 ) {
   const sql = (yield* RelayDb).$client;
   const result = yield* Effect.gen(function* () {
     if (yield* isWorkflowVmThread(sql, input.threadId))
       return yield* withWorkflowVmGuest(input, "active", ({ binding }) =>
         Effect.gen(function* () {
+          if (input.followUpUserId) {
+            yield* requireWorkflowVmFollowUpActor(sql, binding, input.followUpUserId);
+            yield* requireWorkflowVmFollowUpWorkspace(
+              sql,
+              binding,
+              input.followUpPreparing ? "prepare" : "work",
+            );
+            if (input.followUpCommandId) {
+              const entry = yield* makeThreadJournalStore(sql).command(
+                input.threadId,
+                input.followUpCommandId,
+              );
+              if (
+                entry?.actor.userId !== input.followUpUserId ||
+                entry.acceptedGeneration !== input.generation
+              )
+                return yield* tenancyNotFound("thread_not_found");
+            }
+            const admission = yield* makeThreadPlacementStore(sql).admit(input, binding.jobId);
+            if (admission.newlyAdmitted && !input.followUpPreparing)
+              yield* recordWorkflowVmFollowUpWork(sql, binding);
+            return admission;
+          }
           const [active] = yield* sql`SELECT 1 FROM relay_workflow_jobs
             WHERE job_id=${binding.jobId} AND record->>'startAttempted'='true'
               AND status NOT IN ('done','cancelled','failed','cancelling')`;
@@ -486,12 +607,14 @@ export const admitPortableThreadWork = Effect.fn("relay.api.thread_environment.a
           return yield* makeThreadPlacementStore(sql).admit(input, binding.jobId);
         }),
       );
+    if (input.followUpUserId || input.followUpCommandId || input.followUpPreparing)
+      return yield* tenancyNotFound("thread_not_found");
     return yield* withEnvironmentThread(input, true, makeThreadPlacementStore(sql).admit(input));
   }).pipe(Effect.catchTags(mapJournalErrors));
   return { completed: result.completed, newlyAdmitted: result.newlyAdmitted };
 });
 export const completePortableThreadWork = Effect.fn("relay.api.thread_environment.complete")(
-  function* (input: Owner & { readonly workId: string }) {
+  function* (input: Owner & { readonly workId: string; readonly neverStarted?: true }) {
     const sql = (yield* RelayDb).$client;
     yield* Effect.gen(function* () {
       if (yield* isWorkflowVmThread(sql, input.threadId))
@@ -745,7 +868,7 @@ export const confirmThreadVmPauseActivation = Effect.fn("relay.api.thread_vm.pau
   }),
 );
 export const cancelThreadVmPause = Effect.fn("relay.api.thread_vm.pause.cancel")(
-  function* (input: Owner & { operationId: string }) {
+  function* (input: Owner & { operationId: string; nativePauseFallback?: true }) {
     return yield* withEnvironmentThread(
       input,
       "workflow-lifecycle",
@@ -1014,6 +1137,12 @@ export const threadEnvironmentApi = HttpApiBuilder.group(
           Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
         ),
       )
+      .handle("confirmWorkflowVmFollowUpReady", ({ params, payload }) =>
+        confirmWorkflowVmFollowUpReady({ ...params, ...payload }),
+      )
+      .handle("resolveWorkflowVmFollowUp", ({ params, payload }) =>
+        readThreadVmFollowUpEnvironment({ ...params, ...payload }),
+      )
       .handle("readWorkflowVmReviewSecrets", ({ params, payload }) =>
         appendRelayCredentialResponseHeaders.pipe(
           Effect.andThen(readThreadVmReviewSecrets({ ...params, ...payload })),
@@ -1028,6 +1157,11 @@ export const threadEnvironmentApi = HttpApiBuilder.group(
           yield* refreshWorkflowJob(payload.jobId).pipe(Effect.ignore);
           return yield* handle;
         }),
+      )
+      .handle("workflowVmFollowUpPublishing", ({ params, payload }) =>
+        appendRelayCredentialResponseHeaders.pipe(
+          Effect.andThen(handleWorkflowVmFollowUpPush({ ...params, ...payload })),
+        ),
       )
       .handle("mintRepositoryToken", ({ params, payload }) =>
         mintThreadVmRepositoryToken({ ...params, ...payload }),

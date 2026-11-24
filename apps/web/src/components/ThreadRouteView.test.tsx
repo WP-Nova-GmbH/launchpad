@@ -1,11 +1,20 @@
 import { act, type ReactNode } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import {
+  EnvironmentId,
+  ThreadId,
+  type ExecutionEnvironmentDescriptor,
+  type ServerConfig,
+} from "@t3tools/contracts";
+import {
+  RelayRepositoryId,
+  type RelayWorkflowVmFollowUpConnection,
+} from "@t3tools/contracts/relay";
 import type { WorkflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
 import { managedRelaySessionAtom, ManagedRelayTenancy } from "@t3tools/client-runtime/relay";
 import { createThreadVmControlAtoms } from "@t3tools/client-runtime/relay/threadVmControls";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { remoteHttpClientLayer } from "@t3tools/client-runtime/rpc";
 import { Atom } from "effect/unstable/reactivity";
 import * as Effect from "effect/Effect";
@@ -15,13 +24,19 @@ import * as Option from "effect/Option";
 const fixture = vi.hoisted(() => ({
   controls: null as ReturnType<typeof createThreadVmControlAtoms> | null,
   hydrated: false,
-  capabilities: undefined as { workflowVmResultReader?: boolean } | undefined,
+  threadDetailDeleted: false,
+  capabilities: undefined as ExecutionEnvironmentDescriptor["capabilities"] | undefined,
+  phase: "connected" as "connected" | "reconnecting" | "error",
+  scopedTarget: undefined as RelayWorkflowVmFollowUpConnection | undefined,
   locationState: {} as { workflowOrigin?: WorkflowResultOrigin },
   navigate: vi.fn(),
   open: vi.fn(),
+  continueInVm: vi.fn(),
+  connectFollowUp: vi.fn(),
   requests: [] as string[],
 }));
 const environmentId = EnvironmentId.make("original-environment");
+const initialSessionConfig = Atom.make<ServerConfig | null>(null);
 
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
@@ -32,7 +47,11 @@ vi.mock("@tanstack/react-router", () => ({
     return options?.select ? options.select(location) : location;
   },
 }));
-vi.mock("./ChatView", () => ({ default: () => <p>Saved workflow conversation</p> }));
+vi.mock("./ChatView", () => ({
+  default: ({ workflowFollowUp }: { workflowFollowUp?: boolean }) => (
+    <p>{workflowFollowUp ? "Live workflow follow-up" : "Saved workflow conversation"}</p>
+  ),
+}));
 vi.mock("./ChatView.logic", () => ({
   resolveDraftPromotionNavigationTarget: () => null,
   threadHasStarted: () => fixture.hydrated,
@@ -44,8 +63,27 @@ vi.mock("./workflows/WorkflowNavigation", () => ({
   useWorkflowConversation: () => null,
   WorkflowConversationHeader: () => null,
 }));
+vi.mock("./workflows/workflowState", () => ({
+  useWorkflowClient:
+    () =>
+    (
+      operation: (
+        client: { continueWorkflowVm: typeof fixture.continueInVm },
+        token: string,
+      ) => unknown,
+    ) =>
+      operation({ continueWorkflowVm: fixture.continueInVm }, "test-token"),
+  workflowError: (error: Error) => error.message,
+}));
 vi.mock("../connection/catalog", () => ({ environmentCatalog: { retryNow: "reconnect" } }));
-vi.mock("../state/use-atom-command", () => ({ useAtomCommand: () => fixture.open }));
+vi.mock("../state/workflowVmFollowUp", async (load) => ({
+  ...(await load<typeof import("../state/workflowVmFollowUp")>()),
+  connectWorkflowVmFollowUp: "follow-up",
+}));
+vi.mock("../state/use-atom-command", () => ({
+  useAtomCommand: (command: unknown) =>
+    command === "follow-up" ? fixture.connectFollowUp : fixture.open,
+}));
 vi.mock("../composerDraftStore", () => ({
   useComposerDraftStore: (select: (store: object) => unknown) =>
     select({
@@ -69,8 +107,9 @@ vi.mock("../state/entities", () => ({
   useEnvironmentThreadRefs: () => [{ environmentId, threadId: "another-thread" }],
   useThread: () => (fixture.hydrated ? {} : null),
   useThreadShell: () => (fixture.hydrated ? {} : null),
-  useThreadDetail: () => (fixture.hydrated ? {} : null),
-  useThreadStatus: () => (fixture.hydrated ? "live" : "idle"),
+  useThreadDetail: () => (fixture.hydrated && !fixture.threadDetailDeleted ? {} : null),
+  useThreadStatus: () =>
+    fixture.threadDetailDeleted ? "deleted" : fixture.hydrated ? "live" : "idle",
 }));
 vi.mock("../state/query", () => ({
   useEnvironmentQuery: () => ({
@@ -88,13 +127,19 @@ vi.mock("../state/environments", () => ({
             [
               environmentId,
               {
-                connection: { phase: "connected" },
+                entry: {
+                  target: { _tag: "RelayConnectionTarget", workflowFollowUp: fixture.scopedTarget },
+                },
+                connection: { phase: fixture.phase },
                 serverConfig: { environment: { capabilities: fixture.capabilities } },
               },
             ],
           ],
     ),
   }),
+}));
+vi.mock("../state/session", () => ({
+  environmentSession: { initialConfigValueAtom: () => initialSessionConfig },
 }));
 vi.mock("../state/shell", () => ({ environmentShell: { stateAtom: () => "shell" } }));
 vi.mock("../state/thread-move-submissions", () => ({
@@ -121,11 +166,18 @@ vi.mock("../state/projects", () => ({ environmentProjects: {} }));
 vi.mock("../state/server", () => ({ serverEnvironment: {} }));
 vi.mock("../lib/movedThreadDraft", () => ({ recoverMovedDraftFile: () => {} }));
 vi.mock("../cloud/useCloudLinkController", () => ({ useCloudLinkController: () => ({}) }));
-vi.mock("../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => false }));
+vi.mock("../cloud/publicConfig", async (load) => ({
+  ...(await load<typeof import("../cloud/publicConfig")>()),
+  hasCloudPublicConfig: () => false,
+}));
 vi.mock("./clerk/useT3ConnectAuthPrompt", () => ({ useT3ConnectAuthPrompt: () => ({}) }));
 
 import { appAtomRegistry, AppAtomRegistryProvider } from "../rpc/atomRegistry";
 import { ThreadRouteView } from "./ThreadRouteView";
+import {
+  rememberedWorkflowVmFollowUpOriginAtom,
+  workflowVmFollowUpHistoryState,
+} from "../state/workflowVmFollowUp";
 
 let renderer: ReactTestRenderer | null = null;
 const route = (threadId: string) => (
@@ -138,11 +190,17 @@ const route = (threadId: string) => (
 
 beforeEach(() => {
   fixture.hydrated = false;
+  fixture.threadDetailDeleted = false;
   fixture.capabilities = undefined;
+  fixture.phase = "connected";
+  fixture.scopedTarget = undefined;
   fixture.locationState = {};
   fixture.requests = [];
   fixture.navigate.mockReset();
   fixture.open.mockReset().mockResolvedValue(null);
+  fixture.continueInVm.mockReset();
+  fixture.connectFollowUp.mockReset().mockResolvedValue({ _tag: "Success" });
+  appAtomRegistry.set(initialSessionConfig, null);
   appAtomRegistry.set(managedRelaySessionAtom, {
     accountId: "owner",
     readClerkToken: () => Effect.succeed("test-token"),
@@ -179,6 +237,197 @@ afterEach(async () => {
 });
 
 describe("workflow result location recovery", () => {
+  it.each([
+    "viewer reconnect with cached follow-up capabilities",
+    "scoped connection before session confirmation",
+    "failed follow-up connection",
+  ])("re-enters the current follow-up generation from a %s", async (connection) => {
+    const threadId = ThreadId.make("workflow:job");
+    fixture.hydrated = true;
+    const access = { threadId, generation: 1 };
+    fixture.capabilities = {
+      repositoryIdentity: true,
+      workflowVmResultReader: true,
+      workflowVmFollowUp: access,
+    };
+    if (connection === "viewer reconnect with cached follow-up capabilities") {
+      fixture.phase = "reconnecting";
+    } else fixture.scopedTarget = access;
+    if (connection === "failed follow-up connection") {
+      fixture.phase = "error";
+      fixture.threadDetailDeleted = true;
+    }
+    fixture.locationState = {
+      workflowOrigin: {
+        accountId: "owner",
+        organizationId: "org",
+        repositoryId: RelayRepositoryId.make("repo"),
+        jobId: "job",
+        threadId,
+        workflowVmFollowUpGeneration: 1,
+      },
+    };
+    const current = {
+      state: "running",
+      environmentId: EnvironmentId.make("new-workflow-environment"),
+      threadId,
+      generation: 2,
+    };
+    fixture.continueInVm.mockResolvedValue(current);
+
+    await act(async () => {
+      renderer = create(route(threadId));
+    });
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    const continueButton = renderer!.root
+      .findAllByType("button")
+      .find((node) => node.children.includes("Continue in VM"));
+    expect(continueButton).toBeDefined();
+    await act(async () => {
+      continueButton!.props.onClick();
+    });
+
+    expect(fixture.continueInVm).toHaveBeenCalledWith({
+      clerkToken: "test-token",
+      repositoryId: "repo",
+      jobId: "job",
+    });
+    expect(fixture.connectFollowUp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...current,
+        origin: expect.objectContaining({ accountId: "owner", workflowVmFollowUpGeneration: 2 }),
+      }),
+    );
+    expect(fixture.navigate).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: current.environmentId, threadId },
+      state: { workflowOrigin: expect.objectContaining({ workflowVmFollowUpGeneration: 2 }) },
+    });
+    expect(fixture.open).not.toHaveBeenCalled();
+    expect(fixture.requests).toEqual([]);
+  });
+
+  it("opens chat when a connected relay target and current session both confirm follow-up access", async () => {
+    const threadId = ThreadId.make("workflow:job");
+    fixture.hydrated = true;
+    fixture.scopedTarget = { threadId, generation: 1 };
+    fixture.capabilities = { repositoryIdentity: true, workflowVmResultReader: true };
+    fixture.locationState = {
+      workflowOrigin: {
+        accountId: "owner",
+        organizationId: "org",
+        repositoryId: RelayRepositoryId.make("repo"),
+        jobId: "job",
+        threadId,
+        workflowVmFollowUpGeneration: 1,
+      },
+    };
+    appAtomRegistry.set(initialSessionConfig, {
+      environment: {
+        capabilities: { ...fixture.capabilities, workflowVmFollowUp: fixture.scopedTarget },
+      },
+    } as ServerConfig);
+
+    await act(async () => {
+      renderer = create(route(threadId));
+    });
+
+    expect(renderer!.root.findByType("p").children).toContain("Live workflow follow-up");
+    expect(fixture.continueInVm).not.toHaveBeenCalled();
+  });
+
+  it("reopens a previously continued thread from a bare URL without waking a VM or replacing an explicit result", async () => {
+    const threadId = ThreadId.make("workflow:direct-job");
+    const key = scopedThreadKey(scopeThreadRef(environmentId, threadId));
+    fixture.hydrated = true;
+    const access = { threadId, generation: 2 };
+    const origin = {
+      accountId: "owner",
+      organizationId: "org",
+      repositoryId: RelayRepositoryId.make("repo"),
+      jobId: "job",
+      threadId,
+    };
+    fixture.scopedTarget = access;
+    fixture.capabilities = { repositoryIdentity: true, workflowVmResultReader: true };
+    appAtomRegistry.set(initialSessionConfig, {
+      environment: { capabilities: { ...fixture.capabilities, workflowVmFollowUp: access } },
+    } as ServerConfig);
+    appAtomRegistry.set(rememberedWorkflowVmFollowUpOriginAtom(key), {
+      session: appAtomRegistry.get(managedRelaySessionAtom)!,
+      origin: { ...origin, workflowVmFollowUpGeneration: access.generation },
+    });
+
+    await act(async () => {
+      renderer = create(route(threadId));
+    });
+    expect(renderer!.root.findByType("p").children).toContain("Live workflow follow-up");
+
+    fixture.locationState = { workflowOrigin: { ...origin, workflowVmResultReader: true } };
+    await act(async () => renderer!.update(route(threadId)));
+    expect(renderer!.root.findByType("p").children).toContain("Saved workflow conversation");
+
+    fixture.locationState = {};
+    await act(async () => {
+      appAtomRegistry.set(managedRelaySessionAtom, {
+        accountId: "other",
+        readClerkToken: () => Effect.succeed("other-token"),
+      });
+      renderer!.update(route(threadId));
+    });
+    expect(renderer!.root.findByType("p").children).not.toContain("Live workflow follow-up");
+    expect(fixture.connectFollowUp).not.toHaveBeenCalled();
+    expect(fixture.continueInVm).not.toHaveBeenCalled();
+  });
+
+  it("offers explicit Continue after reloading a sidebar history entry", async () => {
+    const threadId = ThreadId.make("workflow:sidebar-job");
+    const threadRef = scopeThreadRef(environmentId, threadId);
+    const key = scopedThreadKey(threadRef);
+    const origin = {
+      accountId: "owner",
+      organizationId: "org",
+      repositoryId: RelayRepositoryId.make("repo"),
+      jobId: "sidebar-job",
+      threadId,
+      workflowVmFollowUpGeneration: 2,
+    };
+    appAtomRegistry.set(rememberedWorkflowVmFollowUpOriginAtom(key), {
+      session: appAtomRegistry.get(managedRelaySessionAtom)!,
+      origin,
+    });
+    const historyState = workflowVmFollowUpHistoryState(threadRef);
+    expect(historyState).toEqual({ workflowOrigin: origin });
+
+    fixture.hydrated = true;
+    fixture.capabilities = { repositoryIdentity: true, workflowVmResultReader: true };
+    fixture.locationState = structuredClone(historyState);
+    appAtomRegistry.set(rememberedWorkflowVmFollowUpOriginAtom(key), null);
+    appAtomRegistry.set(managedRelaySessionAtom, {
+      accountId: "owner",
+      readClerkToken: () => Effect.succeed("new-test-token"),
+    });
+    await act(async () => {
+      renderer = create(route(threadId));
+    });
+    const anyContinueButton = () =>
+      renderer!.root
+        .findAllByType("button")
+        .some((node) => node.children.includes("Continue in VM"));
+    expect(anyContinueButton()).toBe(true);
+
+    await act(async () => {
+      appAtomRegistry.set(managedRelaySessionAtom, {
+        accountId: "other",
+        readClerkToken: () => Effect.succeed("other-token"),
+      });
+    });
+    expect(anyContinueButton()).toBe(false);
+    expect(workflowVmFollowUpHistoryState(threadRef)).toEqual({});
+    expect(fixture.continueInVm).not.toHaveBeenCalled();
+    expect(fixture.connectFollowUp).not.toHaveBeenCalled();
+  });
+
   it("keeps a cold result on its route without querying private placement, then renders its transcript", async () => {
     await act(async () => {
       renderer = create(route("workflow:job"));
@@ -186,7 +435,7 @@ describe("workflow result location recovery", () => {
     expect(fixture.requests).toEqual([]);
     expect(fixture.navigate).not.toHaveBeenCalled();
     fixture.hydrated = true;
-    fixture.capabilities = { workflowVmResultReader: true };
+    fixture.capabilities = { repositoryIdentity: true, workflowVmResultReader: true };
     await act(async () => renderer!.update(route("workflow:job")));
     expect(
       renderer!.root

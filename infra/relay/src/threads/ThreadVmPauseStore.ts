@@ -6,6 +6,10 @@ import {
   authorizeWorkflowVmCheckpoint,
   lockWorkflowVmCheckpoint,
 } from "../jobs/WorkflowVmCheckpoint.ts";
+import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
+import type { LinearWorkflowConfiguration } from "../Config.ts";
+import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
+import { workflowVmExecutionReleased } from "./WorkflowVmFollowUpState.ts";
 import { wakeQueuedThreadVm } from "./ThreadVmWakeAdmission.ts";
 
 export interface PauseClaim {
@@ -111,6 +115,61 @@ export function makeThreadVmPauseStore(sql: PgClient) {
             claim_id = NULL, claim_until = NULL, retry_at = clock_timestamp()
           WHERE relay_thread_vm_pauses.phase IN ('cancelled','completed')`;
         return candidate.allocationId;
+      }),
+    );
+  });
+
+  const reserveFinished = Effect.fn("relay.thread_vm.pause.reserve_finished")(function* (
+    hostId: string,
+    linear: Pick<LinearWorkflowConfiguration, "clientId" | "organizationId"> | undefined,
+  ) {
+    const capacity = makeThreadVmCapacityStore(sql);
+    const allocationId = yield* capacity.finishedVmDueToPause(hostId, linear, true);
+    if (!allocationId) return null;
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const [owner] = yield* sql<{ jobId: string }>`SELECT t.workflow_job_id AS "jobId"
+          FROM relay_thread_vm_allocations a JOIN relay_thread_placements t USING(thread_id)
+          WHERE a.allocation_id=${allocationId}`;
+        if (!owner?.jobId || !(yield* lockWorkflowVmCheckpoint(sql, owner.jobId))) return null;
+        yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id=${allocationId} FOR UPDATE`;
+        if ((yield* capacity.finishedVmDueToPause(hostId, linear, true)) !== allocationId)
+          return null;
+        const [checkpoint] = yield* sql<RelayThreadVmWorkflowCheckpoint & { generation: number }>`
+          SELECT j.job_id AS "jobId",h.publication_id AS "checkpointId",0 AS "checkpointGeneration",
+            h.publication_id AS "publicationId",h.revision AS "publicationRevision",
+            COALESCE(f.workspace_revision,0)::text AS "finishedWorkspaceRevision",t.generation
+          FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
+          JOIN relay_workflow_recovery_heads h USING(job_id)
+          JOIN relay_workflow_recovery_records r ON r.publication_id=h.publication_id AND r.job_id=j.job_id AND r.revision=h.revision
+          JOIN relay_thread_vm_bindings b ON b.allocation_id=${allocationId} AND b.environment_id=t.environment_id
+            AND b.generation=t.generation AND b.revoked_at IS NULL
+          LEFT JOIN relay_workflow_vm_follow_ups f ON f.job_id=j.job_id
+          WHERE j.job_id=${owner.jobId} AND ${workflowVmExecutionReleased(sql)}
+            AND r.manifest->>'terminalExecutionReleased'='true'
+            AND r.manifest#>>'{binding,allocationId}'=b.allocation_id
+            AND r.manifest#>>'{binding,environmentId}'=b.environment_id
+            AND r.manifest#>>'{binding,generation}'=b.generation::text`;
+        if (!checkpoint) return null;
+        const { generation, ...proof } = checkpoint;
+        const operationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
+        yield* acknowledgeThreadVmPauseBackup(sql, allocationId);
+        const inserted = yield* sql`INSERT INTO relay_thread_vm_pauses
+          (allocation_id,operation_id,generation,phase,workflow_checkpoint)
+          VALUES (${allocationId},${operationId},${generation},'pending',
+            ${sql.json({ ...proof, finishedWorkspaceRevision: Number(proof.finishedWorkspaceRevision) })})
+          ON CONFLICT(allocation_id) DO UPDATE SET operation_id=excluded.operation_id,
+            generation=excluded.generation,phase='pending',workflow_checkpoint=excluded.workflow_checkpoint,
+            boot_id=NULL,native_checkpoint_operation_id=NULL,source_receipt=NULL,backup_operation_id=NULL,
+            source_sequence=NULL,source_frozen_at=NULL,source_reopened_at=NULL,pause_dispatch_claim_id=NULL,
+            pause_dispatched_at=NULL,pause_acknowledged_at=NULL,claim_id=NULL,claim_until=NULL,retry_at=clock_timestamp()
+          WHERE relay_thread_vm_pauses.phase IN ('cancelled','completed')
+            AND relay_thread_vm_pauses.source_reopened_at IS NOT NULL RETURNING allocation_id`;
+        if (!inserted.length) return null;
+        yield* sql`INSERT INTO relay_workflow_vm_follow_ups(job_id,reclaim_operation_id)
+          VALUES(${owner.jobId},${operationId})
+          ON CONFLICT(job_id) DO UPDATE SET reclaim_operation_id=excluded.reclaim_operation_id,reclaim_fallback=false`;
+        return allocationId;
       }),
     );
   });
@@ -282,7 +341,11 @@ export function makeThreadVmPauseStore(sql: PgClient) {
             AND compute_ref = ${claim.computeRef}`;
         yield* sql`UPDATE relay_thread_vm_pauses SET phase = 'completed',
           claim_id = NULL, claim_until = NULL WHERE allocation_id = ${claim.allocationId}`;
-        yield* wakeQueuedThreadVm(sql, claim.threadId);
+        const [finished] =
+          yield* sql`UPDATE relay_workflow_vm_follow_ups SET reclaim_operation_id=NULL,reclaim_fallback=false
+          WHERE reclaim_operation_id=${claim.operationId} RETURNING job_id`;
+        if (finished) yield* wakeWorkflows();
+        else yield* wakeQueuedThreadVm(sql, claim.threadId);
         return true;
       }),
     );
@@ -311,6 +374,7 @@ export function makeThreadVmPauseStore(sql: PgClient) {
   });
   return {
     reserveIdle,
+    reserveFinished,
     cancelBeforeFreeze,
     claim,
     markSealed,

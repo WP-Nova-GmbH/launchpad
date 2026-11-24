@@ -13,6 +13,7 @@ import {
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -28,6 +29,8 @@ import {
   decodeWorkflowSaveBinding,
   type WorkflowSaveIntent,
 } from "../jobs/WorkflowResultOutbox.ts";
+import { WorkflowRunRecovery } from "../jobs/WorkflowRunStore.ts";
+import { ownershipReleased } from "../jobs/workflowOwnership.ts";
 import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts";
 import type { ThreadHistoryOwner, ThreadHistorySyncError } from "./ThreadHistorySync.ts";
 import type {
@@ -206,7 +209,11 @@ export function makeWorkflowResultPublisher(
           return yield* fail("This patch exceeds the 10 MB saved-result limit.", true);
         result = { ...capture, patch: yield* materialize(intent.patchArtifactId, patch) };
       }
+      const recovery = Option.getOrUndefined(
+        Schema.decodeUnknownOption(Schema.fromJsonString(WorkflowRunRecovery))(intent.recordJson),
+      );
       manifest = {
+        ...(recovery && ownershipReleased(recovery.run) ? { terminalExecutionReleased: true } : {}),
         format: "workflow-recovery-v1",
         publicationId: intent.publicationId,
         binding,

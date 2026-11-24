@@ -1324,6 +1324,7 @@ export interface ChatComposerProps {
   attachmentUploadsCapabilityKnown: boolean;
   supportsAttachmentUploads: boolean;
   supportsQuestionAttachments: boolean;
+  attachmentDisabledReason: string | null;
   maxFileAttachmentBytes: number | null;
   routeKind: "server" | "draft";
   routeThreadRef: ScopedThreadRef;
@@ -1490,6 +1491,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     attachmentUploadsCapabilityKnown,
     supportsAttachmentUploads,
     supportsQuestionAttachments,
+    attachmentDisabledReason,
     maxFileAttachmentBytes,
     routeKind,
     routeThreadRef,
@@ -1734,6 +1736,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     maxFileAttachmentBytes,
   });
   const attachmentBlockReason =
+    (attachmentDisabledReason && (composerImages.length > 0 || composerFiles.length > 0)
+      ? attachmentDisabledReason
+      : null) ??
     (questionAttachmentTarget &&
     !supportsQuestionAttachments &&
     (composerImages.length > 0 || composerFiles.length > 0)
@@ -2550,6 +2555,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const showCollapsedMobilePromptRow =
     isComposerCollapsedMobile && !isComposerApprovalState && pendingUserInputs.length === 0;
   const showComposerAttachAction =
+    !attachmentDisabledReason &&
     fileStagingLimit !== null &&
     (!activePendingProgress ||
       (supportsQuestionAttachments &&
@@ -3028,6 +3034,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           }
           case "image":
           case "file": {
+            if (attachmentDisabledReason && sourceEnvironmentId !== null) break;
             if (skippedDependentAttachmentIds.has(record.contextId)) break;
             if (sourceEnvironmentId === null && !conflicts) {
               rewritten.set(record.contextId, record.contextId);
@@ -3051,15 +3058,23 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       addComposerDraftPreviewAnnotation,
       addComposerDraftReviewComment,
       addComposerDraftTerminalContexts,
+      attachmentDisabledReason,
       composerContextRecords,
       composerDraftTarget,
       importAttachmentRecord,
     ],
   );
   const importContextFragment = useCallback(
-    (fragment: ComposerContextClipboardFragment): ReadonlyMap<string, string> =>
-      importContextRecords(fragment.records, fragment.source.environmentId),
-    [importContextRecords],
+    (fragment: ComposerContextClipboardFragment): ReadonlyMap<string, string> => {
+      if (
+        attachmentDisabledReason &&
+        fragment.records.some((record) => record.kind === "image" || record.kind === "file")
+      ) {
+        toastManager.add({ type: "error", title: attachmentDisabledReason });
+      }
+      return importContextRecords(fragment.records, fragment.source.environmentId);
+    },
+    [attachmentDisabledReason, importContextRecords],
   );
 
   // ------------------------------------------------------------------
@@ -5293,6 +5308,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
   ): Promise<boolean> => {
     if (!activeThreadId || files.length === 0 || isRevertingCheckpointRef.current) return false;
+    if (attachmentDisabledReason) {
+      toastManager.add({ type: "error", title: attachmentDisabledReason });
+      return false;
+    }
     if (
       pendingUserInputs.length > 0 &&
       (!supportsQuestionAttachments ||
@@ -5585,6 +5604,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
 
     const canStageAttachment =
+      !attachmentDisabledReason &&
       Boolean(activeThreadId) &&
       !isRevertingCheckpointRef.current &&
       questionCanAttach &&
@@ -5596,7 +5616,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       toastManager.add({
         type: "error",
         title: "Pasted text is too large for this message",
-        description: "Remove some text or an attachment, then paste again.",
+        description: attachmentDisabledReason
+          ? "Reduce the clipboard text, then paste again."
+          : "Remove some text or an attachment, then paste again.",
         data: { hideCopyButton: true },
       });
       return true;

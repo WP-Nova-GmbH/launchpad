@@ -92,7 +92,7 @@ export const uploadPortableThreadArtifact = Effect.fn("relay.api.thread_artifact
       artifactId: completed.artifactId,
       threadId: ThreadId.make(completed.threadId),
       operationId: completed.operationId,
-      kind: completed.kind,
+      kind: input.kind,
       sha256: completed.sha256,
       sizeBytes: completed.sizeBytes,
       state: "complete" as const,

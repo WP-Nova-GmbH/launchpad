@@ -41,7 +41,7 @@ export function makeThreadVmRestoreWorker(
       });
     }).pipe(
       Effect.catchTags({
-        E2BRestoreError: () => store.deferPreparation(claim, "snapshot_unconfirmed"),
+        E2BRestoreError: (error) => store.settleCatalogFailure(claim, error),
         ThreadVmRestoreConflict: () => store.deferPreparation(claim, "recovery_unconfirmed"),
         ThreadNativeCheckpointConflict: () => store.deferPreparation(claim, "recovery_unconfirmed"),
       }),

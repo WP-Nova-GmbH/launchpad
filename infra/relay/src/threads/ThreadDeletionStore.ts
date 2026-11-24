@@ -100,7 +100,19 @@ export function makeThreadDeletionStore(sql: PgClient) {
         }
         const identity = input.workflow
           ? sql`t.audience='repository' AND t.owner_user_id IS NULL AND t.workflow_job_id=${input.workflow.jobId} AND t.organization_id=${input.workflow.organizationId} AND t.repository_id=${input.workflow.repositoryId}
-            AND EXISTS(SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id AND j.status IN ('done','failed','cancelled') AND j.record#>>'{progress,executionReleased}'='true')`
+            AND EXISTS(SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id AND j.status IN ('done','failed','cancelled') AND j.record#>>'{progress,executionReleased}'='true'
+              AND j.pending_control IS NULL AND COALESCE(j.record#>'{progress,resultSaving}','null'::jsonb)='null'::jsonb)
+            AND NOT EXISTS(SELECT 1 FROM relay_workflow_vm_follow_ups f WHERE f.job_id=t.workflow_job_id
+              AND (f.reclaim_operation_id IS NOT NULL OR f.operation_id IS NOT NULL OR f.open_until>clock_timestamp()))
+            AND NOT EXISTS(SELECT 1 FROM relay_workflow_vm_follow_up_pushes push
+              WHERE push.job_id=t.workflow_job_id AND push.status IN ('preparing','armed','pending'))
+            AND NOT EXISTS(SELECT 1 FROM relay_thread_commands q WHERE q.thread_id=t.thread_id AND q.receipt_json IS NULL)
+            AND NOT EXISTS(SELECT 1 FROM relay_thread_execution_admissions e
+              WHERE e.thread_id=t.thread_id AND e.generation=t.generation AND NOT e.completed AND
+              NOT EXISTS (SELECT 1 FROM relay_thread_vm_allocations a JOIN relay_thread_vm_activity v USING(allocation_id)
+                WHERE a.thread_id=t.thread_id AND a.state='running' AND a.deleted_at IS NULL
+                  AND v.activity='idle' AND v.observed_at>=clock_timestamp()-interval '2 minutes'
+                  AND jsonb_exists(v.inactive_work_ids,e.work_id)))`
           : sql`t.audience='private' AND t.owner_user_id=${input.ownerUserId}`;
         const requester = input.requesterUserId ?? input.ownerUserId;
         if (!requester) return yield* fail();

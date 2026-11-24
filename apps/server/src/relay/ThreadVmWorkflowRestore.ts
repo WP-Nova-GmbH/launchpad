@@ -422,7 +422,8 @@ export const assertWorkflowVmRestoreReady = Effect.fn("ThreadVmWorkflowRestore.a
         AND provider_instance_id='codex' AND status='stopped'
         AND json_extract(resume_cursor_json,'$.threadId')=${recovery.native?.nativeThreadId ?? null}
         AND json_extract(resume_cursor_json,'$.resumePolicy')='require-existing'
-        AND json_extract(runtime_payload_json,'$.providerContinuation.workflowJobId')=${workflow.binding.jobId}
+        AND (${workflow.checkpoint.finishedWorkspaceRevision !== undefined}
+          OR json_extract(runtime_payload_json,'$.providerContinuation.workflowJobId')=${workflow.binding.jobId})
         AND json_extract(runtime_payload_json,'$.stoppedRuntimeEventsDrained')=1`;
     if (recovery.native ? !verified : !lifecycle.beforeAgent || runtime !== undefined)
       return yield* Effect.fail(fail());

@@ -101,6 +101,7 @@ import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { useThreadDiscoveredPorts } from "../portDiscoveryState";
 import { openDiscoveredPort } from "./preview/openDiscoveredPort";
 import { useAtomCommand } from "../state/use-atom-command";
+import { workflowVmFollowUpHistoryState } from "../state/workflowVmFollowUp";
 import { previewEnvironment } from "../state/preview";
 import {
   legacyProjectCwdPreferenceKey,
@@ -1853,6 +1854,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       return router.navigate({
         to: "/$environmentId/$threadId",
         params: buildThreadRouteParams(threadRef),
+        state: workflowVmFollowUpHistoryState(threadRef),
       });
     },
     [clearSelection, isMobile, router, setOpenMobile, setSelectionAnchor],
@@ -1889,7 +1891,6 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       const isModClick = isMac ? event.metaKey : event.ctrlKey;
       const isShiftClick = event.shiftKey;
       const threadKey = scopedThreadKey(threadRef);
-      const currentSelectionCount = useThreadSelectionStore.getState().selectedThreadKeys.size;
 
       if (isModClick) {
         event.preventDefault();
@@ -1910,27 +1911,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
 
-      if (currentSelectionCount > 0) {
-        clearSelection();
-      }
-      setSelectionAnchor(threadKey);
-      if (isMobile) {
-        setOpenMobile(false);
-      }
-      void router.navigate({
-        to: "/$environmentId/$threadId",
-        params: buildThreadRouteParams(threadRef),
-      });
+      void navigateToThread(threadRef);
     },
-    [
-      clearSelection,
-      isMobile,
-      rangeSelectTo,
-      router,
-      setOpenMobile,
-      setSelectionAnchor,
-      toggleThreadSelection,
-    ],
+    [navigateToThread, rangeSelectTo, toggleThreadSelection],
   );
 
   const handleMultiSelectContextMenu = useCallback(
@@ -3397,6 +3380,7 @@ export default function LegacySidebar() {
       void navigate({
         to: "/$environmentId/$threadId",
         params: buildThreadRouteParams(threadRef),
+        state: workflowVmFollowUpHistoryState(threadRef),
       });
     },
     [clearSelection, isMobile, navigate, setOpenMobile, setSelectionAnchor],

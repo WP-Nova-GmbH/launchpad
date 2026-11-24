@@ -6,7 +6,11 @@ import * as Option from "effect/Option";
 import type { ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import type { SandboxInfo } from "e2b";
 import { threadVmOperationMatches } from "../machines/E2BThreadVmRestoreAttempt.ts";
-import { makeThreadVmResumeStore, workflowVmNativePauseCheckpoint } from "./ThreadVmResumeStore.ts";
+import {
+  makeThreadVmResumeStore,
+  workflowVmFinishedReclaim,
+  workflowVmNativePauseCheckpoint,
+} from "./ThreadVmResumeStore.ts";
 import { wakeQueuedThreadVm } from "./ThreadVmWakeAdmission.ts";
 import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import type { MissingWorkflowVmSourceReconciler } from "./ThreadVmFinalSaveStore.ts";
@@ -60,19 +64,35 @@ export function makeThreadVmLeaseWorker(
   const runOne = Effect.fn("relay.thread_vm.lease.run_one")(function* (
     mode: "running" | "paused" = "running",
   ) {
+    const [fallback] =
+      mode === "running" && compute
+        ? yield* sql<{ allocationId: string }>`SELECT a.allocation_id AS "allocationId"
+          FROM relay_workflow_vm_follow_ups f JOIN relay_thread_vm_pauses x ON x.operation_id=f.reclaim_operation_id
+          JOIN relay_thread_vm_allocations a ON a.allocation_id=x.allocation_id
+          JOIN relay_thread_vm_capacity c ON c.allocation_id=a.allocation_id
+          JOIN relay_thread_placements t ON t.thread_id=a.thread_id AND t.workflow_job_id=f.job_id
+          LEFT JOIN relay_thread_vm_leases l ON l.allocation_id=a.allocation_id
+          WHERE f.reclaim_fallback AND x.phase='cancelled' AND x.source_reopened_at IS NOT NULL
+            AND a.state='running' AND a.deleted_at IS NULL AND c.host_id=${hostId} AND c.state='started'
+            AND t.operation_id IS NULL AND x.generation=t.generation
+            AND (l.attempted_at IS NULL OR l.attempted_at<clock_timestamp()-interval '1 minute')
+          ORDER BY l.attempted_at NULLS FIRST,a.allocation_id LIMIT 1`
+        : [];
     const idleFinishedVm =
-      mode === "running" && compute && finishedWorkflows
+      fallback?.allocationId ??
+      (mode === "running" && compute && finishedWorkflows
         ? yield* makeThreadVmCapacityStore(sql).finishedVmDueToPause(
             hostId,
             finishedWorkflows.linear,
           )
-        : null;
+        : null);
     const [row] = yield* sql<LeaseCandidate>`SELECT a.allocation_id AS "allocationId",
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
       a.thread_id AS "threadId", t.repository_id AS "repositoryId", p.generation,c.operation_id AS "capacityOperationId",
       a.resource_kind AS "resourceKind", a.state AS "allocationState",
       a.native_paused_generation AS "nativePausedGeneration",
-      CASE WHEN a.resource_kind='organization_workflow' AND ${workflowVmNativePauseCheckpoint(sql)}
+      CASE WHEN a.resource_kind='organization_workflow' AND
+        (${workflowVmNativePauseCheckpoint(sql)} OR ${workflowVmFinishedReclaim(sql)})
         THEN t.workflow_job_id ELSE NULL END AS "workflowCheckpointJobId"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
@@ -97,7 +117,10 @@ export function makeThreadVmLeaseWorker(
             AND (x.phase = 'sealed' OR (x.phase = 'pending'
               AND (x.native_checkpoint_operation_id IS NOT NULL OR x.workflow_checkpoint IS NOT NULL)
               AND x.source_sequence IS NOT NULL AND x.source_frozen_at IS NOT NULL
-              AND x.boot_id IS NOT NULL)))
+              AND x.boot_id IS NOT NULL
+              AND (x.workflow_checkpoint IS NULL OR NOT (x.workflow_checkpoint ? 'finishedWorkspaceRevision')
+                OR EXISTS(SELECT 1 FROM relay_thread_vm_backups z WHERE z.operation_id=x.backup_operation_id
+                  AND z.phase='verified')))))
         AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_resumes r
           WHERE r.allocation_id = a.allocation_id AND (r.phase='resuming'
             OR (r.phase='waiting' AND (${mode === "running"} OR r.connect_claim_id IS NOT NULL))))
@@ -177,10 +200,13 @@ export function makeThreadVmLeaseWorker(
             return true;
           const changed = yield* sql.withTransaction(
             Effect.gen(function* () {
-              const [allocation] = yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations
-                WHERE allocation_id=${row.allocationId} AND resource_kind='organization_workflow'
-                  AND compute_ref=${row.computeRef} AND state=${row.allocationState}
-                  AND deleted_at IS NULL FOR UPDATE`;
+              yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${row.threadId} FOR UPDATE`;
+              const [allocation] =
+                yield* sql`SELECT a.allocation_id FROM relay_thread_vm_allocations a
+                JOIN relay_thread_placements t USING(thread_id)
+                WHERE a.allocation_id=${row.allocationId} AND a.resource_kind='organization_workflow'
+                  AND a.compute_ref=${row.computeRef} AND a.state=${row.allocationState}
+                  AND a.deleted_at IS NULL AND NOT ${workflowVmFinishedReclaim(sql)} FOR UPDATE OF a`;
               if (!allocation) return false;
               const [capacity] = yield* sql`UPDATE relay_thread_vm_capacity c SET state='released'
                 WHERE c.operation_id=${row.capacityOperationId} AND c.allocation_id=${row.allocationId}

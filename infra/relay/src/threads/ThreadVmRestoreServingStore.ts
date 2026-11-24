@@ -22,6 +22,7 @@ import {
   type ThreadVmRestore,
   type ThreadVmRestoreClaim,
 } from "./ThreadVmRestoreStore.ts";
+import { authorizeWorkflowVmFollowUpRequest } from "./WorkflowVmFollowUpState.ts";
 import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
 import { authorizeWorkflowPublishingRestore } from "./WorkflowVmPublishingRecovery.ts";
 
@@ -147,6 +148,18 @@ export function makeThreadVmRestoreServingStore(
     row: Effect.Success<ReturnType<typeof authorize>>,
   ) {
     if (!row.workflowCheckpoint) return true;
+    if (row.workflowCheckpoint.finishedWorkspaceRevision !== undefined) {
+      const request = row.workflowJob
+        ? yield* authorizeWorkflowVmFollowUpRequest(sql, row.workflowJob, row.operationId)
+        : null;
+      if (
+        request?.userId === row.actorUserId &&
+        (yield* readCurrentWorkflowCheckpoint(sql, row.workflowCheckpoint))
+      )
+        return true;
+      yield* restores.requestAbort(row.operationId);
+      return false;
+    }
     if (
       row.workflowJob &&
       (yield* authorizeWorkflowPublishingRestore(sql, row.workflowJob, {
@@ -194,6 +207,9 @@ export function makeThreadVmRestoreServingStore(
           }
         RETURNING generation`;
         if (!changed) return yield* conflict("Restore ownership changed before commit.");
+        if (row.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+          yield* sql`UPDATE relay_workflow_vm_follow_ups SET generation=${changed.generation}
+            WHERE operation_id=${row.operationId} AND allocation_id=${row.allocationId}`;
         yield* sql`UPDATE relay_thread_vm_allocations SET template_id=${row.sourceTemplateId} WHERE allocation_id=${row.allocationId}`;
         yield* sql`UPDATE relay_thread_vm_restores SET phase='committed',target_generation=${changed.generation},committed_at=clock_timestamp(),claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
         return (yield* restores.get(row.operationId))!;
@@ -230,11 +246,41 @@ export function makeThreadVmRestoreServingStore(
         if (!(yield* startAuthorized(row))) return null;
         if (yield* restores.parkForCodex(row, row.workflowJob, reservation.state)) return null;
         if (reservation.state === "reserved") yield* capacity.beginExecution(row.operationId);
-        yield* sql`UPDATE relay_thread_vm_restores SET phase='creating',boot_create_started_at=clock_timestamp() WHERE operation_id=${row.operationId}`;
+        yield* sql`UPDATE relay_thread_vm_restores SET phase='creating',boot_create_started_at=clock_timestamp(),error_code=NULL WHERE operation_id=${row.operationId}`;
         return (yield* restores.get(row.operationId))!;
       }),
     );
   });
+  /** A definite POST rejection can settle the exact attempt after revocation. */
+  const settleRejectedCreate = Effect.fn("relay.thread_vm.restore.settle_rejected_create")(
+    function* (
+      attempt: Pick<
+        ThreadVmRestore,
+        "operationId" | "allocationId" | "targetGeneration" | "bootAttempt"
+      >,
+    ) {
+      return yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const row = yield* restores.lock(attempt.operationId);
+          if (
+            row.workflowCheckpoint?.finishedWorkspaceRevision === undefined ||
+            row.allocationId !== attempt.allocationId ||
+            row.targetGeneration !== attempt.targetGeneration ||
+            row.bootAttempt !== attempt.bootAttempt ||
+            !["creating", "aborting"].includes(row.phase) ||
+            !row.bootCreateStarted ||
+            row.bootReceipt ||
+            row.bootIngressRecoveryClaimId
+          )
+            return;
+          yield* sql`UPDATE relay_thread_vm_restores SET phase='aborting',
+          boot_create_started_at=NULL,claim_id=NULL,claim_until=NULL,
+          error_code='create_rejected',retry_at=clock_timestamp()
+          WHERE operation_id=${attempt.operationId}`;
+        }),
+      );
+    },
+  );
   const recordObserved = Effect.fn("relay.thread_vm.restore.record_observed")(function* (
     claim: ThreadVmRestoreClaim,
     sandboxId: string,
@@ -491,7 +537,10 @@ export function makeThreadVmRestoreServingStore(
           });
           if (row.nativeCheckpointOperationId)
             yield* makeThreadNativeCheckpointStore(sql, objects).releaseOperation(row);
-          yield* sql`UPDATE relay_thread_vm_restores SET phase='aborted',claim_id=NULL,claim_until=NULL,error_code=NULL WHERE operation_id=${row.operationId}`;
+          yield* sql`UPDATE relay_thread_vm_restores SET phase='aborted',claim_id=NULL,claim_until=NULL WHERE operation_id=${row.operationId}`;
+          if (row.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+            yield* sql`UPDATE relay_workflow_vm_follow_ups SET operation_id=NULL,requested_at=NULL
+              WHERE operation_id=${row.operationId} AND allocation_id=${row.allocationId}`;
         }),
       );
     },
@@ -513,6 +562,7 @@ export function makeThreadVmRestoreServingStore(
     authorize,
     commit,
     beginCreate,
+    settleRejectedCreate,
     recordObserved,
     admitIngressRecovery,
     beginIngressRecovery,

@@ -20,7 +20,7 @@ interface PauseFreezeReceipt {
 export interface ThreadPauseTransport {
   readonly cancel: (
     owner: ThreadHistoryOwner,
-    input: { operationId: string },
+    input: { operationId: string; nativePauseFallback?: true },
   ) => Effect.Effect<RelayThreadVmPause, ThreadPauseError>;
   readonly activate: (
     owner: ThreadHistoryOwner,
@@ -96,7 +96,10 @@ export function makeThreadPauseTransport<E, R>(
       ),
   );
   const cancel = Effect.fn("ThreadPauseTransport.cancel")(
-    function* (owner: ThreadHistoryOwner, input: { operationId: string }) {
+    function* (
+      owner: ThreadHistoryOwner,
+      input: { operationId: string; nativePauseFallback?: true },
+    ) {
       const client = yield* clientFor(owner);
       return yield* client.threadEnvironment.cancelPause({
         params: {

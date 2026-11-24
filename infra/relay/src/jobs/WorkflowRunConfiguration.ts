@@ -81,7 +81,7 @@ const requireRepository = Effect.fnUntraced(function* (sql: PgClient, identity: 
 });
 
 const readSnapshot = (sql: PgClient, identity: RunIdentity) =>
-  sql<RunConfigurationMetadata & { threadId: string; sealedPayload: string }>`
+  sql<RunConfigurationMetadata & { threadId: string; sealedPayload: string | null }>`
     SELECT thread_id AS "threadId",source_revision AS "sourceRevision",
       has_secrets AS "hasSecrets",sealed_payload AS "sealedPayload"
     FROM relay_workflow_run_configurations WHERE job_id=${identity.jobId}
@@ -93,7 +93,8 @@ const openSnapshot = Effect.fnUntraced(function* (
   identity: RunIdentity,
 ) {
   const [snapshot] = yield* readSnapshot(sql, identity);
-  if (!snapshot || snapshot.threadId !== identity.threadId) return yield* unavailable();
+  if (!snapshot?.sealedPayload || snapshot.threadId !== identity.threadId)
+    return yield* unavailable();
   const opened = yield* decodeEnvelope(yield* box.open(snapshot.sealedPayload));
   if (
     opened.jobId !== identity.jobId ||
@@ -194,6 +195,40 @@ export const withFrozenWorkflowRunConfiguration = <E, R>(
       }),
     )
     .pipe(Effect.mapError(safeError));
+
+/** Keep the authorization marker after the last accessible copy of the workspace is gone. */
+export const purgeOneReleasedWorkflowConfiguration = Effect.fnUntraced(function* (
+  sql: PgClient,
+  hostId: string,
+) {
+  const rows = yield* sql`WITH candidate AS (
+    SELECT c.job_id
+    FROM relay_workflow_run_configurations c JOIN relay_workflow_jobs j USING(job_id)
+    WHERE c.sealed_payload IS NOT NULL
+      AND j.status IN ('done','failed','cancelled') AND j.pending_control IS NULL
+      AND j.record#>>'{progress,executionReleased}'='true'
+      AND COALESCE(j.record#>'{progress,resultSaving}','null'::jsonb)='null'::jsonb
+      AND EXISTS (SELECT 1 FROM relay_thread_vm_allocations a
+        JOIN relay_thread_vm_capacity capacity ON capacity.allocation_id=a.allocation_id
+        WHERE a.thread_id=c.thread_id AND capacity.host_id=${hostId})
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_placements p
+        WHERE p.thread_id=c.thread_id AND p.operation_id IS NOT NULL)
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_allocations a
+        WHERE a.thread_id=c.thread_id AND (a.deleted_at IS NULL OR EXISTS (
+          SELECT 1 FROM relay_thread_vm_backups b WHERE b.allocation_id=a.allocation_id
+            AND (b.phase IN ('pending','creating','captured','verifying','cleanup','verified','retiring')
+              OR (b.phase='failed' AND (b.capture_started_at IS NOT NULL OR b.snapshot_id IS NOT NULL)))
+        )))
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_saved_disks d
+        WHERE d.thread_id=c.thread_id AND d.phase IN ('available','restoring','expiring'))
+      AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_restores r WHERE r.thread_id=c.thread_id
+        AND r.phase NOT IN ('completed','aborted'))
+    ORDER BY j.created_at, c.job_id LIMIT 1 FOR NO KEY UPDATE OF j, c SKIP LOCKED
+  )
+  UPDATE relay_workflow_run_configurations c SET sealed_payload=NULL
+  FROM candidate WHERE c.job_id=candidate.job_id RETURNING c.job_id`;
+  return rows.length > 0;
+});
 
 /** The worker supplies its current claim and the exact target of the pending setup. */
 export type WorkflowRunSetupClaim = RunIdentity & {
@@ -360,6 +395,15 @@ export const resolveWorkflowRunAttemptConfiguration = Effect.fnUntraced(function
   const [registration] = yield* sql`SELECT attempt_id FROM relay_workflow_vm_attempts
     WHERE job_id=${jobId} AND attempt_id=${attempt.attemptId} AND identity=${attemptIdentity}::jsonb FOR SHARE`;
   if (!registration) return yield* denied();
+  return yield* readWorkflowRunFollowUpConfiguration(sql, box, identity);
+}, Effect.mapError(safeError));
+
+/** Only call after authorizing the current workflow attempt or follow-up actor. */
+export const readWorkflowRunFollowUpConfiguration = Effect.fnUntraced(function* (
+  sql: PgClient,
+  box: RelaySecretBox["Service"],
+  identity: RunIdentity,
+) {
   const opened = yield* openSnapshot(sql, box, identity);
   return {
     environment: Object.fromEntries(opened.values.map(({ name, value }) => [name, value])),

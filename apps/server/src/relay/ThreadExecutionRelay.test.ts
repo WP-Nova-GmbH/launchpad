@@ -301,6 +301,27 @@ describe("portable execution handshake", () => {
         assert.equal(yield* makeThreadExecutionRelay(sql, authority).begin(work), "start");
       }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
+  it.effect("keeps proof that work never started across completion retries", () =>
+    Effect.gen(function* () {
+      const { sql, fence, authority } = yield* fixture;
+      const refused = makeThreadExecutionRelay(sql, {
+        ...authority,
+        admit: () => Effect.fail(unavailable("admit")),
+        complete: () => Effect.fail(unavailable("complete")),
+      });
+      assert.equal((yield* Effect.flip(refused.begin(work)))._tag, "ThreadExecutionRelayError");
+      assert.equal(
+        (yield* Effect.flip(refused.confirmStopped(work)))._tag,
+        "ThreadExecutionRelayError",
+      );
+      assert.lengthOf(yield* fence.pendingCompletionReports(), 1);
+      yield* makeThreadExecutionRelay(sql, {
+        ...authority,
+        complete: (input) => Effect.sync(() => assert.isTrue(input.neverStarted)),
+      }).flushCompletions();
+      assert.lengthOf(yield* fence.pendingCompletionReports(), 0);
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
   it.effect(
     "durably retains completion after relay loss and retries only the acknowledgement",
     () =>

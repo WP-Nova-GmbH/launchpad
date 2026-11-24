@@ -1,8 +1,14 @@
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import type { RelayWorkflowVmFollowUpConnection } from "@t3tools/contracts/relay";
+import {
+  requireWorkflowVmFollowUpActor,
+  requireWorkflowVmFollowUpWorkspace,
+  requireWorkflowVmLiveViewer,
+} from "../jobs/WorkflowVmFollowUpAccess.ts";
 import { RelayDb } from "../db.ts";
 import { withPrivateThreadOwnerAccess } from "../http/privateThreadAccess.ts";
-import { readWorkflowVmBinding, requireWorkflowVmViewer } from "../jobs/WorkflowVmBinding.ts";
+import { readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
 import {
   ThreadVmConnectionUnavailable,
   type ThreadVmConnectionTarget,
@@ -86,14 +92,22 @@ export const authorizeThreadVmStatus = (userId: string, threadId: ThreadId) =>
 
 /** Workflow viewer credentials are separate from personal VM owner controls. */
 export const authorizeWorkflowVmViewerConnection = Effect.fnUntraced(
-  function* (userId: string, threadId: ThreadId) {
+  function* (userId: string, threadId: ThreadId, followUp?: RelayWorkflowVmFollowUpConnection) {
     const sql = (yield* RelayDb).$client;
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const current = yield* readWorkflowVmBinding(sql, { threadId });
-        yield* requireWorkflowVmViewer(sql, current.binding, userId);
+        if (followUp) {
+          if (
+            current.binding.threadId !== followUp.threadId ||
+            current.binding.generation !== followUp.generation
+          )
+            return yield* new ThreadVmConnectionUnavailable();
+          yield* requireWorkflowVmFollowUpActor(sql, current.binding, userId);
+        } else yield* requireWorkflowVmLiveViewer(sql, current.binding, userId);
         const { binding, sandboxId, templateId, environmentPublicKey, credentialId } =
-          yield* readWorkflowVmBinding(sql, current.binding);
+          yield* readWorkflowVmBinding(sql, current.binding, "active", true);
+        if (followUp) yield* requireWorkflowVmFollowUpWorkspace(sql, binding, "prepare");
         return {
           state: "running" as const,
           environmentId: binding.environmentId,

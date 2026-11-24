@@ -20,7 +20,9 @@ import { makeThreadVmRestoreServingStore } from "./ThreadVmRestoreServingStore.t
 type RestoreCompute = Pick<
   ReturnType<typeof makeE2BThreadVmCompute>,
   "createFromSnapshot" | "findOperation" | "recoverIngress" | "inspect" | "destroy"
->;
+> & {
+  readonly restore: Pick<ReturnType<typeof makeE2BThreadVmCompute>["restore"], "resolveSource">;
+};
 const matches = (row: ThreadVmRestore, info: SandboxInfo, expectedId?: string) =>
   (!expectedId || info.sandboxId === expectedId) &&
   info.templateId === row.sourceTemplateId &&
@@ -192,21 +194,39 @@ export function makeThreadVmRestoreServingWorker(
       }
       let created: ThreadVmCreated | undefined;
       if (row.phase === "committed") {
+        const source = yield* compute.restore
+          .resolveSource(row.sourceTemplateId, row.sourceBuildId)
+          .pipe(
+            Effect.catchTag("E2BRestoreError", (error) =>
+              restores.settleCatalogFailure(claim, error).pipe(Effect.as(null)),
+            ),
+          );
+        if (!source) return;
         const creating = yield* serving.beginCreate(claim);
         if (!creating) return;
         row = creating;
-        created = yield* compute.createFromSnapshot({
-          allocationId: row.allocationId,
-          operationId: restoreBootOperationId(row.operationId, row.bootAttempt),
-          threadId: row.threadId,
-          generation: row.targetGeneration!,
-          environment: {},
-          sourceTemplateId: row.sourceTemplateId,
-          sourceBuildId: row.sourceBuildId,
-          restoreOperationId: row.operationId,
-          bootAttempt: row.bootAttempt,
-        });
-        row = yield* serving.recordObserved(claim, created.sandboxId);
+        const outcome = yield* compute
+          .createFromSnapshot({
+            allocationId: row.allocationId,
+            operationId: restoreBootOperationId(row.operationId, row.bootAttempt),
+            threadId: row.threadId,
+            generation: row.targetGeneration!,
+            environment: {},
+            sourceTemplateId: source.sourceTemplateID,
+            restoreOperationId: row.operationId,
+            bootAttempt: row.bootAttempt,
+          })
+          .pipe(
+            Effect.catchIf(
+              (error) =>
+                creating.workflowCheckpoint?.finishedWorkspaceRevision !== undefined &&
+                error.createRejected === true,
+              () => serving.settleRejectedCreate(creating).pipe(Effect.as(null)),
+            ),
+          );
+        if (!outcome) return;
+        created = outcome;
+        row = yield* serving.recordObserved(claim, outcome.sandboxId);
       }
       const boot = row.bootReceipt!;
       const identity = {

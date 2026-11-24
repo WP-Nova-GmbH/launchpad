@@ -1,5 +1,8 @@
 import { type EnvironmentId, type ProjectId, type ThreadId } from "@t3tools/contracts";
-import { type RelayCloudMintCredentialProofPayload } from "@t3tools/contracts/relay";
+import type {
+  RelayCloudMintCredentialProofPayload,
+  RelayWorkflowVmFollowUpConnection,
+} from "@t3tools/contracts/relay";
 import {
   normalizeRelayIssuer,
   RELAY_MINT_REQUEST_TYP,
@@ -39,6 +42,7 @@ export const mintThreadVmConnection = <E, R>(input: {
   readonly clientProofKeyThumbprint: string;
   readonly relayIssuer: string;
   readonly deviceId?: string;
+  readonly workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
   readonly profile?: { readonly displayName?: string | null; readonly imageUrl?: string | null };
   readonly cloudMintPrivateKey: Redacted.Redacted<string>;
   readonly authorize: (
@@ -50,7 +54,13 @@ export const mintThreadVmConnection = <E, R>(input: {
   Effect.gen(function* () {
     if (!input.clientProofKeyThumbprint.trim()) return yield* new ThreadVmConnectionUnavailable();
     const target = yield* input.authorize(input.userId, input.threadId);
-    if (target.identity.scope.threadId !== input.threadId)
+    if (
+      target.identity.scope.threadId !== input.threadId ||
+      (input.workflowFollowUp &&
+        (target.identity.resourceKind !== "organization_workflow" ||
+          input.workflowFollowUp.threadId !== input.threadId ||
+          input.workflowFollowUp.generation !== target.identity.scope.generation))
+    )
       return yield* new ThreadVmConnectionUnavailable();
     const crypto = yield* Crypto.Crypto;
     const now = yield* DateTime.now;
@@ -67,6 +77,7 @@ export const mintThreadVmConnection = <E, R>(input: {
       clientProofKeyThumbprint: input.clientProofKeyThumbprint,
       cnf: { jkt: input.clientProofKeyThumbprint },
       ...(input.deviceId ? { deviceId: input.deviceId } : {}),
+      ...(input.workflowFollowUp ? { workflowFollowUp: input.workflowFollowUp } : {}),
       ...(input.profile?.displayName ? { name: input.profile.displayName } : {}),
       ...(input.profile?.imageUrl ? { picture: input.profile.imageUrl } : {}),
       nonce,

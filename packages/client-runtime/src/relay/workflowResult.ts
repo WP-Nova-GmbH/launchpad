@@ -13,6 +13,7 @@ export interface WorkflowResultOrigin extends WorkflowScope {
   readonly jobId: string;
   readonly threadId: string;
   readonly workflowVmResultReader?: true;
+  readonly workflowVmFollowUpGeneration?: number;
   readonly savedDiffCheckpoint?: WorkflowResultCheckpoint;
   readonly reviewCheckpoint?: WorkflowResultCheckpoint;
   readonly reviewVisitId?: string;
@@ -24,6 +25,7 @@ const Origin = Schema.Struct({
   jobId: Schema.String,
   threadId: Schema.String,
   workflowVmResultReader: Schema.optionalKey(Schema.Literal(true)),
+  workflowVmFollowUpGeneration: Schema.optionalKey(Schema.Int),
   savedDiffCheckpoint: Schema.optionalKey(ResultCheckpoint),
   reviewCheckpoint: Schema.optionalKey(ResultCheckpoint),
   reviewVisitId: Schema.optionalKey(Schema.String),

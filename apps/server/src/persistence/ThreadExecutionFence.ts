@@ -415,8 +415,8 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   const pendingCompletionReports = Effect.fn("ThreadExecutionFence.pendingCompletionReports")(
     function* () {
       return yield* sql<
-        Array<Work>[number]
-      >`SELECT thread_id AS "threadId", work_id AS "workId", generation, kind
+        Work & { readonly started: number }
+      >`SELECT thread_id AS "threadId", work_id AS "workId", generation, kind, started
       FROM thread_execution_work WHERE completed = 1 AND relay_completed = 0`;
     },
   );

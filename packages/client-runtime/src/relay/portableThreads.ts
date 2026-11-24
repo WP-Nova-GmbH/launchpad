@@ -255,6 +255,9 @@ export const portableThreadCommandLayer = (registry: AtomRegistry.AtomRegistry) 
             clerkToken,
             threadId: command.threadId,
             command: portable,
+            ...(/^workflow:[^:]+$/u.test(command.threadId)
+              ? { expectedPlacement: { environmentId, generation: route.generation } }
+              : {}),
           })
           .pipe(
             Effect.mapError(

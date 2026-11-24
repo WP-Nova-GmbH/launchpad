@@ -1,5 +1,8 @@
 import { EnvironmentId } from "@t3tools/contracts";
-import { RelayClientEnvironmentSource } from "@t3tools/contracts/relay";
+import {
+  RelayClientEnvironmentSource,
+  RelayWorkflowVmFollowUpConnection,
+} from "@t3tools/contracts/relay";
 import * as Schema from "effect/Schema";
 
 const ConnectionTargetBase = {
@@ -34,6 +37,7 @@ export class RelayConnectionTarget extends Schema.TaggedClass<RelayConnectionTar
      * before the field existed count as the user's own links.
      */
     source: Schema.optional(RelayClientEnvironmentSource),
+    workflowFollowUp: Schema.optionalKey(RelayWorkflowVmFollowUpConnection),
   },
 ) {}
 

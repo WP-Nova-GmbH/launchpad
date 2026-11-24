@@ -1,4 +1,9 @@
+import { reconcileWorkflowVmFollowUpPush } from "../jobs/WorkflowVmFollowUpPush.ts";
 import { readWorkflowVmRecoveries } from "../threads/WorkflowVmRecovery.ts";
+import {
+  openWorkflowVmFollowUp,
+  readWorkflowVmFollowUp,
+} from "../threads/WorkflowVmFollowUpLifecycle.ts";
 import { RelayApi, RelayClientPrincipal } from "@t3tools/contracts/relay";
 import {
   WorkflowDefinition,
@@ -149,6 +154,14 @@ const withViewerControls = Effect.fnUntraced(function* (
       ? { pendingResponseId: pending.responseId }
       : {}),
     viewerControls: {
+      canContinueInVm:
+        job.runtime?.kind === "vm" &&
+        isTerminalWorkflowJob(job.status) &&
+        job.progress?.executionReleased === true &&
+        job.progress.hasThread !== false &&
+        !job.progress.resultSaving &&
+        !row.pendingControl &&
+        (canManage || !(yield* hasFrozenVmSecrets(row.jobId))),
       canCancel: canManage || (yield* mayCancelOwnVm(row, membership.userId)),
       canApprove: !job.progress?.resultSaving && (canManage || memberCheckpoint),
       canRespond:
@@ -474,6 +487,38 @@ export const respondToWorkflowJob = Effect.fn("WorkflowsApi.respond")(function* 
   return yield* refreshForViewer(pendingControl.responseId);
 });
 const errors = mapRelayCommonApiErrors("not_authorized");
+
+const workflowVmFollowUp = Effect.fnUntraced(function* (
+  params: { readonly repositoryId: string; readonly jobId: string },
+  open: boolean,
+) {
+  const membership = yield* authorizeWorkflowRepository(params.repositoryId);
+  const result = yield* (open ? openWorkflowVmFollowUp : readWorkflowVmFollowUp)({
+    ...params,
+    organizationId: membership.organization.organizationId,
+    userId: membership.userId,
+  }).pipe(
+    Effect.catchTag(
+      ["SqlError", "PlatformError"],
+      (cause) => new WorkflowPersistenceError({ cause }),
+    ),
+  );
+  if (result.state !== "running") {
+    if (result.state !== "expired" && result.state !== "unavailable") return result;
+    const publishing = yield* reconcileWorkflowVmFollowUpPush({
+      ...params,
+      organizationId: membership.organization.organizationId,
+      userId: membership.userId,
+    }).pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+    return publishing ? { ...result, publishing } : result;
+  }
+  return {
+    state: result.state,
+    environmentId: result.binding.environmentId,
+    threadId: result.binding.threadId,
+    generation: result.binding.generation,
+  };
+});
 const sameDefinition = Schema.toEquivalence(WorkflowDefinition);
 const vmModels = ThreadVmRuntimeConfiguration.pipe(
   Effect.map(({ settings }) => settings?.workflowModelCatalog ?? null),
@@ -839,6 +884,8 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
           .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
       }).pipe(errors),
     )
+    .handle("continueInVm", ({ params }) => workflowVmFollowUp(params, true).pipe(errors))
+    .handle("getVmFollowUp", ({ params }) => workflowVmFollowUp(params, false).pipe(errors))
     .handle("listSavedResults", ({ params, query }) =>
       listSavedWorkflowResults({ ...params, ...query }),
     )

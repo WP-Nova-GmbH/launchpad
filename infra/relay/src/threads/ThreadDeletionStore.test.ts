@@ -677,6 +677,22 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
                   ._tag,
               ).toBe("Failure");
               yield* f.sql`UPDATE relay_workflow_jobs SET record=jsonb_set(record,'{progress,executionReleased}','true') WHERE job_id=${jobId}`;
+              expect(
+                (yield* Effect.result(f.authorized(permanentlyDeleteThread(f.threadId, f.payload))))
+                  ._tag,
+              ).toBe("Failure");
+              const jobs = yield* f.authorized(makeWorkflows);
+              const stale = (yield* jobs.claim(jobId))!;
+              yield* jobs.updateJob(
+                stale,
+                {
+                  ...stale.record,
+                  progress: { ...stale.record.progress!, resultSaving: undefined },
+                },
+                null,
+                true,
+                stale.leaseUntil!,
+              );
               const wrongGeneration = { ...f.payload, expectedGeneration: 2 };
               expect(
                 (yield* Effect.result(
@@ -695,8 +711,6 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               const capture = yield* addCapture(f);
               yield* f.sql`UPDATE relay_thread_vm_backups SET source_receipt=jsonb_set(source_receipt,'{workflowCheckpoint}',${f.sql.json({ jobId, publicationId, publicationRevision: 1, checkpointId: "input", checkpointGeneration: 0 })})
                 WHERE operation_id=${capture.operationId}`;
-              const jobs = yield* f.authorized(makeWorkflows);
-              const stale = (yield* jobs.claim(jobId))!;
               const deleted = yield* f.authorized(permanentlyDeleteThread(f.threadId, f.payload));
               expect((yield* jobs.getJob(jobId))?.record.progress).toMatchObject({
                 hasThread: false,

@@ -26,6 +26,10 @@ export class ThreadCommandSyncError extends Schema.TaggedError<ThreadCommandSync
   { threadId: Schema.String, detail: Schema.String },
 ) {}
 export interface ThreadCommandTransport {
+  readonly authorizeFollowUp?: (
+    owner: ThreadHistoryOwner,
+    userId: string,
+  ) => Effect.Effect<boolean, ThreadCommandSyncError>;
   readonly next: (
     owner: ThreadHistoryOwner,
   ) => Effect.Effect<RelayThreadInboxEntry | null, ThreadCommandSyncError>;
@@ -144,8 +148,39 @@ export function makeThreadCommandSync(
       kind: "workspace" as const,
       expectedGeneration: owner.generation,
       workId: `inbox:${owner.generation}:${delivery.commandId}`,
+      ...(transport.authorizeFollowUp
+        ? {
+            followUpUserId: entry.actor.userId,
+            followUpCommandId: delivery.commandId,
+          }
+        : {}),
     };
     let receipt = delivery.receiptJson === null ? null : yield* decodeReceipt(delivery.receiptJson);
+    if (receipt === null && transport.authorizeFollowUp) {
+      const persisted = yield* receipts.getByCommandId({
+        commandId: CommandId.make(delivery.commandId),
+      });
+      if (
+        Option.isSome(persisted) &&
+        persisted.value.aggregateKind === "thread" &&
+        persisted.value.aggregateId === threadId
+      ) {
+        receipt = yield* saveReceipt(
+          delivery.commandId,
+          persisted.value.status === "accepted"
+            ? { status: "accepted", sequence: persisted.value.resultSequence }
+            : {
+                status: "rejected",
+                ...(persisted.value.error === null ? {} : { detail: persisted.value.error }),
+              },
+        );
+      } else if (!(yield* transport.authorizeFollowUp(owner, entry.actor.userId))) {
+        receipt = yield* saveReceipt(delivery.commandId, {
+          status: "rejected",
+          detail: "This workflow VM follow-up command is no longer authorized.",
+        });
+      }
+    }
     if (receipt === null) {
       const decision = yield* execution.begin(work);
       if (decision === "ordinary" || decision === "completed")
@@ -177,6 +212,17 @@ export function makeThreadCommandSync(
       } else command = yield* decodeCommand(delivery.normalizedJson);
       // A failure may still have persisted a rejected receipt. Never infer rejection
       // from a transient exception or an interrupted dispatch.
+      if (
+        command !== null &&
+        transport.authorizeFollowUp &&
+        !(yield* transport.authorizeFollowUp(owner, entry.actor.userId))
+      ) {
+        receipt = yield* saveReceipt(delivery.commandId, {
+          status: "rejected",
+          detail: "This workflow VM follow-up command is no longer authorized.",
+        });
+        command = null;
+      }
       if (command !== null) {
         yield* engine.dispatch(command).pipe(Effect.result);
         const persisted = yield* receipts.getByCommandId({

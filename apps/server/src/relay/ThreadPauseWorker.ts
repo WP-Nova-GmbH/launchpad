@@ -110,22 +110,33 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
     const point = yield* recovery
       .captureForPause({ ...input, previousOperationId: owner.operationId })
       .pipe(
-        Effect.catchTag("ThreadVmQueuedWork", () =>
-          transport.cancel(input, { operationId: pause.operationId }).pipe(
-            Effect.flatMap((receipt) => {
-              if (
-                receipt.operationId !== pause.operationId ||
-                receipt.threadId !== threadId ||
-                receipt.environmentId !== owner.environmentId ||
-                receipt.generation !== owner.generation ||
-                receipt.phase !== "cancelled" ||
-                !receipt.canActivate
-              )
-                return fail("Relay acknowledged a different pause cancellation.");
-              // A subsequent synchronize persists activation, then acknowledges reopening.
-              return Effect.succeed(undefined);
-            }),
-          ),
+        Effect.catchIf(
+          (error) =>
+            error._tag === "ThreadVmQueuedWork" ||
+            error._tag === "FinishedWorkflowCaptureUnavailable",
+          (error) =>
+            transport
+              .cancel(input, {
+                operationId: pause.operationId,
+                ...(error._tag === "FinishedWorkflowCaptureUnavailable"
+                  ? { nativePauseFallback: true as const }
+                  : {}),
+              })
+              .pipe(
+                Effect.flatMap((receipt) => {
+                  if (
+                    receipt.operationId !== pause.operationId ||
+                    receipt.threadId !== threadId ||
+                    receipt.environmentId !== owner.environmentId ||
+                    receipt.generation !== owner.generation ||
+                    receipt.phase !== "cancelled" ||
+                    !receipt.canActivate
+                  )
+                    return fail("Relay acknowledged a different pause cancellation.");
+                  // A subsequent synchronize persists activation, then acknowledges reopening.
+                  return Effect.succeed(undefined);
+                }),
+              ),
         ),
       );
     if (!point) return;

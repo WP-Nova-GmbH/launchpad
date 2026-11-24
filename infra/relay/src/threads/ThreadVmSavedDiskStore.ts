@@ -232,12 +232,16 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
               WHERE thread_id=${input.threadId} AND deleted_at IS NULL`).length)
         )
           return yield* conflict("The publishing recovery point no longer owns this saved disk.");
+        const terminal = capture.source.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
         const [valid] = yield* sql`SELECT 1 FROM relay_thread_vm_saved_disks s
         JOIN relay_thread_placements t USING(thread_id)
         JOIN relay_thread_vm_policies p ON p.organization_id=${placement.organizationId}
         WHERE s.operation_id=${save.operationId} AND t.generation=${input.expectedGeneration}
           AND (s.phase='available' OR (${publishing !== null} AND s.phase='restored'))
-          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}) OR ${publishing !== null})
+          AND (s.generation=t.generation OR (${savedDiskHasCancelledRestorePlacement(sql)}) OR ${publishing !== null}
+            OR (${terminal} AND EXISTS(SELECT 1 FROM relay_thread_vm_restores chain
+              WHERE chain.saved_disk_operation_id=s.operation_id AND chain.phase IN ('completed','aborted')
+                AND chain.target_generation=t.generation)))
           AND ((${input.workflowJobId !== undefined} AND ${workflowOwnsWorkspace(sql)}) OR
             ((s.saved_at AT TIME ZONE p.calendar_time_zone
               + make_interval(days => p.saved_disk_retention_days)) AT TIME ZONE p.calendar_time_zone)
@@ -413,14 +417,41 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
             backupOperationId: save.backupOperationId,
             operationId: input.operationId,
           });
-          yield* backups.releasePin({
-            backupOperationId: save.backupOperationId,
-            operationId: savePin(save.operationId),
-          });
-          yield* sql`UPDATE relay_thread_vm_saved_disks SET phase='restored'
-        WHERE operation_id=${save.operationId}`;
+          const capture = yield* requireCapture(
+            input.threadId,
+            save.backupOperationId,
+            save.generation,
+          );
+          const retain = capture.source.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
+          if (!retain)
+            yield* backups.releasePin({
+              backupOperationId: save.backupOperationId,
+              operationId: savePin(save.operationId),
+            });
+          yield* sql`UPDATE relay_thread_vm_saved_disks SET phase=${retain ? "available" : "restored"}
+            WHERE operation_id=${save.operationId}`;
         }),
       );
+    },
+  );
+
+  /** Call under placement lock once the replacement has its exact verified pin. */
+  const supersedeTerminalSave = Effect.fn("relay.thread_vm.saved_disk.supersede_terminal")(
+    function* (threadId: string, jobId: string) {
+      const [prior] = yield* sql<{ operationId: string; backupOperationId: string }>`
+        SELECT s.operation_id AS "operationId",s.backup_operation_id AS "backupOperationId"
+        FROM relay_thread_vm_saved_disks s JOIN relay_thread_vm_backups b ON b.operation_id=s.backup_operation_id
+        WHERE s.thread_id=${threadId} AND s.phase='available' AND b.phase='verified'
+          AND b.source_receipt#>>'{workflowCheckpoint,jobId}'=${jobId}
+          AND b.source_receipt#>'{workflowCheckpoint,finishedWorkspaceRevision}' IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_backup_pins pin WHERE pin.backup_operation_id=b.operation_id
+            AND pin.operation_id<>'saved-' || s.operation_id)
+        FOR UPDATE OF s,b`;
+      if (!prior) return;
+      yield* sql`UPDATE relay_thread_vm_saved_disks SET phase='expiring',retry_at=clock_timestamp()
+        WHERE operation_id=${prior.operationId}`;
+      yield* backups.releasePin({ ...prior, operationId: savePin(prior.operationId) });
+      yield* sql`UPDATE relay_thread_vm_backups SET phase='retiring' WHERE operation_id=${prior.backupOperationId}`;
     },
   );
 
@@ -549,6 +580,7 @@ export function makeThreadVmSavedDiskStore(sql: PgClient) {
     cancelRestore,
     cancelCommittedRestore,
     completeRestore,
+    supersedeTerminalSave,
     claimExpired,
     completeExpiry,
     deferExpiry,

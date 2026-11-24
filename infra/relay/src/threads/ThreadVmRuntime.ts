@@ -29,6 +29,7 @@ import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { RelayConfiguration } from "../Config.ts";
 import { RelayDb } from "../db.ts";
+import { reconcileOneWorkflowVmFollowUpPush } from "../jobs/WorkflowVmFollowUpPush.ts";
 import { makeE2BThreadVmCompute, ThreadVmComputeError } from "../machines/E2BThreadVmCompute.ts";
 import { makeE2BThreadVmEnrollment } from "../machines/E2BThreadVmEnrollment.ts";
 import { makeThreadVmCapacityStore } from "./ThreadVmCapacityStore.ts";
@@ -40,6 +41,8 @@ import { makeThreadVmEnrollmentWorker } from "./ThreadVmEnrollmentWorker.ts";
 import { makeE2BThreadVmActivity } from "../machines/E2BThreadVmActivity.ts";
 import { makeThreadVmActivityWorker } from "./ThreadVmActivityWorker.ts";
 import { makeE2BThreadVmPause } from "../machines/E2BThreadVmPause.ts";
+import { discardRevokedWorkflowVmFollowUp } from "./WorkflowVmFollowUpLifecycle.ts";
+import { makeThreadVmPauseStore } from "./ThreadVmPauseStore.ts";
 import { makeThreadVmPauseWorker } from "./ThreadVmPauseWorker.ts";
 import { makeThreadVmResumeWorker } from "./ThreadVmResumeWorker.ts";
 import { makeE2BThreadVmLease } from "../machines/E2BThreadVmLease.ts";
@@ -500,6 +503,10 @@ export const reconcileThreadVmPauses = Effect.fn("relay.thread_vm.reconcile_paus
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
   const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
+  if (settings.workflowExecutionEnabled === true) {
+    const relay = yield* RelayConfiguration;
+    yield* makeThreadVmPauseStore(sql).reserveFinished(settings.hostId, relay.linearWorkflow);
+  }
   const worker = makeThreadVmPauseWorker(
     sql,
     makeE2BThreadVmCompute(settings.compute),
@@ -519,6 +526,7 @@ export const reconcileThreadVmResumes = Effect.fn("relay.thread_vm.reconcile_res
   const sql = (yield* RelayDb).$client;
   const relay = yield* RelayConfiguration;
   const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
+  yield* discardRevokedWorkflowVmFollowUp(sql, yield* ThreadArtifactObjectStorage, settings.hostId);
   const worker = makeThreadVmResumeWorker(
     sql,
     makeE2BThreadVmCompute(settings.compute),
@@ -537,7 +545,6 @@ export const reconcileThreadVmLeases = Effect.fn("relay.thread_vm.reconcile_leas
 ) {
   if (!settings) return;
   const sql = (yield* RelayDb).$client;
-  const relay = yield* RelayConfiguration;
   const saves = makeThreadVmFinalSaveStore(sql, yield* ThreadArtifactObjectStorage);
   const worker = makeThreadVmLeaseWorker(
     sql,
@@ -545,11 +552,11 @@ export const reconcileThreadVmLeases = Effect.fn("relay.thread_vm.reconcile_leas
     settings.hostId,
     makeE2BThreadVmCompute(settings.compute),
     saves.reconcileMissingWorkflowSource,
-    settings.workflowExecutionEnabled === true ? { linear: relay.linearWorkflow } : undefined,
   );
   for (let index = 0; index < 8; index++) if (!(yield* worker.runOne())) break;
   // A backlog of saved workflow VMs must not consume the running lease budget.
   for (let index = 0; index < 2; index++) if (!(yield* worker.runOne("paused"))) break;
+  yield* reconcileOneWorkflowVmFollowUpPush(settings.hostId);
 });
 
 /** Default-off admission shares final-save safety; each sweep examines at most eight candidates. */

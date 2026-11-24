@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
-import { ClientOrchestrationCommand, EnvironmentId } from "@t3tools/contracts";
+import { ClientOrchestrationCommand, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -8,7 +8,11 @@ import * as Option from "effect/Option";
 import type { RpcSession } from "../rpc/session.ts";
 import type { PreparedConnection } from "../connection/model.ts";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { PrimaryConnectionTarget, AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
+import {
+  PrimaryConnectionTarget,
+  RelayConnectionTarget,
+  AVAILABLE_CONNECTION_STATE,
+} from "../connection/model.ts";
 import { FetchHttpClient } from "effect/unstable/http";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -65,6 +69,34 @@ const dependencies = Layer.mergeAll(
 );
 
 describe("personal prompt authorization", () => {
+  it.effect("omits personal access in workflow follow-up while guarding the account", () =>
+    Effect.gen(function* () {
+      const registry = AtomRegistry.make();
+      const readClerkToken = Effect.sync(() => {
+        throw new Error("Workflow follow-up should skip personal authorization.");
+      });
+      registry.set(managedRelaySessionAtom, {
+        accountId: "alice",
+        readClerkToken: () => readClerkToken,
+      });
+      const supervisor = yield* EnvironmentSupervisor;
+      const target = new RelayConnectionTarget({
+        environmentId: environment,
+        label: "Finished workflow VM",
+        workflowFollowUp: { threadId: ThreadId.make("thread"), generation: 1 },
+      });
+      yield* Effect.gen(function* () {
+        expect(yield* authorizeIssueTrackerTurn(command, "alice")).toEqual(command);
+        const switched = yield* authorizeIssueTrackerTurn(command, "bob").pipe(Effect.result);
+        expect(switched._tag).toBe("Failure");
+      }).pipe(
+        Effect.provideService(EnvironmentSupervisor, { ...supervisor, target }),
+        Effect.provideService(IssueTrackerClientRegistry, registry),
+        Effect.ensuring(Effect.sync(() => registry.dispose())),
+      );
+    }).pipe(Effect.provide(dependencies)),
+  );
+
   it.effect("requests the queued entry's runtime mode when editing its prompt", () =>
     Effect.gen(function* () {
       const registry = AtomRegistry.make();

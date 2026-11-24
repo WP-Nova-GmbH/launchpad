@@ -1,4 +1,5 @@
 import { SavedWorkflowResults } from "./SavedWorkflowResults";
+import { WorkflowVmFollowUpButton } from "./WorkflowVmFollowUpButton";
 import {
   ActivityIcon,
   ArrowLeftIcon,
@@ -393,6 +394,14 @@ export function WorkflowJob({
   );
   const read = reads.jobs[key] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
+  const followUpAction = selectedJob?.viewerControls?.canContinueInVm ? (
+    <WorkflowVmFollowUpButton
+      key={key}
+      scope={scope}
+      jobId={jobId}
+      title={selectedJob.workflow?.definition.name ?? "Workflow workspace"}
+    />
+  ) : null;
   const resultEnvironmentId =
     selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime.environmentId : undefined;
   const resultThreadId =
@@ -1730,21 +1739,30 @@ export function WorkflowJob({
               icon={pullRequestUrl ? PullRequestGlyph.pullRequest : undefined}
               announce={false}
               actions={
-                pullRequestUrl ? (
-                  <Button render={<a href={pullRequestUrl} target="_blank" rel="noreferrer" />}>
-                    Open pull request
-                    <ArrowUpRightIcon aria-hidden />
-                  </Button>
-                ) : selectedJob.runtime?.kind === "vm" &&
+                <>
+                  {pullRequestUrl ? (
+                    <Button render={<a href={pullRequestUrl} target="_blank" rel="noreferrer" />}>
+                      Open pull request
+                      <ArrowUpRightIcon aria-hidden />
+                    </Button>
+                  ) : null}
+                  {selectedJob.runtime?.kind === "vm" &&
                   availableSavedResultsKey === key &&
-                  savedWorkflowThreadState(selectedJob) === "available" ? (
-                  <Button ref={savedResultsButton} onClick={openSavedResults}>
-                    <FileDiffIcon aria-hidden />
-                    Open saved results
-                  </Button>
-                ) : (
-                  conversationActions
-                )
+                  savedWorkflowThreadState(selectedJob) === "available" &&
+                  (!pullRequestUrl || followUpAction) ? (
+                    <Button
+                      ref={savedResultsButton}
+                      variant={pullRequestUrl ? "outline" : "default"}
+                      onClick={openSavedResults}
+                    >
+                      <FileDiffIcon aria-hidden />
+                      Open saved results
+                    </Button>
+                  ) : pullRequestUrl ? null : (
+                    conversationActions
+                  )}
+                  {followUpAction}
+                </>
               }
             >
               {pullRequestNumber !== undefined ? <p>PR #{pullRequestNumber}</p> : null}
@@ -1924,6 +1942,7 @@ export function WorkflowJob({
                 : "Approval completes this workflow."}
             </p>
           ) : null}
+          {!completed ? followUpAction : null}
           {!composingFeedback && selectedJob.runtime?.kind === "vm" ? (
             <SavedWorkflowResults
               key={`${scope.accountId}:${scope.repositoryId}:${jobId}`}

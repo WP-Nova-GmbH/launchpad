@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type { LinearWorkflowConfiguration } from "../Config.ts";
 import { lockWorkflowVmOrganization } from "./WorkflowVmPolicyLock.ts";
+import { hasWorkflowVmFollowUpRequest } from "./WorkflowVmFollowUpState.ts";
 
 export class ThreadVmCapacityConflict extends Schema.TaggedError<ThreadVmCapacityConflict>()(
   "ThreadVmCapacityConflict",
@@ -40,6 +41,8 @@ const eligibleWorkflowWaiter = (
     AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND ${workflowVmCodexConnectionReady(sql)}
   LEFT JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id
   WHERE t.thread_id=a.thread_id AND t.organization_id=a.organization_id AND (
+  ${hasWorkflowVmFollowUpRequest(sql)}
+  OR
   (t.operation_id=c.operation_id AND
     (c.kind<>'create' OR (j.record#>>'{origin,kind}') IS DISTINCT FROM 'automation' OR ${
       linear
@@ -190,6 +193,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
   const finishedVmDueToPause = Effect.fn("relay.vm_capacity.finished_vm_due_to_pause")(function* (
     hostId: string,
     linear: OrderedCapacityAdmission["linearWorkflow"],
+    requireTerminalCheckpoint = false,
   ) {
     const [candidate] = yield* sql<{ allocationId: string }>`WITH charged AS (
       SELECT c.host_id,a.organization_id,a.resource_kind FROM relay_thread_vm_capacity c
@@ -224,6 +228,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
       JOIN relay_thread_placements t ON t.thread_id=a.thread_id
       JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id AND j.organization_id=t.organization_id
         AND j.repository_id=t.repository_id
+      LEFT JOIN relay_workflow_vm_follow_ups f ON f.job_id=j.job_id
       WHERE c.host_id=${hostId} AND c.state='started' AND c.compute_ref=a.compute_ref
         AND a.state='running' AND a.deleted_at IS NULL
         AND a.runtime_protocol='native-v1' AND a.resource_kind='organization_workflow'
@@ -233,6 +238,17 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         AND j.status IN ('done','cancelled','failed') AND j.pending_control IS NULL
         AND j.record#>>'{progress,executionReleased}'='true'
         AND COALESCE(j.record#>'{progress,resultSaving}','null'::jsonb)='null'::jsonb
+        AND (NOT ${requireTerminalCheckpoint} OR EXISTS(SELECT 1 FROM relay_workflow_recovery_heads h
+          JOIN relay_workflow_recovery_records recovery ON recovery.job_id=h.job_id
+            AND recovery.revision=h.revision AND recovery.publication_id=h.publication_id
+          WHERE h.job_id=j.job_id AND recovery.manifest->>'terminalExecutionReleased'='true'
+            AND recovery.manifest#>>'{binding,allocationId}'=a.allocation_id
+            AND recovery.manifest#>>'{binding,environmentId}'=t.environment_id
+            AND recovery.manifest#>>'{binding,generation}'=t.generation::text))
+        AND f.operation_id IS NULL AND f.reclaim_operation_id IS NULL
+        AND (f.open_until IS NULL OR f.open_until<=clock_timestamp())
+        AND NOT EXISTS(SELECT 1 FROM relay_workflow_vm_follow_up_pushes push
+          WHERE push.job_id=j.job_id AND push.status='armed')
         AND provision.workflow_snapshot IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM relay_thread_commands q
           WHERE q.thread_id=t.thread_id AND q.receipt_json IS NULL)

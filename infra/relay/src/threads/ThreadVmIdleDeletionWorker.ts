@@ -3,6 +3,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import type { makeThreadArtifactObjects } from "./ThreadArtifactObjects.ts";
+import { workflowVmExecutionReleased } from "./WorkflowVmFollowUpState.ts";
 import { makeThreadVmFinalSaveStore } from "./ThreadVmFinalSaveStore.ts";
 import { lockThreadVmPolicy, writeThreadVmIdleDeadline } from "./ThreadVmPolicy.ts";
 
@@ -32,7 +33,10 @@ export function makeThreadVmIdleDeletionWorker(
         JOIN LATERAL (SELECT host_id,state FROM relay_thread_vm_capacity WHERE allocation_id=a.allocation_id ORDER BY position DESC LIMIT 1) c ON true
         WHERE (a.resource_kind='personal' OR (a.resource_kind='organization_workflow' AND a.state='paused'
           AND EXISTS (SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id
-            AND j.pending_control IS NULL AND j.status IN ('awaiting_review','awaiting_input')))) AND c.host_id=${hostId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND t.operation_id IS NULL
+            AND j.pending_control IS NULL AND (j.status IN ('awaiting_review','awaiting_input')
+              OR (${workflowVmExecutionReleased(sql)} AND NOT EXISTS(SELECT 1 FROM relay_workflow_vm_follow_ups f
+                WHERE f.job_id=j.job_id AND (f.operation_id IS NOT NULL OR f.reclaim_operation_id IS NOT NULL
+                  OR f.open_until>clock_timestamp()))))))) AND c.host_id=${hostId} AND a.deleted_at IS NULL AND a.compute_ref IS NOT NULL AND t.operation_id IS NULL
           AND a.owner_user_id IS NOT DISTINCT FROM t.owner_user_id AND b.revoked_at IS NULL AND b.environment_id=t.environment_id AND b.generation=t.generation
           AND p.phase='created' AND p.generation=t.generation AND s.phase='ready' AND v.idle_since IS NOT NULL
           AND ((a.state='running' AND c.state='started' AND v.activity='idle' AND v.observed_at>=clock_timestamp()-interval '2 minutes')

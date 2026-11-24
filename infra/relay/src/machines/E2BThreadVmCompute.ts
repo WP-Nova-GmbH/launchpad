@@ -103,7 +103,6 @@ export interface ThreadVmCreateInput {
 
 export interface ThreadVmSnapshotCreateInput extends ThreadVmCreateInput {
   readonly sourceTemplateId: string;
-  readonly sourceBuildId: string;
   readonly restoreOperationId: string;
   readonly bootAttempt: number;
 }
@@ -270,7 +269,7 @@ export const makeE2BThreadVmCompute = (
     restore,
     pausedSnapshotsSupported: Effect.succeed(true),
     create: (input: ThreadVmCreateInput, templateId?: string) => create(input, templateId),
-    /** Native restore starts executing immediately; callers must commit ownership first. */
+    /** Dispatch an already verified snapshot. The caller fences ownership before this POST. */
     createFromSnapshot: Effect.fn("E2BThreadVmCompute.createFromSnapshot")(function* (
       input: ThreadVmSnapshotCreateInput,
     ) {
@@ -284,7 +283,6 @@ export const makeE2BThreadVmCompute = (
           operation: "restore",
           message: "The restore boot attempt does not match its durable operation.",
         });
-      yield* restore.resolveSource(input.sourceTemplateId, input.sourceBuildId);
       // Snapshot templates have one immutable build. Native create accepts that
       // template ID, not a fabricated tag derived from the build UUID.
       return yield* create(input, input.sourceTemplateId, {

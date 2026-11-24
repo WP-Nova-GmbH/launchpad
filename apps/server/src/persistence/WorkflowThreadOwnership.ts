@@ -25,6 +25,14 @@ export function matchesWorkflowVmLifecycleCheckpoint(
   expected: RelayThreadVmWorkflowCheckpoint,
   publishing?: WorkflowVmPublishingRestore,
 ) {
+  if (expected.finishedWorkspaceRevision !== undefined)
+    return (
+      run.runtime.kind === "vm" &&
+      run.jobId === expected.jobId &&
+      expected.checkpointId === expected.publicationId &&
+      expected.checkpointGeneration === 0 &&
+      ownershipReleased(run)
+    );
   const checkpoint = run.progress.checkpoint;
   const step = activeWorkflowStep(run);
   return (
@@ -104,12 +112,18 @@ export const requireWorkflowVmLifecycleCheckpoint = Effect.fn(
       threadId: input.threadId,
       message: "The workflow VM recovery point does not match its current human checkpoint.",
     });
+  const [hasConversation] =
+    expected.finishedWorkspaceRevision !== undefined
+      ? yield* sql`SELECT 1 FROM provider_session_runtime WHERE thread_id=${input.threadId}
+      UNION ALL SELECT 1 FROM projection_turns WHERE thread_id=${input.threadId} LIMIT 1`
+      : [true];
   return {
     binding: run.runtime,
     sourceSequence: row.sourceSequence,
     beforeAgent:
-      run.progress.checkpoint?.kind === "input" &&
-      run.sequence?.completed.every((step) => step.checkpoint === null) === true,
+      !hasConversation ||
+      (run.progress.checkpoint?.kind === "input" &&
+        run.sequence?.completed.every((step) => step.checkpoint === null) === true),
   };
 });
 
@@ -142,4 +156,30 @@ export const assertWorkflowThreadReleased = Effect.fn("assertWorkflowThreadRelea
       threadId,
       message: "Save this workflow's pending result before moving or discarding its workspace.",
     });
+});
+
+/** Follow-up requires a known released workflow, not merely an unowned thread. */
+export const requireReleasedWorkflowVmRun = Effect.fnUntraced(function* (
+  sql: SqlClient.SqlClient,
+  scope: { threadId: string; allocationId: string; generation: number; environmentId: string },
+) {
+  const [row] = yield* sql<{
+    record: string;
+  }>`SELECT record_json AS record FROM repository_workflow_jobs
+    WHERE thread_id=${scope.threadId} AND status IN ('done','failed','cancelled')`;
+  const run = row && Option.getOrUndefined(decode(row.record));
+  if (
+    !run ||
+    run.runtime.kind !== "vm" ||
+    run.runtime.threadId !== scope.threadId ||
+    run.runtime.allocationId !== scope.allocationId ||
+    run.runtime.generation !== scope.generation ||
+    run.runtime.environmentId !== scope.environmentId
+  )
+    return yield* new WorkflowThreadOwnershipError({
+      threadId: scope.threadId,
+      message: "The released workflow does not match the current VM workspace.",
+    });
+  yield* assertWorkflowThreadReleased(sql, scope.threadId);
+  return run;
 });

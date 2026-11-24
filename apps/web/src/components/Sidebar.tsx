@@ -151,6 +151,7 @@ import { threadEnvironment } from "../state/threads";
 import { useEnvironmentQuery } from "../state/query";
 import { useThreadSearch } from "../state/queries";
 import { useAtomCommand } from "../state/use-atom-command";
+import { workflowVmFollowUpHistoryState } from "../state/workflowVmFollowUp";
 import {
   buildThreadRouteParams,
   resolveActiveThreadRouteRef,
@@ -2923,6 +2924,7 @@ export default function Sidebar() {
       return router.navigate({
         to: "/$environmentId/$threadId",
         params: buildThreadRouteParams(threadRef),
+        state: workflowVmFollowUpHistoryState(threadRef),
       });
     },
     [clearSelection, isMobile, router, setOpenMobile, setSelectionAnchor],

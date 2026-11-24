@@ -5,6 +5,7 @@ import type {
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
+import { workflowVmExecutionReleased } from "./WorkflowVmFollowUpState.ts";
 
 /** The placement's run keeps its workspace until execution and cleanup are released. */
 export const workflowOwnsWorkspace = (sql: PgClient) => sql`EXISTS(
@@ -18,6 +19,19 @@ export const readCurrentWorkflowCheckpoint = Effect.fnUntraced(function* (
   checkpoint: RelayThreadVmWorkflowCheckpoint,
   sourceLost = false,
 ) {
+  if (checkpoint.finishedWorkspaceRevision !== undefined) {
+    const [terminal] = yield* sql<{ pending: boolean }>`SELECT false AS pending
+      FROM relay_workflow_jobs j JOIN relay_thread_placements t ON t.workflow_job_id=j.job_id
+      JOIN relay_workflow_recovery_records r ON r.job_id=j.job_id
+      LEFT JOIN relay_workflow_vm_follow_ups f ON f.job_id=j.job_id
+      WHERE j.job_id=${checkpoint.jobId} AND t.audience='repository' AND ${workflowVmExecutionReleased(sql)}
+        AND COALESCE(f.workspace_revision,0)=${checkpoint.finishedWorkspaceRevision}
+        AND r.publication_id=${checkpoint.publicationId} AND r.revision=${checkpoint.publicationRevision}
+        AND r.publication_id=${checkpoint.checkpointId} AND ${checkpoint.checkpointGeneration}=0
+        AND r.manifest->>'terminalExecutionReleased'='true' AND r.thread_id=t.thread_id
+        AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)`;
+    return terminal ?? null;
+  }
   const [row] = yield* sql<{ pending: boolean }>`
     SELECT j.pending_control IS NOT NULL AS pending
     FROM relay_workflow_jobs j JOIN relay_workflow_recovery_heads h USING(job_id)

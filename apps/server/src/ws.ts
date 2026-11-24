@@ -2,6 +2,7 @@ import { currentSessionChanges } from "./auth/currentSession.ts";
 import { makeSessionPresenceReporter } from "./orchestration/sessionPresence.ts";
 import * as Deferred from "effect/Deferred";
 import { WorkflowRunStore } from "./jobs/WorkflowRunStore.ts";
+import { WorkflowVmFollowUpPublisher } from "./relay/WorkflowVmFollowUpPush.ts";
 import { RepositoryAccess, stampCommandAuthor as stampActor } from "./auth/RepositoryAccess.ts";
 import {
   authorizeOrchestrationCommand,
@@ -50,6 +51,7 @@ import {
   type OrchestrationClientOrigin,
   type OrchestrationCommand,
   type GitActionProgressEvent,
+  GitManagerError,
   type GitManagerServiceError,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
@@ -87,6 +89,7 @@ import {
   RpcClientId,
   EnvironmentAuthorizationError,
   AuthOrchestrationOperateScope,
+  AuthWorkflowVmFollowUpScope,
   ThreadId,
   type ThreadPresenceReportInput,
   TerminalProcessExitError,
@@ -129,6 +132,8 @@ import {
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { CurrentWorkflowVmFollowUpActor } from "./relay/ThreadExecutionRelay.ts";
+import { ThreadExecution } from "./relay/ThreadExecution.ts";
 import { makeThreadExecutionFence } from "./persistence/ThreadExecutionFence.ts";
 import { CheckoutAdmission, makeCheckoutCapture } from "./persistence/CheckoutCapture.ts";
 import { resolveCheckoutPath } from "./workspace/CheckoutAccess.ts";
@@ -571,6 +576,41 @@ const makeWsRpcLayer = (
         WS_METHODS.subscribeServerLifecycle,
         WS_METHODS.subscribeAuthSession,
       ]);
+      const workflowVmFollowUp = currentSession.scopes.includes(AuthWorkflowVmFollowUpScope)
+        ? access.workflowFollowUp
+        : undefined;
+      const workflowVmFollowUpMethods = new Set<string>([
+        WS_METHODS.vcsRefreshStatus,
+        WS_METHODS.subscribeVcsStatus,
+        WS_METHODS.vcsListRefs,
+        WS_METHODS.gitRunStackedAction,
+        WS_METHODS.workflowVmFollowUpPush,
+        WS_METHODS.terminalOpen,
+        WS_METHODS.terminalAttach,
+        WS_METHODS.terminalWrite,
+        WS_METHODS.terminalResize,
+        WS_METHODS.terminalClear,
+        WS_METHODS.terminalRestart,
+        WS_METHODS.terminalClose,
+        WS_METHODS.subscribeTerminalEvents,
+        WS_METHODS.subscribeTerminalMetadata,
+      ]);
+      const followUpDenied = () =>
+        new EnvironmentAuthorizationError({
+          message: "Follow-up access to this workflow VM is unavailable.",
+          requiredScope: AuthWorkflowVmFollowUpScope,
+        });
+      const authorizeWorkflowVmFollowUp = (threadId?: string) =>
+        Effect.gen(function* () {
+          if (
+            !workflowVmFollowUp ||
+            !currentSession.user ||
+            (threadId !== undefined && threadId !== workflowVmFollowUp.threadId)
+          )
+            return yield* followUpDenied();
+          yield* workflowVmFollowUp.requireActor(currentSession);
+          return currentSession.user.userId;
+        });
       const workflowMutationMethods = new Set<string>([
         WS_METHODS.vcsPull,
         WS_METHODS.gitRunStackedAction,
@@ -595,6 +635,8 @@ const makeWsRpcLayer = (
         threadId: Schema.optional(Schema.NullOr(Schema.String)),
         projectId: Schema.optional(Schema.NullOr(Schema.String)),
         cwd: Schema.optional(Schema.String),
+        action: Schema.optional(Schema.String),
+        featureBranch: Schema.optional(Schema.Boolean),
         worktreePath: Schema.optional(Schema.NullOr(Schema.String)),
         path: Schema.optional(Schema.NullOr(Schema.String)),
         reference: Schema.optional(
@@ -603,14 +645,48 @@ const makeWsRpcLayer = (
       });
       const authorizeRepositoryInput = (input: unknown, method?: string) =>
         Effect.gen(function* () {
-          if (access.workflowVm && method && !workflowVmResultMethods.has(method))
-            return yield* new EnvironmentAuthorizationError({
-              message: "Workflow VM connections are read-only and scoped to run results.",
-              requiredScope: AuthOrchestrationReadScope,
-            });
           const resource = yield* Schema.decodeUnknownEffect(repositoryInputSchema)(input).pipe(
             Effect.orDie,
           );
+          if (access.workflowVm && method && !workflowVmResultMethods.has(method)) {
+            if (!workflowVmFollowUpMethods.has(method)) return yield* followUpDenied();
+            yield* authorizeWorkflowVmFollowUp(resource.threadId ?? undefined);
+            if (
+              method === WS_METHODS.gitRunStackedAction &&
+              (resource.action !== "commit" || resource.featureBranch)
+            )
+              return yield* followUpDenied();
+            if (resource.cwd || resource.worktreePath || resource.projectId) {
+              const bound = yield* projectionSnapshotQuery
+                .getThreadShellById(workflowVmFollowUp!.threadId)
+                .pipe(Effect.mapError(followUpDenied));
+              if (Option.isNone(bound)) return yield* followUpDenied();
+              const project = yield* projectionSnapshotQuery
+                .getProjectShellById(bound.value.projectId)
+                .pipe(Effect.mapError(followUpDenied));
+              if (
+                Option.isNone(project) ||
+                (resource.projectId && resource.projectId !== bound.value.projectId)
+              )
+                return yield* followUpDenied();
+              const root = bound.value.worktreePath ?? project.value.workspaceRoot;
+              const path = yield* Path.Path;
+              const fs = yield* FileSystem.FileSystem;
+              const expected = yield* resolveCheckoutPath(root, fs, path).pipe(
+                Effect.mapError(followUpDenied),
+              );
+              for (const candidate of [resource.cwd, resource.worktreePath]) {
+                if (
+                  candidate !== undefined &&
+                  candidate !== null &&
+                  (yield* resolveCheckoutPath(candidate, fs, path).pipe(
+                    Effect.mapError(followUpDenied),
+                  )) !== expected
+                )
+                  return yield* followUpDenied();
+              }
+            }
+          }
           if (
             method !== undefined &&
             workflowMutationMethods.has(method) &&
@@ -904,6 +980,28 @@ const makeWsRpcLayer = (
               }),
           ),
         );
+      const followUpActor = workflowVmFollowUp ? currentSession.user?.userId : undefined;
+      const resolveTerminalLaunch = Effect.fnUntraced(function* <
+        Input extends {
+          readonly threadId: string;
+          readonly terminalId: string;
+          readonly cwd?: string | undefined;
+        },
+      >(input: Input) {
+        if (!workflowVmFollowUp || !input.cwd) return input;
+        const env = yield* workflowVmFollowUp.readEnvironment(currentSession).pipe(
+          Effect.mapError(
+            () =>
+              new TerminalProcessExitError({
+                threadId: input.threadId,
+                terminalId: input.terminalId,
+                terminalPid: 0,
+                detail: "Launchpad could not authorize the workflow environment for this terminal.",
+              }),
+          ),
+        );
+        return { ...input, env: { ...env }, providerInstanceId: undefined };
+      });
       const observeRpcEffect = <A, E, R>(
         method: string,
         effect: Effect.Effect<A, E, R>,
@@ -913,7 +1011,12 @@ const makeWsRpcLayer = (
         instrumentRpcEffect(
           method,
           authorizeRepositoryInput(input ?? {}, method).pipe(
-            Effect.andThen(authorizeEffect(requiredScopeForRpcMethod(method), effect)),
+            Effect.andThen(
+              authorizeEffect(
+                requiredScopeForRpcMethod(method),
+                effect.pipe(Effect.provideService(CurrentWorkflowVmFollowUpActor, followUpActor)),
+              ),
+            ),
           ),
           traceAttributes,
         );
@@ -927,7 +1030,12 @@ const makeWsRpcLayer = (
           method,
           Stream.unwrap(
             authorizeRepositoryInput(input ?? {}, method).pipe(
-              Effect.as(authorizeStream(requiredScopeForRpcMethod(method), stream)),
+              Effect.as(
+                authorizeStream(
+                  requiredScopeForRpcMethod(method),
+                  stream.pipe(Stream.provideService(CurrentWorkflowVmFollowUpActor, followUpActor)),
+                ),
+              ),
             ),
           ),
           traceAttributes,
@@ -945,7 +1053,19 @@ const makeWsRpcLayer = (
         instrumentRpcStreamEffect(
           method,
           authorizeRepositoryInput(input ?? {}, method).pipe(
-            Effect.andThen(authorizeEffect(requiredScopeForRpcMethod(method), effect)),
+            Effect.andThen(
+              authorizeEffect(
+                requiredScopeForRpcMethod(method),
+                effect.pipe(
+                  Effect.provideService(CurrentWorkflowVmFollowUpActor, followUpActor),
+                  Effect.map((stream) =>
+                    stream.pipe(
+                      Stream.provideService(CurrentWorkflowVmFollowUpActor, followUpActor),
+                    ),
+                  ),
+                ),
+              ),
+            ),
           ),
           traceAttributes,
         );
@@ -2198,7 +2318,18 @@ const makeWsRpcLayer = (
             : undefined;
 
           return {
-            environment,
+            environment: workflowVmFollowUp
+              ? {
+                  ...environment,
+                  capabilities: {
+                    ...environment.capabilities,
+                    workflowVmFollowUp: {
+                      threadId: workflowVmFollowUp.threadId,
+                      generation: workflowVmFollowUp.generation,
+                    },
+                  },
+                }
+              : environment,
             auth,
             cwd: config.cwd,
             keybindingsConfigPath: config.keybindingsConfigPath,
@@ -4263,7 +4394,9 @@ const makeWsRpcLayer = (
           observeRpcStream(
             WS_METHODS.subscribeVcsStatus,
             vcsStatusBroadcaster.streamStatus(input, {
-              automaticRemoteRefreshInterval: automaticGitFetchInterval,
+              automaticRemoteRefreshInterval: workflowVmFollowUp
+                ? Effect.succeed(Duration.zero)
+                : automaticGitFetchInterval,
             }),
             {
               "rpc.aggregate": "vcs",
@@ -4351,43 +4484,82 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "git" },
             input,
           ),
+        [WS_METHODS.workflowVmFollowUpPush]: (input) =>
+          Effect.gen(function* () {
+            const actorUserId = yield* authorizeWorkflowVmFollowUp(input.threadId);
+            const binding = yield* workflowJobs.getVmBindingForThread(input.threadId);
+            if (!binding || binding.generation !== workflowVmFollowUp?.generation)
+              return yield* followUpDenied();
+            return yield* (yield* WorkflowVmFollowUpPublisher).push({
+              ...input,
+              actorUserId,
+              jobId: binding.jobId,
+              generation: binding.generation,
+            });
+          }),
         [WS_METHODS.gitRunStackedAction]: (input) =>
           observeRpcStream(
             WS_METHODS.gitRunStackedAction,
             Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-              gitWorkflow
-                .runStackedAction(input, {
+              Effect.gen(function* () {
+                const commit = gitWorkflow.runStackedAction(input, {
                   actionId: input.actionId,
                   progressReporter: {
                     publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
                   },
-                })
-                .pipe(
-                  Effect.matchCauseEffect({
-                    onFailure: (cause) => Queue.failCause(queue, cause),
-                    onSuccess: (result) =>
-                      (input.threadId === undefined
-                        ? Effect.void
-                        : linkCreatedPullRequest({
-                            threadId: input.threadId,
-                            result,
-                            commandId: serverCommandId("pr-created-link"),
-                          }).pipe(
-                            Effect.provideService(
-                              OrchestrationEngine.OrchestrationEngineService,
-                              orchestrationEngine,
-                            ),
-                            Effect.provideService(
-                              ProjectionSnapshotQuery.ProjectionSnapshotQuery,
-                              projectionSnapshotQuery,
-                            ),
-                          )
-                      ).pipe(
-                        Effect.andThen(refreshGitStatus(input.cwd)),
-                        Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
-                      ),
-                  }),
-                ),
+                });
+                if (!workflowVmFollowUp) return yield* commit;
+                const execution = yield* Effect.serviceOption(ThreadExecution);
+                const unavailable = () =>
+                  new GitManagerError({
+                    operation: "commit",
+                    cwd: input.cwd,
+                    detail: "The workflow VM is not ready to accept a local commit.",
+                  });
+                if (Option.isNone(execution)) return yield* unavailable();
+                const lease = execution.value;
+                const work = {
+                  kind: "workspace" as const,
+                  threadId: workflowVmFollowUp.threadId,
+                  expectedGeneration: workflowVmFollowUp.generation,
+                  workId: `follow-up-commit:${input.actionId}`,
+                };
+                return yield* Effect.acquireUseRelease(
+                  lease.begin(work).pipe(
+                    Effect.mapError(unavailable),
+                    Effect.flatMap((decision) =>
+                      decision === "start" ? Effect.void : Effect.fail(unavailable()),
+                    ),
+                  ),
+                  () => commit,
+                  () => lease.confirmStopped(work).pipe(Effect.ignore({ log: true })),
+                );
+              }).pipe(
+                Effect.matchCauseEffect({
+                  onFailure: (cause) => Queue.failCause(queue, cause),
+                  onSuccess: (result) =>
+                    (input.threadId === undefined
+                      ? Effect.void
+                      : linkCreatedPullRequest({
+                          threadId: input.threadId,
+                          result,
+                          commandId: serverCommandId("pr-created-link"),
+                        }).pipe(
+                          Effect.provideService(
+                            OrchestrationEngine.OrchestrationEngineService,
+                            orchestrationEngine,
+                          ),
+                          Effect.provideService(
+                            ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+                            projectionSnapshotQuery,
+                          ),
+                        )
+                    ).pipe(
+                      Effect.andThen(refreshGitStatus(input.cwd)),
+                      Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
+                    ),
+                }),
+              ),
             ),
             { "rpc.aggregate": "vcs" },
             input,
@@ -4484,7 +4656,10 @@ const makeWsRpcLayer = (
         [WS_METHODS.terminalOpen]: (input) =>
           observeRpcEffect(
             WS_METHODS.terminalOpen,
-            drainTerminalCleanup(input).pipe(Effect.andThen(terminalManager.open(input))),
+            drainTerminalCleanup(input).pipe(
+              Effect.andThen(resolveTerminalLaunch(input)),
+              Effect.flatMap(terminalManager.open),
+            ),
             {
               "rpc.aggregate": "terminal",
             },
@@ -4522,9 +4697,10 @@ const makeWsRpcLayer = (
                   let ready = !lifetime;
                   yield* Effect.acquireRelease(
                     drainTerminalCleanup(input).pipe(
-                      Effect.andThen(
+                      Effect.andThen(resolveTerminalLaunch(input)),
+                      Effect.flatMap((terminalInput) =>
                         terminalManager.attachStream(
-                          input,
+                          terminalInput,
                           (event) =>
                             ready
                               ? Queue.offer(queue, event).pipe(Effect.asVoid)
@@ -4615,7 +4791,10 @@ const makeWsRpcLayer = (
         [WS_METHODS.terminalRestart]: (input) =>
           observeRpcEffect(
             WS_METHODS.terminalRestart,
-            drainTerminalCleanup(input).pipe(Effect.andThen(terminalManager.restart(input))),
+            drainTerminalCleanup(input).pipe(
+              Effect.andThen(resolveTerminalLaunch(input)),
+              Effect.flatMap(terminalManager.restart),
+            ),
             {
               "rpc.aggregate": "terminal",
             },

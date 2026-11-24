@@ -27,6 +27,11 @@ import { collectThreadAttachmentReferences } from "./ThreadAttachmentReferences.
 
 const decodeSession = Schema.decodeUnknownEffect(OrchestrationSession);
 
+class FinishedWorkflowCaptureUnavailable extends Schema.TaggedError<FinishedWorkflowCaptureUnavailable>()(
+  "FinishedWorkflowCaptureUnavailable",
+  { threadId: Schema.String },
+) {}
+
 /** Stop and retain one exact conversation before either pause or final disk saving. */
 export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make")(function* (
   history: Pick<ReturnType<typeof makeThreadHistorySync>, "synchronize">,
@@ -98,7 +103,7 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     // Routine recovery must not close a shell or interrupt detached work that
     // raced the relay idle report. No live guest workload is evidence of idleness.
     if (tracked && !(yield* inspectVmWorkloads({ type: "inspect" })).stopped) {
-      if (workflow) {
+      if (workflow && input.workflowCheckpoint?.finishedWorkspaceRevision === undefined) {
         // Only the authenticated passive setup supervisor may be closed here.
         // Any recipe, terminal, provider or detached work still blocks capture.
         if (yield* Effect.isFailure(stopPassiveWorkflowVmSetup())) return;
@@ -117,8 +122,11 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     const [runtime] = yield* sql<{
       status: string;
     }>`SELECT status FROM provider_session_runtime WHERE thread_id=${threadId}`;
-    if (!runtime && !workflow?.beforeAgent)
+    if (!runtime && !workflow?.beforeAgent) {
+      if (input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+        return yield* new FinishedWorkflowCaptureUnavailable({ threadId });
       return yield* fail(threadId, "Saving VM recovery needs a retained Codex conversation.");
+    }
     if (
       !runtime &&
       (yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${threadId} LIMIT 1`).length
@@ -165,8 +173,11 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     if (workflow && workflow.sourceSequence > frozen.sourceSequence)
       return yield* fail(threadId, "The saved workflow is newer than the frozen source.");
     if (!frozen.nativeCheckpointTurnId) {
-      if (!workflow?.beforeAgent)
+      if (!workflow?.beforeAgent) {
+        if (input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+          return yield* new FinishedWorkflowCaptureUnavailable({ threadId });
         return yield* fail(threadId, "Frozen native recovery is unavailable.");
+      }
       const references = yield* collectThreadAttachmentReferences(
         threadId,
         events.readAggregateRange({

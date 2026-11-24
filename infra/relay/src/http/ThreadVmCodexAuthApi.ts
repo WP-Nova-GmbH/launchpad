@@ -81,7 +81,11 @@ export const withThreadVmCodexAuthScope = <A, E, R>(
               AND x.generation=${binding.generation} AND x.thread_id=${binding.threadId}
               AND x.organization_id=${binding.organizationId} AND x.mode='organization'
               AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}'
-              AND j.status NOT IN ('cancelled','failed')
+              AND (j.status NOT IN ('cancelled','failed') OR (
+                j.record#>>'{progress,executionReleased}'='true' AND j.pending_control IS NULL
+                AND EXISTS (SELECT 1 FROM relay_workflow_vm_follow_ups f WHERE f.job_id=j.job_id
+                  AND f.allocation_id=x.allocation_id AND f.generation=x.generation
+                  AND f.reclaim_operation_id IS NULL)))
               AND (j.pending_control IS NULL OR j.pending_control#>>'{response,operation}' IS DISTINCT FROM 'cancel')`;
           if (!pinned) return yield* tenancyNotFound("thread_not_found");
           return yield* use(binding);
