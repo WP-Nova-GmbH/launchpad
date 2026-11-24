@@ -7,7 +7,7 @@ import {
   type WorkflowSourceOwner,
   type WorkflowSourceAuthorization,
 } from "@t3tools/contracts/relay";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { EllipsisIcon, RefreshCwIcon } from "lucide-react";
 import { useWorkflowSources } from "../../cloud/workflowSources";
 import { randomUUID } from "../../lib/utils";
@@ -19,6 +19,53 @@ import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../
 import { SourceFacts, SourceIdentity, confirmChange } from "./WorkflowSources";
 
 const repositoryNameKey = (name: string) => name.trim().replace(/\s+/gu, " ").toLowerCase();
+
+function duplicateRepositoryLabels(labels: ReadonlyArray<string | null>) {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const label of labels) {
+    if (label === null) continue;
+    const key = repositoryNameKey(label);
+    if (seen.has(key)) duplicates.add(key);
+    seen.add(key);
+  }
+  return duplicates;
+}
+
+function repositoryGrantLabels(
+  repositories: WorkflowSourceOwner["repositories"],
+  duplicateNames: ReadonlySet<string>,
+) {
+  const options = repositories.map(({ repositoryId, repositoryRemote, name }) => {
+    if (!repositoryRemote) {
+      const label = duplicateNames.has(repositoryNameKey(name))
+        ? `${name} (Repository ID ${repositoryId})`
+        : name;
+      return { repositoryId, label, fullLabel: label };
+    }
+
+    const path = repositoryRemote.replace(/^github\.com\//u, "");
+    const basename = repositoryRemote.split("/").at(-1) ?? "";
+    const customName = repositoryNameKey(name) !== repositoryNameKey(basename);
+    return {
+      repositoryId,
+      label: customName ? `${name} (${path})` : path,
+      fullLabel: customName ? `${name} (${repositoryRemote})` : repositoryRemote,
+    };
+  });
+  const abbreviatedDuplicates = duplicateRepositoryLabels(options.map(({ label }) => label));
+  const qualified = options.map(({ repositoryId, label, fullLabel }) => ({
+    repositoryId,
+    label: abbreviatedDuplicates.has(repositoryNameKey(label)) ? fullLabel : label,
+  }));
+  const duplicates = duplicateRepositoryLabels(qualified.map(({ label }) => label));
+  return new Map(
+    qualified.map(({ repositoryId, label }) => [
+      repositoryId,
+      duplicates.has(repositoryNameKey(label)) ? `${label} (Repository ID ${repositoryId})` : label,
+    ]),
+  );
+}
 
 export function OwnerSources({
   accountId,
@@ -68,19 +115,14 @@ export function OwnerSources({
     }
   };
   const connections = snapshot?.connections ?? [];
-  const duplicateRepositoryNames = new Set<string>();
-  for (const names of [
-    snapshot?.repositories.map(({ name }) => name),
-    snapshot?.withdrawableGrants.map(({ repositoryName }) => repositoryName),
-  ]) {
-    const seen = new Set<string>();
-    for (const name of names ?? []) {
-      if (name === null) continue;
-      const key = repositoryNameKey(name);
-      if (seen.has(key)) duplicateRepositoryNames.add(key);
-      else seen.add(key);
-    }
+  const repositories = snapshot?.repositories ?? [];
+  const duplicateRepositoryNames = duplicateRepositoryLabels(repositories.map(({ name }) => name));
+  for (const key of duplicateRepositoryLabels(
+    snapshot?.withdrawableGrants.map(({ repositoryName }) => repositoryName) ?? [],
+  )) {
+    duplicateRepositoryNames.add(key);
   }
+  const repositoryLabels = repositoryGrantLabels(repositories, duplicateRepositoryNames);
   const hasAuthorizationNotice =
     snapshot?.attempt?.status === "pending" ||
     snapshot?.attempt?.status === "exchanging" ||
@@ -136,7 +178,7 @@ export function OwnerSources({
           }
         >
           {state.error}
-          {snapshot ? " Showing last available status." : ""}
+          {snapshot && state.readFailed ? " Showing last available status." : ""}
         </WorkflowAlert>
       ) : null}
       {!snapshot ? (
@@ -277,6 +319,8 @@ export function OwnerSources({
                 source={source}
                 snapshot={snapshot}
                 duplicateRepositoryNames={duplicateRepositoryNames}
+                repositoryLabels={repositoryLabels}
+                repositoryListStale={state.readFailed}
                 disabled={disabled}
                 reconnect={() => void connect(source.connectionId)}
                 mutate={state.mutate}
@@ -284,7 +328,7 @@ export function OwnerSources({
                   SettingsRow
                     ? {
                         Row: SettingsRow,
-                        stale: state.error !== null,
+                        stale: state.readFailed,
                         refreshing: state.loading,
                         refresh: showSettingsRefresh ? state.refresh : undefined,
                       }
@@ -304,6 +348,8 @@ function OwnerSourceRow({
   source,
   snapshot,
   duplicateRepositoryNames,
+  repositoryLabels,
+  repositoryListStale,
   disabled,
   reconnect,
   mutate,
@@ -313,6 +359,8 @@ function OwnerSourceRow({
   source: WorkflowSource;
   snapshot: WorkflowSourceOwner;
   duplicateRepositoryNames: ReadonlySet<string>;
+  repositoryLabels: ReadonlyMap<string, string>;
+  repositoryListStale: boolean;
   disabled: boolean;
   reconnect: () => void;
   mutate: OwnerState["mutate"];
@@ -325,12 +373,44 @@ function OwnerSourceRow({
       }
     | undefined;
 }) {
-  const [repo, setRepo] = useState<string | null>(null);
+  const [selection, setSelection] = useState<WorkflowSourceOwner["repositories"][number] | null>(
+    null,
+  );
+  const repositoryTrigger = useRef<HTMLButtonElement>(null);
+  const allowButton = useRef<HTMLButtonElement>(null);
   const current = snapshot.grants.filter((g) => g.connectionId === source.connectionId);
   const eligible = snapshot.repositories.filter(
     (r) => !current.some((g) => g.repositoryId === r.repositoryId && !g.revoked),
   );
+  const selectedRepository =
+    selection &&
+    eligible.find(
+      (repository) =>
+        repository.repositoryId === selection.repositoryId &&
+        repository.repositoryRemote === selection.repositoryRemote,
+    );
+  if (selection && !selectedRepository) setSelection(null);
+  const selectedLabel = selectedRepository
+    ? repositoryLabels.get(selectedRepository.repositoryId)
+    : undefined;
   const authorizationBlocked = disabled || snapshot.exchangeInProgress;
+  const grantBlocked = authorizationBlocked || repositoryListStale;
+  const allowRepository = async () => {
+    if (!selectedRepository || grantBlocked) return;
+    const repositoryId = RelayRepositoryId.make(selectedRepository.repositoryId);
+    const result = await mutate((client, token) =>
+      client.allow(token, repositoryId, {
+        connectionId: source.connectionId,
+        grantId: randomUUID(),
+        previousGrantId:
+          current.findLast((grant) => grant.repositoryId === repositoryId)?.grantId ?? null,
+        ...(selectedRepository.repositoryRemote !== undefined
+          ? { expectedRepositoryRemote: selectedRepository.repositoryRemote }
+          : {}),
+      }),
+    );
+    if (result) setSelection((chosen) => (chosen === selection ? null : chosen));
+  };
   const needsReconnect = source.status !== "connected";
   const canReconnect = snapshot.configured && source.health.code !== "service_configuration";
   const grants = snapshot.withdrawableGrants.filter((g) => g.connectionId === source.connectionId);
@@ -578,39 +658,67 @@ function OwnerSourceRow({
         )}
         {connectedToCurrentApp && eligible.length ? (
           <div className="flex flex-wrap items-center gap-2">
-            <div className="min-w-0 flex-1">
-              <Select value={repo} onValueChange={setRepo} disabled={authorizationBlocked}>
-                <SelectTrigger aria-label={`Repository allowed to use ${source.workspaceName}`}>
+            <div className="min-w-36 flex-1">
+              <Select
+                value={selectedRepository?.repositoryId ?? null}
+                onValueChange={(id) => {
+                  if (!grantBlocked) {
+                    setSelection(
+                      eligible.find((repository) => repository.repositoryId === id) ?? null,
+                    );
+                  }
+                }}
+                disabled={grantBlocked}
+              >
+                <SelectTrigger
+                  ref={repositoryTrigger}
+                  size="sm"
+                  aria-label={
+                    "Repository allowed to use " +
+                    source.workspaceName +
+                    (selectedLabel ? ", " + selectedLabel : "")
+                  }
+                >
                   <SelectValue placeholder="Choose repository">
-                    {eligible.find((r) => r.repositoryId === repo)?.name}
+                    {selectedLabel ? (
+                      <span className="block wrap-anywhere whitespace-normal">{selectedLabel}</span>
+                    ) : undefined}
                   </SelectValue>
                 </SelectTrigger>
-                <SelectPopup>
-                  {eligible.map((r) => (
-                    <SelectItem key={r.repositoryId} value={r.repositoryId}>
-                      {r.name}
+                <SelectPopup
+                  alignItemWithTrigger={false}
+                  className="w-(--anchor-width)"
+                  sideOffset={({ side }) => {
+                    const gap = 4;
+                    if (side !== "bottom") return gap;
+                    const trigger = repositoryTrigger.current?.getBoundingClientRect();
+                    const action = allowButton.current?.getBoundingClientRect();
+                    // When the action wraps below the picker, open below the action.
+                    return trigger && action && action.top >= trigger.bottom
+                      ? gap + action.bottom - trigger.bottom
+                      : gap;
+                  }}
+                >
+                  {eligible.map((repository) => (
+                    <SelectItem
+                      key={repository.repositoryId}
+                      value={repository.repositoryId}
+                      label={repository.name}
+                    >
+                      <span className="block wrap-anywhere whitespace-normal">
+                        {repositoryLabels.get(repository.repositoryId)}
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectPopup>
               </Select>
             </div>
             <Button
+              ref={allowButton}
               size="sm"
               variant="outline"
-              disabled={
-                authorizationBlocked || !repo || !eligible.some((r) => r.repositoryId === repo)
-              }
-              onClick={() => {
-                if (repo)
-                  void mutate((c, t) =>
-                    c.allow(t, RelayRepositoryId.make(repo), {
-                      connectionId: source.connectionId,
-                      grantId: randomUUID(),
-                      previousGrantId:
-                        current.findLast((g) => g.repositoryId === repo)?.grantId ?? null,
-                    }),
-                  );
-              }}
+              disabled={grantBlocked || !selectedRepository}
+              onClick={() => void allowRepository()}
             >
               Allow repository
             </Button>

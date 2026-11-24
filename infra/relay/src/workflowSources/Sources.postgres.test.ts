@@ -58,42 +58,119 @@ describe.skipIf(!databaseUrl)("native workflow sources (PostgreSQL)", () => {
         }),
       ),
   );
-  it.effect("identifies same-named withdrawal grants with the earliest organization alias", () =>
-    withDatabase(
-      Effect.gen(function* () {
-        const sql = (yield* RelayDb).$client;
-        yield* sql`UPDATE relay_repositories SET name='API' WHERE repository_id IN ('repo','repo-2')`;
-        yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name) VALUES ('repo-3','org','Without alias')`;
-        yield* sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES
+  it.effect(
+    "identifies same-named repositories and grants with the earliest organization alias",
+    () =>
+      withDatabase(
+        Effect.gen(function* () {
+          const sql = (yield* RelayDb).$client;
+          yield* sql`UPDATE relay_repositories SET name='API' WHERE repository_id IN ('repo','repo-2')`;
+          yield* sql`INSERT INTO relay_repositories(repository_id,organization_id,name) VALUES
+          ('repo-3','org','Without alias'),('repo-4','org','Not yet allowed')`;
+          yield* sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES
           ('github.com/northstar-mirror/api','repo','org','2026-10-03'),
           ('github.com/northstar-z/api','repo','org','2026-10-02'),
           ('github.com/northstar-a/api','repo','org','2026-10-02'),
           ('github.com/northstar-labs/api','repo-2','org','2026-10-01'),
+          ('github.com/northstar/ops','repo-4','org','2026-10-01'),
           ('github.com/other/api','repo','other-org','2026-10-01'),
           ('github.com/other/hidden','repo-3','other-org','2026-10-01')`;
-        yield* createConnection();
-        yield* allow();
-        yield* allow("grant-2", "repo-2");
-        yield* allow("grant-3", "repo-3");
+          yield* createConnection();
+          yield* allow();
+          yield* allow("grant-2", "repo-2");
+          yield* allow("grant-3", "repo-3");
 
+          const snapshot = yield* Sources.owner("org", "admin");
+          expect(snapshot.repositories).toStrictEqual([
+            {
+              repositoryId: "repo",
+              organizationId: "org",
+              name: "API",
+              repositoryRemote: "github.com/northstar-a/api",
+            },
+            {
+              repositoryId: "repo-2",
+              organizationId: "org",
+              name: "API",
+              repositoryRemote: "github.com/northstar-labs/api",
+            },
+            {
+              repositoryId: "repo-4",
+              organizationId: "org",
+              name: "Not yet allowed",
+              repositoryRemote: "github.com/northstar/ops",
+            },
+            { repositoryId: "repo-3", organizationId: "org", name: "Without alias" },
+          ]);
+          expect(
+            snapshot.withdrawableGrants.toSorted((a, b) => a.grantId.localeCompare(b.grantId)),
+          ).toStrictEqual([
+            {
+              grantId: "grant",
+              connectionId: "connection",
+              repositoryName: "API",
+              repositoryRemote: "github.com/northstar-a/api",
+            },
+            {
+              grantId: "grant-2",
+              connectionId: "connection",
+              repositoryName: "API",
+              repositoryRemote: "github.com/northstar-labs/api",
+            },
+            { grantId: "grant-3", connectionId: "connection", repositoryName: "Without alias" },
+          ]);
+        }),
+      ),
+  );
+  it.effect("requires the selected repository alias to still belong to the grant target", () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = (yield* RelayDb).$client;
+        yield* createConnection();
+        const expectedRepositoryRemote = "github.com/acme/api";
+        const wrongOrganizationRemote = "github.com/foreign/api";
+        yield* sql`INSERT INTO relay_repository_aliases(canonical_key,repository_id,organization_id,created_at) VALUES
+          (${expectedRepositoryRemote},'repo','org','2026-10-01'),
+          ('github.com/acme/api-mirror','repo','org','2026-10-02'),
+          ('github.com/acme/other','repo-2','org','2026-10-02'),
+          (${wrongOrganizationRemote},'repo','other-org','2026-10-01')`;
         const snapshot = yield* Sources.owner("org", "admin");
+        const selection = snapshot.repositories.find(
+          ({ repositoryRemote }) => repositoryRemote === expectedRepositoryRemote,
+        )!;
+        expect(selection.repositoryId).toBe("repo");
+
+        yield* sql`UPDATE relay_repository_aliases SET repository_id='repo-2' WHERE canonical_key=${expectedRepositoryRemote}`;
+        const moved = {
+          grantId: "moved",
+          connectionId: "connection",
+          previousGrantId: null,
+          expectedRepositoryRemote,
+        };
         expect(
-          snapshot.withdrawableGrants.toSorted((a, b) => a.grantId.localeCompare(b.grantId)),
-        ).toStrictEqual([
-          {
-            grantId: "grant",
-            connectionId: "connection",
-            repositoryName: "API",
-            repositoryRemote: "github.com/northstar-a/api",
-          },
-          {
-            grantId: "grant-2",
-            connectionId: "connection",
-            repositoryName: "API",
-            repositoryRemote: "github.com/northstar-labs/api",
-          },
-          { grantId: "grant-3", connectionId: "connection", repositoryName: "Without alias" },
-        ]);
+          yield* Store.allow(selection.repositoryId, "admin", moved, "native-app").pipe(
+            Effect.flip,
+          ),
+        ).toMatchObject({ code: "conflict" });
+        expect(
+          yield* Store.allow(
+            selection.repositoryId,
+            "admin",
+            { ...moved, grantId: "foreign", expectedRepositoryRemote: wrongOrganizationRemote },
+            "native-app",
+          ).pipe(Effect.flip),
+        ).toMatchObject({ code: "conflict" });
+        expect((yield* Sources.owner("org", "admin")).grants).toEqual([]);
+
+        const selectedAgain = { ...moved, grantId: "selected-again" };
+        const committed = yield* Store.allow("repo-2", "admin", selectedAgain, "native-app");
+        expect(committed).toMatchObject({ repositoryId: "repo-2", grantId: "selected-again" });
+
+        yield* sql`UPDATE relay_repository_aliases SET repository_id='repo' WHERE canonical_key=${expectedRepositoryRemote}`;
+        expect(yield* Store.allow("repo-2", "admin", selectedAgain, "native-app")).toEqual(
+          committed,
+        );
+        expect((yield* Sources.owner("org", "admin")).grants).toEqual([committed]);
       }),
     ),
   );

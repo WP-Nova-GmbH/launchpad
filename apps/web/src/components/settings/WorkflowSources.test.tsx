@@ -10,7 +10,7 @@ import {
   type ReactElement,
   type ReactNode,
 } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
@@ -121,9 +121,19 @@ vi.mock("../ui/select", () => {
     Select: (props: Record<string, unknown>) =>
       createElement("div", { ...props, "data-picker": true }),
     SelectTrigger: part,
-    SelectValue: part,
+    SelectValue: ({ children, placeholder }: PropsWithChildren<{ placeholder?: string }>) =>
+      createElement("div", { "data-picker-value": true }, children ?? placeholder),
     SelectPopup: part,
-    SelectItem: part,
+    SelectItem: ({
+      children,
+      label,
+      value,
+    }: PropsWithChildren<{ label?: string; value: string }>) =>
+      createElement(
+        "div",
+        { role: "option", "data-picker-option": value, "data-typeahead-label": label },
+        children,
+      ),
   };
 });
 vi.mock("../ui/menu", async (importOriginal) => {
@@ -284,6 +294,8 @@ const source: WorkflowSource = {
 };
 let renderer: ReactTestRenderer;
 const words = () => JSON.stringify(renderer.toJSON());
+const textContent = (node: ReactTestInstance): string =>
+  node.children.map((child) => (typeof child === "string" ? child : textContent(child))).join("");
 const button = (text: string) =>
   renderer.root.findAllByType("button").find(
     (b) =>
@@ -1131,6 +1143,350 @@ for (const status of ["exchanging", "connected", "failed", "cancelled"] as const
     }),
   );
 }
+it.effect(
+  "shows the selected repository path and grants access to the exact same-named repository",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        const previousGrant = {
+          grantId: "previous",
+          connectionId: source.connectionId,
+          organizationId: "org",
+          repositoryId: "labs-launchpad",
+          generation: 1,
+          revoked: true,
+        };
+        fixture.owner = {
+          ...fixture.owner,
+          connections: [source],
+          repositories: [
+            {
+              repositoryId: "acme-launchpad",
+              organizationId: "org",
+              name: "launchpad",
+              repositoryRemote: "github.com/acme/launchpad",
+            },
+            {
+              repositoryId: "labs-launchpad",
+              organizationId: "org",
+              name: "launchpad",
+              repositoryRemote: "github.com/acme-labs/launchpad",
+            },
+            { repositoryId: "legacy", organizationId: "org", name: "launchpad" },
+          ],
+          grants: [previousGrant],
+        };
+        await mountOwner();
+
+        const picker = () => renderer.root.findByProps({ "data-picker": true });
+        const selection = () => renderer.root.findByProps({ "data-picker-value": true });
+        const optionLabels = () =>
+          renderer.root.findAllByProps({ role: "option" }).map(textContent);
+        expect(optionLabels()).toEqual([
+          "acme/launchpad",
+          "acme-labs/launchpad",
+          "launchpad (Repository ID legacy)",
+        ]);
+        expect(button("Allow repository").props.disabled).toBe(true);
+        await act(() => picker().props.onValueChange("labs-launchpad"));
+        expect(textContent(selection())).toBe("acme-labs/launchpad");
+        expect(button("Allow repository").props.disabled).toBe(false);
+
+        const allow = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const request = new Request(input, init);
+          expect(request.method).toBe("POST");
+          expect(new URL(request.url).pathname).toBe(
+            "/v1/repositories/labs-launchpad/workflow-sources/allow",
+          );
+          const body = (await request.json()) as { grantId: string };
+          expect(body).toMatchObject({
+            connectionId: source.connectionId,
+            previousGrantId: "previous",
+            expectedRepositoryRemote: "github.com/acme-labs/launchpad",
+          });
+          fixture.owner = {
+            ...fixture.owner,
+            grants: [
+              ...fixture.owner.grants,
+              {
+                ...previousGrant,
+                grantId: body.grantId,
+                generation: 2,
+                revoked: false,
+              },
+            ],
+          };
+          return Response.json(fixture.repo);
+        });
+        fixture.fetch.mockImplementationOnce(allow);
+        await click("Allow repository");
+        expect(allow).toHaveBeenCalledTimes(1);
+        expect(optionLabels()).toEqual(["acme/launchpad", "launchpad (Repository ID legacy)"]);
+        expect(selection().children).toEqual(["Choose repository"]);
+        expect(button("Allow repository").props.disabled).toBe(true);
+      });
+    }),
+);
+
+it.effect("keeps colliding paths distinct and preserves custom repository names", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        repositories: [
+          {
+            repositoryId: "github-api",
+            organizationId: "org",
+            name: "api",
+            repositoryRemote: "github.com/git.example.com/team/api",
+          },
+          {
+            repositoryId: "internal-api",
+            organizationId: "org",
+            name: "api",
+            repositoryRemote: "git.example.com/team/api",
+          },
+          {
+            repositoryId: "billing",
+            organizationId: "org",
+            name: "Billing production",
+            repositoryRemote: "github.com/acme/monorepo",
+          },
+        ],
+      };
+      await mountOwner();
+
+      const picker = () => renderer.root.findByProps({ "data-picker": true });
+      const selection = () => renderer.root.findByProps({ "data-picker-value": true });
+      const option = (id: string) => renderer.root.findByProps({ "data-picker-option": id });
+      expect(textContent(option("github-api"))).toBe("github.com/git.example.com/team/api");
+      expect(textContent(option("internal-api"))).toBe("git.example.com/team/api");
+      expect(textContent(option("billing"))).toBe("Billing production (acme/monorepo)");
+      expect(option("github-api").props["data-typeahead-label"]).toBe("api");
+      expect(option("billing").props["data-typeahead-label"]).toBe("Billing production");
+
+      await act(() => picker().props.onValueChange("github-api"));
+      expect(textContent(selection())).toBe("github.com/git.example.com/team/api");
+      await act(() => picker().props.onValueChange("billing"));
+      expect(textContent(selection())).toBe("Billing production (acme/monorepo)");
+    });
+  }),
+);
+
+it.effect("requires a fresh selection after a repository becomes eligible again", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      const grant = {
+        grantId: "allowed-elsewhere",
+        connectionId: source.connectionId,
+        organizationId: "org",
+        repositoryId: "repo",
+        generation: 1,
+        revoked: false,
+      };
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        repositories: [
+          {
+            repositoryId: "repo",
+            organizationId: "org",
+            name: "api",
+            repositoryRemote: "github.com/acme/api",
+          },
+          { repositoryId: "other", organizationId: "org", name: "Other repository" },
+        ],
+      };
+      await mountOwner();
+
+      const picker = () => renderer.root.findByProps({ "data-picker": true });
+      const selection = () => renderer.root.findByProps({ "data-picker-value": true });
+      await act(() => picker().props.onValueChange("repo"));
+      expect(textContent(selection())).toBe("acme/api");
+      expect(button("Allow repository").props.disabled).toBe(false);
+
+      fixture.owner = {
+        ...fixture.owner,
+        grants: [grant],
+        withdrawableGrants: [
+          {
+            grantId: grant.grantId,
+            connectionId: grant.connectionId,
+            repositoryName: "api",
+            repositoryRemote: "github.com/acme/api",
+          },
+        ],
+      };
+      await refreshOwner();
+      expect(textContent(selection())).toBe("Choose repository");
+      expect(button("Allow repository").props.disabled).toBe(true);
+
+      fixture.owner = {
+        ...fixture.owner,
+        grants: [{ ...grant, revoked: true }],
+        withdrawableGrants: [],
+      };
+      await refreshOwner();
+      expect(textContent(renderer.root.findByProps({ "data-picker-option": "repo" }))).toBe(
+        "acme/api",
+      );
+      expect(textContent(selection())).toBe("Choose repository");
+      expect(button("Allow repository").props.disabled).toBe(true);
+
+      await act(() => picker().props.onValueChange("repo"));
+      expect(textContent(selection())).toBe("acme/api");
+      expect(button("Allow repository").props.disabled).toBe(false);
+    });
+  }),
+);
+
+it.effect("requires fresh repository information before granting Linear access", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        repositories: [
+          {
+            repositoryId: "repo",
+            organizationId: "org",
+            name: "api",
+            repositoryRemote: "github.com/acme/api",
+          },
+          {
+            repositoryId: "other",
+            organizationId: "org",
+            name: "api",
+            repositoryRemote: "github.com/acme-labs/api",
+          },
+        ],
+      };
+      await mountOwner();
+
+      const picker = () => renderer.root.findByProps({ "data-picker": true });
+      const selection = () => renderer.root.findByProps({ "data-picker-value": true });
+      await act(() => picker().props.onValueChange("repo"));
+      expect(textContent(selection())).toBe("acme/api");
+
+      fixture.failRead = true;
+      await refreshOwner();
+      expect(words()).toContain("Showing last available status.");
+      expect(picker().props.disabled).toBe(true);
+      expect(button("Allow repository").props.disabled).toBe(true);
+      await click("Allow repository");
+      expect(fixture.allowCount).toBe(0);
+
+      fixture.failRead = false;
+      await refreshOwner();
+      expect(textContent(selection())).toBe("acme/api");
+      expect(picker().props.disabled).toBe(false);
+      expect(button("Allow repository").props.disabled).toBe(false);
+
+      fixture.owner = {
+        ...fixture.owner,
+        repositories: fixture.owner.repositories.map((repository) => ({
+          ...repository,
+          repositoryRemote:
+            repository.repositoryId === "repo"
+              ? "github.com/acme-mirror/api"
+              : "github.com/acme/api",
+        })),
+      };
+      fixture.failRead = true;
+      await refreshOwner();
+      expect(picker().props.disabled).toBe(true);
+      await click("Allow repository");
+      expect(fixture.allowCount).toBe(0);
+
+      fixture.failRead = false;
+      await refreshOwner();
+      expect(textContent(selection())).toBe("Choose repository");
+      expect(picker().props.disabled).toBe(false);
+      expect(button("Allow repository").props.disabled).toBe(true);
+
+      await act(() => picker().props.onValueChange("other"));
+      expect(textContent(selection())).toBe("acme/api");
+      const allow = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        expect(request.method).toBe("POST");
+        expect(new URL(request.url).pathname).toBe("/v1/repositories/other/workflow-sources/allow");
+        return Response.json(fixture.repo);
+      });
+      fixture.fetch.mockImplementationOnce(allow);
+      await click("Allow repository");
+      expect(allow).toHaveBeenCalledTimes(1);
+    });
+  }),
+);
+
+it.effect("requires reselection when the relay rejects a moved repository key", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      const remote = "github.com/acme/api";
+      const repository = {
+        repositoryId: "repo",
+        organizationId: "org",
+        name: "api",
+        repositoryRemote: remote,
+      };
+      const other = {
+        ...repository,
+        repositoryId: "other",
+        repositoryRemote: "github.com/acme-labs/api",
+      };
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        repositories: [repository, other],
+      };
+      await mountOwner();
+
+      const picker = () => renderer.root.findByProps({ "data-picker": true });
+      const selection = () => renderer.root.findByProps({ "data-picker-value": true });
+      await act(() => picker().props.onValueChange(repository.repositoryId));
+      expect(textContent(selection())).toBe("acme/api");
+
+      fixture.owner = {
+        ...fixture.owner,
+        repositories: [
+          { ...repository, repositoryRemote: "github.com/acme-mirror/api" },
+          { ...other, repositoryRemote: remote },
+        ],
+      };
+      const message = "The selected repository key changed. Choose a repository again.";
+      const submit = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        expect(request.method).toBe("POST");
+        expect(new URL(request.url).pathname).toBe("/v1/repositories/repo/workflow-sources/allow");
+        expect(await request.json()).toMatchObject({ expectedRepositoryRemote: remote });
+        return Response.json(
+          { _tag: "WorkflowSourceError", code: "conflict", message },
+          { status: 400 },
+        );
+      });
+      fixture.fetch.mockImplementationOnce(submit);
+      const readsBeforeSubmit = fixture.readCount;
+      await click("Allow repository");
+
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(fixture.readCount).toBe(readsBeforeSubmit + 1);
+      expect(words()).toContain(message);
+      expect(textContent(selection())).toBe("Choose repository");
+      expect(button("Allow repository").props.disabled).toBe(true);
+
+      await act(() => picker().props.onValueChange(other.repositoryId));
+      expect(textContent(selection())).toBe("acme/api");
+      expect(button("Allow repository").props.disabled).toBe(false);
+    });
+  }),
+);
+
 it.effect("keeps the selected repository while a cancelled exchange is still in progress", () =>
   Effect.gen(function* () {
     yield* serveRequests;

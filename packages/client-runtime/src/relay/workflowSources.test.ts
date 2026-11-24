@@ -76,8 +76,17 @@ describe("workflow source client", () => {
     ),
   );
   it.effect(
-    "decodes owner withdrawal targets from relays with and without repository remotes",
+    "decodes owner repositories and withdrawal targets with and without repository remotes",
     () => {
+      const repositories = [
+        { repositoryId: "legacy", organizationId: "org", name: "API" },
+        {
+          repositoryId: "visible",
+          organizationId: "org",
+          name: "API",
+          repositoryRemote: "github.com/northstar/api",
+        },
+      ];
       const withdrawableGrants = [
         { grantId: "legacy", connectionId: "owned", repositoryName: "API" },
         {
@@ -91,6 +100,7 @@ describe("workflow source client", () => {
       return Effect.gen(function* () {
         const client = yield* Sources.client;
         const owner = yield* client.owner("token", RelayOrganizationId.make("org"));
+        expect(owner.repositories).toStrictEqual(repositories);
         expect(owner.withdrawableGrants).toStrictEqual(withdrawableGrants);
       }).pipe(
         Effect.provide(
@@ -102,7 +112,7 @@ describe("workflow source client", () => {
               exchangeInProgress: false,
               attempt: null,
               connections: [],
-              repositories: [],
+              repositories,
               grants: [],
               withdrawableGrants,
             }),

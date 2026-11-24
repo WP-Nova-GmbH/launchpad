@@ -1,6 +1,7 @@
 import * as EventFence from "../workflowEvents/Fence.ts";
 import {
   WorkflowSourceError,
+  type AllowWorkflowSource,
   type WorkflowSource,
   type WorkflowSourceGrant,
   type WorkflowSourceHealth,
@@ -233,7 +234,7 @@ export const authority = Effect.fn("workflowSources.authority")(function* (
 export const allow = Effect.fn("workflowSources.allow")(function* (
   repo: string,
   user: string,
-  input: { connectionId: string; grantId: string; previousGrantId: string | null },
+  input: typeof AllowWorkflowSource.Type,
   applicationId: string,
 ) {
   const sql = (yield* RelayDb).$client;
@@ -272,6 +273,18 @@ export const allow = Effect.fn("workflowSources.allow")(function* (
           "reconnect_required",
           "Reconnect this source before allowing repository use.",
         );
+      if (input.expectedRepositoryRemote !== undefined) {
+        const [alias] = yield* sql`
+          SELECT 1 FROM relay_repository_aliases
+          WHERE canonical_key=${input.expectedRepositoryRemote}
+            AND repository_id=${repo} AND organization_id=${repository.organization_id}
+          FOR SHARE`;
+        if (!alias)
+          return yield* fail(
+            "conflict",
+            "The selected repository key changed. Choose a repository again.",
+          );
+      }
       const [previous] =
         yield* sql<Grant>`SELECT * FROM relay_workflow_repository_grants WHERE connection_id=${c.connection_id} AND repository_id=${repo} AND organization_id=${repository.organization_id} ORDER BY generation DESC LIMIT 1 FOR UPDATE`;
       if ((previous?.grant_id ?? null) !== input.previousGrantId || (previous && !previous.revoked))
@@ -324,19 +337,30 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
       const exchangeInProgress = !!a?.exchange_lease_until;
       const connections =
         yield* sql<Connection>`SELECT * FROM relay_workflow_connections WHERE organization_id=${org} ORDER BY workspace_name,connection_id`;
-      const repositories = yield* sql<WorkflowSourceOwner["repositories"][number]>`
-      SELECT repository_id AS "repositoryId",organization_id AS "organizationId",name FROM relay_repositories WHERE organization_id=${org} ORDER BY name,repository_id`;
-      const grants = yield* sql<Grant & { repository_remote: string | null }>`
-      SELECT g.*, CASE WHEN NOT g.revoked THEN (
-        SELECT a.canonical_key FROM relay_repository_aliases a
-        WHERE a.repository_id=g.repository_id AND a.organization_id=g.organization_id
-        ORDER BY a.created_at,a.canonical_key LIMIT 1
-      ) END AS repository_remote
+      const repositoryRows = yield* sql<{
+        repositoryId: string;
+        organizationId: string;
+        name: string;
+        repositoryRemote: string | null;
+      }>`
+      SELECT r.repository_id AS "repositoryId",r.organization_id AS "organizationId",r.name,
+        (SELECT a.canonical_key FROM relay_repository_aliases a
+          WHERE a.repository_id=r.repository_id AND a.organization_id=r.organization_id
+          ORDER BY a.created_at,a.canonical_key LIMIT 1) AS "repositoryRemote"
+      FROM relay_repositories r WHERE r.organization_id=${org} ORDER BY r.name,r.repository_id`;
+      const repositories = repositoryRows.map(({ repositoryRemote, ...repository }) => ({
+        ...repository,
+        ...(repositoryRemote !== null ? { repositoryRemote } : {}),
+      }));
+      const grants = yield* sql<Grant>`
+      SELECT g.*
       FROM relay_workflow_repository_grants g
       JOIN relay_repositories r ON r.repository_id=g.repository_id AND r.organization_id=g.organization_id
       JOIN relay_workflow_connections c ON c.connection_id=g.connection_id AND c.organization_id=g.organization_id
       WHERE g.organization_id=${org} ORDER BY g.generation`;
-      const repositoryNames = new Map(repositories.map((r) => [r.repositoryId, r.name]));
+      const repositoriesById = new Map(
+        repositories.map((repository) => [repository.repositoryId, repository]),
+      );
       const time = yield* now;
       return {
         configured: app !== null,
@@ -368,13 +392,13 @@ export const ownerSnapshot = Effect.fn("workflowSources.ownerSnapshot")(function
         withdrawableGrants: grants
           .filter((g) => !g.revoked)
           .map((g) => {
-            const repositoryName = repositoryNames.get(g.repository_id) ?? null;
+            const repository = repositoriesById.get(g.repository_id);
             return {
               grantId: g.grant_id,
               connectionId: g.connection_id,
-              repositoryName,
-              ...(repositoryName !== null && g.repository_remote !== null
-                ? { repositoryRemote: g.repository_remote }
+              repositoryName: repository?.name ?? null,
+              ...(repository?.repositoryRemote !== undefined
+                ? { repositoryRemote: repository.repositoryRemote }
                 : {}),
             };
           }),

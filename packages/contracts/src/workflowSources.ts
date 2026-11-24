@@ -74,7 +74,12 @@ export const WorkflowSourceOwner = Schema.Struct({
   attempt: Schema.NullOr(WorkflowSourceAttempt),
   connections: Schema.Array(WorkflowSource),
   repositories: Schema.Array(
-    Schema.Struct({ repositoryId: Id, organizationId: Id, name: Schema.String }),
+    Schema.Struct({
+      repositoryId: Id,
+      organizationId: Id,
+      name: Schema.String,
+      repositoryRemote: Schema.optionalKey(Schema.String),
+    }),
   ),
   grants: Schema.Array(WorkflowSourceGrant),
   withdrawableGrants: Schema.Array(
@@ -118,6 +123,9 @@ export const AllowWorkflowSource = Schema.Struct({
   connectionId: Id,
   grantId: Id,
   previousGrantId: Schema.NullOr(Id),
+  expectedRepositoryRemote: Schema.optionalKey(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(512)),
+  ),
 });
 export const WorkflowSourceMetadataQuery = Schema.Struct({
   grantId: Id,

@@ -43,6 +43,7 @@ export function useWorkflowSources<T>(
     [failure, setFailure] = useState<SourceFailure | null>(null);
   const [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(false),
+    [readFailed, setReadFailed] = useState(false),
     [unverified, setUnverified] = useState(false);
   useLayoutEffect(() => {
     live.current = true;
@@ -77,6 +78,7 @@ export function useWorkflowSources<T>(
       if (live.current && identity.current === accountId && request === version.current) {
         setSnapshot((previous) => (mergeSnapshot ? mergeSnapshot(previous, result) : result));
         setFailure(null);
+        setReadFailed(false);
         uncertain.current = false;
         setUnverified(false);
         return result;
@@ -87,6 +89,7 @@ export function useWorkflowSources<T>(
         const code = isSourceError(cause) ? cause.code : undefined;
         if (WorkflowSources.accessRejected(cause) || discardSnapshotOnError?.(code))
           setSnapshot(null);
+        setReadFailed(true);
         setFailure({
           code,
           message: cause instanceof Error ? cause.message : "Could not load workflow sources.",
@@ -152,6 +155,7 @@ export function useWorkflowSources<T>(
     errorCode: failure?.code,
     busy,
     loading,
+    readFailed,
     unverified,
     refresh,
     mutate,
