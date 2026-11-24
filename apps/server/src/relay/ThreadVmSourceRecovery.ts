@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import { CommandId, OrchestrationSession, ThreadId } from "@t3tools/contracts";
 import type { RelayThreadVmWorkflowCheckpoint } from "@t3tools/contracts/relay";
 import * as DateTime from "effect/DateTime";
@@ -18,9 +19,14 @@ import { ThreadExecutionFenceError } from "../persistence/ThreadExecutionFence.t
 import { requireWorkflowVmLifecycleCheckpoint } from "../persistence/WorkflowThreadOwnership.ts";
 import { makeThreadTransferSource } from "./ThreadTransferSource.ts";
 
-import { assertThreadVmQueueIdle } from "./ThreadVmQueueActivity.ts";
+import { assertThreadVmQueueIdle, ThreadVmQueuedWork } from "./ThreadVmQueueActivity.ts";
 import { ThreadExecution } from "./ThreadExecution.ts";
-import { inspectVmWorkloads, stopPassiveWorkflowVmSetup } from "../vmWorkload.ts";
+import {
+  inspectVmWorkloads,
+  recoverIdleWorkflowVmStop,
+  stopPassiveWorkflowVmSetup,
+  type VmWorkloadInventory,
+} from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import { adoptWorkflowVmCancellationSeal } from "./WorkflowVmCancellation.ts";
 import { collectThreadAttachmentReferences } from "./ThreadAttachmentReferences.ts";
@@ -36,6 +42,9 @@ class FinishedWorkflowCaptureUnavailable extends Schema.TaggedError<FinishedWork
 export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make")(function* (
   history: Pick<ReturnType<typeof makeThreadHistorySync>, "synchronize">,
   checkpoints: Pick<ReturnType<typeof makeThreadCheckpointPublisher>, "synchronize">,
+  readBackgroundRevision?: (
+    inventory: typeof VmWorkloadInventory.Type,
+  ) => Effect.Effect<string | undefined>,
 ) {
   const sql = yield* SqlClient.SqlClient,
     provider = yield* ProviderService,
@@ -100,23 +109,86 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
         AND (kind='workspace' OR (${!tracked} AND kind!='provider') OR completed=1)
           AND (completed=0 OR relay_completed=0) LIMIT 1`;
     if (unsettled.length) return;
-    // Routine recovery must not close a shell or interrupt detached work that
-    // raced the relay idle report. No live guest workload is evidence of idleness.
-    if (tracked && !(yield* inspectVmWorkloads({ type: "inspect" })).stopped) {
-      if (workflow && input.workflowCheckpoint?.finishedWorkspaceRevision === undefined) {
+    // Routine recovery must not interrupt work that raced the relay idle report.
+    let beforeStop = tracked ? yield* inspectVmWorkloads({ type: "inspect" }) : null;
+    const finishedWorkflow = input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
+    const operationSeal = finishedWorkflow
+      ? NodeCrypto.createHash("sha256").update(input.operationId).digest("hex").slice(0, 32)
+      : undefined;
+    const checkIdleStopRollback = Effect.fnUntraced(function* (
+      before: typeof VmWorkloadInventory.Type,
+      current: typeof VmWorkloadInventory.Type,
+    ) {
+      if (before.sealedBy !== null && before.sealedBy !== operationSeal) return;
+      // A rejected native stop restores the original open epoch. A normal reopen increments it.
+      const openEpoch = before.epoch - (before.sealedBy === null ? 0 : 1);
+      if (
+        current.bootId === before.bootId &&
+        current.epoch === openEpoch &&
+        current.sealedBy === null
+      )
+        return yield* new ThreadVmQueuedWork({ threadId });
+    });
+    const assertEmptyRevision = Effect.fnUntraced(function* (
+      inventory: typeof VmWorkloadInventory.Type,
+    ) {
+      const revision = input.workflowCheckpoint?.backgroundRevision;
+      // An independent exit has no native stop receipt tied to the reserved idle revision.
+      if (
+        inventory.stopped &&
+        inventory.sealedBy === null &&
+        revision !== undefined &&
+        (!readBackgroundRevision || (yield* readBackgroundRevision(inventory)) !== revision)
+      )
+        return yield* new ThreadVmQueuedWork({ threadId });
+    });
+    if (
+      beforeStop &&
+      finishedWorkflow &&
+      owner.phase === "draining" &&
+      !(yield* provider.listSessions()).some((session) => session.threadId === threadId)
+    ) {
+      // After a coordinator restart only the privileged journal can identify the old stop.
+      // A live runtime still owns its handshake and notification drain.
+      const receipt = yield* recoverIdleWorkflowVmStop(input.operationId, beforeStop);
+      const current = yield* inspectVmWorkloads({ type: "inspect" });
+      if (receipt === "rejected") return yield* checkIdleStopRollback(beforeStop, current);
+      if (
+        !current.stopped ||
+        current.bootId !== beforeStop.bootId ||
+        current.epoch !== beforeStop.epoch ||
+        current.sealedBy !== beforeStop.sealedBy ||
+        (current.sealedBy !== null && current.sealedBy !== operationSeal) ||
+        (receipt === "reserved" && current.sealedBy !== operationSeal)
+      )
+        return;
+      beforeStop = current;
+    }
+    if (beforeStop) yield* assertEmptyRevision(beforeStop);
+    if (beforeStop && !beforeStop.stopped) {
+      if (workflow && !finishedWorkflow) {
         // Only the authenticated passive setup supervisor may be closed here.
         // Any recipe, terminal, provider or detached work still blocks capture.
         if (yield* Effect.isFailure(stopPassiveWorkflowVmSetup())) return;
-      } else if (
-        !provider.stopIdleVmSession ||
-        !(yield* provider.stopIdleVmSession({
+      } else {
+        if (!provider.stopIdleVmSession) return;
+        const stopped = yield* provider.stopIdleVmSession({
           threadId: ThreadId.make(threadId),
           environmentId: input.environmentId,
           generation: input.generation,
           operationId: input.operationId,
-        }))
-      )
-        return;
+          ...(input.workflowCheckpoint?.backgroundRevision
+            ? { backgroundRevision: input.workflowCheckpoint.backgroundRevision }
+            : {}),
+        });
+        if (!stopped) {
+          if (!finishedWorkflow) return;
+          return yield* checkIdleStopRollback(
+            beforeStop,
+            yield* inspectVmWorkloads({ type: "inspect" }),
+          );
+        }
+      }
       if (!(yield* inspectVmWorkloads({ type: "inspect" })).stopped) return;
     }
     const [runtime] = yield* sql<{
@@ -165,7 +237,11 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
       });
     }
     yield* terminals.close({ threadId: ThreadId.make(threadId), waitForProcessExit: true });
-    if (tracked && !(yield* inspectVmWorkloads({ type: "inspect" })).stopped) return;
+    if (tracked) {
+      const inventory = yield* inspectVmWorkloads({ type: "inspect" });
+      if (!inventory.stopped) return;
+      yield* assertEmptyRevision(inventory);
+    }
     yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
     const frozen = yield* source
       .freeze({ ...input, requireIdleQueue: true })

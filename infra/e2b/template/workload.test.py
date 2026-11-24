@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import errno
 import hashlib
 import importlib.util
 import io
@@ -117,6 +118,384 @@ class ProviderIdentityTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Native leader identity changed'):
                 workload.stop_idle_provider(self.gate, expected, 'b' * 32)
         verify.assert_not_called()
+
+    def run_prepared_stop(self, decision=None, *, marker_result=0, timed_out=False, already_frozen=False,
+                          chunks=(), terminate=False, signal_failure=None, operation='b' * 32,
+                          missing_thaw_receipt=False):
+        self.gate.update(sealedBy=None, epoch=1)
+        groups = self.state / 'groups'
+        group = groups / self.work_id
+        group.mkdir(parents=True, exist_ok=True)
+        freezer = group / 'cgroup.freeze'
+        freezer.write_text('1' if already_frozen else '0')
+        events = group / 'cgroup.events'
+        events.write_text('populated 1\nfrozen ' + freezer.read_text() + '\n')
+        expected = self.read_identity()
+        self.stop_args = [operation, self.work_id, json.dumps(expected)]
+        nonce = 'c' * 32
+        read_pipe, write_pipe = os.pipe()
+        if decision is not None:
+            os.write(write_pipe, decision)
+        os.close(write_pipe)
+
+        def write_marker(action, pidfd, received_nonce):
+            self.assertEqual((action, received_nonce), ('write-idle-provider-marker', nonce))
+            self.assertEqual(freezer.read_text(), '1')
+            self.assertIsNone(self.gate['sealedBy'])
+            self.preparation = json.loads((self.state / 'gate.json').read_text())
+            self.assertIsNone(self.preparation['sealedBy'])
+            self.assertEqual(self.preparation['idleProviderPreparation'], {
+                'identity': expected,
+                'operation': operation,
+                'signalReserved': False,
+                'epoch': 1,
+            })
+            return marker_result
+
+        def signal_reserved(pidfd, signum):
+            persisted = json.loads((self.state / 'gate.json').read_text())
+            self.assertEqual(persisted['sealedBy'], self.stop_args[0])
+            self.assertEqual(persisted['idleProviderStop']['identity'], expected)
+            self.assertEqual(persisted['idleProviderStop']['operation'], self.stop_args[0])
+            self.assertEqual(signum, signal.SIGTERM)
+            self.assertEqual(freezer.read_text(), '1')
+            if signal_failure is not None:
+                raise signal_failure
+
+        self.stop_signal = mock.Mock(side_effect=signal_reserved)
+
+        write_text = Path.write_text
+
+        def check_freeze_write(path, value, *args, **kwargs):
+            if path == freezer and value == '1':
+                persisted = json.loads((self.state / 'gate.json').read_text())
+                self.assertIsNone(persisted['sealedBy'])
+                self.assertEqual(persisted['idleProviderPreparation']['operation'], operation)
+            return write_text(path, value, *args, **kwargs)
+
+        def wait_frozen(_group, field, value):
+            self.assertEqual(field, 'frozen')
+            self.assertEqual(freezer.read_text(), value)
+            if value == '0' and missing_thaw_receipt and self.stop_signal.called:
+                raise RuntimeError('Thaw was not confirmed')
+            events.write_text('populated 1\nfrozen ' + value + '\n')
+
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(os.fdopen(read_pipe, 'r'))
+            stack.enter_context(mock.patch.object(workload.sys, 'stdin', types.SimpleNamespace(fileno=lambda: read_pipe)))
+            stack.enter_context(mock.patch.object(workload, 'ROOT', groups))
+            stack.enter_context(mock.patch.object(workload, 'inventory', return_value={'groups': [{'id': self.work_id}]}))
+            stack.enter_context(mock.patch.object(os, 'pidfd_open', side_effect=lambda _pid: os.open(os.devnull, os.O_RDONLY), create=True))
+            stack.enter_context(mock.patch.object(signal, 'pidfd_send_signal', self.stop_signal, create=True))
+            stack.enter_context(mock.patch.object(workload, 'exclusive_provider', return_value=True))
+            stack.enter_context(mock.patch.object(workload, 'native_peer_control', side_effect=write_marker))
+            stack.enter_context(mock.patch.object(workload, 'wait_cgroup_event', side_effect=wait_frozen))
+            stack.enter_context(mock.patch.object(Path, 'write_text', check_freeze_write))
+            if chunks:
+                stack.enter_context(mock.patch.object(os, 'read', side_effect=chunks))
+            if timed_out:
+                stack.enter_context(mock.patch.object(select, 'select', return_value=([], [], [])))
+            if terminate:
+                stack.enter_context(mock.patch.object(select, 'select',
+                    side_effect=lambda *_: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)))
+            stack.enter_context(contextlib.redirect_stdout(output))
+            try:
+                workload.main(['prepare-idle-provider', *self.stop_args, nonce])
+            finally:
+                self.assertEqual(freezer.read_text(), '1' if already_frozen else '0')
+        return [json.loads(line)['status'] for line in output.getvalue().splitlines()]
+
+    def replay_idle_stop(self, *, prepare=False, recover=False, operation=None, boot=None, epoch=None,
+                         missing_thaw_receipt=False):
+        groups = self.state / 'groups'
+        group = groups / self.work_id
+        freezer = group / 'cgroup.freeze'
+
+        def wait_thawed(path, field, value):
+            self.assertEqual((path, field, value), (group, 'frozen', '0'))
+            self.assertEqual(freezer.read_text(), '0')
+            if missing_thaw_receipt:
+                raise RuntimeError('Thaw was not confirmed')
+            (group / 'cgroup.events').write_text('populated 1\nfrozen 0\n')
+
+        args = [operation or self.stop_args[0], *self.stop_args[1:]]
+        if recover:
+            command = ['recover-idle-provider-stop', args[0], boot or self.gate['bootId'],
+                       str(self.gate['epoch'] if epoch is None else epoch)]
+        else:
+            command = ['prepare-idle-provider', *args, 'c' * 32] if prepare else ['inspect-idle-provider-stop', *args]
+        output = io.StringIO()
+        with mock.patch.object(workload, 'ROOT', groups), \
+                mock.patch.object(workload, 'wait_cgroup_event', side_effect=wait_thawed), \
+                mock.patch.object(signal, 'pidfd_send_signal', create=True) as send, \
+                contextlib.redirect_stdout(output):
+            try:
+                workload.main(command)
+            finally:
+                send.assert_not_called()
+        return json.loads(output.getvalue())
+
+    def assert_open_gate_after_refusal(self):
+        gate = json.loads((self.state / 'gate.json').read_text())
+        self.assertIsNone(gate['sealedBy'])
+        self.assertEqual(gate['epoch'], 1)
+        self.assertNotIn('idleProviderPreparation', gate)
+        self.assertNotIn('idleProviderStop', gate)
+        return gate
+
+    def test_idle_stop_thaws_without_signal_on_release_eof_timeout_or_malformed_input(self):
+        for index, (decision, timed_out) in enumerate([
+                (b'release\n', False), (None, False), (b'stop', False), (b'stop\nmore', False), (None, True)]):
+            with self.subTest(decision=decision, timed_out=timed_out):
+                self.assertEqual(self.run_prepared_stop(decision, timed_out=timed_out, operation=f'{index:032x}'),
+                                 ['prepared', 'rejected'])
+                self.stop_signal.assert_not_called()
+                self.assert_open_gate_after_refusal()
+
+    def test_idle_stop_cannot_signal_if_output_ordering_is_unavailable(self):
+        with self.assertRaisesRegex(RuntimeError, 'Provider output ordering is unavailable'):
+            self.run_prepared_stop(b'stop\n', marker_result=1)
+        self.stop_signal.assert_not_called()
+        self.assertIn('idleProviderPreparation', json.loads((self.state / 'gate.json').read_text()))
+        self.assertEqual(self.replay_idle_stop(), {'status': 'rejected'})
+        self.assert_open_gate_after_refusal()
+
+    def test_idle_stop_does_not_thaw_a_preexisting_freeze(self):
+        with self.assertRaisesRegex(RuntimeError, 'already frozen'):
+            self.run_prepared_stop(b'stop\n', already_frozen=True)
+        self.stop_signal.assert_not_called()
+        self.assertFalse((self.state / 'gate.json').exists())
+        with self.assertRaisesRegex(RuntimeError, 'already frozen'):
+            self.replay_idle_stop()
+        freezer = self.state / 'groups' / self.work_id / 'cgroup.freeze'
+        self.assertEqual(freezer.read_text(), '1')
+
+    def test_idle_stop_thaws_and_does_not_signal_when_terminated_while_prepared(self):
+        with self.assertRaises(SystemExit) as termination:
+            self.run_prepared_stop(terminate=True)
+        self.assertEqual(termination.exception.code, 74)
+        self.stop_signal.assert_not_called()
+        self.assertIn('idleProviderPreparation', json.loads((self.state / 'gate.json').read_text()))
+        self.assertEqual(self.replay_idle_stop(), {'status': 'rejected'})
+        self.assert_open_gate_after_refusal()
+
+    def test_idle_stop_retry_thaws_only_its_interrupted_open_preparation(self):
+        self.assertEqual(self.run_prepared_stop(b'release\n'), ['prepared', 'rejected'])
+        # Recover the exact disk state from before the helper had a chance to thaw.
+        self.gate = copy.deepcopy(self.preparation)
+        workload.write_json(self.state / 'gate.json', self.gate)
+        group = self.state / 'groups' / self.work_id
+        freezer = group / 'cgroup.freeze'
+        freezer.write_text('1')
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 1\n')
+        with self.assertRaises(RuntimeError):
+            self.replay_idle_stop(operation='d' * 32)
+        self.assertEqual(self.replay_idle_stop(recover=True, operation='d' * 32), {'status': 'absent'})
+        for changes in ({'epoch': 0}, {'boot': 'different-boot'}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(RuntimeError, 'gate changed'):
+                self.replay_idle_stop(recover=True, **changes)
+        self.assertEqual(freezer.read_text(), '1')
+        with self.assertRaisesRegex(RuntimeError, 'Thaw was not confirmed'):
+            self.replay_idle_stop(recover=True, missing_thaw_receipt=True)
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        self.assertIn('idleProviderPreparation', self.gate)
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'rejected'})
+        self.gate = self.assert_open_gate_after_refusal()
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'rejected'})
+        self.assertEqual(self.replay_idle_stop(prepare=True), {'status': 'rejected'})
+        self.assertEqual(freezer.read_text(), '0')
+
+    def test_idle_stop_retry_does_not_thaw_a_replaced_provider(self):
+        self.assertEqual(self.run_prepared_stop(b'release\n'), ['prepared', 'rejected'])
+        self.gate = copy.deepcopy(self.preparation)
+        workload.write_json(self.state / 'gate.json', self.gate)
+        group = self.state / 'groups' / self.work_id
+        freezer = group / 'cgroup.freeze'
+        freezer.write_text('1')
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 1\n')
+        record = self.state / (self.work_id + '.json')
+        record.write_text(json.dumps({**json.loads(record.read_text()), 'startTicks': '456'}))
+        with self.assertRaises(RuntimeError):
+            self.replay_idle_stop()
+        self.assertEqual(freezer.read_text(), '1')
+        self.assertIn('idleProviderPreparation', json.loads((self.state / 'gate.json').read_text()))
+
+    def test_idle_stop_persists_one_exact_signal_receipt_after_prepare(self):
+        self.assertEqual(self.run_prepared_stop(chunks=(b'st', b'op\n', b'')), ['prepared', 'reserved'])
+        self.stop_signal.assert_called_once()
+        for args in [
+            ['inspect-idle-provider-stop', *self.stop_args],
+            ['prepare-idle-provider', *self.stop_args, 'c' * 32],
+        ]:
+            output = io.StringIO()
+            with mock.patch.object(workload, 'stop_idle_provider') as stop, contextlib.redirect_stdout(output):
+                workload.main(args)
+            stop.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue()), {'status': 'reserved'})
+        with self.assertRaisesRegex(RuntimeError, 'another operation'):
+            workload.main(['inspect-idle-provider-stop', 'd' * 32, *self.stop_args[1:]])
+
+    def test_idle_stop_retry_thaws_after_reserved_signal_without_signalling_again(self):
+        self.assertEqual(self.run_prepared_stop(b'stop\n'), ['prepared', 'reserved'])
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        group = self.state / 'groups' / self.work_id
+        freezer = group / 'cgroup.freeze'
+        # The first helper sent SIGTERM and died before its finally ran.
+        freezer.write_text('1')
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 1\n')
+        with self.assertRaisesRegex(RuntimeError, 'Thaw was not confirmed'):
+            self.replay_idle_stop(missing_thaw_receipt=True)
+        self.assertEqual(json.loads((self.state / 'gate.json').read_text()), self.gate)
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'reserved'})
+        self.assertEqual(freezer.read_text(), '0')
+        self.assertEqual(self.replay_idle_stop(), {'status': 'reserved'})
+        self.assertEqual(json.loads((self.state / 'gate.json').read_text()), self.gate)
+        self.assertEqual(self.gate['sealedBy'], self.stop_args[0])
+        self.stop_signal.assert_called_once()
+
+    def test_resume_reopen_preserves_stop_receipt_until_the_reserved_writer_exits(self):
+        self.assertEqual(self.run_prepared_stop(b'stop\n'), ['prepared', 'reserved'])
+        gate_path = self.state / 'gate.json'
+        self.gate = json.loads(gate_path.read_text())
+        group = self.state / 'groups' / self.work_id
+        freezer = group / 'cgroup.freeze'
+        freezer.write_text('1')
+        (group / 'cgroup.events').write_text('populated 1\nfrozen 1\n')
+        reopen = ['reopen', self.gate['bootId'], self.stop_args[0]]
+        with mock.patch.object(workload, 'ROOT', group.parent):
+            with self.assertRaisesRegex(RuntimeError, 'Provider stop has not finished'):
+                workload.main(reopen)
+            self.assertEqual(json.loads(gate_path.read_text()), self.gate)
+            self.assertEqual(freezer.read_text(), '1')
+            self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'reserved'})
+            self.assertEqual(freezer.read_text(), '0')
+            with self.assertRaisesRegex(RuntimeError, 'Provider stop has not finished'):
+                workload.main(reopen)
+            shutil.rmtree(group)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                workload.main(reopen)
+        receipt = json.loads(output.getvalue())
+        self.assertIsNone(receipt['sealedBy'])
+        self.assertTrue(receipt['stopped'])
+        self.assertNotIn('idleProviderStop', json.loads(gate_path.read_text()))
+        self.stop_signal.assert_called_once()
+
+    def test_resume_reopen_cannot_discard_a_rejection_before_recovering_thaw(self):
+        rejected = PermissionError(errno.EPERM, 'Kernel refused signal delivery')
+        with self.assertRaisesRegex(RuntimeError, 'Thaw was not confirmed'):
+            self.run_prepared_stop(b'stop\n', signal_failure=rejected, missing_thaw_receipt=True)
+        gate_path = self.state / 'gate.json'
+        self.gate = json.loads(gate_path.read_text())
+        with self.assertRaisesRegex(RuntimeError, 'Recover the interrupted provider stop'):
+            workload.main(['reopen', self.gate['bootId'], self.stop_args[0]])
+        self.assertEqual(json.loads(gate_path.read_text()), self.gate)
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'rejected'})
+        self.assert_open_gate_after_refusal()
+
+    def test_idle_stop_signal_failure_preserves_the_receipt_without_a_retry_signal(self):
+        with self.assertRaisesRegex(OSError, 'Signal outcome unknown'):
+            self.run_prepared_stop(b'stop\n', signal_failure=OSError('Signal outcome unknown'))
+        self.stop_signal.assert_called_once()
+        # A different process reads the state that was persisted before SIGTERM.
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        output = io.StringIO()
+        with mock.patch.object(workload, 'stop_idle_provider') as stop, contextlib.redirect_stdout(output):
+            workload.main(['inspect-idle-provider-stop', *self.stop_args])
+        stop.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), {'status': 'reserved'})
+
+    def test_kernel_signal_rejection_reopens_the_same_gate_without_retrying(self):
+        rejected = PermissionError(errno.EPERM, 'Kernel refused signal delivery')
+        self.assertEqual(self.run_prepared_stop(b'stop\n', signal_failure=rejected), ['prepared', 'rejected'])
+        self.stop_signal.assert_called_once()
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        self.assertIsNone(self.gate['sealedBy'])
+        self.assertEqual(self.gate['epoch'], 1)
+        self.assertNotIn('idleProviderStop', self.gate)
+        self.assertEqual(self.gate['idleProviderRefusal'], {
+            'identity': json.loads(self.stop_args[2]),
+            'operation': self.stop_args[0],
+            'signalReserved': False,
+            'epoch': 1,
+        })
+        for args in [
+            ['inspect-idle-provider-stop', *self.stop_args],
+            ['prepare-idle-provider', *self.stop_args, 'c' * 32],
+        ]:
+            output = io.StringIO()
+            with mock.patch.object(workload, 'stop_idle_provider') as stop, contextlib.redirect_stdout(output):
+                workload.main(args)
+            stop.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue()), {'status': 'rejected'})
+        self.assertEqual(self.run_prepared_stop(b'stop\n', operation='d' * 32), ['prepared', 'reserved'])
+        self.stop_signal.assert_called_once()
+
+    def test_old_rejection_does_not_reopen_a_later_seal_with_the_same_operation(self):
+        rejected = PermissionError(errno.EPERM, 'Kernel refused signal delivery')
+        self.assertEqual(self.run_prepared_stop(b'stop\n', signal_failure=rejected), ['prepared', 'rejected'])
+        self.gate = self.assert_open_gate_after_refusal()
+        self.gate.update(sealedBy=self.stop_args[0], epoch=3)
+        workload.write_json(self.state / 'gate.json', self.gate)
+        with self.assertRaisesRegex(RuntimeError, 'no confirmed receipt'):
+            self.replay_idle_stop()
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'absent'})
+        self.assertEqual(json.loads((self.state / 'gate.json').read_text()), self.gate)
+        self.assertEqual(self.gate['sealedBy'], self.stop_args[0])
+        self.assertEqual(self.gate['epoch'], 3)
+
+    def test_lost_rejection_write_does_not_claim_the_gate_is_open(self):
+        write_json = workload.write_json
+
+        def writer(path, gate):
+            if 'idleProviderRefusal' in gate:
+                raise OSError('Rejection receipt was not persisted')
+            write_json(path, gate)
+
+        with mock.patch.object(workload, 'write_json', side_effect=writer), \
+                self.assertRaisesRegex(OSError, 'Rejection receipt was not persisted'):
+            self.run_prepared_stop(b'stop\n', signal_failure=PermissionError(errno.EACCES, 'Refused'))
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            workload.main(['inspect-idle-provider-stop', *self.stop_args])
+        self.assertEqual(json.loads(output.getvalue()), {'status': 'reserved'})
+
+    def test_unconfirmed_thaw_after_definite_rejection_is_reconciled_without_resignalling(self):
+        rejected = PermissionError(errno.EPERM, 'Kernel refused signal delivery')
+        with self.assertRaisesRegex(RuntimeError, 'Thaw was not confirmed'):
+            self.run_prepared_stop(b'stop\n', signal_failure=rejected, missing_thaw_receipt=True)
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        self.assertEqual(self.gate['sealedBy'], self.stop_args[0])
+        self.assertNotIn('idleProviderStop', self.gate)
+        self.assertEqual(self.gate['idleProviderRefusal'], {
+            'identity': json.loads(self.stop_args[2]),
+            'operation': self.stop_args[0],
+            'signalReserved': False,
+            'epoch': 1,
+        })
+        with self.assertRaisesRegex(RuntimeError, 'Thaw was not confirmed'):
+            self.replay_idle_stop(missing_thaw_receipt=True)
+        self.gate = json.loads((self.state / 'gate.json').read_text())
+        self.assertEqual(self.gate['sealedBy'], self.stop_args[0])
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'rejected'})
+        self.gate = self.assert_open_gate_after_refusal()
+        self.assertEqual(self.replay_idle_stop(recover=True), {'status': 'rejected'})
+        self.assertEqual(self.replay_idle_stop(prepare=True), {'status': 'rejected'})
+        self.stop_signal.assert_called_once()
+
+    def test_idle_stop_inspection_never_signals_on_missing_or_unconfirmed_receipt(self):
+        self.gate.update(sealedBy=None, epoch=1)
+        args = ['inspect-idle-provider-stop', 'b' * 32, self.work_id, json.dumps(self.read_identity())]
+        output = io.StringIO()
+        with mock.patch.object(workload, 'stop_idle_provider') as stop, contextlib.redirect_stdout(output):
+            workload.main(args)
+            self.gate['sealedBy'] = args[1]
+            with self.assertRaisesRegex(RuntimeError, 'no confirmed receipt'):
+                workload.main(args)
+        stop.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()), {'status': 'refused'})
 
 
 class KernelStopReceiptTest(unittest.TestCase):
@@ -252,6 +631,31 @@ class WarmRestoreGateTest(unittest.TestCase):
     def test_accepts_a_later_closed_capture_from_an_already_restored_source(self):
         self.gate['warmRestore'] = {'older': 'completed-restore'}
         self.assertEqual(workload.prepare_warm_restore(self.input)['targetSealEpoch'], 8)
+
+    def test_restore_consumes_the_stopped_source_receipt_before_reopening(self):
+        identity = {'bootId': self.gate['bootId'], 'groupId': 'a' * 32, 'pid': 42,
+                    'startTicks': '123', 'executableSha256': 'c' * 64}
+        self.gate['idleProviderStop'] = workload.idle_provider_stop_record(identity, self.gate['sealedBy'])
+        receipt = workload.prepare_warm_restore(self.input)
+        self.assertNotIn('idleProviderStop', self.gate)
+        self.assertEqual(workload.prepare_warm_restore(self.input), receipt)
+        with mock.patch.object(workload, 'write_json') as write, contextlib.redirect_stdout(io.StringIO()):
+            workload.main(['reopen', self.gate['bootId'], self.gate['sealedBy']])
+        write.assert_called_once()
+        self.assertIsNone(self.gate['sealedBy'])
+        self.assertEqual(self.gate['epoch'], 9)
+
+    def test_restore_rejects_mismatched_source_receipt_without_rebinding(self):
+        for boot, operation in [('other-boot', self.gate['sealedBy']), (self.gate['bootId'], 'b' * 32)]:
+            with self.subTest(boot=boot, operation=operation):
+                identity = {'bootId': boot, 'groupId': 'a' * 32, 'pid': 42,
+                            'startTicks': '123', 'executableSha256': 'c' * 64}
+                self.gate['idleProviderStop'] = workload.idle_provider_stop_record(identity, operation)
+                before = copy.deepcopy(self.gate)
+                with self.assertRaisesRegex(RuntimeError, 'Saved provider stop belongs to another source'):
+                    workload.prepare_warm_restore(self.input)
+                self.assertEqual(self.gate, before)
+        self.assertEqual(self.events, [])
 
     def test_mismatched_or_busy_source_never_stops_or_rebinds(self):
         for changed in ({'bootId': 'other'}, {'epoch': 6}, {'sealedBy': None}, {'sealedBy': 'other'}):
@@ -444,7 +848,7 @@ class WorkflowRecoveryTest(unittest.TestCase):
             if path == self.proc / 'exe': return native
             return stat(path, *args, **kwargs)
         self.stack.enter_context(mock.patch.object(Path, 'stat', proc_stat))
-        self.stack.enter_context(mock.patch.object(workload, 'Path', side_effect=lambda value: self.root / value.removeprefix('/') if str(value).startswith('/proc/42') else Path(value)))
+        self.stack.enter_context(mock.patch.object(workload, 'Path', side_effect=lambda value: self.root / str(value).removeprefix('/') if str(value) == '/proc' or str(value).startswith('/proc/') else Path(value)))
 
     def add_group(self, kind='terminal', *, setup_owner=True):
         self.group.mkdir()
@@ -479,6 +883,29 @@ class WorkflowRecoveryTest(unittest.TestCase):
                 self.record['kind'] = kind; self.save_record()
                 with self.assertRaises(RuntimeError): self.inspect()
         self.assertFalse((self.group / 'cgroup.kill').exists())
+
+    def test_finished_workflow_activity_requires_one_pinned_provider_without_descendants(self):
+        self.add_group('provider', setup_owner=False)
+        self.identity.return_value['processGroup'] = 42
+        native = ({'sha256': 'a' * 64}, self.root / 'codex', self.immutable.return_value)
+        with mock.patch.object(workload, 'workflow_native', return_value=native):
+            receipt = workload.workflow_recovery_state(self.gate, allow_codex=True)
+            self.assertTrue(receipt['codexOnly'])
+            self.assertFalse(receipt.get('recoverable', False))
+            self.assertFalse(receipt['stopped'])
+            self.assertEqual(receipt['groups'], [self.record])
+            self.assertIsNone(self.gate['sealedBy'])
+            self.assertFalse((self.group / 'cgroup.kill').exists())
+            with self.assertRaises(RuntimeError): self.inspect()
+
+            self.same_executable.return_value = False
+            with self.assertRaises(RuntimeError):
+                workload.workflow_recovery_state(self.gate, allow_codex=True)
+            self.same_executable.return_value = True
+
+            (self.group / 'cgroup.procs').write_text('42\n43\n')
+            with self.assertRaises(RuntimeError):
+                workload.workflow_recovery_state(self.gate, allow_codex=True)
 
     def test_setup_waiting_for_arm_or_about_to_fork_does_not_pass_singleton_check(self):
         self.add_group()
@@ -538,22 +965,80 @@ class WorkflowRecoveryTest(unittest.TestCase):
         with self.assertRaises(ValueError): self.inspect()
 
     def test_native_action_is_root_only_and_coordinator_delegates_exact_shape(self):
-        self.uid.return_value = 1000
-        with mock.patch.object(os, 'execv', side_effect=RuntimeError('delegated')) as execute:
-            with self.assertRaisesRegex(RuntimeError, 'delegated'):
-                workload.main(['workflow-recovery-state'])
-        execute.assert_called_once_with(workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, 'workflow-recovery-state'])
-        self.uid.return_value = 10001
-        with self.assertRaises(RuntimeError): workload.main(['workflow-recovery-state'])
-        self.uid.return_value = 0
-        self.marked.return_value = False
-        with self.assertRaises(RuntimeError): workload.main(['workflow-recovery-state'])
-        self.marked.return_value = True
-        with self.assertRaises(ValueError): workload.main(['workflow-recovery-state', 'unexpected'])
+        for action in ('workflow-recovery-state', 'workflow-activity-state'):
+            with self.subTest(action=action):
+                self.uid.return_value = 1000
+                with mock.patch.object(os, 'execv', side_effect=RuntimeError('delegated')) as execute:
+                    with self.assertRaisesRegex(RuntimeError, 'delegated'):
+                        workload.main([action])
+                execute.assert_called_once_with(workload.WORKFLOW_EXEC, [workload.WORKFLOW_EXEC, action])
+                self.uid.return_value = 10001
+                with self.assertRaises(RuntimeError): workload.main([action])
+                self.uid.return_value = 0
+                self.marked.return_value = False
+                with self.assertRaises(RuntimeError): workload.main([action])
+                self.marked.return_value = True
+                with self.assertRaises(ValueError): workload.main([action, 'unexpected'])
 
 
 class WorkflowBrokerRecoveryTest(unittest.TestCase):
-    def test_real_entrypoint_limits_recovery_to_coordinator_and_zero_arguments(self):
+    def test_writes_exact_marker_to_provider_stream_and_rejects_other_output(self):
+        cc = shutil.which('cc')
+        if not cc: self.skipTest('C compiler unavailable')
+        source = Path(__file__).with_name('workflow-exec.c').read_text()
+        number = source[source.index('static int number('):source.index('static int duplicate_fd(')]
+        marker = source[source.index('static int write_idle_provider_marker('):source.index('static int endpoint_matches(')]
+        harness = r'''
+#define _GNU_SOURCE
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+static int output;
+static int duplicate_fd(int pidfd, int fd){assert(pidfd==13 && fd==STDOUT_FILENO);return dup(output);}
+static unsigned sends;
+static ssize_t split_send(int fd,const void *buffer,size_t length,int flags) {
+ if (++sends==1){errno=EINTR;return -1;}
+ if (sends==2 && length>6) length=6;
+ return send(fd,buffer,length,flags);
+}
+#define send split_send
+''' + number + marker + r'''
+#undef send
+int main(void) {
+ char *args[]={"13","0123456789abcdef0123456789abcdef"};
+ int pair[2];
+ assert(socketpair(AF_UNIX,SOCK_STREAM,0,pair)==0);
+ output=pair[1];
+ assert(write(output,"partial",7)==7);
+ assert(write_idle_provider_marker(args)==0);
+ assert(sends==3);
+ char received[128]={0};
+ assert(recv(pair[0],received,56,MSG_WAITALL)==56);
+ assert(!strcmp(received,"partial\x1elaunchpad-idle:0123456789abcdef0123456789abcdef\x1f"));
+ close(pair[0]);
+ close(pair[1]);
+ output=open("/dev/null",O_WRONLY);
+ assert(output>=0 && write_idle_provider_marker(args)<0);
+ close(output);
+ return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='launchpad-provider-marker-') as temporary:
+            path = Path(temporary) / 'marker.c'; path.write_text(harness)
+            binary = Path(temporary) / 'marker'
+            compiled = subprocess.run([cc, '-std=c11', '-Wall', '-Werror', str(path), '-o', str(binary)], capture_output=True, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            subprocess.run([str(binary)], check=True, capture_output=True)
+
+    def test_real_entrypoint_limits_recovery_to_expected_uid_and_arguments(self):
         cc = shutil.which('cc')
         if not cc: self.skipTest('C compiler unavailable')
         # Compile the actual entry point with OS identity/control sinks. No setuid
@@ -575,23 +1060,40 @@ static int uid=1000, euid=0, marked=1, calls=0;
 static int getuid(void){return uid;} static int geteuid(void){return euid;}
 static int workflow_enabled(void){return marked;}
 static int inspect_provider_peer(char **args){(void)args;return -1;}
+static int marker_calls=0;
+static int write_idle_provider_marker(char **args){(void)args;marker_calls++;return 0;}
 static int number(char *s,int min,int max){(void)s;(void)min;(void)max;return -1;}
 static int duplicate_fd(int a,int b){(void)a;(void)b;return -1;}
 static int close(int fd){(void)fd;return 0;}
 static int prepare_workspace(void){return -1;}
 static int open_setup_script(char *s){(void)s;return -1;}
 static int exec_workload(char *cwd,char **cmd,enum workload_kind kind){(void)cwd;(void)cmd;(void)kind;return -1;}
-static int exec_control(int count,char **args){assert(count==1);assert(!strcmp(args[0],"workflow-recovery-state"));calls++;return -1;}
+static char *action;
+static int action_count;
+static int exec_control(int count,char **args){assert(count==action_count);assert(!strcmp(args[0],action));calls++;return -1;}
 int broker_main(int argc,char **argv)
 ''' + entry + r'''
 int main(void){
- char *args[]={"broker","workflow-recovery-state","unexpected",NULL};
- broker_main(2,args);assert(calls==1);
- broker_main(3,args);assert(calls==1);
- uid=10001;broker_main(2,args);assert(calls==1);
- uid=1000;euid=1000;broker_main(2,args);assert(calls==1);
- euid=0;marked=0;broker_main(2,args);assert(calls==1);
- uid=0;marked=1;broker_main(2,args);assert(calls==1);
+ char *actions[]={"workflow-recovery-state","workflow-activity-state","prepare-idle-provider",
+                  "inspect-idle-provider-stop","recover-idle-provider-stop"};
+ int counts[]={1,1,5,4,4};
+ for (size_t i=0;i<sizeof(counts)/sizeof(counts[0]);i++) {
+  action=actions[i];
+  action_count=counts[i];
+  char *args[]={"broker",action,"one","two","three","four","five",NULL};
+  uid=1000;euid=0;marked=1;calls=0;
+  broker_main(action_count+1,args);assert(calls==1);
+  broker_main(action_count+2,args);assert(calls==1);
+  broker_main(action_count,args);assert(calls==1);
+  uid=10001;broker_main(action_count+1,args);assert(calls==1);
+  uid=1000;euid=1000;broker_main(action_count+1,args);assert(calls==1);
+  euid=0;marked=0;broker_main(action_count+1,args);assert(calls==1);
+  uid=0;marked=1;broker_main(action_count+1,args);assert(calls==1);
+ }
+ char *marker[]={"broker","write-idle-provider-marker","13","nonce","extra",NULL};
+ uid=1000;euid=0;marked=1;broker_main(4,marker);assert(marker_calls==0);
+ uid=0;euid=0;broker_main(5,marker);assert(marker_calls==0);
+ broker_main(4,marker);assert(marker_calls==1);
  return 0;
 }
 '''

@@ -3221,6 +3221,9 @@ export const RelayThreadVmWorkflowCheckpoint = Schema.Struct({
   publicationId: RelayThreadArtifactId,
   publicationRevision: Schema.Int.check(Schema.isGreaterThan(0)),
   finishedWorkspaceRevision: Schema.optionalKey(NonNegativeInt),
+  backgroundRevision: Schema.optionalKey(
+    Schema.String.check(Schema.isPattern(/^[0-9a-f]{32}(?::stopped)?$/u)),
+  ),
 });
 export type RelayThreadVmWorkflowCheckpoint = typeof RelayThreadVmWorkflowCheckpoint.Type;
 

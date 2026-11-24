@@ -9,11 +9,13 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { VmWorkloadError } from "../../vmWorkload.ts";
 import { VmControlSpawner, VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
@@ -48,29 +50,41 @@ const makeFixture = Effect.fnUntraced(function* (
     readonly resumedNativeId?: string;
     readonly invalidIdentity?: boolean;
     readonly identityExitCode?: number;
+    readonly threadReadNotification?: unknown;
+    readonly beforeNativeFence?: Effect.Effect<void>;
+    readonly failPrepareBeforeSignal?: boolean;
+    readonly getWorkflowBackgroundRevision?: () => string | undefined;
   } = {},
 ) {
   const output = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const exited = yield* Deferred.make<ChildProcessSpawner.ExitCode>();
   const stopRequested = yield* Queue.unbounded<void>();
+  const prepareRequested = yield* Queue.unbounded<void>();
+  const inspectionRequested = yield* Queue.unbounded<void>();
   const responses = yield* Queue.unbounded<{ readonly id: number; readonly result: unknown }>();
   const encoder = new TextEncoder(),
     decoder = new TextDecoder();
   const send = (value: unknown) => Queue.offer(output, encoder.encode(encode(value) + "\n"));
   const methods: string[] = [];
+  const workflowChildActivity: boolean[] = [];
   const requests: Array<{ readonly method: string; readonly params: unknown }> = [];
+  const decisions: Array<"stop" | "release"> = [];
   const bindPeer = vi.fn();
   const modelProvider = options.managed || options.workflow ? "launchpad_vm" : "openai";
   const model = options.managed || options.workflow ? "gpt-6-astra" : "gpt-5.3-codex";
   let admitted = true,
     controlStops = 0,
+    workflowPrepares = 0,
+    workflowInspections = 0,
+    workflowStopReserved = false,
+    workflowStopRejected = false,
     nativeStops = 0,
     processOnly = false,
     groupId = "";
-  const end = Queue.end(output).pipe(
-    Effect.andThen(Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0))),
+  const acknowledgeExit = Deferred.succeed(exited, ChildProcessSpawner.ExitCode(0)).pipe(
     Effect.asVoid,
   );
+  const end = Queue.end(output).pipe(Effect.andThen(acknowledgeExit));
   const handle = ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(42),
     exitCode: Deferred.await(exited),
@@ -91,6 +105,8 @@ const makeFixture = Effect.fnUntraced(function* (
         methods.push(message.method);
         requests.push({ method: message.method, params: message.params });
         if (message.id === undefined) return;
+        if (message.method === "thread/read" && options.threadReadNotification)
+          yield* send(options.threadReadNotification);
         const result =
           message.method === "initialize"
             ? {
@@ -143,8 +159,13 @@ const makeFixture = Effect.fnUntraced(function* (
   const control = ChildProcessSpawner.make((command) =>
     Effect.gen(function* () {
       if (command._tag !== "StandardCommand") return yield* Effect.die("Unexpected control pipe");
+      const action = command.args[0];
       let result: unknown;
-      if (command.args[0] === "provider-identity")
+      let code = 0;
+      let stdout: Stream.Stream<string> | undefined;
+      let stdin: Sink.Sink<void, Uint8Array> = Sink.drain;
+      if (action === "provider-identity") {
+        code = options.identityExitCode ?? 0;
         result = {
           bootId,
           groupId,
@@ -152,24 +173,63 @@ const makeFixture = Effect.fnUntraced(function* (
           startTicks: "1234",
           executableSha256: "a".repeat(64),
         };
-      else {
-        NodeAssert.equal(command.args[0], "stop-idle-provider");
+      } else if (action === "prepare-idle-provider") {
+        workflowPrepares++;
+        yield* Queue.offer(prepareRequested, undefined);
+        if (options.failPrepareBeforeSignal) {
+          code = 1;
+          stdout = Stream.empty;
+        } else {
+          const nonce = command.args[4]!;
+          NodeAssert.match(nonce, /^[a-f0-9]{32}$/u);
+          const finish = yield* Deferred.make<"rejected" | "reserved">();
+          const prepare = Effect.gen(function* () {
+            yield* options.beforeNativeFence ?? Effect.void;
+            yield* Queue.offer(output, encoder.encode(`\x1elaunchpad-idle:${nonce}\x1f`));
+            return encode({ status: "prepared" }) + "\n";
+          });
+          stdout = Stream.fromEffect(prepare).pipe(
+            Stream.concat(
+              Stream.fromEffect(
+                Deferred.await(finish).pipe(Effect.map((status) => encode({ status }) + "\n")),
+              ),
+            ),
+          );
+          stdin = Sink.forEach((bytes: Uint8Array) =>
+            Effect.gen(function* () {
+              const decision = decoder.decode(bytes).trim();
+              if (decision !== "stop" && decision !== "release")
+                return yield* Effect.die("Unexpected idle stop decision");
+              decisions.push(decision);
+              if (decision === "stop" && admitted) {
+                workflowStopReserved = true;
+                controlStops++;
+                yield* Queue.offer(stopRequested, undefined);
+              } else workflowStopRejected = true;
+              yield* Deferred.succeed(finish, workflowStopReserved ? "reserved" : "rejected");
+            }),
+          );
+        }
+      } else if (action === "inspect-idle-provider-stop") {
+        workflowInspections++;
+        yield* Queue.offer(inspectionRequested, undefined);
+        result = {
+          status: workflowStopReserved ? "reserved" : workflowStopRejected ? "rejected" : "refused",
+        };
+      } else {
+        NodeAssert.equal(action, "stop-idle-provider");
         controlStops++;
         yield* Queue.offer(stopRequested, undefined);
         result = { admitted };
       }
       return ChildProcessSpawner.makeHandle({
         pid: ChildProcessSpawner.ProcessId(100),
-        exitCode: Effect.succeed(
-          ChildProcessSpawner.ExitCode(
-            command.args[0] === "provider-identity" ? (options.identityExitCode ?? 0) : 0,
-          ),
-        ),
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(code)),
         isRunning: Effect.succeed(false),
         kill: () => Effect.void,
         unref: Effect.succeed(Effect.void),
-        stdin: Sink.drain,
-        stdout: Stream.encodeText(Stream.make(encode(result))),
+        stdin,
+        stdout: Stream.encodeText(stdout ?? Stream.make(encode(result))),
         stderr: Stream.empty,
         all: Stream.empty,
         getInputFd: () => Sink.drain,
@@ -186,8 +246,15 @@ const makeFixture = Effect.fnUntraced(function* (
       ? {}
       : { resumeCursor: { threadId: nativeId, resumePolicy: "require-existing" as const } }),
     ...(options.managed || options.workflow ? { managedConnectionId: "test-connection" } : {}),
+    ...(options.getWorkflowBackgroundRevision
+      ? { getWorkflowBackgroundRevision: options.getWorkflowBackgroundRevision }
+      : {}),
     ...(options.workflow
       ? {
+          onWorkflowChildrenActive: (busy: boolean) =>
+            Effect.sync(() => {
+              workflowChildActivity.push(busy);
+            }),
           workflowProxy: {
             baseUrl: "http://127.0.0.1:1/v1",
             permitEnv: "TEST_WORKFLOW_PERMIT",
@@ -201,20 +268,54 @@ const makeFixture = Effect.fnUntraced(function* (
     Effect.provideService(VmWorkloadTracking, options.tracked !== false),
   );
   if (options.start !== false) yield* runtime.start();
+  const reportActiveWorkflowChild = Effect.gen(function* () {
+    const observed = yield* runtime.events.pipe(
+      Stream.filter((event) => event.method === "item/agentMessage/delta"),
+      Stream.take(1),
+      Stream.runDrain,
+      Effect.forkScoped,
+    );
+    yield* send({
+      method: "thread/status/changed",
+      params: { threadId: "late-child", status: { type: "active", activeFlags: [] } },
+    });
+    yield* send({
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: nativeId,
+        turnId: "last-turn",
+        itemId: "last-item",
+        delta: "Processed after child activity",
+      },
+    });
+    yield* Fiber.join(observed);
+  });
   return {
     runtime,
     send,
     end,
+    acknowledgeExit,
+    reportActiveWorkflowChild,
     stopRequested,
+    prepareRequested,
+    inspectionRequested,
     responses,
     methods,
+    workflowChildActivity,
     requests,
+    decisions,
     bindPeer,
     get processOnly() {
       return processOnly;
     },
     get stops() {
       return controlStops;
+    },
+    get prepares() {
+      return workflowPrepares;
+    },
+    get inspections() {
+      return workflowInspections;
     },
     get nativeStops() {
       return nativeStops;
@@ -529,6 +630,246 @@ it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
       }),
     ),
   );
+  it.effect("refuses to pause when a workflow child reports active during the idle check", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({
+          workflow: true,
+          threadReadNotification: {
+            method: "thread/status/changed",
+            params: { threadId: "late-child", status: { type: "active", activeFlags: [] } },
+          },
+        });
+        NodeAssert.equal(
+          yield* f.runtime.closeIdleVmHarness!("pause-child", () =>
+            Effect.die("Shutdown admission must not run while the child is active"),
+          ),
+          false,
+        );
+        NodeAssert.ok(f.methods.includes("thread/read"));
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
+  it.effect.each(["no child turn", "tracked child turn", "another active child"] as const)(
+    "handles a workflow child interruption with %s",
+    (activity) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* makeFixture({ workflow: true });
+          yield* f.reportActiveWorkflowChild;
+          if (activity !== "no child turn")
+            yield* f.send({
+              method: "turn/started",
+              params: {
+                threadId: activity === "tracked child turn" ? "late-child" : "another-child",
+                turn: { id: "live-child-turn", status: "inProgress", items: [], error: null },
+              },
+            });
+          const interrupted = yield* f.runtime.events.pipe(
+            Stream.filter((event) => event.method === "collabAgent/activity"),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* f.send({
+            method: "item/completed",
+            params: {
+              threadId: nativeId,
+              turnId: "parent-turn",
+              completedAtMs: 1234,
+              item: {
+                id: "interrupt-child",
+                type: "subAgentActivity",
+                kind: "interrupted",
+                agentThreadId: "late-child",
+                agentPath: "/root/late-child",
+              },
+            },
+          });
+          yield* Fiber.join(interrupted);
+          const idle = activity === "no child turn";
+          NodeAssert.deepEqual(
+            f.workflowChildActivity,
+            idle ? [false, true, false] : [false, true],
+          );
+          let admissionRequested = false;
+          NodeAssert.equal(
+            yield* f.runtime.closeIdleVmHarness!("pause-interrupted", () =>
+              Effect.sync(() => {
+                admissionRequested = true;
+                return { admitted: false };
+              }),
+            ),
+            false,
+          );
+          NodeAssert.equal(admissionRequested, idle);
+          NodeAssert.equal(f.stops, 0);
+        }),
+      ),
+  );
+  it.effect("refuses to signal Codex when a child starts during pause admission", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true });
+        f.reject();
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const stopping = yield* f.runtime.closeIdleVmHarness!("pause-child", (signal) =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(signal),
+          ),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        yield* f.reportActiveWorkflowChild;
+        yield* Deferred.succeed(release, undefined);
+        NodeAssert.equal(yield* Fiber.join(stopping), false);
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
+  it.effect("releases frozen Codex when a child became active before the native fence", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const freeze = yield* Deferred.make<void>();
+        const f = yield* makeFixture({ workflow: true, beforeNativeFence: Deferred.await(freeze) });
+        const stopping = yield* f.runtime.closeIdleVmHarness!(
+          "pause-child",
+          (signal) => signal,
+        ).pipe(Effect.forkScoped);
+        yield* Queue.take(f.prepareRequested);
+        yield* f.send({
+          method: "thread/status/changed",
+          params: { threadId: "late-child", status: { type: "active", activeFlags: [] } },
+        });
+        yield* Deferred.succeed(freeze, undefined);
+        NodeAssert.equal(yield* Fiber.join(stopping), false);
+        NodeAssert.deepEqual(f.decisions, ["release"]);
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
+  it.effect("only checks the receipt after preparation fails before signalling", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true, failPrepareBeforeSignal: true });
+        NodeAssert.ok(
+          isVmWorkloadError(
+            yield* f.runtime.closeIdleVmHarness!("uncertain", (signal) => signal).pipe(Effect.flip),
+          ),
+        );
+        yield* f.reportActiveWorkflowChild;
+        NodeAssert.equal(
+          yield* f.runtime.closeIdleVmHarness!("uncertain", (signal) => signal),
+          false,
+        );
+        NodeAssert.equal(
+          yield* f.runtime.closeIdleVmHarness!("next-pause", (signal) => signal),
+          false,
+        );
+        NodeAssert.equal(f.prepares, 1);
+        NodeAssert.equal(f.inspections, 1);
+        NodeAssert.deepEqual(f.decisions, []);
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
+  it.effect("only recovers an existing idle reservation with exact local admission", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true });
+        const readMethods = () => f.methods.filter((method) => method === "thread/read").length;
+        const before = readMethods();
+        NodeAssert.equal(
+          yield* f.runtime.closeIdleVmHarness!(
+            "pending",
+            () => Effect.die("Recovery must not admit a fresh stop"),
+            undefined,
+            true,
+          ),
+          false,
+        );
+        NodeAssert.equal(readMethods(), before);
+
+        // The local protocol reservation succeeded before admission lost its reply.
+        yield* f.runtime.closeIdleVmHarness!("pending", () =>
+          Effect.fail(new VmWorkloadError()),
+        ).pipe(Effect.flip);
+        const after = readMethods();
+        NodeAssert.equal(after, before + 1);
+        NodeAssert.equal(f.prepares, 0);
+        const recover = f.runtime.closeIdleVmHarness!;
+        yield* recover("pending", () => Effect.succeed({ admitted: false }), undefined, true).pipe(
+          Effect.flip,
+        );
+        NodeAssert.equal((yield* Effect.result(f.runtime.compactThread()))._tag, "Failure");
+        NodeAssert.equal(f.inspections, 0);
+        NodeAssert.equal(yield* recover("pending", (signal) => signal, undefined, true), false);
+        yield* f.runtime.compactThread();
+        NodeAssert.equal(readMethods(), after);
+        NodeAssert.equal(f.prepares, 0);
+        NodeAssert.equal(f.inspections, 1);
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
+  it.effect("allows another turn after recovering a lost native rejection", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true });
+        f.reject();
+        yield* f.runtime.closeIdleVmHarness!("lost-rejection", (signal) =>
+          signal.pipe(Effect.andThen(Effect.fail(new VmWorkloadError()))),
+        ).pipe(Effect.flip);
+        const methods = [...f.methods];
+        NodeAssert.equal(
+          (yield* Effect.result(f.runtime.sendTurn({ input: "Wait" })))._tag,
+          "Failure",
+        );
+        NodeAssert.equal(
+          yield* f.runtime.closeIdleVmHarness!(
+            "lost-rejection",
+            (signal) => signal,
+            undefined,
+            true,
+          ),
+          false,
+        );
+        NodeAssert.deepEqual(f.methods, methods);
+        yield* f.runtime.sendTurn({ input: "Resume the workspace" });
+        NodeAssert.equal(f.methods.at(-1), "turn/start");
+        NodeAssert.equal(f.prepares, 1);
+        NodeAssert.equal(f.inspections, 1);
+        NodeAssert.deepEqual(f.decisions, ["stop"]);
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
+  it.effect("releases frozen Codex after background work changes the observed idle revision", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const freeze = yield* Deferred.make<void>();
+        let revision = "old-quiet-revision";
+        const f = yield* makeFixture({
+          workflow: true,
+          beforeNativeFence: Deferred.await(freeze),
+          getWorkflowBackgroundRevision: () => revision,
+        });
+        const stopping = yield* f.runtime.closeIdleVmHarness!(
+          "pause-revision",
+          (signal) => signal,
+          revision,
+        ).pipe(Effect.forkScoped);
+        yield* Queue.take(f.prepareRequested);
+        revision = "new-quiet-revision";
+        yield* Deferred.succeed(freeze, undefined);
+        NodeAssert.equal(yield* Fiber.join(stopping), false);
+        NodeAssert.deepEqual(f.decisions, ["release"]);
+        NodeAssert.equal(f.stops, 0);
+      }),
+    ),
+  );
   it.effect("releases native admission only after a positive no-signal rejection", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -559,28 +900,121 @@ it.layer(NodeServices.layer)("owned idle Codex shutdown", (it) => {
       }),
     ),
   );
-  it.effect("holds uncertain stop admission and permits only the same operation to reconcile", () =>
+  it.effect("warm reopening drains a reserved stop only for the matching admitted operation", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        const f = yield* fixture;
+        const f = yield* makeFixture({ workflow: true });
         NodeAssert.equal(
           (yield* Effect.result(
-            f.runtime.closeIdleVmHarness!("uncertain", () => Effect.fail(new VmWorkloadError())),
+            f.runtime.closeIdleVmHarness!("uncertain", (signal) =>
+              signal.pipe(Effect.andThen(Effect.fail(new VmWorkloadError()))),
+            ),
           ))._tag,
           "Failure",
         );
-        NodeAssert.equal(
-          yield* f.runtime.closeIdleVmHarness!("different", (signal) => signal),
-          false,
+        yield* Queue.take(f.stopRequested);
+        yield* f.reportActiveWorkflowChild;
+        NodeAssert.ok(
+          isVmWorkloadError(
+            yield* f.runtime.closeIdleVmHarness!(
+              "uncertain",
+              () => Effect.succeed({ admitted: false }),
+              undefined,
+              true,
+            ).pipe(Effect.flip),
+          ),
+        );
+        NodeAssert.ok(
+          isVmWorkloadError(
+            yield* f.runtime.closeIdleVmHarness!(
+              "different",
+              (signal) => signal,
+              undefined,
+              true,
+            ).pipe(Effect.flip),
+          ),
         );
         NodeAssert.equal((yield* Effect.result(f.runtime.compactThread()))._tag, "Failure");
-        const stopped = yield* f.runtime.closeIdleVmHarness!("uncertain", (signal) => signal).pipe(
+        NodeAssert.equal((yield* f.runtime.getSession).status, "ready");
+        NodeAssert.equal(f.stops, 1);
+        const observedExit = yield* f.runtime.events.pipe(
+          Stream.filter((event) => event.method === "session/exited"),
+          Stream.take(1),
+          Stream.runDrain,
           Effect.forkScoped,
         );
-        yield* Queue.take(f.stopRequested);
+        const stopped = yield* f.runtime.closeIdleVmHarness!(
+          "uncertain",
+          (signal) => signal,
+          undefined,
+          true,
+        ).pipe(Effect.forkScoped);
+        yield* Queue.take(f.inspectionRequested);
+        yield* f.acknowledgeExit;
+        yield* Fiber.join(observedExit);
+        const completedBeforeEof = stopped.pollUnsafe();
         yield* f.end;
         NodeAssert.equal(yield* Fiber.join(stopped), true);
+        NodeAssert.equal(completedBeforeEof, undefined);
+        NodeAssert.equal(f.prepares, 1);
+        NodeAssert.equal(f.inspections, 1);
+        NodeAssert.deepEqual(f.decisions, ["stop"]);
         NodeAssert.equal(f.stops, 1);
+      }),
+    ),
+  );
+  it.effect("bounds idle and ordinary drain retries after Codex exits without closing stdout", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* makeFixture({ workflow: true });
+        const events = yield* f.runtime.events.pipe(Stream.runCollect, Effect.forkScoped);
+        const first = yield* f.runtime.closeIdleVmHarness!(
+          "reserved-stop",
+          (signal) => signal,
+        ).pipe(Effect.flip, Effect.forkScoped);
+        yield* Queue.take(f.stopRequested);
+        yield* f.acknowledgeExit;
+        yield* TestClock.adjust("10 seconds");
+        const idleError = yield* Fiber.join(first);
+        NodeAssert.ok(isVmWorkloadError(idleError));
+        NodeAssert.equal(idleError.reason, "timeout");
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const finished = yield* Deferred.make<void>();
+          const retry = yield* f.runtime.closeNativeWriter!.pipe(
+            Effect.ensuring(Deferred.succeed(finished, undefined)),
+            Effect.flip,
+            Effect.forkScoped,
+          );
+          yield* TestClock.adjust("10 seconds");
+          if (!(yield* Deferred.isDone(finished))) {
+            yield* f.end;
+            NodeAssert.fail("Ordinary shutdown is still waiting for output after the deadline");
+          }
+          const error = yield* Fiber.join(retry);
+          const cause = error.cause;
+          NodeAssert.ok(Cause.isCause(cause));
+          const timeout = Option.getOrThrow(Cause.findErrorOption(cause));
+          NodeAssert.ok(isVmWorkloadError(timeout));
+          NodeAssert.equal(timeout.reason, "timeout");
+        }
+
+        yield* f.send({
+          method: "item/agentMessage/delta",
+          params: {
+            threadId: nativeId,
+            turnId: "last-turn",
+            itemId: "last-item",
+            delta: "Late output",
+          },
+        });
+        yield* f.end;
+        yield* f.runtime.closeNativeWriter!;
+        NodeAssert.ok(
+          (yield* Fiber.join(events)).some((event) => event.method === "item/agentMessage/delta"),
+        );
+        NodeAssert.equal(f.stops, 1);
+        NodeAssert.equal(f.nativeStops, 0);
       }),
     ),
   );

@@ -3832,7 +3832,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         operation: "ProviderService.stopIdleVmSession",
         allowRecovery: false,
       });
-      if (!routed.isActive) return true;
+      if (!routed.isActive) return !input.recoverOnly;
       if (
         routed.instanceId !== "codex" ||
         routed.adapter.provider !== "codex" ||
@@ -3858,7 +3858,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             }),
           )
           .pipe(Effect.mapError(() => new VmWorkloadError()));
-      if (!(yield* routed.adapter.stopIdleVmSession(routed.threadId, input.operationId, admit)))
+      if (
+        !(yield* routed.adapter.stopIdleVmSession(
+          routed.threadId,
+          input.operationId,
+          admit,
+          input.backgroundRevision,
+          input.recoverOnly,
+        ))
+      )
         return false;
       yield* stopSession({ threadId: input.threadId });
       return true;

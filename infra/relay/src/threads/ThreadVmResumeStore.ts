@@ -46,6 +46,7 @@ export interface ResumeClaim extends ResumeRecord {
   readonly templateId: string;
   readonly provisionOperationId: string;
   readonly pauseOperationId: string | null;
+  readonly guestPauseOperationId: string | null;
   readonly finalSaveOperationId: string | null;
   readonly capacityState: "reserved" | "started";
   readonly hostId: string;
@@ -477,6 +478,8 @@ export function makeThreadVmResumeStore(sql: PgClient) {
   const claim = Effect.fn("relay.thread_vm.resume.claim")(function* (hostId: string) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        // Capacity has already been admitted FIFO. Retry oldest due work first so a
+        // powered VM waiting for its guest cannot monopolize the resume worker.
         const [row] = yield* sql<Omit<ResumeClaim, "claimId">>`
         SELECT r.operation_id AS "operationId", r.allocation_id AS "allocationId",
           r.generation, r.phase, a.thread_id AS "threadId",t.workflow_job_id AS "workflowJobId",
@@ -485,6 +488,12 @@ export function makeThreadVmResumeStore(sql: PgClient) {
           CASE WHEN x.phase IN ('cancelled','completed') AND x.source_reopened_at IS NULL THEN x.operation_id
             WHEN generic.operation_id IS NOT NULL THEN generic.operation_id
             WHEN a.native_paused_generation=r.generation THEN NULL ELSE x.operation_id END AS "pauseOperationId",
+          CASE WHEN a.resource_kind='organization_workflow' AND x.phase='cancelled'
+            AND x.workflow_checkpoint->>'jobId'=t.workflow_job_id
+            AND x.workflow_checkpoint ? 'finishedWorkspaceRevision'
+            AND x.source_frozen_at IS NULL AND x.native_checkpoint_operation_id IS NULL
+            AND x.source_receipt IS NULL AND final.operation_id IS NULL
+            THEN x.operation_id END AS "guestPauseOperationId",
           c.state AS "capacityState",c.host_id AS "hostId"
         FROM relay_thread_vm_resumes r
         JOIN relay_thread_vm_allocations a ON a.allocation_id = r.allocation_id
@@ -528,7 +537,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
           AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses x WHERE x.allocation_id=a.allocation_id AND x.pause_dispatch_claim_id IS NOT NULL)
           AND r.connect_claim_id IS NULL AND p.ingress_recovery_claim_id IS NULL
           AND (r.claim_until IS NULL OR r.claim_until <= clock_timestamp())
-        ORDER BY c.position LIMIT 1 FOR UPDATE OF r SKIP LOCKED`;
+        ORDER BY r.retry_at,c.position LIMIT 1 FOR UPDATE OF r SKIP LOCKED`;
         if (!row) return null;
         const claimId = operationId();
         yield* sql`UPDATE relay_thread_vm_resumes SET claim_id = ${claimId},
@@ -765,6 +774,11 @@ export function makeThreadVmResumeStore(sql: PgClient) {
         AND r.claim_id = ${claim.claimId} AND r.claim_until > clock_timestamp()
         AND r.phase = 'resuming' AND r.connect_claim_id IS NULL AND a.allocation_id = r.allocation_id
         AND a.state = 'running' AND a.compute_ref = ${claim.computeRef}
+        AND (${claim.guestPauseOperationId}::text IS NULL OR EXISTS (
+          SELECT 1 FROM relay_thread_vm_pauses x
+          WHERE x.allocation_id=r.allocation_id AND x.generation=r.generation
+            AND x.operation_id=${claim.guestPauseOperationId} AND x.phase='cancelled'
+            AND x.source_reopened_at IS NOT NULL))
       RETURNING r.allocation_id`;
         if (rows.length === 1) {
           yield* sql`UPDATE relay_thread_vm_allocations SET native_paused_generation=NULL
@@ -780,6 +794,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
   const defer = Effect.fn("relay.thread_vm.resume.defer")(function* (
     claim: ResumeClaim,
     workflowEnabled = true,
+    awaitingGuest = false,
   ) {
     if (claim.workflowJobId && claim.capacityState === "reserved")
       yield* sql`UPDATE relay_thread_vm_capacity c SET state='waiting'
@@ -790,7 +805,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
             SELECT 1 FROM relay_codex_vm_connections x WHERE x.organization_id=j.organization_id
               AND x.connection_id=j.record#>>'{vmAdmission,codexConnectionId}' AND ${workflowVmCodexConnectionReady(sql)}))`;
     yield* sql`UPDATE relay_thread_vm_resumes SET claim_id = NULL, claim_until = NULL,
-      retry_at = clock_timestamp() + interval '1 minute'
+      retry_at = clock_timestamp() + ${awaitingGuest ? 5 : 60} * interval '1 second'
       WHERE allocation_id = ${claim.allocationId} AND operation_id = ${claim.operationId}
         AND claim_id = ${claim.claimId} AND phase IN ('waiting','resuming')`;
   });

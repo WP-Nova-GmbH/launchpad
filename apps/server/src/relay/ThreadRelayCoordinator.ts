@@ -249,7 +249,12 @@ export const layer = Layer.effect(
     const moves = yield* makeThreadMoveWorker(authority.moves, history, commands);
     const enrollment = yield* makeThreadLocalEnrollmentWorker(authority.enrollment, history);
     const backups = yield* makeThreadBackupSourceWorker(authority.backups, history, checkpoints);
-    const pauses = yield* makeThreadPauseWorker(authority.pauses, history, checkpoints);
+    const pauses = yield* makeThreadPauseWorker(
+      authority.pauses,
+      history,
+      checkpoints,
+      config.stateDir,
+    );
     const finalSaves = yield* makeThreadFinalSaveWorker(authority.finalSaves, history, checkpoints);
     // The durable cursor is the retry queue. Each pass is bounded by an engine head;
     // a disconnected relay neither discards history nor blocks another thread.

@@ -1500,6 +1500,7 @@ export const relayThreadVmActivity = pgTable(
       .notNull()
       .default([])
       .$type<ReadonlyArray<string>>(),
+    backgroundRevision: varchar("background_revision", { length: 48 }),
     observedAt: timestamp("observed_at", { withTimezone: true }),
     idleSince: timestamp("idle_since", { withTimezone: true }),
     lastWorkAt: timestamp("last_work_at", { withTimezone: true }),

@@ -11,6 +11,8 @@ const group = (kind: "provider" | "terminal" | "process" | "transfer" | "probe")
   bootId: "boot",
   kind,
 });
+const providerOnly = { ...empty, stopped: false, groups: [group("provider")] };
+const idleCodex = { ...providerOnly, codexOnly: true as const };
 
 describe("thread VM workload activity", () => {
   it("accepts only the privileged passive setup observation for workflow idleness", () => {
@@ -42,6 +44,21 @@ describe("thread VM workload activity", () => {
     expect(classifyThreadVmActivity({ ...empty, stopped: false })).toBe("unknown");
   });
 
+  it("accepts an attested singleton Codex process only for a finished workflow", () => {
+    expect(classifyThreadVmActivity(idleCodex, true, true)).toBe("idle");
+    expect(classifyThreadVmActivity(idleCodex, true)).toBe("unknown");
+    expect(classifyThreadVmActivity(idleCodex, false, true)).toBe("busy");
+    for (const workloads of [
+      providerOnly,
+      { ...idleCodex, groups: [group("terminal")] },
+      { ...idleCodex, groups: [group("provider"), group("terminal")] },
+      { ...idleCodex, groups: [{ ...group("provider"), bootId: "previous" }] },
+      { ...idleCodex, sealedBy: "pause" },
+    ]) {
+      expect(classifyThreadVmActivity(workloads, true, true)).not.toBe("idle");
+    }
+  });
+
   for (const situation of [
     "idle",
     "queued-prompt",
@@ -57,9 +74,24 @@ describe("thread VM workload activity", () => {
     "stopped-processes",
     "live-process",
     "live-probe",
+    "finished-idle-codex",
+    "finished-codex-with-queued-prompt",
+    "finished-codex-with-unfinished-work",
+    "finished-codex-with-background-work",
+    "finished-codex-without-background-receipt",
+    "finished-stopped-background",
+    "awaiting-review-codex",
   ] as const)
     it.effect(`reads current durable VM activity without waking it (${situation})`, () =>
       Effect.gen(function* () {
+        const codexOnly = situation.includes("codex");
+        const finishedWorkflow = situation.startsWith("finished-");
+        const backgroundRevision =
+          situation === "finished-stopped-background"
+            ? `${"a".repeat(32)}:stopped`
+            : codexOnly && situation !== "finished-codex-without-background-receipt"
+              ? "a".repeat(32)
+              : undefined;
         const transport = vi.fn(
           async (_url: string, _options?: RequestInit) =>
             new Response(
@@ -87,10 +119,14 @@ describe("thread VM workload activity", () => {
           generation: situation === "old-generation" ? 2 : 1,
           phase: situation === "held" ? "draining" : "active",
           archived: situation === "archived",
-          unfinished: situation === "unfinished",
-          processWorkIds: ["stopped-processes", "live-process", "live-probe"].includes(situation)
-            ? ["provider:idle", "terminal:closed", "setup:ready"]
-            : [],
+          unfinished: ["unfinished", "finished-codex-with-unfinished-work"].includes(situation),
+          ...(backgroundRevision ? { backgroundRevision } : {}),
+          backgroundBusy: situation === "finished-codex-with-background-work",
+          processWorkIds: codexOnly
+            ? ["provider:idle"]
+            : ["stopped-processes", "live-process", "live-probe"].includes(situation)
+              ? ["provider:idle", "terminal:closed", "setup:ready"]
+              : [],
           queue: {
             enabled: situation !== "paused-queue",
             handoff: null,
@@ -104,6 +140,12 @@ describe("thread VM workload activity", () => {
               "stopped-processes",
               "live-process",
               "live-probe",
+              "finished-idle-codex",
+              "finished-codex-with-unfinished-work",
+              "finished-codex-with-background-work",
+              "finished-codex-without-background-receipt",
+              "finished-stopped-background",
+              "awaiting-review-codex",
             ].includes(situation)
               ? []
               : [{ state: situation === "delivery-unknown" ? "unknown" : "pending" }],
@@ -114,14 +156,17 @@ describe("thread VM workload activity", () => {
             situation === "old-helper"
               ? empty
               : {
-                  workloads:
-                    situation === "live-process" || situation === "live-probe"
+                  workloads: codexOnly
+                    ? idleCodex
+                    : situation === "live-process" || situation === "live-probe"
                       ? {
                           ...empty,
                           stopped: false,
                           groups: [group(situation === "live-probe" ? "probe" : "process")],
                         }
-                      : empty,
+                      : finishedWorkflow
+                        ? { ...empty, recoverable: true }
+                        : empty,
                   projection,
                 },
           ),
@@ -142,6 +187,8 @@ describe("thread VM workload activity", () => {
           inspect("sandbox", {
             environmentId: "environment",
             operationId: "operation",
+            ...(codexOnly || finishedWorkflow ? { workflowCheckpoint: true } : {}),
+            ...(finishedWorkflow ? { finishedWorkflow: true } : {}),
             scope: {
               allocationId: "allocation",
               threadId: ThreadId.make("thread"),
@@ -153,14 +200,22 @@ describe("thread VM workload activity", () => {
         if (situation === "old-helper") expect(result._tag).toBe("Failure");
         else {
           expect(result._tag).toBe("Success");
-          if (result._tag === "Success" && situation === "stopped-processes")
+          if (
+            result._tag === "Success" &&
+            ["stopped-processes", "finished-idle-codex", "finished-stopped-background"].includes(
+              situation,
+            )
+          )
             expect(result.success).toEqual({
               activity: "idle",
               inactiveWorkIds: projection.processWorkIds,
+              ...(backgroundRevision ? { backgroundRevision } : {}),
             });
           else if (result._tag === "Success")
             expect(result.success).toBe(
-              ["held", "foreign-environment", "old-generation"].includes(situation)
+              ["held", "foreign-environment", "old-generation", "awaiting-review-codex"].includes(
+                situation,
+              )
                 ? "unknown"
                 : [
                       "queued-prompt",
@@ -169,6 +224,10 @@ describe("thread VM workload activity", () => {
                       "unfinished",
                       "live-process",
                       "live-probe",
+                      "finished-codex-with-queued-prompt",
+                      "finished-codex-with-unfinished-work",
+                      "finished-codex-with-background-work",
+                      "finished-codex-without-background-receipt",
                     ].includes(situation)
                   ? "busy"
                   : "idle",

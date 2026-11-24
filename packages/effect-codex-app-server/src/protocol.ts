@@ -17,6 +17,10 @@ const isJsonRpcId = Schema.is(JsonRpcId);
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
 const MAX_BUFFERED_RAW_MESSAGES = 32;
+const IDLE_FENCE_PREFIX = "launchpad-idle:";
+const IDLE_FENCE_BODY_LENGTH = IDLE_FENCE_PREFIX.length + 32;
+const IDLE_FENCE_START = 0x1e;
+const IDLE_FENCE_END = 0x1f;
 
 export interface CodexAppServerProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
@@ -47,6 +51,8 @@ export interface CodexAppServerPatchedProtocolOptions {
   readonly onRequest?: (
     request: CodexAppServerIncomingRequest,
   ) => Effect.Effect<unknown, CodexError.CodexAppServerError>;
+  /** Runs after preceding messages are dispatched. A partial message or a late request vetoes the fence. */
+  readonly onIdleInputFence?: (nonce: string, completeFrame: boolean) => Effect.Effect<void>;
   readonly onTermination?: (error: CodexError.CodexAppServerError) => Effect.Effect<void, never>;
 }
 
@@ -177,6 +183,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const activeRequestHandlers = yield* Ref.make(0);
     const admission = yield* Semaphore.make(1);
     let idleShutdownReserved = false;
+    let requestAfterIdleReservation = false;
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
       if (event.direction === "incoming" && !options.logIncoming) {
@@ -309,20 +316,25 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Queue.offer(incomingRequests, request).pipe(
         Effect.flatMap(() => {
           const handler = options.onRequest;
-          if (!handler) return Effect.void;
+          if (!handler) {
+            if (idleShutdownReserved) requestAfterIdleReservation = true;
+            return Effect.void;
+          }
 
-          return Ref.modify(activeRequestHandlers, (count) =>
-            idleShutdownReserved || count >= MAX_BUFFERED_RAW_MESSAGES
+          return Ref.modify(activeRequestHandlers, (count) => {
+            if (idleShutdownReserved) requestAfterIdleReservation = true;
+            return (idleShutdownReserved && !options.onIdleInputFence) ||
+              count >= MAX_BUFFERED_RAW_MESSAGES
               ? [false, count]
-              : [true, count + 1],
-          ).pipe(
+              : [true, count + 1];
+          }).pipe(
             admission.withPermits(1),
             Effect.flatMap((accepted) => {
               if (!accepted) {
                 return respondError(
                   request.id,
                   CodexError.CodexAppServerRequestError.overloaded(
-                    idleShutdownReserved
+                    idleShutdownReserved && !options.onIdleInputFence
                       ? "Codex provider is stopping."
                       : "Too many Codex requests are already active.",
                   ),
@@ -410,30 +422,78 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       );
     };
 
-    yield* options.stdio.stdin.pipe(
-      Stream.interruptWhen(Deferred.await(terminationSignal)),
-      Stream.decodeText(),
-      Stream.runForEach((chunk) =>
-        Effect.sync(() => {
-          const lines: Array<string> = [];
-          let start = 0;
-          for (
-            let newline = chunk.indexOf("\n");
-            newline !== -1;
-            newline = chunk.indexOf("\n", start)
-          ) {
-            remainder.push(chunk.slice(start, newline));
-            lines.push(remainder.join("").replace(/\r$/, ""));
-            remainder.length = 0;
-            start = newline + 1;
-          }
-          // Keep unfinished lines in fragments so each chunk is scanned only once.
-          if (start < chunk.length) {
-            remainder.push(chunk.slice(start));
-          }
-          return lines;
-        }).pipe(Effect.flatMap((lines) => Effect.forEach(lines, handleLine, { discard: true }))),
-      ),
+    const handleChunk = Effect.fnUntraced(function* (chunk: string) {
+      const lines: Array<string> = [];
+      let start = 0;
+      for (
+        let newline = chunk.indexOf("\n");
+        newline !== -1;
+        newline = chunk.indexOf("\n", start)
+      ) {
+        remainder.push(chunk.slice(start, newline));
+        lines.push(remainder.join("").replace(/\r$/, ""));
+        remainder.length = 0;
+        start = newline + 1;
+      }
+      // Keep unfinished lines in fragments so each chunk is scanned only once.
+      if (start < chunk.length) remainder.push(chunk.slice(start));
+      yield* Effect.forEach(lines, handleLine, { discard: true });
+    });
+    const input = options.stdio.stdin.pipe(Stream.interruptWhen(Deferred.await(terminationSignal)));
+    const readInputWithFences = Effect.fnUntraced(function* (
+      onIdleInputFence: NonNullable<CodexAppServerPatchedProtocolOptions["onIdleInputFence"]>,
+    ) {
+      const decoder = new TextDecoder();
+      let fence: string | undefined;
+      let completeFrame = true;
+      const invalidFence = () =>
+        new CodexError.CodexAppServerTransportError({
+          operation: "read-input-stream",
+          cause: "Invalid idle input fence",
+        });
+      yield* input.pipe(
+        Stream.runForEach(
+          Effect.fnUntraced(function* (chunk) {
+            let offset = 0;
+            while (offset < chunk.length) {
+              if (fence === undefined) {
+                const start = chunk.indexOf(IDLE_FENCE_START, offset);
+                const bytes = chunk.subarray(offset, start === -1 ? undefined : start);
+                if (bytes.length > 0) {
+                  completeFrame = bytes[bytes.length - 1] === 0x0a;
+                  // Strip the fence before decoding. It can split a UTF-8 character.
+                  yield* handleChunk(decoder.decode(bytes, { stream: true }));
+                }
+                if (start === -1) break;
+                offset = start + 1;
+                fence = "";
+              } else {
+                const end = chunk.indexOf(IDLE_FENCE_END, offset);
+                const bytes = chunk.subarray(offset, end === -1 ? undefined : end);
+                if (fence.length + bytes.length > IDLE_FENCE_BODY_LENGTH)
+                  return yield* invalidFence();
+                fence += String.fromCharCode(...bytes);
+                if (end === -1) break;
+                const nonce = fence.slice(IDLE_FENCE_PREFIX.length);
+                if (!fence.startsWith(IDLE_FENCE_PREFIX) || !/^[a-f0-9]{32}$/u.test(nonce))
+                  return yield* invalidFence();
+                yield* onIdleInputFence(nonce, completeFrame && !requestAfterIdleReservation);
+                fence = undefined;
+                offset = end + 1;
+              }
+            }
+          }),
+        ),
+      );
+      if (fence !== undefined) return yield* invalidFence();
+      yield* handleChunk(decoder.decode());
+    });
+
+    yield* (
+      options.onIdleInputFence
+        ? readInputWithFences(options.onIdleInputFence)
+        : input.pipe(Stream.decodeText(), Stream.runForEach(handleChunk))
+    ).pipe(
       Effect.matchEffect({
         onFailure: (error) => {
           const failure = normalizeIncomingError(error, "read-input-stream");
@@ -518,6 +578,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         )
           return false;
         idleShutdownReserved = true;
+        requestAfterIdleReservation = false;
         return true;
       }).pipe(admission.withPermits(1)),
       releaseIdleShutdown: Effect.sync(() => {

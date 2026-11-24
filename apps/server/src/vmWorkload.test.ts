@@ -12,12 +12,15 @@ import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as ProcessRunner from "./processRunner.ts";
 import {
+  inspectIdleWorkflowVmStop,
   inspectVmWorkloads,
   inspectWorkflowVmRecovery,
+  recoverIdleWorkflowVmStop,
   withSealedVmWorkloads,
   withVmWorkloadMaintenance,
   readVmHarnessIdentity,
   stopIdleVmHarness,
+  stopIdleWorkflowVmHarness,
 } from "./vmWorkload.ts";
 import {
   VmControlSpawner,
@@ -702,6 +705,65 @@ it.effect("keeps exact owned harness identity separate from physical-stop proof"
       ),
     );
     expect(stillLive.stopped).toBe(false);
+  }),
+);
+
+it.effect("confirms a workflow stop refusal after explicit kernel rejection", () =>
+  Effect.gen(function* () {
+    const identity = {
+      bootId,
+      groupId: group.id,
+      pid: group.leaderPid,
+      startTicks: "98765",
+      executableSha256: "b".repeat(64),
+    };
+    const rejection = json({ status: "rejected" });
+    expect(
+      yield* stopIdleWorkflowVmHarness(
+        identity,
+        "pause-owned",
+        "c".repeat(32),
+        Effect.succeed(true),
+      ).pipe(
+        Effect.provideService(
+          VmControlSpawner,
+          respond(`${json({ status: "prepared" })}\n${rejection}\n`),
+        ),
+      ),
+    ).toEqual({ admitted: false });
+    expect(
+      yield* inspectIdleWorkflowVmStop(identity, "pause-owned").pipe(
+        Effect.provideService(VmControlSpawner, respond(rejection)),
+      ),
+    ).toEqual({ admitted: false });
+  }),
+);
+
+it.effect("recovers the exact workflow stop without a provider session or signal command", () =>
+  Effect.gen(function* () {
+    const operationId = "pause-owned";
+    const operation = NodeCrypto.createHash("sha256")
+      .update(operationId)
+      .digest("hex")
+      .slice(0, 32);
+    const child = respond(
+      ["absent", "rejected", "reserved", "prepared"].map((status) => json({ status })),
+    );
+    const control = ChildProcessSpawner.make((command) => {
+      if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipeline");
+      expect(command.args).toEqual(["recover-idle-provider-stop", operation, bootId, "7"]);
+      return child.spawn(command);
+    });
+    const recover = recoverIdleWorkflowVmStop(operationId, { bootId, epoch: 7 }).pipe(
+      Effect.provideService(VmControlSpawner, control),
+    );
+    for (const status of ["absent", "rejected", "reserved"]) {
+      expect(yield* recover).toBe(status);
+    }
+    expect(yield* recover.pipe(Effect.flip)).toMatchObject({
+      reason: "decode",
+      action: "recover-idle-provider-stop",
+    });
   }),
 );
 

@@ -11,6 +11,7 @@ const Inventory = Schema.Struct({
   sealedBy: Schema.NullOr(Schema.String),
   stopped: Schema.Boolean,
   recoverable: Schema.optionalKey(Schema.Literal(true)),
+  codexOnly: Schema.optionalKey(Schema.Literal(true)),
   groups: Schema.Array(
     Schema.Struct({
       id: Schema.String,
@@ -29,6 +30,10 @@ const Activity = Schema.Struct({
     phase: Schema.Literals(["active", "draining", "frozen", "retired"]),
     archived: Schema.Boolean,
     unfinished: Schema.Boolean,
+    backgroundBusy: Schema.optionalKey(Schema.Boolean),
+    backgroundRevision: Schema.optionalKey(
+      Schema.String.check(Schema.isPattern(/^[0-9a-f]{32}(?::stopped)?$/u)),
+    ),
     processWorkIds: Schema.optional(
       Schema.Array(Schema.String.check(Schema.isPattern(/^(provider|terminal|setup):.+$/u))),
     ),
@@ -60,7 +65,11 @@ const Activity = Schema.Struct({
 const decodeActivity = Schema.decodeUnknownSync(Schema.fromJsonString(Activity));
 
 /** An idle terminal shell needs a separate process/PTY signal; do not guess from its cgroup. */
-export function classifyThreadVmActivity(inventory: Inventory, workflowCheckpoint = false) {
+export function classifyThreadVmActivity(
+  inventory: Inventory,
+  workflowCheckpoint = false,
+  finishedWorkflow = false,
+) {
   if (
     inventory.stopped !== (inventory.groups.length === 0) ||
     inventory.groups.some((group) => group.bootId !== inventory.bootId) ||
@@ -68,12 +77,19 @@ export function classifyThreadVmActivity(inventory: Inventory, workflowCheckpoin
     inventory.sealedBy !== null
   )
     return "unknown" as const;
-  if (workflowCheckpoint)
+  if (workflowCheckpoint) {
+    if (inventory.codexOnly === true)
+      return finishedWorkflow &&
+        inventory.groups.length === 1 &&
+        inventory.groups[0]?.kind === "provider"
+        ? ("idle" as const)
+        : ("unknown" as const);
     return inventory.recoverable === true &&
       inventory.groups.length <= 1 &&
       inventory.groups.every((group) => group.kind === "terminal")
       ? ("idle" as const)
       : ("unknown" as const);
+  }
   if (inventory.groups.some((group) => group.kind !== "terminal")) return "busy" as const;
   return inventory.groups.length === 0 ? ("idle" as const) : ("unknown" as const);
 }
@@ -108,6 +124,7 @@ export function makeE2BThreadVmActivity(
     identity: Pick<RelayThreadVmBootstrap, "scope" | "operationId"> & {
       readonly environmentId: string;
       readonly workflowCheckpoint?: boolean;
+      readonly finishedWorkflow?: boolean;
     },
   ) {
     return yield* Effect.tryPromise({
@@ -129,20 +146,33 @@ export function makeE2BThreadVmActivity(
           projection.phase !== "active"
         )
           return "unknown" as const;
-        const processActivity = classifyThreadVmActivity(workloads, identity.workflowCheckpoint);
+        const processActivity = classifyThreadVmActivity(
+          workloads,
+          identity.workflowCheckpoint,
+          identity.finishedWorkflow,
+        );
         if (processActivity === "unknown") return processActivity;
         if (
           projection.unfinished ||
+          (identity.finishedWorkflow === true &&
+            (projection.backgroundBusy === true ||
+              (workloads.codexOnly === true && projection.backgroundRevision === undefined))) ||
           threadPromptQueueHasWork(projection.queue, projection.archived)
         )
           return "busy" as const;
         const processWorkIds = projection.processWorkIds ?? [];
         if (new Set(processWorkIds).size !== processWorkIds.length) return "unknown" as const;
-        // A settled turn closes its native writer, but its admissions remain held
-        // until lifecycle drain. Only an empty kernel inventory can supersede them
-        // for idle observation; this does not complete or release execution.
-        if (processActivity === "idle" && processWorkIds.length)
-          return { activity: "idle" as const, inactiveWorkIds: processWorkIds };
+        // The relay can observe an idle VM while a settled Codex session still
+        // holds admissions. The pause drain proves shutdown before releasing them.
+        const backgroundRevision = identity.finishedWorkflow
+          ? projection.backgroundRevision
+          : undefined;
+        if (processActivity === "idle" && (processWorkIds.length || backgroundRevision))
+          return {
+            activity: "idle" as const,
+            inactiveWorkIds: processWorkIds,
+            ...(backgroundRevision ? { backgroundRevision } : {}),
+          };
         return processActivity;
       },
       catch: () =>

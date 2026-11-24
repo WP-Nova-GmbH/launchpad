@@ -138,26 +138,32 @@ export function makeThreadVmPauseStore(sql: PgClient) {
         const [checkpoint] = yield* sql<RelayThreadVmWorkflowCheckpoint & { generation: number }>`
           SELECT j.job_id AS "jobId",h.publication_id AS "checkpointId",0 AS "checkpointGeneration",
             h.publication_id AS "publicationId",h.revision AS "publicationRevision",
-            COALESCE(f.workspace_revision,0)::text AS "finishedWorkspaceRevision",t.generation
+            COALESCE(f.workspace_revision,0)::text AS "finishedWorkspaceRevision",t.generation,
+            v.background_revision AS "backgroundRevision"
           FROM relay_thread_placements t JOIN relay_workflow_jobs j ON j.job_id=t.workflow_job_id
           JOIN relay_workflow_recovery_heads h USING(job_id)
           JOIN relay_workflow_recovery_records r ON r.publication_id=h.publication_id AND r.job_id=j.job_id AND r.revision=h.revision
           JOIN relay_thread_vm_bindings b ON b.allocation_id=${allocationId} AND b.environment_id=t.environment_id
             AND b.generation=t.generation AND b.revoked_at IS NULL
           LEFT JOIN relay_workflow_vm_follow_ups f ON f.job_id=j.job_id
+          LEFT JOIN relay_thread_vm_activity v ON v.allocation_id=b.allocation_id
           WHERE j.job_id=${owner.jobId} AND ${workflowVmExecutionReleased(sql)}
             AND r.manifest->>'terminalExecutionReleased'='true'
             AND r.manifest#>>'{binding,allocationId}'=b.allocation_id
             AND r.manifest#>>'{binding,environmentId}'=b.environment_id
             AND r.manifest#>>'{binding,generation}'=b.generation::text`;
         if (!checkpoint) return null;
-        const { generation, ...proof } = checkpoint;
+        const { generation, backgroundRevision, ...proof } = checkpoint;
         const operationId = yield* (yield* Crypto.Crypto).randomUUIDv4;
         yield* acknowledgeThreadVmPauseBackup(sql, allocationId);
         const inserted = yield* sql`INSERT INTO relay_thread_vm_pauses
           (allocation_id,operation_id,generation,phase,workflow_checkpoint)
           VALUES (${allocationId},${operationId},${generation},'pending',
-            ${sql.json({ ...proof, finishedWorkspaceRevision: Number(proof.finishedWorkspaceRevision) })})
+            ${sql.json({
+              ...proof,
+              finishedWorkspaceRevision: Number(proof.finishedWorkspaceRevision),
+              ...(backgroundRevision ? { backgroundRevision } : {}),
+            })})
           ON CONFLICT(allocation_id) DO UPDATE SET operation_id=excluded.operation_id,
             generation=excluded.generation,phase='pending',workflow_checkpoint=excluded.workflow_checkpoint,
             boot_id=NULL,native_checkpoint_operation_id=NULL,source_receipt=NULL,backup_operation_id=NULL,

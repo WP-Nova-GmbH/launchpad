@@ -62,6 +62,8 @@ export interface ProviderServiceShape {
     readonly environmentId: string;
     readonly generation: number;
     readonly operationId: string;
+    readonly backgroundRevision?: string;
+    readonly recoverOnly?: true;
   }) => Effect.Effect<boolean, ProviderServiceError>;
   /**
    * Start a provider session.

@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_activity" ADD COLUMN "background_revision" varchar(48);

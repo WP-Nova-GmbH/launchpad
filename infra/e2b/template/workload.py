@@ -128,7 +128,8 @@ def inventory(gate):
             # writing metadata. Under this lock no managed launch can enter it.
             group.rmdir()
             record_path.unlink(missing_ok=True)
-    return {**gate, "groups": groups, "stopped": not groups}
+    return {"bootId": gate["bootId"], "epoch": gate["epoch"], "sealedBy": gate["sealedBy"],
+            "groups": groups, "stopped": not groups}
 
 
 def process_identity(pid):
@@ -257,15 +258,132 @@ def exclusive_provider(group, identity):
     return members == {identity['pid']}
 
 
-def stop_idle_provider(gate, expected, operation):
+def idle_provider_stop_record(expected, operation, *, signal_reserved=True):
+    return {'identity': expected, 'operation': operation, 'signalReserved': signal_reserved}
+
+
+def read_idle_provider_stop(gate, path):
+    if 'idleProviderStop' in gate:
+        return gate['idleProviderStop']
+    return read_json(path) if path.exists() else None
+
+
+def confirm_idle_provider_thaw(expected, *, owns_freeze=False):
+    work_id = identifier(expected['groupId'])
+    group = ROOT / work_id
+    if not group.exists():
+        return
+    freezer = group / 'cgroup.freeze'
+    setting = freezer.read_text().strip()
+    if setting == '1' and owns_freeze:
+        record = read_json(STATE / (work_id + '.json'))
+        if (record['id'] != work_id or record['bootId'] != expected['bootId']
+                or record['kind'] != 'provider' or record.get('workflow') is not True
+                or record['leaderPid'] != expected['pid']
+                or record['startTicks'] != expected['startTicks']):
+            raise RuntimeError('Provider cgroup identity changed before thaw')
+        freezer.write_text('0')
+    elif setting != '0':
+        raise RuntimeError('Provider cgroup is already frozen')
+    wait_cgroup_event(group, 'frozen', '0')
+
+
+def idle_provider_refusal(expected, operation, epoch):
+    return {**idle_provider_stop_record(expected, operation, signal_reserved=False), 'epoch': epoch}
+
+
+def inspect_idle_provider_stop(gate, expected, operation, *, gate_only=False):
+    if gate['bootId'] != expected['bootId']:
+        raise RuntimeError('Provider stop belongs to another boot')
+    attempted = STATE / ('provider-stop-' + identifier(expected['groupId']) + '.json')
+    recorded = gate.get('idleProviderStop') if gate_only else read_idle_provider_stop(gate, attempted)
+    if recorded is not None:
+        if (gate['sealedBy'] != operation
+                or recorded != idle_provider_stop_record(expected, operation)):
+            raise RuntimeError('Provider stop belongs to another operation')
+        if 'idleProviderStop' in gate:
+            # A helper can exit after reserving or sending SIGTERM and before
+            # thawing. Releasing its exact freeze never authorizes a new signal.
+            confirm_idle_provider_thaw(expected, owns_freeze=True)
+        return {'status': 'reserved'}
+    sealed = gate['sealedBy'] is not None
+    open_epoch = gate['epoch'] - int(sealed)
+    refusal = idle_provider_refusal(expected, operation, open_epoch)
+    preparation = gate.get('idleProviderPreparation')
+    if preparation is not None and (sealed or preparation != refusal):
+        raise RuntimeError('Provider freeze belongs to another operation')
+    if sealed and (gate['sealedBy'] != operation or gate.get('idleProviderRefusal') != refusal):
+        raise RuntimeError('A sealed provider stop has no confirmed receipt')
+    recovering = preparation is not None or sealed
+    confirm_idle_provider_thaw(expected, owns_freeze=recovering)
+    if recovering:
+        # A retry can finish the rollback once the kernel confirms thaw.
+        gate.pop('idleProviderPreparation', None)
+        gate.update(epoch=open_epoch, sealedBy=None, idleProviderRefusal=refusal)
+        write_json(STATE / 'gate.json', gate)
+    if gate.get('idleProviderRefusal') == refusal:
+        return {'status': 'rejected'}
+    return {'status': 'refused'}
+
+
+def recover_idle_provider_stop(gate, operation, boot_id, epoch):
+    if gate['bootId'] != boot_id or gate['epoch'] != epoch:
+        raise RuntimeError('Provider stop recovery gate changed')
+    matches = [(field, gate[field]) for field in ('idleProviderPreparation', 'idleProviderStop')
+               if field in gate and gate[field]['operation'] == operation]
+    sealed_by = gate['sealedBy']
+    refusal = gate.get('idleProviderRefusal')
+    if (refusal is not None and refusal['operation'] == operation and sealed_by in (None, operation)
+            and refusal['epoch'] == epoch - int(sealed_by is not None)):
+        matches.append(('idleProviderRefusal', refusal))
+    if not matches:
+        return {'status': 'absent'}
+    if len(matches) != 1:
+        raise RuntimeError('Provider stop recovery evidence is inconsistent')
+    field, record = matches[0]
+    if record.get('signalReserved') is not (field == 'idleProviderStop'):
+        raise RuntimeError('Provider stop recovery evidence is inconsistent')
+    expected = record['identity']
+    if (set(expected) != {'bootId', 'groupId', 'pid', 'startTicks', 'executableSha256'}
+            or expected['bootId'] != boot_id or type(expected['pid']) is not int or expected['pid'] <= 1
+            or not re.fullmatch(r'[0-9]{1,20}', expected['startTicks'])
+            or not re.fullmatch(r'[a-f0-9]{64}', expected['executableSha256'])):
+        raise RuntimeError('Provider stop recovery identity is invalid')
+    return inspect_idle_provider_stop(gate, expected, operation, gate_only=True)
+
+
+def confirm_idle_provider_stop(pidfd, nonce):
+    import select
+    if native_peer_control('write-idle-provider-marker', pidfd, nonce) != 0:
+        raise RuntimeError('Provider output ordering is unavailable')
+    print(json.dumps({'status': 'prepared'}), flush=True)
+    # The cgroup stays frozen only for this bounded pipe exchange. A lost
+    # coordinator, incomplete write or extra bytes never authorize SIGTERM.
+    fd = sys.stdin.fileno()
+    deadline = time.monotonic() + 5
+    expected = b'stop\n'
+    decision = b''
+    while expected.startswith(decision):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            return False
+        chunk = os.read(fd, len(expected) + 1 - len(decision))
+        if not chunk:
+            return decision == expected
+        decision += chunk
+    return False
+
+
+def stop_idle_provider(gate, expected, operation, *, marker_nonce=None):
+    import errno
     import signal
     work_id = identifier(expected['groupId'])
     if gate['bootId'] != expected['bootId'] or gate['sealedBy'] not in {None, operation}:
         return {'admitted': False}
     attempted = STATE / ('provider-stop-' + work_id + '.json')
-    if attempted.exists():
-        recorded = read_json(attempted)
-        if recorded != {'identity': expected, 'operation': operation, 'signalReserved': True}:
+    recorded = read_idle_provider_stop(gate, attempted)
+    if recorded is not None:
+        if recorded != idle_provider_stop_record(expected, operation):
             raise RuntimeError('Another operation owns this stop')
         # This records only a reserved attempt, including an uncertain syscall.
         # The runtime must still observe its own child exit and flushed output;
@@ -279,32 +397,60 @@ def stop_idle_provider(gate, expected, operation):
         return {'admitted': False}
     verified = verify_native_executable()
     group = ROOT / work_id
+    freezer = group / 'cgroup.freeze'
+    if marker_nonce is not None and freezer.read_text().strip() != '0':
+        raise RuntimeError('Provider cgroup is already frozen')
     pidfd = os.pidfd_open(expected['pid'])
     frozen = False
     try:
-        (group / 'cgroup.freeze').write_text('1')
+        if marker_nonce is not None:
+            # The process holding the lock may disappear without running finally.
+            # Only a matching operation can recover this freeze without signaling.
+            gate['idleProviderPreparation'] = idle_provider_refusal(expected, operation, gate['epoch'])
+            write_json(STATE / 'gate.json', gate)
         frozen = True
+        freezer.write_text('1')
         wait_cgroup_event(group, 'frozen', '1')
         if (native_identity(gate, work_id, expected['pid'], verified) != expected
                 or not exclusive_provider(group, expected)):
             return {'admitted': False}
+        if marker_nonce is not None and not confirm_idle_provider_stop(pidfd, marker_nonce):
+            return {'admitted': False}
         # Admission and any managed launch share this lock. No other group was
         # live, and the freezer prevents a child racing the ownership check.
-        if gate['sealedBy'] is None:
+        if marker_nonce is not None:
+            # Seal and exact receipt must become durable together before the
+            # syscall. A missing reply can then be recovered without signalling.
+            gate['epoch'] += 1
+            gate['sealedBy'] = operation
+            del gate['idleProviderPreparation']
+            gate['idleProviderStop'] = idle_provider_stop_record(expected, operation)
+            write_json(STATE / 'gate.json', gate)
+        elif gate['sealedBy'] is None:
             gate['epoch'] += 1
             gate['sealedBy'] = operation
             write_json(STATE / 'gate.json', gate)
         # Reserve before the syscall. If its result is uncertain, preserve the
         # attempt and gate; a retry never becomes permission to signal again.
-        write_json(attempted, {'identity': expected, 'operation': operation, 'signalReserved': True})
-        signal.pidfd_send_signal(pidfd, signal.SIGTERM)
-        return {'admitted': True}
+        if marker_nonce is None:
+            write_json(attempted, idle_provider_stop_record(expected, operation))
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except OSError as error:
+            if marker_nonce is None or error.errno not in {errno.EPERM, errno.EACCES}:
+                raise
+            del gate['idleProviderStop']
+            gate['idleProviderRefusal'] = idle_provider_refusal(expected, operation, gate['epoch'] - 1)
+            write_json(STATE / 'gate.json', gate)
+        else:
+            return {'admitted': True}
     finally:
         try:
             if frozen:
-                (group / 'cgroup.freeze').write_text('0')
+                freezer.write_text('0')
         finally:
             os.close(pidfd)
+    return {'admitted': False}
 
 
 def signal_workflow(gate, work_id, pid, signal_name):
@@ -481,7 +627,7 @@ def require_live_setup_owner(gate, work_id, pid, ticks):
     return group
 
 
-def workflow_recovery_state(gate):
+def workflow_recovery_state(gate, *, allow_codex=False):
     if os.getuid() != 0 or not workflow_guest():
         raise RuntimeError('Workflow recovery inspection is unavailable')
     if (gate['bootId'] != BOOT.read_text().strip() or gate['sealedBy'] is not None
@@ -490,10 +636,19 @@ def workflow_recovery_state(gate):
     current = inventory(gate)
     if len(current['groups']) > 1:
         raise RuntimeError('Workflow workloads are still active')
+    codex_only = False
     for record in current['groups']:
+        work_id, pid, ticks = record['id'], record['leaderPid'], record['startTicks']
+        if allow_codex and record.get('kind') == 'provider':
+            pinned = workflow_native()
+            identity = native_process_identity(gate, work_id, pid, pinned)
+            if (not exclusive_provider(ROOT / work_id, identity)
+                    or native_process_identity(gate, work_id, pid, pinned) != identity):
+                raise RuntimeError('Workflow provider descendants are still active')
+            codex_only = True
+            continue
         if record.get('kind') != 'terminal' or record.get('setupOwner') is not True:
             raise RuntimeError('Workflow workloads are still active')
-        work_id, pid, ticks = record['id'], record['leaderPid'], record['startTicks']
         # The fixed owner retains its script FD through arm and recipe spawn.
         # Once closed it can only wait/park; a singleton cannot later fork a recipe.
         for _ in range(2):
@@ -509,6 +664,8 @@ def workflow_recovery_state(gate):
                 raise RuntimeError('Workflow setup descendants are still active')
     if gate['bootId'] != BOOT.read_text().strip() or gate['sealedBy'] is not None:
         raise RuntimeError('Workflow recovery gate changed')
+    if codex_only:
+        return {**current, 'codexOnly': True}
     return {**current, 'recoverable': True}
 
 
@@ -811,11 +968,20 @@ def prepare_warm_restore(value):
                 raise RuntimeError('Restored workload gate changed')
         elif (gate['sealedBy'] != source_operation or gate['epoch'] != source['sealEpoch']):
             raise RuntimeError('Saved source seal differs')
+        stop = gate.get('idleProviderStop')
+        if not rebound and stop is not None:
+            identity = stop['identity']
+            if (identity['bootId'] != source['bootId']
+                    or stop != idle_provider_stop_record(identity, source_operation)):
+                raise RuntimeError('Saved provider stop belongs to another source')
         stop_coordinator(source_scope, source['bootId'])
         # Root-owned admission also blocks a late old start between this command
         # and identity rotation; the user-owned workload gate alone is insufficient.
         sync_json(COORDINATOR_STATE / 'restore-binding.json', value)
         if not rebound:
+            # The source has no workloads. Its completed stop receipt must not
+            # become part of the new operation's seal.
+            gate.pop('idleProviderStop', None)
             gate.update(sealedBy=target_operation, epoch=source['sealEpoch'] + 1, warmRestore=value)
             sync_json(STATE / 'gate.json', gate, 0o600)
         # A retry also repairs a crash between atomic replacement and ownership.
@@ -935,7 +1101,9 @@ def main(args):
         os.execvpe(command[0], command, os.environ)
     if action in {'provider-identity', 'stop-idle-provider', 'signal-workflow', 'stop-workflow-probe', 'verify-workflow-provider-peer', 'workflow-setup-control', 'stop-workflow-publishing'} and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, *args])
-    if action == 'workflow-recovery-state' and len(args) == 1 and os.getuid() == COORDINATOR_UID and workflow_guest():
+    if (action, len(args)) in {('prepare-idle-provider', 5), ('inspect-idle-provider-stop', 4), ('recover-idle-provider-stop', 4)} and os.getuid() == COORDINATOR_UID and workflow_guest():
+        os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, *args])
+    if action in {'workflow-recovery-state', 'workflow-activity-state'} and len(args) == 1 and os.getuid() == COORDINATOR_UID and workflow_guest():
         os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, action])
     if action == 'workflow-setup-control':
         print(json.dumps(workflow_setup_control(args[1:])))
@@ -993,8 +1161,8 @@ def main(args):
             signal.signal(signal.SIGALRM, previous)
         return
     with locked() as gate:
-        if action == 'workflow-recovery-state' and len(args) == 1:
-            print(json.dumps(workflow_recovery_state(gate)))
+        if action in {'workflow-recovery-state', 'workflow-activity-state'} and len(args) == 1:
+            print(json.dumps(workflow_recovery_state(gate, allow_codex=action == 'workflow-activity-state')))
             return
         if action == 'verify-workflow-provider-peer' and len(args) == 6:
             if os.getuid() != 0 or not workflow_guest():
@@ -1009,12 +1177,39 @@ def main(args):
             _, work_id, pid, signal_name = args
             print(json.dumps({'signalled': signal_workflow(gate, work_id, int(pid), signal_name)}))
             return
-        if action == 'stop-idle-provider' and len(args) == 4:
-            _, operation, work_id, raw = args
+        if action == 'recover-idle-provider-stop' and len(args) == 4:
+            if os.getuid() != 0 or not workflow_guest():
+                raise RuntimeError('Workflow provider stop recovery is unavailable')
+            _, operation, boot, epoch = args
+            print(json.dumps(recover_idle_provider_stop(gate, identifier(operation), boot, int(epoch))))
+            return
+        if (action, len(args)) in {('stop-idle-provider', 4), ('prepare-idle-provider', 5), ('inspect-idle-provider-stop', 4)}:
+            _, operation, work_id, raw = args[:4]
             expected = json.loads(raw)
             if expected['groupId'] != identifier(work_id):
                 raise ValueError('Unexpected owned group')
-            print(json.dumps(stop_idle_provider(gate, expected, identifier(operation))))
+            operation = identifier(operation)
+            if action == 'stop-idle-provider':
+                print(json.dumps(stop_idle_provider(gate, expected, operation)))
+                return
+            if os.getuid() != 0 or not workflow_guest():
+                raise RuntimeError('Workflow provider stop control is unavailable')
+            marker_nonce = identifier(args[4]) if action == 'prepare-idle-provider' else None
+            receipt = inspect_idle_provider_stop(gate, expected, operation)
+            if marker_nonce is not None and receipt['status'] == 'refused':
+                import signal
+
+                def cancelled(_signum, _frame):
+                    raise SystemExit(74)
+
+                previous = signal.signal(signal.SIGTERM, cancelled)
+                try:
+                    stop = stop_idle_provider(gate, expected, operation, marker_nonce=marker_nonce)
+                finally:
+                    signal.signal(signal.SIGTERM, previous)
+                receipt = ({'status': 'reserved'} if stop['admitted']
+                           else inspect_idle_provider_stop(gate, expected, operation))
+            print(json.dumps(receipt))
             return
         if action in {"seal", "reopen", "stop"} and len(args) == 3:
             _, boot_id, operation_id = args
@@ -1030,8 +1225,22 @@ def main(args):
             else:
                 if gate["sealedBy"] != operation_id:
                     raise RuntimeError("Only the owning operation may reopen workloads")
+                refusal = gate.get('idleProviderRefusal')
+                if ('idleProviderPreparation' in gate or (refusal is not None
+                        and refusal['operation'] == operation_id and refusal['epoch'] == gate['epoch'] - 1)):
+                    raise RuntimeError('Recover the interrupted provider stop before reopening workloads')
+                stop = gate.get('idleProviderStop')
+                if stop is not None:
+                    identity = stop['identity']
+                    if (identity['bootId'] != boot_id or stop != idle_provider_stop_record(identity, operation_id)):
+                        raise RuntimeError('Provider stop belongs to another operation')
+                    group = ROOT / identifier(identity['groupId'])
+                    # Keep the receipt until the guest has proved the writer exited.
+                    if group.exists() and populated(group):
+                        raise RuntimeError('Provider stop has not finished')
                 gate["epoch"] += 1
                 gate["sealedBy"] = None
+                gate.pop('idleProviderStop', None)
             write_json(STATE / "gate.json", gate)
             if action == "stop":
                 # Only recognized groups from this boot are targets. The gate
