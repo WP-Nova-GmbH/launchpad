@@ -9,6 +9,7 @@ import {
   useState,
   type RefObject,
 } from "react";
+import type { CodeViewHandle } from "@pierre/diffs/react";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { useAtomValue } from "@effect/atom-react";
@@ -51,6 +52,7 @@ import {
   Columns2Icon,
   FileCheck2Icon,
   FileDiffIcon,
+  ListTreeIcon,
   LockIcon,
   RotateCwIcon,
   Rows3Icon,
@@ -61,8 +63,10 @@ import { ToggleGroup, Toggle } from "../ui/toggle-group";
 import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
 import { useIsMobile } from "../../hooks/useMediaQuery";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
-import { getRenderablePatch } from "../../lib/diffRendering";
+import { getRenderablePatch, resolveFileDiffPath } from "../../lib/diffRendering";
 import { cn, randomUUID } from "../../lib/utils";
+import { DiffFileTree } from "../diffs/DiffFileTree";
+import { diffFileTreeEntries, diffFileTreePathAliases } from "../diffs/diffFileTree.logic";
 import { StyledDiffCodeView } from "../diffs/StyledDiffCodeView";
 import { SavedConversationMessage } from "../chat/SavedConversationMessage";
 import {
@@ -97,6 +101,12 @@ type DeletionState =
   | { state: "confirming"; target: DeletionTarget }
   | { state: "unconfirmed" | "blocked"; intent: DeletionIntent; relayChanged?: boolean }
   | { state: "requesting" | "checking" | "requested" | "changed" | "unavailable" | "not-sent" };
+
+function focusedElement(ownerDocument: Document): Element | null {
+  let element = ownerDocument.activeElement;
+  while (element?.shadowRoot?.activeElement) element = element.shadowRoot.activeElement;
+  return element;
+}
 
 function sameThreadPlacement(left: DeletionTarget, right: DeletionTarget | null) {
   return (
@@ -164,6 +174,22 @@ export function SavedWorkflowResults({
   const updateClientSettings = useUpdateClientSettings();
   const tabId = useId();
   const changesTab = useRef<HTMLButtonElement>(null);
+  const [fileListOpen, setFileListOpen] = useState(true);
+  const [diffViewer, setDiffViewer] = useState<CodeViewHandle<undefined> | null>(null);
+  const diffViewport = useRef<HTMLDivElement>(null);
+  const diffScroll = useRef<{ readId: number; position: number } | null>(null);
+  const positionedViewer = useRef<{ viewer: CodeViewHandle<undefined>; readId: number } | null>(
+    null,
+  );
+  const [fileJump, setFileJump] = useState<{
+    readId: number;
+    itemId: string;
+    path: string;
+  } | null>(null);
+  const pendingFileJump = useRef<{
+    jump: NonNullable<typeof fileJump>;
+    focusFrom?: Element | null;
+  } | null>(null);
   const [index, setIndex] = useState<{
     relayUrl: string;
     results: ReadonlyArray<WorkflowSavedResult>;
@@ -722,6 +748,89 @@ export function SavedWorkflowResults({
     sameSavedResult(loaded.result, result)
       ? loaded
       : null;
+  const diffItems = useMemo(
+    () =>
+      activeRead && patch?.kind === "files"
+        ? patch.files.map((fileDiff, index) => ({
+            id: `${activeRead.result.resultId}:${index}`,
+            type: "diff" as const,
+            fileDiff,
+          }))
+        : [],
+    [activeRead, patch],
+  );
+  const changedFiles = useMemo(() => {
+    const firstItemByPath = new Map<string, string>();
+    for (const item of diffItems) {
+      const path = resolveFileDiffPath(item.fileDiff);
+      // A file type change can have a removal and an addition at the same path.
+      if (!firstItemByPath.has(path)) firstItemByPath.set(path, item.id);
+    }
+    return firstItemByPath;
+  }, [diffItems]);
+  const canJumpToFile = changedFiles.size > 1;
+  const fileTree = useMemo(() => {
+    const entries =
+      patch?.kind === "files" && canJumpToFile ? diffFileTreeEntries(patch.files) : [];
+    const aliases = diffFileTreePathAliases(entries.map(({ path }) => path));
+    return {
+      entries: entries.map((entry) => {
+        const alias = aliases.get(entry.path);
+        return alias ? { ...entry, path: alias } : entry;
+      }),
+      aliases,
+      originalPaths: new Map([...aliases].map(([path, alias]) => [alias, path])),
+    };
+  }, [canJumpToFile, patch]);
+  const lastFileJump = fileJump?.readId === activeRead?.readId ? fileJump : null;
+  const diffReadId = canJumpToFile ? activeRead?.readId : undefined;
+  const rememberDiffScroll = useCallback(
+    (position: number) => {
+      if (diffReadId !== undefined) diffScroll.current = { readId: diffReadId, position };
+    },
+    [diffReadId],
+  );
+  const showDiffControls =
+    view === "changes" && !readingChanges && !changesError && changedFiles.size > 0;
+  useEffect(() => {
+    if (view !== "changes" || diffReadId === undefined) {
+      pendingFileJump.current = null;
+      positionedViewer.current = null;
+      return;
+    }
+    if (!diffViewer?.getInstance()) return;
+
+    const pending = pendingFileJump.current;
+    if (pending?.jump === lastFileJump) {
+      pendingFileJump.current = null;
+      diffViewer.scrollTo({ type: "item", id: pending.jump.itemId, align: "start" });
+      const viewport = diffViewport.current;
+      if (
+        viewport &&
+        (pending.focusFrom === undefined ||
+          focusedElement(viewport.ownerDocument) === pending.focusFrom)
+      ) {
+        viewport.scrollIntoView({ block: "nearest", inline: "nearest" });
+        if (pending.focusFrom !== undefined) viewport.focus({ preventScroll: true });
+      }
+    } else if (
+      positionedViewer.current?.viewer !== diffViewer ||
+      positionedViewer.current.readId !== diffReadId
+    ) {
+      const saved = diffScroll.current;
+      if (saved?.readId === diffReadId) {
+        diffViewer.scrollTo({ type: "position", position: saved.position, behavior: "instant" });
+      }
+    }
+    positionedViewer.current = { viewer: diffViewer, readId: diffReadId };
+  }, [diffReadId, diffViewer, lastFileJump, view]);
+  const focusableDiff = useCallback((container: HTMLDivElement | null) => {
+    diffViewport.current = container;
+    if (!container) return;
+    container.tabIndex = 0;
+    container.setAttribute("role", "region");
+    container.setAttribute("aria-label", "Changed file diffs");
+  }, []);
   const verifiedCheckpoint =
     canVerifyResult &&
     reviewingCurrent &&
@@ -1275,24 +1384,46 @@ export function SavedWorkflowResults({
               </Button>
             ))}
           </div>
-          {view === "changes" && !narrow && patch?.kind === "files" ? (
-            <ToggleGroup
-              aria-label="Diff layout"
-              variant="segmented"
-              value={[diffLayout]}
-              onValueChange={(value) => {
-                const next = value[0];
-                if (next === "stacked" || next === "split")
-                  void updateClientSettings({ diffLayout: next });
-              }}
-            >
-              <Toggle aria-label="Stacked diff view" value="stacked">
-                <Rows3Icon className="size-3.5" />
-              </Toggle>
-              <Toggle aria-label="Split diff view" value="split">
-                <Columns2Icon className="size-3.5" />
-              </Toggle>
-            </ToggleGroup>
+          {showDiffControls ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs tabular-nums text-muted-foreground">
+                {changedFiles.size === 1 ? "1 file" : `${changedFiles.size} files`}
+              </span>
+              {canJumpToFile ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  aria-controls={`${tabId}-files`}
+                  aria-expanded={fileListOpen}
+                  onClick={() => {
+                    pendingFileJump.current = null;
+                    setFileListOpen((open) => !open);
+                  }}
+                >
+                  <ListTreeIcon aria-hidden />
+                  Files
+                </Button>
+              ) : null}
+              {!narrow ? (
+                <ToggleGroup
+                  aria-label="Diff layout"
+                  variant="segmented"
+                  value={[diffLayout]}
+                  onValueChange={(value) => {
+                    const next = value[0];
+                    if (next === "stacked" || next === "split")
+                      void updateClientSettings({ diffLayout: next });
+                  }}
+                >
+                  <Toggle aria-label="Stacked diff view" value="stacked">
+                    <Rows3Icon className="size-3.5" />
+                  </Toggle>
+                  <Toggle aria-label="Split diff view" value="split">
+                    <Columns2Icon className="size-3.5" />
+                  </Toggle>
+                </ToggleGroup>
+              ) : null}
+            </div>
           ) : null}
         </div>
       ) : null}
@@ -1354,15 +1485,61 @@ export function SavedWorkflowResults({
                     </p>
                   </div>
                 </div>
-              ) : patch?.kind === "files" ? (
-                <StyledDiffCodeView
-                  options={diffOptions}
-                  items={patch.files.map((fileDiff, n) => ({
-                    id: `${result.resultId}:${n}`,
-                    type: "diff",
-                    fileDiff,
-                  }))}
-                />
+              ) : diffItems.length > 0 ? (
+                <div className="@container/saved-changes min-w-0">
+                  <div className="flex min-w-0 flex-col gap-3 @lg/saved-changes:flex-row">
+                    {canJumpToFile ? (
+                      <nav
+                        id={`${tabId}-files`}
+                        aria-label="Changed files"
+                        hidden={!fileListOpen}
+                        className="relative h-40 min-w-0 shrink-0 border-b border-border/60 @lg/saved-changes:h-auto @lg/saved-changes:min-h-32 @lg/saved-changes:w-44 @lg/saved-changes:border-r @lg/saved-changes:border-b-0"
+                      >
+                        {fileListOpen ? (
+                          <div className="absolute inset-0 flex min-h-0 p-1">
+                            <DiffFileTree
+                              key={activeRead.readId}
+                              ariaLabel="Jump to a changed file"
+                              entries={fileTree.entries}
+                              selectedPath={
+                                lastFileJump
+                                  ? (fileTree.aliases.get(lastFileJump.path) ?? lastFileJump.path)
+                                  : null
+                              }
+                              showHeader={false}
+                              onActivateFile={(treePath, { keyboard }) => {
+                                const path = fileTree.originalPaths.get(treePath) ?? treePath;
+                                const itemId = changedFiles.get(path);
+                                if (!itemId) return;
+                                const jump = { readId: activeRead.readId, itemId, path };
+                                pendingFileJump.current = {
+                                  jump,
+                                  ...(keyboard ? { focusFrom: focusedElement(document) } : {}),
+                                };
+                                setFileJump(jump);
+                              }}
+                            />
+                          </div>
+                        ) : null}
+                      </nav>
+                    ) : null}
+                    <div className="min-w-0 flex-1">
+                      <StyledDiffCodeView
+                        options={diffOptions}
+                        items={diffItems}
+                        {...(canJumpToFile
+                          ? {
+                              viewerRef: setDiffViewer,
+                              containerRef: focusableDiff,
+                              onScroll: rememberDiffScroll,
+                              className:
+                                "max-h-[min(65vh,36rem)] overflow-auto focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
+                            }
+                          : {})}
+                      />
+                    </div>
+                  </div>
+                </div>
               ) : (
                 <pre className="overflow-auto p-4 text-xs">{activeRead.patch}</pre>
               )}

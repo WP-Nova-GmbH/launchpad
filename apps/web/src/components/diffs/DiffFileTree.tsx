@@ -1,7 +1,7 @@
 import type { GitStatusEntry } from "@pierre/trees";
 import { FileTree, useFileTree, useFileTreeSelector } from "@pierre/trees/react";
 import { ChevronsDownUpIcon, ChevronsUpDownIcon } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 
 import { useTheme } from "~/hooks/useTheme";
 import { cn } from "~/lib/utils";
@@ -21,23 +21,41 @@ import {
 
 export type { DiffFileTreeEntry } from "./diffFileTree.logic";
 
-interface DiffFileTreeProps {
+type DiffFileTreeProps = {
   readonly entries: ReadonlyArray<DiffFileTreeEntry>;
-  /** Called with the file's path when the reader picks a file row. */
-  readonly onSelectFile: (path: string) => void;
   /**
-   * The file the diff is currently showing, kept selected in the tree. Bump `revealRequestId` to
+   * The file to keep selected in the tree. Bump `revealRequestId` to
    * scroll the tree to the same path again.
    */
   readonly selectedPath?: string | null;
   readonly revealRequestId?: number;
   readonly ariaLabel: string;
+  readonly showHeader?: boolean;
   /** Right-aligned content in the header row, after the file count. */
   readonly headerAccessory?: ReactNode;
   /** Rendered under the tree, for a host that still has files to fetch. */
   readonly footer?: ReactNode;
   readonly className?: string;
-}
+} & (
+  | {
+      /** Jump when the reader selects a file in the tree. */
+      readonly onSelectFile: (path: string) => void;
+      readonly onActivateFile?: never;
+    }
+  | {
+      /** Jump on explicit activation, which may hand focus to the diff. */
+      readonly onActivateFile: (path: string, input: { keyboard: boolean }) => void;
+      readonly onSelectFile?: never;
+    }
+);
+
+const isUnmodifiedClick = (event: MouseEvent<HTMLElement>) =>
+  !event.defaultPrevented &&
+  event.button === 0 &&
+  !event.ctrlKey &&
+  !event.metaKey &&
+  !event.shiftKey &&
+  !event.altKey;
 
 /**
  * A directory tree of the files in a diff. Every directory starts open: a diff is a short list
@@ -46,9 +64,11 @@ interface DiffFileTreeProps {
 export function DiffFileTree({
   entries,
   onSelectFile,
+  onActivateFile,
   selectedPath = null,
   revealRequestId = 0,
   ariaLabel,
+  showHeader = true,
   headerAccessory,
   footer,
   className,
@@ -70,7 +90,8 @@ export function DiffFileTree({
     () => entries.map((entry) => ({ path: entry.path, status: entry.status })),
     [entries],
   );
-  const filePathsRef = useRef<ReadonlySet<string>>(new Set(paths));
+  const filePaths = useMemo(() => new Set(paths), [paths]);
+  const filePathsRef = useRef<ReadonlySet<string>>(filePaths);
   const onSelectFileRef = useRef(onSelectFile);
   // Selection driven by `selectedPath` below is an echo of a file already on screen, not a
   // request to scroll to it again.
@@ -79,9 +100,9 @@ export function DiffFileTree({
   const mountedPathsRef = useRef<ReadonlyArray<string> | null>(null);
 
   useEffect(() => {
-    filePathsRef.current = new Set(paths);
+    filePathsRef.current = filePaths;
     onSelectFileRef.current = onSelectFile;
-  }, [onSelectFile, paths]);
+  }, [onSelectFile, filePaths]);
 
   const { model } = useFileTree({
     density: "compact",
@@ -89,7 +110,7 @@ export function DiffFileTree({
     initialExpansion: "open",
     icons: T3_PIERRE_ICONS,
     onSelectionChange: (selectedPaths) => {
-      if (syncingSelectionRef.current) return;
+      if (syncingSelectionRef.current || !onSelectFileRef.current) return;
       const path = selectedPaths.at(-1)?.replace(/\/$/, "");
       if (path && filePathsRef.current.has(path)) onSelectFileRef.current(path);
     },
@@ -98,8 +119,9 @@ export function DiffFileTree({
     sort: ordering.sort,
     unsafeCSS: PIERRE_TREE_UNSAFE_CSS,
   });
-  const allDirectoriesExpanded = useFileTreeSelector(model, (currentModel) =>
-    areAllDirectoriesExpanded(currentModel, directoryPaths),
+  const allDirectoriesExpanded = useFileTreeSelector(
+    model,
+    (currentModel) => showHeader && areAllDirectoriesExpanded(currentModel, directoryPaths),
   );
 
   useEffect(() => {
@@ -165,56 +187,63 @@ export function DiffFileTree({
 
   return (
     <div className={cn("flex min-h-0 flex-1 flex-col bg-background", className)}>
-      <div
-        className="flex h-10 min-h-10 shrink-0 items-center gap-1 border-b border-border/60 bg-background px-2 text-xs text-muted-foreground in-data-[preview-panel-mode=inline]:mb-3 in-data-[preview-panel-mode=inline]:h-7 in-data-[preview-panel-mode=inline]:min-h-7 in-data-[preview-panel-mode=inline]:border-b-transparent"
-        data-surface-subheader
-      >
-        <span className="px-1 font-medium text-foreground">Files</span>
-        <span className="ml-auto tabular-nums">{entries.length}</span>
-        {headerAccessory}
-        {directoryPaths.length > 0 ? (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type="button"
-                  size="icon-xs"
-                  variant="ghost"
-                  aria-label={
-                    allDirectoriesExpanded ? "Collapse all folders" : "Expand all folders"
-                  }
-                  onClick={() =>
-                    setAllDirectoriesExpanded(model, directoryPaths, !allDirectoriesExpanded)
-                  }
-                />
-              }
-            >
-              {allDirectoriesExpanded ? (
-                <ChevronsDownUpIcon className="size-3.5" />
-              ) : (
-                <ChevronsUpDownIcon className="size-3.5" />
-              )}
-            </TooltipTrigger>
-            <TooltipPopup>
-              {allDirectoriesExpanded ? "Collapse all folders" : "Expand all folders"}
-            </TooltipPopup>
-          </Tooltip>
-        ) : null}
-      </div>
+      {showHeader ? (
+        <div
+          className="flex h-10 min-h-10 shrink-0 items-center gap-1 border-b border-border/60 bg-background px-2 text-xs text-muted-foreground in-data-[preview-panel-mode=inline]:mb-3 in-data-[preview-panel-mode=inline]:h-7 in-data-[preview-panel-mode=inline]:min-h-7 in-data-[preview-panel-mode=inline]:border-b-transparent"
+          data-surface-subheader
+        >
+          <span className="px-1 font-medium text-foreground">Files</span>
+          <span className="ml-auto tabular-nums">{entries.length}</span>
+          {headerAccessory}
+          {directoryPaths.length > 0 ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    size="icon-xs"
+                    variant="ghost"
+                    aria-label={
+                      allDirectoriesExpanded ? "Collapse all folders" : "Expand all folders"
+                    }
+                    onClick={() =>
+                      setAllDirectoriesExpanded(model, directoryPaths, !allDirectoriesExpanded)
+                    }
+                  />
+                }
+              >
+                {allDirectoriesExpanded ? (
+                  <ChevronsDownUpIcon className="size-3.5" />
+                ) : (
+                  <ChevronsUpDownIcon className="size-3.5" />
+                )}
+              </TooltipTrigger>
+              <TooltipPopup>
+                {allDirectoriesExpanded ? "Collapse all folders" : "Expand all folders"}
+              </TooltipPopup>
+            </Tooltip>
+          ) : null}
+        </div>
+      ) : null}
       <FileTree
         model={model}
         aria-label={ariaLabel}
-        onClickCapture={(event) => {
-          if (
-            event.defaultPrevented ||
-            event.button !== 0 ||
-            event.ctrlKey ||
-            event.metaKey ||
-            event.shiftKey ||
-            event.altKey
-          ) {
-            return;
+        onClick={(event) => {
+          if (!onActivateFile || !isUnmodifiedClick(event)) return;
+          const row = event.nativeEvent
+            .composedPath()
+            .find(
+              (node): node is HTMLElement =>
+                node instanceof HTMLElement && node.hasAttribute("data-item-path"),
+            );
+          const path = row?.getAttribute("data-item-path");
+          if (path && filePaths.has(path)) {
+            // The native file button also emits a click on Enter, Space and AT activation.
+            onActivateFile(path, { keyboard: event.detail === 0 });
           }
+        }}
+        onClickCapture={(event) => {
+          if (onActivateFile || !isUnmodifiedClick(event)) return;
           // Pierre does not emit a selection change for its sole selected row.
           // Read selection before the row handles the click so new selections reveal only once.
           const selected = model.getSelectedPaths();
@@ -225,7 +254,7 @@ export function DiffFileTree({
             .some(
               (node) => node instanceof HTMLElement && node.getAttribute("data-item-path") === path,
             );
-          if (clickedSelectedRow) onSelectFileRef.current(path);
+          if (clickedSelectedRow) onSelectFileRef.current?.(path);
         }}
         className="min-h-0 flex-1 overflow-hidden"
         style={pierreTreeStyle(resolvedTheme)}

@@ -3,6 +3,7 @@ import {
   createContext,
   createElement,
   useContext,
+  useImperativeHandle,
   type PropsWithChildren,
   type Ref,
 } from "react";
@@ -28,6 +29,7 @@ import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry
 import { Atom } from "effect/unstable/reactivity";
 import { ManagedRelay, type ManagedRelaySnapshotState } from "@t3tools/client-runtime/relay";
 import type { RelayThreadDeletion, ThreadVmCapabilities } from "@t3tools/contracts/relay";
+import type { DiffFileTreeEntry } from "../diffs/DiffFileTree";
 const fixture = vi.hoisted(() => ({
   call: vi.fn(),
   list: vi.fn(),
@@ -38,6 +40,8 @@ const fixture = vi.hoisted(() => ({
   refresh: vi.fn(),
   target: vi.fn(),
   renderChange: vi.fn(),
+  scrollTo: vi.fn(),
+  diffViewerReady: true,
 }));
 const capability = (permanentDelete = true): ThreadVmCapabilities => ({
   configured: true,
@@ -67,8 +71,61 @@ vi.mock("./workflowState", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./workflowState")>()),
   useWorkflowClient: () => fixture.call,
 }));
-vi.mock("../diffs/StyledDiffCodeView", () => ({
-  StyledDiffCodeView: (props: Record<string, unknown>) => createElement("pre", props),
+vi.mock("../diffs/StyledDiffCodeView", () => {
+  const instance = {};
+  const viewer = { getInstance: () => instance, scrollTo: fixture.scrollTo };
+  return {
+    StyledDiffCodeView: ({
+      viewerRef,
+      containerRef,
+      onScroll,
+      ...props
+    }: Record<string, unknown> & {
+      viewerRef?: Ref<typeof viewer>;
+      containerRef?: Ref<HTMLDivElement>;
+      onScroll?: (position: number, instance: object) => void;
+    }) => {
+      const ready = fixture.diffViewerReady;
+      useImperativeHandle(ready ? viewerRef : null, () => viewer, [ready]);
+      return ready
+        ? createElement("pre", {
+            ...props,
+            ref: containerRef,
+            onScroll: (position: number) => onScroll?.(position, instance),
+          })
+        : createElement("p", null, "Loading saved diff…");
+    },
+  };
+});
+vi.mock("../diffs/DiffFileTree", () => ({
+  DiffFileTree: ({
+    ariaLabel,
+    entries,
+    onActivateFile,
+    selectedPath,
+  }: {
+    ariaLabel: string;
+    entries: ReadonlyArray<DiffFileTreeEntry>;
+    onActivateFile: (path: string, details: { keyboard: boolean }) => void;
+    selectedPath?: string | null;
+  }) =>
+    createElement(
+      "div",
+      { role: "tree", "aria-label": ariaLabel },
+      entries.map(({ path }) =>
+        createElement(
+          "button",
+          {
+            key: path,
+            role: "treeitem",
+            "aria-label": `Jump to ${path}`,
+            "aria-selected": selectedPath === path,
+            onClick: () => onActivateFile(path, { keyboard: true }),
+          },
+          path,
+        ),
+      ),
+    ),
 }));
 vi.mock("../chat/SavedConversationMessage", () => ({
   SavedConversationMessage: ({
@@ -184,6 +241,11 @@ const scope = {
   repositoryId: RelayRepositoryId.make("repo"),
 };
 const patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n";
+const savedFilePatch = (path: string) =>
+  `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-old\n+new\n`;
+const docsPatch = savedFilePatch("docs/release.ts");
+const sourcePatch = savedFilePatch("src/release.ts");
+const releasePatch = docsPatch + sourcePatch;
 const result: WorkflowSavedResult = {
   resultId: "11111111-1111-4111-8111-111111111111",
   stepId: "Agent 1",
@@ -346,6 +408,7 @@ beforeEach(() => {
   );
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.clearAllMocks();
+  fixture.diffViewerReady = true;
   appAtomRegistry.set(capabilitiesAtom, {
     data: capability(),
     error: null,
@@ -514,6 +577,263 @@ const completedWithCheckpoint: RepositoryWorkflowJob = {
     checkpoint: { ...job.progress!.checkpoint!, checkpointId: "completion-checkpoint" },
   },
 };
+
+it("jumps to the chosen file in the active saved diff", () =>
+  withClient(async () => {
+    const latest = {
+      ...result,
+      patch: { ...result.patch, sizeBytes: releasePatch.length },
+    };
+    const earlier = {
+      ...latest,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      createdAt: "2026-11-10T10:40:00Z",
+    };
+    fixture.list.mockResolvedValue({
+      results: [latest, earlier],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockImplementation(async ({ resultId }) =>
+      resultId === earlier.resultId
+        ? { result: earlier, patch: sourcePatch + docsPatch }
+        : { result: latest, patch: releasePatch },
+    );
+    const setActiveElement = (element: object) =>
+      Object.defineProperty(document, "activeElement", { configurable: true, value: element });
+    const fileTreeItem = {};
+    const changesTab = {};
+    const viewport = {
+      ownerDocument: document,
+      focus: vi.fn(() => setActiveElement(viewport)),
+      scrollIntoView: vi.fn(),
+      setAttribute: vi.fn(),
+    };
+    await mount(completedJob, true, {
+      createNodeMock: (element) => (element.type === "pre" ? viewport : null),
+    });
+
+    const sourceJumpIsVisible = () => {
+      let node = findButton("Jump to src/release.ts") ?? null;
+      if (!node) return false;
+      while (node) {
+        if (node.props.hidden) return false;
+        node = node.parent;
+      }
+      return true;
+    };
+    expect(JSON.stringify(renderer.toJSON())).toContain("2 files");
+    expect(findButton("Files")?.props["aria-expanded"]).toBe(true);
+    expect(sourceJumpIsVisible()).toBe(true);
+    await press("Files");
+    expect(findButton("Files")?.props["aria-expanded"]).toBe(false);
+    expect(sourceJumpIsVisible()).toBe(false);
+    await press("Files");
+    expect(sourceJumpIsVisible()).toBe(true);
+
+    setActiveElement(fileTreeItem);
+    await press("Jump to src/release.ts");
+    const latestJump = { type: "item", id: `${latest.resultId}:1`, align: "start" };
+    expect(fixture.scrollTo).toHaveBeenCalledExactlyOnceWith(latestJump);
+    expect(viewport.scrollIntoView).toHaveBeenCalledOnce();
+    expect(viewport.focus).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(viewport);
+    expect(findButton("Jump to src/release.ts")?.props["aria-selected"]).toBe(true);
+
+    await act(() => renderer.root.findByType("pre").props.onScroll(137));
+    await press("Conversation");
+    setActiveElement(changesTab);
+    await press("Changes");
+    expect(fixture.scrollTo.mock.calls).toEqual([
+      [latestJump],
+      [{ type: "position", position: 137, behavior: "instant" }],
+    ]);
+    expect(viewport.scrollIntoView).toHaveBeenCalledOnce();
+    expect(viewport.focus).toHaveBeenCalledOnce();
+    expect(document.activeElement).toBe(changesTab);
+
+    await selectSavedResult(earlier.resultId);
+    expect(fixture.scrollTo).toHaveBeenCalledTimes(2);
+    expect(findButton("Jump to src/release.ts")?.props["aria-selected"]).toBe(false);
+    setActiveElement(fileTreeItem);
+    await press("Jump to src/release.ts");
+    expect(fixture.scrollTo).toHaveBeenLastCalledWith({
+      type: "item",
+      id: `${earlier.resultId}:0`,
+      align: "start",
+    });
+    expect(viewport.scrollIntoView).toHaveBeenCalledTimes(2);
+    expect(viewport.focus).toHaveBeenCalledTimes(2);
+  }));
+
+function loadSavedDiff(diff: string) {
+  const saved = {
+    ...result,
+    patch: { ...result.patch, sizeBytes: new TextEncoder().encode(diff).length },
+  };
+  fixture.list.mockResolvedValue({
+    results: [saved],
+    nextCursor: null,
+    threadId: "thread",
+    generation: 1,
+  });
+  fixture.read.mockResolvedValue({ result: saved, patch: diff });
+}
+
+it("jumps to both diffs when a file is replaced by a directory", () =>
+  withClient(async () => {
+    loadSavedDiff(
+      [
+        "diff --git a/config b/config",
+        "deleted file mode 100644",
+        "index 3367afd..0000000",
+        "--- a/config",
+        "+++ /dev/null",
+        "@@ -1 +0,0 @@",
+        "-old",
+        "diff --git a/config/default.ts b/config/default.ts",
+        "new file mode 100644",
+        "index 0000000..3e8a2f3",
+        "--- /dev/null",
+        "+++ b/config/default.ts",
+        "@@ -0,0 +1 @@",
+        "+new",
+        "",
+      ].join("\n"),
+    );
+    await mount(completedJob);
+
+    expect(JSON.stringify(renderer.toJSON())).toContain("2 files");
+    await press("Jump to config (file)");
+    expect(fixture.scrollTo).toHaveBeenLastCalledWith({
+      type: "item",
+      id: `${result.resultId}:0`,
+      align: "start",
+    });
+    expect(findButton("Jump to config (file)")?.props["aria-selected"]).toBe(true);
+    await press("Jump to config/default.ts");
+    expect(fixture.scrollTo).toHaveBeenLastCalledWith({
+      type: "item",
+      id: `${result.resultId}:1`,
+      align: "start",
+    });
+  }));
+
+it("jumps to the exact file when two saved paths differ only by repeated spaces", () =>
+  withClient(async () => {
+    const singleSpace = "docs/release notes.ts";
+    const repeatedSpace = "docs/release  notes.ts";
+    loadSavedDiff(savedFilePatch(singleSpace) + savedFilePatch(repeatedSpace));
+    await mount(completedJob);
+
+    expect(
+      renderer.root
+        .findByType("pre")
+        .props.items.map((item: { fileDiff: { name: string } }) => item.fileDiff.name),
+    ).toEqual([singleSpace, repeatedSpace]);
+
+    await press("Jump to docs/release notes.ts");
+    expect(fixture.scrollTo).toHaveBeenLastCalledWith({
+      type: "item",
+      id: `${result.resultId}:0`,
+      align: "start",
+    });
+    await press("Jump to docs/release [2 spaces] notes.ts");
+    expect(fixture.scrollTo).toHaveBeenLastCalledWith({
+      type: "item",
+      id: `${result.resultId}:1`,
+      align: "start",
+    });
+    expect(findButton("Jump to docs/release [2 spaces] notes.ts")?.props["aria-selected"]).toBe(
+      true,
+    );
+  }));
+
+it("restores the saved diff's scroll position after navigating away without a file jump", () =>
+  withClient(async () => {
+    loadSavedDiff(releasePatch);
+    const viewport = {
+      setAttribute: vi.fn(),
+      scrollIntoView: vi.fn(),
+      focus: vi.fn(),
+      ownerDocument: document,
+    };
+    await mount(completedJob, true, {
+      createNodeMock: (element) => (element.type === "pre" ? viewport : null),
+    });
+    await act(() => renderer.root.findByType("pre").props.onScroll(82));
+    await press("Conversation");
+    await press("Changes");
+
+    expect(fixture.scrollTo).toHaveBeenCalledExactlyOnceWith({
+      type: "position",
+      position: 82,
+      behavior: "instant",
+    });
+    expect(viewport.scrollIntoView).not.toHaveBeenCalled();
+    expect(viewport.focus).not.toHaveBeenCalled();
+  }));
+
+it("keeps focus on the newly focused shadow row when a queued file jump completes", () =>
+  withClient(async () => {
+    loadSavedDiff(releasePatch);
+    fixture.diffViewerReady = false;
+    const firstRow = {};
+    const nextRow = {};
+    const treeShadow = { activeElement: firstRow };
+    const treeHost = { shadowRoot: treeShadow };
+    Object.defineProperty(document, "activeElement", { configurable: true, value: treeHost });
+    const viewport = {
+      ownerDocument: document,
+      focus: vi.fn(),
+      scrollIntoView: vi.fn(),
+      setAttribute: vi.fn(),
+    };
+    await mount(completedJob, true, {
+      createNodeMock: (element) => (element.type === "pre" ? viewport : null),
+    });
+
+    await press("Jump to docs/release.ts");
+    expect(fixture.scrollTo).not.toHaveBeenCalled();
+    treeShadow.activeElement = nextRow;
+    fixture.diffViewerReady = true;
+    await act(async () => renderer.update(view(completedJob)));
+
+    expect(fixture.scrollTo).toHaveBeenCalledExactlyOnceWith({
+      type: "item",
+      id: `${result.resultId}:0`,
+      align: "start",
+    });
+    expect(viewport.scrollIntoView).not.toHaveBeenCalled();
+    expect(viewport.focus).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(treeHost);
+    expect(treeShadow.activeElement).toBe(nextRow);
+  }));
+
+it.each([
+  { savedPatch: patch, summary: "1 file" },
+  { savedPatch: "", summary: "No file changes" },
+])("keeps the saved diff compact when it shows $summary", ({ savedPatch, summary }) =>
+  withClient(async () => {
+    const saved = {
+      ...result,
+      patch: { ...result.patch, sizeBytes: new TextEncoder().encode(savedPatch).length },
+    };
+    fixture.list.mockResolvedValue({
+      results: [saved],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockResolvedValue({ result: saved, patch: savedPatch });
+    await mount(completedJob);
+
+    expect(JSON.stringify(renderer.toJSON())).toContain(summary);
+    expect(findButton("Files")).toBeUndefined();
+    expect(renderer.root.findAllByType("pre")).toHaveLength(savedPatch ? 1 : 0);
+  }),
+);
 
 it("keeps the selected diff visible when completing with an available saved result", () =>
   withClient(async () => {

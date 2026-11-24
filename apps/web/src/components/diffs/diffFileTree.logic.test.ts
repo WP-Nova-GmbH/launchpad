@@ -6,6 +6,7 @@ import {
   buildDiffFileTreeUpdates,
   compareDiffFileTreeEntries,
   collectDirectoryPaths,
+  diffFileTreePathAliases,
   diffFileTreePositions,
   diffFileTreeEntries,
 } from "./diffFileTree.logic";
@@ -58,6 +59,67 @@ describe("collectDirectoryPaths", () => {
       "apps/web/",
       "apps/web/src/",
     ]);
+  });
+});
+
+describe("diffFileTreePathAliases", () => {
+  it("renders distinct labels when ordinary whitespace collapse would hide a difference", () => {
+    const paths = [
+      "docs/release notes.ts",
+      "docs/release  notes.ts",
+      "docs/draft  notes outline.ts",
+      "docs/draft notes  outline.ts",
+      "docs/draft [2 spaces] notes outline.ts",
+      "archive/release  notes.ts",
+    ];
+    const aliases = diffFileTreePathAliases(paths);
+    expect(aliases.size).toBe(3);
+    expect(aliases.get("docs/release  notes.ts")).toBe("docs/release [2 spaces] notes.ts");
+    expect(aliases.get("docs/draft notes  outline.ts")).toBe(
+      "docs/draft notes [2 spaces] outline.ts",
+    );
+    expect(aliases.get("docs/draft  notes outline.ts")).toMatch(
+      /^docs\/draft \[2 spaces\] notes outline\.ts \(file(?: \d+)?\)$/u,
+    );
+
+    const treePaths = paths.map((path) => aliases.get(path) ?? path);
+    const tree = preloadFileTree({ paths: treePaths, initialExpansion: "open" });
+    const labels = [...tree.shadowHtml.matchAll(/aria-label="([^"]+)"/gu)].map(
+      ([, label]) => label,
+    );
+    expect(labels).toContain("release notes.ts");
+    expect(labels).toContain("release [2 spaces] notes.ts");
+    expect(new Set(treePaths).size).toBe(paths.length);
+  });
+
+  it("keeps both sides of file-to-directory changes in the virtualized tree", () => {
+    const paths = [
+      "config",
+      "config/default.ts",
+      "config (file)/existing.ts",
+      "config (file 2)",
+      "packages/config/default.ts",
+      "packages/config",
+    ];
+    const aliases = diffFileTreePathAliases(paths);
+    expect(aliases).toEqual(
+      new Map([
+        ["config", "config (file 3)"],
+        ["packages/config", "packages/config (file)"],
+      ]),
+    );
+
+    // The actual tree rejects a file and directory with the same path.
+    const treePaths = paths.map((path) => aliases.get(path) ?? path);
+    const tree = preloadFileTree({
+      paths: treePaths,
+      initialExpansion: "open",
+      flattenEmptyDirectories: true,
+    });
+    const renderedPaths = [...tree.shadowHtml.matchAll(/data-item-path="([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    expect(renderedPaths).toEqual(expect.arrayContaining(treePaths));
   });
 });
 

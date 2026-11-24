@@ -58,6 +58,42 @@ export function collectDirectoryPaths(paths: ReadonlyArray<string>): ReadonlyArr
   return [...directories];
 }
 
+function visibleFileTreeLabelKey(path: string): string {
+  const nameStart = path.lastIndexOf("/") + 1;
+  return path.slice(0, nameStart) + path.slice(nameStart).trim().replace(/ {2,}/gu, " ");
+}
+
+/** Give files with colliding names or display labels distinct paths in the tree. */
+export function diffFileTreePathAliases(paths: ReadonlyArray<string>): ReadonlyMap<string, string> {
+  const folders = new Set(collectDirectoryPaths(paths).map((path) => path.slice(0, -1)));
+  const reservedLabels = new Set<string>();
+  const ambiguousLabels = new Set<string>();
+  for (const path of [...paths, ...folders]) {
+    const label = visibleFileTreeLabelKey(path);
+    if (reservedLabels.has(label)) ambiguousLabels.add(label);
+    reservedLabels.add(label);
+  }
+
+  const aliases = new Map<string, string>();
+  for (const path of paths) {
+    const nameStart = path.lastIndexOf("/") + 1;
+    const name = path.slice(nameStart);
+    const readableName = ambiguousLabels.has(visibleFileTreeLabelKey(path))
+      ? name.replace(/ {2,}/gu, (spaces) => ` [${spaces.length} spaces] `).trim()
+      : name;
+    if (readableName === name && !folders.has(path)) continue;
+
+    const readablePath = path.slice(0, nameStart) + readableName;
+    let alias = readablePath;
+    for (let suffix = 1; reservedLabels.has(visibleFileTreeLabelKey(alias)); suffix++) {
+      alias = suffix === 1 ? `${readablePath} (file)` : `${readablePath} (file ${suffix})`;
+    }
+    reservedLabels.add(visibleFileTreeLabelKey(alias));
+    aliases.set(path, alias);
+  }
+  return aliases;
+}
+
 /** A folder takes the position of its first file in the diff. */
 export function diffFileTreePositions(paths: ReadonlyArray<string>): ReadonlyMap<string, number> {
   const positions = new Map<string, number>();
