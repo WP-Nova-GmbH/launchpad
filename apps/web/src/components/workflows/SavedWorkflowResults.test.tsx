@@ -2065,85 +2065,118 @@ it("keeps concurrent attachment downloads and retries independent", () =>
     expect(JSON.stringify(renderer.toJSON())).toContain("Release report");
   }));
 
-it.each(["the retried file", "another attachment", "another pane"] as const)(
-  "handles focus on %s when attachment recovery clears saved results",
-  (focusLocation) =>
-    withClient(async () => {
-      const accessibleIndex = {
-        results: [result],
-        nextCursor: null,
-        threadId: "thread",
-        generation: 1,
-      };
-      const accessCheck = deferred<typeof accessibleIndex>();
-      fixture.list.mockResolvedValueOnce(accessibleIndex).mockReturnValueOnce(accessCheck.promise);
-      fixture.download
-        .mockRejectedValueOnce(new Error("Download timed out."))
-        .mockRejectedValueOnce(savedThreadNotFound("read saved thread attachment"));
-      const attachments = ["release-notes", "rollback-steps"].map((id) => ({
-        type: "file",
-        id,
-        name: `${id}.txt`,
-        mimeType: "text/plain",
-        sizeBytes: 1,
-      }));
-      fixture.history.mockResolvedValue({
-        entries: [savedConversationStart(), savedMessage(2, "Release report", attachments)],
+it.each([
+  "the retried file",
+  "another attachment",
+  "another pane",
+  "a newly loaded message",
+  "the end of the conversation",
+] as const)("handles focus on %s when attachment recovery clears saved results", (focusLocation) =>
+  withClient(async () => {
+    const accessibleIndex = {
+      results: [result],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    };
+    const accessCheck = deferred<typeof accessibleIndex>();
+    fixture.list.mockResolvedValueOnce(accessibleIndex).mockReturnValueOnce(accessCheck.promise);
+    fixture.download
+      .mockRejectedValueOnce(new Error("Download timed out."))
+      .mockRejectedValueOnce(savedThreadNotFound("read saved thread attachment"));
+    const attachments = ["release-notes", "rollback-steps"].map((id) => ({
+      type: "file",
+      id,
+      name: `${id}.txt`,
+      mimeType: "text/plain",
+      sizeBytes: 1,
+    }));
+    const pageWhileWaiting =
+      focusLocation === "a newly loaded message" || focusLocation === "the end of the conversation";
+    fixture.history
+      .mockResolvedValueOnce({
+        entries: [
+          savedConversationStart(),
+          savedMessage(2, "Release report", attachments),
+          ...(pageWhileWaiting
+            ? Array.from({ length: 198 }, (_, index) =>
+                historyEntry(index + 3, "thread.meta-updated", { title: "Release notes" }),
+              )
+            : []),
+        ],
+      } satisfies RelayThreadHistoryPage)
+      .mockResolvedValue({
+        entries: focusLocation === "a newly loaded message" ? [savedMessage(201, "Follow-up")] : [],
       } satisfies RelayThreadHistoryPage);
 
-      const body = {};
-      const ownerDocument = { ...document, body, activeElement: body };
-      const downloadMarker = "data-saved-attachment-download";
-      const focusTarget = (attributes: Record<string, unknown> = {}) => {
-        const node = {
-          ownerDocument,
-          hasAttribute: (name: string) => attributes[name] !== undefined,
-          focus: vi.fn(() => {
-            ownerDocument.activeElement = node;
-          }),
-        };
-        return node;
+    const body = {};
+    const ownerDocument = { ...document, body, activeElement: body };
+    const downloadMarker = "data-saved-attachment-download";
+    const focusTarget = (attributes: Record<string, unknown> = {}) => {
+      const node = {
+        ownerDocument,
+        hasAttribute: (name: string) => attributes[name] !== undefined,
+        focus: vi.fn(() => {
+          ownerDocument.activeElement = node;
+        }),
       };
-      const inside = new Set<object>();
-      const pane = Object.assign(focusTarget(), {
-        contains: (node: object) => inside.has(node),
-      });
-      await mount(completedJob, true, {
-        createNodeMock: ({ props }) => {
-          const host = props as { "aria-label"?: string };
-          return host["aria-label"] === "Saved workflow results" ? pane : null;
-        },
-      });
-      await press("Conversation");
+      return node;
+    };
+    const inside = new Set<object>();
+    const pane = Object.assign(focusTarget(), {
+      contains: (node: object) => inside.has(node),
+    });
+    const footer = Object.assign(focusTarget(), { isConnected: true });
+    const pageTarget = focusTarget();
+    inside.add(pageTarget);
+    await mount(completedJob, true, {
+      createNodeMock: ({ type, props }) => {
+        const host = props as { "aria-label"?: string; children?: unknown; size?: string };
+        if (type === "button" && host.size === "compact") return footer;
+        if (type === "div" && host.children === "End of saved conversation") {
+          footer.isConnected = false;
+          if (ownerDocument.activeElement === footer) ownerDocument.activeElement = body;
+          return pageTarget;
+        }
+        if (type === "article") return pageTarget;
+        return host["aria-label"] === "Saved workflow results" ? pane : null;
+      },
+    });
+    await press("Conversation");
 
-      await press("Download release-notes.txt");
-      const current = focusTarget(findButton("Retry download release-notes.txt")!.props);
-      const sibling = focusTarget(findButton("Download rollback-steps.txt")!.props);
-      // A download button in another pane must keep focus even with the same marker.
-      const outside = focusTarget({ [downloadMarker]: "" });
-      inside.add(current);
-      inside.add(sibling);
+    await press("Download release-notes.txt");
+    const current = focusTarget(findButton("Retry download release-notes.txt")!.props);
+    const sibling = focusTarget(findButton("Download rollback-steps.txt")!.props);
+    // A download button in another pane must keep focus even with the same marker.
+    const outside = focusTarget({ [downloadMarker]: "" });
+    inside.add(current);
+    inside.add(sibling);
 
-      current.focus();
-      await press("Retry download release-notes.txt");
-      expect(findButton("Downloading… release-notes.txt")).toBeDefined();
-      expect(fixture.list).toHaveBeenCalledTimes(2);
+    current.focus();
+    await press("Retry download release-notes.txt");
+    expect(findButton("Downloading… release-notes.txt")).toBeDefined();
+    expect(fixture.list).toHaveBeenCalledTimes(2);
+    expect(pane.focus).not.toHaveBeenCalled();
+    if (focusLocation === "another attachment") sibling.focus();
+    if (focusLocation === "another pane") outside.focus();
+    if (pageWhileWaiting) {
+      footer.focus();
+      await press("Load more messages");
+      expect(ownerDocument.activeElement).toBe(pageTarget);
+    }
+    await act(() => accessCheck.reject(savedThreadNotFound("listSavedWorkflowResults")));
+
+    expect(findButton("Retry loading results")).toBeDefined();
+    expect(findButton("Downloading… release-notes.txt")).toBeUndefined();
+    expect(findButton("Download rollback-steps.txt")).toBeUndefined();
+    if (focusLocation === "another pane") {
       expect(pane.focus).not.toHaveBeenCalled();
-      if (focusLocation === "another attachment") sibling.focus();
-      if (focusLocation === "another pane") outside.focus();
-      await act(() => accessCheck.reject(savedThreadNotFound("listSavedWorkflowResults")));
-
-      expect(findButton("Retry loading results")).toBeDefined();
-      expect(findButton("Downloading… release-notes.txt")).toBeUndefined();
-      expect(findButton("Download rollback-steps.txt")).toBeUndefined();
-      if (focusLocation === "another pane") {
-        expect(pane.focus).not.toHaveBeenCalled();
-        expect(ownerDocument.activeElement).toBe(outside);
-      } else {
-        expect(pane.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
-        expect(ownerDocument.activeElement).toBe(pane);
-      }
-    }),
+      expect(ownerDocument.activeElement).toBe(outside);
+    } else {
+      expect(pane.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+      expect(ownerDocument.activeElement).toBe(pane);
+    }
+  }),
 );
 
 it("retries a failed attachment while fetching more saved messages", () =>
@@ -2298,11 +2331,32 @@ it("shows local day headings across message pages without repeating a page's fir
           datedMessage(202, "Verified the release checklist.", secondDay),
         ],
       } satisfies RelayThreadHistoryPage);
-    await mount(completedJob);
+    const body = {};
+    const ownerDocument = { ...document, body, activeElement: body };
+    const pageButton = { ownerDocument, isConnected: false };
+    const firstAppended = {
+      focus: vi.fn(() => {
+        ownerDocument.activeElement = firstAppended;
+      }),
+      scrollIntoView: vi.fn(),
+    };
+    await mount(completedJob, true, {
+      createNodeMock: ({ type, props }) => {
+        const host = props as { size?: string };
+        if (type === "button" && host.size === "compact") return pageButton;
+        if (type === "article") {
+          // The final page replaces the focused button.
+          ownerDocument.activeElement = body;
+          return firstAppended;
+        }
+        return null;
+      },
+    });
     await press("Conversation");
 
     expect(headings()).toEqual([firstDate]);
     const firstArticle = renderer.root.findByType("article");
+    ownerDocument.activeElement = pageButton;
     await press("Load more messages");
 
     expect(headings()).toEqual([firstDate, secondDate]);
@@ -2313,6 +2367,11 @@ it("shows local day headings across message pages without repeating a page's fir
       "Added the import change.",
       "Verified the release checklist.",
     ]);
+    expect(articles[1]?.props.tabIndex).toBe(-1);
+    expect(ownerDocument.activeElement).toBe(firstAppended);
+    expect(firstAppended.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "nearest" });
+    expect(findButton("Load more messages")).toBeUndefined();
+    expect(JSON.stringify(renderer.toJSON())).toContain("End of saved conversation");
   }));
 
 it.each(["result", "message"] as const)(
@@ -2471,10 +2530,98 @@ it("keeps an open transcript in the current time zone after the window regains f
     }
   }));
 
+it.each(["initial retry", "final page"] as const)(
+  "keeps focus in Saved results when the loading button remounts during the %s",
+  (phase) =>
+    withClient(async () => {
+      const loading = deferred<RelayThreadHistoryPage>();
+      if (phase === "initial retry") {
+        fixture.history.mockRejectedValueOnce(new Error("Conversation timed out."));
+      } else {
+        fixture.history.mockResolvedValueOnce({
+          entries: [
+            savedConversationStart(),
+            savedMessage(2, "First message"),
+            ...Array.from({ length: 198 }, (_, index) =>
+              historyEntry(index + 3, "thread.meta-updated", { title: "Release notes" }),
+            ),
+          ],
+        } satisfies RelayThreadHistoryPage);
+      }
+      fixture.history.mockReturnValueOnce(loading.promise);
+
+      const body = {};
+      const ownerDocument = { ...document, body, activeElement: body };
+      const focusTarget = () => {
+        const node = {
+          ownerDocument,
+          isConnected: true,
+          focus: vi.fn(() => {
+            ownerDocument.activeElement = node;
+          }),
+        };
+        return node;
+      };
+      const original = focusTarget();
+      const remounted = focusTarget();
+      const pane = focusTarget();
+      const end = focusTarget();
+      let visibleButton = original;
+      await mount(completedJob, true, {
+        createNodeMock: ({ type, props }) => {
+          const host = props as { "aria-label"?: string; children?: unknown; size?: string };
+          const children = Array.isArray(host.children) ? host.children : [host.children];
+          if (
+            type === "button" &&
+            (host.size === "compact" ||
+              children.includes("Retry conversation") ||
+              children.includes("Loading conversation…"))
+          )
+            return visibleButton;
+          if (type === "div" && host.children === "End of saved conversation") {
+            remounted.isConnected = false;
+            if (ownerDocument.activeElement === remounted) ownerDocument.activeElement = body;
+            return end;
+          }
+          return host["aria-label"] === "Saved workflow results" ? pane : null;
+        },
+      });
+      await press("Conversation");
+      original.focus();
+      await press(phase === "initial retry" ? "Retry conversation" : "Load more messages");
+      const loadingLabel =
+        phase === "initial retry" ? "Loading conversation…" : "Loading more messages…";
+      const originalLoadingButton = findButton(loadingLabel);
+
+      await press("Changes");
+      original.isConnected = false;
+      ownerDocument.activeElement = body;
+      visibleButton = remounted;
+      await press("Conversation");
+      expect(findButton(loadingLabel)).toBeDefined();
+      expect(findButton(loadingLabel)).not.toBe(originalLoadingButton);
+      remounted.focus();
+
+      await act(() =>
+        loading.resolve({
+          entries: phase === "initial retry" ? [] : [savedMessage(201, "New message")],
+        }),
+      );
+      expect(fixture.history).toHaveBeenCalledTimes(2);
+      expect(findButton(loadingLabel)).toBeUndefined();
+      expect(ownerDocument.activeElement).toBe(phase === "initial retry" ? pane : end);
+      expect(
+        renderer.root.findAllByType("article").some(({ props }) => props.tabIndex === -1),
+      ).toBe(false);
+    }),
+);
+
 it("retries the failed conversation page without replacing the messages already shown", () =>
   withClient(async () => {
     const firstMessage = "The release notes are ready.";
     const nextMessage = "The rollback steps are included.";
+    const failedPage = deferred<RelayThreadHistoryPage>();
+    const retry = deferred<RelayThreadHistoryPage>();
     fixture.history
       .mockResolvedValueOnce({
         entries: [
@@ -2485,9 +2632,14 @@ it("retries the failed conversation page without replacing the messages already 
           ),
         ],
       } satisfies RelayThreadHistoryPage)
-      .mockRejectedValueOnce(new Error("The next history page was unavailable."));
-    const retry = deferred<RelayThreadHistoryPage>();
-    fixture.history.mockReturnValueOnce(retry.promise);
+      .mockReturnValueOnce(failedPage.promise)
+      .mockReturnValueOnce(retry.promise)
+      .mockResolvedValueOnce({
+        entries: Array.from({ length: 200 }, (_, index) =>
+          historyEntry(index + 401, "thread.meta-updated", { title: "Release notes" }),
+        ),
+      } satisfies RelayThreadHistoryPage)
+      .mockResolvedValueOnce({ entries: [] });
     const body = {};
     const ownerDocument = { ...document, body, activeElement: body };
     const focusTarget = () => {
@@ -2496,37 +2648,49 @@ it("retries the failed conversation page without replacing the messages already 
         focus: vi.fn(() => {
           ownerDocument.activeElement = node;
         }),
+        scrollIntoView: vi.fn(),
       };
       return node;
     };
-    const retryControl = focusTarget();
+    const footerButton = Object.assign(focusTarget(), { isConnected: true });
     const continuation = focusTarget();
+    const end = focusTarget();
     const pane = focusTarget();
     await mount(completedJob, true, {
       createNodeMock: ({ type, props }) => {
-        const host = props as { children?: unknown; "aria-label"?: string };
+        const host = props as { children?: unknown; "aria-label"?: string; size?: string };
         const children = Array.isArray(host.children) ? host.children : [host.children];
-        if (type === "button" && children.includes("Retry loading more messages"))
-          return retryControl;
-        if (type === "button" && children.includes("Load more messages")) {
-          // The browser blurs the old retry control when the next page replaces it.
-          if (ownerDocument.activeElement === retryControl) ownerDocument.activeElement = body;
-          return continuation;
+        if (type === "button" && host.size === "compact") return footerButton;
+        if (type === "article") return continuation;
+        if (type === "div" && children.includes("End of saved conversation")) {
+          // Removing a focused footer button gives focus back to the document.
+          footerButton.isConnected = false;
+          if (ownerDocument.activeElement === footerButton) ownerDocument.activeElement = body;
+          return end;
         }
         return host["aria-label"] === "Saved workflow results" ? pane : null;
       },
     });
     await press("Conversation");
+    const originalArticle = renderer.root.findByType("article");
+    const originalButton = findButton("Load more messages");
+    footerButton.focus();
     await press("Load more messages");
 
     const content = () =>
       JSON.stringify(renderer.toJSON(), (key, value) => (key === "ref" ? undefined : value));
+    expect(findButton("Loading more messages…")).toBe(originalButton);
+    expect(ownerDocument.activeElement).toBe(footerButton);
+    await act(() => failedPage.reject(new Error("The next history page was unavailable.")));
+
     expect(content()).toContain("Couldn’t load more messages");
+    expect(content()).toContain("The next history page was unavailable.");
     expect(content()).toContain(firstMessage);
-    retryControl.focus();
-    await act(() => {
-      void findButton("Retry loading more messages")!.props.onClick();
-    });
+    expect(findButton("Retry loading more messages")).toBe(originalButton);
+    expect(renderer.root.findByType("article")).toBe(originalArticle);
+    expect(ownerDocument.activeElement).toBe(footerButton);
+    await press("Retry loading more messages");
+    expect(findButton("Loading more messages…")).toBe(originalButton);
     expect(content()).toContain(firstMessage);
 
     await act(() =>
@@ -2540,10 +2704,26 @@ it("retries the failed conversation page without replacing the messages already 
       }),
     );
     expect(ownerDocument.activeElement).toBe(continuation);
+    expect(continuation.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "nearest" });
     expect(content()).toContain(firstMessage);
     expect(content()).toContain(nextMessage);
+    expect(renderer.root.findAllByType("article")[0]).toBe(originalArticle);
     expect(findButton("Retry loading more messages")).toBeUndefined();
-    expect(fixture.history.mock.calls.map(([input]) => input.after)).toEqual([0, 200, 200]);
+    expect(findButton("Load more messages")).toBe(originalButton);
+
+    footerButton.focus();
+    await press("Load more messages");
+    expect(renderer.root.findAllByType("article")).toHaveLength(2);
+    expect(findButton("Load more messages")).toBe(originalButton);
+    expect(ownerDocument.activeElement).toBe(footerButton);
+
+    await press("Load more messages");
+    expect(findButton("Load more messages")).toBeUndefined();
+    expect(content()).toContain("End of saved conversation");
+    expect(ownerDocument.activeElement).toBe(end);
+    expect(fixture.history.mock.calls.map(([input]) => input.after)).toEqual([
+      0, 200, 200, 400, 600,
+    ]);
     expect(fixture.read).toHaveBeenCalledOnce();
     expect(fixture.list).toHaveBeenCalledOnce();
   }));

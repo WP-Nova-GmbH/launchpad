@@ -51,6 +51,8 @@ import {
   type WorkflowResultCheckpoint,
 } from "@t3tools/client-runtime/relay/workflow-result";
 import {
+  ChevronDownIcon,
+  CircleAlertIcon,
   Columns2Icon,
   FileCheck2Icon,
   FileDiffIcon,
@@ -86,6 +88,7 @@ import {
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { SavedWorkflowResultPicker } from "./SavedWorkflowResultPicker";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
@@ -247,6 +250,8 @@ export function SavedWorkflowResults({
     resultId: string;
     history: PortableThreadHistory;
     more: boolean;
+    paged: boolean;
+    focusMessageId: string | undefined;
   } | null>(null);
   const [indexError, setIndexError] = useState<string | null>(null);
   const [changesError, setChangesError] = useState<string | null>(null);
@@ -271,9 +276,10 @@ export function SavedWorkflowResults({
   const savedResults = resultsRef ?? localResultsRef;
   const indexRetryButton = useRef<HTMLButtonElement>(null);
   const changesRetryButton = useRef<HTMLButtonElement>(null);
+  const conversationRetryButton = useRef<HTMLButtonElement>(null);
   const conversationPageButton = useRef<HTMLButtonElement>(null);
   const conversationEnd = useRef<HTMLDivElement>(null);
-  const restorePageRetryFocus = useRef(false);
+  const firstLoadedMessage = useRef<HTMLElement>(null);
   const restoreReadFocus = useCallback(
     (button: HTMLButtonElement | null) => {
       if (button && button.ownerDocument?.activeElement === button)
@@ -287,13 +293,7 @@ export function SavedWorkflowResults({
     },
     [restoreReadFocus],
   );
-  useLayoutEffect(() => {
-    if (!restorePageRetryFocus.current) return;
-    restorePageRetryFocus.current = false;
-    const target = conversationPageButton.current ?? conversationEnd.current;
-    if (target && target.ownerDocument?.activeElement === target.ownerDocument?.body)
-      target.focus();
-  }, [conversation, conversationError]);
+
   const deletionStatus = useRef<HTMLDivElement>(null);
   const partialResultToggle = useRef<HTMLButtonElement>(null);
   const restorePickerFocus = useRef(false);
@@ -400,6 +400,11 @@ export function SavedWorkflowResults({
   );
   const latestContentRead = useRef<typeof contentRead>(null);
   const conversationRequest = useRef<symbol | null>(null);
+  const pendingConversationFocus = useRef<{
+    read: NonNullable<typeof contentRead>;
+    conversation: NonNullable<typeof conversation>;
+    button: HTMLButtonElement;
+  } | null>(null);
   const attachmentRequests = useRef(new Map<string, NonNullable<typeof contentRead>>());
   useLayoutEffect(() => {
     latestContentRead.current = contentRead;
@@ -411,6 +416,7 @@ export function SavedWorkflowResults({
     return () => {
       latestContentRead.current = null;
       conversationRequest.current = null;
+      pendingConversationFocus.current = null;
     };
   }, [contentRead]);
   const clearSavedResults = useCallback(() => {
@@ -418,7 +424,12 @@ export function SavedWorkflowResults({
     const focused = section?.ownerDocument?.activeElement;
     if (
       section &&
-      focused?.hasAttribute("data-saved-attachment-download") &&
+      focused &&
+      (focused === conversationPageButton.current ||
+        focused === conversationRetryButton.current ||
+        focused === firstLoadedMessage.current ||
+        focused === conversationEnd.current ||
+        focused.hasAttribute("data-saved-attachment-download")) &&
       section.contains(focused)
     )
       section.focus({ preventScroll: true });
@@ -429,6 +440,7 @@ export function SavedWorkflowResults({
     generation.current++;
     latestContentRead.current = null;
     conversationRequest.current = null;
+    pendingConversationFocus.current = null;
     setLoaded(null);
     setRenderedReview(null);
     setConversation(null);
@@ -636,6 +648,28 @@ export function SavedWorkflowResults({
       : currentWorkflowSavedResult(job, results);
   const partialResult = cancelled && currentResult?.outcome === "cancelled" ? currentResult : null;
   const partialResultHidden = !!partialResult && !partialResultOpen;
+  useLayoutEffect(() => {
+    const pending = pendingConversationFocus.current;
+    pendingConversationFocus.current = null;
+    if (
+      !pending ||
+      pending.conversation !== conversation ||
+      pending.read !== contentRead ||
+      view !== "conversation" ||
+      partialResultHidden
+    )
+      return;
+    const { button } = pending;
+    const focused = focusedElement(button.ownerDocument);
+    if (
+      focused !== button &&
+      (focused !== button.ownerDocument.body || button.isConnected || conversation.more)
+    )
+      return;
+    const target = firstLoadedMessage.current ?? conversationEnd.current;
+    target?.focus({ preventScroll: true });
+    target?.scrollIntoView?.({ block: "nearest" });
+  }, [contentRead, conversation, partialResultHidden, view]);
   const pickerKey = index?.results.length && !partialResultHidden ? resultsScope : null;
   useLayoutEffect(() => {
     if (restorePickerFocus.current) {
@@ -936,6 +970,7 @@ export function SavedWorkflowResults({
       const previous =
         conversation?.resultId === contentRead.result.resultId ? conversation.history : null;
       if (more && !previous) return;
+      const sourceButton = more ? conversationPageButton.current : null;
       const request = Symbol();
       const owns = () =>
         active.current &&
@@ -962,22 +997,35 @@ export function SavedWorkflowResults({
           }),
         );
         if (owns()) {
-          const button = conversationPageButton.current;
-          if (!more) restoreReadFocus(button);
-          else if (!next.more || conversationError)
-            restorePageRetryFocus.current =
-              !!button && button.ownerDocument?.activeElement === button;
+          if (!more) restoreReadFocus(conversationRetryButton.current);
+          const pageButton = more ? conversationPageButton.current : null;
+          const focusedFooter =
+            pageButton && focusedElement(pageButton.ownerDocument) === pageButton
+              ? pageButton
+              : null;
+          let focusMessageId: string | undefined;
+          if (focusedFooter && focusedFooter === sourceButton) {
+            // History events can update or remove rows without adding a visible message.
+            const seen = new Set(previous?.thread?.messages.map(({ id }) => id));
+            focusMessageId = next.history.thread?.messages.find(({ id }) => !seen.has(id))?.id;
+          }
+          const loadedConversation = {
+            resultId: contentRead.result.resultId,
+            ...next,
+            paged: more,
+            focusMessageId,
+          };
+          if (focusedFooter && (focusMessageId || !next.more))
+            pendingConversationFocus.current = {
+              read: contentRead,
+              conversation: loadedConversation,
+              button: focusedFooter,
+            };
           setConversationError(null);
-          setConversation({ resultId: contentRead.result.resultId, ...next });
+          setConversation(loadedConversation);
         }
       } catch (cause) {
         if (!(await recoverContentRead(contentRead, epoch, cause, relayChanged)) && owns()) {
-          const button = conversationPageButton.current;
-          restorePageRetryFocus.current =
-            more &&
-            !conversationError &&
-            !!button &&
-            button.ownerDocument?.activeElement === button;
           setConversationError({ more, detail: workflowError(cause) });
         }
       } finally {
@@ -993,7 +1041,6 @@ export function SavedWorkflowResults({
       job.jobId,
       scope.repositoryId,
       conversation,
-      conversationError,
       recoverContentRead,
       restoreReadFocus,
     ],
@@ -1265,24 +1312,8 @@ export function SavedWorkflowResults({
       deletionInFlight.current = false;
     }
   };
-  const conversationRetry = (more: boolean) => (
-    <Button
-      ref={conversationPageButton}
-      size="sm"
-      variant="outline"
-      aria-disabled={readingConversation !== null || undefined}
-      onClick={() => void readConversation(more)}
-    >
-      <RotateCwIcon aria-hidden />
-      {more
-        ? readingConversation
-          ? "Loading more messages…"
-          : "Retry loading more messages"
-        : readingConversation
-          ? "Loading conversation…"
-          : "Retry conversation"}
-    </Button>
-  );
+  const loadingMoreMessages = readingConversation === "more";
+  const moreMessagesError = conversationError?.more ? conversationError : null;
   const messages = conversation?.history.thread?.messages;
   const timeZone = useSyncExternalStore(
     subscribeToLocalTimeZone,
@@ -1619,7 +1650,18 @@ export function SavedWorkflowResults({
             {conversationError && !conversationError.more ? (
               <WorkflowAlert
                 title="Couldn’t load the conversation"
-                actions={conversationRetry(false)}
+                actions={
+                  <Button
+                    ref={conversationRetryButton}
+                    size="sm"
+                    variant="outline"
+                    aria-disabled={readingConversation !== null || undefined}
+                    onClick={() => void readConversation()}
+                  >
+                    <RotateCwIcon aria-hidden />
+                    {readingConversation ? "Loading conversation…" : "Retry conversation"}
+                  </Button>
+                }
               >
                 {conversationError.detail}
               </WorkflowAlert>
@@ -1630,7 +1672,7 @@ export function SavedWorkflowResults({
             ) : null}
             {conversation?.resultId === result.resultId ? (
               <div className="space-y-4 py-2">
-                {!messages?.length ? (
+                {!messages?.length && !conversation.more ? (
                   <p className="text-sm text-muted-foreground">
                     No saved messages for this Agent result.
                   </p>
@@ -1649,40 +1691,82 @@ export function SavedWorkflowResults({
                         viewerAccountId={scope.accountId}
                         timeZone={timeZone}
                         busy={readingConversation !== null}
+                        focusRef={
+                          message.id === conversation.focusMessageId
+                            ? firstLoadedMessage
+                            : undefined
+                        }
                         attachmentDownloads={attachmentDownloads}
                         onDownload={download}
                       />
                     </Fragment>
                   );
                 })}
-                {conversationError?.more ? (
-                  <WorkflowAlert
-                    title="Couldn’t load more messages"
-                    actions={conversationRetry(true)}
-                  >
-                    {conversationError.detail}
-                  </WorkflowAlert>
-                ) : conversation.more ? (
-                  <Button
-                    ref={conversationPageButton}
-                    size="sm"
-                    variant="outline"
-                    aria-disabled={readingConversation !== null || undefined}
-                    onClick={() => void readConversation(true)}
-                  >
-                    {readingConversation === "more"
-                      ? "Loading more messages…"
-                      : "Load more messages"}
-                  </Button>
-                ) : (
-                  <div
-                    ref={conversationEnd}
-                    tabIndex={-1}
-                    className="sr-only text-sm text-muted-foreground focus:not-sr-only"
-                  >
-                    End of saved conversation.
+                {conversation.more || conversation.paged ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3 [overflow-anchor:none]">
+                    <div
+                      role="status"
+                      className={
+                        moreMessagesError && !loadingMoreMessages ? "min-w-0 space-y-1" : "sr-only"
+                      }
+                    >
+                      {loadingMoreMessages ? (
+                        "Loading more messages…"
+                      ) : moreMessagesError ? (
+                        <>
+                          <p className="flex items-center gap-2 text-xs font-medium text-destructive-foreground">
+                            <CircleAlertIcon aria-hidden className="size-4 shrink-0" />
+                            Couldn’t load more messages
+                          </p>
+                          <p className="text-xs text-muted-foreground wrap-anywhere">
+                            {moreMessagesError.detail}
+                          </p>
+                        </>
+                      ) : null}
+                    </div>
+                    {conversation.more ? (
+                      <Button
+                        ref={conversationPageButton}
+                        size="compact"
+                        variant="outline"
+                        aria-disabled={loadingMoreMessages || undefined}
+                        aria-label={
+                          moreMessagesError && !loadingMoreMessages
+                            ? "Retry loading more messages"
+                            : undefined
+                        }
+                        onClick={() => {
+                          if (!loadingMoreMessages) void readConversation(true);
+                        }}
+                      >
+                        {loadingMoreMessages ? (
+                          <>
+                            <Spinner aria-hidden aria-label={undefined} role={undefined} />
+                            Loading more messages…
+                          </>
+                        ) : moreMessagesError ? (
+                          <>
+                            <RotateCwIcon aria-hidden />
+                            Retry
+                          </>
+                        ) : (
+                          <>
+                            <ChevronDownIcon aria-hidden />
+                            Load more messages
+                          </>
+                        )}
+                      </Button>
+                    ) : (
+                      <div
+                        ref={conversationEnd}
+                        tabIndex={-1}
+                        className="text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring"
+                      >
+                        End of saved conversation
+                      </div>
+                    )}
                   </div>
-                )}
+                ) : null}
               </div>
             ) : null}
           </>

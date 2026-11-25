@@ -1,6 +1,6 @@
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import { DownloadIcon, FileTextIcon, ImageIcon, RefreshCwIcon } from "lucide-react";
-import { memo } from "react";
+import { memo, type Ref } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { OrchestrationMessage, ChatAttachment } from "@t3tools/contracts";
@@ -20,6 +20,7 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
   attachmentDownloads,
   viewerAccountId,
   timeZone,
+  focusRef,
   onDownload,
 }: {
   message: OrchestrationMessage;
@@ -27,6 +28,7 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
   attachmentDownloads?: ReadonlyMap<string, AttachmentDownloadState>;
   viewerAccountId?: string;
   timeZone?: string;
+  focusRef?: Ref<HTMLElement> | undefined;
   onDownload: (file: ChatAttachment) => Promise<void>;
 }) {
   const isUser = message.role === "user";
@@ -134,7 +136,15 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
     </>
   );
   return (
-    <article className={messageClass}>
+    <article
+      ref={focusRef}
+      tabIndex={focusRef ? -1 : undefined}
+      className={
+        focusRef
+          ? `${messageClass} focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring`
+          : messageClass
+      }
+    >
       <div className="mb-1 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-muted-foreground">
         <span className="font-medium text-foreground">{authorLabel}</span>
         {sentAt ? (
