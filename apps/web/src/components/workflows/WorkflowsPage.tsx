@@ -833,193 +833,183 @@ function WorkflowRepositoryView({
     if (!entries.length) return null;
 
     return (
-      <div className="grid gap-x-4 @min-[34rem]/workflow-catalog:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_clamp(11rem,25%,13rem)]">
-        <div
-          aria-hidden
-          className="col-span-full hidden grid-cols-subgrid border-b pb-2 text-xs text-muted-foreground @min-[34rem]/workflow-catalog:grid"
-        >
-          <span>Workflow</span>
-          <span>Trigger</span>
-        </div>
-        <ul
-          role="list"
-          aria-label={archived ? "Archived workflows" : "Workflows"}
-          className="col-span-full grid grid-cols-subgrid"
-        >
-          {entries.map((workflow) => {
-            const key = workflowSessionKey(scope, workflow.workflowId);
-            const local = drafts.editors[key];
-            const editorDirty = !!local && workflowEditorDirty(local);
-            const runDraft = drafts.runs[key];
-            const { name, target } = workflow.definition;
-            const machineProject =
-              target.kind === "machine"
-                ? projects.find(
-                    (project) =>
-                      project.environmentId === target.environmentId &&
-                      project.projectId === target.projectId,
-                  )
-                : undefined;
-            const restoreIssue =
-              archived && restoreCheckoutIssue(workflow, projects, projectsUnavailable);
-            const restoreBlocked = !!restoreIssue && !local?.operation;
-            const canRecoverInVm =
-              restoreIssue === "missing" &&
-              projects.length === 0 &&
-              !!vmAuthoring &&
-              vmExecutionAvailable;
-            const restoreHint = `workflow-restore-${workflow.workflowId}`;
-            const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
-            const canStartRun = !archived && !vmUnavailable;
-            const hasRunSubmission = hasWorkflowRunSubmission(runDraft, canStartRun);
-            const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
-            const runLabel = hasRunSubmission
-              ? "View run submission"
-              : hasRetainedInstructions
-                ? "View retained instructions"
-                : "Run";
-            const summary = summaries.find(
-              (item) =>
-                item.workflowId === workflow.workflowId && item.revision === workflow.revision,
-            );
-            const trigger = workflow.automation?.trigger;
-            const triggerState = automationSupported ? summary?.state : undefined;
-            const triggerLabel = archived
-              ? trigger
-                ? "Automatic triggering off"
-                : "Manual run"
-              : !automationSupported
-                ? "Automation state unavailable on this relay"
-                : triggerState === "on"
-                  ? "Automatic"
-                  : triggerState === "off"
-                    ? trigger
-                      ? "Automatic triggering off"
-                      : "Manual run"
-                    : triggerState === "needs_attention"
-                      ? "Needs attention"
-                      : "Automation state unavailable";
-            const triggerIssue = local?.error ?? summary?.reason;
-            const canToggle =
-              canConfigure &&
-              automationSupported &&
-              !archived &&
-              (!!workflow.automation?.enabled || canEnableTarget(workflow, local?.definition));
-            const canCopy =
-              copyRepositories.length > 0 && (target.kind === "machine" || !!vmAuthoring);
+      <ul
+        role="list"
+        aria-label={archived ? "Archived workflows" : "Workflows"}
+        className="grid gap-y-px"
+      >
+        {entries.map((workflow) => {
+          const key = workflowSessionKey(scope, workflow.workflowId);
+          const local = drafts.editors[key];
+          const editorDirty = !!local && workflowEditorDirty(local);
+          const runDraft = drafts.runs[key];
+          const { name, target } = workflow.definition;
+          const machineProject =
+            target.kind === "machine"
+              ? projects.find(
+                  (project) =>
+                    project.environmentId === target.environmentId &&
+                    project.projectId === target.projectId,
+                )
+              : undefined;
+          const restoreIssue =
+            archived && restoreCheckoutIssue(workflow, projects, projectsUnavailable);
+          const restoreBlocked = !!restoreIssue && !local?.operation;
+          const canRecoverInVm =
+            restoreIssue === "missing" &&
+            projects.length === 0 &&
+            !!vmAuthoring &&
+            vmExecutionAvailable;
+          const restoreHint = `workflow-restore-${workflow.workflowId}`;
+          const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
+          const canStartRun = !archived && !vmUnavailable;
+          const hasRunSubmission = hasWorkflowRunSubmission(runDraft, canStartRun);
+          const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
+          const runLabel = hasRunSubmission
+            ? "View run submission"
+            : hasRetainedInstructions
+              ? "View retained instructions"
+              : "Run";
+          const summary = summaries.find(
+            (item) =>
+              item.workflowId === workflow.workflowId && item.revision === workflow.revision,
+          );
+          const trigger = workflow.automation?.trigger;
+          const triggerState = automationSupported ? summary?.state : undefined;
+          const triggerLabel = archived
+            ? trigger
+              ? "Automatic triggering off"
+              : "Manual run"
+            : !automationSupported
+              ? "Automation state unavailable on this relay"
+              : triggerState === "on"
+                ? "Automatic"
+                : triggerState === "off"
+                  ? trigger
+                    ? "Automatic triggering off"
+                    : "Manual run"
+                  : triggerState === "needs_attention"
+                    ? "Needs attention"
+                    : "Automation state unavailable";
+          const triggerIssue = local?.error ?? summary?.reason;
+          const triggerReason = !archived && !local?.error ? triggerIssue : undefined;
+          const showTriggerSettings =
+            !archived && canConfigure && (!!triggerIssue || triggerState === "needs_attention");
+          const canToggle =
+            canConfigure &&
+            automationSupported &&
+            !archived &&
+            (!!workflow.automation?.enabled || canEnableTarget(workflow, local?.definition));
+          const canCopy =
+            copyRepositories.length > 0 && (target.kind === "machine" || !!vmAuthoring);
 
-            return (
-              <li
-                key={workflow.workflowId}
-                className={cn(
-                  "relative col-span-full grid grid-cols-subgrid items-start gap-y-3 border-b py-3 last:border-b-0",
-                  canConfigure && "cursor-pointer hover:bg-accent/35",
-                )}
-                onClick={canConfigure ? openWorkflowEditorFromRow : undefined}
-              >
-                <div className="min-w-0 space-y-1 wrap-anywhere">
-                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 @min-[34rem]/workflow-catalog:pt-1.5 sm:@min-[34rem]/workflow-catalog:pt-1">
-                    {canConfigure ? (
-                      <Link
-                        to="/workflows/$repositoryId/$workflowId/edit"
-                        params={{
-                          repositoryId: scope.repositoryId,
-                          workflowId: workflow.workflowId,
-                        }}
-                        aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
-                        className="text-sm font-medium before:pointer-events-none before:absolute before:inset-0 before:rounded-sm focus-visible:outline-none focus-visible:before:ring-2 focus-visible:before:ring-ring focus-visible:before:ring-inset"
-                        data-workflow-edit-link
-                        ref={
-                          !archived && restoreFocusId === workflow.workflowId
-                            ? restoredWorkflowEdit
-                            : undefined
-                        }
-                      >
-                        {name}
-                      </Link>
-                    ) : (
-                      <p className="text-sm font-medium">{name}</p>
-                    )}
-                    {editorDirty ? (
-                      <span className="text-xs text-muted-foreground">Unsaved changes</span>
-                    ) : null}
-                  </div>
-                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    {target.kind === "vm" ? (
-                      <>
-                        <span className="inline-flex items-center gap-1.5">
-                          <CloudIcon aria-hidden className="size-3.5 shrink-0" />
-                          VM
-                        </span>
-                        <span className="inline-flex min-w-0 items-center gap-1.5">
-                          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
-                          <span>
-                            <span className="sr-only">Base branch: </span>
-                            {target.baseBranch ?? "Repository default"}
-                          </span>
-                        </span>
-                      </>
-                    ) : machineProject ? (
-                      <span className="inline-flex min-w-0 items-center gap-1.5">
-                        <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
-                        <span>
-                          {machineProject.machineLabel} / {machineProject.title}
-                        </span>
-                      </span>
-                    ) : canConfigure && restoreBlocked ? (
-                      <span className="inline-flex items-center gap-1.5">
-                        <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
-                        Machine
-                      </span>
-                    ) : (
-                      <span>
-                        {projectsUnavailable
-                          ? "Machine target not verified"
-                          : "Machine target unavailable"}
-                      </span>
-                    )}
-                  </div>
-                  {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
-                    <p className="text-xs text-muted-foreground">VM execution unavailable</p>
+          return (
+            <li
+              key={workflow.workflowId}
+              className={cn(
+                "relative grid grid-cols-1 items-center gap-x-4 gap-y-2 rounded-md py-2.5 @min-[34rem]/workflow-catalog:grid-cols-[minmax(0,1fr)_fit-content(45%)]",
+                "after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:border-b after:border-border last:after:hidden",
+                compactCatalogHeader ? "px-2" : "px-3",
+                canConfigure && "cursor-pointer hover:bg-accent/35",
+              )}
+              onClick={canConfigure ? openWorkflowEditorFromRow : undefined}
+            >
+              <div className="min-w-0 space-y-1 wrap-anywhere">
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                  {canConfigure ? (
+                    <Link
+                      to="/workflows/$repositoryId/$workflowId/edit"
+                      params={{
+                        repositoryId: scope.repositoryId,
+                        workflowId: workflow.workflowId,
+                      }}
+                      aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
+                      className="text-sm font-medium before:pointer-events-none before:absolute before:inset-0 before:rounded-md focus-visible:outline-none focus-visible:before:ring-2 focus-visible:before:ring-ring focus-visible:before:ring-inset"
+                      data-workflow-edit-link
+                      ref={
+                        !archived && restoreFocusId === workflow.workflowId
+                          ? restoredWorkflowEdit
+                          : undefined
+                      }
+                    >
+                      {name}
+                    </Link>
+                  ) : (
+                    <p className="text-sm font-medium">{name}</p>
+                  )}
+                  {editorDirty ? (
+                    <span className="text-xs text-muted-foreground">Unsaved changes</span>
                   ) : null}
                 </div>
-                <div className="min-w-0 space-y-1 wrap-anywhere">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
                   <div
                     role="status"
                     aria-atomic="true"
-                    className="space-y-1 @min-[34rem]/workflow-catalog:pt-1.5 sm:@min-[34rem]/workflow-catalog:pt-1"
+                    className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1"
                   >
-                    <p
+                    <span
                       className={
                         triggerState === "needs_attention"
-                          ? "text-sm font-medium text-warning-foreground"
-                          : "text-sm"
+                          ? "font-medium text-warning-foreground"
+                          : undefined
                       }
                     >
                       <span className="sr-only">{name}: </span>
                       {triggerLabel}
-                    </p>
-                    {trigger ? (
-                      <p className="text-xs text-muted-foreground">
-                        {workflowTriggerLabel(trigger)}
-                      </p>
-                    ) : null}
-                    {!archived && triggerIssue && !local?.error ? (
-                      <p className="text-xs text-muted-foreground">{triggerIssue}</p>
-                    ) : null}
+                    </span>
+                    {trigger ? <span>{workflowTriggerLabel(trigger)}</span> : null}
+                    {/* Keep refresh updates in the persistent trigger announcement. */}
+                    {triggerReason ? <span className="sr-only">{triggerReason}</span> : null}
                   </div>
-                  {!archived && local?.error ? (
-                    <div role="alert" className="cursor-auto text-xs">
-                      <p className="font-medium text-error-foreground">
-                        Workflow change not confirmed
-                      </p>
-                      <p className="text-muted-foreground">{local.error}</p>
-                    </div>
-                  ) : null}
-                  {!archived &&
-                  canConfigure &&
-                  (triggerIssue || triggerState === "needs_attention") ? (
-                    <div className="w-fit pt-1">
+                  {target.kind === "vm" ? (
+                    <>
+                      <span className="inline-flex items-center gap-1.5">
+                        <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+                        VM
+                      </span>
+                      <span className="inline-flex min-w-0 items-center gap-1.5">
+                        <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+                        <span>
+                          <span className="sr-only">Base branch: </span>
+                          {target.baseBranch ?? "Repository default"}
+                        </span>
+                      </span>
+                    </>
+                  ) : machineProject ? (
+                    <span className="inline-flex min-w-0 items-center gap-1.5">
+                      <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                      <span>
+                        {machineProject.machineLabel} / {machineProject.title}
+                      </span>
+                    </span>
+                  ) : canConfigure && restoreBlocked ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                      Machine
+                    </span>
+                  ) : (
+                    <span>
+                      {projectsUnavailable
+                        ? "Machine target not verified"
+                        : "Machine target unavailable"}
+                    </span>
+                  )}
+                </div>
+                {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
+                  <p className="text-xs text-muted-foreground">VM execution unavailable</p>
+                ) : null}
+                {!archived && local?.error ? (
+                  <div role="alert" className="cursor-auto text-xs">
+                    <p className="font-medium text-error-foreground">
+                      Workflow change not confirmed
+                    </p>
+                    <p className="text-muted-foreground">{local.error}</p>
+                  </div>
+                ) : null}
+                {triggerReason || showTriggerSettings ? (
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                    {triggerReason ? <p aria-hidden>{triggerReason}</p> : null}
+                    {showTriggerSettings ? (
                       <Button
                         variant="ghost"
                         size="compact"
@@ -1028,198 +1018,192 @@ function WorkflowRepositoryView({
                       >
                         Trigger settings
                       </Button>
-                    </div>
-                  ) : null}
-                </div>
-                <div
-                  data-workflow-row-actions
-                  className="flex w-fit min-w-0 max-w-full cursor-auto flex-wrap items-center gap-2 empty:hidden pointer-coarse:gap-4 @min-[34rem]/workflow-catalog:justify-end @min-[34rem]/workflow-catalog:justify-self-end [&>button]:max-w-full"
-                >
-                  {archived && canConfigure ? (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      aria-label={
-                        local?.operation?.state === "pending"
-                          ? `Saving ${name}`
-                          : local?.operation
-                            ? `Retry save for ${name}`
-                            : `Restore ${name}`
-                      }
-                      aria-describedby={restoreBlocked ? restoreHint : undefined}
-                      disabled={restoreBlocked || local?.operation?.state === "pending"}
-                      onClick={(event) => void restore(workflow, event.currentTarget)}
-                    >
-                      <ArchiveRestoreIcon aria-hidden />
-                      {local?.operation?.state === "pending"
-                        ? "Saving…"
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+              <div
+                data-workflow-row-actions
+                className="flex w-fit min-w-0 max-w-full cursor-auto flex-wrap items-center justify-end gap-2 justify-self-end empty:hidden pointer-coarse:gap-4 [&>button]:max-w-full"
+              >
+                {archived && canConfigure ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-label={
+                      local?.operation?.state === "pending"
+                        ? `Saving ${name}`
                         : local?.operation
-                          ? "Retry save"
-                          : "Restore"}
-                    </Button>
-                  ) : null}
-                  {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
-                    <Button
-                      variant="ghost"
-                      size="sm-multiline"
-                      aria-label={`${runLabel} for ${name}`}
-                      onClick={() =>
-                        navigate({
-                          to: "/workflows/$repositoryId/$workflowId/run",
-                          params: {
-                            repositoryId: scope.repositoryId,
-                            workflowId: workflow.workflowId,
-                          },
-                        })
+                          ? `Retry save for ${name}`
+                          : `Restore ${name}`
+                    }
+                    aria-describedby={restoreBlocked ? restoreHint : undefined}
+                    disabled={restoreBlocked || local?.operation?.state === "pending"}
+                    onClick={(event) => void restore(workflow, event.currentTarget)}
+                  >
+                    <ArchiveRestoreIcon aria-hidden />
+                    {local?.operation?.state === "pending"
+                      ? "Saving…"
+                      : local?.operation
+                        ? "Retry save"
+                        : "Restore"}
+                  </Button>
+                ) : null}
+                {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
+                  <Button
+                    variant="ghost"
+                    size="sm-multiline"
+                    aria-label={`${runLabel} for ${name}`}
+                    onClick={() =>
+                      navigate({
+                        to: "/workflows/$repositoryId/$workflowId/run",
+                        params: {
+                          repositoryId: scope.repositoryId,
+                          workflowId: workflow.workflowId,
+                        },
+                      })
+                    }
+                  >
+                    {runLabel === "Run" ? (
+                      <PlayIcon aria-hidden />
+                    ) : (
+                      <ChevronRightIcon aria-hidden />
+                    )}
+                    {runLabel}
+                  </Button>
+                ) : null}
+                {canCopy || canToggle ? (
+                  <Menu>
+                    <MenuTrigger
+                      render={
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`More actions for ${name}`}
+                        />
                       }
                     >
-                      {runLabel === "Run" ? (
-                        <PlayIcon aria-hidden />
-                      ) : (
-                        <ChevronRightIcon aria-hidden />
-                      )}
-                      {runLabel}
-                    </Button>
-                  ) : null}
-                  {canCopy || canToggle ? (
-                    <Menu>
-                      <MenuTrigger
-                        render={
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={`More actions for ${name}`}
-                          />
-                        }
-                      >
-                        <EllipsisIcon aria-hidden />
-                      </MenuTrigger>
-                      <MenuPopup align="end">
-                        {canCopy ? (
-                          <MenuItem
-                            onClick={() => {
-                              setCopyDestination(
-                                copyRepositories.some(
-                                  (entry) => entry.repository.repositoryId === scope.repositoryId,
-                                )
-                                  ? scope.repositoryId
-                                  : copyRepositories[0]!.repository.repositoryId,
-                              );
-                              setCopyError(null);
-                              setCopy(workflow);
-                            }}
-                          >
-                            <CopyIcon aria-hidden />
-                            Copy workflow
-                          </MenuItem>
-                        ) : null}
-                        {canToggle ? (
-                          <MenuItem
-                            disabled={
-                              !!error ||
-                              !summary ||
-                              local?.operation?.state === "pending" ||
-                              (!!local?.baseline && local.baseline.revision > workflow.revision)
-                            }
-                            onClick={() => toggleAutomation(workflow)}
-                          >
-                            {local?.operation?.state === "pending"
-                              ? "Saving…"
-                              : local?.operation
-                                ? "Retry trigger change"
-                                : workflow.automation?.enabled
-                                  ? "Turn off automatic triggering"
-                                  : trigger
-                                    ? "Turn on automatic triggering"
-                                    : "Set up automatic triggering"}
-                          </MenuItem>
-                        ) : null}
-                      </MenuPopup>
-                    </Menu>
-                  ) : null}
+                      <EllipsisIcon aria-hidden />
+                    </MenuTrigger>
+                    <MenuPopup align="end">
+                      {canCopy ? (
+                        <MenuItem
+                          onClick={() => {
+                            setCopyDestination(
+                              copyRepositories.some(
+                                (entry) => entry.repository.repositoryId === scope.repositoryId,
+                              )
+                                ? scope.repositoryId
+                                : copyRepositories[0]!.repository.repositoryId,
+                            );
+                            setCopyError(null);
+                            setCopy(workflow);
+                          }}
+                        >
+                          <CopyIcon aria-hidden />
+                          Copy workflow
+                        </MenuItem>
+                      ) : null}
+                      {canToggle ? (
+                        <MenuItem
+                          disabled={
+                            !!error ||
+                            !summary ||
+                            local?.operation?.state === "pending" ||
+                            (!!local?.baseline && local.baseline.revision > workflow.revision)
+                          }
+                          onClick={() => toggleAutomation(workflow)}
+                        >
+                          {local?.operation?.state === "pending"
+                            ? "Saving…"
+                            : local?.operation
+                              ? "Retry trigger change"
+                              : workflow.automation?.enabled
+                                ? "Turn off automatic triggering"
+                                : trigger
+                                  ? "Turn on automatic triggering"
+                                  : "Set up automatic triggering"}
+                        </MenuItem>
+                      ) : null}
+                    </MenuPopup>
+                  </Menu>
+                ) : null}
+              </div>
+              {archived && local?.error ? (
+                <div className="col-span-full cursor-auto">
+                  <WorkflowAlert title="Workflow change not confirmed">{local.error}</WorkflowAlert>
                 </div>
-                {archived && local?.error ? (
-                  <div className="col-span-full cursor-auto">
-                    <WorkflowAlert title="Workflow change not confirmed">
-                      {local.error}
-                    </WorkflowAlert>
-                  </div>
-                ) : null}
-                {canConfigure && restoreBlocked ? (
-                  <div id={restoreHint} className="col-span-full cursor-auto">
-                    <WorkflowAlert
-                      title={
-                        restoreIssue === "unavailable"
-                          ? "Could not load Machine checkouts"
-                          : "Machine checkout unavailable"
-                      }
-                      variant="warning"
-                      actions={
-                        restoreIssue === "unavailable" ? (
-                          <Button size="sm" variant="outline" onClick={refreshOrganizationCatalog}>
-                            <RefreshCwIcon aria-hidden />
-                            Retry loading checkouts
-                          </Button>
-                        ) : projects.length || canRecoverInVm ? (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            aria-label={
-                              canRecoverInVm
-                                ? `Choose execution target for ${name}`
-                                : `Choose checkout for ${name}`
-                            }
-                            onClick={() =>
-                              void navigate({
-                                to: "/workflows/$repositoryId/$workflowId/edit",
-                                params: {
-                                  repositoryId: scope.repositoryId,
-                                  workflowId: workflow.workflowId,
-                                },
-                                search: { settings: "execution" },
-                              })
-                            }
-                          >
-                            {canRecoverInVm ? (
-                              <CloudIcon aria-hidden />
-                            ) : (
-                              <MonitorIcon aria-hidden />
-                            )}
-                            {canRecoverInVm ? "Choose execution target" : "Choose checkout"}
-                          </Button>
-                        ) : organizationAdmin ? (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() =>
-                              void navigate({
-                                to: "/settings/organization",
-                                hash: searchableSetting("organization-machines").id,
-                              })
-                            }
-                          >
-                            Machines settings
-                          </Button>
-                        ) : null
-                      }
-                    >
-                      {restoreIssue === "unavailable"
-                        ? "Reload the checkout list before restoring this workflow."
-                        : projects.length
-                          ? "Choose and save a checkout in Workflow settings before restoring."
-                          : canRecoverInVm
-                            ? "Choose VM in Workflow settings and save before restoring."
-                            : organizationAdmin
-                              ? "To keep this workflow on a Machine, connect one with a checkout of this repository."
-                              : "To keep this workflow on a Machine, ask an organization admin to connect one with a checkout of this repository."}
-                    </WorkflowAlert>
-                  </div>
-                ) : null}
-              </li>
-            );
-          })}
-        </ul>
-      </div>
+              ) : null}
+              {canConfigure && restoreBlocked ? (
+                <div id={restoreHint} className="col-span-full cursor-auto">
+                  <WorkflowAlert
+                    title={
+                      restoreIssue === "unavailable"
+                        ? "Could not load Machine checkouts"
+                        : "Machine checkout unavailable"
+                    }
+                    variant="warning"
+                    actions={
+                      restoreIssue === "unavailable" ? (
+                        <Button size="sm" variant="outline" onClick={refreshOrganizationCatalog}>
+                          <RefreshCwIcon aria-hidden />
+                          Retry loading checkouts
+                        </Button>
+                      ) : projects.length || canRecoverInVm ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          aria-label={
+                            canRecoverInVm
+                              ? `Choose execution target for ${name}`
+                              : `Choose checkout for ${name}`
+                          }
+                          onClick={() =>
+                            void navigate({
+                              to: "/workflows/$repositoryId/$workflowId/edit",
+                              params: {
+                                repositoryId: scope.repositoryId,
+                                workflowId: workflow.workflowId,
+                              },
+                              search: { settings: "execution" },
+                            })
+                          }
+                        >
+                          {canRecoverInVm ? <CloudIcon aria-hidden /> : <MonitorIcon aria-hidden />}
+                          {canRecoverInVm ? "Choose execution target" : "Choose checkout"}
+                        </Button>
+                      ) : organizationAdmin ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            void navigate({
+                              to: "/settings/organization",
+                              hash: searchableSetting("organization-machines").id,
+                            })
+                          }
+                        >
+                          Machines settings
+                        </Button>
+                      ) : null
+                    }
+                  >
+                    {restoreIssue === "unavailable"
+                      ? "Reload the checkout list before restoring this workflow."
+                      : projects.length
+                        ? "Choose and save a checkout in Workflow settings before restoring."
+                        : canRecoverInVm
+                          ? "Choose VM in Workflow settings and save before restoring."
+                          : organizationAdmin
+                            ? "To keep this workflow on a Machine, connect one with a checkout of this repository."
+                            : "To keep this workflow on a Machine, ask an organization admin to connect one with a checkout of this repository."}
+                  </WorkflowAlert>
+                </div>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
     );
   };
   if (view === "builder")
