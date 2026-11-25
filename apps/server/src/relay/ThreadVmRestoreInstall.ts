@@ -454,7 +454,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
           ...saved.workspace,
           manifestSha256,
           worktreesRoot: config.worktreesDir,
-          ...(workflow ? { retainedWorkflow: true as const } : {}),
+          ...(workflow ? { retainedWorkflow: finished ? "finished" : "unfinished" } : {}),
         });
         if (
           recovery.reset &&

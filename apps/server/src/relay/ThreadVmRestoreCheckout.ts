@@ -24,7 +24,7 @@ export const adoptThreadVmRestoreCheckout = Effect.fn("ThreadVmRestoreCheckout.a
     checkoutPath: string;
     branch: string | null;
     worktreesRoot: string;
-    retainedWorkflow?: true;
+    retainedWorkflow?: "unfinished" | "finished";
   }) {
     const sql = yield* SqlClient.SqlClient,
       fs = yield* FileSystem.FileSystem,
@@ -99,14 +99,13 @@ export const adoptThreadVmRestoreCheckout = Effect.fn("ThreadVmRestoreCheckout.a
       ["symbolic-ref", "--quiet", "--short", "HEAD"],
       { allowFailure: true },
     );
-    if (
-      (symbolic.code !== 0 && symbolic.code !== 1) ||
-      (symbolic.code === 0 ? symbolic.stdout.trim() : null) !== input.branch
-    )
-      return yield* fail();
+    if (symbolic.code !== 0 && symbolic.code !== 1) return yield* fail();
+    const branch = symbolic.code === 0 ? symbolic.stdout.trim() : null;
+    // Finished follow-ups can switch branches after the thread's last placement event.
+    if (input.retainedWorkflow !== "finished" && branch !== input.branch) return yield* fail();
     const inspection = yield* encodeInspection({
       head,
-      branch: input.branch,
+      branch,
       index: yield* workspaceFileHash(path.join(gitDir, "index")),
       // A root-certified workflow disk already retains the complete worktree.
       // File-by-file move restrictions would reject otherwise valid VM content.
@@ -129,7 +128,7 @@ export const adoptThreadVmRestoreCheckout = Effect.fn("ThreadVmRestoreCheckout.a
             prior.repositoryRoot !== input.repositoryRoot ||
             prior.checkoutPath !== input.checkoutPath ||
             prior.mode !== mode ||
-            prior.branch !== input.branch ||
+            prior.branch !== branch ||
             prior.manifestSha256 !== input.manifestSha256 ||
             prior.workspaceSha256 !== workspaceSha256
           )
@@ -137,7 +136,7 @@ export const adoptThreadVmRestoreCheckout = Effect.fn("ThreadVmRestoreCheckout.a
           return { ...prior, head };
         }
         yield* sql`INSERT INTO thread_checkout_claims(operation_id,thread_id,generation,project_id,repository_root,checkout_path,mode,branch,manifest_sha256,workspace_sha256,inspection_json,phase)
-        VALUES(${input.operationId},${input.threadId},${input.generation},${input.projectId},${input.repositoryRoot},${input.checkoutPath},${mode},${input.branch},${input.manifestSha256},${workspaceSha256},${inspection},'installed')`;
+        VALUES(${input.operationId},${input.threadId},${input.generation},${input.projectId},${input.repositoryRoot},${input.checkoutPath},${mode},${branch},${input.manifestSha256},${workspaceSha256},${inspection},'installed')`;
         yield* sql`INSERT INTO thread_checkout_claim_projects(operation_id,project_id) VALUES(${input.operationId},${input.projectId})`;
         return { ...(yield* claims.get(input.operationId))!, head };
       }),
