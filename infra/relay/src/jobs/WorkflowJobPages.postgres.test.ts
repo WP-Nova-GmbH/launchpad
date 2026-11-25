@@ -128,7 +128,7 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
               for (let n = 0; n < 122; n++)
                 yield* store.createJob(job(`run-${String(n).padStart(3, "0")}`));
               yield* store.createJob(job("foreign", "awaiting_review", "other-repo"));
-              yield* store.save("org", "repo", {
+              const savedWorkflow = yield* store.save("org", "repo", {
                 workflowId: "workflow",
                 expectedRevision: 0,
                 archived: true,
@@ -328,6 +328,165 @@ describe.skipIf(!url)("workflow run pages (PostgreSQL)", () => {
                 { jobId: cleanup.jobId, needsAttention: true },
               ]);
               expect(cleanupPage.nextCursor).toBeNull();
+
+              const input = job("answered-input", "awaiting_input", "confirmation-repo");
+              input.pendingControl = {
+                userId: "author",
+                response: {
+                  operation: "input",
+                  checkpointId: "input",
+                  expectedRevision: 1,
+                  text: "answer",
+                },
+              };
+              const activeInput = job("open-input", "awaiting_input", input.repositoryId);
+              const approval = job("approved-review", "awaiting_review", input.repositoryId);
+              approval.record = {
+                ...approval.record,
+                workflow: {
+                  ...savedWorkflow,
+                  repositoryId: approval.repositoryId,
+                  archived: false,
+                },
+                progress: {
+                  revision: 1,
+                  status: "awaiting_review",
+                  threadId: ThreadId.make("approval-thread"),
+                  detail: "Earlier final-check failure",
+                  checkpoint: null,
+                  approvalPending: true,
+                  steps: [{ stepId: "agent", generation: 0, status: "completed" }],
+                },
+              };
+              const finalCheck = (
+                id: string,
+                progress: Partial<NonNullable<typeof approval.record.progress>>,
+              ) => {
+                const row = job(id, "awaiting_review", input.repositoryId);
+                row.record = {
+                  ...row.record,
+                  workflow: approval.record.workflow,
+                  progress: { ...approval.record.progress!, approvalPending: false, ...progress },
+                };
+                return row;
+              };
+              const blockedFinal = finalCheck("blocked-final-checks", {
+                retryableApproval: true,
+                detail: "Cannot verify the result. Cancel the run and start again.",
+              });
+              const blank = finalCheck("blank-final-checks", { detail: " \t\n" });
+              const review = finalCheck("open-review", {
+                steps: [
+                  { stepId: "agent", generation: 0, status: "completed" },
+                  { stepId: "agent", generation: 1, status: "waiting" },
+                ],
+              });
+              const retryableSave = job("retryable-save", "awaiting_review", input.repositoryId);
+              const retryableThreadId = ThreadId.make("retryable-save-thread");
+              retryableSave.record = {
+                ...retryableSave.record,
+                runtime: { kind: "vm", threadId: retryableThreadId },
+                progress: {
+                  ...approval.record.progress!,
+                  threadId: retryableThreadId,
+                  approvalPending: false,
+                  resultSaving: {
+                    publicationId: "11111111-1111-4111-8111-111111111111",
+                    state: "failed",
+                    resultId: null,
+                    detail: `  Workflow storage rejected this publication. ${"x".repeat(500)}  `,
+                    retryable: true,
+                  },
+                },
+              };
+              retryableSave.pendingControl = {
+                userId: "author",
+                responseId: "pending-feedback",
+                response: {
+                  operation: "request_changes",
+                  checkpointId: "review",
+                  expectedRevision: 1,
+                  text: "Revise the result",
+                },
+              };
+              for (const row of [
+                input,
+                activeInput,
+                approval,
+                blank,
+                blockedFinal,
+                review,
+                retryableSave,
+              ])
+                yield* store.createJob(row);
+              const statuses = () =>
+                store
+                  .pageJobs(input.repositoryId, { view: "attention" })
+                  .pipe(
+                    Effect.map((page) =>
+                      page.jobs.map(({ jobId, checkpointResponsePending, completionState }) => [
+                        jobId,
+                        checkpointResponsePending,
+                        completionState,
+                      ]),
+                    ),
+                  );
+              expect(yield* statuses()).toEqual([
+                [input.jobId, true, undefined],
+                [approval.jobId, true, "finishing"],
+                [blank.jobId, undefined, "finishing"],
+                [blockedFinal.jobId, undefined, "completion_blocked"],
+                [activeInput.jobId, undefined, undefined],
+                [review.jobId, undefined, undefined],
+                [retryableSave.jobId, undefined, "save_failed"],
+              ]);
+              const { jobs: completionRows } = yield* store.pageJobs(input.repositoryId, {
+                view: "attention",
+              });
+              const savedFailure = completionRows.find(
+                ({ jobId }) => jobId === retryableSave.jobId,
+              );
+              expect(savedFailure?.detail).toBeNull();
+              expect(savedFailure?.completionDetail).toMatch(
+                /^Workflow storage rejected this publication\./,
+              );
+              expect(savedFailure?.completionDetail).toHaveLength(500);
+              expect(
+                completionRows.find(({ jobId }) => jobId === blockedFinal.jobId),
+              ).toMatchObject({
+                detail: null,
+                completionDetail: "Cannot verify the result. Cancel the run and start again.",
+              });
+              expect(
+                completionRows.find(({ jobId }) => jobId === blank.jobId)?.completionDetail,
+              ).toBeUndefined();
+              const currentSave = retryableSave.record.progress!.resultSaving!;
+              const retrying = yield* store.updateJob(retryableSave, retryableSave.record, {
+                userId: "author",
+                response: {
+                  operation: "retry_saving",
+                  publicationId: currentSave.publicationId,
+                  expectedRevision: 1,
+                },
+              });
+              expect(yield* statuses()).toContainEqual([
+                retryableSave.jobId,
+                undefined,
+                "retrying_save",
+              ]);
+
+              yield* store.updateJob(retrying, {
+                ...retrying.record,
+                progress: {
+                  ...retrying.record.progress!,
+                  resultSaving: { ...currentSave, state: "saving", retryable: false, detail: null },
+                },
+              });
+              expect(yield* statuses()).toContainEqual([
+                retryableSave.jobId,
+                undefined,
+                "saving_result",
+              ]);
 
               return yield* Effect.fail("rollback-pages" as const);
             }),

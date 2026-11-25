@@ -2,6 +2,9 @@ import {
   RepositoryWorkflow,
   RepositoryWorkflowJob,
   isTerminalWorkflowJob,
+  workflowIsFinishing,
+  type RepositoryWorkflowJobSummary,
+  type WorkflowJobProgress,
   WorkflowConflictError,
   WorkflowInvalidError,
   type WorkflowJobPageQuery,
@@ -549,11 +552,65 @@ export const make = Effect.gen(function* () {
               AND t.organization_id=${jobs.organizationId} AND t.repository_id=${jobs.repositoryId}
               AND r.phase<>'completed' AND r.error_code='boot_deletion_unconfirmed'
               AND r.boot_recovery_started_at IS NOT NULL AND r.boot_receipt IS NOT NULL))) IS TRUE)`;
+      const pendingOperation = sql`${jobs.pendingControl}#>>'{response,operation}'`;
+      // Match canReplaceBlockedCheckpoint in WorkflowsApi. Retry saving stays available
+      // when the VM checkpoint response has never reached the executor.
+      const blockedByRetryableSave = sql<boolean>`(
+        ${jobs.record}#>>'{runtime,kind}' = 'vm'
+        AND ${jobs.pendingControl}->>'responseId' IS NOT NULL
+        AND ${jobs.pendingControl}->>'checkpointDispatch' IS NULL
+        AND ${jobs.record}#>>'{progress,resultSaving,state}' = 'failed'
+        AND ${jobs.record}#>>'{progress,resultSaving,retryable}' = 'true'
+      )`;
+      const checkpointResponsePending = sql<boolean>`(
+        (${jobs.status} = 'awaiting_review'
+          AND ${jobs.record}#>>'{progress,approvalPending}' = 'true')
+        OR (
+          ((${jobs.status} = 'awaiting_input' AND ${pendingOperation} = 'input')
+            OR (${jobs.status} = 'awaiting_review' AND ${pendingOperation} IN ('request_changes', 'approve')))
+            AND ${blockedByRetryableSave} IS NOT TRUE
+        )
+      ) IS TRUE`;
+      const approvalPending = sql<boolean>`(
+        ${pendingOperation} = 'approve'
+        OR ${jobs.record}#>>'{progress,approvalPending}' = 'true'
+      ) IS TRUE`;
+      const resultSave = sql`${jobs.record}#>'{progress,resultSaving}'`;
+      const resultSaveState = sql<RepositoryWorkflowJobSummary["completionState"] | null>`
+        CASE WHEN ${jobs.status} IN ('awaiting_input', 'awaiting_review', 'finishing') THEN
+          CASE ${resultSave}->>'state'
+            WHEN 'saving' THEN 'saving_result'
+            WHEN 'failed' THEN
+              CASE WHEN ${pendingOperation} = 'retry_saving'
+                AND ${jobs.pendingControl}#>>'{response,publicationId}' = ${resultSave}->>'publicationId'
+                THEN 'retrying_save' ELSE 'save_failed' END
+          END
+        END`;
+      const finalChecks = sql<{
+        stepIds: readonly string[];
+        steps: WorkflowJobProgress["steps"] | null;
+        detail: string | null;
+        retryableApproval: boolean | null;
+        approvalPending: boolean;
+      } | null>`
+        CASE WHEN ${jobs.status} IN ('awaiting_review', 'finishing') THEN jsonb_build_object(
+          'stepIds', jsonb_path_query_array(${jobs.record}, '$.workflow.definition.steps[*].id'),
+          'steps', ${jobs.record}#>'{progress,steps}',
+          'detail', ${jobs.record}#>>'{progress,detail}',
+          'retryableApproval', ${jobs.record}#>'{progress,retryableApproval}',
+          'approvalPending', ${approvalPending}
+        ) END`;
       const rows = yield* persist(
         db
           .select({
             summary: jobs.summary,
             needsAttention,
+            checkpointResponsePending,
+            resultSaveState,
+            resultSaveDetail: sql<
+              string | null
+            >`CASE WHEN ${resultSaveState} = 'save_failed' THEN ${resultSave}->>'detail' END`,
+            finalChecks,
             targetKind: sql<"machine" | "vm">`CASE
               WHEN ${jobs.record}#>>'{vmAdmission,codexConnectionId}' IS NOT NULL
                 OR ${jobs.record}#>>'{runtime,kind}'='vm' THEN 'vm' ELSE 'machine' END`,
@@ -579,11 +636,56 @@ export const make = Effect.gen(function* () {
           )
           .limit(limit + 1),
       );
-      const page = rows.slice(0, limit).map(({ summary, needsAttention, targetKind }) => ({
-        ...summary,
-        needsAttention,
-        targetKind,
-      }));
+      const page = rows
+        .slice(0, limit)
+        .map(
+          ({
+            summary,
+            needsAttention,
+            checkpointResponsePending,
+            targetKind,
+            resultSaveState,
+            resultSaveDetail,
+            finalChecks,
+          }) => {
+            let completionState = resultSaveState;
+            if (
+              !completionState &&
+              finalChecks &&
+              workflowIsFinishing({
+                status: summary.status,
+                workflow: { definition: { steps: finalChecks.stepIds.map((id) => ({ id })) } },
+                progress: { steps: finalChecks.steps ?? undefined },
+              })
+            ) {
+              // The detail client clears retryableApproval for cancel-only messages. Those
+              // messages still indicate a blocked completion even when retry is unavailable.
+              const blocked =
+                !finalChecks.approvalPending &&
+                (finalChecks.retryableApproval === true || !!finalChecks.detail?.trim());
+              completionState = blocked ? "completion_blocked" : "finishing";
+            }
+            const reason = (
+              completionState === "save_failed"
+                ? resultSaveDetail
+                : completionState === "completion_blocked"
+                  ? finalChecks?.detail
+                  : null
+            )?.trim();
+            const completionDetail =
+              reason && reason !== "Response saved; waiting for the environment."
+                ? Array.from(reason).slice(0, 500).join("")
+                : undefined;
+            return {
+              ...summary,
+              needsAttention,
+              ...(checkpointResponsePending ? { checkpointResponsePending } : {}),
+              ...(completionState ? { completionState } : {}),
+              ...(completionDetail ? { completionDetail } : {}),
+              targetKind,
+            };
+          },
+        );
       const last = page.at(-1);
       return {
         jobs: page,

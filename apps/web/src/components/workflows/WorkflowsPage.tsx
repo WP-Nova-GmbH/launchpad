@@ -363,7 +363,8 @@ function WorkflowRepositoryView({
   const tab = "tab" in search && search.tab === "runs" ? "runs" : "workflows";
   const catalogPage = view === "catalog";
   const desktop = useMediaQuery("(min-width: 48rem)");
-  const tabSize = catalogPage && desktop ? "compact" : "default";
+  const compactCatalogHeader = catalogPage && desktop;
+  const tabSize = compactCatalogHeader ? "compact" : "default";
   const workflowId = "workflowId" in params ? params.workflowId : undefined;
   const jobId = "jobId" in params ? params.jobId : undefined;
   const call = useWorkflowClient(scope);
@@ -1279,6 +1280,72 @@ function WorkflowRepositoryView({
         )}
       </div>
     );
+  const catalogTabs = (
+    <div
+      className={cn("flex shrink-0 gap-2", catalogPage && "ms-auto md:gap-1")}
+      role="tablist"
+      aria-label="Workflow catalog"
+    >
+      <Button
+        role="tab"
+        size={tabSize}
+        aria-selected={tab === "workflows"}
+        variant={tab === "workflows" ? "secondary" : "ghost"}
+        onClick={() =>
+          navigate({
+            to: "/workflows/$repositoryId",
+            params: { repositoryId: scope.repositoryId },
+            search: { tab: "workflows" },
+          })
+        }
+      >
+        Workflows
+      </Button>
+      <Button
+        role="tab"
+        size={tabSize}
+        aria-selected={tab === "runs"}
+        variant={tab === "runs" ? "secondary" : "ghost"}
+        onClick={() => {
+          if (tab === "runs") return;
+          void navigate({
+            to: "/workflows/$repositoryId",
+            params: { repositoryId: scope.repositoryId },
+            search: { tab: "runs" },
+          });
+        }}
+      >
+        Runs
+      </Button>
+    </div>
+  );
+  const catalogActions =
+    canConfigure && tab === "workflows" ? (
+      <div className="flex flex-wrap gap-2">
+        <RepositorySourcesButton
+          repositoryId={scope.repositoryId}
+          repositoryName={entry.repository.name}
+        />
+        {firstWorkflow ? null : createWorkflow}
+      </div>
+    ) : null;
+  const refreshWorkflowsButton = (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="ghost"
+            size={compactCatalogHeader ? "icon-sm" : "icon"}
+            aria-label="Refresh workflows"
+            onClick={refreshView}
+          />
+        }
+      >
+        <RefreshCwIcon aria-hidden />
+      </TooltipTrigger>
+      <TooltipPopup>Refresh workflows</TooltipPopup>
+    </Tooltip>
+  );
   return (
     <div
       className={cn(
@@ -1381,45 +1448,38 @@ function WorkflowRepositoryView({
             <div
               className={cn(
                 "flex flex-wrap items-center justify-between gap-3",
-                catalogPage && "md:min-h-8",
+                catalogPage && "gap-y-2 md:min-h-8 md:border-b md:pb-2",
               )}
             >
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <div
+                className={cn(
+                  "flex min-w-0 flex-wrap items-center gap-2",
+                  catalogPage && "grow basis-48",
+                )}
+              >
                 {view !== "catalog" ? (
                   <Button variant="ghost" onClick={back}>
                     {view === "job" ? "← Back to runs" : "← Workflows"}
                   </Button>
                 ) : null}
                 <div
-                  className={cn(
-                    "w-72 max-w-full",
-                    catalogPage && (repositories.length < 2 ? "md:-ms-6" : "md:-ms-9"),
-                  )}
+                  className={compactCatalogHeader ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}
                 >
                   <WorkflowRepositorySwitcher
                     current={entry}
                     repositories={repositories}
                     onSelect={selectRepository}
+                    inline={compactCatalogHeader}
                   />
                 </div>
               </div>
-              {view !== "catalog" || tab !== "runs" ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label="Refresh workflows"
-                        onClick={refreshView}
-                      />
-                    }
-                  >
-                    <RefreshCwIcon aria-hidden />
-                  </TooltipTrigger>
-                  <TooltipPopup>Refresh workflows</TooltipPopup>
-                </Tooltip>
-              ) : null}
+              {catalogPage ? catalogTabs : refreshWorkflowsButton}
+            </div>
+          ) : null}
+          {catalogPage && tab === "workflows" ? (
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {loaded ? catalogActions : null}
+              {refreshWorkflowsButton}
             </div>
           ) : null}
           {error ? (
@@ -1478,59 +1538,12 @@ function WorkflowRepositoryView({
             />
           ) : (
             <>
-              <div
-                className={cn(
-                  "flex flex-wrap items-center justify-between gap-3",
-                  catalogPage && "md:min-h-8 md:items-start",
-                )}
-              >
-                <div
-                  className={cn("flex gap-2", catalogPage && "md:-ms-2 md:my-0.5 md:gap-1")}
-                  role="tablist"
-                  aria-label="Workflow catalog"
-                >
-                  <Button
-                    role="tab"
-                    size={tabSize}
-                    aria-selected={tab === "workflows"}
-                    variant={tab === "workflows" ? "secondary" : "ghost"}
-                    onClick={() =>
-                      navigate({
-                        to: "/workflows/$repositoryId",
-                        params: { repositoryId: scope.repositoryId },
-                        search: { tab: "workflows" },
-                      })
-                    }
-                  >
-                    Workflows
-                  </Button>
-                  <Button
-                    role="tab"
-                    size={tabSize}
-                    aria-selected={tab === "runs"}
-                    variant={tab === "runs" ? "secondary" : "ghost"}
-                    onClick={() => {
-                      if (tab === "runs") return;
-                      void navigate({
-                        to: "/workflows/$repositoryId",
-                        params: { repositoryId: scope.repositoryId },
-                        search: { tab: "runs" },
-                      });
-                    }}
-                  >
-                    Runs
-                  </Button>
+              {!catalogPage ? (
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  {catalogTabs}
+                  {catalogActions}
                 </div>
-                {canConfigure && tab === "workflows" ? (
-                  <div className="flex flex-wrap gap-2">
-                    <RepositorySourcesButton
-                      repositoryId={scope.repositoryId}
-                      repositoryName={entry.repository.name}
-                    />
-                    {firstWorkflow ? null : createWorkflow}
-                  </div>
-                ) : null}
-              </div>
+              ) : null}
               {tab === "workflows" ? (
                 <div className="@container/workflow-catalog">
                   {canChooseTemplate && retainedDraft ? (

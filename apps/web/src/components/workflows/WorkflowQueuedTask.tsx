@@ -1,7 +1,11 @@
 import { Link } from "@tanstack/react-router";
 import type { Ref } from "react";
 import { ClockIcon, LinkIcon, Settings2Icon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
-import type { RepositoryWorkflowJob, WorkflowQueueReason } from "@t3tools/contracts/workflows";
+import type {
+  RepositoryWorkflowJob,
+  RepositoryWorkflowJobSummary,
+  WorkflowQueueReason,
+} from "@t3tools/contracts/workflows";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
 
@@ -70,7 +74,13 @@ const machineQueuedTasks: Partial<Record<WorkflowQueueReason["code"], QueuedTask
   },
 };
 
-export function workflowQueuedTask(job: RepositoryWorkflowJob, detail: string | null | undefined) {
+type QueuedWorkflow = Pick<
+  RepositoryWorkflowJobSummary,
+  "status" | "queueReason" | "runtime" | "originSummary" | "targetKind"
+> &
+  Partial<Pick<RepositoryWorkflowJob, "workflow" | "origin" | "vmAdmission">>;
+
+export function workflowQueuedTask(job: QueuedWorkflow, detail: string | null | undefined) {
   const code = job.queueReason?.code;
   if (
     !code ||
@@ -79,7 +89,7 @@ export function workflowQueuedTask(job: RepositoryWorkflowJob, detail: string | 
     return undefined;
   }
 
-  const targetKind = job.runtime?.kind ?? job.workflow?.definition.target.kind;
+  const targetKind = job.runtime?.kind ?? job.workflow?.definition.target.kind ?? job.targetKind;
   const origin = job.origin?.kind ?? job.originSummary?.kind;
   // Machine runs can be queued before the relay records a target or runtime.
   const machine = !job.vmAdmission && (targetKind ? targetKind === "machine" : !!origin);

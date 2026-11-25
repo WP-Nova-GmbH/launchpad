@@ -191,30 +191,228 @@ it("keeps the frozen automatic workflow name when catalog metadata is unavailabl
   expect(content()).toContain("Started by workflow");
 });
 
-it("shows a workflow VM recovery error alongside the current checkpoint in Needs attention", async () => {
+it("opens attention rows for input, review, and specific blockers", async () => {
+  const withdrawnAccess =
+    "The original repository source permission was withdrawn. Cancel this job; a different grant cannot replace it.";
+  const unconfirmedCleanup =
+    "Launchpad could not confirm deletion of the previous workflow VM. Cleanup will retry automatically. Saved results are still available.";
   fixture.call.mockResolvedValueOnce({ jobs: [], nextCursor: null }).mockResolvedValueOnce({
     jobs: [
+      { ...row("Answer before preparing"), status: "awaiting_input", needsAttention: true },
+      { ...row("Review the changes"), status: "awaiting_review", needsAttention: true },
       {
-        ...row("Answer before preparing"),
+        ...row("Recover the workspace"),
         targetKind: "vm",
-        runtime: { kind: "vm", threadId: ThreadId.make("workflow:input") },
+        runtime: { kind: "vm", threadId: ThreadId.make("workflow:review") },
+        status: "awaiting_review",
+        vmRecovery: { state: "recovery_error", detail: unconfirmedCleanup },
+        needsAttention: true,
+      },
+      {
+        ...row("Publish release notes"),
+        runtime: null,
+        targetKind: "vm",
+        status: "queued",
+        queueReason: { code: "vm_limit_disabled", retryAt: null },
+        detail: "Ask an organization admin to raise the Workflow VMs limit to start this run.",
+        needsAttention: true,
+      },
+      {
+        ...row("Publish after retry"),
+        runtime: null,
+        targetKind: "vm",
+        status: "queued",
+        queueReason: { code: "vm_limit_disabled", retryAt: null },
+        detail: "GitHub verification failed while retrying.",
+        needsAttention: true,
+      },
+      {
+        ...row("Publish from Linear"),
+        runtime: null,
+        targetKind: "vm",
+        status: "queued",
+        queueReason: { code: "source_withdrawn", retryAt: null },
+        detail: withdrawnAccess,
+        needsAttention: true,
+      },
+      {
+        ...row("Reconnect the original account"),
+        targetKind: "vm",
+        runtime: { kind: "vm", threadId: ThreadId.make("workflow:waiting-codex") },
         status: "awaiting_input",
-        vmRecovery: { state: "recovery_error" },
+        vmRecovery: { state: "waiting_codex" },
+        checkpointResponsePending: true,
+        needsAttention: false,
+      },
+      {
+        ...row("Restore the workspace"),
+        targetKind: "vm",
+        runtime: { kind: "vm", threadId: ThreadId.make("workflow:pending") },
+        status: "awaiting_review",
+        vmRecovery: { state: "restoring" },
+        needsAttention: false,
+      },
+      {
+        ...row("Wait for capacity"),
+        runtime: null,
+        targetKind: "vm",
+        status: "queued",
+        queueReason: { code: "vm_waiting_capacity", retryAt: null },
+        needsAttention: true,
       },
     ],
     nextCursor: null,
   });
   await act(async () => {
-    renderer = create(
-      <WorkflowJobs scope={scope} workflows={[]} refreshWorkflows={refreshWorkflows} />,
-    );
+    renderer = create(screen());
   });
+
   await press("Needs attention");
-  expect(content()).toContain("Workflow VM recovery needs attention");
   expect(content()).toContain("Needs input");
-  await press("View run for Workflow run: Answer before preparing");
-  expect(fixture.navigate).toHaveBeenCalledWith(
-    expect.objectContaining({ params: { repositoryId: "repo", jobId: "Answer before preparing" } }),
+  expect(content()).toContain("Needs review");
+  expect(content()).toContain("Recovery needs attention");
+  expect(content()).toContain(unconfirmedCleanup);
+  expect(content()).toContain("Workflow VMs disabled");
+  expect(content()).toContain("GitHub verification failed while retrying.");
+  expect(
+    renderer.root
+      .findByProps({ children: "Publish from Linear" })
+      .parent?.findByProps({ children: withdrawnAccess }),
+  ).toBeDefined();
+  expect(content()).toContain("Reconnect Codex to continue");
+  expect(content()).toContain("Restoring workspace");
+  expect(content()).toContain("Waiting for a VM slot");
+
+  await press("View input for Workflow run: Answer before preparing");
+  await press("Open review for Workflow run: Review the changes");
+  await press("View blocker for Workflow run: Recover the workspace");
+  await press("View blocker for Workflow run: Publish release notes");
+  await press("View blocker for Workflow run: Publish after retry");
+  await press("View blocker for Workflow run: Publish from Linear");
+  await press("View blocker for Workflow run: Reconnect the original account");
+  await press("View run for Workflow run: Restore the workspace");
+  await press("View run for Workflow run: Wait for capacity");
+  expect(fixture.navigate.mock.calls.map(([route]) => route.params.jobId)).toEqual([
+    "Answer before preparing",
+    "Review the changes",
+    "Recover the workspace",
+    "Publish release notes",
+    "Publish after retry",
+    "Publish from Linear",
+    "Reconnect the original account",
+    "Restore the workspace",
+    "Wait for capacity",
+  ]);
+});
+
+it("shows submitted checkpoints as pending until a refresh makes them actionable", async () => {
+  const input = { ...row("Answer during preparation"), status: "awaiting_input" as const };
+  const review = { ...row("Review the result"), status: "awaiting_review" as const };
+  const saved = {
+    ...row("Review the saved workspace"),
+    status: "awaiting_review" as const,
+    runtime: { kind: "vm" as const, threadId: ThreadId.make("workflow:saved-review") },
+    vmRecovery: { state: "saved" as const },
+  };
+  const jobs = [input, review, saved];
+  fixture.call
+    .mockResolvedValueOnce({ jobs: [], nextCursor: null })
+    .mockResolvedValueOnce({
+      jobs: jobs.map((job) => ({ ...job, needsAttention: true, checkpointResponsePending: true })),
+      nextCursor: null,
+    })
+    .mockResolvedValueOnce({
+      jobs: jobs.map((job) => ({ ...job, needsAttention: true })),
+      nextCursor: null,
+    });
+  await act(async () => {
+    renderer = create(screen());
+  });
+
+  await press("Needs attention");
+  expect(content()).toContain("Waiting for confirmation");
+  expect(content()).toContain("Response queued");
+  expect(content()).not.toContain("Needs input");
+  expect(content()).not.toContain("Needs review");
+  await press("View run for Workflow run: Answer during preparation");
+  await press("View run for Workflow run: Review the result");
+  await press("View run for Workflow run: Review the saved workspace");
+
+  await press("Refresh runs");
+  await press("View input for Workflow run: Answer during preparation");
+  await press("Open review for Workflow run: Review the result");
+  await press("Open review for Workflow run: Review the saved workspace");
+  expect(fixture.navigate.mock.calls.map(([route]) => route.params.jobId)).toEqual([
+    ...jobs.map((job) => job.jobId),
+    ...jobs.map((job) => job.jobId),
+  ]);
+});
+
+it("opens save and completion recovery instead of an unavailable Review checkpoint", async () => {
+  const jobs = [
+    {
+      ...row("Save the result"),
+      status: "awaiting_review",
+      detail: "Response saved; waiting for the environment.",
+      completionState: "saving_result",
+      checkpointResponsePending: true,
+      runtime: { kind: "vm", threadId: ThreadId.make("workflow:saving") },
+      vmRecovery: { state: "saved" },
+    },
+    {
+      ...row("Recover the result"),
+      status: "awaiting_review",
+      completionState: "save_failed",
+      completionDetail: "The workspace snapshot could not be saved. Retry saving to continue.",
+    },
+    {
+      ...row("Retry the save"),
+      status: "awaiting_review",
+      completionState: "retrying_save",
+    },
+    {
+      ...row("Finish final checks"),
+      status: "awaiting_review",
+      completionState: "finishing",
+      checkpointResponsePending: true,
+    },
+    {
+      ...row("Resolve final checks"),
+      status: "awaiting_review",
+      completionState: "completion_blocked",
+      completionDetail: "Result verification could not finish. Retry approval.",
+    },
+  ] satisfies WorkflowJobPage["jobs"];
+  fixture.call.mockResolvedValueOnce({ jobs: [], nextCursor: null }).mockResolvedValueOnce({
+    jobs: jobs.map((job) => ({ ...job, needsAttention: true })),
+    nextCursor: null,
+  });
+  await act(async () => {
+    renderer = create(screen());
+  });
+
+  await press("Needs attention");
+  expect(content()).toContain("Saving run data");
+  expect(content()).toContain("Save failed");
+  expect(content()).toContain("The workspace snapshot could not be saved.");
+  expect(content()).toContain("Waiting for retry confirmation");
+  expect(content()).toContain("Finishing run");
+  expect(content()).toContain("Completion blocked");
+  expect(content()).toContain("The environment couldn’t verify the final result.");
+  expect(content()).not.toContain("Retry saving to continue.");
+  expect(content()).not.toContain("Retry approval.");
+  expect(content()).not.toContain("Open review");
+  expect(content()).not.toContain("Response queued");
+  expect(content()).not.toContain("Waiting for confirmation");
+  expect(content()).not.toContain("Response saved; waiting for the environment.");
+
+  await press("View run for Workflow run: Save the result");
+  await press("View blocker for Workflow run: Recover the result");
+  await press("View run for Workflow run: Retry the save");
+  await press("View run for Workflow run: Finish final checks");
+  await press("View blocker for Workflow run: Resolve final checks");
+  expect(fixture.navigate.mock.calls.map(([route]) => route.params.jobId)).toEqual(
+    jobs.map((job) => job.jobId),
   );
 });
 

@@ -125,15 +125,19 @@ function RepositoryIdentity({
   remote,
   truncate = false,
   compact = false,
+  inline = false,
 }: {
   name: string;
   remote: string | undefined;
   truncate?: boolean;
   compact?: boolean;
+  inline?: boolean;
 }) {
   const textLayout = truncate ? "truncate" : "wrap-anywhere whitespace-normal";
   return (
-    <span className="min-w-0 flex-1 text-left">
+    <span
+      className={cn("min-w-0 flex-1 text-left", inline && "flex flex-wrap items-baseline gap-x-2")}
+    >
       <span className={cn("block text-sm font-medium", textLayout, compact && "leading-4")}>
         {name}
       </span>
@@ -157,14 +161,25 @@ export function WorkflowRepositorySwitcher({
   repositories,
   onSelect,
   compact = false,
-}: RepositoryPickerProps & { current: RelayRepositorySummary; compact?: boolean }) {
+  inline = false,
+}: RepositoryPickerProps & {
+  current: RelayRepositorySummary;
+  compact?: boolean;
+  inline?: boolean;
+}) {
   const [query, setQuery] = useState("");
   const { name, canonicalKeys, repositoryId } = current.repository;
   const remote = canonicalKeys[0];
   const identity = (
-    <span className={cn("flex min-w-0 items-center gap-2", compact ? "py-0.5" : "py-1")}>
+    <span className={cn("flex min-w-0 items-center gap-2", compact || inline ? "py-0.5" : "py-1")}>
       <FolderGit2Icon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
-      <RepositoryIdentity name={name} remote={remote} truncate compact={compact} />
+      <RepositoryIdentity
+        name={name}
+        remote={remote}
+        truncate={!inline}
+        compact={compact}
+        inline={inline}
+      />
     </span>
   );
   if (repositories.length < 2) return identity;
@@ -189,7 +204,7 @@ export function WorkflowRepositorySwitcher({
     >
       <ComboboxTrigger
         aria-label={`Switch workflow repository. Current repository is ${name}${remote ? `, ${remote}` : ""}.`}
-        render={<SelectButton />}
+        render={<SelectButton size={inline ? "sm" : "default"} />}
       >
         {identity}
       </ComboboxTrigger>

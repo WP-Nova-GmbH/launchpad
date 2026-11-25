@@ -660,7 +660,14 @@ export const RepositoryWorkflowJob = Schema.Struct({
 });
 export type RepositoryWorkflowJob = typeof RepositoryWorkflowJob.Type;
 
-export function workflowAllStepsFinished(job: RepositoryWorkflowJob) {
+type WorkflowStepCompletion = {
+  readonly workflow: {
+    readonly definition: { readonly steps: ReadonlyArray<{ id: string }> };
+  } | null;
+  readonly progress: Pick<WorkflowJobProgress, "steps"> | null;
+};
+
+export function workflowAllStepsFinished(job: WorkflowStepCompletion) {
   const steps = job.workflow?.definition.steps;
   const recorded = job.progress?.steps;
   if (!steps?.length || !recorded?.length) return false;
@@ -673,7 +680,9 @@ export function workflowAllStepsFinished(job: RepositoryWorkflowJob) {
 }
 
 /** Some executors retain the final Review checkpoint while running final checks. */
-export function workflowIsFinishing(job: RepositoryWorkflowJob | null) {
+export function workflowIsFinishing(
+  job: (WorkflowStepCompletion & Pick<RepositoryWorkflowJob, "status">) | null,
+) {
   return (
     job?.status === "finishing" ||
     (job?.status === "awaiting_review" && workflowAllStepsFinished(job))
@@ -695,6 +704,20 @@ export const RepositoryWorkflowJobSummary = Schema.Struct({
   createdAt: RepositoryWorkflowJob.fields.createdAt,
   updatedAt: RepositoryWorkflowJob.fields.updatedAt,
   needsAttention: Schema.optional(Schema.Boolean),
+  /** Active checkpoint response awaiting executor acknowledgement. */
+  checkpointResponsePending: Schema.optional(Schema.Boolean),
+  /** Result saving or final checks that take precedence over a retained checkpoint. */
+  completionState: Schema.optional(
+    Schema.Literals([
+      "saving_result",
+      "retrying_save",
+      "save_failed",
+      "finishing",
+      "completion_blocked",
+    ]),
+  ),
+  /** Executor diagnostic for a blocked save or final check. */
+  completionDetail: Schema.optional(Schema.String),
 });
 export type RepositoryWorkflowJobSummary = typeof RepositoryWorkflowJobSummary.Type;
 

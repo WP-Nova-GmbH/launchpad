@@ -21,6 +21,21 @@ export interface WorkflowRecovery {
   stepId?: string;
 }
 
+export function workflowSaveFailureDetail(detail: string | null | undefined) {
+  return detail
+    ?.replace(/^(Could not save the result\. )?Retry saving( to continue)?\.$/, "")
+    .replace(/ Retry saving( to continue)?\.$/, "");
+}
+
+export function workflowFinalCheckDetail(detail: string | null | undefined) {
+  return detail
+    ?.replace(
+      /^Result verification could not finish\. Retry approval\.$/,
+      "The environment couldn’t verify the final result.",
+    )
+    .replace(/ Retry approval\.$/, "");
+}
+
 export function workflowCompletionRecovery(
   job: RepositoryWorkflowJob,
   finishing: boolean,
@@ -50,11 +65,7 @@ export function workflowCompletionRecovery(
     const retrying = queued || pendingRetry === "retry_saving";
     const blocked = saving.state === "failed" && !retrying;
     const saveSubject = saving.resultId ? "step result" : "run state";
-    const saveError = blocked
-      ? saving.detail
-          ?.replace(/^(Could not save the result\. )?Retry saving( to continue)?\.$/, "")
-          .replace(/ Retry saving( to continue)?\.$/, "")
-      : undefined;
+    const saveError = blocked ? workflowSaveFailureDetail(saving.detail) : undefined;
     const description = retrying
       ? "Waiting for the environment to confirm the save retry."
       : blocked
@@ -90,14 +101,7 @@ export function workflowCompletionRecovery(
   // A final check can stop with guidance to cancel even when the executor offers no retry.
   const blocked = !retrying && (progress?.retryableApproval === true || !!executorDetail);
   const completionDetail =
-    retrying && progress?.retryableApproval
-      ? undefined
-      : executorDetail
-          ?.replace(
-            /^Result verification could not finish\. Retry approval\.$/,
-            "The environment couldn’t verify the final result.",
-          )
-          .replace(/ Retry approval\.$/, "");
+    retrying && progress?.retryableApproval ? undefined : workflowFinalCheckDetail(executorDetail);
   return {
     context: "Final checks",
     count: workflowAllStepsFinished(job)

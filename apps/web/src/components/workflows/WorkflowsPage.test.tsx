@@ -745,6 +745,8 @@ it.effect("keeps restored History in place when the selected Runs tab is clicked
   Effect.gen(function* () {
     yield* serve;
     yield* Effect.promise(async () => {
+      const desktop = Object.assign(new EventTarget(), { matches: true });
+      vi.stubGlobal("window", Object.assign(new EventTarget(), { matchMedia: () => desktop }));
       fixture.runsReturn = {
         scopeKey: workflowSessionKey(starterScope, "runs"),
         view: "history",
@@ -780,6 +782,16 @@ it.effect("keeps restored History in place when the selected Runs tab is clicked
       expect(fixture.page).toHaveBeenCalledTimes(2);
       expect(button("History").props["aria-pressed"]).toBe(true);
       expect(content()).toContain("Older release");
+      expect(content()).toContain(`Repository ${canonicalKey}`);
+      expect(button("Refresh runs")).toBeDefined();
+      expect(button("Refresh workflows")).toBeUndefined();
+
+      await press("Workflows");
+      expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
+        to: "/workflows/$repositoryId",
+        params: { repositoryId },
+        search: { tab: "workflows" },
+      });
     });
   }),
 );

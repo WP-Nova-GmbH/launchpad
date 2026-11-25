@@ -1,7 +1,17 @@
-import { ChevronDownIcon, CircleAlertIcon, RefreshCwIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  CircleAlertIcon,
+  ClipboardCheckIcon,
+  MessageSquareIcon,
+  RefreshCwIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import * as Schema from "effect/Schema";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { WorkflowAlert } from "./WorkflowAlert";
+import { workflowFinalCheckDetail, workflowSaveFailureDetail } from "./WorkflowCompletionRecovery";
+import { workflowQueuedTask } from "./WorkflowQueuedTask";
+import { workflowVmRecoveryTask } from "./WorkflowVmRecovery";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, type HistoryState } from "@tanstack/react-router";
 import {
@@ -72,6 +82,91 @@ function returnedRunId(
     [row.nextJobId, row.previousJobId].find((id) => jobs.some(({ jobId }) => jobId === id)) ??
     jobs[Math.min(row.index, jobs.length - 1)]?.jobId
   );
+}
+
+const completionStatusLabels = {
+  saving_result: "Saving run data",
+  retrying_save: "Waiting for retry confirmation",
+  save_failed: "Save failed",
+  finishing: "Finishing run",
+  completion_blocked: "Completion blocked",
+} satisfies Record<NonNullable<RepositoryWorkflowJobSummary["completionState"]>, string>;
+
+function runAttentionPresentation(
+  job: RepositoryWorkflowJobSummary,
+  recovery: ReturnType<typeof workflowVmRecoveryDisplay>,
+) {
+  const responsePending = job.checkpointResponsePending === true;
+  const recoveryTask = job.vmRecovery
+    ? workflowVmRecoveryTask(job.vmRecovery, responsePending)
+    : undefined;
+  if (recoveryTask?.warning) {
+    return {
+      status: "Blocked",
+      action: "View blocker",
+      icon: recoveryTask.icon,
+      detail: recoveryTask.title,
+      context: recoveryTask.message,
+    };
+  }
+  if (job.completionState) {
+    const blocked =
+      job.completionState === "save_failed" || job.completionState === "completion_blocked";
+    const rawDetail =
+      job.completionDetail ??
+      (job.detail === "Response saved; waiting for the environment." ? null : job.detail);
+    const context =
+      job.completionState === "save_failed"
+        ? workflowSaveFailureDetail(rawDetail)
+        : job.completionState === "completion_blocked"
+          ? workflowFinalCheckDetail(rawDetail)
+          : rawDetail;
+    return {
+      status: completionStatusLabels[job.completionState],
+      action: blocked ? "View blocker" : "View run",
+      icon: blocked ? TriangleAlertIcon : undefined,
+      detail: null,
+      context,
+    };
+  }
+  if (recoveryTask && (recovery?.pending || responsePending)) {
+    return { status: recoveryTask.title, action: "View run", detail: null };
+  }
+  if (job.status === "queued" && job.queueReason?.code === "vm_waiting_capacity") {
+    const task = workflowQueuedTask(job, job.detail);
+    return {
+      status: task?.title ?? workflowStatusLabel(job.status),
+      action: "View run",
+      detail: task ? null : undefined,
+    };
+  }
+  if (responsePending) return { status: "Waiting for confirmation", action: "View run" };
+  if (job.needsAttention === false) return null;
+
+  if (job.status === "awaiting_input") {
+    return {
+      status: workflowStatusLabel(job.status),
+      action: "View input",
+      icon: MessageSquareIcon,
+    };
+  }
+  if (job.status === "awaiting_review") {
+    return {
+      status: workflowStatusLabel(job.status),
+      action: "Open review",
+      icon: ClipboardCheckIcon,
+    };
+  }
+  if (job.needsAttention && (job.status === "queued" || job.status === "preparing")) {
+    return {
+      status: "Blocked",
+      action: "View blocker",
+      icon: TriangleAlertIcon,
+      detail: workflowQueuedTask(job, job.detail)?.title,
+    };
+  }
+
+  return null;
 }
 
 function currentRunsHistoryEntry(entryKey: string | undefined) {
@@ -519,11 +614,24 @@ function WorkflowJobsList({
               const vmRecovery = workflowVmRecoveryDisplay(job.vmRecovery);
               const atCheckpoint =
                 job.status === "awaiting_review" || job.status === "awaiting_input";
-              const needsAttention = vmRecovery
-                ? (job.needsAttention ??
-                  (vmRecovery.warning || (!vmRecovery.pending && atCheckpoint)))
-                : atCheckpoint;
-              const actionLabel = job.status === "awaiting_review" ? "Open review" : "View run";
+              const attentionRow =
+                view === "attention" ? runAttentionPresentation(job, vmRecovery) : null;
+              const AttentionIcon = attentionRow?.icon;
+              const needsAttention =
+                vmRecovery || view === "attention" ? job.needsAttention : undefined;
+              const attentionStyle = attentionRow
+                ? !!AttentionIcon
+                : (needsAttention ??
+                  (vmRecovery?.warning || (!vmRecovery?.pending && atCheckpoint)));
+              const statusLabel = attentionRow?.status ?? workflowStatusLabel(job.status);
+              const actionLabel =
+                attentionRow?.action ??
+                (view !== "attention" && job.status === "awaiting_review"
+                  ? "Open review"
+                  : "View run");
+              const context =
+                attentionRow?.context ??
+                (attentionRow?.detail === undefined ? (vmRecovery?.title ?? job.detail) : null);
 
               return (
                 <li
@@ -543,28 +651,36 @@ function WorkflowJobsList({
                     <p className="line-clamp-2 text-xs wrap-anywhere text-muted-foreground">
                       {job.instruction}
                     </p>
-                    {vmRecovery ? (
-                      <p className="text-xs wrap-anywhere text-muted-foreground">
-                        {vmRecovery.title}
-                      </p>
-                    ) : job.detail ? (
-                      <p className="text-xs wrap-anywhere text-muted-foreground">{job.detail}</p>
+                    {context ? (
+                      <p className="text-xs wrap-anywhere text-muted-foreground">{context}</p>
                     ) : null}
                   </div>
-                  <span
-                    className={
-                      needsAttention ? "text-xs font-medium text-warning-foreground" : "text-xs"
-                    }
-                  >
-                    {workflowStatusLabel(job.status)}
-                  </span>
+                  <div className="min-w-0 space-y-0.5 text-xs">
+                    <span
+                      className={
+                        attentionStyle
+                          ? "flex items-start gap-1.5 font-medium text-warning-foreground"
+                          : "block"
+                      }
+                    >
+                      {AttentionIcon ? (
+                        <AttentionIcon aria-hidden className="mt-0.5 size-3.5 shrink-0" />
+                      ) : null}
+                      {statusLabel}
+                    </span>
+                    {attentionRow?.detail ? (
+                      <p className="text-xs wrap-anywhere text-muted-foreground">
+                        {attentionRow.detail}
+                      </p>
+                    ) : null}
+                  </div>
                   <span className="text-xs whitespace-nowrap text-muted-foreground tabular-nums">
                     <span className="sr-only">Submitted </span>
                     <time dateTime={job.createdAt}>{formatRelativeTimeLabel(job.createdAt)}</time>
                   </span>
                   <div className="justify-self-end">
                     <Button
-                      variant={needsAttention ? "outline" : "ghost"}
+                      variant={attentionStyle ? "outline" : "ghost"}
                       size="compact"
                       aria-label={`${actionLabel} for ${workflowName}: ${job.instruction}`}
                       data-workflow-run-id={job.jobId}
