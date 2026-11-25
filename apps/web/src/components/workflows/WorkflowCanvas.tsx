@@ -31,6 +31,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
   type Ref,
 } from "react";
 import {
@@ -159,10 +160,13 @@ export function WorkflowCanvas({
         aria-label="Scrollable workflow canvas"
       >
         <div className={styles["workflow-start"]}>
-          <div className={styles["workflow-zone-label"]}>
-            <strong>Starts when</strong>
-            <span>Manual run{triggerLabel !== "Manual run" ? " or a Linear event" : ""}</span>
-          </div>
+          <CanvasBadge
+            description={
+              triggerLabel === "Manual run" ? "Manual run" : "Manual run or a Linear event"
+            }
+          >
+            Starts when
+          </CanvasBadge>
           <button
             type="button"
             className={styles["workflow-start-marker"]}
@@ -237,29 +241,28 @@ export function WorkflowCanvas({
                     return (
                       <div key={step.id} className={styles["workflow-canvas-row"]}>
                         {zoneIndex === 0 ? (
-                          <div className={styles["workflow-zone-label"]}>
-                            <strong>
-                              {kind === "agent" ? (
-                                <BotIcon />
-                              ) : kind === "input" ? (
-                                <MessageSquareIcon />
-                              ) : (
-                                <UserRoundCheckIcon />
-                              )}
-                              {kind === "agent"
-                                ? "Automatic"
-                                : kind === "input"
-                                  ? "Human input"
-                                  : "Human review"}
-                            </strong>
-                            <span>
-                              {kind === "agent"
+                          <CanvasBadge
+                            description={
+                              kind === "agent"
                                 ? "Automatic steps continue the work"
                                 : kind === "input"
                                   ? "Waits for an answer"
-                                  : "Waits for approval"}
-                            </span>
-                          </div>
+                                  : "Waits for approval"
+                            }
+                          >
+                            {kind === "agent" ? (
+                              <BotIcon aria-hidden />
+                            ) : kind === "input" ? (
+                              <MessageSquareIcon aria-hidden />
+                            ) : (
+                              <UserRoundCheckIcon aria-hidden />
+                            )}
+                            {kind === "agent"
+                              ? "Automatic"
+                              : kind === "input"
+                                ? "Human input"
+                                : "Human review"}
+                          </CanvasBadge>
                         ) : null}
                         <CanvasNode
                           step={step}
@@ -341,9 +344,39 @@ export function WorkflowCanvas({
             <MaximizeIcon />
           </Button>
         </div>
-        <span className={styles["workflow-canvas-hint"]}>Select a step to edit its settings</span>
       </div>
     </section>
+  );
+}
+
+function CanvasBadge({ children, description }: { children: ReactNode; description: string }) {
+  const [open, setOpen] = useState(false);
+  const triggerId = useId();
+  const descriptionId = `${triggerId}-description`;
+
+  return (
+    <Tooltip open={open} onOpenChange={setOpen} triggerId={triggerId}>
+      <TooltipTrigger
+        id={triggerId}
+        closeOnClick={false}
+        render={
+          <button
+            type="button"
+            className={styles["workflow-zone-label"]}
+            aria-describedby={descriptionId}
+            onClick={() => setOpen(true)}
+          />
+        }
+      >
+        {children}
+      </TooltipTrigger>
+      <span id={descriptionId} hidden>
+        {description}
+      </span>
+      <TooltipPopup>
+        <span aria-hidden>{description}</span>
+      </TooltipPopup>
+    </Tooltip>
   );
 }
 
@@ -378,17 +411,6 @@ function CanvasNode({
       data-dragging={isDragging || undefined}
       style={{ transform: CSS.Translate.toString(transform) }}
     >
-      <button
-        type="button"
-        ref={setActivatorNodeRef}
-        disabled={disabled}
-        className={styles["workflow-reorder-handle"]}
-        aria-label={`Reorder ${step.title || "Untitled step"}`}
-        {...attributes}
-        {...listeners}
-      >
-        <GripVerticalIcon />
-      </button>
       <Tooltip>
         <TooltipTrigger
           render={
@@ -416,7 +438,6 @@ function CanvasNode({
             <strong>{step.title || "Untitled step"}</strong>
             <span>{summary}</span>
           </span>
-          <span className={styles["workflow-node-number"]}>{index + 1}</span>
           {warning ? (
             <AlertCircleIcon className={styles["workflow-node-warning"]} aria-label={warning}>
               <title>{warning}</title>
@@ -429,6 +450,17 @@ function CanvasNode({
           {warning ? <p>{warning}</p> : null}
         </TooltipPopup>
       </Tooltip>
+      <button
+        type="button"
+        ref={setActivatorNodeRef}
+        disabled={disabled}
+        className={styles["workflow-reorder-handle"]}
+        aria-label={`Reorder ${step.title || "Untitled step"}`}
+        {...attributes}
+        {...listeners}
+      >
+        <GripVerticalIcon aria-hidden />
+      </button>
     </div>
   );
 }

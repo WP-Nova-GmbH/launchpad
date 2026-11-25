@@ -499,9 +499,13 @@ describe("Save recovery after a lost reply", () => {
     async (revision) => {
       const workflow = saved("flow", 4, newWorkflowDraft([project])!.definition);
       await mount({ ...base, isNew: false, workflow });
+      const saveSlot = button("Saved")!;
       await rename("Local edits");
+      expect(button("Save")).toBe(saveSlot);
       read.mockRejectedValueOnce(new Error("Reply lost"));
       await submit();
+      expect(button("Save")).toBe(saveSlot);
+      expect(saveSlot.props["aria-disabled"]).toBe(true);
       expect(button("Check saved version")).toBeDefined();
       expect(button("Retry original save")).toBeUndefined();
 
@@ -524,6 +528,10 @@ describe("Save recovery after a lost reply", () => {
       if (revision === "unchanged") {
         expect(content).toContain("Save didn’t land");
         expect(button("Retry original save")).toBeDefined();
+        expect(button("Save")).toBe(saveSlot);
+        expect(saveSlot.props["aria-disabled"]).toBe(true);
+        await submit();
+        expect(read).toHaveBeenCalledTimes(beforeCheck + 1);
         return;
       }
 
@@ -938,7 +946,11 @@ describe("Canvas editor state", () => {
     await mount();
     const id = newId();
     const result = saved(id);
+    const saveSlot = button("Save")!;
+    expect(saveSlot.props["aria-disabled"]).not.toBe(true);
     await submit();
+    expect(button("Saving…")).toBe(saveSlot);
+    expect(saveSlot.props["aria-disabled"]).toBe(true);
     const operation = editor(id).operation;
     await act(() => canvas().props.onSelect("review"));
     await rename("Blocked edit");
@@ -954,6 +966,11 @@ describe("Canvas editor state", () => {
     });
     expect(editor(id).baseline).toEqual(result);
     expect(editor(id).selectedStepId).toBe("");
+    expect(button("Saved")).toBe(saveSlot);
+    expect(saveSlot.props["aria-disabled"]).toBe(true);
+    const writes = read.mock.calls.length;
+    await submit();
+    expect(read).toHaveBeenCalledTimes(writes);
   });
   it("inserts using current anchors, selects the new ID, and refuses a removed anchor", async () => {
     await mount();

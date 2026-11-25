@@ -44,6 +44,7 @@ import {
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { randomUUID } from "../../lib/utils";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import {
   AlertDialog,
@@ -76,6 +77,7 @@ import {
   ChevronDownIcon,
   ToggleLeftIcon,
   RefreshCwIcon,
+  CheckIcon,
 } from "lucide-react";
 
 import {
@@ -1079,6 +1081,9 @@ function WorkflowBuilderWorkspace({
   const saveCheckFailed = draft.saveRecovery === "check-failed";
   const retryingSave = pending && saveRetryable;
   const showSaveRecovery = recoveringSave || retryingSave;
+  const hasUnsavedChanges = workflowEditorDirty(draft);
+  const showSaved = !pending && !showSaveRecovery && !hasUnsavedChanges;
+  const saveUnavailable = pending || reading || showSaveRecovery || showSaved;
   const focusedRecoveryRemoval = useRef<HTMLButtonElement | null>(null);
   const registerSaveRecoveryControl = useCallback((node: HTMLButtonElement | null) => {
     saveRecoveryControl.current = node;
@@ -1694,6 +1699,7 @@ function WorkflowBuilderWorkspace({
       saveRecoveryControl.current?.focus();
       return;
     }
+    if (!hasUnsavedChanges) return;
     if (targetVersionConflict) {
       if (!settingsOpen || triggerOpen) openSettings();
       setFocusRequest({ field: "reload-target", stepId: null, scrollIntoView: true });
@@ -1807,7 +1813,7 @@ function WorkflowBuilderWorkspace({
       scope={scope}
       automation={draft.automation ?? draft.baseline?.automation}
       savedAutomation={draft.baseline?.automation}
-      unsaved={workflowEditorDirty(draft)}
+      unsaved={hasUnsavedChanges}
       onSave={() => void submit()}
       onReviewSave={
         recoveringSave
@@ -2519,7 +2525,6 @@ function WorkflowBuilderWorkspace({
               </TooltipTrigger>
               <TooltipPopup>{targetLabel}</TooltipPopup>
             </Tooltip>
-            <span>{draft.definition.steps.length} steps</span>
             {archived ? <span>Archived</span> : null}
             <span>
               {automationSupported && workflowDraftAutomationResolved(draft)
@@ -2571,16 +2576,29 @@ function WorkflowBuilderWorkspace({
                 ? "View retained instructions"
                 : "Run"}
           </Button>
-          {!showSaveRecovery ? (
-            <div className="flex items-center gap-2">
-              <span role="status" className="text-xs text-muted-foreground">
-                {pending ? "Saving…" : workflowEditorDirty(draft) ? "Unsaved changes" : "Saved"}
-              </span>
-              <Button type="submit" disabled={pending || reading} ref={saveControl}>
-                Save
-              </Button>
-            </div>
-          ) : null}
+          <div className="grid w-28 shrink-0">
+            <Button
+              type="submit"
+              variant={showSaved ? "secondary" : saveUnavailable ? "outline" : "default"}
+              aria-disabled={saveUnavailable || undefined}
+              ref={saveControl}
+              onClick={(event) => {
+                if (saveUnavailable) event.preventDefault();
+              }}
+            >
+              {pending ? <Spinner aria-hidden /> : showSaved ? <CheckIcon aria-hidden /> : null}
+              {pending ? "Saving…" : showSaved ? "Saved" : "Save"}
+            </Button>
+            <span role="status" className="sr-only">
+              {showSaveRecovery
+                ? ""
+                : pending
+                  ? "Saving workflow…"
+                  : showSaved
+                    ? "Workflow saved"
+                    : "Unsaved changes"}
+            </span>
+          </div>
         </div>
       </div>
       {vmRunUnavailable ||
