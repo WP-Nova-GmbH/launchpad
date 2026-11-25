@@ -1282,7 +1282,7 @@ function WorkflowRepositoryView({
     );
   const catalogTabs = (
     <div
-      className={cn("flex shrink-0 gap-2", catalogPage && "ms-auto md:gap-1")}
+      className={cn("flex flex-wrap gap-2", catalogPage && "md:gap-1")}
       role="tablist"
       aria-label="Workflow catalog"
     >
@@ -1319,16 +1319,6 @@ function WorkflowRepositoryView({
       </Button>
     </div>
   );
-  const catalogActions =
-    canConfigure && tab === "workflows" ? (
-      <div className="flex flex-wrap gap-2">
-        <RepositorySourcesButton
-          repositoryId={scope.repositoryId}
-          repositoryName={entry.repository.name}
-        />
-        {firstWorkflow ? null : createWorkflow}
-      </div>
-    ) : null;
   const refreshWorkflowsButton = (
     <Tooltip>
       <TooltipTrigger
@@ -1346,6 +1336,19 @@ function WorkflowRepositoryView({
       <TooltipPopup>Refresh workflows</TooltipPopup>
     </Tooltip>
   );
+  const catalogActions =
+    tab === "workflows" && (catalogPage || canConfigure) ? (
+      <div className="flex flex-wrap items-center gap-2 pointer-coarse:gap-y-4">
+        {loaded && canConfigure ? (
+          <RepositorySourcesButton
+            repositoryId={scope.repositoryId}
+            repositoryName={entry.repository.name}
+          />
+        ) : null}
+        {catalogPage ? refreshWorkflowsButton : null}
+        {loaded && !firstWorkflow ? createWorkflow : null}
+      </div>
+    ) : null;
   return (
     <div
       className={cn(
@@ -1426,7 +1429,7 @@ function WorkflowRepositoryView({
           className={cn(
             "text-sm font-medium",
             catalogPage &&
-              "md:ms-[max(0px,calc((100%_+_var(--workspace-native-controls-inset)_-_var(--container-6xl))/2))] md:ps-(--workflow-catalog-rail)",
+              "md:ms-[max(0px,calc((100%_+_var(--workspace-native-controls-inset)_-_var(--container-5xl))/2))] md:ps-(--workflow-catalog-rail)",
           )}
         >
           Workflows
@@ -1441,45 +1444,37 @@ function WorkflowRepositoryView({
         data-workflow-runs-scroll-container
       >
         <WorkspacePageContainer
-          width="expanded"
-          className={catalogPage ? "md:gap-3 md:ps-(--workflow-catalog-rail) md:pt-3" : undefined}
+          width={catalogPage ? "wide" : "expanded"}
+          className={
+            catalogPage
+              ? "gap-3 pointer-coarse:gap-y-4 md:ps-(--workflow-catalog-rail) md:pt-3"
+              : undefined
+          }
         >
           {!(view === "job" && jobId && loaded) ? (
-            <div
-              className={cn(
-                "flex flex-wrap items-center justify-between gap-3",
-                catalogPage && "gap-y-2 md:min-h-8 md:border-b md:pb-2",
-              )}
-            >
-              <div
-                className={cn(
-                  "flex min-w-0 flex-wrap items-center gap-2",
-                  catalogPage && "grow basis-48",
-                )}
-              >
-                {view !== "catalog" ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                {!catalogPage ? (
                   <Button variant="ghost" onClick={back}>
                     {view === "job" ? "← Back to runs" : "← Workflows"}
                   </Button>
                 ) : null}
-                <div
-                  className={compactCatalogHeader ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}
-                >
+                <div className={catalogPage ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}>
                   <WorkflowRepositorySwitcher
                     current={entry}
                     repositories={repositories}
                     onSelect={selectRepository}
-                    inline={compactCatalogHeader}
+                    inline={catalogPage}
                   />
                 </div>
               </div>
-              {catalogPage ? catalogTabs : refreshWorkflowsButton}
+              {catalogPage ? null : refreshWorkflowsButton}
             </div>
           ) : null}
-          {catalogPage && tab === "workflows" ? (
-            <div className="flex flex-wrap items-center justify-end gap-2">
-              {loaded ? catalogActions : null}
-              {refreshWorkflowsButton}
+          {catalogPage ? (
+            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b pb-2 pointer-coarse:gap-y-4">
+              {catalogTabs}
+              {catalogActions}
             </div>
           ) : null}
           {error ? (

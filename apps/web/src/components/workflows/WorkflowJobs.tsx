@@ -522,7 +522,7 @@ function WorkflowJobsList({
       aria-label="Workflow runs"
     >
       <div className="flex items-center justify-between gap-2">
-        <div className="flex flex-wrap gap-1 md:-ms-2" role="group" aria-label="Filter runs">
+        <div className="flex flex-wrap gap-1" role="group" aria-label="Filter runs">
           {(["active", "attention", "history"] as const).map((choice) => (
             <Button
               key={choice}

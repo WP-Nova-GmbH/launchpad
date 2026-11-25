@@ -40,20 +40,29 @@ const templates = [
 ] as const;
 
 export function WorkflowCatalogEmpty({ actions }: { actions?: ReactNode }) {
+  const titleId = useId();
+
   return (
-    <section className="flex flex-wrap items-center gap-3 rounded-lg border bg-card p-4 text-card-foreground">
-      <WorkflowIcon aria-hidden className="size-5 shrink-0 text-muted-foreground" />
-      <div className="min-w-0 flex-1 basis-48 space-y-1 wrap-anywhere">
-        <h2 className="text-sm font-semibold">
-          {actions ? "Create your first workflow" : "No workflows yet"}
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          {actions
-            ? "Choose a template to start a draft."
-            : "A repository maintainer or organization admin can create workflows here."}
-        </p>
+    <section
+      aria-labelledby={titleId}
+      className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-3 rounded-lg border bg-card p-4 text-card-foreground sm:p-5"
+    >
+      <div className="grid size-8 place-items-center rounded-md bg-muted text-muted-foreground">
+        <WorkflowIcon aria-hidden className="size-4" />
       </div>
-      {actions}
+      <div className="min-w-0 space-y-3 wrap-anywhere">
+        <div className="space-y-1">
+          <h2 id={titleId} className="text-sm font-semibold">
+            {actions ? "Create your first workflow" : "No workflows yet"}
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            {actions
+              ? "Choose a template to start a draft."
+              : "A repository maintainer or organization admin can create workflows here."}
+          </p>
+        </div>
+        {actions}
+      </div>
     </section>
   );
 }

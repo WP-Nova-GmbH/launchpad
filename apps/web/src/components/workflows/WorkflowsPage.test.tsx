@@ -241,6 +241,17 @@ vi.mock("../ui/dialog", () => {
     DialogFooter: part,
   };
 });
+vi.mock("../ui/sheet", () => {
+  const part = ({ children }: PropsWithChildren) => children;
+  return {
+    Sheet: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
+      open ? createElement("section", { role: "dialog" }, children) : null,
+    SheetPopup: part,
+    SheetHeader: part,
+    SheetTitle: ({ children }: PropsWithChildren) => createElement("h2", null, children),
+    SheetDescription: part,
+  };
+});
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: PropsWithChildren) => children,
   TooltipTrigger: ({ render, children }: PropsWithChildren<{ render: ReactElement }>) =>
@@ -440,14 +451,15 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
   return (node.children ?? []).map(text).join(" ");
 }
 const content = () => text(renderer!.toJSON());
-const button = (label: string) =>
+const buttons = (label: string) =>
   renderer!.root
     .findAllByType("button")
-    .find(
+    .filter(
       (node) =>
         node.props["aria-label"] === label ||
         node.children.filter((child) => typeof child === "string").join("") === label,
-    )!;
+    );
+const button = (label: string) => buttons(label)[0]!;
 async function press(label: string, waitForReads = true) {
   const before = deliveries.length;
   await act(async () => {
@@ -1162,6 +1174,41 @@ it.effect("uses catalog Refresh to recover Machine choices and reload workflow d
       expect(retainedStarter()?.targetConfirmed).toBe(false);
     });
   }),
+);
+
+it.effect(
+  "keeps the empty catalog actions and an open Sources sheet when the viewport changes",
+  () =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        const viewport = Object.assign(new EventTarget(), { matches: true });
+        vi.stubGlobal("window", Object.assign(new EventTarget(), { matchMedia: () => viewport }));
+        fixture.tab = "workflows";
+        fixture.vmAuthoring = { models: null };
+        fixture.definitions.mockResolvedValue([]);
+        await mountCatalog();
+
+        expect(content()).toContain("Create your first workflow");
+        for (const label of ["Create workflow", "Workflow sources", "Refresh workflows"]) {
+          expect(buttons(label)).toHaveLength(1);
+        }
+        await press("Workflow sources");
+        const openSheet = renderer!.root.findByProps({ role: "dialog" });
+        expect(openSheet.findByType("h2").children).toEqual(["Workflow sources"]);
+
+        await act(() => {
+          viewport.matches = false;
+          viewport.dispatchEvent(new Event("change"));
+        });
+
+        expect(renderer!.root.findByProps({ role: "dialog" })).toBe(openSheet);
+        expect(buttons("Refresh sources")).toHaveLength(1);
+        for (const label of ["Create workflow", "Workflow sources", "Refresh workflows"]) {
+          expect(buttons(label)).toHaveLength(1);
+        }
+      });
+    }),
 );
 
 it.effect("offers a publishing starter with a VM and no checkout", () =>

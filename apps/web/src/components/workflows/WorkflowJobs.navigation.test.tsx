@@ -43,9 +43,15 @@ function deferred() {
 it("keeps the visible History list while the run route is loading and restores it when returning", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("self", {});
+  const viewport = Object.assign(new EventTarget(), { matches: true });
   vi.stubGlobal(
     "window",
-    Object.assign(new EventTarget(), { origin: "http://localhost", setInterval, clearInterval }),
+    Object.assign(new EventTarget(), {
+      origin: "http://localhost",
+      matchMedia: () => viewport,
+      setInterval,
+      clearInterval,
+    }),
   );
   vi.stubGlobal("document", Object.assign(new EventTarget(), { getElementById: () => null }));
   vi.stubGlobal("history", {});
