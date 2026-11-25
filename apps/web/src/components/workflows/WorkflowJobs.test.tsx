@@ -8,9 +8,14 @@ import {
 } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
-import type { WorkflowJobPage } from "@t3tools/contracts/workflows";
+import {
+  WorkflowInvalidError,
+  type WorkflowJobListView,
+  type WorkflowJobPage,
+} from "@t3tools/contracts/workflows";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import { RelayRepositoryId, RelayTenancyForbiddenError } from "@t3tools/contracts/relay";
+import { ManagedRelay } from "@t3tools/client-runtime/relay";
 import { workflowSessionKey } from "@t3tools/client-runtime/relay/workflow-session";
 import type { WorkflowRunsReturn } from "./workflowRunsNavigation";
 
@@ -20,8 +25,18 @@ type FixtureHistoryState = {
   workflowRunsReturn?: WorkflowRunsReturn;
 };
 
+type PageQuery = {
+  view: WorkflowJobListView;
+  cursor?: string;
+};
+
+type PageOperation = (
+  client: { pageWorkflowJobs(input: { query: PageQuery }): Promise<WorkflowJobPage> },
+  token: string,
+) => Promise<WorkflowJobPage>;
+
 const fixture = vi.hoisted(() => ({
-  call: vi.fn<() => Promise<WorkflowJobPage>>(),
+  call: vi.fn<(operation: PageOperation) => Promise<WorkflowJobPage>>(),
   navigate: vi.fn(),
   historyState: {} as FixtureHistoryState,
 }));
@@ -77,6 +92,13 @@ const press = (label: string) =>
       .find((button) => button.props["aria-label"] === label || button.props.children === label)!
       .props.onClick();
   });
+function trackPageRequests() {
+  const readPage = vi.fn<(query: PageQuery) => Promise<WorkflowJobPage>>();
+  fixture.call.mockImplementation((operation) =>
+    operation({ pageWorkflowJobs: ({ query }) => readPage(query) }, "fixture-token"),
+  );
+  return readPage;
+}
 function deferred() {
   let resolve!: (value: WorkflowJobPage) => void;
   const promise = new Promise<WorkflowJobPage>((yes) => {
@@ -229,7 +251,12 @@ it("lets viewers distinguish runs awaiting input and open the intended run", asy
 
 function liveBrowser() {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
-  const browser = Object.assign(new EventTarget(), { setInterval, clearInterval });
+  const media = Object.assign(new EventTarget(), { matches: false });
+  const browser = Object.assign(new EventTarget(), {
+    setInterval,
+    clearInterval,
+    matchMedia: () => media,
+  });
   const document = Object.assign(new EventTarget(), { visibilityState: "visible" });
   vi.stubGlobal("window", browser);
   vi.stubGlobal("document", document);
@@ -249,13 +276,15 @@ function runsHistory() {
   const scroll = { scrollTop: 0 };
   const focus = vi.fn();
   const retry = { ownerDocument: document };
+  const olderRuns = { ownerDocument: document };
   const createAction = (id: string) => ({
     dataset: { workflowRunId: id },
     ownerDocument: document,
     get isConnected() {
       return content().includes(`"data-workflow-run-id":"${id}"`);
     },
-    focus: () => focus(id),
+    focus: vi.fn((_options?: FocusOptions) => focus(id)),
+    scrollIntoView: vi.fn(),
   });
   const actions = new Map<string, ReturnType<typeof createAction>>();
   const action = (id: string) => {
@@ -268,6 +297,7 @@ function runsHistory() {
   const node = {
     ownerDocument: document,
     closest: () => scroll,
+    focus: () => focus("Workflow runs"),
     querySelectorAll: () =>
       renderer.root.findAllByType("button").flatMap(({ props }) => {
         const id = props["data-workflow-run-id"];
@@ -278,13 +308,14 @@ function runsHistory() {
     createNodeMock: ({ type, props }: ReactElement<Record<string, unknown>>) => {
       if (type === "section") return node;
       if (type === "button" && props.children === "Retry loading runs") return retry;
+      if (type === "button" && props["aria-label"] === "Load older runs") return olderRuns;
       if (type === "button" && typeof props["data-workflow-run-id"] === "string")
         return action(props["data-workflow-run-id"]);
       if (type === "button") return { focus: () => focus(props.children) };
       return null;
     },
   };
-  return { browser, document, history, scroll, focus, options, retry, actions };
+  return { browser, document, history, scroll, focus, options, retry, olderRuns, actions };
 }
 
 const returnMarker = (overrides: Partial<WorkflowRunsReturn> = {}): WorkflowRunsReturn => ({
@@ -294,6 +325,233 @@ const returnMarker = (overrides: Partial<WorkflowRunsReturn> = {}): WorkflowRuns
   loadedCount: 0,
   scrollTop: 0,
   ...overrides,
+});
+
+it("retries the same older History page without replacing the loaded rows or scroll", async () => {
+  const { document, scroll, focus, options, olderRuns, actions } = runsHistory();
+  const nextPage = deferred();
+  const retry = deferred();
+  const recentPage = { jobs: [row("Recent run", "2026-01-03")], nextCursor: "older" };
+  const olderPage = { jobs: [row("Older run", "2026-01-02")], nextCursor: "oldest" };
+  const readPage = trackPageRequests()
+    .mockResolvedValueOnce({ jobs: [], nextCursor: null })
+    .mockResolvedValueOnce(recentPage)
+    .mockReturnValueOnce(nextPage.promise)
+    .mockRejectedValueOnce(new Error("The relay timed out."))
+    .mockResolvedValueOnce(recentPage)
+    .mockResolvedValueOnce(olderPage)
+    .mockReturnValueOnce(retry.promise);
+  await act(() => {
+    renderer = create(screen(), options);
+  });
+  await press("History");
+  const recent = renderer.root.findByType("li");
+  expect(content()).toContain("Load older runs");
+
+  await press("Load older runs");
+  expect(content()).toContain("Loading older runs…");
+  expect(renderer.root.findByType("li")).toBe(recent);
+  await act(() => nextPage.resolve(olderPage));
+  scroll.scrollTop = 430;
+  await press("Load older runs");
+  expect(content()).toContain("Couldn’t load older runs");
+  expect(content()).not.toContain("Retry loading runs");
+  expect(content()).not.toContain("Could not refresh runs");
+  expect(renderer.root.findAllByType("li")[0]).toBe(recent);
+  expect(renderer.root.findAllByType("li")).toHaveLength(2);
+  expect(scroll.scrollTop).toBe(430);
+
+  await act(() => vi.advanceTimersByTime(5_000));
+  expect(content()).toContain("Couldn’t load older runs");
+  expect(content()).toContain("Retry loading older runs");
+  expect(renderer.root.findAllByType("li")).toHaveLength(2);
+  expect(scroll.scrollTop).toBe(430);
+
+  Object.defineProperty(document, "activeElement", { value: olderRuns });
+  await press("Retry loading older runs");
+  expect(content()).toContain("Loading older runs…");
+  expect(renderer.root.findAllByType("li")).toHaveLength(2);
+  expect(scroll.scrollTop).toBe(430);
+  await act(() => {
+    retry.resolve({ jobs: [row("Oldest run", "2026-01-01")], nextCursor: null });
+  });
+  expect(readPage.mock.calls.map(([query]) => query)).toEqual([
+    { view: "active" },
+    { view: "history" },
+    { view: "history", cursor: "older" },
+    { view: "history", cursor: "oldest" },
+    { view: "history" },
+    { view: "history", cursor: "older" },
+    { view: "history", cursor: "oldest" },
+  ]);
+  expect(renderer.root.findAllByType("li")[0]).toBe(recent);
+  expect(renderer.root.findAllByType("li")).toHaveLength(3);
+  expect(content()).toContain("Oldest run");
+  expect(focus).toHaveBeenCalledExactlyOnceWith("Oldest run");
+  expect(actions.get("Oldest run")?.focus).toHaveBeenCalledExactlyOnceWith({
+    preventScroll: true,
+  });
+  expect(actions.get("Oldest run")?.scrollIntoView).toHaveBeenCalledExactlyOnceWith({
+    block: "nearest",
+  });
+  expect(content()).not.toContain("Couldn’t load older runs");
+  expect(content()).not.toContain("Retry loading older runs");
+  expect(scroll.scrollTop).toBe(430);
+});
+
+it.each(["footer", "focus"])("recovers a rejected History cursor via %s", async (source) => {
+  const { browser, scroll, options } = runsHistory();
+  const refreshFirst = deferred();
+  const newer = row("New run", "2026-01-04");
+  const recent = row("Recent run", "2026-01-03");
+  const older = row("Older run", "2026-01-02");
+  const readPage = trackPageRequests()
+    .mockResolvedValueOnce({ jobs: [], nextCursor: null })
+    .mockResolvedValueOnce({ jobs: [recent], nextCursor: "older" })
+    .mockResolvedValueOnce({ jobs: [older], nextCursor: "rejected" })
+    .mockRejectedValueOnce(
+      ManagedRelay.relayRequestError("pageWorkflowJobs")(
+        new WorkflowInvalidError({ message: "Invalid run-list cursor. Refresh the list." }),
+      ),
+    )
+    .mockReturnValueOnce(refreshFirst.promise)
+    .mockResolvedValueOnce({ jobs: [recent], nextCursor: "replacement-older" })
+    .mockResolvedValueOnce({ jobs: [older], nextCursor: "replacement-oldest" })
+    .mockResolvedValueOnce({ jobs: [row("Oldest run", "2026-01-01")], nextCursor: null });
+  await act(() => {
+    renderer = create(screen(), options);
+  });
+  await press("History");
+  await press("Load older runs");
+  const loadedRows = renderer.root.findAllByType("li");
+  expect(loadedRows).toHaveLength(2);
+  scroll.scrollTop = 430;
+
+  await press("Load older runs");
+  expect(content()).toContain("Couldn’t load older runs");
+  expect(content()).toContain("Refresh runs to load older runs");
+  expect(content()).not.toContain("Retry loading older runs");
+  expect(content()).not.toContain("Retry loading runs");
+  expect(renderer.root.findAllByType("li")).toEqual(loadedRows);
+
+  if (source === "footer") await press("Refresh runs to load older runs");
+  else await act(() => browser.dispatchEvent(new Event("focus")));
+  expect(readPage).toHaveBeenLastCalledWith({ view: "history" });
+  expect(renderer.root.findAllByType("li")).toEqual(loadedRows);
+  expect(scroll.scrollTop).toBe(430);
+  await act(() => refreshFirst.resolve({ jobs: [newer], nextCursor: "replacement-recent" }));
+  expect(readPage).toHaveBeenLastCalledWith({ view: "history", cursor: "replacement-older" });
+  const refreshedRows = renderer.root.findAllByType("li");
+  expect(refreshedRows[1]).toBe(loadedRows[0]);
+  expect(refreshedRows[2]).toBe(loadedRows[1]);
+  expect(refreshedRows).toHaveLength(3);
+  expect(content()).not.toContain("Couldn’t load older runs");
+  expect(scroll.scrollTop).toBe(430);
+
+  await press("Load older runs");
+  expect(readPage.mock.calls.map(([query]) => query)).toEqual([
+    { view: "active" },
+    { view: "history" },
+    { view: "history", cursor: "older" },
+    { view: "history", cursor: "rejected" },
+    { view: "history" },
+    { view: "history", cursor: "replacement-recent" },
+    { view: "history", cursor: "replacement-older" },
+    { view: "history", cursor: "replacement-oldest" },
+  ]);
+  expect(renderer.root.findAllByType("li")).toHaveLength(4);
+  expect(content()).toContain("Oldest run");
+  expect(scroll.scrollTop).toBe(430);
+});
+
+it("keeps initial and refresh errors at the top of History", async () => {
+  const readPage = trackPageRequests()
+    .mockResolvedValueOnce({ jobs: [], nextCursor: null })
+    .mockRejectedValueOnce(new Error("History is unavailable."))
+    .mockResolvedValueOnce({ jobs: [row("Recent run")], nextCursor: "older" })
+    .mockRejectedValueOnce(new Error("Older page timed out."))
+    .mockRejectedValueOnce(new Error("Refresh timed out."))
+    .mockResolvedValueOnce({ jobs: [row("Refreshed run")], nextCursor: null });
+  await act(() => {
+    renderer = create(screen());
+  });
+  await press("History");
+  expect(content()).toContain("Could not load runs");
+  expect(content()).toContain("History is unavailable.");
+  expect(content()).not.toContain("Retry loading older runs");
+  await press("Retry loading runs");
+
+  await press("Load older runs");
+  expect(content()).toContain("Couldn’t load older runs");
+  await press("Refresh runs");
+  expect(content()).toContain("Could not refresh runs");
+  expect(content()).toContain("Refresh timed out.");
+  expect(content()).toContain("Recent run");
+  expect(content()).not.toContain("Retry loading older runs");
+  await press("Retry loading runs");
+  expect(content()).toContain("Refreshed run");
+  expect(content()).not.toContain("Recent run");
+  expect(readPage.mock.calls.map(([query]) => query)).toEqual([
+    { view: "active" },
+    { view: "history" },
+    { view: "history" },
+    { view: "history", cursor: "older" },
+    { view: "history" },
+    { view: "history" },
+  ]);
+});
+
+it("drops an older-page failure when an automatic refresh changes the History cursor", async () => {
+  const { browser } = liveBrowser();
+  const readPage = trackPageRequests()
+    .mockResolvedValueOnce({ jobs: [], nextCursor: null })
+    .mockResolvedValueOnce({ jobs: [row("Recent run")], nextCursor: "old-cursor" })
+    .mockRejectedValueOnce(new Error("Older page timed out."))
+    .mockResolvedValueOnce({ jobs: [row("Recent run")], nextCursor: "new-cursor" })
+    .mockResolvedValueOnce({ jobs: [row("Older run")], nextCursor: null });
+  await act(() => {
+    renderer = create(screen());
+  });
+  await press("History");
+  await press("Load older runs");
+  expect(content()).toContain("Retry loading older runs");
+
+  await act(() => browser.dispatchEvent(new Event("focus")));
+  expect(content()).not.toContain("Retry loading older runs");
+  expect(content()).not.toContain("Couldn’t load older runs");
+  await press("Load older runs");
+  expect(readPage).toHaveBeenLastCalledWith({ view: "history", cursor: "new-cursor" });
+  expect(content()).toContain("Recent run");
+  expect(content()).toContain("Older run");
+});
+
+it("clears loaded History when an older page confirms access loss", async () => {
+  fixture.call
+    .mockResolvedValueOnce({ jobs: [], nextCursor: null })
+    .mockResolvedValueOnce({ jobs: [row("Private run")], nextCursor: "older" })
+    .mockRejectedValueOnce(
+      new Error("Repository access was revoked.", {
+        cause: new RelayTenancyForbiddenError({
+          code: "tenancy_forbidden",
+          reason: "no_repository_access",
+          traceId: "fixture-access-revocation",
+        }),
+      }),
+    );
+  await act(() => {
+    renderer = create(screen());
+  });
+  await press("History");
+  expect(content()).toContain("Private run");
+  await press("Load older runs");
+
+  expect(content()).toContain("Could not load runs");
+  expect(content()).toContain("Repository access was revoked.");
+  expect(content()).toContain("Retry loading runs");
+  expect(renderer.root.findAllByType("li")).toHaveLength(0);
+  expect(content()).not.toContain("Private run");
+  expect(content()).not.toContain("Couldn’t load older runs");
+  expect(content()).not.toContain("Retry loading older runs");
 });
 
 it("reopens History and finds the original row past the previous page boundary", async () => {
@@ -314,7 +572,7 @@ it("reopens History and finds the original row past the previous page boundary",
     renderer = create(screen(), options);
   });
   await press("History");
-  await press("Load more runs");
+  await press("Load older runs");
   scroll.scrollTop = 430;
   await press("View run for Workflow run: Older run");
   const marker = returnMarker({
@@ -348,7 +606,7 @@ it("reopens History and finds the original row past the previous page boundary",
   });
   expect(fixture.call).toHaveBeenCalledTimes(6);
   expect(content()).toContain("Older run");
-  expect(content()).toContain("Load more runs");
+  expect(content()).toContain("Load older runs");
   expect(focus).toHaveBeenCalledExactlyOnceWith("Older run");
   expect(scroll.scrollTop).toBe(430);
 });

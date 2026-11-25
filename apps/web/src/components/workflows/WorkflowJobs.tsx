@@ -1,12 +1,14 @@
-import { RefreshCwIcon } from "lucide-react";
+import { ChevronDownIcon, CircleAlertIcon, RefreshCwIcon } from "lucide-react";
+import * as Schema from "effect/Schema";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, type HistoryState } from "@tanstack/react-router";
-import type {
-  RepositoryWorkflow,
-  RepositoryWorkflowJobSummary,
-  WorkflowJobListView,
+import {
+  WorkflowInvalidError,
+  type RepositoryWorkflow,
+  type RepositoryWorkflowJobSummary,
+  type WorkflowJobListView,
 } from "@t3tools/contracts/workflows";
 import { workflowVmRecoveryDisplay } from "@t3tools/client-runtime/relay/workflow-responses";
 import {
@@ -20,8 +22,10 @@ import {
   type WorkflowScope,
   type WorkflowJobPageRequest,
 } from "@t3tools/client-runtime/relay/workflow-session";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { useWorkflowClient, workflowError } from "./workflowState";
 import type { WorkflowRunsReturn } from "./workflowRunsNavigation";
 
@@ -34,6 +38,18 @@ interface WorkflowJobsProps {
 type RunsHistoryEntry = HistoryState & { __TSR_key?: string; key?: string };
 type RunPosition = Pick<RepositoryWorkflowJobSummary, "createdAt" | "jobId">;
 const runsScrollContainer = "[data-workflow-runs-scroll-container]";
+type OlderRunsFailure = { cursor: string; recovery: "retry" | "refresh" };
+const emptyRunsRead = {
+  ...emptyWorkflowJobPageRead,
+  olderRunsFailure: null as OlderRunsFailure | null,
+};
+const isRejectedCursor = Schema.is(Schema.Struct({ cause: WorkflowInvalidError }));
+
+function findRunAction(list: HTMLElement, jobId: string) {
+  return [...list.querySelectorAll<HTMLButtonElement>("[data-workflow-run-id]")].find(
+    (button) => button.dataset.workflowRunId === jobId,
+  );
+}
 
 function compareRunPosition(left: RunPosition, right: RunPosition) {
   // The relay orders runs by ISO creation time and uses job ID to break ties.
@@ -98,8 +114,9 @@ function WorkflowJobsList({
 }) {
   const call = useWorkflowClient(scope);
   const navigate = useNavigate();
+  const desktop = useMediaQuery("(min-width: 48rem)");
   const [view, setView] = useState<WorkflowJobListView>(() => returnContext?.view ?? "active");
-  const [read, setRead] = useState(emptyWorkflowJobPageRead);
+  const [read, setRead] = useState(emptyRunsRead);
   const pendingReturn = useRef(returnContext);
   const returnFocusCancelled = useRef(false);
   const attentionReturn = useRef<{
@@ -121,6 +138,15 @@ function WorkflowJobsList({
   const section = useRef<HTMLElement>(null);
   const selectedFilter = useRef<HTMLButtonElement>(null);
   const retryButton = useRef<HTMLButtonElement>(null);
+  const olderRunsButton = useRef<HTMLButtonElement>(null);
+  const olderRunsFocus = useRef<{ key: string; jobId: string; button: HTMLButtonElement } | null>(
+    null,
+  );
+  const restoreOlderRunsFocus = useCallback(() => {
+    const button = olderRunsButton.current;
+    if (button && button.ownerDocument.activeElement === button)
+      section.current?.focus({ preventScroll: true });
+  }, []);
   const current = useRef<WorkflowJobPageRequest | null>(null);
   const latestRead = useRef(read);
   useLayoutEffect(() => {
@@ -128,10 +154,16 @@ function WorkflowJobsList({
   }, [read]);
   const key = workflowSessionKey(scope, `runs:${view}`);
   const load = useCallback(
-    async (cursor: string | null = null, refreshMetadata = false, minimumCount = 0) => {
+    async (
+      cursor: string | null = null,
+      refreshMetadata = false,
+      minimumCount = 0,
+      refreshThrough?: RunPosition,
+    ) => {
       if (current.current?.key === key) return;
       const request = { key, cursor };
-      const restoreRow = cursor === null ? pendingReturn.current?.row : undefined;
+      const restoreRow =
+        cursor === null ? (pendingReturn.current?.row ?? refreshThrough) : undefined;
       current.current = request;
       const retry = retryButton.current;
       if (pendingReturn.current && retry && retry.ownerDocument.activeElement === retry) {
@@ -139,7 +171,15 @@ function WorkflowJobsList({
         selectedFilter.current?.focus({ preventScroll: true });
         returnFocusCancelled.current = false;
       }
-      setRead((previous) => beginWorkflowJobPage(previous, request));
+      setRead((previous) => ({
+        ...beginWorkflowJobPage(previous, request),
+        olderRunsFailure:
+          previous.key === key &&
+          cursor === null &&
+          (!refreshMetadata || previous.olderRunsFailure?.recovery === "refresh")
+            ? previous.olderRunsFailure
+            : null,
+      }));
       try {
         const [page] = await Promise.all([
           readWorkflowJobPages(
@@ -175,23 +215,53 @@ function WorkflowJobsList({
           ),
           refreshMetadata ? refreshWorkflows() : undefined,
         ]);
-        if (current.current === request)
-          setRead((previous) => settleWorkflowJobPage(previous, request, page));
+        if (current.current === request) {
+          if (!page.nextCursor) {
+            const button = olderRunsButton.current;
+            if (button && button.ownerDocument.activeElement === button) {
+              const loadedIds = new Set(latestRead.current.jobs?.map(({ jobId }) => jobId));
+              const firstAppended =
+                cursor !== null ? page.jobs.find(({ jobId }) => !loadedIds.has(jobId)) : undefined;
+              if (firstAppended)
+                olderRunsFocus.current = { key, jobId: firstAppended.jobId, button };
+              else restoreOlderRunsFocus();
+            }
+          }
+          setRead((previous) => {
+            if (previous.request !== request) return previous;
+            const next = settleWorkflowJobPage(previous, request, page);
+            return {
+              ...next,
+              olderRunsFailure:
+                previous.olderRunsFailure?.cursor === next.nextCursor
+                  ? previous.olderRunsFailure
+                  : null,
+            };
+          });
+        }
       } catch (cause) {
-        if (current.current === request)
-          setRead((previous) =>
-            settleWorkflowJobPage(
-              previous,
-              request,
-              workflowError(cause),
-              workflowJobAccessLost(cause),
-            ),
-          );
+        if (current.current === request) {
+          const accessLost = workflowJobAccessLost(cause);
+          const olderRunsFailure: OlderRunsFailure | null =
+            !accessLost && view === "history" && cursor !== null
+              ? { cursor, recovery: isRejectedCursor(cause) ? "refresh" : "retry" }
+              : null;
+          if (accessLost) restoreOlderRunsFocus();
+          setRead((previous) => {
+            if (previous.request !== request) return previous;
+            const next = settleWorkflowJobPage(previous, request, workflowError(cause), accessLost);
+            return {
+              ...next,
+              error: olderRunsFailure ? null : next.error,
+              olderRunsFailure: accessLost ? null : (olderRunsFailure ?? previous.olderRunsFailure),
+            };
+          });
+        }
       } finally {
         if (current.current === request) current.current = null;
       }
     },
-    [call, key, scope.repositoryId, view, refreshWorkflows],
+    [call, key, scope.repositoryId, view, refreshWorkflows, restoreOlderRunsFocus],
   );
   useEffect(() => {
     void load(null, false, pendingReturn.current?.loadedCount ?? 0);
@@ -204,11 +274,17 @@ function WorkflowJobsList({
     const refreshVisible = () => {
       if (document.visibilityState === "hidden" || current.current) return;
       const previous = latestRead.current;
+      const { jobs, nextCursor, olderRunsFailure } =
+        previous.key === key ? previous : emptyRunsRead;
+      const refreshThrough =
+        olderRunsFailure?.recovery === "refresh" && olderRunsFailure.cursor === nextCursor
+          ? jobs?.at(-1)
+          : undefined;
       void load(
         null,
         false,
-        pendingReturn.current?.loadedCount ??
-          (previous.key === key ? (previous.jobs?.length ?? 0) : 0),
+        pendingReturn.current?.loadedCount ?? jobs?.length ?? 0,
+        refreshThrough,
       );
     };
     const timer = window.setInterval(refreshVisible, 5000);
@@ -220,8 +296,20 @@ function WorkflowJobsList({
       document.removeEventListener("visibilitychange", refreshVisible);
     };
   }, [load, key]);
-  const page = read.key === key ? read : emptyWorkflowJobPageRead;
+  const page = read.key === key ? read : emptyRunsRead;
   const busy = !!page.request;
+  useLayoutEffect(() => {
+    const pending = olderRunsFocus.current;
+    if (!pending || busy) return;
+    olderRunsFocus.current = null;
+    const list = section.current;
+    if (!list || pending.key !== key || page.nextCursor) return;
+    const { activeElement, body } = list.ownerDocument;
+    if (activeElement && activeElement !== body && activeElement !== pending.button) return;
+    const target = findRunAction(list, pending.jobId);
+    (target ?? list).focus({ preventScroll: true });
+    target?.scrollIntoView?.({ block: "nearest" });
+  }, [busy, key, page.nextCursor]);
   useLayoutEffect(() => {
     const document = section.current?.ownerDocument;
     if (!document || !pendingReturn.current) return;
@@ -261,11 +349,7 @@ function WorkflowJobsList({
     }
 
     const jobId = returnedRunId(context, page.jobs);
-    const target = jobId
-      ? [...list.querySelectorAll<HTMLButtonElement>("[data-workflow-run-id]")].find(
-          (action) => action.dataset.workflowRunId === jobId,
-        )
-      : undefined;
+    const target = jobId ? findRunAction(list, jobId) : undefined;
     (target ?? selectedFilter.current)?.focus({ preventScroll: true });
     if (
       restored?.view === "attention" &&
@@ -278,7 +362,33 @@ function WorkflowJobsList({
     target?.scrollIntoView?.({ block: "nearest" });
   }, [busy, entryKey, page.error, page.jobs, view]);
 
-  const refreshRuns = () => void load(null, true, pendingReturn.current?.loadedCount ?? 0);
+  const olderRunsRecovery =
+    page.olderRunsFailure?.cursor === page.nextCursor ? page.olderRunsFailure.recovery : undefined;
+  const refreshOlderRuns = olderRunsRecovery === "refresh";
+  const refreshLoadedHistory = (refreshMetadata: boolean) =>
+    void load(null, refreshMetadata, page.jobs?.length ?? 0, page.jobs?.at(-1));
+  const refreshRuns = () => {
+    if (refreshOlderRuns) refreshLoadedHistory(true);
+    else void load(null, true, pendingReturn.current?.loadedCount ?? 0);
+  };
+  const loadingOlderRuns = page.request?.cursor != null;
+  const olderRunsPending = loadingOlderRuns || (busy && refreshOlderRuns);
+  const olderRunsLabel = loadingOlderRuns
+    ? "Loading older runs…"
+    : busy && refreshOlderRuns
+      ? "Refreshing runs…"
+      : refreshOlderRuns
+        ? "Refresh runs"
+        : olderRunsRecovery
+          ? "Retry"
+          : "Load older runs";
+  const olderRunsActionName = olderRunsPending
+    ? olderRunsLabel
+    : refreshOlderRuns
+      ? "Refresh runs to load older runs"
+      : olderRunsRecovery
+        ? "Retry loading older runs"
+        : olderRunsLabel;
   const openRun = (index: number) => {
     const { jobs } = page;
     const job = jobs?.[index];
@@ -312,11 +422,12 @@ function WorkflowJobsList({
   return (
     <section
       ref={section}
+      tabIndex={-1}
       className="@container/workflow-runs space-y-4"
       aria-label="Workflow runs"
     >
       <div className="flex items-center justify-between gap-2">
-        <div className="flex flex-wrap gap-1" role="group" aria-label="Filter runs">
+        <div className="flex flex-wrap gap-1 md:-ms-2" role="group" aria-label="Filter runs">
           {(["active", "attention", "history"] as const).map((choice) => (
             <Button
               key={choice}
@@ -342,7 +453,7 @@ function WorkflowJobsList({
             render={
               <Button
                 variant="ghost"
-                size="icon"
+                size={desktop ? "icon-sm" : "icon"}
                 aria-label="Refresh runs"
                 disabled={busy}
                 onClick={refreshRuns}
@@ -474,9 +585,52 @@ function WorkflowJobsList({
         </div>
       ) : null}
       {page.nextCursor ? (
-        <Button variant="outline" disabled={busy} onClick={() => void load(page.nextCursor)}>
-          {busy ? "Loading…" : "Load more runs"}
-        </Button>
+        view === "history" ? (
+          <div className="flex flex-wrap items-center gap-2 [overflow-anchor:none]">
+            <p
+              role="status"
+              className={
+                olderRunsRecovery && !olderRunsPending
+                  ? "flex items-center gap-2 text-xs font-medium text-destructive-foreground"
+                  : "sr-only"
+              }
+            >
+              {olderRunsPending ? (
+                olderRunsLabel
+              ) : olderRunsRecovery ? (
+                <>
+                  <CircleAlertIcon aria-hidden className="size-4 shrink-0" />
+                  Couldn’t load older runs
+                </>
+              ) : null}
+            </p>
+            <Button
+              ref={olderRunsButton}
+              variant="outline"
+              size="compact"
+              aria-disabled={busy || undefined}
+              aria-label={olderRunsActionName}
+              onClick={() => {
+                if (busy) return;
+                if (refreshOlderRuns) refreshLoadedHistory(false);
+                else void load(page.nextCursor);
+              }}
+            >
+              {olderRunsPending ? (
+                <Spinner aria-hidden aria-label={undefined} role={undefined} />
+              ) : olderRunsRecovery ? (
+                <RefreshCwIcon aria-hidden />
+              ) : (
+                <ChevronDownIcon aria-hidden />
+              )}
+              {olderRunsLabel}
+            </Button>
+          </div>
+        ) : (
+          <Button variant="outline" disabled={busy} onClick={() => void load(page.nextCursor)}>
+            {busy ? "Loading…" : "Load more runs"}
+          </Button>
+        )
       ) : null}
     </section>
   );

@@ -516,7 +516,7 @@ afterEach(async () => {
 });
 it("replaces failed sign-in loading with an error and lets the user retry", async () => {
   const reload = vi.fn();
-  vi.stubGlobal("window", { location: { reload } });
+  vi.stubGlobal("window", { location: { reload }, matchMedia: () => ({ matches: false }) });
   fixture.authStatus = "loading";
   fixture.signedIn = false;
   const page = () => (
@@ -660,7 +660,7 @@ it.effect(
         expect(content()).toContain("Metadata offline");
         expect(content()).toContain("Workflow run");
         await press("History");
-        await press("Load more runs");
+        await press("Load older runs");
         expect(content()).toContain("Older history run");
         await press("Refresh runs", false);
         expect(button("Refresh runs").props.disabled).toBe(true);
@@ -1336,6 +1336,7 @@ it.effect("keeps later draft edits when a save retry succeeds during departure",
       vi.stubGlobal("HTMLElement", function FixtureElement() {});
       vi.stubGlobal("window", {
         origin: "http://localhost",
+        matchMedia: () => Object.assign(new EventTarget(), { matches: false }),
         addEventListener() {},
         removeEventListener() {},
         scrollTo() {},

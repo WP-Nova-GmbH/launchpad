@@ -49,6 +49,7 @@ import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { WorkspacePageContainer } from "../WorkspacePageContainer";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { isElectron } from "../../env";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { cn } from "../../lib/utils";
 import { searchableSetting } from "../settings/settingsSearch";
 import { Button } from "../ui/button";
@@ -360,6 +361,9 @@ function WorkflowRepositoryView({
   const search = useSearch({ strict: false });
   const runsReturn = useLocation({ select: ({ state }) => state.workflowRunsReturn });
   const tab = "tab" in search && search.tab === "runs" ? "runs" : "workflows";
+  const catalogPage = view === "catalog";
+  const desktop = useMediaQuery("(min-width: 48rem)");
+  const tabSize = catalogPage && desktop ? "compact" : "default";
   const workflowId = "workflowId" in params ? params.workflowId : undefined;
   const jobId = "jobId" in params ? params.jobId : undefined;
   const call = useWorkflowClient(scope);
@@ -1276,7 +1280,13 @@ function WorkflowRepositoryView({
       </div>
     );
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+    <div
+      className={cn(
+        "flex h-full min-h-0 min-w-0 flex-1 flex-col",
+        catalogPage &&
+          "md:[--workflow-catalog-rail:--spacing(12)] md:[[data-sidebar-state=collapsed]_&]:[--workflow-catalog-rail:max(--spacing(12),var(--workspace-titlebar-content-left))]",
+      )}
+    >
       {copySource ? (
         <WorkflowCopyDialog
           source={copySource}
@@ -1337,26 +1347,55 @@ function WorkflowRepositoryView({
           />
         )
       ) : null}
-      <WorkspacePageHeader electron={isElectron}>
-        <h1 className="text-sm font-medium">Workflows</h1>
+      <WorkspacePageHeader
+        electron={isElectron}
+        className={
+          catalogPage
+            ? "md:scrollbar-gutter-stable md:overflow-hidden md:[--workspace-gutter-start:0px] md:[--workspace-gutter-end:0px] md:[--workspace-titlebar-content-left:0px]"
+            : undefined
+        }
+      >
+        <h1
+          className={cn(
+            "text-sm font-medium",
+            catalogPage &&
+              "md:ms-[max(0px,calc((100%_+_var(--workspace-native-controls-inset)_-_var(--container-6xl))/2))] md:ps-(--workflow-catalog-rail)",
+          )}
+        >
+          Workflows
+        </h1>
       </WorkspacePageHeader>
       <div
         className={cn(
           "min-h-0 flex-1 overflow-y-auto",
           view === "job" && "scrollbar-gutter-stable",
+          catalogPage && "md:scrollbar-gutter-stable",
         )}
         data-workflow-runs-scroll-container
       >
-        <WorkspacePageContainer width="expanded">
+        <WorkspacePageContainer
+          width="expanded"
+          className={catalogPage ? "md:gap-3 md:ps-(--workflow-catalog-rail) md:pt-3" : undefined}
+        >
           {!(view === "job" && jobId && loaded) ? (
-            <div className="flex flex-wrap items-center justify-between gap-3">
+            <div
+              className={cn(
+                "flex flex-wrap items-center justify-between gap-3",
+                catalogPage && "md:min-h-8",
+              )}
+            >
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 {view !== "catalog" ? (
                   <Button variant="ghost" onClick={back}>
                     {view === "job" ? "← Back to runs" : "← Workflows"}
                   </Button>
                 ) : null}
-                <div className="w-72 max-w-full">
+                <div
+                  className={cn(
+                    "w-72 max-w-full",
+                    catalogPage && (repositories.length < 2 ? "md:-ms-6" : "md:-ms-9"),
+                  )}
+                >
                   <WorkflowRepositorySwitcher
                     current={entry}
                     repositories={repositories}
@@ -1439,10 +1478,20 @@ function WorkflowRepositoryView({
             />
           ) : (
             <>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex gap-2" role="tablist" aria-label="Workflow catalog">
+              <div
+                className={cn(
+                  "flex flex-wrap items-center justify-between gap-3",
+                  catalogPage && "md:min-h-8 md:items-start",
+                )}
+              >
+                <div
+                  className={cn("flex gap-2", catalogPage && "md:-ms-2 md:my-0.5 md:gap-1")}
+                  role="tablist"
+                  aria-label="Workflow catalog"
+                >
                   <Button
                     role="tab"
+                    size={tabSize}
                     aria-selected={tab === "workflows"}
                     variant={tab === "workflows" ? "secondary" : "ghost"}
                     onClick={() =>
@@ -1457,6 +1506,7 @@ function WorkflowRepositoryView({
                   </Button>
                   <Button
                     role="tab"
+                    size={tabSize}
                     aria-selected={tab === "runs"}
                     variant={tab === "runs" ? "secondary" : "ghost"}
                     onClick={() => {
