@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useEffectEvent,
+  useImperativeHandle,
   useLayoutEffect,
   useId,
   useMemo,
@@ -178,6 +179,7 @@ export function SavedWorkflowResults({
   onResultsAvailableChange,
   showCancellationDetail = true,
   showSupersededReviewApproval,
+  revealPartialResultRef,
   resultsRef,
 }: {
   scope: WorkflowScope;
@@ -189,6 +191,7 @@ export function SavedWorkflowResults({
   onResultsAvailableChange?: ((available: boolean) => void) | undefined;
   showCancellationDetail?: boolean;
   showSupersededReviewApproval?: boolean;
+  revealPartialResultRef?: RefObject<(() => void) | null>;
   resultsRef?: RefObject<HTMLElement | null>;
 }) {
   const call = useWorkflowClient(scope);
@@ -680,11 +683,14 @@ export function SavedWorkflowResults({
     }
   }, [pickerKey, partialResultHidden, savedResults]);
   const hasPartialChanges = !!partialResult && partialResult.patch.sizeBytes > 0;
-  const resultsAvailable =
-    !resultsUnavailable &&
-    !waitingForThread &&
-    results.length > 0 &&
-    (!partialResult || partialResultOpen);
+  const resultsAvailable = !resultsUnavailable && !waitingForThread && results.length > 0;
+  useImperativeHandle(
+    revealPartialResultRef,
+    () => () => {
+      if (resultsAvailable && partialResultHidden) setPartialResultOpen(true);
+    },
+    [resultsAvailable, partialResultHidden],
+  );
   const completedSavedResultsPane = completed && (resultsAvailable || !!indexError);
   useLayoutEffect(() => {
     onResultsAvailableChange?.(resultsAvailable);

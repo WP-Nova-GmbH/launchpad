@@ -2,6 +2,7 @@ import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
+import { workflowSessionKey } from "@t3tools/client-runtime/relay/workflow-session";
 import {
   canRecoverPrivateThreadLocation,
   workflowResultOrigin,
@@ -354,10 +355,14 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         <div className="flex max-w-md flex-col items-center gap-3 text-center">
           <h2 className="text-sm font-medium">Workflow VM disconnected</h2>
           <WorkflowVmFollowUpButton
-            key={scopedThreadKey(target.threadRef)}
+            key={workflowSessionKey(
+              effectiveOrigin,
+              JSON.stringify([effectiveOrigin.jobId, scopedThreadKey(target.threadRef)]),
+            )}
             scope={effectiveOrigin}
             jobId={effectiveOrigin.jobId}
             title={workflowConversation?.title ?? serverThread?.title ?? "Workflow workspace"}
+            runDetailsFallback
           />
         </div>
       </div>

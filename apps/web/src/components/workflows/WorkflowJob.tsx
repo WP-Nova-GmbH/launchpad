@@ -421,21 +421,21 @@ export function WorkflowJob({
   const recoverySettingsLink = useRunActionFocus<HTMLAnchorElement>(key, runHeading);
   const savedResultsButton = useRunActionFocus(key, runHeading);
   const savedResults = useRef<HTMLElement>(null);
+  const revealPartialResult = useRef<(() => void) | null>(null);
   const [availableSavedResultsKey, setAvailableSavedResultsKey] = useState<string | null>(null);
   const onSavedResultsAvailableChange = useCallback(
     (available: boolean) => setAvailableSavedResultsKey(available ? key : null),
     [key],
   );
+  const [unavailableWorkspaceKey, setUnavailableWorkspaceKey] = useState<string | null>(null);
+  const onWorkspaceUnavailable = useCallback(() => setUnavailableWorkspaceKey(key), [key]);
   const read = reads.jobs[key] ?? emptyWorkflowJobRead;
   const selectedJob = read.job;
-  const followUpAction = selectedJob?.viewerControls?.canContinueInVm ? (
-    <WorkflowVmFollowUpButton
-      key={key}
-      scope={scope}
-      jobId={jobId}
-      title={selectedJob.workflow?.definition.name ?? "Workflow workspace"}
-    />
-  ) : null;
+  const canContinueInVm = selectedJob?.viewerControls?.canContinueInVm === true;
+  const workspaceUnavailable = unavailableWorkspaceKey === key;
+  if (unavailableWorkspaceKey !== null && (!workspaceUnavailable || !canContinueInVm)) {
+    setUnavailableWorkspaceKey(null);
+  }
   const resultEnvironmentId =
     selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime.environmentId : undefined;
   const resultThreadId =
@@ -1455,9 +1455,33 @@ export function WorkflowJob({
   const openSavedResults = () => {
     const results = savedResults.current;
     if (!results) return;
+    revealPartialResult.current?.();
     results.scrollIntoView({ block: "start" });
     results.focus({ preventScroll: true });
   };
+  const savedResultsAction =
+    selectedJob.runtime?.kind === "vm" &&
+    availableSavedResultsKey === key &&
+    savedWorkflowThreadState(selectedJob) === "available" ? (
+      <Button
+        ref={savedResultsButton}
+        variant={pullRequestUrl && !workspaceUnavailable ? "outline" : "default"}
+        onClick={openSavedResults}
+      >
+        <FileDiffIcon aria-hidden />
+        Open saved results
+      </Button>
+    ) : null;
+  const followUpAction = canContinueInVm ? (
+    <WorkflowVmFollowUpButton
+      key={key}
+      scope={scope}
+      jobId={jobId}
+      title={selectedJob.workflow?.definition.name ?? "Workflow workspace"}
+      onWorkspaceUnavailable={onWorkspaceUnavailable}
+      savedResultsAction={savedResultsAction}
+    />
+  ) : null;
   const vmRecoveryActions =
     selectedJob.vmRecovery?.state === "waiting_codex" && organizationAdmin ? (
       <Button
@@ -1891,22 +1915,11 @@ export function WorkflowJob({
                       <ArrowUpRightIcon aria-hidden />
                     </Button>
                   ) : null}
-                  {selectedJob.runtime?.kind === "vm" &&
-                  availableSavedResultsKey === key &&
-                  savedWorkflowThreadState(selectedJob) === "available" &&
-                  (!pullRequestUrl || followUpAction) ? (
-                    <Button
-                      ref={savedResultsButton}
-                      variant={pullRequestUrl ? "outline" : "default"}
-                      onClick={openSavedResults}
-                    >
-                      <FileDiffIcon aria-hidden />
-                      Open saved results
-                    </Button>
-                  ) : pullRequestUrl ? null : (
-                    conversationActions
-                  )}
-                  {followUpAction}
+                  {savedResultsAction &&
+                  !workspaceUnavailable &&
+                  (!pullRequestUrl || canContinueInVm)
+                    ? savedResultsAction
+                    : !pullRequestUrl && conversationActions}
                 </>
               }
             >
@@ -2017,6 +2030,7 @@ export function WorkflowJob({
               {inspectReviewInTask ? conversationActions : null}
             </div>
           )}
+          {followUpAction}
           {selectedJob.status === "queued" && !queuedTask ? (
             <p className="text-sm text-muted-foreground">
               Waiting for an execution target. No steps have started.
@@ -2075,7 +2089,6 @@ export function WorkflowJob({
             </p>
           ) : null}
           {vmRun ? runInstructions : null}
-          {!completed ? followUpAction : null}
           {!composingFeedback && selectedJob.runtime?.kind === "vm" ? (
             <SavedWorkflowResults
               key={`${scope.accountId}:${scope.repositoryId}:${jobId}`}
@@ -2086,8 +2099,11 @@ export function WorkflowJob({
               onReviewTargetChange={setReviewingCurrentResult}
               onReviewRenderChange={onSavedReviewRenderChange}
               showSupersededReviewApproval={approval && !manualHold && !confirmationPending}
-              onResultsAvailableChange={completed ? onSavedResultsAvailableChange : undefined}
+              onResultsAvailableChange={
+                completed || canContinueInVm ? onSavedResultsAvailableChange : undefined
+              }
               showCancellationDetail={publishingCancellationDetail === undefined}
+              revealPartialResultRef={revealPartialResult}
               resultsRef={savedResults}
             />
           ) : null}

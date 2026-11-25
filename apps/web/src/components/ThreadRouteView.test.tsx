@@ -24,6 +24,7 @@ import * as Option from "effect/Option";
 const fixture = vi.hoisted(() => ({
   controls: null as ReturnType<typeof createThreadVmControlAtoms> | null,
   hydrated: false,
+  catalogLoaded: false,
   threadDetailDeleted: false,
   capabilities: undefined as ExecutionEnvironmentDescriptor["capabilities"] | undefined,
   phase: "connected" as "connected" | "reconnecting" | "error",
@@ -40,6 +41,19 @@ const initialSessionConfig = Atom.make<ServerConfig | null>(null);
 
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => fixture.navigate,
+  Link: ({
+    to,
+    params,
+    children,
+  }: {
+    to: string;
+    params: { repositoryId: string; jobId: string };
+    children?: ReactNode;
+  }) => (
+    <a href={to.replace("$repositoryId", params.repositoryId).replace("$jobId", params.jobId)}>
+      {children}
+    </a>
+  ),
   useLocation: (options?: {
     select?: (location: { state: typeof fixture.locationState }) => unknown;
   }) => {
@@ -60,7 +74,7 @@ vi.mock("./ui/sidebar", () => ({
   SidebarInset: ({ children }: { children: ReactNode }) => children,
 }));
 vi.mock("./workflows/WorkflowNavigation", () => ({
-  useWorkflowConversation: () => null,
+  useWorkflowConversation: () => (fixture.catalogLoaded ? { title: "Workflow run" } : null),
   WorkflowConversationHeader: () => null,
 }));
 vi.mock("./workflows/workflowState", () => ({
@@ -190,6 +204,7 @@ const route = (threadId: string) => (
 
 beforeEach(() => {
   fixture.hydrated = false;
+  fixture.catalogLoaded = false;
   fixture.threadDetailDeleted = false;
   fixture.capabilities = undefined;
   fixture.phase = "connected";
@@ -305,6 +320,45 @@ describe("workflow result location recovery", () => {
     });
     expect(fixture.open).not.toHaveBeenCalled();
     expect(fixture.requests).toEqual([]);
+  });
+
+  it("offers a route back to the run when a disconnected workspace has expired without catalog data", async () => {
+    const threadId = ThreadId.make("workflow:job");
+    fixture.locationState = {
+      workflowOrigin: {
+        accountId: "owner",
+        organizationId: "org",
+        repositoryId: RelayRepositoryId.make("repo"),
+        jobId: "job",
+        threadId,
+        workflowVmFollowUpGeneration: 1,
+      },
+    };
+    const detail = "This workspace expired. The original saved results are still available.";
+    fixture.continueInVm.mockResolvedValue({ state: "expired", detail });
+
+    await act(async () => {
+      renderer = create(route(threadId));
+    });
+    const continueButton = renderer!.root
+      .findAllByType("button")
+      .find((node) => node.children.includes("Continue in VM"));
+    expect(continueButton).toBeDefined();
+    await act(async () => continueButton!.props.onClick());
+
+    expect(renderer!.root.findAllByType("p").some((node) => node.children.includes(detail))).toBe(
+      true,
+    );
+    const runDetailsLink = () =>
+      renderer!.root.findAllByType("a").find((node) => node.children.includes("Open run details"));
+    const recoveryLink = runDetailsLink();
+    expect(recoveryLink?.props.href).toBe("/workflows/repo/jobs/job");
+
+    fixture.catalogLoaded = true;
+    await act(async () => renderer!.update(route(threadId)));
+    expect(runDetailsLink()).toBe(recoveryLink);
+    expect(fixture.connectFollowUp).not.toHaveBeenCalled();
+    expect(fixture.navigate).not.toHaveBeenCalled();
   });
 
   it("opens chat when a connected relay target and current session both confirm follow-up access", async () => {

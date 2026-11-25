@@ -503,12 +503,51 @@ describe("successful run outcome", () => {
     if (!hasDiff) expect(findButton("Inspect result")).toBeUndefined();
   });
 
+  const vmJobWithFollowUp = {
+    ...job,
+    runtime: { kind: "vm", threadId: job.progress!.threadId },
+    progress: { ...job.progress!, hasThread: true },
+    viewerControls: {
+      canCancel: false,
+      canApprove: false,
+      canRespond: false,
+      canContinueInVm: true,
+    },
+  } satisfies RepositoryWorkflowJob;
+
+  async function mountVmFollowUp(options?: Parameters<typeof create>[1]) {
+    appAtomRegistry.set(managedRelaySessionAtom, {
+      accountId: scope.accountId,
+      readClerkToken: () => Effect.succeed("token"),
+    });
+    fixture.call.mockResolvedValue(vmJobWithFollowUp);
+    await mount(true, options);
+  }
+
+  async function pollFollowUp() {
+    const poll = vi.mocked(window.setTimeout).mock.lastCall?.[0];
+    if (typeof poll !== "function") throw new Error("Expected a follow-up status check");
+    await act(() => poll());
+  }
+
+  const restoredVm = {
+    state: "running",
+    environmentId: EnvironmentId.make("restored-vm"),
+    threadId: job.progress!.threadId,
+    generation: 3,
+  } as const;
+  const followUpRequest = {
+    clerkToken: "token",
+    repositoryId: scope.repositoryId,
+    jobId: job.jobId,
+  };
+
   it.each([
     { context: "History", current: true },
     { context: "another run", current: false, wrongJob: true },
     { context: "another scope", current: false, wrongScope: true },
   ] as const)(
-    "waits for VM capacity and opens the authorized follow-up from $context",
+    "waits for VM capacity, restores the workspace, and opens the authorized follow-up from $context",
     async (entry) => {
       fixture.workflowRunsReturn = {
         scopeKey: "wrongScope" in entry ? "other-scope" : workflowSessionKey(scope, "runs"),
@@ -517,40 +556,39 @@ describe("successful run outcome", () => {
         loadedCount: 40,
         scrollTop: 360,
       };
-      const vmJob = {
-        ...job,
-        runtime: { kind: "vm", threadId: job.progress!.threadId },
-        viewerControls: {
-          canCancel: false,
-          canApprove: false,
-          canRespond: false,
-          canContinueInVm: true,
-        },
-      } satisfies RepositoryWorkflowJob;
-      appAtomRegistry.set(managedRelaySessionAtom, {
-        accountId: scope.accountId,
-        readClerkToken: () => Effect.succeed("token"),
-      });
-      fixture.call.mockResolvedValue(vmJob);
-      await mount();
+      await mountVmFollowUp();
+      expect(text(renderer!.root)).toContain("Continue the conversation");
 
-      fixture.call.mockResolvedValueOnce({
-        state: "waiting_capacity",
-        detail: "Waiting for a VM slot.",
-      });
+      const client = {
+        continueWorkflowVm: vi.fn().mockResolvedValue({
+          state: "waiting_capacity",
+          detail: "The workspace will open when a VM slot becomes available.",
+        }),
+        getWorkflowVmFollowUp: vi
+          .fn()
+          .mockResolvedValueOnce({
+            state: "restoring",
+            detail: "The saved disk is being attached.",
+          })
+          .mockResolvedValueOnce(restoredVm),
+      };
+      fixture.call.mockImplementation((operation) => operation(client, "token"));
       await press("Continue in VM");
-      expect(text(renderer!.root)).toContain("Waiting for a VM slot.");
+
+      expect(text(renderer!.root)).toContain("Waiting for a VM slot");
+      expect(client.continueWorkflowVm).toHaveBeenCalledExactlyOnceWith(followUpRequest);
       expect(fixture.open).not.toHaveBeenCalled();
 
-      fixture.call.mockResolvedValueOnce({
-        state: "running",
-        environmentId: EnvironmentId.make("restored-vm"),
-        threadId: job.progress!.threadId,
-        generation: 3,
-      });
-      const poll = vi.mocked(window.setTimeout).mock.lastCall?.[0];
-      if (typeof poll !== "function") throw new Error("Expected a follow-up status check");
-      await act(() => poll());
+      await pollFollowUp();
+      expect(text(renderer!.root)).toContain("Restoring workspace");
+      expect(fixture.open).not.toHaveBeenCalled();
+
+      await pollFollowUp();
+      expect(client.continueWorkflowVm).toHaveBeenCalledTimes(1);
+      expect(client.getWorkflowVmFollowUp.mock.calls).toEqual([
+        [followUpRequest],
+        [followUpRequest],
+      ]);
       expect(fixture.open).toHaveBeenCalledWith(expect.objectContaining({ generation: 3 }));
       expect(fixture.navigate).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -567,34 +605,101 @@ describe("successful run outcome", () => {
     },
   );
 
-  it("stops offering retries after the relay confirms that the exact workspace is unavailable", async () => {
-    appAtomRegistry.set(managedRelaySessionAtom, {
-      accountId: scope.accountId,
-      readClerkToken: () => Effect.succeed("token"),
-    });
-    fixture.call.mockResolvedValue({
-      ...job,
-      runtime: { kind: "vm", threadId: job.progress!.threadId },
-      viewerControls: {
-        canCancel: false,
-        canApprove: false,
-        canRespond: false,
-        canContinueInVm: true,
-      },
-    } satisfies RepositoryWorkflowJob);
-    await mount();
-
-    fixture.call.mockResolvedValueOnce({
-      state: "unavailable",
-      canRetry: false,
-      detail: "The exact workspace is unavailable. Saved results are still available.",
-    });
+  it("retries opening the same VM after a failed request", async () => {
+    await mountVmFollowUp();
+    const client = {
+      continueWorkflowVm: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("Could not reach Launchpad Connect."))
+        .mockResolvedValueOnce(restoredVm),
+    };
+    fixture.call.mockImplementation((operation) => operation(client, "token"));
     await press("Continue in VM");
 
-    expect(findButton("Continue in VM")?.props.disabled).toBe(true);
-    expect(text(renderer!.root)).toContain("Saved results are still available.");
+    expect(text(renderer!.root)).toContain("Couldn’t open VM");
+    expect(text(renderer!.root)).toContain("Could not reach Launchpad Connect.");
     expect(fixture.open).not.toHaveBeenCalled();
+
+    await press("Retry opening VM");
+    expect(client.continueWorkflowVm.mock.calls).toEqual([[followUpRequest], [followUpRequest]]);
+    expect(fixture.open).toHaveBeenCalledWith(expect.objectContaining({ generation: 3 }));
+    expect(fixture.navigate).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    { reason: "The VM is paused.", instruction: "Select Continue in VM to resume it." },
+    { reason: "The workspace is saved.", instruction: "Select Continue in VM to restore it." },
+  ])(
+    "offers the real retry action when polling reports $reason",
+    async ({ reason, instruction }) => {
+      await mountVmFollowUp();
+      const client = {
+        continueWorkflowVm: vi
+          .fn()
+          .mockResolvedValueOnce({
+            state: "restoring",
+            detail: "The saved disk is being attached.",
+          })
+          .mockResolvedValueOnce(restoredVm),
+        getWorkflowVmFollowUp: vi
+          .fn()
+          .mockResolvedValue({ state: "unavailable", detail: `${reason} ${instruction}` }),
+      };
+      fixture.call.mockImplementation((operation) => operation(client, "token"));
+      await press("Continue in VM");
+      await pollFollowUp();
+
+      expect(text(renderer!.root)).toContain(reason);
+      expect(text(renderer!.root)).not.toContain(instruction);
+      expect(client.getWorkflowVmFollowUp).toHaveBeenCalledExactlyOnceWith(followUpRequest);
+      expect(fixture.open).not.toHaveBeenCalled();
+
+      await press("Retry opening VM");
+      expect(client.continueWorkflowVm.mock.calls).toEqual([[followUpRequest], [followUpRequest]]);
+      expect(fixture.navigate).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    { available: true, state: "unavailable" },
+    { available: false, state: "unavailable" },
+    { available: true, state: "expired" },
+  ] as const)(
+    "stops offering retries when the workspace is $state, with usable results: $available",
+    async ({ available, state }) => {
+      const results = { scrollIntoView: vi.fn(), focus: vi.fn() };
+      await mountVmFollowUp({
+        createNodeMock: ({ props }) =>
+          (props as { "aria-label"?: string })["aria-label"] === "Saved workflow results"
+            ? results
+            : null,
+      });
+      await act(() =>
+        renderer!.root.findByType(SavedWorkflowResults).props.onResultsAvailableChange(available),
+      );
+      fixture.call.mockResolvedValueOnce({
+        state,
+        ...(state === "unavailable" ? { canRetry: false } : {}),
+        detail: "The exact workspace is unavailable.",
+      });
+      await press("Continue in VM");
+
+      expect(text(renderer!.root)).toContain("Workspace unavailable");
+      expect(findButton("Continue in VM")).toBeUndefined();
+      expect(findButton("Retry opening VM")).toBeUndefined();
+      expect(
+        renderer!.root
+          .findAllByType("button")
+          .filter((button) => text(button).trim() === "Open saved results"),
+      ).toHaveLength(available ? 1 : 0);
+      if (available) {
+        await press("Open saved results");
+        expect(results.scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+        expect(results.focus).toHaveBeenCalledWith({ preventScroll: true });
+      }
+      expect(fixture.open).not.toHaveBeenCalled();
+    },
+  );
 
   it("jumps to available read-only VM results and hides the shortcut when the result goes away", async () => {
     const vmJob = {

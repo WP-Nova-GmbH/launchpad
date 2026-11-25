@@ -2,6 +2,7 @@ import {
   act,
   createContext,
   createElement,
+  createRef,
   useContext,
   useImperativeHandle,
   type PropsWithChildren,
@@ -317,7 +318,10 @@ const view = (
   canConfigure = true,
   options: Pick<
     Parameters<typeof SavedWorkflowResults>[0],
-    "showCancellationDetail" | "showSupersededReviewApproval"
+    | "showCancellationDetail"
+    | "showSupersededReviewApproval"
+    | "onResultsAvailableChange"
+    | "revealPartialResultRef"
   > = {},
 ) =>
   createElement(
@@ -2825,6 +2829,67 @@ it.each([
       expect(fixture.refresh).not.toHaveBeenCalled();
     }),
 );
+
+it("reveals a canceled run’s available partial results from an external shortcut", () =>
+  withClient(async () => {
+    const partial: WorkflowSavedResult = {
+      ...result,
+      resultId: "33333333-3333-4333-8333-333333333333",
+      stepId: "Agent 2",
+      outcome: "cancelled",
+    };
+    const cancelledJob = {
+      ...job,
+      status: "cancelled",
+      progress: { ...job.progress!, status: "cancelled", checkpoint: null },
+    } satisfies RepositoryWorkflowJob;
+    fixture.list.mockResolvedValue({
+      results: [partial, result],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read
+      .mockResolvedValueOnce({ result: partial, patch })
+      .mockResolvedValue({ result, patch });
+    const revealPartialResultRef = createRef<() => void>();
+    const onResultsAvailableChange = vi.fn();
+    const options = { revealPartialResultRef, onResultsAvailableChange };
+    await act(async () => {
+      renderer = create(view(cancelledJob, true, options));
+    });
+
+    expect(findButton("View saved changes")?.props["aria-expanded"]).toBe(false);
+    expect(onResultsAvailableChange).toHaveBeenLastCalledWith(true);
+    await act(() => revealPartialResultRef.current?.());
+    expect(findButton("Hide saved result")?.props["aria-expanded"]).toBe(true);
+
+    await selectSavedResult(result.resultId);
+    await press("Conversation");
+    await press("Hide saved result");
+    expect(onResultsAvailableChange).toHaveBeenLastCalledWith(true);
+    await act(() => revealPartialResultRef.current?.());
+    expect(findButton("Conversation")?.props["aria-selected"]).toBe(true);
+    expect(
+      pickerOptions().find((option) => option.props["aria-selected"])?.props["data-result-id"],
+    ).toBe(result.resultId);
+
+    await act(() =>
+      renderer.update(
+        view(
+          {
+            ...cancelledJob,
+            progress: { ...cancelledJob.progress, threadDeletionRequested: true },
+          },
+          true,
+          options,
+        ),
+      ),
+    );
+    expect(onResultsAvailableChange).toHaveBeenLastCalledWith(false);
+    await act(() => revealPartialResultRef.current?.());
+    expect(findButton("Hide saved result")).toBeUndefined();
+  }));
 
 it("keeps an open saved conversation in place when a live run is canceled", () =>
   withClient(async () => {
