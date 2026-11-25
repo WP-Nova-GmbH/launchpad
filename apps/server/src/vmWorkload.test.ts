@@ -12,12 +12,15 @@ import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as ProcessRunner from "./processRunner.ts";
 import {
+  inspectIdleWorkflowVmStop,
   inspectVmWorkloads,
   inspectWorkflowVmRecovery,
+  recoverIdleWorkflowVmStop,
   withSealedVmWorkloads,
   withVmWorkloadMaintenance,
   readVmHarnessIdentity,
   stopIdleVmHarness,
+  stopIdleWorkflowVmHarness,
 } from "./vmWorkload.ts";
 import {
   VmControlSpawner,
@@ -570,7 +573,7 @@ it.effect(
 );
 
 it.effect(
-  "a preconstructed workflow runner admits only trusted Git under the sealed read context",
+  "a workflow runner admits only trusted Git and the fixed Codex reader under the seal",
   () =>
     Effect.gen(function* () {
       const operationId = "captured-checkpoint-read";
@@ -600,9 +603,22 @@ it.effect(
             { bootId, epoch: 7 },
           );
           expect(patch.stdout).toBe("saved patch");
+          const reader = [
+            "-IS",
+            "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py",
+            "conversation-files",
+          ];
+          const codexHome = "/home/launchpad-workflow/.codex";
+          yield* withSealedVmWorkloads(
+            operationId,
+            captured.run({ command: "/usr/bin/python3", args: reader, cwd: codexHome }),
+            { bootId, epoch: 7 },
+            true,
+          );
           for (const [command, args] of [
             ["codex", ["app-server"]],
             ["/bin/bash", []],
+            ["/usr/bin/python3", reader],
           ] as const) {
             expect(
               Exit.isFailure(
@@ -617,7 +633,7 @@ it.effect(
         }),
         true,
       ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, raw));
-      expect(commands).toHaveLength(1);
+      expect(commands).toHaveLength(2);
       expect(commands[0]!.args.slice(0, 4)).toEqual(["run-transfer", bootId, sealedBy, "7"]);
       expect(commands[0]!.args.slice(5)).toEqual([
         "--",
@@ -628,6 +644,21 @@ it.effect(
         "a",
         "b",
         "--",
+      ]);
+      expect(commands[1]!.args.slice(0, 4)).toEqual([
+        "run-workflow-transfer",
+        bootId,
+        sealedBy,
+        "7",
+      ]);
+      expect(commands[1]!.args.slice(5)).toEqual([
+        "process",
+        "/home/launchpad-workflow/.codex",
+        "--",
+        "/usr/bin/python3",
+        "-IS",
+        "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py",
+        "conversation-files",
       ]);
     }),
 );
@@ -702,6 +733,65 @@ it.effect("keeps exact owned harness identity separate from physical-stop proof"
       ),
     );
     expect(stillLive.stopped).toBe(false);
+  }),
+);
+
+it.effect("confirms a workflow stop refusal after explicit kernel rejection", () =>
+  Effect.gen(function* () {
+    const identity = {
+      bootId,
+      groupId: group.id,
+      pid: group.leaderPid,
+      startTicks: "98765",
+      executableSha256: "b".repeat(64),
+    };
+    const rejection = json({ status: "rejected" });
+    expect(
+      yield* stopIdleWorkflowVmHarness(
+        identity,
+        "pause-owned",
+        "c".repeat(32),
+        Effect.succeed(true),
+      ).pipe(
+        Effect.provideService(
+          VmControlSpawner,
+          respond(`${json({ status: "prepared" })}\n${rejection}\n`),
+        ),
+      ),
+    ).toEqual({ admitted: false });
+    expect(
+      yield* inspectIdleWorkflowVmStop(identity, "pause-owned").pipe(
+        Effect.provideService(VmControlSpawner, respond(rejection)),
+      ),
+    ).toEqual({ admitted: false });
+  }),
+);
+
+it.effect("recovers the exact workflow stop without a provider session or signal command", () =>
+  Effect.gen(function* () {
+    const operationId = "pause-owned";
+    const operation = NodeCrypto.createHash("sha256")
+      .update(operationId)
+      .digest("hex")
+      .slice(0, 32);
+    const child = respond(
+      ["absent", "rejected", "reserved", "prepared"].map((status) => json({ status })),
+    );
+    const control = ChildProcessSpawner.make((command) => {
+      if (!ChildProcess.isStandardCommand(command)) throw new Error("Unexpected pipeline");
+      expect(command.args).toEqual(["recover-idle-provider-stop", operation, bootId, "7"]);
+      return child.spawn(command);
+    });
+    const recover = recoverIdleWorkflowVmStop(operationId, { bootId, epoch: 7 }).pipe(
+      Effect.provideService(VmControlSpawner, control),
+    );
+    for (const status of ["absent", "rejected", "reserved"]) {
+      expect(yield* recover).toBe(status);
+    }
+    expect(yield* recover.pipe(Effect.flip)).toMatchObject({
+      reason: "decode",
+      action: "recover-idle-provider-stop",
+    });
   }),
 );
 

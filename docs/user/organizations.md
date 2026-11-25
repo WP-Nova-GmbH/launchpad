@@ -220,6 +220,12 @@ continues from the saved result. Cancelled runs show any confirmed GitHub links 
 outcome could not be verified. Machine publishing requires an updated Linux or macOS executor,
 and Machine PR publishing supports GitHub.
 
+After a VM workflow finishes, choose **Continue in VM** to return to its conversation and checkout.
+Launchpad resumes or restores the workspace when it is still available. You can keep working in chat
+or the terminal, then commit and choose **Push** to update the run's branch and any pull request it
+already opened. Only maintainers and organization admins can continue in a VM that received repository
+secrets. **Saved results** opens the workflow's recorded changes even after its workspace expires.
+
 Anyone with repository access can run a Machine workflow with a description of the task and inspect the
 shared job. Jobs wait while the selected machine is offline or busy. Each accepted job uses its own
 worktree and one shared agent conversation. Inspect the saved result and diff before approving a

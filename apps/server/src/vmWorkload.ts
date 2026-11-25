@@ -1,4 +1,4 @@
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as ProcessRunner from "./processRunner.ts";
 import {
   VmControlSpawner,
@@ -12,6 +12,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import * as Clock from "effect/Clock";
+import * as Stream from "effect/Stream";
 
 const Identifier = Schema.String.check(Schema.isPattern(/^[a-f0-9]{32}$/u));
 const BootId = Schema.String.check(
@@ -63,6 +64,16 @@ const harnessIdentityJson = Schema.fromJsonString(VmHarnessIdentity);
 const decodeHarnessIdentity = Schema.decodeEffect(harnessIdentityJson);
 const encodeHarnessIdentity = Schema.encodeEffect(harnessIdentityJson);
 const decodeHarnessStop = Schema.decodeEffect(Schema.fromJsonString(VmHarnessStop));
+const decodeWorkflowHarnessStop = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({ status: Schema.Literals(["prepared", "refused", "rejected", "reserved"]) }),
+  ),
+);
+const decodeWorkflowStopRecovery = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({ status: Schema.Literals(["absent", "rejected", "reserved"]) }),
+  ),
+);
 const decodeHarnessPeer = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Struct({ matched: Schema.Boolean })),
 );
@@ -179,6 +190,107 @@ export const stopIdleVmHarness = Effect.fn("VmWorkload.stop_harness")(function* 
       identity.groupId,
       encoded,
     ]),
+  );
+}, Effect.mapError(harnessFailure));
+
+/** A retry may observe a recorded signal reservation, but cannot issue one. */
+export const inspectIdleWorkflowVmStop = Effect.fn("VmWorkload.inspect_workflow_harness_stop")(
+  function* (identity: VmHarnessIdentity, operationId: string) {
+    const action = "inspect-idle-provider-stop";
+    const { status } = yield* decodeWorkflowHarnessStop(
+      yield* harnessCommand([
+        action,
+        NodeCrypto.createHash("sha256").update(operationId).digest("hex").slice(0, 32),
+        identity.groupId,
+        yield* encodeHarnessIdentity(identity),
+      ]),
+    );
+    if (status === "prepared") return yield* new VmWorkloadError({ reason: "decode", action });
+    return { admitted: status === "reserved" };
+  },
+  Effect.mapError(harnessFailure),
+);
+
+/** Recover a persisted stop after losing the runtime that owned the Codex process. */
+export const recoverIdleWorkflowVmStop = Effect.fn("VmWorkload.recover_workflow_harness_stop")(
+  function* (operationId: string, expected: { readonly bootId: string; readonly epoch: number }) {
+    const action = "recover-idle-provider-stop";
+    const receipt = yield* harnessCommand([
+      action,
+      NodeCrypto.createHash("sha256").update(operationId).digest("hex").slice(0, 32),
+      expected.bootId,
+      String(expected.epoch),
+    ]);
+    return (yield* decodeWorkflowStopRecovery(receipt).pipe(
+      Effect.mapError((cause) => new VmWorkloadError({ reason: "decode", action, cause })),
+    )).status;
+  },
+);
+
+/** The helper holds the exact Codex process frozen until it receives one decision or exits. */
+export const stopIdleWorkflowVmHarness = Effect.fn("VmWorkload.stop_workflow_harness")(function* (
+  identity: VmHarnessIdentity,
+  operationId: string,
+  nonce: string,
+  confirmIdle: Effect.Effect<boolean>,
+) {
+  const action = "prepare-idle-provider";
+  const control = yield* VmControlSpawner;
+  if (!control) return yield* new VmWorkloadError({ reason: "control_unavailable", action });
+  const args = [
+    action,
+    NodeCrypto.createHash("sha256").update(operationId).digest("hex").slice(0, 32),
+    identity.groupId,
+    yield* encodeHarnessIdentity(identity),
+    nonce,
+  ];
+  return yield* Effect.scoped(
+    Effect.gen(function* () {
+      const child = yield* control.spawn(
+        ChildProcess.make("/opt/launchpad/bin/launchpad-workload", args, {
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "ignore",
+        }),
+      );
+      let decision: boolean | undefined;
+      let result: boolean | undefined;
+      yield* child.stdout.pipe(
+        Stream.decodeText(),
+        Stream.splitLines,
+        Stream.runForEach(
+          Effect.fnUntraced(function* (line) {
+            if (result !== undefined || line.length > 128)
+              return yield* new VmWorkloadError({ reason: "decode", action });
+            const { status } = yield* decodeWorkflowHarnessStop(line);
+            if (status === "prepared") {
+              if (decision !== undefined)
+                return yield* new VmWorkloadError({ reason: "decode", action });
+              decision = yield* confirmIdle;
+              yield* Stream.make(decision ? "stop\n" : "release\n").pipe(
+                Stream.encodeText,
+                Stream.run(child.stdin),
+              );
+            } else {
+              if (status === "reserved" && decision === false)
+                return yield* new VmWorkloadError({ reason: "decode", action });
+              result = status === "reserved";
+            }
+          }),
+        ),
+      );
+      const code = yield* child.exitCode;
+      if (code !== 0)
+        return yield* new VmWorkloadError({ reason: "command_exit", action, exitCode: code });
+      if (result === undefined) return yield* new VmWorkloadError({ reason: "decode", action });
+      return { admitted: result };
+    }),
+  ).pipe(
+    Effect.interruptible,
+    Effect.timeoutOrElse({
+      duration: "15 seconds",
+      orElse: () => Effect.fail(new VmWorkloadError({ reason: "timeout", action })),
+    }),
   );
 }, Effect.mapError(harnessFailure));
 

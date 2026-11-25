@@ -1,4 +1,5 @@
 import { EnvironmentId } from "@t3tools/contracts";
+import type { RelayWorkflowVmFollowUpConnection } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -6,6 +7,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -30,7 +32,11 @@ import type {
   NetworkStatus,
   SupervisorConnectionState,
 } from "./model.ts";
-import { ConnectionBlockedError } from "./model.ts";
+import {
+  ConnectionBlockedError,
+  ConnectionTransientError,
+  RelayConnectionTarget,
+} from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
@@ -75,6 +81,10 @@ export class EnvironmentRegistry extends Context.Service<
     readonly register: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
+    readonly setWorkflowFollowUp: (
+      environmentId: EnvironmentId,
+      access: RelayWorkflowVmFollowUpConnection | null,
+    ) => Effect.Effect<void, ConnectionAttemptError | EnvironmentNotRegisteredError>;
     readonly registerPlatform: (registration: PrimaryConnectionRegistration) => Effect.Effect<void>;
     readonly reconcilePlatform: (
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
@@ -747,6 +757,88 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const setWorkflowFollowUp = Effect.fn("EnvironmentRegistry.setWorkflowFollowUp")(function* (
+    environmentId: EnvironmentId,
+    access: RelayWorkflowVmFollowUpConnection | null,
+  ) {
+    const replace = withLeaseLock(
+      environmentId,
+      Effect.gen(function* () {
+        const entry = yield* getEntry(environmentId);
+        if (entry.target._tag !== "RelayConnectionTarget" || !entry.enabled)
+          return yield* new ConnectionBlockedError({
+            reason: "permission",
+            detail: "The workflow VM connection is unavailable.",
+          });
+        const { workflowFollowUp: current, ...target } = entry.target;
+        const existing = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+        if (
+          current?.threadId !== access?.threadId ||
+          current?.generation !== access?.generation ||
+          !existing ||
+          (access && (yield* SubscriptionRef.get(existing.supervisor.state)).phase === "blocked")
+        ) {
+          yield* installEntryLocked({
+            ...entry,
+            target: new RelayConnectionTarget({
+              ...target,
+              ...(access ? { workflowFollowUp: access } : {}),
+            }),
+          });
+          return (yield* SubscriptionRef.get(serviceScopes)).get(environmentId)?.supervisor;
+        }
+        return existing.supervisor;
+      }),
+    );
+    const supervisor = yield* replace;
+    if (!access) return;
+    const unavailable = () =>
+      new ConnectionBlockedError({
+        reason: "permission",
+        detail: "The workflow VM did not open an authorized follow-up session.",
+      });
+    if (!supervisor) return yield* unavailable();
+    const session = yield* Stream.merge(
+      Stream.concat(
+        Stream.fromEffect(SubscriptionRef.get(supervisor.session)),
+        SubscriptionRef.changes(supervisor.session),
+      ).pipe(
+        Stream.filterMap(Option.match({ onNone: () => Result.failVoid, onSome: Result.succeed })),
+        Stream.map((session) => ({ session })),
+      ),
+      Stream.concat(
+        Stream.fromEffect(SubscriptionRef.get(supervisor.state)),
+        SubscriptionRef.changes(supervisor.state),
+      ).pipe(
+        Stream.filter((state) => state.phase === "blocked" && state.lastFailure !== null),
+        Stream.map((state) => ({ error: state.lastFailure! })),
+      ),
+    ).pipe(
+      Stream.runHead,
+      Effect.timeoutOrElse({
+        duration: "25 seconds",
+        orElse: () =>
+          Effect.fail(
+            new ConnectionTransientError({
+              reason: "timeout",
+              detail: "The workflow VM connection did not open in time.",
+            }),
+          ),
+      }),
+    );
+    if (Option.isNone(session)) return yield* unavailable();
+    if ("error" in session.value) return yield* session.value.error;
+    const { environment } = yield* session.value.session.initialConfig;
+    const confirmed = environment.capabilities.workflowVmFollowUp;
+    if (
+      environment.environmentId !== environmentId ||
+      confirmed?.threadId !== access.threadId ||
+      confirmed.generation !== access.generation ||
+      (yield* SubscriptionRef.get(serviceScopes)).get(environmentId)?.supervisor !== supervisor
+    )
+      return yield* unavailable();
+  });
+
   const retryNow = (environmentId: EnvironmentId) =>
     acquireSupervisor(environmentId).pipe(
       Effect.flatMap((supervisor) => supervisor.retryNow),
@@ -886,6 +978,7 @@ export const make = Effect.gen(function* () {
     networkStatus,
     start,
     register,
+    setWorkflowFollowUp,
     registerPlatform,
     reconcilePlatform,
     remove,

@@ -72,6 +72,7 @@ export function makeThreadVmActivityStore(sql: PgClient) {
       readonly activity: Activity;
       readonly inactiveWorkIds?: ReadonlyArray<string>;
       readonly workflowCheckpoint?: boolean;
+      readonly backgroundRevision?: string;
     }) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
@@ -80,10 +81,14 @@ export function makeThreadVmActivityStore(sql: PgClient) {
             input.workflowCheckpoint,
           );
           const policy = yield* lockThreadVmPolicy(sql, organizationId);
+          const backgroundRevision = input.backgroundRevision ?? null;
           const rows = yield* sql`UPDATE relay_thread_vm_activity
           SET activity = ${input.activity}, observed_at = clock_timestamp(),
           inactive_work_ids = ${sql.json(input.activity === "idle" ? [...(input.inactiveWorkIds ?? [])] : [])},
-          idle_since = CASE WHEN ${input.activity} = 'idle' THEN COALESCE(idle_since, clock_timestamp()) ELSE NULL END
+          background_revision = ${backgroundRevision},
+          idle_since = CASE WHEN ${input.activity} = 'idle' THEN
+            CASE WHEN background_revision IS DISTINCT FROM ${backgroundRevision}::text
+              THEN clock_timestamp() ELSE COALESCE(idle_since, clock_timestamp()) END ELSE NULL END
           WHERE allocation_id = ${input.allocationId} AND revision = ${input.revision}
             AND activity = 'unknown'
             AND observed_at >= clock_timestamp() - interval '2 minutes'

@@ -500,6 +500,43 @@ describe("portable relay inbox delivery", () => {
         assert.isTrue([...f.work.values()].every(Boolean));
       }).pipe(Effect.provide(testLayer)),
   );
+  it.effect("rejects a saved follow-up delivery after role revocation and advances the inbox", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      f.inbox.push(entry("revoked"), { ...entry("next", 2), actor: { ...actor, userId: "other" } });
+      let revoked = false;
+      const authorizeFollowUp = (_owner: unknown, userId: string) =>
+        Effect.succeed(!revoked || userId !== actor.userId);
+      const interrupted = makeThreadCommandSync(
+        f.sql,
+        {
+          dispatch: () =>
+            Effect.fail(new ThreadExecutionFenceError({ threadId, detail: "disconnected" })),
+        },
+        f.receipts,
+        f.execution,
+        { ...f.transport, authorizeFollowUp },
+        f.normalize,
+      );
+      yield* Effect.flip(interrupted.synchronize(threadId));
+      const [delivery] = yield* f.sql<{
+        normalized: string | null;
+      }>`SELECT normalized_json AS normalized
+        FROM thread_relay_command_deliveries WHERE command_id='revoked'`;
+      assert.isNotNull(delivery?.normalized);
+      assert.isFalse(f.acknowledged.has("revoked"));
+      revoked = true;
+      yield* f.make({ authorizeFollowUp }).synchronize(threadId);
+      assert.equal(f.acknowledged.get("revoked")?.status, "rejected");
+      assert.equal(f.acknowledged.get("next")?.status, "accepted");
+      assert.equal(f.normalizations(), 2);
+      assert.isTrue(
+        Option.isNone(yield* f.receipts.getByCommandId({ commandId: CommandId.make("revoked") })),
+      );
+      assert.isTrue([...f.work.values()].every(Boolean));
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect(
     "retries a transient dispatch failure with the saved normalized payload and acknowledges only persisted rejection",
     () =>

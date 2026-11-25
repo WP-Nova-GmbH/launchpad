@@ -5,6 +5,8 @@ import {
   ORCHESTRATION_PROTOCOL_VERSION,
   type ExecutionEnvironmentDescriptor,
   type OrchestrationShellSnapshot,
+  type ServerConfig,
+  ThreadId,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -391,7 +393,15 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         const session = yield* Effect.acquireRelease(
           Effect.succeed({
             client: {} as RpcSession.RpcSession["client"],
-            initialConfig: Effect.die(new Error("Config is not used by registry tests.")),
+            initialConfig: Effect.succeed({
+              environment: {
+                environmentId: target.environmentId,
+                capabilities:
+                  target._tag === "RelayConnectionTarget" && target.workflowFollowUp
+                    ? { workflowVmFollowUp: target.workflowFollowUp }
+                    : {},
+              },
+            } as ServerConfig),
             subscribeServerConfig: () =>
               Stream.die(new Error("Config is not used by registry tests.")),
             ready: Effect.void,
@@ -1185,6 +1195,34 @@ describe("EnvironmentRegistry", () => {
             ?.unsupportedReason,
         ).toBe(error.message);
         expect(yield* Ref.get(harness.sessions)).toHaveLength(0);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("retries a blocked follow-up connection for the same VM generation", () =>
+    Effect.gen(function* () {
+      const permissionDenied = new ConnectionBlockedError({
+        reason: "permission",
+        detail: "Workflow access is unavailable.",
+      });
+      const denied = yield* Ref.make(true);
+      const harness = yield* makeHarness([RELAY_TARGET], [], [], {
+        beforePrepare: () =>
+          Ref.get(denied).pipe(
+            Effect.flatMap((blocked) => (blocked ? Effect.fail(permissionDenied) : Effect.void)),
+          ),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const access = { threadId: ThreadId.make("workflow:follow-up"), generation: 2 };
+        const open = registry.setWorkflowFollowUp(RELAY_TARGET.environmentId, access);
+        expect(yield* Effect.flip(open)).toEqual(permissionDenied);
+        yield* Ref.set(denied, false);
+        yield* open;
+        expect((yield* registry.state(RELAY_TARGET.environmentId)).phase).toBe("connected");
+        yield* open;
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer));
     }),
   );

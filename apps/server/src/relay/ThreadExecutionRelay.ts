@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Native path normalization; filesystem resolution is supplied by the caller.
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as NodePath from "node:path";
 import * as Schema from "effect/Schema";
@@ -23,11 +24,29 @@ export class ThreadExecutionRelayError extends Schema.TaggedError<ThreadExecutio
     retryableAdmission: Schema.optional(Schema.Literal(true)),
   },
 ) {}
+export const CurrentWorkflowVmFollowUpActor = Context.Reference<string | undefined>(
+  "t3/relay/CurrentWorkflowVmFollowUpActor",
+  { defaultValue: () => undefined },
+);
+
+export const CurrentWorkflowVmFollowUpResponse = Context.Reference<
+  | {
+      readonly threadId: string;
+      readonly workId: string;
+      readonly userId: string;
+      readonly commandId: string;
+    }
+  | undefined
+>("t3/relay/CurrentWorkflowVmFollowUpResponse", { defaultValue: () => undefined });
+
 export interface ThreadWorkIdentity {
   readonly threadId: string;
   readonly workId: string;
   readonly kind: "provider" | "terminal" | "setup" | "workspace";
   readonly expectedGeneration?: number;
+  readonly followUpUserId?: string;
+  readonly followUpCommandId?: string;
+  readonly followUpPreparing?: true;
 }
 type RelayWork = ThreadWorkIdentity & {
   readonly relayUrl: string;
@@ -41,7 +60,9 @@ export interface ThreadExecutionAuthority {
     { readonly completed: boolean; readonly newlyAdmitted: boolean },
     ThreadExecutionRelayError
   >;
-  readonly complete: (work: RelayWork) => Effect.Effect<void, ThreadExecutionRelayError>;
+  readonly complete: (
+    work: RelayWork & { readonly neverStarted?: true },
+  ) => Effect.Effect<void, ThreadExecutionRelayError>;
 }
 
 /** Never replay an uncertain side effect. A caller must reconcile it with its provider/process receipt. */
@@ -142,6 +163,11 @@ export function makeThreadExecutionRelay(
           return admitted.decision === "start" ? ("ordinary" as const) : admitted.decision;
         }),
       );
+    const response = yield* CurrentWorkflowVmFollowUpResponse;
+    const matchingResponse =
+      response?.threadId === input.threadId && response.workId === work.workId
+        ? response
+        : undefined;
     const prior = yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* recheckScope(input.threadId, scope);
@@ -170,20 +196,45 @@ export function makeThreadExecutionRelay(
             });
           // The relay lease remains outstanding. Only the durable negative
           // dispatch receipt permits reusing it without replaying uncertain work.
-          return "start" as const;
+          return matchingResponse ? ("revalidate-response" as const) : ("start" as const);
         }
         return reserved;
       }),
     );
-    if (typeof prior === "string") return prior;
-    if (prior.completed) return "completed" as const;
-    if (prior.started) return "reconcile" as const;
-    const grant = yield* authority.admit(work);
+    if (prior !== "revalidate-response") {
+      if (typeof prior === "string") return prior;
+      if (prior.completed) return "completed" as const;
+      if (prior.started) return "reconcile" as const;
+    }
+    const followUpUserId =
+      work.followUpUserId ?? matchingResponse?.userId ?? (yield* CurrentWorkflowVmFollowUpActor);
+    const followUpCommandId = work.followUpCommandId ?? matchingResponse?.commandId;
+    const grant = yield* authority
+      .admit({
+        ...work,
+        ...(followUpUserId ? { followUpUserId } : {}),
+        ...(followUpCommandId ? { followUpCommandId } : {}),
+      })
+      .pipe(
+        Effect.onError(() =>
+          prior === "revalidate-response"
+            ? captures.reject(captures.admissionId(input)).pipe(Effect.orDie)
+            : Effect.void,
+        ),
+      );
     if (grant.completed) {
       yield* fence.completeWork(work);
       yield* captures.complete(captures.admissionId(input));
       yield* fence.acknowledgeWork(work);
       return "completed" as const;
+    }
+    if (prior === "revalidate-response") {
+      if ((yield* getPlacement(input.threadId))?.phase === "active") return "start" as const;
+      yield* captures.reject(captures.admissionId(input));
+      return yield* new ThreadExecutionFenceError({
+        threadId: input.threadId,
+        detail: "The thread is not accepting a rejected invocation retry here.",
+      });
     }
     const decision = yield* fence.startReservedWork(work);
     if (decision === "held") {
@@ -213,7 +264,7 @@ export function makeThreadExecutionRelay(
     yield* fence.completeWork(work);
     yield* captures.complete(captures.admissionId(input));
     if (!prior.relayCompleted) {
-      yield* authority.complete(work);
+      yield* authority.complete({ ...work, ...(prior.started ? {} : { neverStarted: true }) });
       yield* fence.acknowledgeWork(work);
     }
   });
@@ -277,7 +328,11 @@ export function makeThreadExecutionRelay(
           threadId: pending.threadId,
           detail: "An old execution completion still needs reconciliation.",
         });
-      yield* authority.complete({ ...placement, ...pending });
+      yield* authority.complete({
+        ...placement,
+        ...pending,
+        ...(pending.started ? {} : { neverStarted: true }),
+      });
       yield* fence.acknowledgeWork(pending);
     }
   });

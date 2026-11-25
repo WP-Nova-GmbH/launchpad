@@ -384,14 +384,15 @@ describe("E2B thread VM compute", () => {
       const restored = {
         ...input,
         sourceTemplateId: "snapshot-template",
-        sourceBuildId,
         restoreOperationId: input.operationId,
         bootAttempt: 0,
       };
+      yield* compute.restore.resolveSource(restored.sourceTemplateId, sourceBuildId);
       yield* compute.createFromSnapshot(restored);
       const creates = () =>
         transport.mock.calls.filter(([, options]) => options?.method === "POST");
       expect(creates()).toHaveLength(1);
+      expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(["GET", "POST"]);
       expect(decodeJson(String(creates()[0]![1]!.body))).toEqual({
         templateID: "snapshot-template",
         metadata: {
@@ -414,23 +415,24 @@ describe("E2B thread VM compute", () => {
         autoPauseMemory: true,
         autoResume: { enabled: false },
       });
-      const mismatch = yield* compute
-        .createFromSnapshot({ ...restored, sourceBuildId: "11111111-1111-4111-8111-111111111111" })
+      const mismatch = yield* compute.restore
+        .resolveSource(restored.sourceTemplateId, "11111111-1111-4111-8111-111111111111")
         .pipe(Effect.flip);
       expect(mismatch).toMatchObject({ reason: "identity" });
       expect(creates()).toHaveLength(1);
-      transport.mockImplementation(async (url) => {
-        if (String(url).endsWith("/v2/sandboxes"))
-          throw new Error("management-key lost create reply");
-        return Response.json({
-          templateID: "snapshot-template",
-          builds: [{ buildID: sourceBuildId, status: "ready" }],
-        });
-      });
+      transport.mockRejectedValueOnce(new Error("Catalog unavailable"));
+      expect(
+        yield* compute.restore
+          .resolveSource(restored.sourceTemplateId, sourceBuildId)
+          .pipe(Effect.flip),
+      ).toMatchObject({ _tag: "E2BRestoreError", reason: "transport" });
+      expect(creates()).toHaveLength(1);
+      transport.mockClear();
+      transport.mockRejectedValueOnce(new Error("management-key lost create reply"));
       const error = yield* compute.createFromSnapshot(restored).pipe(Effect.flip);
       expect(error).toMatchObject({ operation: "create" });
       expect(error).not.toHaveProperty("createRejected", true);
-      expect(creates()).toHaveLength(2);
+      expect(transport.mock.calls.map(([, options]) => options?.method)).toEqual(["POST"]);
       expect(client.create).not.toHaveBeenCalled();
     }),
   );

@@ -13,9 +13,20 @@ const decodeNamedTemplate = Schema.decodeUnknownEffect(
   Schema.Struct({ ...Template.fields, names: Schema.Array(Identifier) }),
 );
 const decodeAlias = Schema.decodeUnknownEffect(Schema.Struct({ templateID: Identifier }));
+const isE2BNotFound = Schema.is(
+  Schema.Struct({ code: Schema.Literal(404), message: Schema.NonEmptyString }),
+);
 export class E2BRestoreError extends Schema.TaggedError<E2BRestoreError>()("E2BRestoreError", {
   operation: Schema.String,
-  reason: Schema.Literals(["configuration", "transport", "http", "response", "identity"]),
+  reason: Schema.Literals([
+    "configuration",
+    "transport",
+    "http",
+    "response",
+    "identity",
+    "not_found",
+    "not_ready",
+  ]),
   status: Schema.optionalKey(Schema.Number),
 }) {}
 
@@ -49,6 +60,7 @@ export function makeE2BRestoreClient(
   const request = Effect.fn("E2BRestoreClient.request")(function* (
     operation: string,
     path: string,
+    exactSource = false,
   ) {
     if (!valid) return yield* new E2BRestoreError({ operation, reason: "configuration" });
     const response = yield* Effect.tryPromise({
@@ -63,6 +75,20 @@ export function makeE2BRestoreClient(
       catch: () => new E2BRestoreError({ operation, reason: "transport" }),
     });
     if (!response.ok) {
+      if (
+        exactSource &&
+        response.status === 404 &&
+        response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ===
+          "application/json"
+      ) {
+        // An HTTP 404 can come from a proxy. Only recognize E2B's JSON error envelope.
+        const missing = yield* Effect.tryPromise({
+          try: async () => isE2BNotFound(await response.json()),
+          catch: () => undefined,
+        }).pipe(Effect.orElseSucceed(() => false));
+        if (missing)
+          return yield* new E2BRestoreError({ operation, reason: "not_found", status: 404 });
+      }
       yield* Effect.tryPromise({
         try: () => response.body?.cancel() ?? Promise.resolve(),
         catch: () => undefined,
@@ -81,17 +107,22 @@ export function makeE2BRestoreClient(
     if (!sourceTemplateID || sourceTemplateID.includes(":") || sourceTemplateID.includes("/"))
       return yield* new E2BRestoreError({ operation: "snapshot", reason: "identity" });
     const template = yield* decodeTemplate(
-      yield* request("snapshot", `/templates/${encodeURIComponent(sourceTemplateID)}`),
+      yield* request("snapshot", `/templates/${encodeURIComponent(sourceTemplateID)}`, true),
     ).pipe(
       Effect.mapError(() => new E2BRestoreError({ operation: "snapshot", reason: "response" })),
     );
     if (
       template.templateID !== sourceTemplateID ||
       template.builds.length !== 1 ||
-      template.builds[0]!.status !== "ready" ||
       template.builds[0]!.buildID !== sourceBuildID
     )
       return yield* new E2BRestoreError({ operation: "snapshot", reason: "identity" });
+    const status = template.builds[0]!.status;
+    if (status !== "ready")
+      return yield* new E2BRestoreError({
+        operation: "snapshot",
+        reason: status === "error" ? "identity" : "not_ready",
+      });
     return { sourceTemplateID, sourceBuildID };
   });
   const named = Effect.fn("E2BRestoreClient.namedTemplate")(function* (name: string) {

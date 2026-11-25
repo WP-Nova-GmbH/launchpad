@@ -12,9 +12,18 @@ const principal = {
   },
 };
 const path = "/v1/environments/vm-env/threads/private-thread";
+const workflowVmRoutes = [
+  "attempt",
+  "review-secrets",
+  "publishing",
+  "follow-up/ready",
+  "follow-up/environment",
+  "follow-up-publishing",
+];
+
 describe("thread VM credential HTTP boundary", () => {
-  it.each(["attempt", "review-secrets", "publishing"])(
-    "permits workflow %s only for the assigned thread",
+  it.each(workflowVmRoutes)(
+    "permits workflow VM %s only for the assigned workflow thread",
     (action) => {
       const workflowThreadId = ThreadId.make(`workflow:${"a".repeat(64)}`);
       const workflowPrincipal = {
@@ -30,7 +39,7 @@ describe("thread VM credential HTTP boundary", () => {
         url.replace(encodeURIComponent(workflowThreadId), "another-thread"),
         url + "/extra",
         url + "/",
-        url.replace(`/workflow/${action}`, `/workflow%2F${action}`),
+        url.replace(/\/([^/]+)$/u, "%2F$1"),
         url.replace(`/workflow/${action}`, "/workflow/another"),
       ])
         expect(threadVmCredentialAllows(workflowPrincipal, "POST", forbidden)).toBe(false);
@@ -38,7 +47,14 @@ describe("thread VM credential HTTP boundary", () => {
   );
 
   it("permits only the assigned thread's command/history/work protocol", () => {
-    expect(threadVmCredentialAllows(principal, "POST", path + "/workflow/publishing")).toBe(false);
+    for (const action of [
+      "publishing",
+      "follow-up/ready",
+      "follow-up/environment",
+      "follow-up-publishing",
+    ]) {
+      expect(threadVmCredentialAllows(principal, "POST", path + "/workflow/" + action)).toBe(false);
+    }
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/github")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/credentials/codex")).toBe(true);
     expect(threadVmCredentialAllows(principal, "POST", path + "/provider-auth/source")).toBe(true);

@@ -294,6 +294,11 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  WorkflowVmFollowUpPushError,
+  WorkflowVmFollowUpPushInput,
+  WorkflowVmFollowUpPushResult,
+} from "./workflows.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -348,6 +353,7 @@ export const WS_METHODS = {
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
+  workflowVmFollowUpPush: "workflowVm.followUpPush",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
 
@@ -1126,6 +1132,11 @@ const WsGitRunStackedActionRpc = Rpc.make(WS_METHODS.gitRunStackedAction, {
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
   stream: true,
 });
+const WsWorkflowVmFollowUpPushRpc = Rpc.make(WS_METHODS.workflowVmFollowUpPush, {
+  payload: WorkflowVmFollowUpPushInput,
+  success: WorkflowVmFollowUpPushResult,
+  error: Schema.Union([WorkflowVmFollowUpPushError, EnvironmentAuthorizationError]),
+});
 
 const WsGitResolvePullRequestRpc = Rpc.make(WS_METHODS.gitResolvePullRequest, {
   payload: GitPullRequestRefInput,
@@ -1617,6 +1628,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsGitRunStackedActionRpc,
+  WsWorkflowVmFollowUpPushRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,
   WsVcsListRefsRpc,

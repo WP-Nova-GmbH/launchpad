@@ -1,3 +1,4 @@
+import type { RelayWorkflowVmFollowUpConnection } from "@t3tools/contracts/relay";
 import {
   WorkflowConflictError,
   WorkflowInvalidError,
@@ -104,6 +105,8 @@ export const ManagedRelayRequestAction = Schema.Literals([
   "runWorkflow",
   "getWorkflowJob",
   "getWorkflowJobResult",
+  "continueWorkflowVm",
+  "getWorkflowVmFollowUp",
   "listSavedWorkflowResults",
   "readSavedWorkflowResult",
   "getSavedWorkflowHistory",
@@ -230,6 +233,8 @@ export const ManagedRelayRequestActivity = Schema.Literals([
   "runWorkflow",
   "getWorkflowJob",
   "getWorkflowJobResult",
+  "continueWorkflowVm",
+  "getWorkflowVmFollowUp",
   "listSavedWorkflowResults",
   "readSavedWorkflowResult",
   "getSavedWorkflowHistory",
@@ -521,6 +526,7 @@ export class ManagedRelayClient extends Context.Service<
       readonly scopes: ReadonlyArray<RelayDpopAccessTokenScope>;
       readonly environmentId: RelayClientEnvironmentRecord["environmentId"];
       readonly deviceId?: string;
+      readonly workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
     }) => Effect.Effect<RelayEnvironmentConnectResponse, ManagedRelayClientError>;
     readonly registerDevice: (input: {
       readonly clerkToken: string;
@@ -1061,6 +1067,7 @@ export const make = Effect.fn("ManagedRelayClient.make")(function* (
             const payload: RelayEnvironmentConnectRequest = {
               ...(input.deviceId ? { deviceId: input.deviceId } : {}),
               clientKeyThumbprint: authorization.thumbprint,
+              ...(input.workflowFollowUp ? { workflowFollowUp: input.workflowFollowUp } : {}),
             };
             return client.dpopClient
               .connectEnvironment({

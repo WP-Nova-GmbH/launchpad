@@ -53,12 +53,15 @@ import {
   WorkflowInvalidError,
   WorkflowSubmissionPendingError,
   WorkflowVmDispatchBinding,
+  WorkflowVmFollowUpPushResult,
   WorkflowRecoveryManifest,
   WorkflowSavedResult,
   WorkflowSaveReceipt,
   WorkflowVmPublishingRequest,
   WorkflowVmPublishingResponse,
   WorkflowVmPublishingRestore,
+  WorkflowVmFollowUpPublishingRequest,
+  WorkflowVmFollowUpPublishingResponse,
 } from "./workflows.ts";
 import {
   RepositoryPolicyProof,
@@ -1159,7 +1162,14 @@ export const RelayListEnvironmentsResponse = Schema.Struct({
 });
 export type RelayListEnvironmentsResponse = typeof RelayListEnvironmentsResponse.Type;
 
+export const RelayWorkflowVmFollowUpConnection = Schema.Struct({
+  threadId: ThreadId,
+  generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
+});
+export type RelayWorkflowVmFollowUpConnection = typeof RelayWorkflowVmFollowUpConnection.Type;
+
 export const RelayEnvironmentConnectRequest = Schema.Struct({
+  workflowFollowUp: Schema.optionalKey(RelayWorkflowVmFollowUpConnection),
   deviceId: Schema.optional(
     TrimmedNonEmptyString.annotate({
       description: "Optional client device identifier requesting the connection.",
@@ -1291,6 +1301,7 @@ export type RelayEnvironmentStatusResponse = typeof RelayEnvironmentStatusRespon
 
 export const RelayCloudMintCredentialProofPayload = Schema.Struct({
   ...RelaySignedJwtRegisteredClaims,
+  workflowFollowUp: Schema.optionalKey(RelayWorkflowVmFollowUpConnection),
   environmentId: EnvironmentId,
   clientProofKeyThumbprint: TrimmedNonEmptyString,
   cnf: Schema.Struct({
@@ -3160,6 +3171,14 @@ export const RelayThreadVmClientAccess = Schema.Struct({
   repositoryId: RelayRepositoryId,
   generation: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0)),
   userId: TrimmedNonEmptyString,
+  workflowFollowUp: Schema.optionalKey(
+    Schema.Struct({
+      jobId: TrimmedNonEmptyString,
+      ready: Schema.Boolean,
+      publishedSha: Schema.NullOr(Schema.String),
+      publishedBranch: Schema.NullOr(Schema.String),
+    }),
+  ),
 });
 
 export const RelayThreadVmManagedEndpoint = Schema.Struct({
@@ -3201,6 +3220,10 @@ export const RelayThreadVmWorkflowCheckpoint = Schema.Struct({
   checkpointGeneration: NonNegativeInt,
   publicationId: RelayThreadArtifactId,
   publicationRevision: Schema.Int.check(Schema.isGreaterThan(0)),
+  finishedWorkspaceRevision: Schema.optionalKey(NonNegativeInt),
+  backgroundRevision: Schema.optionalKey(
+    Schema.String.check(Schema.isPattern(/^[0-9a-f]{32}(?::stopped)?$/u)),
+  ),
 });
 export type RelayThreadVmWorkflowCheckpoint = typeof RelayThreadVmWorkflowCheckpoint.Type;
 
@@ -3343,6 +3366,7 @@ export const RelayThreadVmRestoreRecovery = Schema.Struct({
       manifestArtifactId: RelayThreadArtifactId,
       binding: WorkflowVmDispatchBinding,
       sourceSequence: NonNegativeInt,
+      latestPublicationRevision: Schema.optionalKey(NonNegativeInt),
       publishing: Schema.optionalKey(WorkflowVmPublishingRestore),
     }),
   ),
@@ -3508,7 +3532,11 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       "/v1/environments/:environmentId/threads/:threadId/pause/cancel",
       {
         params: RelayThreadOwnerParams,
-        payload: Schema.Struct({ ...RelayThreadGeneration, operationId: RelayThreadArtifactId }),
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          operationId: RelayThreadArtifactId,
+          nativePauseFallback: Schema.optionalKey(Schema.Literal(true)),
+        }),
         success: RelayThreadVmPause,
         error: RelayTenancyErrors,
       },
@@ -3656,7 +3684,11 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       "/v1/environments/:environmentId/threads/:threadId/access/check",
       {
         params: RelayThreadOwnerParams,
-        payload: Schema.Struct({ ...RelayThreadGeneration, userId: TrimmedNonEmptyString }),
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          userId: TrimmedNonEmptyString,
+          workflowFollowUp: Schema.optionalKey(Schema.Literal(true)),
+        }),
         success: RelayThreadVmClientAccess,
         error: RelayTenancyErrors,
       },
@@ -3685,6 +3717,34 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
           stepGeneration: NonNegativeInt,
           commandId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
         }),
+        success: Schema.Struct({
+          environment: Schema.Record(Schema.String, Schema.String),
+          hasSecrets: Schema.Boolean,
+          secretNames: Schema.Array(Schema.String),
+        }),
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "confirmWorkflowVmFollowUpReady",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/follow-up/ready",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          userId: TrimmedNonEmptyString,
+          workId: TrimmedNonEmptyString,
+        }),
+        success: RelayOkResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "resolveWorkflowVmFollowUp",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/follow-up/environment",
+      {
+        params: RelayThreadOwnerParams,
+        payload: Schema.Struct({ ...RelayThreadGeneration, userId: TrimmedNonEmptyString }),
         success: Schema.Struct({
           environment: Schema.Record(Schema.String, Schema.String),
           hasSecrets: Schema.Boolean,
@@ -3723,6 +3783,16 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
         params: RelayThreadOwnerParams,
         payload: WorkflowVmPublishingRequest,
         success: WorkflowVmPublishingResponse,
+        error: RelayTenancyErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "workflowVmFollowUpPublishing",
+      "/v1/environments/:environmentId/threads/:threadId/workflow/follow-up-publishing",
+      {
+        params: RelayThreadOwnerParams,
+        payload: WorkflowVmFollowUpPublishingRequest,
+        success: WorkflowVmFollowUpPublishingResponse,
         error: RelayTenancyErrors,
       },
     ),
@@ -3795,7 +3865,13 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       "/v1/environments/:environmentId/threads/:threadId/work/admit",
       {
         params: RelayThreadOwnerParams,
-        payload: Schema.Struct({ ...RelayThreadGeneration, workId: TrimmedNonEmptyString }),
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          workId: TrimmedNonEmptyString,
+          followUpUserId: Schema.optionalKey(TrimmedNonEmptyString),
+          followUpCommandId: Schema.optionalKey(TrimmedNonEmptyString),
+          followUpPreparing: Schema.optionalKey(Schema.Literal(true)),
+        }),
         success: Schema.Struct({ completed: Schema.Boolean, newlyAdmitted: Schema.Boolean }),
         error: RelayTenancyErrors,
       },
@@ -3805,7 +3881,11 @@ const RelayThreadEnvironmentGroup = HttpApiGroup.make("threadEnvironment")
       "/v1/environments/:environmentId/threads/:threadId/work/complete",
       {
         params: RelayThreadOwnerParams,
-        payload: Schema.Struct({ ...RelayThreadGeneration, workId: TrimmedNonEmptyString }),
+        payload: Schema.Struct({
+          ...RelayThreadGeneration,
+          workId: TrimmedNonEmptyString,
+          neverStarted: Schema.optionalKey(Schema.Literal(true)),
+        }),
         success: RelayOkResponse,
         error: RelayTenancyErrors,
       },
@@ -4205,7 +4285,12 @@ const RelayThreadCommandsGroup = HttpApiGroup.make("threadCommands")
     HttpApiEndpoint.post("stage", "/v1/threads/:threadId/commands", {
       params: Schema.Struct({ threadId: ThreadId }),
       headers: RelayBearerRequestHeaders,
-      payload: Schema.Struct({ command: PortableThreadCommand }),
+      payload: Schema.Struct({
+        command: PortableThreadCommand,
+        expectedPlacement: Schema.optionalKey(
+          Schema.Struct({ environmentId: EnvironmentId, ...RelayThreadGeneration }),
+        ),
+      }),
       success: RelayThreadCommandReceipt,
       error: RelayTenancyErrors,
     }),
@@ -4427,6 +4512,29 @@ const WorkflowErrors = [
   WorkflowConflictError,
   WorkflowInvalidError,
 ] as const;
+export const RelayWorkflowVmFollowUp = Schema.Union([
+  Schema.Struct({
+    state: Schema.Literal("running"),
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    generation: Schema.Int,
+  }),
+  Schema.Struct({
+    state: Schema.Literals([
+      "waiting_capacity",
+      "waiting_codex",
+      "resuming",
+      "restoring",
+      "expired",
+      "unavailable",
+    ]),
+    detail: TrimmedNonEmptyString,
+    canRetry: Schema.optionalKey(Schema.Literal(false)),
+    publishing: Schema.optionalKey(WorkflowVmFollowUpPushResult),
+  }),
+]);
+export type RelayWorkflowVmFollowUp = typeof RelayWorkflowVmFollowUp.Type;
+
 const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
   .add(
     HttpApiEndpoint.get("list", "/v1/repositories/:repositoryId/workflows", {
@@ -4475,6 +4583,26 @@ const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
         headers: RelayBearerRequestHeaders,
         params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
         success: RelayAssignedWorkflowThreadPlacement,
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.post(
+      "continueInVm",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/follow-up",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+        success: RelayWorkflowVmFollowUp,
+        error: WorkflowErrors,
+      },
+    ),
+    HttpApiEndpoint.get(
+      "getVmFollowUp",
+      "/v1/repositories/:repositoryId/workflow-jobs/:jobId/follow-up",
+      {
+        headers: RelayBearerRequestHeaders,
+        params: Schema.Struct({ repositoryId: RelayRepositoryId, jobId: TrimmedNonEmptyString }),
+        success: RelayWorkflowVmFollowUp,
         error: WorkflowErrors,
       },
     ),

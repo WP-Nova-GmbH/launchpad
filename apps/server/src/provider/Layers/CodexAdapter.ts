@@ -6,6 +6,7 @@ import {
 } from "../../vmWorkloadCommand.ts";
 import { exportWorkflowCodexConversation } from "../Drivers/WorkflowCodexConversation.ts";
 import { CurrentWorkflowVmAttemptEnvironment } from "../../relay/WorkflowVmAttempts.ts";
+import { makeWorkflowVmBackgroundActivity } from "../workflowVmBackgroundActivity.ts";
 import {
   openWorkflowCodexProxy,
   WORKFLOW_CODEX_PERMIT_ENV,
@@ -2542,6 +2543,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               )
             : undefined;
 
+        const background = workflowProxy
+          ? yield* makeWorkflowVmBackgroundActivity(fs, path, serverConfig.stateDir, input.threadId)
+          : undefined;
         const runtimeInput: CodexSessionRuntimeOptions = {
           ...(sessionOptions?.requireResume !== undefined
             ? { requireResume: sessionOptions.requireResume }
@@ -2554,6 +2558,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { managedConnectionId: options.managedAuth.connectionId }
             : {}),
           ...(options?.models ? { models: options.models } : {}),
+          ...(background
+            ? {
+                onWorkflowChildrenActive: background.observeChildren,
+                onWorkflowTaskEvent: (event) =>
+                  Effect.forEach(
+                    mapCollabAgentEvent(event, input.threadId),
+                    background.observeTask,
+                    {
+                      discard: true,
+                    },
+                  ),
+                getWorkflowBackgroundRevision: background.getQuietRevision,
+              }
+            : {}),
           launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
           ...(workflowProxy
             ? {
@@ -3247,26 +3265,45 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
   const stopIdleVmSession: NonNullable<CodexAdapterShape["stopIdleVmSession"]> = Effect.fn(
     "CodexAdapter.stop_idle_vm",
-  )(function* (threadId, operationId, admit) {
+  )(function* (threadId, operationId, admit, backgroundRevision, recoverOnly) {
     const session = sessions.get(threadId);
-    if (!session) return true;
+    if (!session) return !recoverOnly;
     if (!trackWorkloads || !session.runtime.closeIdleVmHarness) return false;
     return yield* Effect.gen(function* () {
-      if (session.checkpointing || session.stopped || sessions.get(threadId) !== session)
+      if (session.stopped || sessions.get(threadId) !== session) return false;
+      if (session.checkpointing) {
+        if (recoverOnly)
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId,
+            detail: "The Codex runtime is checkpointing.",
+          });
         return false;
+      }
       session.checkpointing = true;
-      if (!(yield* session.runtime.closeIdleVmHarness!(operationId, admit))) return false;
-      // The owned runtime ends its stream only after native EOF. Keep this mapper
-      // alive until every final event has entered the normal ingestion queue.
-      yield* Fiber.join(session.eventFiber);
-      return true;
+      return yield* Effect.gen(function* () {
+        if (
+          !(yield* session.runtime.closeIdleVmHarness!(
+            operationId,
+            admit,
+            backgroundRevision,
+            recoverOnly,
+          ))
+        )
+          return false;
+        // The owned runtime ends its stream only after native EOF. Keep this mapper
+        // alive until every final event has entered the normal ingestion queue.
+        yield* Fiber.join(session.eventFiber);
+        return true;
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            session.checkpointing = false;
+          }),
+        ),
+      );
     }).pipe(
       session.mutations.withPermits(1),
-      Effect.ensuring(
-        Effect.sync(() => {
-          session.checkpointing = false;
-        }),
-      ),
       Effect.mapError(
         (cause) =>
           new ProviderAdapterProcessError({

@@ -1,3 +1,4 @@
+import { authorizeWorkflowVmFollowUpRequest } from "./WorkflowVmFollowUpState.ts";
 import { readWorkflowRestorePublication } from "./WorkflowVmWorkspace.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import { ThreadId } from "@t3tools/contracts";
@@ -63,10 +64,12 @@ export function makeThreadVmRestoreImportStore(
     const read = Effect.gen(function* () {
       const [binding] = yield* sql<{
         environmentId: string;
+        organizationId: string;
         repositoryId: string;
         canonicalKey: string;
         templateId: string;
-      }>`SELECT b.environment_id AS "environmentId",b.repository_id AS "repositoryId",alias.canonical_key AS "canonicalKey",a.template_id AS "templateId"
+      }>`SELECT b.environment_id AS "environmentId",t.organization_id AS "organizationId",
+        b.repository_id AS "repositoryId",alias.canonical_key AS "canonicalKey",a.template_id AS "templateId"
         FROM relay_thread_placements t JOIN relay_thread_vm_bindings b ON b.thread_id=t.thread_id
         JOIN relay_thread_vm_enrollments e ON e.allocation_id=b.allocation_id JOIN relay_thread_vm_allocations a ON a.allocation_id=b.allocation_id
         JOIN relay_thread_vm_provisions p ON p.allocation_id=a.allocation_id JOIN relay_environment_credentials k ON k.credential_id=b.credential_id
@@ -163,6 +166,7 @@ export function makeThreadVmRestoreImportStore(
       }),
     );
   });
+  // The guest API locks a repository workflow job before calling this under its placement lock.
   const finish = Effect.fn("relay.thread_vm.restore.confirm_activation")(function* (
     receipt: RelayThreadVmRestoreImportReceipt,
   ) {
@@ -173,6 +177,19 @@ export function makeThreadVmRestoreImportStore(
         if (!row.receipt || (yield* encodeReceipt(row.receipt)) !== (yield* encodeReceipt(decoded)))
           return yield* fail();
         if (row.phase === "completed") return { ready: true };
+        const interactiveActor =
+          row.workflowCheckpoint?.finishedWorkspaceRevision === undefined
+            ? null
+            : yield* authorizeWorkflowVmFollowUpRequest(
+                sql,
+                { ...row, jobId: row.workflowCheckpoint.jobId },
+                row.operationId,
+              );
+        if (
+          row.workflowCheckpoint?.finishedWorkspaceRevision !== undefined &&
+          interactiveActor?.userId !== row.actorUserId
+        )
+          return yield* fail();
         if (row.workflowCheckpoint) {
           const [codex] =
             yield* sql`SELECT 1 FROM relay_thread_vm_codex_auth a JOIN relay_workflow_jobs j
@@ -216,6 +233,10 @@ export function makeThreadVmRestoreImportStore(
         if (row.nativeCheckpointOperationId)
           yield* makeThreadNativeCheckpointStore(sql, objects).releaseOperation(row);
         yield* sql`UPDATE relay_thread_vm_restores SET phase='completed',claim_id=NULL,claim_until=NULL,error_code=NULL,retry_at=clock_timestamp()+interval '1 minute' WHERE operation_id=${row.operationId}`;
+        if (row.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+          yield* sql`UPDATE relay_workflow_vm_follow_ups SET operation_id=NULL,requested_at=NULL,
+            open_until=clock_timestamp()+interval '1 minute' WHERE operation_id=${row.operationId}
+              AND allocation_id=${row.allocationId} AND generation=${row.targetGeneration!}`;
         return { ready: true };
       }),
     );

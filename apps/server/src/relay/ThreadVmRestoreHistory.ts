@@ -107,7 +107,7 @@ export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.ex
       artifactRoot: string;
       baseDir?: string;
       workspaceRoot?: string;
-      workflow?: { jobId: string; nativeThreadId: string; continuationKey: string };
+      workflow?: { jobId: string; nativeThreadId: string; continuationKey: string | null };
     } & (
       | { native: ThreadNativeCheckpointPublicationReceipt }
       | {
@@ -196,6 +196,7 @@ export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.ex
       });
       let workflowWriter:
         | Omit<Effect.Success<ReturnType<typeof decodeWorkflowWriter>>, "workflowVmCancellation">
+        | { readonly stoppedRuntimeEventsDrained: true }
         | undefined;
       if (input.workflow) {
         const [runtime] = yield* sql<{ cursor: string; payload: string }>`SELECT
@@ -203,18 +204,26 @@ export const exportThreadVmRestoreHistory = Effect.fn("ThreadVmRestoreHistory.ex
           FROM provider_session_runtime WHERE thread_id=${point.threadId}
             AND provider_name='codex' AND provider_instance_id='codex'
             AND adapter_key='codex' AND status='stopped'`;
-        if (!runtime || !runtime.cursor || !runtime.payload) return yield* fail("workflow-runtime");
+        if (!runtime?.cursor) return yield* fail("workflow-runtime");
         const cursor = yield* decodeWorkflowCursor(runtime.cursor);
-        const writer = yield* decodeWorkflowWriter(runtime.payload);
-        if (
-          cursor.threadId !== input.workflow.nativeThreadId ||
-          writer.providerContinuation.workflowJobId !== input.workflow.jobId ||
-          writer.providerContinuation.continuationKey !== input.workflow.continuationKey ||
-          writer.workflowVmCancellation !== undefined
-        )
+        if (cursor.threadId !== input.workflow.nativeThreadId)
           return yield* fail("workflow-runtime");
-        const { workflowVmCancellation: _, ...proof } = writer;
-        workflowWriter = proof;
+        if (input.workflow.continuationKey === null) {
+          // Released workflows can have ordinary follow-up turns. The frozen
+          // source already proved their real Codex cursor and drained archive.
+          workflowWriter = { stoppedRuntimeEventsDrained: true };
+        } else {
+          if (!runtime.payload) return yield* fail("workflow-runtime");
+          const writer = yield* decodeWorkflowWriter(runtime.payload);
+          if (
+            writer.providerContinuation.workflowJobId !== input.workflow.jobId ||
+            writer.providerContinuation.continuationKey !== input.workflow.continuationKey ||
+            writer.workflowVmCancellation !== undefined
+          )
+            return yield* fail("workflow-runtime");
+          const { workflowVmCancellation: _, ...proof } = writer;
+          workflowWriter = proof;
+        }
       } else if ("source" in input) {
         const [runtime] =
           yield* sql`SELECT 1 FROM provider_session_runtime WHERE thread_id=${point.threadId}`;

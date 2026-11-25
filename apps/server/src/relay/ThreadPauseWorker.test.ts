@@ -1,6 +1,6 @@
 import * as NodeCrypto from "node:crypto";
 import { emptyThreadPromptQueue } from "@t3tools/shared/threadPromptQueue";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
 import type { RelayThreadVmPause } from "@t3tools/contracts/relay";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -19,8 +19,12 @@ import {
 } from "../vmWorkloadCommand.ts";
 
 import { ProviderService } from "../provider/Services/ProviderService.ts";
+import { ProviderValidationError } from "../provider/Errors.ts";
+import { initial } from "../jobs/WorkflowActions.test-fixture.ts";
+import { WorkflowRun, WorkflowRunRecovery } from "../jobs/WorkflowRunStore.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
+import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
 import { makeThreadPauseWorker } from "./ThreadPauseWorker.ts";
 import { ThreadPauseError } from "./ThreadPauseTransport.ts";
 import { threadCheckpointId } from "./ThreadNativeCheckpoint.ts";
@@ -30,6 +34,9 @@ import {
 } from "./testUtils/threadAttachmentCheckpoint.ts";
 
 const encodeQueueFixture = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeRun = Schema.encodeSync(Schema.fromJsonString(WorkflowRun));
+const encodeRunBinding = Schema.encodeSync(Schema.fromJsonString(WorkflowRun.fields.runtime));
+const encodeRecovery = Schema.encodeSync(Schema.fromJsonString(WorkflowRunRecovery));
 
 for (const problem of [
   "historical-cancelled",
@@ -41,6 +48,25 @@ for (const problem of [
   "source-changed-during-read",
   "queued-work",
   "late-queued-work",
+  "finished-background-work",
+  "finished-background-revision-unavailable",
+  "finished-background-revision-changed-after-exit",
+  "finished-background-revision-same-stop",
+  "finished-refused-provider-stop",
+  "finished-uncertain-provider-stop",
+  "finished-provider-stop-rollback",
+  "finished-provider-stop-rollback-wrong-seal",
+  "finished-provider-stop-rollback-wrong-boot",
+  "finished-provider-stop-rollback-wrong-epoch",
+  "finished-restarted-provider-preparation",
+  "finished-restarted-provider-rejection",
+  "finished-restarted-provider-reservation",
+  "finished-restarted-provider-absent",
+  "finished-restarted-provider-ordinary-seal",
+  "finished-warm-activation-live-rejection",
+  "finished-warm-activation-live-reservation",
+  "finished-warm-activation-orphan-reservation",
+  "finished-warm-activation-hidden-runtime",
   "archived-queue",
   "paused-queue",
   "lost-reply",
@@ -63,7 +89,89 @@ for (const problem of [
           operationId = NodeCrypto.randomUUID(),
           advancedOperationId = NodeCrypto.randomUUID();
         const maintenance = yield* Semaphore.make(1);
+        const finishedWorkflow = problem.startsWith("finished-");
+        const providerStopRollback = problem.startsWith("finished-provider-stop-rollback");
+        const restarted = problem.startsWith("finished-restarted-provider-");
+        const warmActivation = problem.startsWith("finished-warm-activation-");
+        const warmLive = problem.startsWith("finished-warm-activation-live-");
+        const warmRejection = problem === "finished-warm-activation-live-rejection";
+        const orphanedWriter = problem === "finished-warm-activation-orphan-reservation";
+        const hiddenWriter = problem === "finished-warm-activation-hidden-runtime";
+        const reserved =
+          problem === "finished-restarted-provider-reservation" ||
+          (warmActivation && !warmRejection);
+        const refusable =
+          problem === "finished-restarted-provider-preparation" ||
+          problem === "finished-restarted-provider-rejection" ||
+          warmRejection;
+        const operationSeal = NodeCrypto.createHash("sha256")
+          .update(operationId)
+          .digest("hex")
+          .slice(0, 32);
+        let bootId = NodeCrypto.randomUUID();
+        let epoch = 1;
+        const workflowCheckpoint = {
+          jobId: "job",
+          checkpointId: operationId,
+          checkpointGeneration: 0,
+          publicationId: operationId,
+          publicationRevision: 1,
+          finishedWorkspaceRevision: 1,
+          ...(problem.startsWith("finished-background-revision-")
+            ? { backgroundRevision: "a".repeat(32) }
+            : {}),
+        };
+        if (finishedWorkflow) {
+          const base = initial();
+          const capsule: WorkflowRunRecovery = {
+            format: "workflow-run-recovery-v1",
+            frozenConfiguration: { jobId: workflowCheckpoint.jobId, repositoryId: "repo" },
+            checkpointPins: [],
+            workflowIgnoreRulesBase64: null,
+            run: {
+              ...base,
+              executionReserved: false,
+              actions: [],
+              runtime: {
+                kind: "vm",
+                jobId: workflowCheckpoint.jobId,
+                organizationId: "org",
+                repositoryId: "repo",
+                allocationId: "allocation",
+                generation: f.owner.generation,
+                operationId: f.owner.operationId,
+                environmentId: EnvironmentId.make(f.owner.environmentId),
+                projectId: ProjectId.make(f.owner.projectId),
+                threadId: ThreadId.make(f.owner.threadId),
+              },
+              progress: {
+                ...base.progress,
+                status: "done",
+                threadId: ThreadId.make(f.owner.threadId),
+              },
+            },
+          };
+          yield* f.sql`INSERT INTO repository_workflow_jobs VALUES(${capsule.run.jobId},${f.owner.threadId},'done',0,${encodeRun(capsule.run)})`;
+          yield* f.sql`INSERT INTO workflow_result_outbox(publication_id,job_id,thread_id,revision,binding_json,record_json,
+            source_sequence,state_artifact_id,patch_artifact_id,manifest_artifact_id,status,started_at,deadline,retry_at)
+            VALUES(${operationId},${capsule.run.jobId},${f.owner.threadId},1,${encodeRunBinding(capsule.run.runtime)},
+            ${encodeRecovery(capsule)},0,'state','patch','manifest','acknowledged',0,1,0)`;
+        }
         yield* f.sql`INSERT INTO provider_session_runtime(thread_id,provider_name,adapter_key,status,last_seen_at) VALUES(${f.owner.threadId},'codex','codex','stopped','2026-10-07T00:00:00Z')`;
+        const runtimeEpisode = NodeCrypto.randomUUID();
+        const recordWriterDrain = (drained: boolean) =>
+          encodeQueueFixture({
+            providerContinuation: { runtimeEpisode, continuationKey: "provider-key" },
+            stoppedRuntimeEventsDrained: drained,
+          }).pipe(
+            Effect.flatMap(
+              (payload) => f.sql`UPDATE provider_session_runtime
+              SET provider_instance_id='codex',status=${drained ? "stopped" : "running"},runtime_payload_json=${payload}
+              WHERE thread_id=${f.owner.threadId}`,
+            ),
+            Effect.orDie,
+          );
+        if (orphanedWriter || hiddenWriter) yield* recordWriterDrain(false);
         yield* f.sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_files_json) VALUES(${f.owner.threadId},${f.nativeInput.turnId},'completed','2026-10-07T00:00:00Z','2026-10-07T00:01:00Z','[]')`;
         let operation: RelayThreadVmPause = {
           threadId: ThreadId.make(f.owner.threadId),
@@ -75,14 +183,18 @@ for (const problem of [
               ? "completed"
               : problem.startsWith("cancelled-before-drain") ||
                   problem.startsWith("native-timeout-cancelled") ||
+                  warmActivation ||
                   problem === "historical-cancelled"
                 ? "cancelled"
                 : "pending",
           canActivate:
-            problem.startsWith("cancelled-before-drain") || problem === "historical-cancelled",
+            problem.startsWith("cancelled-before-drain") ||
+            warmActivation ||
+            problem === "historical-cancelled",
           sourceReopened:
             problem === "historical-cancelled" ||
             problem === "completed-reopened-before-final-save",
+          ...(finishedWorkflow ? { workflowCheckpoint } : {}),
           bootId: null,
           sourceSequence: null,
           nativeCheckpointOperationId: null,
@@ -127,37 +239,130 @@ for (const problem of [
           yield* f.sql`INSERT INTO thread_execution_work(thread_id,work_id,generation,kind,started,completed,relay_completed)
             VALUES(${f.owner.threadId},${`${kind}:idle`},1,${kind},1,0,0)`;
         }
-        let liveProvider = [
-          "idle-owned-provider",
-          "provider-with-descendant",
-          "unconfirmed-provider-stop",
-        ].includes(problem);
+        let liveProvider =
+          finishedWorkflow ||
+          ["idle-owned-provider", "provider-with-descendant", "unconfirmed-provider-stop"].includes(
+            problem,
+          );
         let idleStops = 0;
+        let sealedBy: string | null = null;
+        let recoveryAttempts = 0;
+        let runtimeReconciliations = 0;
+        let cancelAttempts = 0;
+        let activationAttempts = 0;
+        let flushBackground = Effect.void;
+        const background = ThreadBackgroundLiveness.make();
+        if (problem === "finished-background-work")
+          background.recordTaskLiveness({
+            threadId: f.owner.threadId,
+            kind: "started",
+            taskId: "monitor",
+            taskType: "monitor",
+            status: "running",
+          });
         const services = Layer.mergeAll(
           Layer.mock(ProviderService)({
-            listSessions: () => Effect.succeed([]),
+            listSessions: () =>
+              Effect.succeed(
+                !stopped &&
+                  (providerStopRollback ||
+                    (warmLive && liveProvider) ||
+                    problem === "finished-refused-provider-stop" ||
+                    problem === "finished-uncertain-provider-stop" ||
+                    problem === "finished-background-revision-same-stop")
+                  ? [
+                      {
+                        threadId: ThreadId.make(f.owner.threadId),
+                        provider: ProviderDriverKind.make("codex"),
+                        runtimeMode: "approval-required",
+                        status: "ready",
+                        createdAt: "2026-10-07T00:00:00Z",
+                        updatedAt: "2026-10-07T00:00:00Z",
+                      },
+                    ]
+                  : [],
+              ),
             stopIdleVmSession: (input) =>
               Effect.gen(function* () {
                 if (!liveProvider) return false;
+                if (input.recoverOnly) {
+                  expect(input).toEqual({
+                    threadId: f.owner.threadId,
+                    environmentId: f.owner.environmentId,
+                    generation: 1,
+                    operationId,
+                    recoverOnly: true,
+                  });
+                  expect((yield* f.fences.get(f.owner.threadId).pipe(Effect.orDie))?.phase).toBe(
+                    "draining",
+                  );
+                  if (!warmLive) return false;
+                  runtimeReconciliations++;
+                  if (warmRejection) {
+                    sealedBy = null;
+                    epoch--;
+                    return false;
+                  }
+                  if (runtimeReconciliations === 1)
+                    return yield* new ProviderValidationError({
+                      operation: "stopIdleVmSession",
+                      issue: "The reserved provider stop is still pending",
+                    });
+                  liveProvider = false;
+                  return true;
+                }
                 expect(input).toEqual({
                   threadId: f.owner.threadId,
                   environmentId: f.owner.environmentId,
                   generation: 1,
                   operationId,
                 });
-                expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+                expect((yield* f.fences.get(f.owner.threadId).pipe(Effect.orDie))?.phase).toBe(
+                  "draining",
+                );
                 idleStops++;
-                if (problem === "provider-with-descendant") return false;
+                if (
+                  (problem === "finished-uncertain-provider-stop" || providerStopRollback) &&
+                  idleStops === 1
+                ) {
+                  sealedBy =
+                    problem === "finished-provider-stop-rollback-wrong-seal"
+                      ? "f".repeat(32)
+                      : operationSeal;
+                  epoch++;
+                  return yield* new ProviderValidationError({
+                    operation: "stopIdleVmSession",
+                    issue: "Lost stop acknowledgement",
+                  });
+                }
+                if (providerStopRollback) {
+                  sealedBy = null;
+                  // Only the original epoch is valid, even if the gate is open.
+                  epoch += problem === "finished-provider-stop-rollback-wrong-epoch" ? 1 : -1;
+                  if (problem === "finished-provider-stop-rollback-wrong-boot")
+                    bootId = NodeCrypto.randomUUID();
+                  return false;
+                }
+                if (
+                  [
+                    "provider-with-descendant",
+                    "finished-refused-provider-stop",
+                    "finished-uncertain-provider-stop",
+                  ].includes(problem)
+                )
+                  return false;
                 if (problem === "idle-owned-provider") liveProvider = false;
                 return true;
-              }).pipe(Effect.orDie),
+              }),
             stopSession: () =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 stopped++;
+                if (hiddenWriter) yield* recordWriterDrain(true);
               }),
             flushRuntimeEvents: () =>
-              Effect.sync(() => {
+              Effect.gen(function* () {
                 flushed++;
+                yield* flushBackground;
               }),
             checkpointConversation: () =>
               Effect.gen(function* () {
@@ -185,14 +390,31 @@ for (const problem of [
           }),
           Layer.mock(OrchestrationEngineService)({}),
         );
-        const bootId = NodeCrypto.randomUUID();
-        let sealedBy: string | null = null;
         let reopenedOperationId: string | undefined;
         const control = ChildProcessSpawner.make((command) => {
           if (command._tag !== "StandardCommand")
             return Effect.die("Unexpected piped control command");
+          const recover = command.args[0] === "recover-idle-provider-stop";
+          if (recover) {
+            expect(command.args).toEqual([
+              "recover-idle-provider-stop",
+              operationSeal,
+              bootId,
+              String(epoch),
+            ]);
+            recoveryAttempts++;
+            if (refusable && sealedBy === operationSeal) {
+              sealedBy = null;
+              epoch--;
+            }
+          }
           if (command.args[0] === "seal") sealedBy = command.args[2]!;
           if (command.args[0] === "reopen") {
+            if (warmActivation) {
+              expect(liveProvider).toBe(false);
+              expect(recoveryAttempts).toBe(warmLive ? 1 : orphanedWriter ? 3 : 2);
+              expect(flushed).toBe(1);
+            }
             reopenedOperationId = command.args[2];
             sealedBy = null;
           }
@@ -208,17 +430,23 @@ for (const problem of [
               all: Stream.empty,
               stdout: Stream.encodeText(
                 Stream.make(
-                  JSON.stringify({
-                    bootId,
-                    epoch: 1,
-                    sealedBy,
-                    groups: liveProvider
-                      ? [{ id: "a".repeat(32), bootId, kind: "provider", leaderPid: 2 }]
-                      : problem === "live-terminal"
-                        ? [{ id: "a".repeat(32), bootId, kind: "terminal", leaderPid: 2 }]
-                        : [],
-                    stopped: !liveProvider && problem !== "live-terminal",
-                  }),
+                  JSON.stringify(
+                    recover
+                      ? {
+                          status: refusable ? "rejected" : reserved ? "reserved" : "absent",
+                        }
+                      : {
+                          bootId,
+                          epoch,
+                          sealedBy,
+                          groups: liveProvider
+                            ? [{ id: "a".repeat(32), bootId, kind: "provider", leaderPid: 2 }]
+                            : problem === "live-terminal"
+                              ? [{ id: "a".repeat(32), bootId, kind: "terminal", leaderPid: 2 }]
+                              : [],
+                          stopped: !liveProvider && problem !== "live-terminal",
+                        },
+                  ),
                 ),
               ),
               getInputFd: () => Sink.drain,
@@ -241,9 +469,19 @@ for (const problem of [
                 }
                 return operation;
               }).pipe(Effect.orDie),
-            cancel: () =>
+            cancel: (_owner, request) =>
               Effect.gen(function* () {
+                cancelAttempts++;
+                if (problem === "finished-restarted-provider-preparation" && cancelAttempts === 1)
+                  return yield* new ThreadPauseError({
+                    threadId: f.owner.threadId,
+                    detail: "Relay unavailable after native rollback",
+                  });
                 operation = { ...operation, phase: "cancelled", canActivate: true };
+                if (finishedWorkflow) {
+                  expect(request.nativePauseFallback).toBeUndefined();
+                  return operation;
+                }
                 return yield* new ThreadPauseError({
                   threadId: f.owner.threadId,
                   detail: "Lost cancellation reply",
@@ -251,6 +489,12 @@ for (const problem of [
               }),
             activate: () =>
               Effect.gen(function* () {
+                activationAttempts++;
+                if (orphanedWriter && activationAttempts === 1)
+                  return yield* new ThreadPauseError({
+                    threadId: f.owner.threadId,
+                    detail: "Relay unavailable after the source reopened",
+                  });
                 operation = { ...operation, sourceReopened: true };
                 if (problem === "lost-reply" || problem === "cancelled-before-drain-lost-ack")
                   return yield* new ThreadPauseError({
@@ -286,8 +530,13 @@ for (const problem of [
                 yield* f.sql`UPDATE thread_attachment_checkpoints SET published_artifact_id='chat-receipt' WHERE thread_id=${f.owner.threadId} AND checkpoint_id=${key}`;
               }).pipe(Effect.orDie),
           },
+          f.root,
         ).pipe(
           Effect.provide(services),
+          Effect.provideService(
+            ThreadBackgroundLiveness.ThreadBackgroundLivenessService,
+            background,
+          ),
           Effect.provideService(VmWorkloadTracking, true),
           Effect.provideService(VmWorkloadMaintenance, maintenance),
           Effect.provideService(VmControlSpawner, control),
@@ -319,6 +568,166 @@ for (const problem of [
           if (problem === "native-timeout-cancelled-frozen")
             yield* f.fences.freeze({ ...f.owner, operationId });
           sealedBy = NodeCrypto.createHash("sha256").update(operationId).digest("hex").slice(0, 32);
+        }
+        if (problem === "finished-background-revision-changed-after-exit") {
+          const writeQuietRevision = (revision: string) =>
+            encodeQueueFixture({
+              bootId,
+              groupId: "c".repeat(32),
+              coordinatorPid: 42,
+              coordinatorStartTicks: "1",
+              busy: false,
+              revision,
+            }).pipe(
+              Effect.flatMap((receipt) =>
+                f.fs.writeFileString(f.path.join(f.root, "workflow-vm-background.json"), receipt),
+              ),
+            );
+          liveProvider = false;
+          yield* writeQuietRevision("a".repeat(32));
+          yield* f.sql`INSERT INTO thread_execution_work(thread_id,work_id,generation,kind,started,completed,relay_completed)
+            VALUES(${f.owner.threadId},'workspace:finishing',1,'workspace',1,0,0)`;
+          yield* synchronize(f.owner.threadId);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+          expect(captures).toBe(0);
+
+          // The child's final output becomes visible while draining the exited provider.
+          flushBackground = writeQuietRevision("b".repeat(32)).pipe(Effect.orDie);
+          yield* f.sql`UPDATE thread_execution_work SET completed=1,relay_completed=1
+            WHERE thread_id=${f.owner.threadId} AND work_id='workspace:finishing'`;
+          yield* synchronize(f.owner.threadId);
+          expect(operation.phase).toBe("cancelled");
+          yield* synchronize(f.owner.threadId);
+          expect(operation.sourceReopened).toBe(true);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          expect(captures).toBe(0);
+          expect(acknowledgements).toBe(0);
+          return;
+        }
+        if (problem === "finished-background-revision-same-stop") {
+          yield* f.fences.beginDrain({
+            ...f.owner,
+            operationId,
+            previousOperationId: f.owner.operationId,
+            workflowCheckpoint,
+          });
+          liveProvider = false;
+          sealedBy = NodeCrypto.createHash("sha256").update(operationId).digest("hex").slice(0, 32);
+          // The provider exited under this operation's own native stop seal.
+          yield* Effect.result(synchronize(f.owner.threadId));
+          expect(operation.phase).toBe("pending");
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("frozen");
+          expect(recoveryAttempts).toBe(0);
+          expect(stopped).toBe(1);
+          expect(flushed).toBe(1);
+          expect(captures).toBe(1);
+          expect(acknowledgements).toBe(1);
+          return;
+        }
+        if (warmActivation) {
+          yield* f.fences.beginDrain({
+            ...f.owner,
+            operationId,
+            previousOperationId: f.owner.operationId,
+            workflowCheckpoint,
+          });
+          sealedBy = operationSeal;
+          epoch++;
+          const first = yield* Effect.result(synchronize(f.owner.threadId));
+          expect(first._tag).toBe(warmLive && !warmRejection ? "Failure" : "Success");
+          if (!warmRejection) {
+            expect(operation.sourceReopened).toBe(false);
+            expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+            expect(sealedBy).toBe(operationSeal);
+            expect(reopenedOperationId).toBeUndefined();
+            if (!warmLive) liveProvider = false;
+            if (orphanedWriter) {
+              expect((yield* Effect.result(synchronize(f.owner.threadId)))._tag).toBe("Failure");
+              expect(operation.sourceReopened).toBe(false);
+              expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+              expect(sealedBy).toBe(operationSeal);
+              expect(reopenedOperationId).toBeUndefined();
+              expect(flushed).toBe(0);
+              expect(activationAttempts).toBe(0);
+              yield* recordWriterDrain(true);
+              expect((yield* Effect.result(synchronize(f.owner.threadId)))._tag).toBe("Failure");
+              expect(operation.sourceReopened).toBe(false);
+              expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+            }
+            yield* synchronize(f.owner.threadId);
+            expect(reopenedOperationId).toBe(operationSeal);
+          } else {
+            expect(liveProvider).toBe(true);
+            expect(reopenedOperationId).toBeUndefined();
+          }
+          expect(idleStops).toBe(0);
+          expect(runtimeReconciliations).toBe(warmRejection ? 1 : warmLive ? 2 : 0);
+          expect(stopped).toBe(warmLive ? 0 : 1);
+          expect(operation.sourceReopened).toBe(true);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          if (orphanedWriter) {
+            expect(activationAttempts).toBe(2);
+            expect(recoveryAttempts).toBe(3);
+            expect(flushed).toBe(1);
+          }
+          return;
+        }
+        if (restarted) {
+          yield* f.fences.beginDrain({
+            ...f.owner,
+            operationId,
+            previousOperationId: f.owner.operationId,
+            workflowCheckpoint,
+          });
+          if (problem === "finished-restarted-provider-rejection") {
+            sealedBy = operationSeal;
+            epoch++;
+          }
+          if (reserved) sealedBy = operationSeal;
+          if (problem === "finished-restarted-provider-ordinary-seal") {
+            sealedBy = operationSeal;
+            liveProvider = false;
+            yield* Effect.result(synchronize(f.owner.threadId));
+            expect(recoveryAttempts).toBe(1);
+            expect(idleStops).toBe(0);
+            expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("frozen");
+            expect(captures).toBe(1);
+            expect(acknowledgements).toBe(1);
+            return;
+          }
+          const first = yield* Effect.result(synchronize(f.owner.threadId));
+          expect(idleStops).toBe(0);
+          expect(stopped).toBe(0);
+          expect(captures).toBe(0);
+          expect(acknowledgements).toBe(0);
+          expect(recoveryAttempts).toBe(1);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+          if (refusable) {
+            expect(sealedBy).toBeNull();
+            expect(epoch).toBe(1);
+            if (problem === "finished-restarted-provider-preparation") {
+              expect(first._tag).toBe("Failure");
+              expect(operation.phase).toBe("pending");
+              yield* synchronize(f.owner.threadId);
+              expect(recoveryAttempts).toBe(2);
+            }
+            expect(operation.phase).toBe("cancelled");
+            yield* synchronize(f.owner.threadId);
+            expect(operation.sourceReopened).toBe(true);
+            expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          } else {
+            expect(first._tag).toBe("Success");
+            expect(operation.phase).toBe("pending");
+            expect(cancelAttempts).toBe(0);
+            if (reserved) {
+              liveProvider = false;
+              yield* Effect.result(synchronize(f.owner.threadId));
+              expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("frozen");
+              expect(captures).toBe(1);
+              expect(acknowledgements).toBe(1);
+            }
+          }
+          return;
         }
         const first = yield* Effect.result(synchronize(f.owner.threadId));
         if (problem.startsWith("native-timeout-cancelled")) {
@@ -400,6 +809,39 @@ for (const problem of [
           expect(captures).toBe(0);
           expect(closed).toBe(0);
           expect(flushed).toBe(0);
+          return;
+        }
+        if (problem === "finished-uncertain-provider-stop" || providerStopRollback) {
+          expect(first._tag).toBe("Failure");
+          expect(operation.phase).toBe("pending");
+          yield* synchronize(f.owner.threadId);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("draining");
+          if (problem === "finished-provider-stop-rollback") {
+            expect(operation.phase).toBe("cancelled");
+            yield* synchronize(f.owner.threadId);
+            expect(operation.sourceReopened).toBe(true);
+            expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          } else {
+            expect(operation.phase).toBe("pending");
+            expect(operation.sourceReopened).toBe(false);
+          }
+          expect(sealedBy).toBe(
+            problem === "finished-uncertain-provider-stop" ? operationSeal : null,
+          );
+          expect(idleStops).toBe(2);
+          expect(captures).toBe(0);
+          expect(acknowledgements).toBe(0);
+          return;
+        }
+        if (finishedWorkflow) {
+          expect(first._tag).toBe("Success");
+          expect(operation.phase).toBe("cancelled");
+          yield* synchronize(f.owner.threadId);
+          expect(operation.sourceReopened).toBe(true);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          expect(idleStops).toBe(problem === "finished-refused-provider-stop" ? 1 : 0);
+          expect(captures).toBe(0);
+          expect(acknowledgements).toBe(0);
           return;
         }
         if (problem === "wrong-generation") {

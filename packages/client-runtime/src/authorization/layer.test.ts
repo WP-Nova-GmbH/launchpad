@@ -2,6 +2,7 @@ import {
   AuthOrchestrationReadScope,
   AuthStandardClientScopes,
   EnvironmentId,
+  ThreadId,
 } from "@t3tools/contracts";
 import {
   RelayEnvironmentConnectScope,
@@ -340,6 +341,51 @@ describe("RemoteEnvironmentAuthorization", () => {
       expect(harness.fetch.calls).toHaveLength(1);
       expect(String(harness.fetch.calls[0]?.[0])).toBe(
         "https://environment.example.test/api/auth/websocket-ticket",
+      );
+    }),
+  );
+
+  it.effect("keeps a workflow follow-up connection separate from its saved viewer token", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        initialToken: new TokenStore.RemoteDpopAccessToken({
+          environmentId: ENVIRONMENT_ID,
+          accountId: "account-1",
+          label: DESCRIPTOR.label,
+          endpoint: ENDPOINT,
+          accessToken: "viewer-token",
+          expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+          dpopThumbprint: "thumbprint-1",
+        }),
+        responses: [
+          websocketTicket("viewer-one"),
+          Response.json(DESCRIPTOR),
+          accessToken("follow-up-token"),
+          websocketTicket("follow-up"),
+          websocketTicket("viewer-two"),
+        ],
+      });
+      const workflowFollowUp = { threadId: ThreadId.make("workflow:job"), generation: 3 };
+      yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        const target = { expectedEnvironmentId: ENVIRONMENT_ID };
+        expect((yield* remote.authorizeDpop(target)).httpAuthorization).toMatchObject({
+          _tag: "Dpop",
+          accessToken: "viewer-token",
+        });
+        expect(
+          (yield* remote.authorizeDpop({ ...target, workflowFollowUp })).httpAuthorization,
+        ).toMatchObject({ _tag: "Dpop", accessToken: "follow-up-token" });
+        expect((yield* remote.authorizeDpop(target)).httpAuthorization).toMatchObject({
+          _tag: "Dpop",
+          accessToken: "viewer-token",
+        });
+      }).pipe(Effect.provide(harness.layer));
+      expect(yield* Ref.get(harness.relayInputs)).toEqual([
+        expect.objectContaining({ workflowFollowUp }),
+      ]);
+      expect((yield* Ref.get(harness.tokens)).get(ENVIRONMENT_ID)?.accessToken).toBe(
+        "viewer-token",
       );
     }),
   );

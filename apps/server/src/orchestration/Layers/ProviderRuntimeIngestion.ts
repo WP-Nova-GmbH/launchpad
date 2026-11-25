@@ -52,7 +52,10 @@ import { ProjectionThreadMessageRepositoryLive } from "../../persistence/Layers/
 import { ProjectionThreadProposedPlanRepository } from "../../persistence/Services/ProjectionThreadProposedPlans.ts";
 import { ProjectionThreadProposedPlanRepositoryLive } from "../../persistence/Layers/ProjectionThreadProposedPlans.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
-import { ThreadBackgroundLivenessService } from "../ThreadBackgroundLiveness.ts";
+import {
+  recordProviderTaskLiveness,
+  ThreadBackgroundLivenessService,
+} from "../ThreadBackgroundLiveness.ts";
 import { ThreadPlanProgressService } from "../ThreadPlanProgress.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -2559,40 +2562,7 @@ const make = Effect.gen(function* () {
 
       // Sidebar background liveness: fed from the same lifecycle stream,
       // read by the shell query at mapping time (no persistence).
-      switch (event.type) {
-        case "task.started":
-        case "task.progress":
-        case "task.updated":
-        case "task.completed": {
-          const payload = event.payload as {
-            taskId: string;
-            taskType?: string;
-            status?: string;
-            agentId?: string;
-          };
-          threadBackgroundLiveness.recordTaskLiveness({
-            threadId: thread.id,
-            taskId: payload.taskId,
-            taskType: payload.taskType,
-            status: payload.status,
-            agentId: payload.agentId,
-            kind:
-              event.type === "task.started"
-                ? "started"
-                : event.type === "task.progress"
-                  ? "progress"
-                  : event.type === "task.updated"
-                    ? "updated"
-                    : "completed",
-          });
-          break;
-        }
-        case "session.exited":
-          threadBackgroundLiveness.clearThreadLiveness(thread.id);
-          break;
-        default:
-          break;
-      }
+      recordProviderTaskLiveness(threadBackgroundLiveness, event);
 
       let taskTitle: string | undefined;
       if (event.type === "task.completed") {

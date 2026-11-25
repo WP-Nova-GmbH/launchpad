@@ -31,12 +31,12 @@ export function makeThreadArtifactTransfer(sql: PgClient, objects: Objects) {
         sha256: artifact.sha256,
         sizeBytes: artifact.sizeBytes,
       });
-      return artifact;
+      return { ...artifact, kind: input.kind };
     }
     if (artifact.state !== "pending")
       return yield* new ThreadArtifactConflict({ message: "Artifact is being deleted" });
     yield* uploadBytes(artifact, input.body);
-    return yield* catalog.complete(input);
+    return { ...(yield* catalog.complete(input)), kind: input.kind };
   });
 
   /** Network I/O stays outside authorization transactions; completion is reauthorized separately. */

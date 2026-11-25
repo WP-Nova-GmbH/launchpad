@@ -356,17 +356,22 @@ beforeEach(() => {
 });
 afterAll(() => appAtomRegistry.dispose());
 
-function chatView(id: ThreadId) {
+function chatView(id: ThreadId, workflowFollowUp = false) {
   return (
     <AppAtomRegistryProvider>
-      <ChatView routeKind="server" environmentId={environmentId} threadId={id} />
+      <ChatView
+        routeKind="server"
+        environmentId={environmentId}
+        threadId={id}
+        workflowFollowUp={workflowFollowUp}
+      />
     </AppAtomRegistryProvider>
   );
 }
 
-async function render(id = threadId) {
+async function render(id = threadId, workflowFollowUp = false) {
   await act(async () => {
-    renderer = create(chatView(id));
+    renderer = create(chatView(id, workflowFollowUp));
   });
 }
 
@@ -644,6 +649,61 @@ it("does not read personal queued commands when opening a direct VM result befor
   expect(renderedText()).not.toContain("Queued changes could not be refreshed.");
 });
 
+it("keeps a follow-up draft with a file and explains why it cannot be sent", async () => {
+  const id = ThreadId.make("workflow:attachment-draft");
+  const config = mocks.environment!.serverConfig!;
+  mocks.thread = { ...mocks.thread!, id };
+  mocks.environment = {
+    ...mocks.environment!,
+    serverConfig: {
+      ...config,
+      environment: {
+        ...config.environment,
+        capabilities: {
+          ...config.environment.capabilities,
+          workflowVmResultReader: true,
+          workflowVmFollowUp: { threadId: id, generation: 1 },
+        },
+      },
+    },
+  };
+  mocks.locationState = {
+    workflowOrigin: {
+      accountId: "alice",
+      organizationId: "org",
+      repositoryId: RelayRepositoryId.make("repo"),
+      jobId: "attachment-draft",
+      threadId: id,
+      workflowVmFollowUpGeneration: 1,
+    },
+  };
+  const context = mocks.composer!.current.getSendContext();
+  const file = new File(["details"], "details.txt", { type: "text/plain" });
+  mocks.composer!.current.getSendContext = () => ({
+    ...context,
+    files: [
+      {
+        type: "file",
+        id: "kept-file",
+        name: file.name,
+        mimeType: file.type,
+        sizeBytes: file.size,
+        file,
+      },
+    ],
+  });
+  await render(id, true);
+  composerProps().promptRef.current = "Read my notes";
+
+  await act(async () => {
+    await composerProps().onSend();
+  });
+
+  expect(transport.dispatched).toEqual([]);
+  expect(composerProps().promptRef.current).toBe("Read my notes");
+  expect(renderedText()).toContain("Workflow VM follow-ups can’t include attachments.");
+});
+
 it.each(["personal", "machine-workflow"] as const)(
   "keeps queued changes visible in an offline writable %s thread",
   async (kind) => {
@@ -670,6 +730,67 @@ it.each(["personal", "machine-workflow"] as const)(
     expect(renderedText()).not.toContain("This workflow result is read-only.");
   },
 );
+
+it("sends the first prompt on an empty finished workflow's existing checkout", async () => {
+  const finishedThreadId = ThreadId.make("workflow:cancelled");
+  const generation = 1;
+  const config = mocks.environment!.serverConfig!;
+  mocks.thread = {
+    ...mocks.thread!,
+    id: finishedThreadId,
+    latestTurn: null,
+    proposedPlans: [],
+    interactionMode: "default",
+  };
+  mocks.environment = {
+    ...mocks.environment!,
+    serverConfig: {
+      ...config,
+      environment: {
+        ...config.environment,
+        capabilities: {
+          ...config.environment.capabilities,
+          sharedPromptQueue: true,
+          workflowVmResultReader: true,
+          workflowVmFollowUp: { threadId: finishedThreadId, generation },
+        },
+      },
+    },
+  };
+  mocks.locationState = {
+    workflowOrigin: {
+      accountId: "alice",
+      organizationId: "org",
+      repositoryId: RelayRepositoryId.make("repo"),
+      jobId: "cancelled",
+      threadId: finishedThreadId,
+      workflowVmFollowUpGeneration: generation,
+    },
+  };
+  transport = makeSubmissionRuntime(appAtomRegistry, environmentId, true);
+  const updateMetadata = vi
+    .spyOn(threadEnvironment.updateMetadata, "run")
+    .mockImplementation(() => {
+      throw new Error("The follow-up relay does not allow modifying the workflow title.");
+    });
+  observeQueuedCommands(null);
+  await render(finishedThreadId, true);
+
+  composerProps().promptRef.current = "Continue the existing work";
+  await act(async () => {
+    await composerProps().onSend();
+  });
+
+  expect(updateMetadata).not.toHaveBeenCalled();
+  expect(transport.dispatched).toMatchObject([
+    {
+      type: "thread.prompt.enqueue",
+      threadId: finishedThreadId,
+      message: { text: "Continue the existing work" },
+    },
+  ]);
+  expect(transport.dispatched[0]).not.toHaveProperty("bootstrap");
+});
 
 describe("plan submission ownership", () => {
   it.each([

@@ -14,6 +14,7 @@ import {
   type WorkflowVmPreparationScope,
 } from "./ThreadVmWorkflowAccess.ts";
 import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
+import { authorizeWorkflowVmFollowUpRequest } from "./WorkflowVmFollowUpState.ts";
 import { authorizeWorkflowPublishingRestore } from "./WorkflowVmPublishingRecovery.ts";
 
 interface WorkflowEnrollmentScope extends WorkflowVmPreparationScope {
@@ -96,7 +97,14 @@ export function makeThreadVmRestoreEnrollmentStore(sql: PgClient) {
           AND NOT EXISTS(SELECT 1 FROM relay_thread_deletions d WHERE d.thread_id=t.thread_id)
         FOR SHARE OF r,s,backup,runner,initial`;
         if (!scope) return yield* new ThreadVmEnrollmentInvalid();
-        if (
+        if (scope.checkpoint.finishedWorkspaceRevision !== undefined && !scope.issued) {
+          const request = yield* authorizeWorkflowVmFollowUpRequest(sql, job, input.operationId);
+          if (
+            request?.userId !== scope.actorUserId ||
+            !(yield* readCurrentWorkflowCheckpoint(sql, scope.checkpoint))
+          )
+            return yield* new ThreadVmEnrollmentInvalid();
+        } else if (
           !scope.issued &&
           !(yield* authorizeWorkflowPublishingRestore(sql, job, {
             operationId: input.operationId,

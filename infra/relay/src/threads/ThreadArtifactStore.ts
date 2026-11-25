@@ -10,11 +10,12 @@ export class ThreadArtifactConflict extends Schema.TaggedError<ThreadArtifactCon
 const conflict = (message: string) => new ThreadArtifactConflict({ message });
 
 export type ThreadArtifactKind = "workspace" | "native" | "attachment" | "history" | "manifest";
+type StoredThreadArtifactKind = ThreadArtifactKind | "follow-up-push";
 export interface ThreadArtifact {
   readonly artifactId: string;
   readonly threadId: string;
   readonly operationId: string;
-  readonly kind: ThreadArtifactKind;
+  readonly kind: StoredThreadArtifactKind;
   readonly storageKey: string;
   readonly sha256: string;
   readonly sizeBytes: number;
@@ -35,7 +36,7 @@ export function makeThreadArtifactStore(sql: PgClient) {
     readonly artifactId: string;
     readonly threadId: string;
     readonly operationId: string;
-    readonly kind: ThreadArtifactKind;
+    readonly kind: StoredThreadArtifactKind;
     readonly sha256: string;
     readonly sizeBytes: number;
   }) {
@@ -45,7 +46,9 @@ export function makeThreadArtifactStore(sql: PgClient) {
       !Number.isSafeInteger(input.sizeBytes) ||
       input.sizeBytes < 0 ||
       input.sizeBytes > 64 * 1024 * 1024 ||
-      !["workspace", "native", "attachment", "history", "manifest"].includes(input.kind)
+      !["workspace", "native", "attachment", "history", "manifest", "follow-up-push"].includes(
+        input.kind,
+      )
     )
       return yield* conflict("Invalid artifact intent");
     const storageKey = `thread-artifacts/v1/${input.artifactId}`;

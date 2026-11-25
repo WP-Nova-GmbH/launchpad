@@ -12,6 +12,7 @@ import * as WorkflowActions from "./jobs/WorkflowActions.ts";
 import * as RepositoryWorkflowRunner from "./jobs/RepositoryWorkflowRunner.ts";
 import { WorkflowVmAttempts } from "./relay/WorkflowVmAttempts.ts";
 import { WorkflowVmPublisher } from "./relay/WorkflowVmPublishing.ts";
+import { WorkflowVmFollowUpPublisher } from "./relay/WorkflowVmFollowUpPush.ts";
 import * as WorkflowRunStore from "./jobs/WorkflowRunStore.ts";
 import * as SetupProcessJournal from "./terminal/SetupProcessJournal.ts";
 import * as SetupProcessAdapter from "./terminal/SetupProcessAdapter.ts";
@@ -579,7 +580,17 @@ const RuntimeCoreDependenciesLive = Layer.mergeAll(
     ),
     Layer.provideMerge(WorkflowRunStore.layer),
     Layer.provideMerge(WorkflowVmAttempts.layer),
-    Layer.provideMerge(WorkflowVmPublisher.layer),
+    Layer.provideMerge(
+      Layer.mergeAll(
+        WorkflowVmPublisher.layer,
+        ThreadExecutionLayerLive,
+        WorkflowVmFollowUpPublisher.layer.pipe(
+          Layer.provide(SetupProcessAdapter.layer.pipe(Layer.provide(ResourceMonitorBinary.layer))),
+          Layer.provide(ProcessRunner.layer),
+          Layer.provide(ServerSecretStore.layer),
+        ),
+      ),
+    ),
     Layer.provideMerge(AntigravityInstallationRefreshLive),
     Layer.provideMerge(ProviderAuthServiceLive),
     Layer.provideMerge(ThreadVmProviderAuth.layer),

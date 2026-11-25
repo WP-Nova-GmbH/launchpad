@@ -96,6 +96,7 @@ export function makeThreadJournalStore(sql: PgClient) {
     threadId: string,
     after: number,
     limit: number,
+    actorUserId?: string,
   ) {
     if (
       !Number.isSafeInteger(after) ||
@@ -108,6 +109,7 @@ export function makeThreadJournalStore(sql: PgClient) {
     const rows = yield* sql<{ commandId: string; position: number; receipt: null }>`
       SELECT command_id AS "commandId", position, receipt_json AS receipt FROM relay_thread_commands
       WHERE thread_id = ${threadId} AND position > ${after} AND receipt_json IS NULL
+      ${actorUserId === undefined ? sql`` : sql`AND actor_json->>'userId'=${actorUserId}`}
       ORDER BY position LIMIT ${limit + 1}`;
     return { entries: rows.slice(0, limit), hasMore: rows.length > limit };
   });

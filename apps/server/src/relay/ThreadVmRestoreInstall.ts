@@ -225,13 +225,16 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
           yield* input.readArtifact(workflow.manifest.state.artifactId),
         )
       : null;
+    const finished = workflow?.checkpoint.finishedWorkspaceRevision !== undefined;
     if (
       capsule &&
       (capsule.run.worktreePath !== workspaceRoot ||
-        capsule.run.providerContinuation?.driver !== "codex" ||
-        (!point &&
-          (capsule.run.progress.checkpoint?.kind !== "input" ||
-            capsule.run.sequence?.completed.every((step) => step.checkpoint === null) !== true)))
+        (!finished &&
+          (capsule.run.providerContinuation?.driver !== "codex" ||
+            (!point &&
+              (capsule.run.progress.checkpoint?.kind !== "input" ||
+                capsule.run.sequence?.completed.every((step) => step.checkpoint === null) !==
+                  true)))))
     )
       return yield* fail();
     const unrelated = yield* sql`SELECT 1 FROM projection_projects WHERE project_id!=${projectId}
@@ -301,7 +304,9 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
                       workflow: {
                         jobId: capsule.run.jobId,
                         nativeThreadId: point.nativeThreadId,
-                        continuationKey: capsule.run.providerContinuation!.continuationKey,
+                        continuationKey: finished
+                          ? null
+                          : capsule.run.providerContinuation!.continuationKey,
                       },
                     }
                   : {}),
@@ -449,7 +454,7 @@ export const installThreadVmRestoreRecovery = Effect.fn("ThreadVmRestoreInstall.
           ...saved.workspace,
           manifestSha256,
           worktreesRoot: config.worktreesDir,
-          ...(workflow ? { retainedWorkflow: true as const } : {}),
+          ...(workflow ? { retainedWorkflow: finished ? "finished" : "unfinished" } : {}),
         });
         if (
           recovery.reset &&

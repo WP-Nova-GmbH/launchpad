@@ -52,12 +52,14 @@ class DurableActivityTests(unittest.TestCase):
         self.writer.executescript("""
             PRAGMA journal_mode=WAL;
             CREATE TABLE thread_execution_fences(thread_id TEXT,environment_id TEXT,generation INT,phase TEXT);
-            CREATE TABLE projection_threads(thread_id TEXT,archived_at TEXT,deleted_at TEXT);
+            CREATE TABLE projection_threads(thread_id TEXT,archived_at TEXT,deleted_at TEXT,
+                pending_approval_count INT DEFAULT 0,pending_user_input_count INT DEFAULT 0);
+            CREATE TABLE projection_thread_sessions(thread_id TEXT PRIMARY KEY,status TEXT,provider_name TEXT,active_turn_id TEXT);
             CREATE TABLE projection_thread_prompt_queues(thread_id TEXT,state_json TEXT);
             CREATE TABLE projection_turns(thread_id TEXT,completed_at TEXT,state TEXT,checkpoint_status TEXT);
             CREATE TABLE thread_execution_work(thread_id TEXT,work_id TEXT,generation INT,kind TEXT,started INT,completed INT,relay_completed INT);
             INSERT INTO thread_execution_fences VALUES('thread','environment',1,'active');
-            INSERT INTO projection_threads VALUES('thread',NULL,NULL);
+            INSERT INTO projection_threads(thread_id) VALUES('thread');
         """)
         self.queue = {"enabled": True, "handoff": None, "awaitingTurnId": None, "entries": []}
 
@@ -86,6 +88,70 @@ class DurableActivityTests(unittest.TestCase):
         result = activity.projection_activity(self.path)
         self.assertTrue(result["archived"])
         self.assertTrue(result["unfinished"])
+
+    def test_live_codex_requires_a_settled_session_for_the_current_thread(self):
+        self.writer.execute("INSERT INTO projection_thread_sessions VALUES('other','ready','codex',NULL)")
+        self.writer.commit()
+        self.assertTrue(activity.projection_activity(self.path, codex_only=True)["unfinished"])
+        for status, provider, turn, unfinished in (
+                ("ready", "codex", None, False),
+                ("stopped", "codex", None, True),
+                ("running", "codex", None, True),
+                ("ready", "claude", None, True),
+                ("ready", "codex", "current-turn", True)):
+            with self.subTest(status=status, provider=provider, turn=turn):
+                self.writer.execute("INSERT OR REPLACE INTO projection_thread_sessions VALUES('thread',?,?,?)", (status, provider, turn))
+                self.writer.commit()
+                self.assertEqual(activity.projection_activity(self.path, codex_only=True)["unfinished"], unfinished)
+
+    def test_failed_codex_can_be_idle_once_the_turn_and_requests_settle(self):
+        self.writer.execute("INSERT INTO projection_thread_sessions VALUES('thread','error','codex',NULL)")
+        self.writer.execute("INSERT INTO projection_turns VALUES('thread','2026-11-24','error','ready')")
+        for active_turn, approvals, user_inputs, unfinished in (
+                ("current-turn", 0, 0, True),
+                (None, 1, 0, True),
+                (None, 0, 1, True),
+                (None, 0, 0, False)):
+            with self.subTest(active_turn=active_turn, approvals=approvals, user_inputs=user_inputs):
+                self.writer.execute("UPDATE projection_thread_sessions SET active_turn_id=?", (active_turn,))
+                self.writer.execute("UPDATE projection_threads SET pending_approval_count=?, pending_user_input_count=?", (approvals, user_inputs))
+                self.writer.commit()
+                self.assertEqual(activity.projection_activity(self.path, codex_only=True)["unfinished"], unfinished)
+        self.writer.execute("UPDATE projection_turns SET checkpoint_status='pending'")
+        self.writer.commit()
+        self.assertTrue(activity.projection_activity(self.path, codex_only=True)["unfinished"])
+
+    def test_background_receipt_is_current_for_live_codex_and_retained_after_exit(self):
+        root = self.path.parent
+        file = root / "background.json"
+        proc = root / "proc"
+        (proc / "42").mkdir(parents=True)
+        stat = proc / "42" / "stat"
+        stat.write_text("42 (coordinator) " + "S " + "0 " * 18 + "1234")
+        live = {"bootId": "boot", "codexOnly": True, "groups": [{"id": "codex"}]}
+        stopped = {"bootId": "boot", "groups": []}
+        revision = "a" * 32
+        current = {"bootId": "boot", "groupId": "codex", "coordinatorPid": 42,
+                   "coordinatorStartTicks": "1234", "busy": False, "revision": revision}
+        self.assertEqual(activity.background_activity(live, file, proc), {"backgroundBusy": True})
+        for updates in ({"bootId": "old"}, {"groupId": "old"}, {"coordinatorStartTicks": "old"}):
+            with self.subTest(updates=updates):
+                file.write_text(json.dumps({**current, **updates}))
+                self.assertEqual(activity.background_activity(live, file, proc), {"backgroundBusy": True})
+        file.write_text(json.dumps({**current, "busy": True}))
+        self.assertEqual(activity.background_activity(live, file, proc),
+                         {"backgroundBusy": True, "backgroundRevision": revision})
+        file.write_text(json.dumps(current))
+        self.assertEqual(activity.background_activity(live, file, proc),
+                         {"backgroundBusy": False, "backgroundRevision": revision})
+        stat.unlink()
+        self.assertEqual(activity.background_activity(live, file, proc), {"backgroundBusy": True})
+        self.assertEqual(activity.background_activity(stopped, file, proc),
+                         {"backgroundRevision": revision})
+        file.write_text(json.dumps({**current, "busy": True}))
+        self.assertEqual(activity.background_activity(stopped, file, proc),
+                         {"backgroundRevision": revision + ":stopped"})
+        self.assertEqual(activity.background_activity({**stopped, "bootId": "new"}, file, proc), {})
 
     def test_reports_exact_started_process_reservations_after_a_settled_turn(self):
         for kind in ("provider", "terminal", "setup"):

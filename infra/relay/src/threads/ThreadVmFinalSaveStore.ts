@@ -1,3 +1,4 @@
+import { makeThreadVmSavedDiskStore } from "./ThreadVmSavedDiskStore.ts";
 import { readCurrentWorkflowCheckpoint } from "./WorkflowVmWorkspace.ts";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
@@ -428,10 +429,13 @@ export function makeThreadVmFinalSaveStore(
             WHERE b.allocation_id=${input.allocationId} AND b.compute_ref=${input.computeRef} AND b.generation=${input.generation}
               AND b.phase='verified' AND b.snapshot_id IS NOT NULL AND b.native_capture_receipt IS NOT NULL
               AND b.source_receipt#>>'{workflowCheckpoint,jobId}'=${job.jobId}
-              AND b.source_receipt#>>'{workflowCheckpoint,checkpointId}'=${job.record.progress?.checkpoint?.checkpointId ?? null}
-              AND b.source_receipt#>>'{workflowCheckpoint,checkpointGeneration}'=${String(job.record.progress?.checkpoint?.generation ?? 0)}
-              AND b.source_receipt#>>'{workflowCheckpoint,publicationId}'=h.publication_id
-              AND b.source_receipt#>>'{workflowCheckpoint,publicationRevision}'=h.revision::text
+              AND ((b.source_receipt#>>'{workflowCheckpoint,finishedWorkspaceRevision}' IS NULL
+                AND b.source_receipt#>>'{workflowCheckpoint,checkpointId}'=${job.record.progress?.checkpoint?.checkpointId ?? null}
+                AND b.source_receipt#>>'{workflowCheckpoint,checkpointGeneration}'=${String(job.record.progress?.checkpoint?.generation ?? 0)}
+                AND b.source_receipt#>>'{workflowCheckpoint,publicationId}'=h.publication_id
+                AND b.source_receipt#>>'{workflowCheckpoint,publicationRevision}'=h.revision::text)
+                OR b.source_receipt#>>'{workflowCheckpoint,finishedWorkspaceRevision}'=COALESCE(
+                  (SELECT workspace_revision FROM relay_workflow_vm_follow_ups f WHERE f.job_id=${job.jobId}),0)::text)
             ORDER BY b.verified_at DESC,b.operation_id DESC LIMIT 1 FOR UPDATE OF b`;
           const receipt = backup?.sourceReceipt;
           const checkpoint = receipt?.workflowCheckpoint;
@@ -484,6 +488,9 @@ export function makeThreadVmFinalSaveStore(
           }
           if (resume)
             yield* sql`DELETE FROM relay_thread_vm_resumes WHERE operation_id=${resume.operationId}`;
+          yield* sql`UPDATE relay_workflow_vm_follow_ups SET operation_id=NULL,requested_at=NULL,
+            open_until=NULL,reclaim_operation_id=NULL,reclaim_fallback=false WHERE job_id=${job.jobId}
+              AND (allocation_id=${input.allocationId} OR reclaim_operation_id=${pause?.operationId ?? null})`;
           const allocations = makeThreadVmAllocationStore(sql);
           yield* allocations.requestDeletion(input.allocationId, "organization_workflow");
           if (!save) {
@@ -510,6 +517,8 @@ export function makeThreadVmFinalSaveStore(
             VALUES (${save.operationId},${input.threadId},${input.allocationId},NULL,${source.environmentId},${input.generation},
               ${input.hostId},${input.computeRef},${source.state},'source_loss',0,NULL,'deleting',${sql.json(save.receipt)},
               ${save.receipt.sourceSequence},${save.receipt.nativeCheckpointOperationId},clock_timestamp(),${save.backupOperationId})`;
+          if (save.receipt.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+            yield* makeThreadVmSavedDiskStore(sql).supersedeTerminalSave(input.threadId, job.jobId);
           yield* sql`INSERT INTO relay_thread_vm_saved_disks(operation_id,thread_id,backup_operation_id,generation,host_id,phase)
             VALUES(${save.operationId},${input.threadId},${save.backupOperationId},${input.generation},${input.hostId},'available')`;
           yield* sql`UPDATE relay_thread_placements SET operation_id=${save.operationId} WHERE thread_id=${input.threadId}`;
@@ -762,6 +771,11 @@ export function makeThreadVmFinalSaveStore(
           backupOperationId: operation.backupOperationId,
           operationId: `saved-${operationId}`,
         });
+        if (workflow?.finishedWorkspaceRevision !== undefined)
+          yield* makeThreadVmSavedDiskStore(sql).supersedeTerminalSave(
+            operation.threadId,
+            workflow.jobId,
+          );
         yield* sql`INSERT INTO relay_thread_vm_saved_disks(operation_id,thread_id,backup_operation_id,generation,host_id,phase)
         VALUES(${operationId},${operation.threadId},${operation.backupOperationId},${operation.generation},${operation.hostId},'available')`;
         yield* makeThreadVmAllocationStore(sql).requestDeletion(

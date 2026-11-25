@@ -1293,6 +1293,7 @@ export const dpopClientApi = HttpApiBuilder.group(
               environmentId: params.environmentId,
               clientProofKeyThumbprint,
               ...(payload.deviceId ? { deviceId: payload.deviceId } : {}),
+              ...(payload.workflowFollowUp ? { workflowFollowUp: payload.workflowFollowUp } : {}),
             }).pipe(
               Effect.mapError(
                 () =>

@@ -243,6 +243,113 @@ it.effect("pauses and reopens the original placement at an acknowledged first In
   }).pipe(Effect.provide(Layer.mergeAll(SqlitePersistenceMemory, NodeServices.layer))),
 );
 
+it.effect.each(["finished", "unfinished"] as const)(
+  "cold activation preserves the native ownership requirements for a %s workflow",
+  (state) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const fences = makeThreadExecutionFence(sql);
+      const restore = { ...enrollment, generation: 2, operationId: "restore" };
+      yield* fences.prepare(restore);
+      const original = released();
+      const binding = {
+        ...restore,
+        jobId: original.jobId,
+        organizationId: original.workflow.organizationId,
+        repositoryId: original.workflow.repositoryId,
+        threadId: ThreadId.make(restore.threadId),
+        projectId: ProjectId.make(restore.projectId),
+        environmentId: EnvironmentId.make(restore.environmentId),
+        allocationId: "restored-allocation",
+      };
+      const checkpoint = {
+        ...original.sequence!.completed[0]!.checkpoint!,
+        checkpointId: "review",
+        kind: "review" as const,
+        stepId: "review",
+        generation: 0,
+        role: "maintainer" as const,
+      };
+      const run: WorkflowRun = {
+        ...original,
+        runtime: { kind: "vm", ...binding },
+        providerContinuation: {
+          driver: ProviderDriverKind.make("codex"),
+          continuationKey: "codex:managed",
+        },
+        workflow: {
+          ...original.workflow,
+          definition: {
+            ...original.workflow.definition,
+            target: { kind: "vm", baseBranch: null },
+            steps: [
+              original.workflow.definition.steps[0]!,
+              { id: "review", kind: "review", title: "Review", role: "maintainer" },
+            ],
+          },
+        },
+        progress: {
+          ...original.progress,
+          status: state === "finished" ? "done" : "awaiting_review",
+          stepId: "review",
+          checkpoint,
+        },
+      };
+      const store = yield* makeStore;
+      yield* store.save(run);
+      const intent = (yield* makeWorkflowResultOutbox(sql).next(binding.threadId))!;
+      yield* sql`UPDATE workflow_result_outbox SET status='acknowledged'
+        WHERE publication_id=${intent.publicationId}`;
+      yield* sql`INSERT INTO projection_projects
+        (project_id,title,workspace_root,scripts_json,created_at,updated_at)
+        VALUES (${restore.projectId},'Restored','/workspace/project','[]',${run.createdAt},${run.createdAt})`;
+      yield* sql`INSERT INTO projection_threads
+        (thread_id,project_id,title,model_selection_json,created_at,updated_at,branch)
+        VALUES (${restore.threadId},${restore.projectId},'Restored','{}',
+          ${run.createdAt},${run.createdAt},'launchpad/job')`;
+      yield* sql`INSERT INTO thread_checkout_claims
+        (operation_id,thread_id,generation,project_id,repository_root,checkout_path,
+          mode,branch,manifest_sha256,workspace_sha256,inspection_json,phase)
+        VALUES (${restore.operationId},${restore.threadId},2,${restore.projectId},
+          '/workspace/project','/workspace/project','main','launchpad/job',
+          'manifest','workspace','{}','installed')`;
+      yield* sql`INSERT INTO thread_transfer_baselines
+        (operation_id,thread_id,generation,manifest_sha256,history_sha256,receipts_sha256,
+          source_environment_id,source_sequence,destination_sequence)
+        VALUES (${restore.operationId},${restore.threadId},2,'manifest','history','receipts','old-environment',7,8)`;
+      // Finished human follow-up imports its stopped native cursor without a workflow episode.
+      yield* sql`INSERT INTO provider_session_runtime
+        (thread_id,provider_name,provider_instance_id,adapter_key,runtime_mode,status,
+          last_seen_at,resume_cursor_json,runtime_payload_json)
+        VALUES (${restore.threadId},'codex','codex','codex','full-access','stopped',
+          ${run.createdAt},'{"threadId":"retained-native","resumePolicy":"require-existing"}',
+          '{"stoppedRuntimeEventsDrained":true}')`;
+      const workflowCheckpoint = {
+        jobId: run.jobId,
+        checkpointId: state === "finished" ? intent.publicationId : checkpoint.checkpointId,
+        checkpointGeneration: 0,
+        publicationId: intent.publicationId,
+        publicationRevision: intent.revision,
+        ...(state === "finished" ? { finishedWorkspaceRevision: 1 } : {}),
+      };
+      if (state === "unfinished") {
+        assert.include(
+          (yield* Effect.flip(fences.activate({ ...restore, workflowCheckpoint }))).message,
+          "restored workflow runtime is not ready",
+        );
+        assert.equal((yield* fences.get(restore.threadId))?.phase, "frozen");
+        return;
+      }
+      yield* fences.activate({ ...restore, workflowCheckpoint });
+      assert.isTrue(yield* store.isVmFenceActive(binding));
+      assert.deepEqual(
+        yield* sql`SELECT phase,release_reason FROM thread_checkout_claims
+          WHERE operation_id=${restore.operationId}`,
+        [{ phase: "released", release_reason: "activated" }],
+      );
+    }).pipe(Effect.provide(Layer.mergeAll(SqlitePersistenceMemory, NodeServices.layer))),
+);
+
 it.effect(
   "keeps pending saved results during transfer without pretending execution is running",
   () =>

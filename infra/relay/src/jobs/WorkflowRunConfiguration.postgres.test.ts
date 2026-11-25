@@ -36,6 +36,7 @@ import { ThreadVmRuntimeConfiguration } from "../threads/ThreadVmRuntime.ts";
 import { configLayer } from "../workflowSources/test-fixture.ts";
 import { updateRepositoryWorkflowConfiguration } from "./RepositoryWorkflowConfiguration.ts";
 import {
+  purgeOneReleasedWorkflowConfiguration,
   resolveWorkflowRunSetupConfiguration,
   resolveWorkflowRunAttemptConfiguration,
   withFrozenWorkflowRunConfiguration,
@@ -475,6 +476,38 @@ describe.skipIf(!databaseUrl)("workflow run configuration (Postgres)", () => {
           expect(
             yield* Effect.flip(resolveWorkflowRunSetupConfiguration(f.sql, f.box, claim)),
           ).toMatchObject({ reason: "unavailable" });
+        }),
+    );
+
+    it.effect(
+      "purges released secrets only after the workspace is gone and keeps the access marker",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          yield* f.write(0, secret("p08-fixture-secret"));
+          const run = yield* f.queue();
+          yield* run.freeze;
+          const { claim } = yield* run.install();
+          const hostId = NodeCrypto.randomUUID();
+          yield* makeThreadVmCapacityStore(f.sql).configure(hostId, 1);
+          yield* f.sql`INSERT INTO relay_thread_vm_capacity
+          (operation_id,allocation_id,host_id,kind,state,compute_ref)
+          VALUES (${claim.operationId},${claim.allocationId},${hostId},'create','started',${claim.computeRef})`;
+          yield* f.sql`UPDATE relay_thread_placements SET operation_id=NULL WHERE thread_id=${claim.threadId}`;
+          yield* f.sql`UPDATE relay_workflow_jobs SET status='done',
+          record=jsonb_set(record || '{"status":"done"}','{progress}','{"status":"done","executionReleased":true}')
+          WHERE job_id=${claim.jobId}`;
+
+          expect(yield* purgeOneReleasedWorkflowConfiguration(f.sql, hostId)).toBe(false);
+          yield* f.sql`UPDATE relay_thread_vm_capacity SET state='released' WHERE allocation_id=${claim.allocationId}`;
+          yield* f.sql`UPDATE relay_thread_vm_allocations SET state='deleted',deleted_at=clock_timestamp()
+          WHERE allocation_id=${claim.allocationId}`;
+          expect(yield* purgeOneReleasedWorkflowConfiguration(f.sql, hostId)).toBe(true);
+          expect(
+            yield* f.sql`SELECT sealed_payload,has_secrets FROM relay_workflow_run_configurations
+          WHERE job_id=${claim.jobId}`,
+          ).toEqual([{ sealed_payload: null, has_secrets: true }]);
+          expect(yield* purgeOneReleasedWorkflowConfiguration(f.sql, hostId)).toBe(false);
         }),
     );
 

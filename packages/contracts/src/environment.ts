@@ -199,6 +199,10 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   desktopAppUpdate: Schema.optionalKey(Schema.Boolean),
   /** This workflow VM serves read-only run results to clients. */
   workflowVmResultReader: Schema.optionalKey(Schema.Boolean),
+  /** The authenticated socket can operate this released VM thread. */
+  workflowVmFollowUp: Schema.optionalKey(
+    Schema.Struct({ threadId: ThreadId, generation: Schema.Int }),
+  ),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

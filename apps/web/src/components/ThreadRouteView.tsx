@@ -2,11 +2,15 @@ import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { connectionStatusText } from "@t3tools/client-runtime/connection";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import { portableThreadPlacementsAtom } from "@t3tools/client-runtime/relay/portableThreadPresentation";
-import { canRecoverPrivateThreadLocation } from "@t3tools/client-runtime/relay/workflow-result";
+import {
+  canRecoverPrivateThreadLocation,
+  workflowResultOrigin,
+} from "@t3tools/client-runtime/relay/workflow-result";
 import { useAtomValue } from "@effect/atom-react";
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import type { ScopedThreadRef, ServerConfig } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useState } from "react";
+import { Atom } from "effect/unstable/reactivity";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import ChatView from "./ChatView";
 import { resolveDraftPromotionNavigationTarget, threadHasStarted } from "./ChatView.logic";
@@ -16,8 +20,10 @@ import {
   useWorkflowConversation,
   WorkflowConversationHeader,
 } from "./workflows/WorkflowNavigation";
+import { WorkflowVmFollowUpButton } from "./workflows/WorkflowVmFollowUpButton";
 import { Button } from "./ui/button";
 import { environmentCatalog } from "../connection/catalog";
+import { canUseWorkflowVmFollowUp } from "../lib/workflowResultGitAccess";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { useAtomCommand } from "../state/use-atom-command";
 import { CurrentThreadLocation } from "./chat/ThreadMoveControls";
@@ -39,8 +45,10 @@ import {
 import { useEnvironmentQuery } from "../state/query";
 import { useEnvironments } from "../state/environments";
 import { environmentShell } from "../state/shell";
+import { environmentSession } from "../state/session";
 import { threadMoveRelayUrl } from "../state/thread-move-submissions";
 import { threadVmControls, useEnvironmentThread } from "../state/threads";
+import { sessionWorkflowVmFollowUpOriginAtom } from "../state/workflowVmFollowUp";
 import {
   buildThreadRouteParams,
   isCurrentThreadMoveHandoff,
@@ -49,6 +57,8 @@ import {
   type ThreadRouteTarget,
 } from "../threadRoutes";
 import { resolveThreadSyncPhase } from "../threadSync";
+
+const noWorkflowSessionConfig = Atom.make<ServerConfig | null>(null);
 
 /**
  * The single chat surface behind both `/draft/$draftId` and
@@ -111,18 +121,62 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     ? environments.presentationById.get(serverThreadRef.environmentId)
     : undefined;
   const connection = environment?.connection;
+  const capabilities = environment?.serverConfig?.environment.capabilities;
+  const threadId = target.kind === "server" ? target.threadRef.threadId : undefined;
+  const accountId = relaySession?.accountId;
+  const rememberedOrigin = useAtomValue(
+    sessionWorkflowVmFollowUpOriginAtom(
+      target.kind === "server" ? scopedThreadKey(target.threadRef) : "",
+    ),
+  );
+  const effectiveOrigin = useMemo(
+    () =>
+      workflowResultOrigin(
+        {
+          workflowOrigin: workflowOrigin === undefined ? rememberedOrigin : workflowOrigin,
+        },
+        accountId,
+        threadId,
+      ),
+    [accountId, rememberedOrigin, threadId, workflowOrigin],
+  );
+  const wantsWorkflowFollowUp = effectiveOrigin?.workflowVmFollowUpGeneration !== undefined;
+  const connectionTarget = environment?.entry.target;
+  const scopedTarget =
+    connectionTarget?._tag === "RelayConnectionTarget"
+      ? connectionTarget.workflowFollowUp
+      : undefined;
+  const sessionConfig = useAtomValue(
+    wantsWorkflowFollowUp && serverThreadRef
+      ? environmentSession.initialConfigValueAtom(serverThreadRef.environmentId)
+      : noWorkflowSessionConfig,
+  );
+  const workflowFollowUp =
+    connection?.phase === "connected" &&
+    canUseWorkflowVmFollowUp({
+      capabilities: sessionConfig?.environment.capabilities,
+      scopedTarget,
+      origin: effectiveOrigin ?? undefined,
+      threadId: threadId ?? null,
+    });
+  const followUpNeedsReconnect = wantsWorkflowFollowUp && !workflowFollowUp;
   const workflowConversation = useWorkflowConversation({
-    threadId: target.kind === "server" ? target.threadRef.threadId : undefined,
+    environmentId: serverThreadRef?.environmentId,
+    origin: effectiveOrigin,
+    threadId,
     threadTitle: serverThread?.title ?? serverThreadShell?.title,
     threadJob: serverThread ? serverThread.workflowJob : serverThreadShell?.workflowJob,
-    capabilities: environment?.serverConfig?.environment.capabilities,
+    capabilities,
+    followUp: workflowFollowUp,
   });
-  const privateLocationRecovery = canRecoverPrivateThreadLocation({
-    capabilities: environment?.serverConfig?.environment.capabilities,
-    origin: workflowOrigin,
-    accountId: relaySession?.accountId,
-    threadId: serverThreadRef?.threadId,
-  });
+  const privateLocationRecovery =
+    !wantsWorkflowFollowUp &&
+    canRecoverPrivateThreadLocation({
+      capabilities,
+      origin: workflowOrigin,
+      accountId,
+      threadId: serverThreadRef?.threadId,
+    });
   const relayUrl = handoff ? threadMoveRelayUrl() : null;
   const handoffCurrent = useAtomValue(
     portableThreadPlacementsAtom,
@@ -258,13 +312,14 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     if (renderState === "missing") {
       const { clearPendingFileDropsForThread } = useSidebarPendingFileDropStore.getState();
       clearPendingFileDropsForThread(target.threadRef);
-      if (environmentHasAnyThreads && !recoverUnavailable) {
+      if (environmentHasAnyThreads && !recoverUnavailable && !followUpNeedsReconnect) {
         void navigate({ to: "/", replace: true });
       }
     }
   }, [
     bootstrapComplete,
     environmentHasAnyThreads,
+    followUpNeedsReconnect,
     handoffOwnsNotice,
     navigate,
     recoverUnavailable,
@@ -293,6 +348,20 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         />
       );
     }
+  } else if (!handoffOwnsNotice && followUpNeedsReconnect && effectiveOrigin) {
+    view = (
+      <div className="flex flex-1 items-center justify-center px-6">
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <h2 className="text-sm font-medium">Workflow VM disconnected</h2>
+          <WorkflowVmFollowUpButton
+            key={scopedThreadKey(target.threadRef)}
+            scope={effectiveOrigin}
+            jobId={effectiveOrigin.jobId}
+            title={workflowConversation?.title ?? serverThread?.title ?? "Workflow workspace"}
+          />
+        </div>
+      </div>
+    );
   } else if (
     !handoffOwnsNotice &&
     (renderState === "ready" || (renderState === "loading" && serverThreadShell !== null))
@@ -305,6 +374,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         routeKind="server"
         threadSyncPhase={threadSyncPhase}
         hasWorkflowConversationHeader={workflowConversation !== null}
+        workflowFollowUp={workflowFollowUp}
       />
     );
   } else {

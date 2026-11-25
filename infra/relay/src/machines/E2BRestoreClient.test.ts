@@ -62,7 +62,7 @@ describe("native E2B snapshot catalog", () => {
         if (problem === "failed") value.builds[0]!.status = "error";
         expect(
           yield* fixture(value).client.resolveSource("snapshot", buildId).pipe(Effect.flip),
-        ).toMatchObject({ reason: "identity" });
+        ).toMatchObject({ reason: problem === "pending" ? "not_ready" : "identity" });
       }),
     );
   }
@@ -142,6 +142,32 @@ describe("native E2B snapshot catalog", () => {
           .resolveTerminalNamedSnapshot("capture")
           .pipe(Effect.flip),
       ).toMatchObject({ operation: "snapshot", reason: "http", status: 404 });
+    }),
+  );
+  it.effect("distinguishes a native missing exact snapshot from a generic HTTP 404", () =>
+    Effect.gen(function* () {
+      const missing = makeE2BRestoreClient(settings, async () =>
+        Response.json(
+          { code: 404, message: "Template not found", upstream: "management-secret" },
+          { status: 404 },
+        ),
+      );
+      const native = yield* missing.resolveSource("snapshot", buildId).pipe(Effect.flip);
+      expect(native).toMatchObject({ operation: "snapshot", reason: "not_found", status: 404 });
+      expect(encodeJson(native)).not.toContain("management-secret");
+      for (const response of [
+        new Response("<h1>Not found</h1>", { status: 404 }),
+        Response.json({ error: "Unknown route" }, { status: 404 }),
+        Response.json({ code: 403, message: "Forbidden" }, { status: 404 }),
+        Response.json({ code: 404 }, { status: 404 }),
+      ]) {
+        const upstream = makeE2BRestoreClient(settings, async () => response);
+        expect(yield* upstream.resolveSource("snapshot", buildId).pipe(Effect.flip)).toMatchObject({
+          operation: "snapshot",
+          reason: "http",
+          status: 404,
+        });
+      }
     }),
   );
   it.effect("keeps terminal failed captures separate from native ready completions", () =>

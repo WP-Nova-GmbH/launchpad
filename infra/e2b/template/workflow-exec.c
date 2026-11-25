@@ -8,6 +8,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 #define COORDINATOR_ID 1000
 #define WORKFLOW_ID 10001
 #define WORKFLOW_HOME "/home/launchpad-workflow"
+#define WORKFLOW_CODEX_HOME WORKFLOW_HOME "/.codex"
 #define WORKFLOW_MARKER "/etc/launchpad/workflow-guest"
 #define WORKLOAD_HELPER "/opt/launchpad/bin/launchpad-workload"
 #define CHECKPOINT_PYTHON "/opt/launchpad/bin/launchpad-workflow-reader-python"
@@ -182,6 +184,61 @@ static int duplicate_fd(int pidfd, int fd) {
     return (int)syscall(SYS_pidfd_getfd, pidfd, fd, 0);
 }
 
+static int write_idle_provider_marker(char **args) {
+    int pidfd = number(args[0], 3, INT_MAX);
+    const char *nonce = args[1];
+    if (pidfd < 0 || strlen(nonce) != 32 || strspn(nonce, "0123456789abcdef") != 32)
+        return -1;
+    int output = duplicate_fd(pidfd, STDOUT_FILENO);
+    if (output < 0) return -1;
+
+    char marker[64];
+    int length = snprintf(marker, sizeof(marker), "\x1elaunchpad-idle:%s\x1f", nonce);
+    ssize_t written = -1;
+    struct stat info;
+    if (fstat(output, &info) != 0) {
+        close(output);
+        return -1;
+    }
+    if (S_ISSOCK(info.st_mode)) {
+        struct sockaddr_storage address;
+        socklen_t address_size = sizeof(address);
+        int type;
+        socklen_t type_size = sizeof(type);
+        struct pollfd ready = { .fd = output, .events = POLLOUT };
+        // The provider is frozen. On a writable Unix stream no app writer
+        // can consume the space for this short marker before we send it.
+        if (getsockname(output, (struct sockaddr *)&address, &address_size) == 0 &&
+            address.ss_family == AF_UNIX &&
+            getsockopt(output, SOL_SOCKET, SO_TYPE, &type, &type_size) == 0 &&
+            type == SOCK_STREAM) {
+            written = 0;
+            for (int attempt = 0; attempt < length && written < length; attempt++) {
+                int polled = poll(&ready, 1, 25);
+                if (polled < 0 && errno == EINTR) continue;
+                if (polled != 1 || !(ready.revents & POLLOUT)) break;
+                ssize_t sent = send(output, marker + written, (size_t)(length - written),
+                                    MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                    continue;
+                if (sent <= 0) break;
+                written += sent;
+            }
+        }
+    } else if (S_ISFIFO(info.st_mode)) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", output);
+        // Open a new file description so O_NONBLOCK never changes Codex's fd.
+        int pipe = open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (pipe >= 0) {
+            written = write(pipe, marker, (size_t)length);
+            close(pipe);
+        }
+    }
+    close(output);
+    return written == length ? 0 : -1;
+}
+
 static int endpoint_matches(const struct sockaddr_in *address, socklen_t length, int port) {
     return length == sizeof(*address) && address->sin_family == AF_INET &&
         address->sin_addr.s_addr == htonl(INADDR_LOOPBACK) && address->sin_port == htons((uint16_t)port);
@@ -251,6 +308,9 @@ static int inspect_provider_peer(char **args) {
 
 int main(int argc, char **argv) {
     if (getuid() == 0 && geteuid() == 0) {
+        if (argc == 4 && strcmp(argv[1], "write-idle-provider-marker") == 0 &&
+            write_idle_provider_marker(argv + 2) == 0)
+            return 0;
         if (argc == 6 && strcmp(argv[1], "inspect-workflow-provider-socket") == 0) {
             int result = inspect_provider_peer(argv + 2);
             if (result >= 0) return result;
@@ -271,7 +331,8 @@ int main(int argc, char **argv) {
             if (strcmp(argv[1], "exec-provider") == 0) exec_workload(argv[2], argv + 4, provider);
         }
         if (argc == 4 && strcmp(argv[1], "exec-checkpoint-reader") == 0 &&
-            (strcmp(argv[3], "capture") == 0 || strcmp(argv[3], "exclude") == 0)) {
+            (strcmp(argv[3], "capture") == 0 || strcmp(argv[3], "exclude") == 0 ||
+             (strcmp(argv[3], "conversation-files") == 0 && strcmp(argv[2], WORKFLOW_CODEX_HOME) == 0))) {
             char *command[] = {CHECKPOINT_PYTHON, "-IS", CHECKPOINT_READER, argv[3], NULL};
             exec_workload(argv[2], command, checkpoint_reader);
         }
@@ -283,12 +344,16 @@ int main(int argc, char **argv) {
             char *command[] = {SETUP_OWNER, "--workflow-setup-owner-v4", "--script-fd-v1", NULL};
             exec_workload(argv[2], command, setup_owner);
         }
-        if ((argc == 2 && strcmp(argv[1], "workflow-recovery-state") == 0) ||
+        if ((argc == 2 && (strcmp(argv[1], "workflow-recovery-state") == 0 ||
+                           strcmp(argv[1], "workflow-activity-state") == 0)) ||
             (argc == 3 && strcmp(argv[1], "stop-workflow-publishing") == 0) ||
             (argc == 4 && (strcmp(argv[1], "provider-identity") == 0 ||
                            strcmp(argv[1], "stop-workflow-probe") == 0)) ||
             (argc == 5 && (strcmp(argv[1], "stop-idle-provider") == 0 ||
+                           strcmp(argv[1], "inspect-idle-provider-stop") == 0 ||
+                           strcmp(argv[1], "recover-idle-provider-stop") == 0 ||
                            strcmp(argv[1], "signal-workflow") == 0)) ||
+            (argc == 6 && strcmp(argv[1], "prepare-idle-provider") == 0) ||
             (argc >= 3 && argc <= 5 && strcmp(argv[1], "workflow-setup-control") == 0) ||
             (argc == 7 && strcmp(argv[1], "verify-workflow-provider-peer") == 0))
             exec_control(argc - 1, argv + 1);

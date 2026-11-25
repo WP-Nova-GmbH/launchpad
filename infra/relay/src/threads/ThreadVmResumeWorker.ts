@@ -151,14 +151,19 @@ export function makeThreadVmResumeWorker(
         return;
       const sealed = yield* sealThreadVmTrafficAccessToken(tokenIdentity, token);
       if (!(yield* store.finishPower(claim, sealed))) return;
-      yield* guest
-        .reopenAfterResume(
-          claim.computeRef,
-          identity,
-          claim.finalSaveOperationId ?? claim.pauseOperationId,
-        )
-        .pipe(Effect.timeout(GUEST_REOPEN_TIMEOUT_MS));
-      if ((yield* store.complete(claim)) && claim.workflowJobId) yield* wakeWorkflows();
+      // A cancelled finished capture can still have the guest's Codex stop in flight.
+      // The allocation is powered, but only the guest can reconcile that stop before reopening.
+      if (claim.guestPauseOperationId === null)
+        yield* guest
+          .reopenAfterResume(
+            claim.computeRef,
+            identity,
+            claim.finalSaveOperationId ?? claim.pauseOperationId,
+          )
+          .pipe(Effect.timeout(GUEST_REOPEN_TIMEOUT_MS));
+      const completed = yield* store.complete(claim);
+      if (completed && claim.workflowJobId) yield* wakeWorkflows();
+      return !completed && claim.guestPauseOperationId !== null;
     });
     yield* attempt.pipe(
       Effect.timeout(THREAD_VM_RESUME_ATTEMPT_TIMEOUT_MS),
@@ -168,7 +173,9 @@ export function makeThreadVmResumeWorker(
         ThreadVmIngressTokenUnavailable: () => Effect.void,
         TimeoutError: () => Effect.logWarning("Thread VM resume attempt exceeded its deadline."),
       }),
-      Effect.andThen(store.defer(claim, workflowEnabled === true)),
+      Effect.flatMap((awaitingGuest) =>
+        store.defer(claim, workflowEnabled === true, awaitingGuest === true),
+      ),
     );
     return true;
   });

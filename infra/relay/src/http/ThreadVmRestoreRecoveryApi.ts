@@ -1,4 +1,5 @@
 import { readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
+import { lockWorkflowVmCheckpoint } from "../jobs/WorkflowVmCheckpoint.ts";
 import {
   readWorkflowVmPublishing,
   type WorkflowVmPublication,
@@ -48,18 +49,29 @@ const failures = {
 };
 // The restore endpoints additionally require the exact fresh allocation and
 // generation. Repository VM credentials have no personal owner to authorize.
-const withRestoreEnvironment = <A, E, R>(input: Owner, action: Effect.Effect<A, E, R>) =>
+const withRestoreEnvironment = <A, E, R>(
+  input: Owner,
+  action: Effect.Effect<A, E, R>,
+  activatingOperationId?: string,
+) =>
   Effect.gen(function* () {
     const principal = yield* RelayEnvironmentPrincipal;
     const sql = (yield* RelayDb).$client;
-    const [workflow] = yield* sql`SELECT 1 FROM relay_thread_placements t
-      JOIN relay_thread_vm_restores r ON r.thread_id=t.thread_id
-      JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
-      WHERE t.thread_id=${input.threadId} AND t.audience='repository'
-        AND a.allocation_id=${principal.threadVm?.allocationId ?? null} AND a.resource_kind='organization_workflow'
-        AND t.generation=${input.generation} AND r.target_generation=t.generation
-        AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))`;
-    return yield* withEnvironmentThread(input, workflow ? "workflow-lifecycle" : true, action);
+    const access = Effect.gen(function* () {
+      const [workflow] = yield* sql<{ jobId: string }>`SELECT t.workflow_job_id AS "jobId"
+        FROM relay_thread_placements t JOIN relay_thread_vm_restores r ON r.thread_id=t.thread_id
+        JOIN relay_thread_vm_allocations a ON a.allocation_id=r.allocation_id
+        WHERE t.thread_id=${input.threadId} AND t.audience='repository'
+          AND t.environment_id=${principal.environmentId}
+          AND a.allocation_id=${principal.threadVm?.allocationId ?? null} AND a.resource_kind='organization_workflow'
+          AND t.generation=${input.generation} AND r.target_generation=t.generation
+          AND (t.operation_id=r.operation_id OR (r.phase='completed' AND t.operation_id IS NULL))
+          ${activatingOperationId === undefined ? sql`` : sql`AND r.operation_id=${activatingOperationId}`}`;
+      // Activation and follow-up polling both acquire the workflow job before the placement.
+      if (workflow && activatingOperationId) yield* lockWorkflowVmCheckpoint(sql, workflow.jobId);
+      return yield* withEnvironmentThread(input, workflow ? "workflow-lifecycle" : true, action);
+    });
+    return yield* activatingOperationId ? sql.withTransaction(access) : access;
   }).pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
 
 const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string) {
@@ -169,6 +181,11 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
           responses: projection.record.progress?.responses ?? [],
         };
       }
+      const [head] =
+        checkpoint?.finishedWorkspaceRevision !== undefined
+          ? yield* sql<{ revision: number }>`SELECT revision FROM relay_workflow_recovery_heads
+          WHERE job_id=${checkpoint.jobId}`
+          : [];
       return {
         operationId: row.operationId,
         ...(row.savedDiskOperationId
@@ -185,6 +202,7 @@ const recovery = Effect.fnUntraced(function* (input: Owner, operationId?: string
                 ...publication,
                 binding: target.binding,
                 sourceSequence: source.source.sourceSequence,
+                ...(head ? { latestPublicationRevision: head.revision } : {}),
                 ...(publishing ? { publishing } : {}),
               },
             }
@@ -292,6 +310,7 @@ export const confirmThreadVmRestoreActivation = Effect.fn("relay.api.restore.act
           ? makeThreadVmResetImportStore(sql, objects).finish(receipt)
           : makeThreadVmRestoreImportStore(sql, objects).finish(receipt);
       }),
+      receipt.operationId,
     );
   },
   Effect.catchTags({

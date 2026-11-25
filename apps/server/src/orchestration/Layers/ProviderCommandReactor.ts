@@ -53,7 +53,12 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { WorkflowRunStore, type WorkflowRun } from "../../jobs/WorkflowRunStore.ts";
-import { ThreadExecutionRelayError } from "../../relay/ThreadExecutionRelay.ts";
+import { readRelayProviderResponseActor } from "../../relay/ThreadCommandSync.ts";
+import {
+  CurrentWorkflowVmFollowUpActor,
+  CurrentWorkflowVmFollowUpResponse,
+  ThreadExecutionRelayError,
+} from "../../relay/ThreadExecutionRelay.ts";
 import {
   canContinueWorkflowVmInference,
   CurrentWorkflowVmAttemptEnvironment,
@@ -2045,6 +2050,46 @@ const make = Effect.gen(function* () {
         return;
       }
       const continuation = yield* workflowAttempt(threadId, prompt.messageId);
+      const followUpBinding =
+        !continuation && (yield* WorkflowVmGuest)
+          ? yield* workflows.getVmBindingForThread(threadId)
+          : null;
+      const followUpUserId = followUpBinding
+        ? (prompt.editedBy ?? prompt.author)?.userId
+        : undefined;
+      const resolveFollowUp = workflowVmAttempts.resolveFollowUp;
+      const followUpEnvironment =
+        followUpBinding && followUpUserId && resolveFollowUp
+          ? yield* resolveFollowUp(followUpBinding, followUpUserId)
+          : null;
+      if (followUpBinding && !followUpEnvironment) {
+        yield* release("This workflow VM follow-up prompt is no longer authorized.");
+        yield* orchestrationEngine.dispatch({
+          type: "thread.prompt.remove",
+          commandId: CommandId.make(`${attemptId}:not-authorized`),
+          threadId,
+          messageId: prompt.messageId,
+          expectedRevision: prompt.revision,
+          createdAt: yield* promptNow,
+        });
+        yield* appendProviderFailureActivity({
+          threadId,
+          kind: "provider.turn.start.failed",
+          summary: "Follow-up prompt rejected",
+          detail: "The sender no longer has access to continue this workflow VM.",
+          turnId: null,
+          createdAt: yield* promptNow,
+        });
+        return;
+      }
+      if (followUpBinding && handoff.mode !== "next-turn") {
+        yield* release("This workflow prompt must wait for its own turn.");
+        return;
+      }
+      const withFollowUpActor = Effect.provideService(
+        CurrentWorkflowVmFollowUpActor,
+        followUpUserId,
+      );
       const workflowRun = continuation ? yield* workflows.get(continuation.jobId) : null;
       if (
         workflowRun?.runtime.kind === "vm" &&
@@ -2074,8 +2119,12 @@ const make = Effect.gen(function* () {
         return;
       }
       if (handoff.mode === "next-turn") {
-        yield* ensureThreadWorktree(thread);
-        if (!isCompact && !thread.messages.some((message) => message.role === "user")) {
+        if (!followUpBinding) yield* ensureThreadWorktree(thread);
+        if (
+          !followUpBinding &&
+          !isCompact &&
+          !thread.messages.some((message) => message.role === "user")
+        ) {
           const project = yield* resolveProject(thread.projectId);
           const cwd =
             resolveThreadWorkspaceCwd({ thread, projects: project ? [project] : [] }) ??
@@ -2275,7 +2324,7 @@ const make = Effect.gen(function* () {
           }).pipe(Effect.orElseSucceed(() => false)),
         };
       });
-      const environment = yield* workflowEnvironment;
+      const environment = followUpEnvironment ?? (yield* workflowEnvironment);
       secretBearing = environment?.hasSecrets === true;
       if (environment) {
         const beforeSession = (yield* readPromptThread(threadId))?.promptQueue;
@@ -2321,7 +2370,10 @@ const make = Effect.gen(function* () {
               ...(prompt.modelSelection ? { modelSelection: prompt.modelSelection } : {}),
               interactionMode: prompt.interactionMode,
               createdAt: prompt.createdAt,
-            }).pipe(Effect.provideService(CurrentWorkflowVmAttemptEnvironment, environment));
+            }).pipe(
+              Effect.provideService(CurrentWorkflowVmAttemptEnvironment, environment),
+              withFollowUpActor,
+            );
       const latest = yield* readPromptThread(threadId);
       if (latest?.promptQueue?.handoff?.attemptId !== attemptId) return;
       if (
@@ -2385,7 +2437,14 @@ const make = Effect.gen(function* () {
           });
         }
         yield* workflowAttempt(threadId, prompt.messageId, continuation?.jobId);
-        if (environment) yield* workflowEnvironment;
+        if (followUpEnvironment?.authorizeInference) {
+          if (!(yield* followUpEnvironment.authorizeInference))
+            return yield* new ProviderAdapterValidationError({
+              provider: "codex",
+              operation: "sendTurn",
+              issue: "Workflow VM follow-up access changed.",
+            });
+        } else if (environment) yield* workflowEnvironment;
       });
       crossedProviderBoundary = true;
       if (isCompact) {
@@ -2410,7 +2469,11 @@ const make = Effect.gen(function* () {
                 ),
               ),
           })
-          .pipe(Effect.ensuring(Effect.sync(() => void compactingThreadIds.delete(threadId))));
+          .pipe(
+            Effect.provideService(CurrentWorkflowVmAttemptEnvironment, environment),
+            withFollowUpActor,
+            Effect.ensuring(Effect.sync(() => void compactingThreadIds.delete(threadId))),
+          );
         observedCompactionTerminal = true;
         if (compaction.type === "turn" && compaction.outcome !== "completed") {
           yield* appendProviderFailureActivity({
@@ -2448,7 +2511,10 @@ const make = Effect.gen(function* () {
             },
             { beforeDispatch, onAdmitted },
           )
-          .pipe(Effect.provideService(CurrentWorkflowVmAttemptEnvironment, environment));
+          .pipe(
+            Effect.provideService(CurrentWorkflowVmAttemptEnvironment, environment),
+            withFollowUpActor,
+          );
       }
     });
     yield* run.pipe(
@@ -2846,11 +2912,36 @@ const make = Effect.gen(function* () {
   ) {
     if (retryingWorkflowResponses.has(event.eventId)) return;
     const threadId = event.payload.threadId;
-    const run = event.commandId?.startsWith("server:supervisor:")
-      ? yield* workflows.getByThread(threadId)
-      : null;
-    const liveSessionOnly = run?.runtime.kind === "vm" ? { liveSessionOnly: true } : undefined;
+    const commandId = event.commandId;
+    const supervisor = commandId?.startsWith("server:supervisor:");
+    const run = supervisor ? yield* workflows.getByThread(threadId) : null;
+    const actor =
+      !supervisor && commandId && (yield* WorkflowVmGuest)
+        ? yield* readRelayProviderResponseActor(sql, {
+            commandId,
+            threadId,
+            requestId: event.payload.requestId,
+            type:
+              event.type === "thread.approval-response-requested"
+                ? "thread.approval.respond"
+                : "thread.user-input.respond",
+          })
+        : undefined;
+    const operation =
+      event.type === "thread.approval-response-requested" ? "approval" : "user-input";
+    const followUpResponse =
+      commandId && actor
+        ? {
+            threadId,
+            workId: `provider:${operation}:${event.payload.requestId}`,
+            userId: actor,
+            commandId,
+          }
+        : undefined;
+    const liveSessionOnly =
+      followUpResponse || run?.runtime.kind === "vm" ? { liveSessionOnly: true } : undefined;
     yield* send(liveSessionOnly).pipe(
+      Effect.provideService(CurrentWorkflowVmFollowUpResponse, followUpResponse),
       Effect.catchCause((cause) =>
         Effect.gen(function* () {
           if (Cause.hasInterruptsOnly(cause)) return yield* Effect.interrupt;

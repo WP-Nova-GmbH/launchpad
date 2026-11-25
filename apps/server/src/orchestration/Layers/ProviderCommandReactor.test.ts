@@ -22,6 +22,7 @@ import {
   ThreadExecutionRelayError,
 } from "../../relay/ThreadExecutionRelay.ts";
 import { workflowPromptId } from "../../jobs/workflowSequence.ts";
+import { WorkflowVmGuest } from "../../vmWorkloadCommand.ts";
 import { TerminalManager } from "../../terminal/Manager.ts";
 import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
 import { GitVcsDriver } from "../../vcs/GitVcsDriver.ts";
@@ -39,6 +40,7 @@ import * as NodePath from "node:path";
 
 import {
   ModelSelection,
+  OrchestrationCommand,
   ProviderRuntimeEvent,
   ProviderSession,
   type ProviderTurnStartResult,
@@ -101,6 +103,7 @@ import {
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const encodeRelayCommand = Schema.encodeEffect(Schema.fromJsonString(OrchestrationCommand));
 const decodeWorkflowRun = Schema.decodeUnknownEffect(WorkflowRun);
 const decodeContinuityWorkflowRun = Schema.decodeUnknownSync(WorkflowRun);
 const decodeServerProvider = Schema.decodeUnknownEffect(ServerProvider);
@@ -251,6 +254,7 @@ describe("ProviderCommandReactor", () => {
   async function createHarness(input?: {
     readonly threadId?: ThreadId;
     readonly withWorkflowVmAuthority?: boolean;
+    readonly workflowGuest?: boolean;
     readonly workflowVmAuthority?: ThreadExecutionAuthority;
     readonly adapterRegistry?: ProviderAdapterRegistryShape;
     readonly withRuntimeIngestion?: boolean;
@@ -562,7 +566,9 @@ describe("ProviderCommandReactor", () => {
       }),
     ).pipe(Layer.provide(orchestrationLayer));
     const layer = Layer.merge(
-      ProviderCommandReactorLive,
+      ProviderCommandReactorLive.pipe(
+        Layer.provide(Layer.succeed(WorkflowVmGuest, input?.workflowGuest ?? false)),
+      ),
       input?.withRuntimeIngestion
         ? ProviderRuntimeIngestionLive
         : Layer.succeed(ProviderRuntimeIngestionService, {
@@ -7501,6 +7507,130 @@ describe("ProviderCommandReactor", () => {
       interactionMode: "default",
       createdAt: "2026-10-12T10:00:00.000Z",
     });
+  effectIt.effect.each(["approval", "user-input"] as const)(
+    "admits a finished-workflow %s response under the authenticated relay command",
+    (kind) =>
+      Effect.gen(function* () {
+        const template = continuityQueueRun(`follow-up-${kind}`);
+        const threadId = ThreadId.make(`workflow:${template.jobId}`);
+        const commandId = CommandId.make(`follow-up-${kind}-command`);
+        const requestId = ApprovalRequestId.make(`follow-up-${kind}-request`);
+        const instanceId = template.modelSelection.instanceId;
+        const original = yield* continuityQueueAdapter(instanceId);
+        const respond = vi.fn(() => Effect.void);
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            threadId,
+            workflowGuest: true,
+            threadModelSelection: template.modelSelection,
+            workflowVmAuthority: {
+              admit: (work) =>
+                work.workId !== `provider:${kind}:${requestId}` ||
+                (work.followUpUserId === "authenticated-maintainer" &&
+                  work.followUpCommandId === commandId &&
+                  work.generation === 1)
+                  ? Effect.succeed({ newlyAdmitted: true, completed: false })
+                  : Effect.fail(
+                      new ThreadExecutionRelayError({
+                        threadId,
+                        operation: "admit",
+                        detail: "The finished workflow has released execution.",
+                      }),
+                    ),
+              complete: () => Effect.void,
+            },
+            adapterRegistry: queueRegistry(
+              new Map([
+                [
+                  instanceId,
+                  {
+                    adapter: {
+                      ...original.adapter,
+                      respondToRequest: respond,
+                      respondToUserInput: respond,
+                    },
+                    key: "codex:shared-queue-home",
+                  },
+                ],
+              ]),
+            ),
+          }),
+        );
+        const environmentId = EnvironmentId.make("workflow-vm");
+        yield* harness.sql`INSERT INTO thread_execution_fences
+          (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+          VALUES (${threadId}, 'https://relay.example', ${environmentId}, 'project-1', 1, 'operation', 'active')`;
+        yield* harness.providerService.startSession(threadId, {
+          threadId,
+          providerInstanceId: instanceId,
+          runtimeMode: "approval-required",
+        });
+        const createdAt = template.createdAt;
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("follow-up-session"),
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            providerInstanceId: instanceId,
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+        if (kind === "user-input")
+          yield* harness.engine.dispatch({
+            type: "thread.activity.append",
+            commandId: CommandId.make("follow-up-question"),
+            threadId,
+            activity: {
+              id: EventId.make("follow-up-question"),
+              kind: "user-input.requested",
+              tone: "info",
+              summary: "Question",
+              turnId: null,
+              createdAt,
+              payload: {
+                requestId,
+                questions: [{ id: "context", header: "Context", question: "More?", options: [] }],
+              },
+            },
+            createdAt,
+          });
+        const command = {
+          threadId,
+          commandId,
+          requestId,
+          createdAt,
+          ...(kind === "approval"
+            ? { type: "thread.approval.respond" as const, decision: "accept" as const }
+            : { type: "thread.user-input.respond" as const, answers: { context: "Yes" } }),
+        };
+        const inboxEntry = yield* encodeJson({
+          threadId,
+          commandId,
+          position: 1,
+          acceptedGeneration: 1,
+          actor: { userId: "authenticated-maintainer", displayName: null, imageUrl: null },
+          receipt: null,
+          command,
+        });
+        const normalized = yield* encodeRelayCommand(command);
+        yield* harness.sql`INSERT INTO thread_relay_command_deliveries
+          (command_id,thread_id,generation,position,entry_json,normalized_json)
+          VALUES (${commandId},${threadId},1,1,${inboxEntry},${normalized})`;
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(harness.drain);
+        expect(respond.mock.calls).toEqual([
+          [threadId, requestId, kind === "approval" ? "accept" : { context: "Yes" }],
+        ]);
+      }),
+  );
+
   effectIt.effect.each([
     { kind: "approval", outcome: "recovered" },
     { kind: "user-input", outcome: "recovered" },

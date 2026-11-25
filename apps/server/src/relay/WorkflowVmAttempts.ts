@@ -1,3 +1,4 @@
+import { RelayTenancyNotFoundError } from "@t3tools/contracts/relay";
 import type { WorkflowVmDispatchBinding } from "@t3tools/contracts/workflows";
 import type { ThreadPromptHandoff, ThreadPromptQueue } from "@t3tools/contracts";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
@@ -65,6 +66,10 @@ export class WorkflowVmAttempts extends Context.Reference<{
       readonly stepGeneration: number;
     },
   ) => Effect.Effect<WorkflowVmAttemptEnvironment, WorkflowVmAttemptError>;
+  readonly resolveFollowUp?: (
+    binding: WorkflowVmDispatchBinding,
+    userId: string,
+  ) => Effect.Effect<WorkflowVmAttemptEnvironment | null, WorkflowVmAttemptError>;
   readonly readReviewSecrets: (
     binding: WorkflowVmDispatchBinding,
   ) => Effect.Effect<Redacted.Redacted<ReadonlyArray<string>>, WorkflowVmAttemptError>;
@@ -119,6 +124,46 @@ export class WorkflowVmAttempts extends Context.Reference<{
           )
             return yield* new WorkflowVmAttemptError();
           return configuration;
+        }),
+        resolveFollowUp: Effect.fnUntraced(function* (binding, userId) {
+          const endpoint = yield* boundClient(binding);
+          const params = { environmentId: binding.environmentId, threadId: binding.threadId };
+          const payload = { generation: binding.generation, userId };
+          const configuration = yield* endpoint.resolveWorkflowVmFollowUp({ params, payload }).pipe(
+            Effect.catchIf(Schema.is(RelayTenancyNotFoundError), () => Effect.succeed(null)),
+            Effect.timeout("5 seconds"),
+            Effect.mapError(() => new WorkflowVmAttemptError()),
+          );
+          if (!configuration) return null;
+          if (
+            configuration.hasSecrets !== configuration.secretNames.length > 0 ||
+            configuration.secretNames.some(
+              (name) => !Object.hasOwn(configuration.environment, name),
+            )
+          )
+            return yield* new WorkflowVmAttemptError();
+          return {
+            ...configuration,
+            authorizeInference: endpoint
+              .checkClientAccess({
+                params,
+                payload: { ...payload, workflowFollowUp: true },
+              })
+              .pipe(
+                Effect.map(
+                  (access) =>
+                    access.workflowFollowUp?.ready === true &&
+                    access.environmentId === binding.environmentId &&
+                    access.threadId === binding.threadId &&
+                    access.generation === binding.generation &&
+                    access.userId === userId &&
+                    access.repositoryId === binding.repositoryId &&
+                    access.projectId === binding.projectId,
+                ),
+                Effect.timeout("5 seconds"),
+                Effect.orElseSucceed(() => false),
+              ),
+          };
         }),
         readReviewSecrets: Effect.fnUntraced(function* (binding) {
           const environment = yield* boundClient(binding);

@@ -61,8 +61,12 @@ import { makeThreadNativeCheckpoint } from "./ThreadNativeCheckpoint.ts";
 import { makeThreadAttachmentCheckpoint } from "./ThreadAttachmentCheckpoint.ts";
 import { makeThreadNativeCheckpointTransfer } from "./ThreadNativeCheckpointTransfer.ts";
 import { makeThreadAttachmentCheckpointTransfer } from "./ThreadAttachmentCheckpointTransfer.ts";
+import { inspectThreadHistoryArchive } from "./ThreadHistoryArchive.ts";
+import { ThreadHistoryBaselineImporter } from "./ThreadHistoryBaseline.ts";
 import { attachmentRelativePath } from "../attachmentStore.ts";
 import { THREAD_VM_IDENTITY_SECRET } from "./ThreadVmEnrollment.ts";
+import { adoptThreadVmRestoreCheckout } from "./ThreadVmRestoreCheckout.ts";
+import { exportThreadVmRestoreHistory } from "./ThreadVmRestoreHistory.ts";
 import {
   installThreadVmRestoreRecovery,
   readThreadVmRestoreState,
@@ -93,7 +97,11 @@ const decodeRecovery = (input: unknown) => {
 const isRecovery = Schema.is(RelayThreadVmRestoreRecovery);
 const at = "2026-10-07T00:00:00.000Z",
   nativeId = "01900000-0000-7000-8000-000000000001";
-const fixture = Effect.fnUntraced(function* (worktree = false, ordinary = false) {
+const fixture = Effect.fnUntraced(function* (
+  worktree = false,
+  ordinary = false,
+  legacyBranch = false,
+) {
   const fs = yield* FileSystem.FileSystem,
     path = yield* Path.Path,
     runner = yield* ProcessRunner;
@@ -193,7 +201,7 @@ const fixture = Effect.fnUntraced(function* (worktree = false, ordinary = false)
         modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
         runtimeMode: "full-access",
         interactionMode: "default",
-        branch: worktree ? "work" : "main",
+        branch: legacyBranch ? `t3-job/${threadId}` : worktree ? "work" : "main",
         worktreePath: worktree ? checkoutPath : null,
         createdAt: at,
       });
@@ -452,6 +460,95 @@ it.layer(
     ),
   ),
 )("saved VM import", (it) => {
+  it.effect("finished workflow restore projects the branch already checked out by follow-up", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture(false, false, true);
+        const actualBranch = `launchpad/${f.threadId}`;
+        yield* f.git(f.checkoutPath, ["branch", "-m", actualBranch]);
+        const head = yield* f.git(f.checkoutPath, ["rev-parse", "HEAD"]);
+        const savedDisk = yield* exportThreadVmRestoreHistory({
+          boot: {
+            version: 1,
+            operationId: f.operationId,
+            allocationId: f.recovery.scope.allocationId,
+            threadId: f.threadId,
+            generation: f.recovery.scope.generation,
+          },
+          native: f.recovery.native,
+          workspaceRoot: f.workspaceRoot,
+          baseDir: f.baseDir,
+          artifactRoot: f.path.join(f.root, "restore-history"),
+        });
+        expect(savedDisk.workspace.branch).toBe(`t3-job/${f.threadId}`);
+        yield* Effect.gen(function* () {
+          const owner = {
+            threadId: f.threadId,
+            projectId: ProjectId.make(`vm:${f.threadId}`),
+            environmentId: f.recovery.environmentId,
+            relayUrl: "https://relay.test",
+            generation: f.recovery.scope.generation,
+            operationId: f.operationId,
+          };
+          yield* (yield* OrchestrationEngineService).dispatch({
+            type: "project.create",
+            commandId: CommandId.make(`${f.operationId}:restore-project`),
+            projectId: owner.projectId,
+            title: "VM workspace",
+            workspaceRoot: f.workspaceRoot,
+            createdAt: at,
+          });
+          yield* makeThreadExecutionFence(yield* SqlClient.SqlClient).prepare(owner);
+          const history = yield* inspectThreadHistoryArchive({
+            owner: savedDisk.manifest,
+            manifest: savedDisk.manifest,
+            directory: savedDisk.directory,
+          });
+          const manifestSha256 = NodeCrypto.createHash("sha256")
+            .update(encode(savedDisk.manifest))
+            .digest("hex");
+          const adoption = {
+            ...owner,
+            ...savedDisk.workspace,
+            manifestSha256,
+            worktreesRoot: f.path.join(f.baseDir, "worktrees"),
+          };
+          const unfinished = yield* Effect.flip(
+            adoptThreadVmRestoreCheckout({ ...adoption, retainedWorkflow: "unfinished" }),
+          );
+          expect(unfinished.message).toContain("does not match this frozen restore");
+
+          const checkout = yield* adoptThreadVmRestoreCheckout({
+            ...adoption,
+            retainedWorkflow: "finished",
+          });
+          expect(checkout.branch).toBe(actualBranch);
+          expect(checkout.head).toBe(head);
+          yield* (yield* ThreadHistoryBaselineImporter).install({
+            version: 1,
+            manifestSha256,
+            source: savedDisk.manifest,
+            destination: { ...owner, branch: checkout.branch, worktreePath: null },
+            events: yield* Stream.runCollect(history.events),
+            receipts: history.receipts,
+            importedAt: at,
+            nativeRuntime: null,
+          });
+          const snapshot = yield* (yield* ProjectionSnapshotQuery).getSnapshot();
+          expect(snapshot.threads.find((thread) => thread.id === f.threadId)?.branch).toBe(
+            actualBranch,
+          );
+        }).pipe(Effect.provide(f.destinationLayer));
+        expect(yield* f.git(f.checkoutPath, ["symbolic-ref", "--short", "HEAD"])).toBe(
+          actualBranch,
+        );
+        expect(yield* f.fs.readFileString(f.path.join(f.checkoutPath, "untracked"))).toBe(
+          "keep me\n",
+        );
+      }),
+    ),
+  );
+
   for (const worktree of [false, true])
     it.effect(
       `independent backup import replaces snapshot app/native state and pauses the idle ready conversation in ${worktree ? "saved worktree" : "main checkout"}`,

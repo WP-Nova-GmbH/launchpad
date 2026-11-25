@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
-import { getTerminalFocusOwner, isTerminalFocused } from "./terminalFocus";
+import {
+  getTerminalFocusOwner,
+  isDrawerTerminalShortcut,
+  isTerminalFocused,
+} from "./terminalFocus";
 
 class MockHTMLElement {
   isConnected = false;
@@ -77,5 +81,22 @@ describe("isTerminalFocused", () => {
 
     expect(getTerminalFocusOwner()).toBe("right-panel");
     expect(isTerminalFocused()).toBe(true);
+  });
+});
+
+describe("workflow drawer terminal shortcuts", () => {
+  it.each(["terminal.close", "terminal.new", "terminal.split", "terminal.splitVertical"] as const)(
+    "claims %s only for a focused drawer",
+    (command) => {
+      expect(isDrawerTerminalShortcut(command, "drawer")).toBe(true);
+      expect(isDrawerTerminalShortcut(command, "right-panel")).toBe(false);
+      expect(isDrawerTerminalShortcut(command, null)).toBe(false);
+    },
+  );
+
+  it("can open the drawer without granting other shortcuts", () => {
+    expect(isDrawerTerminalShortcut("terminal.toggle", null)).toBe(true);
+    expect(isDrawerTerminalShortcut("thread.settle", "drawer")).toBe(false);
+    expect(isDrawerTerminalShortcut("rightPanel.toggle", "drawer")).toBe(false);
   });
 });

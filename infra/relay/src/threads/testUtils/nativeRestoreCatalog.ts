@@ -97,6 +97,10 @@ export const nativeRestoreFixture = Effect.fnUntraced(function* () {
     endAt: DateTime.toDateUtc(DateTime.makeUnsafe("2099-01-01T00:00:00Z")),
   });
   const compute = {
+    restore: {
+      resolveSource: (sourceTemplateID, sourceBuildID) =>
+        Effect.succeed({ sourceTemplateID, sourceBuildID }),
+    },
     createFromSnapshot: () =>
       Effect.succeed({ sandboxId, trafficAccessToken: Redacted.make("native-private-token") }),
     findOperation: () => Effect.succeed([info()]),

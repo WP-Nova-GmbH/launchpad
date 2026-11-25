@@ -210,15 +210,16 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
             "Checkout and history installation must finish before activation.",
           );
         if (checkout && binding) {
+          const finished = input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
           const [ready] = yield* sql`SELECT 1 FROM thread_transfer_baselines b
             JOIN repository_workflow_jobs j USING(thread_id)
             LEFT JOIN provider_session_runtime p USING(thread_id)
             WHERE b.operation_id=${input.operationId} AND b.generation=${input.generation}
               AND j.job_id=${binding.jobId} AND (
                 (${lifecycle?.beforeAgent === true} AND p.thread_id IS NULL)
-                OR (p.status='stopped' AND p.provider_name='codex' AND p.provider_instance_id='codex'
+                OR (p.status='stopped' AND p.provider_name='codex' AND p.provider_instance_id='codex' AND p.adapter_key='codex'
                   AND json_extract(p.resume_cursor_json,'$.resumePolicy')='require-existing'
-                  AND json_extract(p.runtime_payload_json,'$.providerContinuation.workflowJobId')=j.job_id
+                  AND (${finished} OR json_extract(p.runtime_payload_json,'$.providerContinuation.workflowJobId')=j.job_id)
                   AND json_extract(p.runtime_payload_json,'$.stoppedRuntimeEventsDrained')=1)
               )`;
           if (binding.operationId !== input.operationId || !ready)
@@ -415,8 +416,8 @@ export function makeThreadExecutionFence(sql: SqlClient.SqlClient) {
   const pendingCompletionReports = Effect.fn("ThreadExecutionFence.pendingCompletionReports")(
     function* () {
       return yield* sql<
-        Array<Work>[number]
-      >`SELECT thread_id AS "threadId", work_id AS "workId", generation, kind
+        Work & { readonly started: number }
+      >`SELECT thread_id AS "threadId", work_id AS "workId", generation, kind, started
       FROM thread_execution_work WHERE completed = 1 AND relay_completed = 0`;
     },
   );

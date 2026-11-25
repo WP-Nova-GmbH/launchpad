@@ -15,7 +15,11 @@
  *
  * @module ThreadBackgroundLivenessService
  */
-import { INERT_TASK_TYPES, MONITOR_TASK_TYPES } from "@t3tools/contracts";
+import {
+  INERT_TASK_TYPES,
+  MONITOR_TASK_TYPES,
+  type ProviderRuntimeEvent,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -71,6 +75,44 @@ export class ThreadBackgroundLivenessService extends Context.Service<
     readonly getThreadBackgroundLiveness: (threadId: string) => ThreadBackgroundLiveness;
   }
 >()("t3/orchestration/ThreadBackgroundLiveness/ThreadBackgroundLivenessService") {}
+
+export function recordProviderTaskLiveness(
+  liveness: ThreadBackgroundLivenessService["Service"],
+  event: ProviderRuntimeEvent,
+) {
+  switch (event.type) {
+    case "task.started":
+    case "task.progress":
+    case "task.updated":
+    case "task.completed": {
+      const { taskId, taskType, status, agentId } = event.payload as {
+        taskId: string;
+        taskType?: string;
+        status?: string;
+        agentId?: string;
+      };
+      liveness.recordTaskLiveness({
+        threadId: event.threadId,
+        taskId,
+        taskType,
+        status,
+        agentId,
+        kind:
+          event.type === "task.started"
+            ? "started"
+            : event.type === "task.progress"
+              ? "progress"
+              : event.type === "task.updated"
+                ? "updated"
+                : "completed",
+      });
+      break;
+    }
+    case "session.exited":
+      liveness.clearThreadLiveness(event.threadId);
+      break;
+  }
+}
 
 export function make(): ThreadBackgroundLivenessService["Service"] {
   const stateByThreadId = new Map<string, ThreadLivenessState>();

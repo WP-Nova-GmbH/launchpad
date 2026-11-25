@@ -158,7 +158,7 @@ export const activateRestoredThreadVm = Effect.fn("ThreadVmRestoreActivation.act
             yield* (yield* makeWorkflowRunStore).republishRestoredCheckpoint(
               workflow.binding,
               workflow.checkpoint.publicationRevision,
-              workflow.publishing?.latestPublicationRevision,
+              workflow.latestPublicationRevision ?? workflow.publishing?.latestPublicationRevision,
             );
         }),
       );

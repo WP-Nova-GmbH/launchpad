@@ -381,7 +381,7 @@ export function makeThreadPlacementStore(sql: PgClient) {
   });
 
   const completeWork = Effect.fn("relay.thread_placement.complete_work")(function* (
-    input: Owner & { readonly workId: string },
+    input: Owner & { readonly workId: string; readonly neverStarted?: true },
     workflowJobId?: string,
   ) {
     return yield* sql.withTransaction(
@@ -399,7 +399,8 @@ export function makeThreadPlacementStore(sql: PgClient) {
           WHERE thread_id = ${input.threadId} AND work_id = ${input.workId}
           AND environment_id = ${input.environmentId} AND generation = ${input.generation}
           AND completed = true`;
-        if (!existing.length) return yield* conflict("Work has no matching admission");
+        if (!existing.length && !(workflowJobId && input.neverStarted))
+          return yield* conflict("Work has no matching admission");
       }),
     );
   });

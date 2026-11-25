@@ -13,6 +13,7 @@ import {
   EnvironmentAuthorizationError,
   OrganizationRepositoryPolicy,
   type AuthSessionUser,
+  type AuthEnvironmentScope,
   type OrchestrationCommand,
   type ProjectId,
   type ThreadId,
@@ -33,6 +34,7 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { ServerSecretStore } from "./ServerSecretStore.ts";
 
 export interface RepositoryActor {
+  readonly scopes?: Iterable<AuthEnvironmentScope> | undefined;
   readonly user?: AuthSessionUser;
 }
 const denied = () =>
@@ -58,6 +60,20 @@ export interface RepositoryAccessShape {
   /** When present, even another thread in the same project is outside the audience. */
   readonly threadId?: ThreadId;
   readonly workflowVm?: boolean;
+  readonly workflowFollowUp?: {
+    readonly threadId: ThreadId;
+    readonly generation: number;
+    readonly requireActor: (
+      actor: RepositoryActor,
+      fresh?: boolean,
+    ) => Effect.Effect<void, EnvironmentAuthorizationError>;
+    readonly prepareActor: (
+      actor: RepositoryActor,
+    ) => Effect.Effect<void, EnvironmentAuthorizationError>;
+    readonly readEnvironment: (
+      actor: RepositoryActor,
+    ) => Effect.Effect<Readonly<Record<string, string>>, EnvironmentAuthorizationError>;
+  };
   /** Internal execution only. Callers supply a verified dispatch or a durable accepted run. */
   readonly requireWorkflowProject: (
     binding: WorkflowProjectBinding,

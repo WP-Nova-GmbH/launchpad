@@ -11,6 +11,7 @@ import {
   ThreadCheckpointPublishError,
 } from "./ThreadCheckpointPublisher.ts";
 import { makeWorkflowResultPublisher } from "./WorkflowResultPublisher.ts";
+import { recoverWorkflowVmFollowUpPush } from "./WorkflowVmFollowUpPush.ts";
 import { CheckpointDiffQuery } from "../checkpointing/CheckpointDiffQuery.ts";
 import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import { ServerConfig } from "../config.ts";
@@ -236,7 +237,9 @@ export const layer = Layer.effect(
       engine,
       receipts,
       execution,
-      authority.commands,
+      (yield* WorkflowVmGuest)
+        ? { ...authority.commands, authorizeFollowUp: authority.authorizeFollowUp }
+        : authority.commands,
       (command, authenticatedUserId) =>
         normalizeDispatchCommand(command, authenticatedUserId).pipe(
           Effect.provideContext(normalizerContext),
@@ -246,7 +249,12 @@ export const layer = Layer.effect(
     const moves = yield* makeThreadMoveWorker(authority.moves, history, commands);
     const enrollment = yield* makeThreadLocalEnrollmentWorker(authority.enrollment, history);
     const backups = yield* makeThreadBackupSourceWorker(authority.backups, history, checkpoints);
-    const pauses = yield* makeThreadPauseWorker(authority.pauses, history, checkpoints);
+    const pauses = yield* makeThreadPauseWorker(
+      authority.pauses,
+      history,
+      checkpoints,
+      config.stateDir,
+    );
     const finalSaves = yield* makeThreadFinalSaveWorker(authority.finalSaves, history, checkpoints);
     // The durable cursor is the retry queue. Each pass is bounded by an engine head;
     // a disconnected relay neither discards history nor blocks another thread.
@@ -333,6 +341,10 @@ export const layer = Layer.effect(
     const finalSaveSweep = Effect.gen(function* () {
       const vm = yield* readInstalledThreadVm();
       if (!vm) return;
+      if (yield* WorkflowVmGuest)
+        yield* recoverWorkflowVmFollowUpPush.pipe(
+          Effect.catch(() => Effect.logDebug("Workflow VM push stop acknowledgement will retry")),
+        );
       const owners = yield* sql<{
         threadId: string;
       }>`SELECT thread_id AS "threadId" FROM thread_execution_fences

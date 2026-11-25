@@ -12,7 +12,7 @@ import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import { readInstalledThreadVm } from "./ThreadVmEnrollment.ts";
 import { ThreadCommandSyncError, type ThreadCommandTransport } from "./ThreadCommandSync.ts";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { RelayInternalError } from "@t3tools/contracts/relay";
+import { RelayInternalError, RelayTenancyNotFoundError } from "@t3tools/contracts/relay";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -117,7 +117,13 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
             environmentId: EnvironmentId.make(work.environmentId),
             threadId: ThreadId.make(work.threadId),
           },
-          payload: { generation: work.generation, workId: work.workId },
+          payload: {
+            generation: work.generation,
+            workId: work.workId,
+            ...(work.followUpUserId ? { followUpUserId: work.followUpUserId } : {}),
+            ...(work.followUpCommandId ? { followUpCommandId: work.followUpCommandId } : {}),
+            ...(work.followUpPreparing ? { followUpPreparing: true } : {}),
+          },
         })
         .pipe(
           Effect.timeout("15 seconds"),
@@ -141,7 +147,11 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
             environmentId: EnvironmentId.make(work.environmentId),
             threadId: ThreadId.make(work.threadId),
           },
-          payload: { generation: work.generation, workId: work.workId },
+          payload: {
+            generation: work.generation,
+            workId: work.workId,
+            ...(work.neverStarted ? { neverStarted: true } : {}),
+          },
         })
         .pipe(
           Effect.timeout("15 seconds"),
@@ -207,6 +217,35 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
       threadId,
       detail: "Relay command delivery is waiting for acknowledgement.",
     });
+  const authorizeFollowUp = Effect.fnUntraced(
+    function* (owner: ThreadHistoryOwner, userId: string) {
+      const client = yield* configuredClient(owner, "inbox");
+      return yield* client.threadEnvironment
+        .checkClientAccess({
+          params: {
+            environmentId: EnvironmentId.make(owner.environmentId),
+            threadId: ThreadId.make(owner.threadId),
+          },
+          payload: { generation: owner.generation, userId, workflowFollowUp: true },
+        })
+        .pipe(
+          Effect.map(
+            (result) =>
+              result.workflowFollowUp?.ready === true &&
+              result.userId === userId &&
+              result.threadId === owner.threadId &&
+              result.generation === owner.generation &&
+              result.environmentId === owner.environmentId,
+          ),
+          Effect.catchIf(Schema.is(RelayTenancyNotFoundError), () => Effect.succeed(false)),
+        );
+    },
+    (effect, owner) =>
+      effect.pipe(
+        Effect.timeout("10 seconds"),
+        Effect.mapError(() => inboxError(owner.threadId)),
+      ),
+  );
   const commands: ThreadCommandTransport = {
     next: Effect.fn("ThreadExecutionAuthority.nextCommand")(function* (owner) {
       return yield* Effect.gen(function* () {
@@ -382,6 +421,7 @@ export const makeThreadExecutionAuthority = Effect.gen(function* () {
   };
   return {
     ...authority,
+    authorizeFollowUp,
     history,
     commands,
     checkpoints,

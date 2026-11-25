@@ -281,7 +281,7 @@ import {
 } from "./chat/composerProviderState";
 import { confirmTerminalClose, isTerminalCloseConfirmPending } from "../lib/terminalCloseConfirm";
 import { isPreviewFocused } from "../lib/previewFocus";
-import { getTerminalFocusOwner } from "../lib/terminalFocus";
+import { getTerminalFocusOwner, isDrawerTerminalShortcut } from "../lib/terminalFocus";
 import {
   preventRepeatedTerminalCloseShortcut,
   preventTerminalCloseShortcut,
@@ -764,6 +764,7 @@ type ChatViewProps =
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: ThreadSyncPhase | null;
       hasWorkflowConversationHeader?: boolean;
+      workflowFollowUp?: boolean;
       routeKind: "server";
       draftId?: never;
     }
@@ -775,6 +776,7 @@ type ChatViewProps =
       forceExpandedMobileComposer?: boolean;
       threadSyncPhase?: never;
       hasWorkflowConversationHeader?: never;
+      workflowFollowUp?: never;
       routeKind: "draft";
       draftId: DraftId;
     };
@@ -1520,6 +1522,7 @@ export default function ChatView(props: ChatViewProps) {
     reserveTitleBarControlInset = true,
     forceExpandedMobileComposer = false,
     hasWorkflowConversationHeader = false,
+    workflowFollowUp = false,
   } = props;
   const draftId = routeKind === "draft" ? props.draftId : null;
   const threadSyncPhase = routeKind === "server" ? (props.threadSyncPhase ?? null) : null;
@@ -1603,6 +1606,12 @@ export default function ChatView(props: ChatViewProps) {
       origin: workflowOrigin,
       threadId,
     });
+  const canUseChatAndTerminal = canUseLiveWorkspace || workflowFollowUp;
+  const attachmentDisabledReason = workflowFollowUp
+    ? "Workflow VM follow-ups can’t include attachments."
+    : null;
+  const canUseChatAndTerminalRef = useRef(canUseChatAndTerminal);
+  canUseChatAndTerminalRef.current = canUseChatAndTerminal;
   const showThreadHeader = !hasWorkflowConversationHeader || canUseLiveWorkspace;
   const canUseLiveWorkspaceRef = useRef(canUseLiveWorkspace);
   canUseLiveWorkspaceRef.current = canUseLiveWorkspace;
@@ -2018,11 +2027,11 @@ export default function ChatView(props: ChatViewProps) {
   const activeThreadId = activeThread?.id ?? null;
   const activeThreadEnvironmentId = activeThread?.environmentId ?? null;
   const runningTerminalIds = useThreadRunningTerminalIds({
-    environmentId: canUseLiveWorkspace ? (activeThread?.environmentId ?? null) : null,
+    environmentId: canUseChatAndTerminal ? (activeThread?.environmentId ?? null) : null,
     threadId: activeThreadId,
   });
   const activeThreadKnownSessionsRaw = useKnownTerminalSessions({
-    environmentId: canUseLiveWorkspace ? (activeThread?.environmentId ?? null) : null,
+    environmentId: canUseChatAndTerminal ? (activeThread?.environmentId ?? null) : null,
     threadId: activeThreadId,
   });
   const activeThreadKnownSessions = useMemo(() => {
@@ -2115,7 +2124,7 @@ export default function ChatView(props: ChatViewProps) {
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
     usePanelAnimationSettings();
   const activeTerminalDrawerPresence = usePanelPresence(
-    Boolean(canUseLiveWorkspace && activeThreadKey && terminalUiState.terminalOpen),
+    Boolean(canUseChatAndTerminal && activeThreadKey && terminalUiState.terminalOpen),
     true,
     panelAnimationsActive,
     activeThreadKey,
@@ -2700,8 +2709,10 @@ export default function ChatView(props: ChatViewProps) {
   const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
   const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
   const supportsQuestionAttachments =
+    !attachmentDisabledReason &&
     attachmentEnvironmentConfig?.environment.capabilities.questionAttachments === true;
   const supportsAttachmentUploads =
+    !attachmentDisabledReason &&
     attachmentEnvironmentConfig?.environment.capabilities.attachmentUploads === true;
   const advertisedFileAttachmentBytes =
     attachmentEnvironmentConfig?.environment.capabilities.fileAttachments?.maxUploadBytes ?? null;
@@ -3585,7 +3596,7 @@ export default function ChatView(props: ChatViewProps) {
         sessionStatus: activeThread?.session?.status,
         archived: activeThread?.archivedAt != null,
         unavailable: activeEnvironmentUnavailable || threadDetailLoading,
-        workflowControlled: activeThread?.workflowJob != null,
+        workflowControlled: !workflowFollowUp && activeThread?.workflowJob != null,
         moving:
           routeServerThreadShell?.relayRouting !== undefined &&
           routeServerThreadShell.relayRouting.phase !== "active",
@@ -3596,6 +3607,7 @@ export default function ChatView(props: ChatViewProps) {
       activeThread?.session?.status,
       activeThread?.archivedAt,
       activeThread?.workflowJob,
+      workflowFollowUp,
       routeServerThreadShell?.relayRouting,
       activeEnvironmentUnavailable,
       threadDetailLoading,
@@ -4148,7 +4160,7 @@ export default function ChatView(props: ChatViewProps) {
     () => {},
   );
   const onInterrupt = useCallback(async () => {
-    if (!canUseLiveWorkspaceRef.current) return;
+    if (!canUseChatAndTerminalRef.current) return;
     const { activeThread, phase, setThreadError } = interruptContextRef.current;
     if (activeThread && supportsSharedPromptQueue) {
       const result = await pauseSharedQueue({
@@ -4227,7 +4239,7 @@ export default function ChatView(props: ChatViewProps) {
     [activeThreadRef, storeSetTerminalOpen],
   );
   const toggleTerminalVisibility = useCallback(() => {
-    if (!activeThreadRef || !canUseLiveWorkspaceRef.current) return;
+    if (!activeThreadRef || !canUseChatAndTerminalRef.current) return;
     const nextOpen = !terminalUiState.terminalOpen;
     if (nextOpen && terminalUiState.terminalIds.length === 0) {
       if (!activeThreadId || !activeProject) {
@@ -4272,7 +4284,7 @@ export default function ChatView(props: ChatViewProps) {
   const splitTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
       if (
-        !canUseLiveWorkspaceRef.current ||
+        !canUseChatAndTerminalRef.current ||
         !activeThreadRef ||
         hasReachedSplitLimit ||
         !activeThreadId ||
@@ -4320,7 +4332,12 @@ export default function ChatView(props: ChatViewProps) {
     ],
   );
   const createNewTerminal = useCallback(() => {
-    if (!canUseLiveWorkspaceRef.current || !activeThreadRef || !activeThreadId || !activeProject) {
+    if (
+      !canUseChatAndTerminalRef.current ||
+      !activeThreadRef ||
+      !activeThreadId ||
+      !activeProject
+    ) {
       return;
     }
     const cwdForOpen = gitCwd ?? activeProject.workspaceRoot;
@@ -4356,7 +4373,7 @@ export default function ChatView(props: ChatViewProps) {
   ]);
   const closeTerminal = useCallback(
     (terminalId: string) => {
-      if (!activeThreadId || !activeThreadRef) return;
+      if (!canUseChatAndTerminalRef.current || !activeThreadId || !activeThreadRef) return;
       const fallbackExitWrite = () =>
         writeTerminal({
           environmentId,
@@ -6967,6 +6984,9 @@ export default function ChatView(props: ChatViewProps) {
       if (!command) return;
       if (
         !canUseLiveWorkspaceRef.current &&
+        !(
+          canUseChatAndTerminalRef.current && isDrawerTerminalShortcut(command, terminalFocusOwner)
+        ) &&
         command !== "thread.copyReference" &&
         command !== "diff.toggle" &&
         !command.startsWith("rightPanel.")
@@ -7585,8 +7605,9 @@ export default function ChatView(props: ChatViewProps) {
     queuedMessage?: QueuedComposerMessage,
   ) => {
     e?.preventDefault();
-    if (!canUseLiveWorkspaceRef.current) return;
+    if (!canUseChatAndTerminalRef.current) return;
     if (
+      !workflowFollowUp &&
       activeThread?.workflowJob &&
       (!activePendingProgress || directAnnotation || queuedMessage)
     ) {
@@ -7743,6 +7764,10 @@ export default function ChatView(props: ChatViewProps) {
       directAnnotation?.image && annotationImageAppended
         ? [...sendContextImages, directAnnotation.image]
         : sendContextImages;
+    if (attachmentDisabledReason && (composerImages.length || composerFiles.length)) {
+      setThreadError(activeThread.id, attachmentDisabledReason);
+      return;
+    }
     const composerPreviewAnnotations =
       directAnnotation &&
       !sendContextPreviewAnnotations.some(
@@ -7989,7 +8014,8 @@ export default function ChatView(props: ChatViewProps) {
       return;
     }
     const threadIdForSend = activeThread.id;
-    const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
+    const isFirstMessage =
+      !workflowFollowUp && (!isServerThread || activeThread.messages.length === 0);
     const baseBranchForWorktree =
       isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath
         ? activeThreadBranch
@@ -8994,7 +9020,7 @@ export default function ChatView(props: ChatViewProps) {
   // leaves the message queued. Re-run when any of them clear so a due message
   // does not wait for an unrelated phase change.
   const queueSendGate =
-    !canUseLiveWorkspace ||
+    !canUseChatAndTerminal ||
     activeEnvironmentUnavailable ||
     !clientSettingsHydrated ||
     isRevertingCheckpoint ||
@@ -9950,8 +9976,8 @@ export default function ChatView(props: ChatViewProps) {
 
   const panelToggleControls = (
     <PanelLayoutControls
-      terminalAvailable={canUseLiveWorkspace && activeProject !== null}
-      terminalOpen={canUseLiveWorkspace && terminalUiState.terminalOpen}
+      terminalAvailable={canUseChatAndTerminal && activeProject !== null}
+      terminalOpen={canUseChatAndTerminal && terminalUiState.terminalOpen}
       terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
       rightPanelAvailable={activeProject !== null}
       rightPanelOpen={rightPanelOpen}
@@ -10248,7 +10274,7 @@ export default function ChatView(props: ChatViewProps) {
           </WorkspacePageHeader>
         ) : null}
 
-        {canUseLiveWorkspace ? (
+        {canUseChatAndTerminal ? (
           <PortableThreadCommandStatus
             environmentId={activeThread.environmentId}
             threadId={activeThread.id}
@@ -10461,7 +10487,7 @@ export default function ChatView(props: ChatViewProps) {
                 className="w-full ps-(--workspace-gutter-start) pe-(--workspace-gutter-end)"
               >
                 <ChatComposerWorkspace
-                  enabled={canUseLiveWorkspace}
+                  enabled={canUseChatAndTerminal}
                   hasWorkflowConversationHeader={hasWorkflowConversationHeader}
                   environmentId={activeThread.environmentId}
                   threadId={activeThread.id}
@@ -10513,14 +10539,16 @@ export default function ChatView(props: ChatViewProps) {
                         visibleEntryIds={sharedQueuePresentation.queuedEntries.map(
                           (entry) => entry.messageId,
                         )}
-                        workflowControlled={activeThread?.workflowJob != null}
+                        workflowControlled={!workflowFollowUp && activeThread?.workflowJob != null}
                         supportsPreparation={supportsSharedPreparation}
                         canWorkLocally={
                           activeThread?.latestTurn === null &&
                           activeThread.messages.every((message) => message.role !== "user")
                         }
                         activeTurnId={
-                          phase === "running" ? (activeThread.session?.activeTurnId ?? null) : null
+                          !workflowFollowUp && phase === "running"
+                            ? (activeThread.session?.activeTurnId ?? null)
+                            : null
                         }
                         unavailable={activeEnvironmentUnavailable || threadDetailLoading}
                       />
@@ -10549,6 +10577,7 @@ export default function ChatView(props: ChatViewProps) {
                               attachmentUploadsCapabilityKnown={attachmentUploadsCapabilityKnown}
                               supportsAttachmentUploads={supportsAttachmentUploads}
                               supportsQuestionAttachments={supportsQuestionAttachments}
+                              attachmentDisabledReason={attachmentDisabledReason}
                               maxFileAttachmentBytes={maxFileAttachmentBytes}
                               routeKind={routeKind}
                               routeThreadRef={routeThreadRef}
@@ -10571,7 +10600,9 @@ export default function ChatView(props: ChatViewProps) {
                               isSendBusy={isSendBusy}
                               isRevertingCheckpoint={isRevertingCheckpoint}
                               sendDisabledReason={
-                                activeThread?.workflowJob && !activePendingProgress
+                                !workflowFollowUp &&
+                                activeThread?.workflowJob &&
+                                !activePendingProgress
                                   ? "This thread belongs to a workflow. Use its job controls in Workflows."
                                   : isRevertingCheckpoint
                                     ? "Rewinding conversation"
@@ -10805,7 +10836,7 @@ export default function ChatView(props: ChatViewProps) {
         {mountedTerminalThreadRefs
           .filter(({ key, threadRef }) =>
             key === activeThreadKey
-              ? canUseLiveWorkspace
+              ? canUseChatAndTerminal
               : workflowResultGitAccess({
                   capabilities: environmentById.get(threadRef.environmentId)?.serverConfig
                     ?.environment.capabilities,

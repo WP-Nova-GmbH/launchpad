@@ -371,6 +371,92 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
       }),
   );
 
+  it.effect.each([1, 7, 1024])(
+    "dispatches idle fences in input order and preserves split UTF-8 across %i-byte chunks",
+    (chunkSize) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const seen: unknown[] = [];
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          onNotification: ({ params }) =>
+            Effect.sync(() => {
+              seen.push(params);
+            }),
+          onIdleInputFence: (nonce, completeFrame) =>
+            Effect.sync(() => {
+              seen.push({ nonce, completeFrame });
+            }),
+        });
+        const completeNonce = "a".repeat(32),
+          partialNonce = "b".repeat(32);
+        const first = encodeJsonl({ method: "x/first", params: "already dispatched" });
+        const second = encodeJsonl({ method: "x/second", params: "hé🙂" });
+        const partialAt = second.indexOf(0xc3) + 1;
+        const bytes = new Uint8Array([
+          ...first,
+          ...encoder.encode(`\x1elaunchpad-idle:${completeNonce}\x1f`),
+          ...second.subarray(0, partialAt),
+          ...encoder.encode(`\x1elaunchpad-idle:${partialNonce}\x1f`),
+          ...second.subarray(partialAt),
+        ]);
+        for (let offset = 0; offset < bytes.length; offset += chunkSize)
+          yield* Queue.offer(input, bytes.subarray(offset, offset + chunkSize));
+        yield* Queue.end(input);
+        yield* transport.awaitInputDrained;
+        assert.deepEqual(seen, [
+          "already dispatched",
+          { nonce: completeNonce, completeFrame: true },
+          { nonce: partialNonce, completeFrame: false },
+          "hé🙂",
+        ]);
+      }),
+  );
+
+  it.effect.each(["\x1elaunchpad-idle:incomplete", `\x1e${"x".repeat(64)}`])(
+    "does not confirm an incomplete or oversized idle fence",
+    (frame) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          onIdleInputFence: () => Effect.die("Invalid fence reached callback"),
+        });
+        yield* Queue.offer(input, encoder.encode(frame));
+        yield* Queue.end(input);
+        assert.instanceOf(
+          yield* Effect.flip(transport.awaitInputDrained),
+          CodexError.CodexAppServerTransportError,
+        );
+      }),
+  );
+
+  it.effect("vetoes a frozen fence if a native request arrived after shutdown reservation", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const fences = yield* Queue.unbounded<boolean>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        onIdleInputFence: (_nonce, completeFrame) =>
+          Queue.offer(fences, completeFrame).pipe(Effect.asVoid),
+        onRequest: () => Effect.succeed({ accepted: true }),
+      });
+      const fence = encoder.encode(`\x1elaunchpad-idle:${"a".repeat(32)}\x1f`);
+      assert.equal(yield* transport.reserveIdleShutdown, true);
+      yield* Queue.offer(input, encodeJsonl({ id: 60, method: "approval/late", params: {} }));
+      assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+        id: 60,
+        result: { accepted: true },
+      });
+      yield* Queue.offer(input, fence);
+      assert.equal(yield* Queue.take(fences), false);
+      yield* transport.releaseIdleShutdown;
+      assert.equal(yield* transport.reserveIdleShutdown, true);
+      yield* Queue.offer(input, fence);
+      assert.equal(yield* Queue.take(fences), true);
+    }),
+  );
+
   it.effect("reports a malformed fragmented final line before input stream termination", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();

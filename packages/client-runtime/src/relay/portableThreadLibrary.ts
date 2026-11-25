@@ -54,7 +54,7 @@ type VerifiedThreadRelay = {
 const verifiedRelayAtom = Atom.family((_key: string) =>
   Atom.make<VerifiedThreadRelay | null>(null).pipe(Atom.keepAlive),
 );
-const rememberVerifiedRelay = (
+export const rememberVerifiedRelay = (
   registry: AtomRegistry.AtomRegistry,
   environmentId: string,
   threadId: string,

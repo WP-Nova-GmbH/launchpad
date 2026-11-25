@@ -24,6 +24,7 @@ export interface CodexAppServerClientOptions {
   readonly logger?: (
     event: CodexProtocol.CodexAppServerProtocolLogEvent,
   ) => Effect.Effect<void, never>;
+  readonly onIdleInputFence?: CodexProtocol.CodexAppServerPatchedProtocolOptions["onIdleInputFence"];
 }
 
 interface CodexAppServerClientRaw {
@@ -191,6 +192,7 @@ const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make")(func
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.onIdleInputFence ? { onIdleInputFence: options.onIdleInputFence } : {}),
     onNotification: dispatchNotification,
     onRequest: dispatchRequest,
   });

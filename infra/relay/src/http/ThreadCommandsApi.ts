@@ -18,6 +18,11 @@ import { makeThreadPlacementStore } from "../threads/ThreadPlacementStore.ts";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import { RelayDb } from "../db.ts";
 import { UserDirectory } from "../tenancy/UserDirectory.ts";
+import { isWorkflowVmThread, readWorkflowVmBinding } from "../jobs/WorkflowVmBinding.ts";
+import {
+  requireWorkflowVmFollowUpActor,
+  requireWorkflowVmFollowUpWorkspace,
+} from "../jobs/WorkflowVmFollowUpAccess.ts";
 import { makeThreadJournalStore } from "../threads/ThreadJournalStore.ts";
 import { relayInternalErrorResponse } from "./Api.ts";
 import { withPrivateThreadAccess } from "./privateThreadAccess.ts";
@@ -280,6 +285,7 @@ const cancelOwnedQueuedVmMove = Effect.fnUntraced(function* (
 export const stagePortableThreadCommand = Effect.fn("relay.api.thread_commands.stage")(function* (
   threadId: string,
   command: PortableThreadCommand,
+  expectedPlacement?: { readonly environmentId: string; readonly generation: number },
 ) {
   const { userId } = yield* RelayClientPrincipal;
   const directory = yield* UserDirectory;
@@ -293,6 +299,65 @@ export const stagePortableThreadCommand = Effect.fn("relay.api.thread_commands.s
   };
   const withoutAuthor =
     "author" in command ? (({ author: _untrusted, ...payload }) => payload)(command) : command;
+  if (
+    yield* isWorkflowVmThread(sql, threadId).pipe(
+      Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
+    )
+  ) {
+    if (
+      !expectedPlacement ||
+      ![
+        "thread.prompt.enqueue",
+        "thread.prompt.edit",
+        "thread.prompt.remove",
+        "thread.queue.reorder",
+        "thread.queue.pause",
+        "thread.queue.resume",
+        "thread.queue.resolve",
+        "thread.turn.interrupt",
+        "thread.approval.respond",
+        "thread.user-input.respond",
+        "thread.user-input.dismiss",
+      ].includes(withoutAuthor.type)
+    )
+      return yield* tenancyNotFound("thread_not_found");
+    if ("issueTrackerAuthorization" in withoutAuthor && withoutAuthor.issueTrackerAuthorization)
+      return yield* tenancyConflict("thread_command_conflict");
+    if ("bootstrap" in withoutAuthor && withoutAuthor.bootstrap)
+      return yield* tenancyConflict("thread_command_conflict");
+    if (
+      (withoutAuthor.type === "thread.prompt.enqueue" ||
+        withoutAuthor.type === "thread.prompt.edit") &&
+      withoutAuthor.message.attachments.length
+    )
+      return yield* tenancyConflict("thread_command_conflict");
+    return yield* sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const current = yield* readWorkflowVmBinding(sql, { threadId, ...expectedPlacement });
+          yield* requireWorkflowVmFollowUpActor(sql, current.binding, userId);
+          yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${threadId} FOR UPDATE`;
+          const { binding } = yield* readWorkflowVmBinding(sql, current.binding, "active", true);
+          yield* requireWorkflowVmFollowUpWorkspace(sql, binding);
+          const entry = yield* makeThreadJournalStore(sql).stage({
+            threadId,
+            command: withoutAuthor,
+            actor,
+          });
+          if (!entry) return yield* relayInternalErrorResponse("persistence_failed");
+          return { commandId: entry.commandId, position: entry.position, receipt: entry.receipt };
+        }),
+      )
+      .pipe(
+        Effect.catchTags({
+          ThreadPlacementConflict: () => tenancyConflict("thread_command_conflict"),
+          SchemaError: () => tenancyConflict("thread_command_conflict"),
+          ThreadVmResumeConflict: () => tenancyConflict("thread_command_conflict"),
+          ThreadVmCapacityConflict: () => tenancyConflict("thread_command_conflict"),
+          SqlError: () => relayInternalErrorResponse("persistence_failed"),
+        }),
+      );
+  }
   return yield* withPrivateThreadAccess(threadId, "write", (placement) =>
     Effect.gen(function* () {
       const journal = makeThreadJournalStore(sql);
@@ -398,6 +463,23 @@ export const getPortableThreadCommandReceipt = Effect.fn("relay.api.thread_comma
   function* (threadId: string, commandId: string) {
     const sql = (yield* RelayDb).$client;
     const receipt = makeThreadJournalStore(sql).command(threadId, commandId);
+    if (
+      yield* isWorkflowVmThread(sql, threadId).pipe(
+        Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
+      )
+    ) {
+      const { userId } = yield* RelayClientPrincipal;
+      return yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const entry = yield* receipt;
+            if (!entry || entry.actor.userId !== userId)
+              return yield* tenancyNotFound("thread_not_found");
+            return { commandId: entry.commandId, position: entry.position, receipt: entry.receipt };
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")));
+    }
     return yield* withPrivateThreadAccess(threadId, "read", () => receipt).pipe(
       Effect.catchTag("RelayTenancyNotFoundError", (error) =>
         withPrivateThreadAccess(threadId, "move-cleanup", (placement) =>
@@ -419,6 +501,21 @@ export const getPortableThreadCommandReceipt = Effect.fn("relay.api.thread_comma
 export const getPendingPortableThreadCommands = Effect.fn("relay.api.thread_commands.pending")(
   function* (threadId: string, after: number, limit: number) {
     const sql = (yield* RelayDb).$client;
+    if (
+      yield* isWorkflowVmThread(sql, threadId).pipe(
+        Effect.catchTag("SqlError", () => relayInternalErrorResponse("persistence_failed")),
+      )
+    ) {
+      const { userId } = yield* RelayClientPrincipal;
+      return yield* makeThreadJournalStore(sql)
+        .pending(threadId, after, limit, userId)
+        .pipe(
+          Effect.catchTags({
+            ThreadPlacementConflict: () => tenancyConflict("thread_command_conflict"),
+            SqlError: () => relayInternalErrorResponse("persistence_failed"),
+          }),
+        );
+    }
     return yield* withPrivateThreadAccess(threadId, "read", () =>
       makeThreadJournalStore(sql).pending(threadId, after, limit),
     ).pipe(
@@ -439,7 +536,7 @@ export const threadCommandsApi = HttpApiBuilder.group(RelayApi, "threadCommands"
       getPortableThreadMoveCancellation({ ...params, ...query }),
     )
     .handle("stage", ({ params, payload }) =>
-      stagePortableThreadCommand(params.threadId, payload.command),
+      stagePortableThreadCommand(params.threadId, payload.command, payload.expectedPlacement),
     )
     .handle("pending", ({ params, query }) =>
       getPendingPortableThreadCommands(params.threadId, query.after, query.limit),

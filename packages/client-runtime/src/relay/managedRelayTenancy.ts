@@ -10,11 +10,13 @@ import type { RelayThreadDeletionRequest, RelayThreadDeletion } from "@t3tools/c
 import type {
   PortableThreadCommand,
   CommandId,
+  EnvironmentId,
   ThreadId,
   RepositoryAccessRemovalStatus,
 } from "@t3tools/contracts";
 import {
   RelayApi,
+  type RelayWorkflowVmFollowUp,
   type RelayCodexVmConnection,
   type RelayCodexVmStartSignIn,
   type RelayCodexVmStartSignInResponse,
@@ -208,6 +210,16 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly repositoryId: RelayRepositoryId;
       readonly jobId: string;
     }) => Effect.Effect<RelayAssignedWorkflowThreadPlacement, ManagedRelayClientError>;
+    readonly continueWorkflowVm: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+    }) => Effect.Effect<RelayWorkflowVmFollowUp, ManagedRelayClientError>;
+    readonly getWorkflowVmFollowUp: (input: {
+      readonly clerkToken: string;
+      readonly repositoryId: RelayRepositoryId;
+      readonly jobId: string;
+    }) => Effect.Effect<RelayWorkflowVmFollowUp, ManagedRelayClientError>;
     readonly listSavedWorkflowResults: (input: {
       clerkToken: string;
       repositoryId: RelayRepositoryId;
@@ -343,6 +355,10 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly clerkToken: string;
       readonly threadId: ThreadId;
       readonly command: PortableThreadCommand;
+      readonly expectedPlacement?: {
+        readonly environmentId: EnvironmentId;
+        readonly generation: number;
+      };
     }) => Effect.Effect<RelayThreadCommandReceipt, ManagedRelayClientError>;
     readonly cancelActiveThreadMove: (
       input: ActiveThreadMoveRequest,
@@ -664,6 +680,8 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     runWorkflow: unavailable("clientRuntime.managedRelayTenancy.runWorkflow"),
     getWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJob"),
     getWorkflowJobResult: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJobResult"),
+    continueWorkflowVm: unavailable("clientRuntime.managedRelayTenancy.continueWorkflowVm"),
+    getWorkflowVmFollowUp: unavailable("clientRuntime.managedRelayTenancy.getWorkflowVmFollowUp"),
     listSavedWorkflowResults: unavailable(
       "clientRuntime.managedRelayTenancy.listSavedWorkflowResults",
     ),
@@ -959,6 +977,32 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           .pipe(
             Effect.mapError(relayRequestError("getWorkflowJobResult")),
             timeoutRelayRequest("getWorkflowJobResult"),
+          );
+      },
+    ),
+    continueWorkflowVm: Effect.fn("clientRuntime.managedRelayTenancy.continueWorkflowVm")(
+      function* (input) {
+        return yield* client.workflows
+          .continueInVm({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("continueWorkflowVm")),
+            timeoutRelayRequest("continueWorkflowVm"),
+          );
+      },
+    ),
+    getWorkflowVmFollowUp: Effect.fn("clientRuntime.managedRelayTenancy.getWorkflowVmFollowUp")(
+      function* (input) {
+        return yield* client.workflows
+          .getVmFollowUp({
+            headers: bearerHeaders(input.clerkToken),
+            params: { repositoryId: input.repositoryId, jobId: input.jobId },
+          })
+          .pipe(
+            Effect.mapError(relayRequestError("getWorkflowVmFollowUp")),
+            timeoutRelayRequest("getWorkflowVmFollowUp"),
           );
       },
     ),
@@ -1414,7 +1458,10 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           .stage({
             headers: bearerHeaders(input.clerkToken),
             params: { threadId: input.threadId },
-            payload: { command: input.command },
+            payload: {
+              command: input.command,
+              ...(input.expectedPlacement ? { expectedPlacement: input.expectedPlacement } : {}),
+            },
           })
           .pipe(
             Effect.mapError(relayRequestError("queue portable thread command")),

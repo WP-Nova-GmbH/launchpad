@@ -74,7 +74,7 @@ interface CaptureProgress {
 const runReader = Effect.fnUntraced(function* <A, E, R>(
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   cwd: string,
-  mode: "capture" | "exclude",
+  mode: "capture" | "exclude" | "conversation-files",
   manifest: Uint8Array | undefined,
   consume: (
     output: Stream.Stream<Uint8Array, import("effect/PlatformError").PlatformError>,
@@ -132,6 +132,33 @@ export const readWorkflowCheckpointExclude = (
         },
       ),
       Effect.map(({ buffer, length }) => buffer.subarray(0, length)),
+    ),
+  ).pipe(Effect.scoped, Effect.timeout("15 seconds"));
+
+const decodeConversationFiles = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Array(Schema.String)),
+);
+
+/** The fixed workload reader accepts only a native conversation ID on stdin. */
+export const listWorkflowConversationFiles = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  home: string,
+  threadId: string,
+) =>
+  runReader(spawner, home, "conversation-files", Buffer.from(threadId), (output) =>
+    output.pipe(
+      Stream.runFoldEffect(
+        () => ({ length: 0, chunks: [] as Uint8Array[] }),
+        (state, chunk) => {
+          state.length += chunk.byteLength;
+          if (state.length > 4 * 1024 * 1024) return Effect.fail(invalid());
+          state.chunks.push(chunk);
+          return Effect.succeed(state);
+        },
+      ),
+      Effect.flatMap(({ chunks, length }) =>
+        decodeConversationFiles(Buffer.concat(chunks, length).toString("utf8")),
+      ),
     ),
   ).pipe(Effect.scoped, Effect.timeout("15 seconds"));
 

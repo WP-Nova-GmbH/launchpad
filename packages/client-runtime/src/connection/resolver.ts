@@ -164,6 +164,7 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
     function* (target: RelayConnectionTarget) {
       const authorized = yield* remote.authorizeDpop({
         expectedEnvironmentId: target.environmentId,
+        ...(target.workflowFollowUp ? { workflowFollowUp: target.workflowFollowUp } : {}),
       });
       return {
         environmentId: authorized.environmentId,

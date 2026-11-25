@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
@@ -115,7 +116,16 @@ export const executeAuthenticatedEnvironmentHttpRequest = Effect.fn(
     let rejectedAccessToken: string | undefined;
     for (;;) {
       let authorization = input.prepared.httpAuthorization;
-      if (authorization?._tag === "Dpop") {
+      const workflowFollowUp =
+        input.prepared.target._tag === "RelayConnectionTarget"
+          ? input.prepared.target.workflowFollowUp
+          : undefined;
+      if (
+        authorization?._tag === "Dpop" &&
+        (!workflowFollowUp ||
+          rejectedAccessToken !== undefined ||
+          authorization.expiresAtEpochMs <= (yield* Clock.currentTimeMillis))
+      ) {
         const remote = input.remoteAuthorization;
         if (remote === undefined || Option.isNone(remote)) {
           return yield* new RemoteEnvironmentAuthFetchError({
@@ -126,6 +136,7 @@ export const executeAuthenticatedEnvironmentHttpRequest = Effect.fn(
         const current = yield* remote.value
           .authorizeDpopHttp({
             expectedEnvironmentId: input.prepared.environmentId,
+            ...(workflowFollowUp ? { workflowFollowUp } : {}),
             ...(rejectedAccessToken === undefined ? {} : { rejectedAccessToken }),
           })
           .pipe(

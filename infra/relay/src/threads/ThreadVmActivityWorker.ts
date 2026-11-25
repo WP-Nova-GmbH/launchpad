@@ -12,6 +12,7 @@ type Inspect = (
     readonly templateId: string;
     readonly environmentId: string;
     readonly workflowCheckpoint?: boolean;
+    readonly finishedWorkflow?: boolean;
     readonly scope: {
       readonly allocationId: string;
       readonly threadId: ReturnType<typeof ThreadId.make>;
@@ -23,7 +24,11 @@ type Inspect = (
   | "busy"
   | "idle"
   | "unknown"
-  | { readonly activity: "idle"; readonly inactiveWorkIds: ReadonlyArray<string> },
+  | {
+      readonly activity: "idle";
+      readonly inactiveWorkIds: ReadonlyArray<string>;
+      readonly backgroundRevision?: string;
+    },
   ThreadVmComputeError
 >;
 
@@ -37,6 +42,7 @@ interface Candidate {
   readonly repositoryId: string;
   readonly generation: number;
   readonly workflowCheckpoint: boolean;
+  readonly finishedWorkflow: boolean;
 }
 
 /** Only a current running binding can supply a fresh idle report. Failed reads remain unknown. */
@@ -76,18 +82,20 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
     if (repaired) return true;
     const [row] = yield* sql<Candidate>`SELECT a.allocation_id AS "allocationId",
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
-      b.environment_id AS "environmentId", a.thread_id AS "threadId", b.repository_id AS "repositoryId", p.generation, (a.resource_kind='organization_workflow') AS "workflowCheckpoint"
+      b.environment_id AS "environmentId", a.thread_id AS "threadId", b.repository_id AS "repositoryId", p.generation,
+      (a.resource_kind='organization_workflow') AS "workflowCheckpoint",
+      (a.resource_kind='organization_workflow' AND COALESCE(j.status IN ('done','cancelled','failed'),false)) AS "finishedWorkflow"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id AND c.state = 'started'
       JOIN relay_thread_vm_ready s ON s.allocation_id = a.allocation_id
       JOIN relay_thread_vm_bindings b ON b.allocation_id = a.allocation_id
       JOIN relay_thread_placements t ON t.thread_id = a.thread_id
+      LEFT JOIN relay_workflow_jobs j ON a.resource_kind='organization_workflow' AND j.job_id=t.workflow_job_id
       LEFT JOIN relay_thread_vm_activity v ON v.allocation_id = a.allocation_id
       WHERE a.runtime_protocol='native-v1' AND (a.resource_kind='personal' OR (a.resource_kind='organization_workflow'
-        AND EXISTS(SELECT 1 FROM relay_workflow_jobs j WHERE j.job_id=t.workflow_job_id
-          AND (j.status IN ('awaiting_review','awaiting_input')
-            OR (j.status IN ('done','cancelled','failed') AND j.record#>>'{progress,executionReleased}'='true')))))
+        AND (j.status IN ('awaiting_review','awaiting_input')
+          OR (j.status IN ('done','cancelled','failed') AND j.record#>>'{progress,executionReleased}'='true'))))
         AND c.host_id = ${hostId} AND a.state = 'running' AND a.compute_ref IS NOT NULL
         AND a.deleted_at IS NULL AND p.phase = 'created' AND s.phase = 'ready'
         AND b.revoked_at IS NULL AND b.generation = p.generation
@@ -107,6 +115,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       templateId: row.templateId,
       environmentId: row.environmentId,
       ...(row.workflowCheckpoint ? { workflowCheckpoint: true } : {}),
+      ...(row.finishedWorkflow ? { finishedWorkflow: true } : {}),
       scope: {
         allocationId: row.allocationId,
         threadId: ThreadId.make(row.threadId),
@@ -123,9 +132,8 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       WHERE thread_id = ${row.threadId} AND receipt_json IS NULL LIMIT 1`;
     const observed = typeof inspected === "string" ? inspected : inspected.activity;
     const inactive = new Set(typeof inspected === "string" ? [] : inspected.inactiveWorkIds);
-    // Match every remote reservation to the exact locally started process reported
-    // by the empty guest inventory. Lost admission replies and workspace writes
-    // cannot be inferred complete from the absence of a running process.
+    // Match remote reservations to locally started processes covered by the idle
+    // report. Lost admission replies and workspace writes still block idle.
     const pending = unfinished.some(
       ({ workId }) =>
         !["provider:", "terminal:", "setup:"].some((prefix) => workId.startsWith(prefix)) ||
@@ -150,6 +158,9 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
           workflowCheckpoint: row.workflowCheckpoint,
           activity: result,
           inactiveWorkIds: result === "idle" ? [...inactive] : [],
+          ...(row.finishedWorkflow && typeof inspected !== "string" && inspected.backgroundRevision
+            ? { backgroundRevision: inspected.backgroundRevision }
+            : {}),
         })
         .pipe(Effect.catchTag("ThreadVmActivityConflict", () => Effect.succeed(false)));
     return true;

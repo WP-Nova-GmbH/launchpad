@@ -104,6 +104,8 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     operationId: string,
     admit: import("../../vmWorkload.ts").VmHarnessStopAdmission,
+    backgroundRevision?: string,
+    recoverOnly?: true,
   ) => Effect.Effect<boolean, TError>;
   /** Flush adapter output after its native writer has stopped. Codex moves require this receipt. */
   readonly drainRuntimeEvents?: (threadId: ThreadId) => Effect.Effect<void, TError>;

@@ -105,11 +105,19 @@ export function makeThreadVmPauseRecoveryStore(
             WHERE x.operation_id=${input.operationId}
               AND x.workflow_checkpoint=${sql.json(input.workflowCheckpoint ?? null)}
               AND h.publication_id=${workflow.publicationId} AND h.revision=${workflow.publicationRevision}
-              AND (j.status IN ('awaiting_review','awaiting_input') OR
-                (j.status='cancelling' AND j.pending_control->'supersededCheckpoint' IS NULL))
-              AND j.record#>>'{progress,status}' IN ('awaiting_review','awaiting_input')
-              AND j.record#>>'{progress,checkpoint,checkpointId}'=${workflow.checkpointId}
-              AND COALESCE((j.record#>>'{progress,checkpoint,generation}')::int,0)=${workflow.checkpointGeneration}
+              AND (${
+                workflow.finishedWorkspaceRevision === undefined
+                  ? sql`(j.status IN ('awaiting_review','awaiting_input') OR
+                    (j.status='cancelling' AND j.pending_control->'supersededCheckpoint' IS NULL))
+                  AND j.record#>>'{progress,status}' IN ('awaiting_review','awaiting_input')
+                  AND j.record#>>'{progress,checkpoint,checkpointId}'=${workflow.checkpointId}
+                  AND COALESCE((j.record#>>'{progress,checkpoint,generation}')::int,0)=${workflow.checkpointGeneration}`
+                  : sql`j.status IN ('done','cancelled','failed') AND j.pending_control IS NULL
+                  AND j.record#>>'{progress,executionReleased}'='true'
+                  AND r.manifest->>'terminalExecutionReleased'='true'
+                  AND EXISTS(SELECT 1 FROM relay_workflow_vm_follow_ups f WHERE f.job_id=j.job_id
+                    AND f.reclaim_operation_id=x.operation_id AND f.workspace_revision=${workflow.finishedWorkspaceRevision})`
+              })
               AND r.manifest#>>'{binding,environmentId}'=${input.environmentId}
               AND (r.manifest#>>'{binding,generation}')::int=${input.generation}`;
           if (
@@ -209,13 +217,17 @@ export function makeThreadVmPauseRecoveryStore(
           yield* sql`UPDATE relay_thread_vm_pauses SET source_reopened_at=COALESCE(source_reopened_at,clock_timestamp())
         WHERE allocation_id=${pause.allocationId} AND operation_id=${input.operationId}`;
           yield* acknowledgeThreadVmPauseBackup(sql, pause.allocationId);
+          yield* sql`UPDATE relay_workflow_vm_follow_ups SET reclaim_operation_id=NULL
+            WHERE reclaim_operation_id=${input.operationId} AND NOT reclaim_fallback`;
           return (yield* get(input))!;
         }),
       );
     },
   );
   const cancelBeforeFreeze = Effect.fn("relay.thread_vm.pause.recovery.cancel_before_freeze")(
-    function* (input: Owner & { readonly operationId: string }) {
+    function* (
+      input: Owner & { readonly operationId: string; readonly nativePauseFallback?: true },
+    ) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const pause = yield* get(input);
@@ -224,6 +236,12 @@ export function makeThreadVmPauseRecoveryStore(
           if (pause.phase === "cancelled") return pause;
           if (!(yield* makeThreadVmPauseStore(sql).cancelBeforeFreeze(input)))
             return yield* conflict("Certified pause cannot be cancelled by its source.");
+          if (
+            input.nativePauseFallback &&
+            pause.workflowCheckpoint?.finishedWorkspaceRevision !== undefined
+          )
+            yield* sql`UPDATE relay_workflow_vm_follow_ups SET reclaim_fallback=true
+              WHERE job_id=${pause.workflowCheckpoint.jobId} AND reclaim_operation_id=${input.operationId}`;
           return (yield* get(input))!;
         }),
       );

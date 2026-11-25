@@ -8,6 +8,7 @@ import { makeThreadExecutionFence } from "../persistence/ThreadExecutionFence.ts
 import { CheckoutAdmission, makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { makeProviderExecution } from "../provider/ProviderExecution.ts";
 import {
+  CurrentWorkflowVmFollowUpResponse,
   makeThreadExecutionRelay,
   ThreadExecutionRelayError,
   type ThreadExecutionAuthority,
@@ -139,6 +140,31 @@ describe("portable execution handshake", () => {
           0,
         );
       }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect("rechecks follow-up permission before retrying a rejected provider response", () =>
+    Effect.gen(function* () {
+      const { sql, authority } = yield* fixture;
+      let eligible = true;
+      const relay = makeThreadExecutionRelay(sql, {
+        ...authority,
+        admit: (input) => (eligible ? authority.admit(input) : Effect.fail(unavailable("admit"))),
+      });
+      const response = { ...work, workId: "approval:retry" };
+      const begin = relay.begin(response).pipe(
+        Effect.provideService(CurrentWorkflowVmFollowUpResponse, {
+          threadId: response.threadId,
+          workId: `provider:${response.workId}`,
+          userId: "maintainer",
+          commandId: "response-command",
+        }),
+      );
+      assert.equal(yield* begin, "start");
+      yield* relay.rejectInvocation(response);
+      eligible = false;
+      assert.equal((yield* Effect.flip(begin))._tag, "ThreadExecutionRelayError");
+      eligible = true;
+      assert.equal(yield* begin, "start");
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
   it.effect.each(["uncertain", "completed"] as const)(
     "never replays an ordinary %s operation after portable enrollment",
@@ -300,6 +326,27 @@ describe("portable execution handshake", () => {
         );
         assert.equal(yield* makeThreadExecutionRelay(sql, authority).begin(work), "start");
       }).pipe(Effect.provide(SqlitePersistenceMemory)),
+  );
+  it.effect("keeps proof that work never started across completion retries", () =>
+    Effect.gen(function* () {
+      const { sql, fence, authority } = yield* fixture;
+      const refused = makeThreadExecutionRelay(sql, {
+        ...authority,
+        admit: () => Effect.fail(unavailable("admit")),
+        complete: () => Effect.fail(unavailable("complete")),
+      });
+      assert.equal((yield* Effect.flip(refused.begin(work)))._tag, "ThreadExecutionRelayError");
+      assert.equal(
+        (yield* Effect.flip(refused.confirmStopped(work)))._tag,
+        "ThreadExecutionRelayError",
+      );
+      assert.lengthOf(yield* fence.pendingCompletionReports(), 1);
+      yield* makeThreadExecutionRelay(sql, {
+        ...authority,
+        complete: (input) => Effect.sync(() => assert.isTrue(input.neverStarted)),
+      }).flushCompletions();
+      assert.lengthOf(yield* fence.pendingCompletionReports(), 0);
+    }).pipe(Effect.provide(SqlitePersistenceMemory)),
   );
   it.effect(
     "durably retains completion after relay loss and retries only the acknowledgement",

@@ -32,8 +32,10 @@ import * as Crypto from "effect/Crypto";
 import type * as Cause from "effect/Cause";
 import * as NodeChildSpawner from "@effect/platform-node/NodeChildProcessSpawner";
 import {
+  inspectIdleWorkflowVmStop,
   readVmHarnessIdentity,
   stopIdleVmHarness,
+  stopIdleWorkflowVmHarness,
   verifyWorkflowVmHarnessPeer,
   VmWorkloadError,
   type VmHarnessIdentity,
@@ -84,6 +86,7 @@ const BENIGN_ERROR_LOG_SNIPPETS = [
   "state db record_discrepancy: find_thread_path_by_id_str_in_subdir, falling_back",
 ];
 const CODEX_APP_SERVER_FORCE_KILL_AFTER = "2 seconds" as const;
+const CODEX_VM_DRAIN_TIMEOUT = "10 seconds" as const;
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
   "missing thread",
@@ -207,6 +210,12 @@ export interface CodexSessionRuntimeOptions {
   readonly workflowProxy?: Pick<WorkflowCodexProxy, "baseUrl" | "bindPeer"> & {
     readonly permitEnv: string;
   };
+  readonly onWorkflowChildrenActive?: (
+    busy: boolean,
+    identity: VmHarnessIdentity,
+  ) => Effect.Effect<void>;
+  readonly getWorkflowBackgroundRevision?: () => string | undefined;
+  readonly onWorkflowTaskEvent?: (event: ProviderEvent) => Effect.Effect<void>;
   readonly homePath?: string;
   readonly launchArgs?: string;
   readonly environment?: NodeJS.ProcessEnv;
@@ -284,6 +293,8 @@ export interface CodexSessionRuntimeShape {
   readonly closeIdleVmHarness?: (
     operationId: string,
     admit: VmHarnessStopAdmission,
+    backgroundRevision?: string,
+    recoverOnly?: true,
   ) => Effect.Effect<boolean, CodexSessionRuntimeError>;
 }
 
@@ -1530,6 +1541,7 @@ export const makeCodexSessionRuntime = (
     const collabChildMetadataRef = yield* Ref.make(new Map<string, CollabChildMetadataState>());
     /** Child provider-thread id → its currently running provider turn id. */
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
+    const activeWorkflowChildren = new Set<string>();
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
     const closeLock = yield* Semaphore.make(1);
@@ -1570,6 +1582,7 @@ export const makeCodexSessionRuntime = (
     const launch = trackedLaunch ?? spawnCommand;
     let harnessIdentity: VmHarnessIdentity | undefined;
     let idleOperation: string | undefined;
+    let vmSignalAttempted = false;
     let vmStopping = false;
     let vmInputDrained = false;
     let vmShutdownComplete = false;
@@ -1595,16 +1608,36 @@ export const makeCodexSessionRuntime = (
         ),
       );
 
-    const clientContext = yield* CodexClient.layerChildProcess(child).pipe(
-      Layer.build,
-      Effect.provideService(Scope.Scope, runtimeScope),
-    );
-    const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
-      Effect.provide(clientContext),
-    );
     const serverNotifications = yield* Queue.unbounded<
       CodexServerNotification | { readonly barrier: Deferred.Deferred<void> }
     >();
+    let idleInputFence:
+      | {
+          readonly nonce: string;
+          readonly barrier: Deferred.Deferred<void>;
+          completeFrame: boolean | undefined;
+        }
+      | undefined;
+    const clientContext = yield* CodexClient.layerChildProcess(
+      child,
+      options.workflowProxy
+        ? {
+            onIdleInputFence: (nonce, completeFrame) =>
+              Effect.gen(function* () {
+                const fence = idleInputFence;
+                if (fence?.nonce !== nonce || fence.completeFrame !== undefined) return;
+                fence.completeFrame = completeFrame;
+                // Wire records enter this queue in order. Wait for their effects as well.
+                if (completeFrame)
+                  yield* Queue.offer(serverNotifications, { barrier: fence.barrier });
+                else yield* Deferred.succeed(fence.barrier, undefined);
+              }),
+          }
+        : undefined,
+    ).pipe(Layer.build, Effect.provideService(Scope.Scope, runtimeScope));
+    const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
+      Effect.provide(clientContext),
+    );
     const proposedFileChanges = new Map<string, string>();
     const rememberProposedFileChanges = (notification: CodexServerNotification) => {
       if (notification.method !== "item/started" && notification.method !== "item/completed")
@@ -1658,7 +1691,11 @@ export const makeCodexSessionRuntime = (
         ? { resumePolicy: options.resumeCursor.resumePolicy }
         : {}),
     });
-    const offerEvent = (event: ProviderEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
+    const offerEvent = (event: ProviderEvent) =>
+      (event.kind === "notification" && event.method.startsWith("collabAgent/")
+        ? (options.onWorkflowTaskEvent?.(event) ?? Effect.void)
+        : Effect.void
+      ).pipe(Effect.andThen(Queue.offer(events, event)), Effect.asVoid);
 
     const emitEvent = (event: Omit<ProviderEvent, "id" | "provider" | "createdAt">) =>
       Effect.gen(function* () {
@@ -1830,6 +1867,18 @@ export const makeCodexSessionRuntime = (
         ),
       );
 
+    const setWorkflowChildActivity = Effect.fnUntraced(function* (
+      threadId: string,
+      active: boolean,
+    ) {
+      const wasActive = activeWorkflowChildren.size > 0;
+      if (active) activeWorkflowChildren.add(threadId);
+      else activeWorkflowChildren.delete(threadId);
+      const hasActiveChild = activeWorkflowChildren.size > 0;
+      if (harnessIdentity && hasActiveChild !== wasActive)
+        yield* options.onWorkflowChildrenActive?.(hasActiveChild, harnessIdentity) ?? Effect.void;
+    });
+
     /**
      * Registers v2 collab children and re-emits their notifications as
      * synthetic `collabAgent/*` events for the adapter's task.* synthesis.
@@ -1913,6 +1962,15 @@ export const makeCodexSessionRuntime = (
           ) {
             return false;
           }
+          // Parent-side interruptions have no child turn ID. They settle
+          // pre-turn activity but cannot identify which tracked turn ended.
+          if (
+            options.workflowProxy &&
+            notification.method === "item/completed" &&
+            item.kind === "interrupted" &&
+            !(yield* Ref.get(collabChildLiveTurnsRef)).has(item.agentThreadId)
+          )
+            yield* setWorkflowChildActivity(item.agentThreadId, false);
           const activitySpawnTurnId = (yield* Ref.get(sessionRef)).activeTurnId ?? undefined;
           yield* Ref.update(collabChildAgentsRef, (current) => {
             const existing = current.get(item.agentThreadId);
@@ -2176,6 +2234,26 @@ export const makeCodexSessionRuntime = (
         const payload = notification.params;
         const route = readRouteFields(notification);
         const collabReceiverTurns = yield* Ref.get(collabReceiverTurnsRef);
+        // A child can report active before its turn ID is available for interrupting.
+        if (
+          options.workflowProxy &&
+          !isMemoryConsolidationNotification &&
+          (notification.method === "thread/status/changed" ||
+            notification.method === "thread/closed" ||
+            notification.method === "turn/started" ||
+            notification.method === "turn/completed" ||
+            (notification.method === "error" && notification.params.willRetry !== true))
+        ) {
+          const threadId = notification.params.threadId;
+          const rootId = currentProviderThreadId(yield* Ref.get(sessionRef));
+          if (rootId && threadId !== rootId)
+            yield* setWorkflowChildActivity(
+              threadId,
+              notification.method === "turn/started" ||
+                (notification.method === "thread/status/changed" &&
+                  notification.params.status.type === "active"),
+            );
+        }
         const childParentTurnId = (() => {
           const providerConversationId = readNotificationThreadId(notification);
           return providerConversationId
@@ -2816,6 +2894,10 @@ export const makeCodexSessionRuntime = (
               command: `${options.binaryPath} app-server`,
               cause: identity.failure,
             });
+          yield* (
+            options.onWorkflowChildrenActive?.(activeWorkflowChildren.size > 0, identity.success) ??
+              Effect.void
+          );
           options.workflowProxy.bindPeer((listenerPort, clientPort, signal) =>
             Effect.runPromise(
               verifyWorkflowVmHarnessPeer(identity.success, listenerPort, clientPort).pipe(
@@ -2880,16 +2962,26 @@ export const makeCodexSessionRuntime = (
       }),
     );
 
-    const drainVmNativeWriter = Effect.gen(function* () {
-      if (vmShutdownComplete) return;
-      if (!vmInputDrained) {
-        yield* child.exitCode.pipe(Effect.exit);
-        yield* client.raw.awaitInputDrained!;
-        const barrier = yield* Deferred.make<void>();
-        yield* Queue.offer(serverNotifications, { barrier });
-        yield* Deferred.await(barrier);
-        vmInputDrained = true;
-      }
+    const awaitVmNativeWriterDrain = Effect.gen(function* () {
+      if (vmInputDrained) return;
+      yield* child.exitCode.pipe(Effect.ignore);
+      yield* client.raw.awaitInputDrained!;
+      const barrier = yield* Deferred.make<void>();
+      yield* Queue.offer(serverNotifications, { barrier });
+      yield* Deferred.await(barrier);
+      vmInputDrained = true;
+    }).pipe(
+      // An exit alone does not prove stdout has been drained. Keep this wait
+      // bounded even when an idle stop retry takes the ordinary close path.
+      Effect.interruptible,
+      Effect.timeoutOrElse({
+        duration: CODEX_VM_DRAIN_TIMEOUT,
+        orElse: () =>
+          Effect.fail(new VmWorkloadError({ action: "drain-provider-output", reason: "timeout" })),
+      }),
+    );
+
+    const finishVmNativeWriterShutdown = Effect.gen(function* () {
       if (!(yield* Ref.get(closedRef))) {
         yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
         yield* emitSessionEvent("session/closed", "Session stopped");
@@ -2925,7 +3017,8 @@ export const makeCodexSessionRuntime = (
           if (yield* child.isRunning.pipe(Effect.mapError(failure)))
             return yield* failure("The native writer is still running.");
           yield* updateSession(sessionRef, { status: "closed", activeTurnId: undefined });
-          yield* drainVmNativeWriter.pipe(
+          yield* awaitVmNativeWriterDrain.pipe(
+            Effect.andThen(finishVmNativeWriterShutdown),
             Effect.catchCause((cause) => Effect.fail(failure(cause))),
           );
         }),
@@ -2935,6 +3028,8 @@ export const makeCodexSessionRuntime = (
     const closeIdleVmHarness = Effect.fn("CodexSessionRuntime.close_idle_vm")(function* (
       operationId: string,
       admit: VmHarnessStopAdmission,
+      backgroundRevision?: string,
+      recoverOnly?: true,
     ) {
       if (
         !trackWorkloads ||
@@ -2946,22 +3041,30 @@ export const makeCodexSessionRuntime = (
       )
         return false;
       const ownedHarness = harnessIdentity;
-      if (idleOperation && idleOperation !== operationId) return false;
-      if (vmShutdownComplete) return true;
+      if (idleOperation && idleOperation !== operationId) {
+        if ((recoverOnly || vmSignalAttempted) && !vmShutdownComplete)
+          return yield* new VmWorkloadError({ action: "stop-idle-provider" });
+        return false;
+      }
+      if (recoverOnly && (!idleOperation || !options.workflowProxy)) return false;
+      if (vmShutdownComplete && !recoverOnly) return true;
+      const idle = Effect.gen(function* () {
+        const state = yield* Ref.get(sessionRef);
+        return (
+          (state.status === "ready" || state.status === "error") &&
+          !state.activeTurnId &&
+          !(yield* Ref.get(collabChildLiveTurnsRef)).size &&
+          activeWorkflowChildren.size === 0 &&
+          !(yield* Ref.get(pendingApprovalsRef)).size &&
+          !(yield* Ref.get(pendingUserInputsRef)).size &&
+          !(yield* Ref.get(closedRef)) &&
+          !handlingNotification &&
+          (backgroundRevision === undefined ||
+            options.getWorkflowBackgroundRevision?.() === backgroundRevision) &&
+          (yield* Queue.size(serverNotifications)) <= 0
+        );
+      });
       if (!idleOperation) {
-        const idle = Effect.gen(function* () {
-          const state = yield* Ref.get(sessionRef);
-          return (
-            (state.status === "ready" || state.status === "error") &&
-            !state.activeTurnId &&
-            !(yield* Ref.get(collabChildLiveTurnsRef)).size &&
-            !(yield* Ref.get(pendingApprovalsRef)).size &&
-            !(yield* Ref.get(pendingUserInputsRef)).size &&
-            !(yield* Ref.get(closedRef)) &&
-            !handlingNotification &&
-            (yield* Queue.size(serverNotifications)) <= 0
-          );
-        });
         if (!(yield* idle)) return false;
         // The round trip orders prior notifications; recheck state changed while it ran.
         yield* readCodexConversationSource(client, yield* readProviderThreadId);
@@ -2973,20 +3076,77 @@ export const makeCodexSessionRuntime = (
       // HTTP caller disappears. A timeout never proves a native writer stopped.
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
-          if (!vmStopping) {
+          if (!vmStopping || recoverOnly) {
+            let confirmedRefusal = false;
             const result = yield* admit(
-              stopIdleVmHarness(ownedHarness, operationId).pipe(
-                Effect.provideService(VmControlSpawner, controlSpawner),
-              ),
+              Effect.gen(function* () {
+                // Admission may wait for the ownership transaction. After an
+                // uncertain signal, only the native receipt can establish its outcome.
+                if (!recoverOnly && !vmSignalAttempted && !(yield* idle))
+                  return { admitted: false };
+                const stop = Effect.gen(function* () {
+                  if (options.workflowProxy && (recoverOnly || vmSignalAttempted))
+                    return yield* inspectIdleWorkflowVmStop(ownedHarness, operationId);
+                  if (!options.workflowProxy) {
+                    vmSignalAttempted = true;
+                    return yield* stopIdleVmHarness(ownedHarness, operationId);
+                  }
+                  const id = yield* crypto.randomUUIDv4.pipe(
+                    Effect.mapError((cause) => new VmWorkloadError({ cause })),
+                  );
+                  const fence = {
+                    nonce: id.replaceAll("-", ""),
+                    barrier: yield* Deferred.make<void>(),
+                    completeFrame: undefined as boolean | undefined,
+                  };
+                  idleInputFence = fence;
+                  vmSignalAttempted = true;
+                  const confirmIdle = Deferred.await(fence.barrier).pipe(
+                    Effect.andThen(
+                      Effect.suspend(() => (fence.completeFrame ? idle : Effect.succeed(false))),
+                    ),
+                    Effect.interruptible,
+                    Effect.timeoutOrElse({
+                      duration: "2 seconds",
+                      orElse: () => Effect.succeed(false),
+                    }),
+                  );
+                  return yield* stopIdleWorkflowVmHarness(
+                    ownedHarness,
+                    operationId,
+                    fence.nonce,
+                    confirmIdle,
+                  ).pipe(
+                    Effect.ensuring(
+                      Effect.sync(() => {
+                        idleInputFence = undefined;
+                      }),
+                    ),
+                  );
+                });
+                const receipt = yield* stop.pipe(
+                  Effect.provideService(VmControlSpawner, controlSpawner),
+                );
+                confirmedRefusal = !receipt.admitted;
+                return receipt;
+              }),
             );
             if (!result.admitted) {
+              // A declined ownership check is not a native refusal receipt.
+              if (vmStopping || ((recoverOnly || vmSignalAttempted) && !confirmedRefusal))
+                return yield* new VmWorkloadError({ action: "stop-idle-provider" });
+              vmSignalAttempted = false;
               idleOperation = undefined;
               yield* client.raw.releaseIdleShutdown!;
               return false;
             }
             vmStopping = true;
           }
-          yield* drainVmNativeWriter;
+          if (vmShutdownComplete) return true;
+          // A reserved signal can outlive the helper without producing an exit.
+          // Let the lifecycle worker retry this proof while retaining ownership.
+          yield* awaitVmNativeWriterDrain;
+          yield* finishVmNativeWriterShutdown;
           return true;
         }),
       );

@@ -2,14 +2,24 @@ import { isElectron } from "../../env";
 import { useEffect, useMemo, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import { Link, useLocation } from "@tanstack/react-router";
-import { ArrowLeftIcon, ChevronRightIcon, LockIcon, WorkflowIcon } from "lucide-react";
-import type { ExecutionEnvironmentDescriptor, ThreadWorkflowJob } from "@t3tools/contracts";
+import {
+  ArrowLeftIcon,
+  ChevronRightIcon,
+  GitBranchIcon,
+  LockIcon,
+  WorkflowIcon,
+} from "lucide-react";
+import {
+  ThreadId,
+  type EnvironmentId,
+  type ExecutionEnvironmentDescriptor,
+  type ThreadWorkflowJob,
+} from "@t3tools/contracts";
 import {
   isTerminalWorkflowJob,
   workflowIsFinishing,
   type RepositoryWorkflowJob,
 } from "@t3tools/contracts/workflows";
-import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
 import {
   workflowJobReadAtom,
   workflowSessionKey,
@@ -18,15 +28,18 @@ import {
 import { useManagedRelayOrganizationCatalog } from "../../cloud/managedRelayState";
 import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { workflowResultGitAccess } from "../../lib/workflowResultGitAccess";
+import { randomUUID } from "../../lib/utils";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { pushWorkflowVmFollowUp } from "../../state/workflowVmFollowUp";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { WorkspacePageHeader } from "../WorkspacePageHeader";
 import { workflowRunsReturnForJob } from "./workflowRunsNavigation";
-import { useWorkflowClient, WORKFLOW_REVIEW_ANCHOR } from "./workflowState";
+import { useWorkflowClient, workflowError, WORKFLOW_REVIEW_ANCHOR } from "./workflowState";
 import {
   sameWorkflowResultCheckpoint,
   workflowResultCheckpoint,
-  workflowResultOrigin,
   type WorkflowResultCheckpoint,
   type WorkflowResultOrigin,
 } from "@t3tools/client-runtime/relay/workflow-result";
@@ -40,26 +53,23 @@ declare module "@tanstack/react-router" {
 }
 
 export function useWorkflowConversation({
+  environmentId,
+  origin: knownOrigin,
   threadId,
   threadTitle,
   threadJob,
   capabilities,
+  followUp,
 }: {
+  environmentId?: EnvironmentId | undefined;
+  origin: WorkflowResultOrigin | null;
   threadId: string | undefined;
   threadTitle: string | undefined;
   threadJob: typeof ThreadWorkflowJob.Type | null | undefined;
   capabilities: ExecutionEnvironmentDescriptor["capabilities"] | undefined;
+  followUp: boolean;
 }) {
-  const session = useAtomValue(managedRelaySessionAtom);
-  const routeOrigin = useLocation({ select: (location) => location.state.workflowOrigin });
-  const accountId = session?.accountId;
-  const origin = useMemo(
-    () =>
-      hasCloudPublicConfig()
-        ? workflowResultOrigin({ workflowOrigin: routeOrigin }, accountId, threadId)
-        : null,
-    [routeOrigin, accountId, threadId],
-  );
+  const origin = hasCloudPublicConfig() ? knownOrigin : null;
   const catalog = useManagedRelayOrganizationCatalog({
     allowMissingProjects: true,
     enabled: origin !== null,
@@ -90,10 +100,12 @@ export function useWorkflowConversation({
   });
   return {
     origin,
+    environmentId,
     title: job?.workflow?.definition.name ?? threadTitle ?? "Workflow run",
     repository: repository.name,
     job,
-    readOnly,
+    readOnly: readOnly && !followUp,
+    followUp,
     status,
   };
 }
@@ -103,7 +115,7 @@ export function WorkflowConversationHeader({
 }: {
   conversation: NonNullable<ReturnType<typeof useWorkflowConversation>>;
 }) {
-  const { origin, title, repository, readOnly, status } = conversation;
+  const { origin, environmentId, title, repository, readOnly, followUp, status } = conversation;
   const call = useWorkflowClient(origin);
   const runsReturn = useLocation({ select: ({ state }) => state.workflowRunsReturn });
   const returnContext = workflowRunsReturnForJob(origin, origin.jobId, runsReturn);
@@ -224,6 +236,13 @@ export function WorkflowConversationHeader({
             {liveStatus}
           </Badge>
         ) : null}
+        {followUp && environmentId ? (
+          <WorkflowFollowUpPush
+            key={origin.threadId + ":" + origin.workflowVmFollowUpGeneration}
+            environmentId={environmentId}
+            threadId={ThreadId.make(origin.threadId)}
+          />
+        ) : null}
         <Button
           size="sm"
           variant="outline"
@@ -250,5 +269,72 @@ export function WorkflowConversationHeader({
         </Button>
       </div>
     </WorkspacePageHeader>
+  );
+}
+
+function WorkflowFollowUpPush({
+  environmentId,
+  threadId,
+}: {
+  environmentId: EnvironmentId;
+  threadId: ThreadId;
+}) {
+  const push = useAtomCommand(pushWorkflowVmFollowUp, { reportFailure: false });
+  const [attempt, setAttempt] = useState<{
+    operationId: string;
+    status: "working" | "pending" | "pushed" | "failed";
+    detail: string | null;
+  } | null>(null);
+
+  const submit = async () => {
+    if (attempt?.status === "working") return;
+    const operationId = attempt?.status === "pending" ? attempt.operationId : randomUUID();
+    setAttempt({ operationId, status: "working", detail: null });
+    const result = await push({ environmentId, input: { threadId, operationId } });
+    if (result._tag === "Failure") {
+      setAttempt({
+        operationId,
+        status: "pending",
+        detail: workflowError(squashAtomCommandFailure(result)),
+      });
+      return;
+    }
+    const receipt = result.value;
+    const errorDetail =
+      receipt.status === "conflict"
+        ? "The workflow branch changed on GitHub."
+        : receipt.status === "failed"
+          ? "The workflow commit was not pushed."
+          : null;
+    setAttempt({
+      operationId: receipt.operationId,
+      status: receipt.status === "conflict" ? "failed" : receipt.status,
+      detail:
+        receipt.detail ??
+        (receipt.status === "pushed" ? "Pushed to " + receipt.branch : errorDetail),
+    });
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={attempt?.status === "working"}
+        onClick={() => void submit()}
+      >
+        <GitBranchIcon aria-hidden />
+        {attempt?.status === "working"
+          ? "Checking push…"
+          : attempt?.status === "pending"
+            ? "Check push"
+            : "Push"}
+      </Button>
+      {attempt?.detail ? (
+        <span role={attempt.status === "failed" ? "alert" : "status"} className="text-xs">
+          {attempt.detail}
+        </span>
+      ) : null}
+    </div>
   );
 }

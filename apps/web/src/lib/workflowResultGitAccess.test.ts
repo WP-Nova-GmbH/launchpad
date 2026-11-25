@@ -1,6 +1,11 @@
+import { ThreadId } from "@t3tools/contracts";
 import { RelayRepositoryId } from "@t3tools/contracts/relay";
 import { describe, expect, it } from "vite-plus/test";
-import { canUseLiveProjectWorkspace, workflowResultGitAccess } from "./workflowResultGitAccess";
+import {
+  canUseLiveProjectWorkspace,
+  canUseWorkflowVmFollowUp,
+  workflowResultGitAccess,
+} from "./workflowResultGitAccess";
 
 const threadId = "workflow:result";
 const origin = {
@@ -46,6 +51,28 @@ describe("workflow result Git access", () => {
         .canReadCheckoutGit,
     ).toBe(true);
   });
+});
+
+it("limits follow-up controls to the exact authorized thread and generation", () => {
+  const capabilities = {
+    workflowVmResultReader: true,
+    workflowVmFollowUp: { threadId: ThreadId.make(threadId), generation: 2 },
+  } as Parameters<typeof canUseWorkflowVmFollowUp>[0]["capabilities"];
+  const followUpOrigin = { ...origin, workflowVmFollowUpGeneration: 2 };
+  const access = {
+    threadId,
+    capabilities,
+    origin: followUpOrigin,
+    scopedTarget: { threadId: ThreadId.make(threadId), generation: 2 },
+  };
+  expect(canUseWorkflowVmFollowUp(access)).toBe(true);
+  expect(canUseWorkflowVmFollowUp({ ...access, scopedTarget: undefined })).toBe(false);
+  expect(canUseWorkflowVmFollowUp({ ...access, capabilities: undefined })).toBe(false);
+  expect(canUseWorkflowVmFollowUp({ ...access, origin })).toBe(false);
+  expect(canUseWorkflowVmFollowUp({ ...access, threadId: "different" })).toBe(false);
+  expect(
+    workflowResultGitAccess({ threadId, capabilities, origin: followUpOrigin }).canReadCheckoutGit,
+  ).toBe(false);
 });
 
 describe("workflow VM project access", () => {

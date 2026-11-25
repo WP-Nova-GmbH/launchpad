@@ -210,6 +210,80 @@ export const WorkflowVmPublishingResponse = Schema.Union([
 ]);
 export type WorkflowVmPublishingResponse = typeof WorkflowVmPublishingResponse.Type;
 
+const FollowUpPushOperationId = Schema.String.check(Schema.isUUID());
+const WorkflowVmFollowUpBranch = TrimmedNonEmptyString.check(Schema.isMaxLength(150));
+export const WORKFLOW_VM_FOLLOW_UP_MAX_BUNDLE_BYTES = 4 * 1024 * 1024;
+const WorkflowVmFollowUpBundle = Schema.String.check(
+  Schema.isMaxLength(Math.ceil(WORKFLOW_VM_FOLLOW_UP_MAX_BUNDLE_BYTES / 3) * 4),
+);
+export const WorkflowVmFollowUpPushInput = Schema.Struct({
+  threadId: ThreadId,
+  operationId: FollowUpPushOperationId,
+});
+export const WorkflowVmFollowUpPushResult = Schema.Struct({
+  operationId: FollowUpPushOperationId,
+  branch: WorkflowVmFollowUpBranch,
+  commitSha: WorkflowGitObjectId,
+  status: Schema.Literals(["pushed", "pending", "conflict", "failed"]),
+  detail: Schema.NullOr(TrimmedNonEmptyString),
+});
+export type WorkflowVmFollowUpPushResult = typeof WorkflowVmFollowUpPushResult.Type;
+export class WorkflowVmFollowUpPushError extends Schema.TaggedError<WorkflowVmFollowUpPushError>()(
+  "WorkflowVmFollowUpPushError",
+  { message: Schema.String },
+) {}
+const WorkflowVmFollowUpBaseline = Schema.Struct({
+  branch: WorkflowVmFollowUpBranch,
+  sha: WorkflowGitObjectId,
+  treeSha: WorkflowGitObjectId,
+  baseSha: WorkflowGitObjectId,
+});
+export type WorkflowVmFollowUpBaseline = typeof WorkflowVmFollowUpBaseline.Type;
+export const WorkflowVmFollowUpPublishingRequest = Schema.Struct({
+  generation: WorkflowVmDispatchBinding.fields.generation,
+  jobId: WorkflowPublicationId,
+  actorUserId: WorkflowPublicationId,
+  operationId: FollowUpPushOperationId,
+  request: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("read"),
+      headSha: Schema.optionalKey(WorkflowGitObjectId),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("prepare"),
+      baseline: WorkflowVmFollowUpBaseline,
+      sha: WorkflowGitObjectId,
+      oldRemoteSha: Schema.NullOr(WorkflowGitObjectId),
+      bundle: WorkflowVmFollowUpBundle,
+    }),
+    Schema.Struct({ kind: Schema.Literal("arm"), commandId: FollowUpPushOperationId }),
+    Schema.Struct({ kind: Schema.Literal("confirm"), commandId: FollowUpPushOperationId }),
+    Schema.Struct({ kind: Schema.Literal("stop"), commandId: FollowUpPushOperationId }),
+  ]),
+});
+export type WorkflowVmFollowUpPublishingRequest = typeof WorkflowVmFollowUpPublishingRequest.Type;
+export const WorkflowVmFollowUpPublishingResponse = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("ok") }),
+  Schema.Struct({
+    kind: Schema.Literal("prepare"),
+    sha: Schema.NullOr(WorkflowGitObjectId),
+    oldRemoteSha: Schema.NullOr(WorkflowGitObjectId),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("ready"),
+    result: WorkflowVmFollowUpPushResult,
+    oldRemoteSha: Schema.NullOr(WorkflowGitObjectId),
+    canonicalKey: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+    bundle: WorkflowVmFollowUpBundle,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("credential"),
+    token: Schema.RedactedFromValue(TrimmedNonEmptyString),
+  }),
+  Schema.Struct({ kind: Schema.Literal("result"), result: WorkflowVmFollowUpPushResult }),
+]);
+export type WorkflowVmFollowUpPublishingResponse = typeof WorkflowVmFollowUpPublishingResponse.Type;
+
 export const WORKFLOW_RESULT_MAX_BYTES = 10_000_000;
 export const WorkflowResultObject = Schema.Struct({
   artifactId: Schema.String.check(Schema.isUUID()),
@@ -243,6 +317,7 @@ export type WorkflowSavedResult = typeof WorkflowSavedResult.Type;
 export const WorkflowRecoveryManifest = Schema.Struct({
   format: Schema.Literal("workflow-recovery-v1"),
   supportsVmCheckpointRecovery: Schema.optionalKey(Schema.Literal(true)),
+  terminalExecutionReleased: Schema.optionalKey(Schema.Literal(true)),
   publicationId: Schema.String.check(Schema.isUUID()),
   binding: WorkflowVmDispatchBinding,
   revision: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -576,6 +651,7 @@ export const RepositoryWorkflowJob = Schema.Struct({
       canCancel: Schema.Boolean,
       canApprove: Schema.Boolean,
       canRespond: Schema.Boolean,
+      canContinueInVm: Schema.optionalKey(Schema.Boolean),
     }),
   ),
   pendingManualControl: Schema.optional(Schema.NullOr(WorkflowManualControl)),

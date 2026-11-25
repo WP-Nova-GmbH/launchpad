@@ -4,6 +4,7 @@ import type { RelayThreadVmRestorePhase } from "@t3tools/contracts/relay";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import type { E2BRestoreError } from "../machines/E2BRestoreClient.ts";
 import * as Schema from "effect/Schema";
 import { E2BNativeSnapshotReceipt } from "../machines/E2BNativeSnapshotReceipt.ts";
 import { lockWorkflowVmCheckpoint } from "../jobs/WorkflowVmCheckpoint.ts";
@@ -567,14 +568,20 @@ export function makeThreadVmRestoreStore(
       Effect.gen(function* () {
         const row = yield* lock(operationId);
         if (["aborted", "aborting"].includes(row.phase)) return row;
-        if (["importing", "completed"].includes(row.phase))
+        const followUp = row.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
+        if (row.phase === "completed" || (!followUp && row.phase === "importing"))
           return yield* conflict("An enrolled restore must finish its chosen destination.");
         yield* sql`SELECT allocation_id FROM relay_thread_vm_allocations WHERE allocation_id=${row.allocationId} FOR UPDATE`;
-        const issued =
-          yield* sql`SELECT 1 FROM relay_thread_vm_enrollments WHERE allocation_id=${row.allocationId} AND environment_id IS NOT NULL
-          UNION ALL SELECT 1 FROM relay_thread_vm_bindings WHERE allocation_id=${row.allocationId}`;
-        if (issued.length)
-          return yield* conflict("An issued restore identity must finish its chosen destination.");
+        // An unactivated follow-up can retire only through the native boot stop receipt.
+        if (!followUp) {
+          const issued = yield* sql`SELECT 1 FROM relay_thread_vm_enrollments
+            WHERE allocation_id=${row.allocationId} AND environment_id IS NOT NULL
+            UNION ALL SELECT 1 FROM relay_thread_vm_bindings WHERE allocation_id=${row.allocationId}`;
+          if (issued.length)
+            return yield* conflict(
+              "An issued restore identity must finish its chosen destination.",
+            );
+        }
         if (row.backupRecoveryOperationId)
           return yield* conflict(
             "The stopped recovery source cannot be reactivated; retry this destination.",
@@ -617,7 +624,18 @@ export function makeThreadVmRestoreStore(
         });
         if (row.nativeCheckpointOperationId)
           yield* natives.releaseOperation({ threadId: row.threadId, operationId: row.operationId });
-        yield* sql`UPDATE relay_thread_vm_restores SET phase='aborted',claim_id=NULL,claim_until=NULL,error_code=NULL WHERE operation_id=${row.operationId}`;
+        const followUp = row.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
+        // Native follow-up preparation only reads the catalog. Historical probe or boot work still needs deletion reconciliation.
+        yield* sql`UPDATE relay_thread_vm_restores SET phase='aborted',claim_id=NULL,claim_until=NULL,
+          deletion_cleaned_at=CASE WHEN ${followUp && !row.enrollmentIssued} AND serving_requested
+            AND prepare_started_at IS NOT NULL AND prepared_receipt IS NULL
+            AND probe_attempt=0 AND probe_removed_at IS NULL AND preparation_cancellations='[]'::jsonb
+            AND boot_prepare_started_at IS NULL AND boot_recovery_started_at IS NULL AND boot_attempt=0
+            THEN COALESCE(deletion_cleaned_at,clock_timestamp()) ELSE deletion_cleaned_at END
+          WHERE operation_id=${row.operationId}`;
+        if (followUp)
+          yield* sql`UPDATE relay_workflow_vm_follow_ups SET operation_id=NULL,requested_at=NULL
+            WHERE operation_id=${row.operationId} AND allocation_id=${row.allocationId}`;
         return (yield* get(row.operationId))!;
       }),
     );
@@ -627,7 +645,9 @@ export function makeThreadVmRestoreStore(
     errorCode: string,
   ) {
     yield* sql`UPDATE relay_thread_vm_restores SET claim_id=NULL,claim_until=NULL,
-      retry_at=clock_timestamp()+interval '1 minute',error_code=${errorCode}
+      retry_at=clock_timestamp()+interval '1 minute',error_code=CASE
+        WHEN phase='aborting' AND error_code IN ('snapshot_unavailable','snapshot_lookup_failed','create_rejected')
+        THEN error_code ELSE ${errorCode} END
       WHERE operation_id=${input.operationId} AND claim_id=${input.claimId}
         AND claim_until>clock_timestamp() AND phase NOT IN ('aborted','completed')`;
   });
@@ -652,6 +672,52 @@ export function makeThreadVmRestoreStore(
       )
       .pipe(Effect.catchTag("ThreadVmRestoreConflict", () => defer(input, errorCode)));
   });
+  const settleCatalogFailure = Effect.fn("relay.thread_vm.restore.settle_catalog_failure")(
+    function* (
+      claim: ThreadVmRestoreClaim & Pick<ThreadVmRestore, "workflowCheckpoint">,
+      error: E2BRestoreError,
+    ) {
+      if (claim.workflowCheckpoint?.finishedWorkspaceRevision === undefined)
+        return yield* deferPreparation(claim, "snapshot_unconfirmed");
+      const snapshotUnavailable = error.reason === "identity" || error.reason === "not_found";
+      const retry =
+        error.reason === "transport" ||
+        error.reason === "response" ||
+        error.reason === "not_ready" ||
+        (error.reason === "http" &&
+          (error.status === 408 || error.status === 429 || (error.status ?? 500) >= 500));
+      const errorCode = retry
+        ? "snapshot_unconfirmed"
+        : snapshotUnavailable
+          ? "snapshot_unavailable"
+          : "snapshot_lookup_failed";
+      yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const row = yield* requireClaim(claim);
+            if (
+              !["preparing", "committed"].includes(row.phase) ||
+              row.bootCreateStarted ||
+              row.bootReceipt ||
+              row.bootIngressRecoveryClaimId
+            )
+              return yield* conflict("This lookup no longer owns an unissued restore.");
+            const [parked] = yield* sql`UPDATE relay_thread_vm_capacity c SET state='waiting'
+              FROM relay_thread_vm_allocations a WHERE c.operation_id=${row.operationId}
+                AND c.allocation_id=${row.allocationId} AND c.host_id=${row.hostId}
+                AND c.kind='create' AND c.state IN ('reserved','started') AND c.compute_ref IS NULL
+                AND a.allocation_id=c.allocation_id AND a.state='creating' AND a.compute_ref IS NULL
+                AND a.deleted_at IS NULL RETURNING c.operation_id`;
+            if (!parked) return yield* conflict("Restore capacity changed during snapshot lookup.");
+            yield* sql`UPDATE relay_thread_vm_restores SET phase=${retry ? row.phase : "aborting"},
+              claim_id=NULL,claim_until=NULL,error_code=${errorCode},
+              retry_at=clock_timestamp()+${retry ? 1 : 0} * interval '1 minute'
+              WHERE operation_id=${row.operationId}`;
+          }),
+        )
+        .pipe(Effect.catchTag("ThreadVmRestoreConflict", () => Effect.void));
+    },
+  );
   return {
     get,
     begin,
@@ -664,6 +730,7 @@ export function makeThreadVmRestoreStore(
     completeAbort,
     defer,
     deferPreparation,
+    settleCatalogFailure,
     parkForCodex,
     // Shared by the serving coordinator; each mutation remains in its caller's transaction.
     lock,

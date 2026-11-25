@@ -5,6 +5,7 @@ import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import {
   RelayCloudMintCredentialProofPayload,
   type RelayEnvironmentMintResponse,
+  type RelayWorkflowVmFollowUpConnection,
 } from "@t3tools/contracts/relay";
 import {
   RELAY_MINT_REQUEST_TYP,
@@ -57,9 +58,12 @@ function fixture(
     nonce?: string;
     thumbprint?: string;
     waitPastExpiry?: boolean;
+    workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
+    target?: ThreadVmConnectionTarget;
   } = {},
 ) {
-  let current = target;
+  const original = options.target ?? target;
+  let current = original;
   let allowed = true;
   let reads = 0;
   let mints = 0;
@@ -69,6 +73,7 @@ function fixture(
     clientProofKeyThumbprint: options.thumbprint ?? "client-key",
     relayIssuer: "https://relay.test/",
     cloudMintPrivateKey: Redacted.make(relay.privateKey),
+    ...(options.workflowFollowUp ? { workflowFollowUp: options.workflowFollowUp } : {}),
     authorize: (userId, threadId) =>
       Effect.gen(function* () {
         reads++;
@@ -82,7 +87,7 @@ function fixture(
         Effect.gen(function* () {
           mints++;
           expect(sandboxId).toBe(target.sandboxId);
-          expect(identity).toEqual(target.identity);
+          expect(identity).toEqual(original.identity);
           const now = Math.floor((yield* DateTime.now).epochMilliseconds / 1000);
           const payload = yield* verifyRelayJwt({
             publicKey: relay.publicKey,
@@ -95,6 +100,7 @@ function fixture(
           expect(payload.sub).toBe("owner");
           expect(payload.scope).toEqual(["environment:connect"]);
           expect(payload.cnf.jkt).toBe("client-key");
+          expect(payload.workflowFollowUp).toEqual(options.workflowFollowUp);
           const response: RelayEnvironmentMintResponse = {
             credential: "one-time-secret",
             expiresAt: DateTime.formatIso(DateTime.makeUnsafe((now + 60) * 1000)),
@@ -144,6 +150,25 @@ describe("private VM credential exchange", () => {
         expect(yield* encodeJson(result)).not.toContain("one-time-secret");
         expect(test.counts()).toEqual({ reads: 2, mints: 1 });
       }),
+  );
+  it.effect("signs follow-up for the exact workflow thread and generation", () =>
+    Effect.gen(function* () {
+      const workflowTarget = {
+        ...target,
+        identity: { ...target.identity, resourceKind: "organization_workflow" as const },
+      };
+      const request = { threadId: target.identity.scope.threadId, generation: 1 };
+      const live = fixture({ target: workflowTarget, workflowFollowUp: request });
+      yield* live.run;
+      expect(live.counts().mints).toBe(1);
+      for (const stale of [
+        fixture({ workflowFollowUp: request }),
+        fixture({ target: workflowTarget, workflowFollowUp: { ...request, generation: 2 } }),
+      ]) {
+        yield* stale.run.pipe(Effect.flip);
+        expect(stale.counts().mints).toBe(0);
+      }
+    }),
   );
   it.effect("does not contact compute when access is denied or the client key is absent", () =>
     Effect.gen(function* () {
