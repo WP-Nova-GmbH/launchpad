@@ -84,6 +84,7 @@ export interface OrganizationAdminState {
   readonly githubReadError: string | null;
   readonly githubConnectionVerified: boolean;
   readonly busy: boolean;
+  readonly repositoryRevision: number;
   readonly accessRemoval: RepositoryAccessRemovalStatus | null;
   readonly issuedInvitations: ReadonlyArray<IssuedInvitation>;
   readonly issuedMachineEnrollments: ReadonlyArray<IssuedMachineEnrollment>;
@@ -165,6 +166,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
   const [snapshot, setSnapshot] = useState<OrganizationAdminSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [repositoryRevision, setRepositoryRevision] = useState(0);
   const [accessRemoval, setAccessRemoval] = useState<RepositoryAccessRemovalStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [githubReadFailure, setGithubReadFailure] = useState<{
@@ -382,6 +384,12 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     },
     [load, userId],
   );
+  const mutateRepository = (description: string, run: () => Promise<unknown>) =>
+    mutate(description, async () => {
+      const result = await run();
+      setRepositoryRevision((revision) => revision + 1);
+      return result;
+    });
 
   const githubFailure = githubReadFailure?.userId === userId ? githubReadFailure : null;
   const installation = snapshot?.github.connection;
@@ -400,6 +408,7 @@ export function useOrganizationAdmin(): OrganizationAdminState {
     githubReadError: githubFailure?.message ?? null,
     githubConnectionVerified,
     busy,
+    repositoryRevision,
     accessRemoval,
     issuedInvitations,
     issuedMachineEnrollments,
@@ -478,25 +487,25 @@ export function useOrganizationAdmin(): OrganizationAdminState {
         ),
       ),
     registerRepository: (input) =>
-      mutate("Could not register the repository", () =>
+      mutateRepository("Could not register the repository", () =>
         call("Could not register the repository", (client, clerkToken) =>
           client.registerRepository({ clerkToken, payload: input }),
         ),
       ),
     deleteRepository: (repositoryId) =>
-      mutate("Could not remove the repository", () =>
+      mutateRepository("Could not remove the repository", () =>
         call("Could not remove the repository", (client, clerkToken) =>
           client.deleteRepository({ clerkToken, repositoryId }),
         ),
       ),
     addAlias: (input) =>
-      mutate("Could not add the key", () =>
+      mutateRepository("Could not add the key", () =>
         call("Could not add the key", (client, clerkToken) =>
           client.addAlias({ clerkToken, ...input }),
         ),
       ),
     removeAlias: (input) =>
-      mutate("Could not remove the key", () =>
+      mutateRepository("Could not remove the key", () =>
         call("Could not remove the key", (client, clerkToken) =>
           client.removeAlias({ clerkToken, ...input }),
         ),

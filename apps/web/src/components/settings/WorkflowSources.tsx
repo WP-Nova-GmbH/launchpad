@@ -7,9 +7,11 @@ import { OwnerSources } from "../workflows/WorkflowOwnerSources";
 export function WorkflowSourcesSettings({
   organizationId,
   isAdmin,
+  repositoryRevision = 0,
 }: {
   organizationId: RelayOrganizationId;
   isAdmin: boolean;
+  repositoryRevision?: number;
 }) {
   const { isLoaded, userId } = useAuth();
   return (
@@ -22,6 +24,7 @@ export function WorkflowSourcesSettings({
           key={JSON.stringify([userId, organizationId])}
           accountId={userId}
           organizationId={organizationId}
+          repositoryRevision={repositoryRevision}
           settingsRow={SettingsRow}
         />
       ) : (

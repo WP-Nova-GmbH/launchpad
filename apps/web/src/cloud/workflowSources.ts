@@ -15,6 +15,7 @@ type Operation<A> = (
   token: string,
 ) => Effect.Effect<A, WorkflowSourceError | ManagedRelay.ManagedRelayClientError>;
 type SourceFailure = { message: string; code?: WorkflowSourceError["code"] | undefined };
+type RefreshOptions = { preserveMutationError?: boolean };
 const isSourceError = Schema.is(WorkflowSourceError);
 
 /** Mount under the current account and resource key. */
@@ -40,7 +41,8 @@ export function useWorkflowSources<T>(
     writing = useRef(false),
     uncertain = useRef(false);
   const [snapshot, setSnapshot] = useState<T | null>(null),
-    [failure, setFailure] = useState<SourceFailure | null>(null);
+    [readFailure, setReadFailure] = useState<SourceFailure | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(false),
     [readFailed, setReadFailed] = useState(false),
@@ -67,42 +69,51 @@ export function useWorkflowSources<T>(
     },
     [getToken, accountId],
   );
-  const load = useCallback(async () => {
-    const request = ++version.current;
-    readAbort.current?.abort();
-    const controller = new AbortController();
-    readAbort.current = controller;
-    setLoading(true);
-    try {
-      const result = await call(read, controller.signal);
-      if (live.current && identity.current === accountId && request === version.current) {
-        setSnapshot((previous) => (mergeSnapshot ? mergeSnapshot(previous, result) : result));
-        setFailure(null);
-        setReadFailed(false);
-        uncertain.current = false;
-        setUnverified(false);
-        return result;
+  const load = useCallback(
+    async (options?: RefreshOptions) => {
+      const preserveMutationError = options?.preserveMutationError;
+      const request = ++version.current;
+      readAbort.current?.abort();
+      const controller = new AbortController();
+      readAbort.current = controller;
+      setLoading(true);
+      try {
+        const result = await call(read, controller.signal);
+        if (live.current && identity.current === accountId && request === version.current) {
+          setSnapshot((previous) => (mergeSnapshot ? mergeSnapshot(previous, result) : result));
+          setReadFailure(null);
+          if (!preserveMutationError) setMutationError(null);
+          setReadFailed(false);
+          uncertain.current = false;
+          setUnverified(false);
+          return result;
+        }
+        return null;
+      } catch (cause) {
+        if (live.current && identity.current === accountId && request === version.current) {
+          const code = isSourceError(cause) ? cause.code : undefined;
+          if (WorkflowSources.accessRejected(cause) || discardSnapshotOnError?.(code))
+            setSnapshot(null);
+          setReadFailed(true);
+          setReadFailure({
+            code,
+            message: cause instanceof Error ? cause.message : "Could not load workflow sources.",
+          });
+          if (!preserveMutationError) setMutationError(null);
+        }
+        return null;
+      } finally {
+        if (live.current && request === version.current) setLoading(false);
       }
-      return null;
-    } catch (cause) {
-      if (live.current && identity.current === accountId && request === version.current) {
-        const code = isSourceError(cause) ? cause.code : undefined;
-        if (WorkflowSources.accessRejected(cause) || discardSnapshotOnError?.(code))
-          setSnapshot(null);
-        setReadFailed(true);
-        setFailure({
-          code,
-          message: cause instanceof Error ? cause.message : "Could not load workflow sources.",
-        });
-      }
-      return null;
-    } finally {
-      if (live.current && request === version.current) setLoading(false);
-    }
-  }, [call, read, accountId, mergeSnapshot, discardSnapshotOnError]);
-  const refresh = useCallback(async () => {
-    if (live.current && !writing.current) await load();
-  }, [load]);
+    },
+    [call, read, accountId, mergeSnapshot, discardSnapshotOnError],
+  );
+  const refresh = useCallback(
+    async (options?: RefreshOptions) => {
+      if (live.current && !writing.current) await load(options);
+    },
+    [load],
+  );
   useEffect(() => {
     void refresh();
     const focus = () => void refresh();
@@ -116,7 +127,8 @@ export function useWorkflowSources<T>(
     if (writing.current || uncertain.current) return null;
     writing.current = true;
     setBusy(true);
-    setFailure(null);
+    setReadFailure(null);
+    setMutationError(null);
     ++version.current;
     try {
       const result = await call(operation);
@@ -128,7 +140,7 @@ export function useWorkflowSources<T>(
       if (verified === null) {
         uncertain.current = true;
         setUnverified(true);
-        setFailure((previous) => previous ?? { message: "Refresh to verify this change." });
+        setReadFailure((previous) => previous ?? { message: "Refresh to verify this change." });
         return null;
       }
       return { result, snapshot: verified };
@@ -138,10 +150,12 @@ export function useWorkflowSources<T>(
         setUnverified(true);
         if (WorkflowSources.accessRejected(cause)) setSnapshot(null);
         await load();
-        if (live.current)
-          setFailure({
-            message: cause instanceof Error ? cause.message : "Refresh to verify this change.",
-          });
+        if (live.current && identity.current === accountId) {
+          setReadFailure(null);
+          setMutationError(
+            cause instanceof Error ? cause.message : "Refresh to verify this change.",
+          );
+        }
       }
       return null;
     } finally {
@@ -151,8 +165,8 @@ export function useWorkflowSources<T>(
   };
   return {
     snapshot,
-    error: failure?.message ?? null,
-    errorCode: failure?.code,
+    error: readFailure?.message ?? mutationError,
+    errorCode: readFailure?.code,
     busy,
     loading,
     readFailed,

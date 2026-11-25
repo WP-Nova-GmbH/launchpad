@@ -648,14 +648,54 @@ it.effect("mobile reads safe source health, refreshes stale status and clears re
   }),
 );
 
+const ownerSettings = (repositoryRevision = 0) => (
+  <WorkflowSourcesSettings
+    organizationId={RelayOrganizationId.make("org")}
+    isAdmin
+    repositoryRevision={repositoryRevision}
+  />
+);
 const mountOwner = async () => {
   await act(async () => {
-    renderer = create(
-      <WorkflowSourcesSettings organizationId={RelayOrganizationId.make("org")} isAdmin />,
-    );
+    renderer = create(ownerSettings());
   });
   await drain();
 };
+it.effect(
+  "refreshes the Linear repository picker when the organization registers a repository",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        fixture.owner = {
+          ...fixture.owner,
+          connections: [source],
+          repositories: [{ repositoryId: "repo", organizationId: "org", name: "Existing repo" }],
+        };
+        await mountOwner();
+        const picker = () => renderer.root.findByProps({ "data-picker": true });
+        const optionLabels = () =>
+          renderer.root.findAllByProps({ role: "option" }).map(textContent);
+        await act(() => picker().props.onValueChange("repo"));
+        expect(optionLabels()).toEqual(["Existing repo"]);
+
+        fixture.owner = {
+          ...fixture.owner,
+          repositories: [
+            ...fixture.owner.repositories,
+            { repositoryId: "new-repo", organizationId: "org", name: "New repo" },
+          ],
+        };
+        await act(() => renderer.update(ownerSettings(1)));
+        await drain();
+
+        expect(optionLabels()).toEqual(["Existing repo", "New repo"]);
+        expect(textContent(renderer.root.findByProps({ "data-picker-value": true }))).toBe(
+          "Existing repo",
+        );
+      });
+    }),
+);
 const openOwnerActions = () => click(`Linear connection actions for ${source.workspaceName}`);
 const refreshOwner = async () => {
   if (button("Retry connections")) await click("Retry connections");
@@ -671,6 +711,75 @@ const click = async (label: string) => {
   });
   await drain();
 };
+it.effect("keeps a rejected Linear grant visible while refreshing repository options", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      fixture.owner = {
+        ...fixture.owner,
+        connections: [source],
+        repositories: [{ repositoryId: "repo", organizationId: "org", name: "Existing repo" }],
+      };
+      await mountOwner();
+      const picker = () => renderer.root.findByProps({ "data-picker": true });
+      await act(() => picker().props.onValueChange("repo"));
+
+      let markGrantStarted!: () => void;
+      const grantStarted = new Promise<void>((resolve) => {
+        markGrantStarted = resolve;
+      });
+      let resolveGrant!: (response: Response) => void;
+      const grantResponse = new Promise<Response>((resolve) => {
+        resolveGrant = resolve;
+      });
+      fixture.fetch.mockImplementationOnce((input, init) => {
+        const request = new Request(input, init);
+        expect(request.method).toBe("POST");
+        expect(new URL(request.url).pathname).toBe("/v1/repositories/repo/workflow-sources/allow");
+        markGrantStarted();
+        return grantResponse;
+      });
+      await act(async () => {
+        button("Allow repository").props.onClick();
+        await grantStarted;
+      });
+
+      fixture.owner = {
+        ...fixture.owner,
+        repositories: [
+          ...fixture.owner.repositories,
+          { repositoryId: "new-repo", organizationId: "org", name: "New repo" },
+        ],
+      };
+      await act(() => renderer.update(ownerSettings(1)));
+      resolveGrant(
+        Response.json(
+          { _tag: "WorkflowSourceError", code: "conflict", message: "Linear grant was rejected." },
+          { status: 400 },
+        ),
+      );
+      await drain();
+      expect(words()).toContain("New repo");
+      expect(words()).toContain("Linear grant was rejected.");
+
+      fixture.failRead = true;
+      await act(() => renderer.update(ownerSettings(2)));
+      await drain();
+      expect(words()).toContain("Showing last available status.");
+      expect(picker().props.disabled).toBe(true);
+
+      fixture.failRead = false;
+      await act(() => renderer.update(ownerSettings(3)));
+      await drain();
+      expect(words()).not.toContain("Showing last available status.");
+      expect(words()).toContain("Linear grant was rejected.");
+      expect(picker().props.disabled).toBe(false);
+
+      await click("Retry connections");
+      expect(words()).not.toContain("Linear grant was rejected.");
+    });
+  }),
+);
 it.effect("keeps repository access visible and routes admins to reconnect Linear", () =>
   Effect.gen(function* () {
     yield* serveRequests;

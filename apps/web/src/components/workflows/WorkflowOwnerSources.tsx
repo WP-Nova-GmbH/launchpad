@@ -7,7 +7,7 @@ import {
   type WorkflowSourceOwner,
   type WorkflowSourceAuthorization,
 } from "@t3tools/contracts/relay";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { EllipsisIcon, RefreshCwIcon } from "lucide-react";
 import { useWorkflowSources } from "../../cloud/workflowSources";
 import { randomUUID } from "../../lib/utils";
@@ -70,10 +70,12 @@ function repositoryGrantLabels(
 export function OwnerSources({
   accountId,
   organizationId,
+  repositoryRevision = 0,
   settingsRow: SettingsRow,
 }: {
   accountId: string;
   organizationId: RelayOrganizationId;
+  repositoryRevision?: number;
   settingsRow?: typeof OrganizationSettingsRow;
 }) {
   const read = useCallback(
@@ -81,6 +83,13 @@ export function OwnerSources({
     [organizationId],
   );
   const state = useWorkflowSources<WorkflowSourceOwner>(accountId, read);
+  const { busy, refresh } = state;
+  const lastRepositoryRevision = useRef(repositoryRevision);
+  useEffect(() => {
+    if (busy || lastRepositoryRevision.current === repositoryRevision) return;
+    lastRepositoryRevision.current = repositoryRevision;
+    void refresh({ preserveMutationError: true });
+  }, [busy, refresh, repositoryRevision]);
   const [authorization, setAuthorization] =
     useState<WorkflowSourceAuthorization["authorization"]>(null);
   const snapshot = state.snapshot,

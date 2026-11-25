@@ -1832,6 +1832,7 @@ function ConfiguredOrganizationSettings() {
             <WorkflowSourcesSettings
               organizationId={state.snapshot.membership.organization.organizationId}
               isAdmin={state.snapshot.membership.role === "admin"}
+              repositoryRevision={state.repositoryRevision}
             />
           ) : null}
           {state.snapshot && state.snapshot.membership.userId === userId ? (
