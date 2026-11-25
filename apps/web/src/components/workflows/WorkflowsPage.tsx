@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { useAtomValue } from "@effect/atom-react";
 import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
@@ -9,7 +9,6 @@ import {
   CopyIcon,
   EllipsisIcon,
   ChevronRightIcon,
-  PencilIcon,
   PlayIcon,
   RefreshCwIcon,
   CloudIcon,
@@ -18,7 +17,7 @@ import {
 } from "lucide-react";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
-import { useLocation, useNavigate, useParams, useSearch } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { useEffect, useLayoutEffect, useState, useCallback, useRef } from "react";
 import {
   RelayRepositoryId,
@@ -88,6 +87,35 @@ import {
 import { updateWorkflowDrafts } from "@t3tools/client-runtime/relay/workflow-session";
 
 type WorkflowView = "catalog" | "builder" | "run" | "job";
+
+function openWorkflowEditorFromRow(event: MouseEvent<HTMLLIElement>) {
+  const { currentTarget: row, target } = event;
+  if (
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey ||
+    !(target instanceof Element) ||
+    !row.contains(target) ||
+    target.closest('a, button, [role="alert"], [data-workflow-row-actions]')
+  ) {
+    return;
+  }
+
+  const selection = row.ownerDocument.getSelection();
+  if (
+    selection &&
+    !selection.isCollapsed &&
+    selection.rangeCount > 0 &&
+    selection.getRangeAt(0).intersectsNode(row)
+  ) {
+    return;
+  }
+
+  row.querySelector<HTMLAnchorElement>("[data-workflow-edit-link]")?.click();
+}
 
 // Create and Edit share the mounted editor when the first save promotes the route.
 export function WorkflowEditorPage() {
@@ -388,7 +416,7 @@ function WorkflowRepositoryView({
   const [restoreNotice, setRestoreNotice] = useState("");
   const [restoreFocusId, setRestoreFocusId] = useState<string | null>(null);
   const restoreFocus = useRef<HTMLButtonElement | null>(null);
-  const restoredWorkflowEdit = useRef<HTMLButtonElement>(null);
+  const restoredWorkflowEdit = useRef<HTMLAnchorElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [codexRefreshVersion, setCodexRefreshVersion] = useState(0);
@@ -805,7 +833,7 @@ function WorkflowRepositoryView({
     if (!entries.length) return null;
 
     return (
-      <div className="grid gap-x-4 @min-[34rem]/workflow-catalog:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_12rem]">
+      <div className="grid gap-x-4 @min-[34rem]/workflow-catalog:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_clamp(11rem,25%,13rem)]">
         <div
           aria-hidden
           className="col-span-full hidden grid-cols-subgrid border-b pb-2 text-xs text-muted-foreground @min-[34rem]/workflow-catalog:grid"
@@ -823,7 +851,7 @@ function WorkflowRepositoryView({
             const local = drafts.editors[key];
             const editorDirty = !!local && workflowEditorDirty(local);
             const runDraft = drafts.runs[key];
-            const { name, steps, target } = workflow.definition;
+            const { name, target } = workflow.definition;
             const machineProject =
               target.kind === "machine"
                 ? projects.find(
@@ -883,19 +911,40 @@ function WorkflowRepositoryView({
             return (
               <li
                 key={workflow.workflowId}
-                className="col-span-full grid grid-cols-subgrid items-start gap-y-3 border-b py-3 last:border-b-0"
+                className={cn(
+                  "relative col-span-full grid grid-cols-subgrid items-start gap-y-3 border-b py-3 last:border-b-0",
+                  canConfigure && "cursor-pointer hover:bg-accent/35",
+                )}
+                onClick={canConfigure ? openWorkflowEditorFromRow : undefined}
               >
                 <div className="min-w-0 space-y-1 wrap-anywhere">
-                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                    <p className="text-sm font-medium">{name}</p>
+                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 @min-[34rem]/workflow-catalog:pt-1.5 sm:@min-[34rem]/workflow-catalog:pt-1">
+                    {canConfigure ? (
+                      <Link
+                        to="/workflows/$repositoryId/$workflowId/edit"
+                        params={{
+                          repositoryId: scope.repositoryId,
+                          workflowId: workflow.workflowId,
+                        }}
+                        aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
+                        className="text-sm font-medium before:pointer-events-none before:absolute before:inset-0 before:rounded-sm focus-visible:outline-none focus-visible:before:ring-2 focus-visible:before:ring-ring focus-visible:before:ring-inset"
+                        data-workflow-edit-link
+                        ref={
+                          !archived && restoreFocusId === workflow.workflowId
+                            ? restoredWorkflowEdit
+                            : undefined
+                        }
+                      >
+                        {name}
+                      </Link>
+                    ) : (
+                      <p className="text-sm font-medium">{name}</p>
+                    )}
                     {editorDirty ? (
                       <span className="text-xs text-muted-foreground">Unsaved changes</span>
                     ) : null}
                   </div>
                   <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                    <span>
-                      {steps.length} {steps.length === 1 ? "step" : "steps"}
-                    </span>
                     {target.kind === "vm" ? (
                       <>
                         <span className="inline-flex items-center gap-1.5">
@@ -935,7 +984,11 @@ function WorkflowRepositoryView({
                   ) : null}
                 </div>
                 <div className="min-w-0 space-y-1 wrap-anywhere">
-                  <div role="status" aria-atomic="true" className="space-y-1">
+                  <div
+                    role="status"
+                    aria-atomic="true"
+                    className="space-y-1 @min-[34rem]/workflow-catalog:pt-1.5 sm:@min-[34rem]/workflow-catalog:pt-1"
+                  >
                     <p
                       className={
                         triggerState === "needs_attention"
@@ -956,7 +1009,7 @@ function WorkflowRepositoryView({
                     ) : null}
                   </div>
                   {!archived && local?.error ? (
-                    <div role="alert" className="text-xs">
+                    <div role="alert" className="cursor-auto text-xs">
                       <p className="font-medium text-error-foreground">
                         Workflow change not confirmed
                       </p>
@@ -966,9 +1019,9 @@ function WorkflowRepositoryView({
                   {!archived &&
                   canConfigure &&
                   (triggerIssue || triggerState === "needs_attention") ? (
-                    <div className="pt-1">
+                    <div className="w-fit pt-1">
                       <Button
-                        variant="outline"
+                        variant="ghost"
                         size="compact"
                         aria-label={`Trigger settings for ${name}`}
                         onClick={() => setupTrigger(workflow)}
@@ -978,35 +1031,14 @@ function WorkflowRepositoryView({
                     </div>
                   ) : null}
                 </div>
-                <div className="flex min-w-0 flex-wrap items-center gap-1 pointer-coarse:gap-4 @min-[34rem]/workflow-catalog:justify-end">
-                  {canConfigure ? (
-                    <Button
-                      variant="ghost"
-                      size="compact"
-                      aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
-                      ref={
-                        !archived && restoreFocusId === workflow.workflowId
-                          ? restoredWorkflowEdit
-                          : undefined
-                      }
-                      onClick={() =>
-                        navigate({
-                          to: "/workflows/$repositoryId/$workflowId/edit",
-                          params: {
-                            repositoryId: scope.repositoryId,
-                            workflowId: workflow.workflowId,
-                          },
-                        })
-                      }
-                    >
-                      <PencilIcon aria-hidden />
-                      {editorDirty ? "Resume editing" : "Edit"}
-                    </Button>
-                  ) : null}
+                <div
+                  data-workflow-row-actions
+                  className="flex w-fit min-w-0 max-w-full cursor-auto flex-wrap items-center gap-2 empty:hidden pointer-coarse:gap-4 @min-[34rem]/workflow-catalog:justify-end @min-[34rem]/workflow-catalog:justify-self-end [&>button]:max-w-full"
+                >
                   {archived && canConfigure ? (
                     <Button
                       variant="outline"
-                      size="compact"
+                      size="sm"
                       aria-label={
                         local?.operation?.state === "pending"
                           ? `Saving ${name}`
@@ -1028,8 +1060,8 @@ function WorkflowRepositoryView({
                   ) : null}
                   {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
                     <Button
-                      variant="outline"
-                      size="compact"
+                      variant="ghost"
+                      size="sm-multiline"
                       aria-label={`${runLabel} for ${name}`}
                       onClick={() =>
                         navigate({
@@ -1107,14 +1139,14 @@ function WorkflowRepositoryView({
                   ) : null}
                 </div>
                 {archived && local?.error ? (
-                  <div className="col-span-full">
+                  <div className="col-span-full cursor-auto">
                     <WorkflowAlert title="Workflow change not confirmed">
                       {local.error}
                     </WorkflowAlert>
                   </div>
                 ) : null}
                 {canConfigure && restoreBlocked ? (
-                  <div id={restoreHint} className="col-span-full">
+                  <div id={restoreHint} className="col-span-full cursor-auto">
                     <WorkflowAlert
                       title={
                         restoreIssue === "unavailable"

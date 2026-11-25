@@ -60,6 +60,7 @@ const fixture = vi.hoisted(() => ({
   refreshCatalog: vi.fn<() => void | Promise<void>>(),
   codexStatus: vi.fn<() => Promise<"connected" | "disconnected" | "reconnect_required">>(),
   realDepartureGuard: false,
+  organizationRole: "admin" as "admin" | "member",
   tab: "runs",
   workflowId: undefined as string | undefined,
   jobId: undefined as string | undefined,
@@ -94,6 +95,15 @@ vi.mock("@tanstack/react-router", async () => {
     await vi.importActual<typeof import("@tanstack/react-router")>("@tanstack/react-router");
   return {
     ...router,
+    Link: (props: ComponentProps<typeof router.Link>) => {
+      if (fixture.realDepartureGuard) return createElement(router.Link, props);
+      const { to, params, ...attributes } = props;
+      const values = typeof params === "object" ? params : {};
+      const href = to?.replace(/\$(\w+)/gu, (_, key: string) =>
+        encodeURIComponent(String((values as Record<string, string>)[key] ?? "")),
+      );
+      return createElement("a", { ...attributes, href });
+    },
     useNavigate: () => fixture.navigate,
     useLocation: ({
       select,
@@ -135,6 +145,7 @@ vi.mock("../../cloud/managedRelayState", () => ({
         ? undefined
         : {
             ...catalog,
+            membership: { ...catalog.membership, role: fixture.organizationRole },
             repositories: fixture.repositories ?? catalog.repositories,
             projects: fixture.projects,
             ...(fixture.projectsUnavailable ? { projectsUnavailable: true } : {}),
@@ -460,6 +471,8 @@ const buttons = (label: string) =>
         node.children.filter((child) => typeof child === "string").join("") === label,
     );
 const button = (label: string) => buttons(label)[0]!;
+const editorLink = (label: string) =>
+  renderer!.root.findAllByType("a").find((node) => node.props["aria-label"] === label);
 async function press(label: string, waitForReads = true) {
   const before = deliveries.length;
   await act(async () => {
@@ -504,6 +517,7 @@ beforeEach(() => {
   fixture.codexStatus.mockReset().mockResolvedValue("connected");
   fixture.save.mockReset();
   fixture.realDepartureGuard = false;
+  fixture.organizationRole = "admin";
   fixture.tab = "runs";
   fixture.workflowId = undefined;
   fixture.jobId = undefined;
@@ -886,6 +900,38 @@ it.effect.each([true, false])(
     }),
 );
 
+it.effect.each(["maintainer", "developer"] as const)(
+  "keeps workflow editing and running separate for a repository %s",
+  (role) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.organizationRole = "member";
+        fixture.repositories = [{ ...catalog.repositories[0]!, role }];
+        fixture.definitions.mockResolvedValue([workflow]);
+        await mountCatalog();
+
+        const name = workflow.definition.name;
+        const title = editorLink(`Edit ${name}`);
+        expect(content()).toContain(name);
+        expect(button(`Edit ${name}`)).toBeUndefined();
+        if (role === "maintainer") {
+          expect(title?.props.href).toBe(`/workflows/repository/${workflow.workflowId}/edit`);
+          expect(title?.children).toContain(name);
+        } else {
+          expect(title).toBeUndefined();
+        }
+
+        await press(`Run for ${name}`);
+        expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/workflows/$repositoryId/$workflowId/run",
+          params: { repositoryId, workflowId: workflow.workflowId },
+        });
+      });
+    }),
+);
+
 it.effect("keeps automatic triggering off and retains its rule when restoring a workflow", () =>
   Effect.gen(function* () {
     yield* serve;
@@ -910,7 +956,7 @@ it.effect("keeps automatic triggering off and retains its rule when restoring a 
       const focusRestoredEdit = vi.fn();
       await mountCatalog("catalog", {
         createNodeMock: (element) =>
-          element.type === "button" &&
+          element.type === "a" &&
           (element.props as { "aria-label"?: string })["aria-label"] === "Edit Archived review"
             ? { focus: focusRestoredEdit }
             : null,
@@ -1518,7 +1564,18 @@ it.effect("keeps later draft edits when a save retry succeeds during departure",
       expect(router.history.location.pathname).toBe("/workflows/repository");
       expect(button("Resume draft")).toBeUndefined();
 
-      await press("Resume editing Release checklist");
+      const resume = editorLink("Resume editing Release checklist")!;
+      expect(resume.props.href).toBe(`/workflows/repository/${saved.workflowId}/edit`);
+      await act(async () => {
+        resume.props.onClick({
+          button: 0,
+          currentTarget: { getAttribute: () => null },
+          preventDefault() {},
+        });
+      });
+      await act(async () => {
+        await Promise.all(deliveries);
+      });
       expect(router.history.location.pathname).toBe(
         `/workflows/repository/${saved.workflowId}/edit`,
       );
