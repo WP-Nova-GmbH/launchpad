@@ -23,7 +23,12 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import {
+  RelayMachineId,
+  RelayRepositoryId,
+  type RelayOrganizationProject,
+} from "@t3tools/contracts/relay";
+import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import { managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
@@ -49,6 +54,7 @@ import {
   setWorkflowSessionAccount,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { AppAtomRegistryProvider, appAtomRegistry } from "../../rpc/atomRegistry";
+import { __setClientSettingsForTests, persistClientSettingsPatch } from "../../hooks/useSettings";
 import type { WorkflowRunsReturn } from "./workflowRunsNavigation";
 
 const fixture = vi.hoisted(() => ({
@@ -112,7 +118,10 @@ vi.mock("../../diffPanelStore", () => ({
 vi.mock("../../rightPanelStore", () => ({
   useRightPanelStore: { getState: () => ({ open: fixture.panel }) },
 }));
-vi.mock("../../lib/runtime", () => ({ runtime: {} }));
+vi.mock("../../lib/runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/runtime")>()),
+  runtime: {},
+}));
 vi.mock("./workflowState", async () => ({
   ...(await vi.importActual("./workflowState")),
   useWorkflowClient: () => fixture.call,
@@ -256,12 +265,13 @@ const view = (
   canConfigure = true,
   organizationAdmin = false,
   workflowScope = scope,
+  projects: readonly RelayOrganizationProject[] = [],
 ) => (
   <AppAtomRegistryProvider>
     <WorkflowJob
       scope={workflowScope}
       jobId={jobId}
-      projects={[]}
+      projects={projects}
       canConfigure={canConfigure}
       organizationAdmin={organizationAdmin}
       refreshCatalog={fixture.refreshCatalog}
@@ -297,6 +307,7 @@ const headerStatus = () =>
     .findAllByType("header")
     .flatMap((header) => header.findAllByType("span"))
     .find((span) => span.props.role === "status")!;
+const runContext = () => renderer!.root.findByProps({ "aria-label": "Run context" });
 function conversationOpeningIsBlocked() {
   const button = findButton("Opening conversation…") ?? findButton("Open conversation");
   return button.props.disabled === true || button.props["aria-disabled"] === true;
@@ -320,6 +331,7 @@ async function pollRun() {
   await act(() => poll());
 }
 beforeEach(() => {
+  __setClientSettingsForTests(DEFAULT_CLIENT_SETTINGS);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("window", {
     setInterval: vi.fn(),
@@ -386,6 +398,68 @@ it.each([
         : { scopeKey, view: "active", row: null, loadedCount: 0, scrollTop: 0 },
     },
   });
+});
+
+it("keeps Machine context when a completed run's checkout leaves the catalog", async () => {
+  const manual = {
+    ...job,
+    origin: { kind: "manual", userId: scope.accountId },
+    createdAt: "2026-10-27T13:00:00.000Z",
+  } satisfies RepositoryWorkflowJob;
+  const checkout = {
+    environmentId: EnvironmentId.make("original"),
+    projectId: ProjectId.make("project"),
+    machineId: RelayMachineId.make("studio"),
+    machineLabel: "Studio Mac",
+    title: "Launchpad",
+    repositoryCanonicalKey: null,
+    createdAt: manual.createdAt,
+    updatedAt: manual.createdAt,
+    catalogUpdatedAt: manual.createdAt,
+  } satisfies RelayOrganizationProject;
+  const other = {
+    ...checkout,
+    environmentId: EnvironmentId.make("other"),
+    machineLabel: "Other Mac",
+  };
+  fixture.call.mockResolvedValue(manual);
+  await act(() => {
+    renderer = create(view("job", true, false, scope, [other, checkout]));
+  });
+
+  expect(text(runContext())).toContain("Manual");
+  expect(text(runContext())).toContain("Studio Mac");
+  expect(text(runContext())).toContain("Checkout  Launchpad");
+  expect(text(runContext())).not.toContain("Other Mac");
+  expect(text(runContext().findByType("time"))).toBe(
+    new Date(manual.createdAt).toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }),
+  );
+
+  await act(() => renderer!.update(view("job", true, false, scope, [other])));
+  expect(text(runContext())).toContain("Machine");
+  expect(text(runContext())).toContain("Checkout details unavailable");
+  expect(text(runContext())).not.toContain("Other Mac");
+  expect(text(runContext())).not.toContain("Studio Mac");
+});
+
+it("keeps the full submission date when the Time format setting changes", async () => {
+  const date = new Date(2026, 9, 27, 15, 44);
+  fixture.call.mockResolvedValue({ ...job, createdAt: date.toISOString() });
+  __setClientSettingsForTests({ ...DEFAULT_CLIENT_SETTINGS, timestampFormat: "12-hour" });
+  await mount();
+
+  const submitted = () => text(runContext().findByType("time"));
+  expect(submitted()).toBe(
+    date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short", hour12: true }),
+  );
+
+  await act(() => persistClientSettingsPatch({ timestampFormat: "24-hour" }, async () => {}));
+  expect(submitted()).toBe(
+    date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short", hour12: false }),
+  );
 });
 
 describe("successful run outcome", () => {
@@ -2635,6 +2709,8 @@ describe("workflow run presentation", () => {
       renderer!.root.findByProps({ "aria-label": "Linear issue" }).findByProps({ role: "status" });
     const initialStatus = issueStatus();
     expect(initialStatus.children).toEqual(["Waiting to capture Linear issue details"]);
+    expect(text(runContext())).toContain("Trigger Linear");
+    expect(text(runContext())).toContain("Workflow VM");
     expect(content()).toContain("Title from the trigger");
     expect(content()).toContain("Waiting to capture");
     expect(content()).not.toContain("Run instructions");
@@ -3963,6 +4039,7 @@ describe("queued workflow recovery", () => {
     await mount(false);
 
     const content = text(renderer!.toJSON());
+    expect(text(runContext())).toContain("Workflow VM");
     expect(content).toContain("Waiting for a VM slot");
     expect(content).not.toContain("Waiting for execution");
     expect(content).not.toContain("Waiting for an execution target");
@@ -4068,6 +4145,8 @@ describe("queued workflow recovery", () => {
       fixture.call.mockResolvedValue(run);
       await mount();
       const status = headerStatus();
+      expect(text(runContext())).toContain("Pending");
+      expect(text(runContext())).not.toContain("Checkout details unavailable");
 
       fixture.call.mockResolvedValue({
         ...run,

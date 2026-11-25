@@ -20,7 +20,8 @@ import {
   SquareIcon,
 } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
-import { formatRelativeTimeLabel } from "../../timestampFormat";
+import { formatAbsoluteTimestamp } from "../../timestampFormat";
+import { useClientSettings } from "../../hooks/useSettings";
 import { WorkflowAlert } from "./WorkflowAlert";
 import { WorkflowOutcome } from "./WorkflowOutcome";
 import {
@@ -340,6 +341,7 @@ export function WorkflowJob({
   organizationAdmin: boolean;
   refreshCatalog: () => void;
 }) {
+  const timestampFormat = useClientSettings((settings) => settings.timestampFormat);
   const navigate = useNavigate();
   const { history } = useRouter();
   const returningToReview = useLocation({ select: ({ hash }) => hash === WORKFLOW_REVIEW_ANCHOR });
@@ -1252,6 +1254,19 @@ export function WorkflowJob({
   const runOrigin = selectedJob.origin?.kind ?? selectedJob.originSummary?.kind;
   const manualRun = runOrigin === "manual" || (runOrigin === undefined && !runIssue);
   const vmRun = vmReview || !!selectedJob.vmAdmission;
+  const triggerLabel = manualRun
+    ? "Manual"
+    : selectedJob.origin?.kind === "automation" || runIssue
+      ? "Linear"
+      : "Automatic";
+  const targetLabel = machine
+    ? (target?.machineLabel ?? "Machine")
+    : vmRun
+      ? "Workflow VM"
+      : terminal
+        ? "Unknown"
+        : "Pending";
+  const submittedAt = formatAbsoluteTimestamp(selectedJob.createdAt, timestampFormat);
   const runInstructions = manualRun ? (
     <WorkflowRunInstructions key={`instructions:${key}`} instruction={selectedJob.instruction} />
   ) : null;
@@ -1679,32 +1694,51 @@ export function WorkflowJob({
             ) : null}
           </div>
         </div>
+        <dl
+          aria-label="Run context"
+          className="mt-3 grid grid-cols-2 gap-x-5 gap-y-2 border-b pb-3 text-sm sm:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)]"
+        >
+          <div>
+            <dt className="text-xs text-muted-foreground">Trigger</dt>
+            <dd className="mt-0.5 font-medium">{triggerLabel}</dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">{target ? "Machine" : "Target"}</dt>
+            <dd className="mt-0.5">
+              <span className="flex items-start gap-1.5 font-medium">
+                {machine ? (
+                  <MonitorIcon
+                    aria-hidden
+                    className="mt-1 size-3.5 shrink-0 text-muted-foreground"
+                  />
+                ) : vmRun ? (
+                  <CloudIcon aria-hidden className="mt-1 size-3.5 shrink-0 text-muted-foreground" />
+                ) : null}
+                <span>{targetLabel}</span>
+              </span>
+              {target ? (
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Checkout <span className="font-medium text-foreground">{target.title}</span>
+                </span>
+              ) : machine ? (
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Checkout details unavailable
+                </span>
+              ) : null}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-muted-foreground">Submitted</dt>
+            <dd className="mt-0.5 font-medium">
+              {submittedAt ? (
+                <time dateTime={selectedJob.createdAt}>{submittedAt}</time>
+              ) : (
+                "Unknown"
+              )}
+            </dd>
+          </div>
+        </dl>
         {!manualRun ? <WorkflowIssueDetails key={key} job={selectedJob} /> : null}
-        {selectedJob.origin?.kind === "automation" ? (
-          <p className="mt-1 text-xs text-muted-foreground">Started by workflow</p>
-        ) : null}
-        <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-muted-foreground">
-          <span className="flex min-w-0 items-center gap-1.5">
-            {!target && (selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm") ? (
-              <CloudIcon aria-hidden className="size-3.5 shrink-0" />
-            ) : (
-              <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
-            )}
-            <span>
-              {target
-                ? target.machineLabel + (selectedJob.workflow ? " / " + target.title : "")
-                : selectedJob.vmAdmission || selectedJob.runtime?.kind === "vm"
-                  ? "Workflow VM"
-                  : "Organization execution target"}
-            </span>
-          </span>
-          <Tooltip>
-            <TooltipTrigger render={<time dateTime={selectedJob.createdAt} />}>
-              Submitted {formatRelativeTimeLabel(selectedJob.createdAt)}
-            </TooltipTrigger>
-            <TooltipPopup>{new Date(selectedJob.createdAt).toLocaleString()}</TooltipPopup>
-          </Tooltip>
-        </div>
       </header>
       {read.error && !showReviewCheck ? (
         <WorkflowAlert
