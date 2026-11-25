@@ -197,15 +197,100 @@ export const workflowSourceCallbackRoute = HttpRouter.add(
       }),
     );
     if (outcome) yield* wakeWorkflows();
+
+    const title = outcome ? "Linear connected" : "Linear connection not confirmed";
+    const instruction = outcome
+      ? "Switch back to Launchpad to manage repository access in"
+      : "Switch back to Launchpad to check the connection status in";
     return HttpServerResponse.text(
-      `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Workflow source · Launchpad</title><body><h1>${outcome ? "Linear connected" : "Linear was not connected"}</h1><p>Return to Organization settings in Launchpad and refresh the connection status. You can close this tab.</p></body></html>`,
+      `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>${title} · Launchpad</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        background: #fcfcfc;
+        color: #27272a;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        --muted: #595962;
+        --success: #167648;
+        --success-background: #edf7f1;
+        --warning: #a04c16;
+        --warning-background: #fff3e8;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          background: #0a0a0a;
+          color: #f5f5f5;
+          --muted: #a3a3a3;
+          --success: #79cba0;
+          --success-background: #15251c;
+          --warning: #e6a873;
+          --warning-background: #2b2017;
+        }
+      }
+      body {
+        display: grid;
+        min-height: 100vh;
+        min-height: 100svh;
+        margin: 0;
+        place-items: center;
+      }
+      main {
+        box-sizing: border-box;
+        width: min(100%, 26rem);
+        padding: 2rem 1.5rem;
+        text-align: center;
+      }
+      .brand { margin: 0 0 1.5rem; color: var(--muted); font-size: .8125rem; font-weight: 500; }
+      .status {
+        display: grid;
+        place-items: center;
+        width: 2.75rem;
+        height: 2.75rem;
+        margin: 0 auto .875rem;
+        border-radius: 50%;
+        background: var(--success-background);
+        color: var(--success);
+      }
+      .status::after {
+        content: "";
+        width: 1rem;
+        height: .5rem;
+        border-left: 2px solid currentColor;
+        border-bottom: 2px solid currentColor;
+        transform: translateY(-2px) rotate(-45deg);
+      }
+      .status.warning { background: var(--warning-background); color: var(--warning); }
+      .status.warning::after { content: "!"; width: auto; height: auto; border: 0; transform: none; font-size: 1.5rem; }
+      h1 { margin: 0; font-size: clamp(1.5rem, 4.5vw, 1.75rem); line-height: 1.2; letter-spacing: -.025em; font-weight: 500; }
+      .instruction { margin: .6875rem 0 0; color: var(--muted); font-size: .875rem; line-height: 1.6; text-wrap: pretty; }
+      .instruction strong { color: CanvasText; font-weight: 500; }
+      .hint { margin: 1.1875rem 0 0; color: var(--muted); font-size: .75rem; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <main aria-labelledby="title">
+      <p class="brand">Launchpad</p>
+      <div class="status${outcome ? "" : " warning"}" aria-hidden="true"></div>
+      <h1 id="title">${title}</h1>
+      <p class="instruction">${instruction} <strong>Organization settings → Workflow sources</strong>.</p>
+      <p class="hint">You can close this tab.</p>
+    </main>
+  </body>
+</html>`,
       {
         status: outcome ? 200 : 400,
         contentType: "text/html; charset=utf-8",
         headers: {
           "cache-control": "no-store",
           "referrer-policy": "no-referrer",
-          "content-security-policy": "default-src 'none'; frame-ancestors 'none'",
+          "content-security-policy":
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
         },
       },
     );
