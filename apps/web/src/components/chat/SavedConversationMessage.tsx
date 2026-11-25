@@ -4,6 +4,7 @@ import { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { OrchestrationMessage, ChatAttachment } from "@t3tools/contracts";
+import { parseTimestampDate } from "../../timestampFormat";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
 
@@ -17,13 +18,36 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
   message,
   busy,
   attachmentDownloads,
+  viewerAccountId,
+  timeZone,
   onDownload,
 }: {
   message: OrchestrationMessage;
   busy: boolean;
   attachmentDownloads?: ReadonlyMap<string, AttachmentDownloadState>;
+  viewerAccountId?: string;
+  timeZone?: string;
   onDownload: (file: ChatAttachment) => Promise<void>;
 }) {
+  const isUser = message.role === "user";
+  const workflowTranscript = viewerAccountId !== undefined;
+  const workflowPrompt =
+    workflowTranscript && isUser && message.workflowOrigin?.kind === "automation";
+  const roleLabel = isUser ? "You" : message.role === "system" ? "System" : "Assistant";
+  let authorLabel = message.author?.displayName ?? roleLabel;
+  if (workflowTranscript) {
+    authorLabel = roleLabel;
+    if (workflowPrompt) authorLabel = "Workflow";
+    else if (isUser && message.author?.userId !== viewerAccountId)
+      authorLabel = message.author?.displayName ?? "Unknown author";
+  }
+  const messageClass = workflowPrompt
+    ? "border-s-2 border-border/60 ps-3"
+    : isUser
+      ? "ml-6 rounded-xl bg-muted/40 px-4 py-3"
+      : "px-1";
+
+  const sentAt = parseTimestampDate(message.createdAt);
   const body = (
     <>
       <div className="break-words text-sm leading-relaxed [&_p]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-muted [&_pre]:p-3 [&_code]:font-mono [&_a]:text-primary [&_a]:underline [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5">
@@ -110,21 +134,19 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
     </>
   );
   return (
-    <article className={message.role === "user" ? "ml-6 rounded-xl bg-muted/40 px-4 py-3" : "px-1"}>
+    <article className={messageClass}>
       <div className="mb-1 flex flex-wrap items-baseline gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        <span className="font-medium text-foreground">
-          {message.author?.displayName ??
-            (message.role === "user" ? "You" : message.role === "system" ? "System" : "Assistant")}
-        </span>
-        <time
-          dateTime={message.createdAt}
-          aria-label={new Date(message.createdAt).toLocaleString()}
-        >
-          {new Date(message.createdAt).toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          })}
-        </time>
+        <span className="font-medium text-foreground">{authorLabel}</span>
+        {sentAt ? (
+          <time
+            dateTime={message.createdAt}
+            aria-label={sentAt.toLocaleString(undefined, { timeZone })}
+          >
+            {sentAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZone })}
+          </time>
+        ) : (
+          <span>Time unavailable</span>
+        )}
       </div>
       {message.role === "reasoning" ? (
         <details className="text-muted-foreground">

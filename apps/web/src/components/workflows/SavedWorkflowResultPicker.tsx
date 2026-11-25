@@ -1,7 +1,8 @@
 import type { WorkflowSavedResult } from "@t3tools/contracts/workflows";
 import { CheckIcon, ChevronDownIcon, HistoryIcon } from "lucide-react";
-import { useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+import { useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
+import { parseTimestampDate } from "../../timestampFormat";
 import { Button } from "../ui/button";
 import {
   Combobox,
@@ -14,17 +15,11 @@ import {
   ComboboxTrigger,
 } from "../ui/combobox";
 
-const savedTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
 const outcomes = { completed: "Completed", failed: "Failed", cancelled: "Canceled" };
 const pageStatus = {
   loading: "Loading older results…",
   failed: "Couldn’t load older results",
   retrying: "Retrying…",
-};
-
-const formatSavedTime = (timestamp: string) => {
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime()) ? "Save time unavailable" : savedTime.format(date);
 };
 
 function pickerOwnsFocus(trigger: HTMLButtonElement | null, popup: HTMLDivElement | null) {
@@ -35,6 +30,7 @@ function pickerOwnsFocus(trigger: HTMLButtonElement | null, popup: HTMLDivElemen
 export function SavedWorkflowResultPicker({
   results,
   selected,
+  timeZone,
   currentReview,
   stepTitle,
   onSelect,
@@ -45,6 +41,7 @@ export function SavedWorkflowResultPicker({
 }: {
   results: ReadonlyArray<WorkflowSavedResult>;
   selected: WorkflowSavedResult | null;
+  timeZone: string;
   currentReview: WorkflowSavedResult | null;
   stepTitle: (stepId: string) => string;
   onSelect: (id: string) => void;
@@ -53,6 +50,11 @@ export function SavedWorkflowResultPicker({
   onLoadOlder: () => void;
   onFocusBeforeRemoval: () => void;
 }) {
+  const savedTime = useMemo(
+    () =>
+      new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium", timeZone }),
+    [timeZone],
+  );
   const [query, setQuery] = useState("");
   const trigger = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
@@ -83,20 +85,28 @@ export function SavedWorkflowResultPicker({
     ? `No ${earlier}matches in loaded results`
     : `No matching ${earlier}results`;
 
-  const renderResult = (result: WorkflowSavedResult) => (
-    <ComboboxItem key={result.resultId} value={result}>
-      <span className="grid min-w-0 flex-1 gap-0.5 py-0.5">
-        <span className="wrap-anywhere font-medium">{stepTitle(result.stepId)}</span>
-        <span className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
-          <time dateTime={result.createdAt}>{formatSavedTime(result.createdAt)}</time>
-          {result.resultId !== currentReview?.resultId ? (
-            <span>{outcomes[result.outcome]}</span>
-          ) : null}
+  const renderResult = (result: WorkflowSavedResult) => {
+    const timestamp = parseTimestampDate(result.createdAt);
+    return (
+      <ComboboxItem key={result.resultId} value={result}>
+        <span className="grid min-w-0 flex-1 gap-0.5 py-0.5">
+          <span className="wrap-anywhere font-medium">{stepTitle(result.stepId)}</span>
+          <span className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
+            {timestamp ? (
+              <time dateTime={result.createdAt}>{savedTime.format(timestamp)}</time>
+            ) : (
+              <span>Save time unavailable</span>
+            )}
+            {result.resultId !== currentReview?.resultId ? (
+              <span>{outcomes[result.outcome]}</span>
+            ) : null}
+          </span>
         </span>
-      </span>
-      {selected?.resultId === result.resultId ? <CheckIcon aria-hidden /> : null}
-    </ComboboxItem>
-  );
+        {selected?.resultId === result.resultId ? <CheckIcon aria-hidden /> : null}
+      </ComboboxItem>
+    );
+  };
+  const selectedTime = selected ? parseTimestampDate(selected.createdAt) : null;
 
   return (
     <div className="w-full min-w-0 sm:w-auto sm:max-w-96">
@@ -119,7 +129,7 @@ export function SavedWorkflowResultPicker({
           render={<Button type="button" size="sm" variant="outline" />}
           aria-label={
             selected
-              ? `Saved result: ${selectedTitle}, saved ${formatSavedTime(selected.createdAt)}`
+              ? `Saved result: ${selectedTitle}, ${selectedTime ? `saved ${savedTime.format(selectedTime)}` : "save time unavailable"}`
               : "Saved result"
           }
           className="max-w-full"

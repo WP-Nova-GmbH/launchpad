@@ -2195,6 +2195,282 @@ it("retries a failed attachment while fetching more saved messages", () =>
     expect(findButton("Download rollback-steps.txt")!.props["aria-disabled"]).toBeFalsy();
   }));
 
+it("distinguishes the viewer, collaborators and workflow authors in a saved transcript", () =>
+  withClient(async () => {
+    const savedAt = new Date(2026, 10, 24, 16);
+    const messageAt = new Date(2026, 10, 24, 15).toISOString();
+    const savedResult = { ...result, createdAt: savedAt.toISOString() };
+    const viewer = { userId: scope.accountId, displayName: null, imageUrl: null };
+    const messages = [
+      { text: "Draft the release notes.", author: viewer, label: "You" },
+      {
+        text: "Call out the import change.",
+        author: { userId: "collaborator", displayName: "Maya Chen", imageUrl: null },
+        label: "Maya Chen",
+      },
+      { text: "Include the rollback link.", label: "Unknown author" },
+      {
+        text: "Prepare release notes for REL-42.",
+        author: viewer,
+        workflowOrigin: {
+          kind: "automation",
+          jobId: job.jobId,
+          workflowId: job.workflowId,
+          workflowName: "Release notes",
+        },
+        label: "Workflow",
+      },
+    ];
+    fixture.list.mockResolvedValue({
+      results: [savedResult],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockResolvedValue({ result: savedResult, patch });
+    fixture.history.mockResolvedValue({
+      entries: [
+        savedConversationStart(),
+        ...messages.map(({ label: _label, ...message }, index) =>
+          historyEntry(index + 2, "thread.message-sent", {
+            messageId: `message-${index + 2}`,
+            role: "user",
+            turnId: result.turnId,
+            streaming: false,
+            createdAt: messageAt,
+            ...message,
+          }),
+        ),
+      ],
+    } satisfies RelayThreadHistoryPage);
+    await mount(completedJob);
+    await press("Conversation");
+
+    const articles = renderer.root.findAllByType("article");
+    expect(articles).toHaveLength(messages.length);
+    for (const [index, article] of articles.entries()) {
+      expect(article.findAllByType("span").flatMap((node) => node.children)).toContain(
+        messages[index]!.label,
+      );
+      expect(article.findByType("time").props.dateTime).toBe(messageAt);
+    }
+    expect(renderer.root.findAllByType("h4")).toHaveLength(0);
+  }));
+
+it("shows local day headings across message pages without repeating a page's first day", () =>
+  withClient(async () => {
+    const firstDay = new Date(2026, 10, 23, 16);
+    const secondDay = new Date(2026, 10, 24, 9);
+    const savedResult = { ...result, createdAt: new Date(2026, 10, 24, 10).toISOString() };
+    const datedMessage = (cursor: number, text: string, date: Date) =>
+      historyEntry(cursor, "thread.message-sent", {
+        messageId: `message-${cursor}`,
+        role: "assistant",
+        text,
+        turnId: result.turnId,
+        streaming: false,
+        createdAt: date.toISOString(),
+      });
+    const headings = () =>
+      renderer.root.findAllByType("h4").map((heading) => heading.children.join(""));
+    const firstDate = firstDay.toLocaleDateString(undefined, { dateStyle: "medium" });
+    const secondDate = secondDay.toLocaleDateString(undefined, { dateStyle: "medium" });
+    fixture.list.mockResolvedValue({
+      results: [savedResult],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockResolvedValue({ result: savedResult, patch });
+    fixture.history
+      .mockResolvedValueOnce({
+        entries: [
+          savedConversationStart(),
+          datedMessage(2, "Started the release notes.", firstDay),
+          ...Array.from({ length: 198 }, (_, index) =>
+            historyEntry(index + 3, "thread.meta-updated", { title: "Release notes" }),
+          ),
+        ],
+      } satisfies RelayThreadHistoryPage)
+      .mockResolvedValueOnce({
+        entries: [
+          datedMessage(201, "Added the import change.", firstDay),
+          datedMessage(202, "Verified the release checklist.", secondDay),
+        ],
+      } satisfies RelayThreadHistoryPage);
+    await mount(completedJob);
+    await press("Conversation");
+
+    expect(headings()).toEqual([firstDate]);
+    const firstArticle = renderer.root.findByType("article");
+    await press("Load more messages");
+
+    expect(headings()).toEqual([firstDate, secondDate]);
+    const articles = renderer.root.findAllByType("article");
+    expect(articles[0]).toBe(firstArticle);
+    expect(articles.map((article) => article.findByType("p").children.join(""))).toEqual([
+      "Started the release notes.",
+      "Added the import change.",
+      "Verified the release checklist.",
+    ]);
+  }));
+
+it.each(["result", "message"] as const)(
+  "keeps the transcript and valid day headings when a legacy %s timestamp is invalid",
+  (invalidTimestamp) =>
+    withClient(async () => {
+      const firstDay = new Date(2026, 10, 23, 16);
+      const secondDay = new Date(2026, 10, 24, 9);
+      const savedResult = {
+        ...result,
+        createdAt: invalidTimestamp === "result" ? "unknown save time" : secondDay.toISOString(),
+      };
+      const messages = [
+        { text: "Started the release notes.", createdAt: firstDay.toISOString() },
+        {
+          text: "Added the import change.",
+          createdAt:
+            invalidTimestamp === "message" ? "unknown message time" : firstDay.toISOString(),
+        },
+        { text: "Added the migration note.", createdAt: firstDay.toISOString() },
+        { text: "Verified the checklist.", createdAt: secondDay.toISOString() },
+      ];
+      fixture.list.mockResolvedValue({
+        results: [savedResult],
+        nextCursor: null,
+        threadId: "thread",
+        generation: 1,
+      });
+      fixture.read.mockResolvedValue({ result: savedResult, patch });
+      fixture.history.mockResolvedValue({
+        entries: [
+          savedConversationStart(),
+          ...messages.map((message, index) =>
+            historyEntry(index + 2, "thread.message-sent", {
+              messageId: `message-${index + 2}`,
+              role: "assistant",
+              turnId: result.turnId,
+              streaming: false,
+              ...message,
+            }),
+          ),
+        ],
+      } satisfies RelayThreadHistoryPage);
+
+      await mount(completedJob);
+      await press("Conversation");
+
+      const articles = renderer.root.findAllByType("article");
+      expect(articles.map((article) => article.findByType("p").children.join(""))).toEqual(
+        messages.map(({ text }) => text),
+      );
+      expect(renderer.root.findAllByType("h4").map((heading) => heading.children.join(""))).toEqual(
+        [
+          firstDay.toLocaleDateString(undefined, { dateStyle: "medium" }),
+          secondDay.toLocaleDateString(undefined, { dateStyle: "medium" }),
+        ],
+      );
+      if (invalidTimestamp === "message") {
+        const undated = articles[1]!;
+        expect(undated.findAllByType("time")).toHaveLength(0);
+        expect(undated.findAllByType("span").flatMap((span) => span.children)).toContain(
+          "Time unavailable",
+        );
+      } else {
+        const header = renderer.root.findByType("header");
+        expect(header.findAllByType("time")).toHaveLength(0);
+        expect(header.findAllByType("span").flatMap((span) => span.children)).toContain(
+          "Save time unavailable",
+        );
+      }
+    }),
+);
+
+it("keeps an open transcript in the current time zone after the window regains focus", () =>
+  withClient(async () => {
+    const firstDay = new Date("2026-11-23T23:55:00Z");
+    const secondDay = new Date("2026-11-24T00:05:00Z");
+    const savedResult = { ...result, createdAt: "2026-11-24T00:10:00Z" };
+    fixture.list.mockResolvedValue({
+      results: [savedResult],
+      nextCursor: null,
+      threadId: "thread",
+      generation: 1,
+    });
+    fixture.read.mockResolvedValue({ result: savedResult, patch });
+    fixture.history.mockResolvedValue({
+      entries: [
+        savedConversationStart(),
+        ...[firstDay, secondDay].map((date, index) =>
+          historyEntry(index + 2, "thread.message-sent", {
+            messageId: `message-${index + 2}`,
+            role: "assistant",
+            turnId: result.turnId,
+            streaming: false,
+            text: index === 0 ? "Started the release notes." : "Verified the checklist.",
+            createdAt: date.toISOString(),
+          }),
+        ),
+      ],
+    } satisfies RelayThreadHistoryPage);
+    const mediaQuery = Object.assign(new EventTarget(), { matches: false });
+    const windowTarget = Object.assign(new EventTarget(), { matchMedia: () => mediaQuery });
+    vi.stubGlobal("window", windowTarget);
+    let timeZone = "UTC";
+    const resolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+    const reportedTimeZone = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockImplementation(function (this: Intl.DateTimeFormat) {
+        return { ...resolvedOptions.call(this), timeZone };
+      });
+    try {
+      await mount(completedJob);
+      await press("Conversation");
+
+      const dateHeadings = () =>
+        renderer.root.findAllByType("h4").map((heading) => heading.children.join(""));
+      expect(dateHeadings()).toEqual(
+        [firstDay, secondDay].map((date) =>
+          date.toLocaleDateString(undefined, { dateStyle: "medium", timeZone: "UTC" }),
+        ),
+      );
+      const firstArticle = renderer.root.findAllByType("article")[0];
+
+      timeZone = "America/Los_Angeles";
+      await act(() => windowTarget.dispatchEvent(new Event("focus")));
+
+      expect(dateHeadings()).toEqual([]);
+      expect(renderer.root.findAllByType("article")[0]).toBe(firstArticle);
+      expect(firstArticle!.findByType("time").children.join("")).toBe(
+        firstDay.toLocaleTimeString(undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+          timeZone,
+        }),
+      );
+      const savedAt = new Date(savedResult.createdAt);
+      const headerTime = savedAt.toLocaleString(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+        timeZone,
+      });
+      const pickerTime = savedAt.toLocaleString(undefined, {
+        dateStyle: "medium",
+        timeStyle: "medium",
+        timeZone,
+      });
+      expect(
+        renderer.root
+          .findByType("header")
+          .findAllByType("time")
+          .map((time) => time.children.join("")),
+      ).toEqual([`Saved ${headerTime}`, pickerTime]);
+      expect(fixture.history).toHaveBeenCalledOnce();
+    } finally {
+      reportedTimeZone.mockRestore();
+    }
+  }));
+
 it("retries the failed conversation page without replacing the messages already shown", () =>
   withClient(async () => {
     const firstMessage = "The release notes are ready.";

@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useEffectEvent,
@@ -7,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type RefObject,
 } from "react";
 import type { CodeViewHandle } from "@pierre/diffs/react";
@@ -65,6 +67,7 @@ import { useIsMobile } from "../../hooks/useMediaQuery";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { getRenderablePatch, resolveFileDiffPath } from "../../lib/diffRendering";
 import { cn, randomUUID } from "../../lib/utils";
+import { parseTimestampDate } from "../../timestampFormat";
 import { DiffFileTree } from "../diffs/DiffFileTree";
 import { diffFileTreeEntries, diffFileTreePathAliases } from "../diffs/diffFileTree.logic";
 import { StyledDiffCodeView } from "../diffs/StyledDiffCodeView";
@@ -93,6 +96,19 @@ const sameSavedResult = Schema.toEquivalence(WorkflowSavedResult);
 const isRequestFailed = Schema.is(ManagedRelay.ManagedRelayRequestFailedError);
 const isNotFound = Schema.is(Schema.Struct({ cause: RelayTenancyNotFoundError }));
 const noAttachmentDownloads: ReadonlyMap<string, AttachmentDownloadState> = new Map();
+function readLocalTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
+function subscribeToLocalTimeZone(onChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("focus", onChange);
+  document.addEventListener("visibilitychange", onChange);
+  return () => {
+    window.removeEventListener("focus", onChange);
+    document.removeEventListener("visibilitychange", onChange);
+  };
+}
 
 type DeletionTarget = { relayUrl: string; threadId: ThreadId; generation: number };
 type HistoryRequest = { key: string; scope: string; epoch: number };
@@ -1267,6 +1283,34 @@ export function SavedWorkflowResults({
           : "Retry conversation"}
     </Button>
   );
+  const messages = conversation?.history.thread?.messages;
+  const timeZone = useSyncExternalStore(
+    subscribeToLocalTimeZone,
+    readLocalTimeZone,
+    readLocalTimeZone,
+  );
+  const resultSavedAt = result?.createdAt;
+  const savedAt = useMemo(
+    () => (resultSavedAt === undefined ? null : parseTimestampDate(resultSavedAt)),
+    [resultSavedAt],
+  );
+  const messageDates = useMemo(() => {
+    if (!messages?.length) return null;
+    const day = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone });
+    const savedDay = savedAt ? day.format(savedAt) : null;
+    let previousDay: string | null = null;
+    let showHeadings = false;
+    const headings = messages.map((message) => {
+      const sentAt = parseTimestampDate(message.createdAt);
+      if (!sentAt) return null;
+      const date = day.format(sentAt);
+      showHeadings ||= date !== savedDay;
+      const heading = date === previousDay ? null : date;
+      previousDay = date;
+      return heading;
+    });
+    return showHeadings ? headings : null;
+  }, [messages, savedAt, timeZone]);
   const resultView = (
     <div id={`${tabId}-saved-results`} className="space-y-3" hidden={partialResultHidden}>
       <header className="flex flex-wrap items-start justify-between gap-3">
@@ -1281,13 +1325,18 @@ export function SavedWorkflowResults({
             </div>
             <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
               <span>{resultLabel}</span>
-              <time dateTime={result.createdAt}>
-                Saved{" "}
-                {new Date(result.createdAt).toLocaleString(undefined, {
-                  dateStyle: "medium",
-                  timeStyle: "short",
-                })}
-              </time>
+              {savedAt ? (
+                <time dateTime={result.createdAt}>
+                  Saved{" "}
+                  {savedAt.toLocaleString(undefined, {
+                    dateStyle: "medium",
+                    timeStyle: "short",
+                    timeZone,
+                  })}
+                </time>
+              ) : (
+                <span>Save time unavailable</span>
+              )}
               {result.outcome !== "completed" ? <span>{result.outcome}</span> : null}
             </div>
           </div>
@@ -1297,6 +1346,7 @@ export function SavedWorkflowResults({
             key={pickerKey}
             results={index.results}
             selected={result}
+            timeZone={timeZone}
             currentReview={reviewAvailable ? currentResult : null}
             stepTitle={stepTitle}
             onSelect={selectResult}
@@ -1580,20 +1630,31 @@ export function SavedWorkflowResults({
             ) : null}
             {conversation?.resultId === result.resultId ? (
               <div className="space-y-4 py-2">
-                {!conversation.history.thread?.messages.length ? (
+                {!messages?.length ? (
                   <p className="text-sm text-muted-foreground">
                     No saved messages for this Agent result.
                   </p>
                 ) : null}
-                {conversation.history.thread?.messages.map((message) => (
-                  <SavedConversationMessage
-                    key={message.id}
-                    message={message}
-                    busy={readingConversation !== null}
-                    attachmentDownloads={attachmentDownloads}
-                    onDownload={download}
-                  />
-                ))}
+                {messages?.map((message, index) => {
+                  const date = messageDates?.[index];
+                  return (
+                    <Fragment key={message.id}>
+                      {date ? (
+                        <h4 className="flex items-center gap-2.5 text-xs font-medium text-muted-foreground after:flex-1 after:border-t after:border-border after:content-['']">
+                          {date}
+                        </h4>
+                      ) : null}
+                      <SavedConversationMessage
+                        message={message}
+                        viewerAccountId={scope.accountId}
+                        timeZone={timeZone}
+                        busy={readingConversation !== null}
+                        attachmentDownloads={attachmentDownloads}
+                        onDownload={download}
+                      />
+                    </Fragment>
+                  );
+                })}
                 {conversationError?.more ? (
                   <WorkflowAlert
                     title="Couldn’t load more messages"
