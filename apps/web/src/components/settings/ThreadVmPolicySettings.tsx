@@ -129,7 +129,7 @@ function ThreadVmPolicyEditor({
       title="Thread VMs"
       icon={<MonitorIcon className="size-4 text-muted-foreground" />}
     >
-      <p className="px-3 pb-1 text-sm text-muted-foreground sm:px-4">
+      <p className="px-3 py-3 text-sm text-muted-foreground sm:px-4">
         Each VM belongs to one thread.{" "}
         {isAdmin
           ? "These limits apply to everyone in your organization."

@@ -127,7 +127,7 @@ const MACHINE_ROLE_LABELS: Readonly<Record<RelayMachineRole, string>> = {
  * Connections, Source Control, and Projects in turn.
  */
 function SectionNote({ children }: { children: ReactNode }) {
-  return <p className="px-3 pb-1 text-sm text-muted-foreground sm:px-4">{children}</p>;
+  return <p className="px-3 py-3 text-sm text-muted-foreground sm:px-4">{children}</p>;
 }
 
 function RoleBadge({ children }: { children: string }) {
