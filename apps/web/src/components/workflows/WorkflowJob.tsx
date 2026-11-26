@@ -975,7 +975,7 @@ export function WorkflowJob({
   );
   if (!selectedJob)
     return (
-      <div className="mx-auto w-full max-w-3xl space-y-4">
+      <div className="min-w-0 w-full space-y-4">
         {runNavigation}
         {read.error ? (
           <WorkflowAlert
@@ -1552,7 +1552,7 @@ export function WorkflowJob({
       </summary>
       <form
         ref={checkpointForm}
-        className="space-y-3"
+        className="max-w-2xl space-y-3"
         onSubmit={(event) => {
           event.preventDefault();
           void respond(input ? "input" : "request_changes");
@@ -1614,7 +1614,7 @@ export function WorkflowJob({
     </>
   ) : null;
   return (
-    <div className="mx-auto min-w-0 w-full max-w-3xl space-y-6 wrap-anywhere">
+    <div className="min-w-0 w-full space-y-6 wrap-anywhere">
       {runNavigation}
       <p role="status" aria-label="Checkpoint response access" className="sr-only">
         {checkpointAccessAnnouncement}

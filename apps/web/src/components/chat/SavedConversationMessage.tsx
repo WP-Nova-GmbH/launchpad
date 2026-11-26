@@ -4,6 +4,7 @@ import { memo, type Ref } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { OrchestrationMessage, ChatAttachment } from "@t3tools/contracts";
+import { cn } from "../../lib/utils";
 import { parseTimestampDate } from "../../timestampFormat";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
@@ -52,7 +53,12 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
   const sentAt = parseTimestampDate(message.createdAt);
   const body = (
     <>
-      <div className="break-words text-sm leading-relaxed [&_p]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-muted [&_pre]:p-3 [&_code]:font-mono [&_a]:text-primary [&_a]:underline [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5">
+      <div
+        className={cn(
+          "break-words text-sm leading-relaxed [&_p]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-muted [&_pre]:p-3 [&_code]:font-mono [&_a]:text-primary [&_a]:underline [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:list-decimal [&_ol]:pl-5",
+          workflowTranscript && "[&_:is(p,li:not(:has(pre,table)))]:max-w-[72ch]",
+        )}
+      >
         <SavedMessageMarkdown remarkPlugins={SAVED_MARKDOWN_PLUGINS}>
           {message.text}
         </SavedMessageMarkdown>

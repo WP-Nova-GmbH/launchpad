@@ -122,13 +122,54 @@ export function WorkflowEditorPage() {
   return <WorkflowsPage view="builder" />;
 }
 
+function WorkflowPageFrame({
+  children,
+  overlays,
+  contentClassName,
+}: {
+  children: ReactNode;
+  overlays?: ReactNode;
+  contentClassName?: string | undefined;
+}) {
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col md:[--workflow-page-gutter:--spacing(12)] md:[[data-sidebar-state=collapsed]_&]:[--workflow-page-gutter:max(--spacing(12),var(--workspace-titlebar-content-left))]">
+      {overlays}
+      <WorkspacePageHeader
+        electron={isElectron}
+        className="md:scrollbar-gutter-stable md:overflow-hidden md:[--workspace-gutter-start:0px] md:[--workspace-gutter-end:0px] md:[--workspace-titlebar-content-left:0px]"
+      >
+        <h1 className="text-sm font-medium md:ms-[max(0px,calc((100%_+_var(--workspace-native-controls-inset)_-_var(--container-5xl))/2))] md:ps-(--workflow-page-gutter)">
+          Workflows
+        </h1>
+      </WorkspacePageHeader>
+      <div
+        className="min-h-0 flex-1 overflow-y-auto scrollbar-gutter-stable"
+        data-workflow-runs-scroll-container
+      >
+        <WorkspacePageContainer
+          width="wide"
+          className={cn("md:ps-(--workflow-page-gutter)", contentClassName)}
+        >
+          {children}
+        </WorkspacePageContainer>
+      </div>
+    </div>
+  );
+}
+
+function WorkflowPageLoading() {
+  return (
+    <WorkflowPageFrame contentClassName="min-h-full items-center justify-center">
+      <Spinner />
+    </WorkflowPageFrame>
+  );
+}
+
 export function WorkflowsPage({ view = "catalog" }: { view?: WorkflowView }) {
   return hasCloudPublicConfig() ? (
     <>
       <ClerkLoading>
-        <div className="flex h-full min-h-0 min-w-0 flex-1 items-center justify-center">
-          <Spinner />
-        </div>
+        <WorkflowPageLoading />
       </ClerkLoading>
       <ClerkFailed>
         <WorkflowNotice
@@ -167,26 +208,21 @@ function WorkflowNotice({
 }) {
   const navigate = useNavigate();
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-      <WorkspacePageHeader electron={isElectron}>
-        <h1 className="text-sm font-medium">Workflows</h1>
-      </WorkspacePageHeader>
-      <WorkspacePageContainer>
-        <WorkflowAlert
-          title={title}
-          variant={variant}
-          actions={
-            actions ?? (
-              <Button variant="outline" onClick={() => navigate({ to: "/" })}>
-                Back to projects
-              </Button>
-            )
-          }
-        >
-          {message}
-        </WorkflowAlert>
-      </WorkspacePageContainer>
-    </div>
+    <WorkflowPageFrame>
+      <WorkflowAlert
+        title={title}
+        variant={variant}
+        actions={
+          actions ?? (
+            <Button variant="outline" onClick={() => navigate({ to: "/" })}>
+              Back to projects
+            </Button>
+          )
+        }
+      >
+        {message}
+      </WorkflowAlert>
+    </WorkflowPageFrame>
   );
 }
 
@@ -214,11 +250,7 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
     (isSignedIn &&
       (catalog.accountId !== userId || (catalog.isPending && (!catalog.data || emptyChooser))))
   )
-    return (
-      <div className="flex h-full min-h-0 min-w-0 flex-1 items-center justify-center">
-        <Spinner />
-      </div>
-    );
+    return <WorkflowPageLoading />;
   if (!isSignedIn || !userId)
     return (
       <WorkflowNotice
@@ -260,33 +292,26 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
     );
   if (!entry || !scope)
     return (
-      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-        <WorkspacePageHeader electron={isElectron}>
-          <h1 className="text-sm font-medium">Workflows</h1>
-        </WorkspacePageHeader>
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <WorkspacePageContainer width="expanded">
-            <WorkflowRepositoryChooser
-              key={catalog.data.membership.organization.organizationId}
-              repositories={catalog.data.repositories}
-              canManageRepositories={catalog.data.membership.role === "admin"}
-              onManageRepositories={() => {
-                void navigate({
-                  to: "/settings/organization",
-                  hash: searchableSetting("organization-repositories").id,
-                });
-              }}
-              onSelect={(repositoryId) => {
-                void navigate({
-                  to: "/workflows/$repositoryId",
-                  params: { repositoryId },
-                  search: { tab: "workflows" },
-                });
-              }}
-            />
-          </WorkspacePageContainer>
-        </div>
-      </div>
+      <WorkflowPageFrame>
+        <WorkflowRepositoryChooser
+          key={catalog.data.membership.organization.organizationId}
+          repositories={catalog.data.repositories}
+          canManageRepositories={catalog.data.membership.role === "admin"}
+          onManageRepositories={() => {
+            void navigate({
+              to: "/settings/organization",
+              hash: searchableSetting("organization-repositories").id,
+            });
+          }}
+          onSelect={(repositoryId) => {
+            void navigate({
+              to: "/workflows/$repositoryId",
+              params: { repositoryId },
+              search: { tab: "workflows" },
+            });
+          }}
+        />
+      </WorkflowPageFrame>
     );
   const { membership } = catalog.data;
   const organizationAdmin =
@@ -1366,288 +1391,248 @@ function WorkflowRepositoryView({
       </div>
     ) : null;
   return (
-    <div
-      className={cn(
-        "flex h-full min-h-0 min-w-0 flex-1 flex-col",
-        catalogPage &&
-          "md:[--workflow-catalog-rail:--spacing(12)] md:[[data-sidebar-state=collapsed]_&]:[--workflow-catalog-rail:max(--spacing(12),var(--workspace-titlebar-content-left))]",
-      )}
+    <WorkflowPageFrame
+      contentClassName={catalogPage ? "gap-3 pointer-coarse:gap-y-4 md:pt-3" : undefined}
+      overlays={
+        <>
+          {copySource ? (
+            <WorkflowCopyDialog
+              source={copySource}
+              sourceRepositoryId={scope.repositoryId}
+              repositories={copyRepositories}
+              destination={copyRepository}
+              existingDraft={copyDraft}
+              checkoutIssue={copyCheckoutIssue}
+              onRefreshCheckouts={refreshOrganizationCatalog}
+              busy={copyBusy}
+              error={copyError}
+              onSelectDestination={(id) => {
+                if (copyRequest.current) return;
+                setCopyDestination(id);
+                setCopyError(null);
+              }}
+              onClose={closeCopy}
+              onCopy={() => void copySaved()}
+            />
+          ) : null}
+          {templateDialog && canChooseTemplate && vmAuthoring !== null ? (
+            templateDialog === "picker" ? (
+              <WorkflowTemplateDialog
+                repositoryName={entry.repository.name}
+                vmAuthoring={!!vmAuthoring}
+                hasMachineCheckout={projects.length > 0}
+                projectsUnavailable={projectsUnavailable}
+                selected={selectedTemplate}
+                onSelect={setSelectedTemplate}
+                finalFocus={templateOpener}
+                error={templateError}
+                onRefreshCheckouts={() => {
+                  setTemplateError(null);
+                  refreshOrganizationCatalog();
+                }}
+                onOpenMachines={
+                  organizationAdmin
+                    ? () => {
+                        closeTemplates();
+                        void navigate({
+                          to: "/settings/organization",
+                          hash: searchableSetting("organization-machines").id,
+                        });
+                      }
+                    : undefined
+                }
+                onCreate={useTemplate}
+                onClose={closeTemplates}
+              />
+            ) : (
+              <WorkflowDraftReplacementDialog
+                repositoryName={entry.repository.name}
+                draft={templateDialog.draft}
+                template={templateDialog.template}
+                finalFocus={templateOpener}
+                onKeep={closeTemplates}
+                onReplace={() => installTemplate(templateDialog.template, templateDialog.draft)}
+              />
+            )
+          ) : null}
+        </>
+      }
     >
-      {copySource ? (
-        <WorkflowCopyDialog
-          source={copySource}
-          sourceRepositoryId={scope.repositoryId}
-          repositories={copyRepositories}
-          destination={copyRepository}
-          existingDraft={copyDraft}
-          checkoutIssue={copyCheckoutIssue}
-          onRefreshCheckouts={refreshOrganizationCatalog}
-          busy={copyBusy}
-          error={copyError}
-          onSelectDestination={(id) => {
-            if (copyRequest.current) return;
-            setCopyDestination(id);
-            setCopyError(null);
-          }}
-          onClose={closeCopy}
-          onCopy={() => void copySaved()}
-        />
+      {!(view === "job" && jobId && loaded) ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {!catalogPage ? (
+              <Button variant="ghost" onClick={back}>
+                {view === "job" ? "← Back to runs" : "← Workflows"}
+              </Button>
+            ) : null}
+            <div className={catalogPage ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}>
+              <WorkflowRepositorySwitcher
+                current={entry}
+                repositories={repositories}
+                onSelect={selectRepository}
+                inline={catalogPage}
+              />
+            </div>
+          </div>
+          {catalogPage ? null : refreshWorkflowsButton}
+        </div>
       ) : null}
-      {templateDialog && canChooseTemplate && vmAuthoring !== null ? (
-        templateDialog === "picker" ? (
-          <WorkflowTemplateDialog
-            repositoryName={entry.repository.name}
-            vmAuthoring={!!vmAuthoring}
-            hasMachineCheckout={projects.length > 0}
-            projectsUnavailable={projectsUnavailable}
-            selected={selectedTemplate}
-            onSelect={setSelectedTemplate}
-            finalFocus={templateOpener}
-            error={templateError}
-            onRefreshCheckouts={() => {
-              setTemplateError(null);
-              refreshOrganizationCatalog();
-            }}
-            onOpenMachines={
-              organizationAdmin
-                ? () => {
-                    closeTemplates();
-                    void navigate({
-                      to: "/settings/organization",
-                      hash: searchableSetting("organization-machines").id,
-                    });
-                  }
-                : undefined
-            }
-            onCreate={useTemplate}
-            onClose={closeTemplates}
-          />
-        ) : (
-          <WorkflowDraftReplacementDialog
-            repositoryName={entry.repository.name}
-            draft={templateDialog.draft}
-            template={templateDialog.template}
-            finalFocus={templateOpener}
-            onKeep={closeTemplates}
-            onReplace={() => installTemplate(templateDialog.template, templateDialog.draft)}
-          />
-        )
+      {catalogPage ? (
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b pb-2 pointer-coarse:gap-y-4">
+          {catalogTabs}
+          {catalogActions}
+        </div>
       ) : null}
-      <WorkspacePageHeader
-        electron={isElectron}
-        className={
-          catalogPage
-            ? "md:scrollbar-gutter-stable md:overflow-hidden md:[--workspace-gutter-start:0px] md:[--workspace-gutter-end:0px] md:[--workspace-titlebar-content-left:0px]"
-            : undefined
-        }
-      >
-        <h1
-          className={cn(
-            "text-sm font-medium",
-            catalogPage &&
-              "md:ms-[max(0px,calc((100%_+_var(--workspace-native-controls-inset)_-_var(--container-5xl))/2))] md:ps-(--workflow-catalog-rail)",
-          )}
-        >
-          Workflows
-        </h1>
-      </WorkspacePageHeader>
-      <div
-        className={cn(
-          "min-h-0 flex-1 overflow-y-auto",
-          view === "job" && "scrollbar-gutter-stable",
-          catalogPage && "md:scrollbar-gutter-stable",
-        )}
-        data-workflow-runs-scroll-container
-      >
-        <WorkspacePageContainer
-          width={catalogPage ? "wide" : "expanded"}
-          className={
-            catalogPage
-              ? "gap-3 pointer-coarse:gap-y-4 md:ps-(--workflow-catalog-rail) md:pt-3"
-              : undefined
+      {error ? (
+        <WorkflowAlert
+          title="Could not refresh workflows"
+          actions={
+            <Button variant="outline" size="sm" onClick={refreshView}>
+              Retry
+            </Button>
           }
         >
-          {!(view === "job" && jobId && loaded) ? (
+          {error}{" "}
+          {(canChooseTemplate && retainedDraftRecovery) || "Showing the last available data."}
+        </WorkflowAlert>
+      ) : null}
+      {!loaded ? (
+        <Spinner />
+      ) : view === "run" ? (
+        workflow ? (
+          <WorkflowRun
+            canConfigure={canConfigure}
+            organizationAdmin={organizationAdmin}
+            scope={scope}
+            workflow={workflow}
+            projects={projects}
+            call={call}
+            vmExecutionAvailable={vmExecutionAvailable}
+          />
+        ) : (
+          <WorkflowAlert
+            title="Workflow unavailable"
+            actions={
+              <>
+                <Button variant="outline" onClick={refreshView}>
+                  <RefreshCwIcon aria-hidden />
+                  Refresh workflows
+                </Button>
+                <Button variant="ghost" onClick={back}>
+                  Back to workflows
+                </Button>
+              </>
+            }
+          >
+            This workflow may have been removed or your access may have changed. Refresh or return
+            to the list.
+          </WorkflowAlert>
+        )
+      ) : view === "job" && jobId ? (
+        <WorkflowJob
+          scope={scope}
+          jobId={jobId}
+          projects={projects}
+          canConfigure={canConfigure}
+          organizationAdmin={organizationAdmin}
+          refreshCatalog={refreshView}
+        />
+      ) : (
+        <>
+          {!catalogPage ? (
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
-                {!catalogPage ? (
-                  <Button variant="ghost" onClick={back}>
-                    {view === "job" ? "← Back to runs" : "← Workflows"}
-                  </Button>
-                ) : null}
-                <div className={catalogPage ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}>
-                  <WorkflowRepositorySwitcher
-                    current={entry}
-                    repositories={repositories}
-                    onSelect={selectRepository}
-                    inline={catalogPage}
-                  />
-                </div>
-              </div>
-              {catalogPage ? null : refreshWorkflowsButton}
-            </div>
-          ) : null}
-          {catalogPage ? (
-            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b pb-2 pointer-coarse:gap-y-4">
               {catalogTabs}
               {catalogActions}
             </div>
           ) : null}
-          {error ? (
-            <WorkflowAlert
-              title="Could not refresh workflows"
-              actions={
-                <Button variant="outline" size="sm" onClick={refreshView}>
-                  Retry
-                </Button>
-              }
-            >
-              {error}{" "}
-              {(canChooseTemplate && retainedDraftRecovery) || "Showing the last available data."}
-            </WorkflowAlert>
-          ) : null}
-          {!loaded ? (
-            <Spinner />
-          ) : view === "run" ? (
-            workflow ? (
-              <WorkflowRun
-                canConfigure={canConfigure}
-                organizationAdmin={organizationAdmin}
-                scope={scope}
-                workflow={workflow}
-                projects={projects}
-                call={call}
-                vmExecutionAvailable={vmExecutionAvailable}
-              />
-            ) : (
-              <WorkflowAlert
-                title="Workflow unavailable"
-                actions={
-                  <>
-                    <Button variant="outline" onClick={refreshView}>
-                      <RefreshCwIcon aria-hidden />
-                      Refresh workflows
-                    </Button>
-                    <Button variant="ghost" onClick={back}>
-                      Back to workflows
-                    </Button>
-                  </>
-                }
-              >
-                This workflow may have been removed or your access may have changed. Refresh or
-                return to the list.
-              </WorkflowAlert>
-            )
-          ) : view === "job" && jobId ? (
-            <WorkflowJob
-              scope={scope}
-              jobId={jobId}
-              projects={projects}
-              canConfigure={canConfigure}
-              organizationAdmin={organizationAdmin}
-              refreshCatalog={refreshView}
-            />
-          ) : (
-            <>
-              {!catalogPage ? (
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  {catalogTabs}
-                  {catalogActions}
+          {tab === "workflows" ? (
+            <div className="@container/workflow-catalog">
+              {canChooseTemplate && retainedDraft ? (
+                <div className={workflows.length ? "mb-4" : undefined}>
+                  <WorkflowCatalogDraft
+                    draft={retainedDraft}
+                    actions={
+                      <div className="flex flex-wrap gap-2">
+                        {!retainedDraft.operation ? (
+                          <Button
+                            ref={templateOpener}
+                            variant="outline"
+                            disabled={vmAuthoring === null}
+                            onClick={openTemplates}
+                          >
+                            Start another workflow
+                          </Button>
+                        ) : null}
+                        <Button
+                          ref={retainedDraft.operation ? templateOpener : undefined}
+                          disabled={vmAuthoring === null}
+                          onClick={resumeDraft}
+                        >
+                          Resume draft
+                        </Button>
+                      </div>
+                    }
+                  />
                 </div>
               ) : null}
-              {tab === "workflows" ? (
-                <div className="@container/workflow-catalog">
-                  {canChooseTemplate && retainedDraft ? (
-                    <div className={workflows.length ? "mb-4" : undefined}>
-                      <WorkflowCatalogDraft
-                        draft={retainedDraft}
-                        actions={
-                          <div className="flex flex-wrap gap-2">
-                            {!retainedDraft.operation ? (
-                              <Button
-                                ref={templateOpener}
-                                variant="outline"
-                                disabled={vmAuthoring === null}
-                                onClick={openTemplates}
-                              >
-                                Start another workflow
-                              </Button>
-                            ) : null}
-                            <Button
-                              ref={retainedDraft.operation ? templateOpener : undefined}
-                              disabled={vmAuthoring === null}
-                              onClick={resumeDraft}
-                            >
-                              Resume draft
-                            </Button>
-                          </div>
-                        }
-                      />
-                    </div>
-                  ) : null}
-                  {rows(false)}
-                  {firstWorkflow && !(canChooseTemplate && retainedDraft) ? (
-                    <WorkflowCatalogEmpty actions={createWorkflow} />
-                  ) : archivedOnly ? (
-                    <div className="flex items-start gap-3 rounded-lg border bg-card p-4 text-card-foreground">
-                      <ArchiveIcon
-                        aria-hidden
-                        className="mt-0.5 size-5 shrink-0 text-muted-foreground"
-                      />
-                      <div className="space-y-1">
-                        <h2 className="text-sm font-semibold">No active workflows</h2>
-                        <p className="text-sm text-muted-foreground">
-                          {canConfigure
-                            ? "Restore an archived workflow to make it available again."
-                            : "A repository maintainer or organization admin can restore a workflow."}
-                        </p>
-                      </div>
-                    </div>
-                  ) : null}
-                  {archivedWorkflows.length ? (
-                    <Collapsible
-                      open={archiveOpen}
-                      onOpenChange={setArchiveExpanded}
-                      className="mt-6"
-                    >
-                      <CollapsibleTrigger
-                        aria-label="Archived workflows"
-                        aria-description={`${archivedWorkflows.length} archived`}
-                        className="flex w-full items-center gap-2 rounded-md py-2 text-start text-sm font-medium"
-                      >
-                        <ChevronRightIcon
-                          aria-hidden
-                          className={archiveOpen ? "size-4 rotate-90" : "size-4"}
-                        />
-                        Archived workflows
-                        <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-                          {archivedWorkflows.length}
-                        </span>
-                      </CollapsibleTrigger>
-                      <CollapsiblePanel>
-                        {canConfigure ? (
-                          <p className="pb-3 text-xs text-muted-foreground">
-                            Automatic triggering stays off when you restore a workflow.
-                          </p>
-                        ) : null}
-                        {rows(true)}
-                      </CollapsiblePanel>
-                    </Collapsible>
-                  ) : null}
-                  <p
-                    role="status"
-                    className={restoreNotice ? "mt-3 text-sm text-muted-foreground" : "sr-only"}
-                  >
-                    {restoreNotice}
-                  </p>
+              {rows(false)}
+              {firstWorkflow && !(canChooseTemplate && retainedDraft) ? (
+                <WorkflowCatalogEmpty actions={createWorkflow} />
+              ) : archivedOnly ? (
+                <div className="flex items-start gap-3 rounded-lg border bg-card p-4 text-card-foreground">
+                  <ArchiveIcon
+                    aria-hidden
+                    className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+                  />
+                  <div className="space-y-1">
+                    <h2 className="text-sm font-semibold">No active workflows</h2>
+                    <p className="text-sm text-muted-foreground">
+                      {canConfigure
+                        ? "Restore an archived workflow to make it available again."
+                        : "A repository maintainer or organization admin can restore a workflow."}
+                    </p>
+                  </div>
                 </div>
-              ) : (
-                <WorkflowJobs scope={scope} workflows={workflows} refreshWorkflows={refresh} />
-              )}
-            </>
+              ) : null}
+              {archivedWorkflows.length ? (
+                <Collapsible open={archiveOpen} onOpenChange={setArchiveExpanded} className="mt-6">
+                  <CollapsibleTrigger
+                    aria-label="Archived workflows"
+                    aria-description={`${archivedWorkflows.length} archived`}
+                    className="flex w-full items-center gap-2 rounded-md py-2 text-start text-sm font-medium"
+                  >
+                    <ChevronRightIcon
+                      aria-hidden
+                      className={archiveOpen ? "size-4 rotate-90" : "size-4"}
+                    />
+                    Archived workflows
+                    <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                      {archivedWorkflows.length}
+                    </span>
+                  </CollapsibleTrigger>
+                  <CollapsiblePanel>
+                    {canConfigure ? (
+                      <p className="pb-3 text-xs text-muted-foreground">
+                        Automatic triggering stays off when you restore a workflow.
+                      </p>
+                    ) : null}
+                    {rows(true)}
+                  </CollapsiblePanel>
+                </Collapsible>
+              ) : null}
+              <p
+                role="status"
+                className={restoreNotice ? "mt-3 text-sm text-muted-foreground" : "sr-only"}
+              >
+                {restoreNotice}
+              </p>
+            </div>
+          ) : (
+            <WorkflowJobs scope={scope} workflows={workflows} refreshWorkflows={refresh} />
           )}
-        </WorkspacePageContainer>
-      </div>
-    </div>
+        </>
+      )}
+    </WorkflowPageFrame>
   );
 }
