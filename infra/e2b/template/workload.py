@@ -1086,11 +1086,14 @@ def main(args):
                 os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-git', cwd, '--', *command[1:]])
             if kind == 'process' and command[:3] == ['/usr/bin/python3', '-IS', str(CHECKPOINT_READER)]:
                 require_workflow_dump_policy()
-                if (len(command) != 4 or command[3] not in {'capture', 'exclude', 'conversation-files'}
+                if (len(command) != 4 or command[3] not in {'capture', 'exclude', 'paths', 'conversation-files'}
                         or (command[3] == 'conversation-files' and cwd != WORKFLOW_CODEX_HOME)):
                     raise RuntimeError('Invalid workflow checkpoint reader launch')
                 require_workflow_executable(immutable(CHECKPOINT_PYTHON))
                 immutable(CHECKPOINT_READER)
+                if command[3] == 'paths':
+                    # Keep the scanner's Git child execute-only, like its Python parent.
+                    require_workflow_executable(immutable(WORKFLOW_GIT))
                 os.execv(WORKFLOW_EXEC, [WORKFLOW_EXEC, 'exec-checkpoint-reader', cwd, command[3]])
             if kind in {'provider', 'probe'}:
                 require_workflow_dump_policy()

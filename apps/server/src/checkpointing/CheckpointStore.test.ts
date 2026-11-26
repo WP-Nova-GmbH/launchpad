@@ -1121,12 +1121,24 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
         yield* initRepoWithCommit(cwd);
         yield* fs.makeDirectory(NodePath.join(cwd, "other"));
         yield* fs.makeDirectory(NodePath.join(cwd, "examples"));
+        yield* fs.makeDirectory(NodePath.join(cwd, "rules"));
         const externalIgnore = NodePath.join(root, "external-ignore");
         yield* writeTextFile(externalIgnore, "visible.txt\n");
         yield* fs.symlink(externalIgnore, NodePath.join(cwd, "examples/.gitignore"));
         yield* writeTextFile(NodePath.join(cwd, "other/baseline.txt"), "tracked baseline\n");
-        yield* writeTextFile(NodePath.join(cwd, ".gitignore"), ".gitignore\n*.generated\ncache/\n");
-        yield* git(cwd, ["add", "-f", ".gitignore", "examples/.gitignore", "other/baseline.txt"]);
+        yield* writeTextFile(
+          NodePath.join(cwd, ".gitignore"),
+          "/.gitignore\n*.generated\ncache/\n",
+        );
+        yield* writeTextFile(NodePath.join(cwd, "rules/.gitignore"), "*.tmp\n!keep.tmp\n");
+        yield* git(cwd, [
+          "add",
+          "-f",
+          ".gitignore",
+          "examples/.gitignore",
+          "other/baseline.txt",
+          "rules/.gitignore",
+        ]);
         yield* git(cwd, ["commit", "-m", "Track a self-ignored rule and a baseline directory"]);
         yield* git(root, ["init", "--bare", directory]);
         yield* git(directory, [
@@ -1230,6 +1242,17 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
           expect(
             yield* git(directory, ["ls-tree", baseline.commitId, "examples/.gitignore"]),
           ).toMatch(/^120000 blob /u);
+          yield* writeTextFile(NodePath.join(cwd, ".gitignore"), "/review-note.txt\n");
+          yield* writeTextFile(NodePath.join(cwd, "review-note.txt"), "review this new file\n");
+          yield* fs.makeDirectory(NodePath.join(cwd, "new-rules"));
+          yield* writeTextFile(NodePath.join(cwd, "new-rules/.gitignore"), "*\n");
+          yield* writeTextFile(
+            NodePath.join(cwd, "new-rules/change.txt"),
+            "review nested change\n",
+          );
+          yield* writeTextFile(NodePath.join(cwd, "rules/.gitignore"), "*\n");
+          yield* writeTextFile(NodePath.join(cwd, "rules/keep.tmp"), "baseline exception\n");
+          yield* writeTextFile(NodePath.join(cwd, "rules/discard.tmp"), "baseline ignore\n");
           yield* fs.writeFileString(privateFile, "reviewed update\n");
           yield* writeTextFile(
             NodePath.join(cwd, "examples/visible.txt"),
@@ -1237,7 +1260,7 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
           );
           yield* writeTextFile(NodePath.join(cwd, "agent.generated"), "committed despite ignore\n");
           yield* writeTextFile(NodePath.join(cwd, "untracked.generated"), "ignored result\n");
-          yield* git(cwd, ["add", "-f", "agent.generated"]);
+          yield* git(cwd, ["add", "-f", ".gitignore", "rules/.gitignore", "agent.generated"]);
           yield* git(cwd, ["commit", "-m", "Commit agent output"]);
           yield* fs.remove(NodePath.join(cwd, "other/baseline.txt"));
           const cache = NodePath.join(cwd, "cache");
@@ -1267,6 +1290,13 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
           expect(patch).toContain("-setup baseline\n+reviewed update");
           expect(patch).toContain("+committed despite ignore");
           expect(patch).toContain("+ignore link not read");
+          expect(patch).toContain("+/review-note.txt");
+          expect(patch).toContain("+review this new file");
+          expect(patch).toContain("new-rules/.gitignore");
+          expect(patch).toContain("+review nested change");
+          expect(patch).toContain("diff --git a/rules/.gitignore b/rules/.gitignore");
+          expect(patch).toContain("+baseline exception");
+          expect(patch).not.toContain("rules/discard.tmp");
           expect(patch).toContain("-tracked baseline");
           expect(patch).not.toContain("untracked.generated");
           expect(patch).not.toContain("scratch.cache");
@@ -1277,7 +1307,8 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
               checkpointRef: CheckpointRef.make(result.commitId),
             }),
           ).toBe(result.treeId);
-          expect(reads).toEqual(["exclude", "capture", "exclude", "exclude", "capture", "exclude"]);
+          const captureReads = ["exclude", "paths", "capture", "paths", "exclude"];
+          expect(reads).toEqual([...captureReads, ...captureReads]);
           expect((yield* capture(verify)).treeId).toBe(result.treeId);
           yield* writeTextFile(NodePath.join(cwd, "agent.generated"), "edited after review\n");
           expect((yield* capture(verify)).treeId).not.toBe(result.treeId);
@@ -1319,14 +1350,15 @@ it.layer(TestLayer)("CheckpointStore.layer", (it) => {
           );
           expect(yield* Effect.flip(capture(verify))).toMatchObject(sparseError);
           yield* git(cwd, ["config", "--worktree", "core.sparseCheckout", "false"]);
+          const concurrentPath = NodePath.join(cwd, "concurrent.txt");
           beforeCapture = fs.writeFileString(
-            NodePath.join(cwd, ".gitignore"),
-            ".gitignore\ncache/\n",
+            concurrentPath,
+            "new file during checkpoint capture\n",
           );
           expect(yield* Effect.flip(capture(verify))).toMatchObject({
             detail: "The workflow Git checkpoint paths changed during capture.",
           });
-          yield* git(cwd, ["restore", ".gitignore"]);
+          yield* fs.remove(concurrentPath);
           beforeCapture = git(cwd, [
             "commit",
             "--allow-empty",

@@ -9,6 +9,7 @@ import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
 
 export const WORKFLOW_CHECKPOINT_READ_TIMEOUT_MS = 10 * 60_000;
 
@@ -74,7 +75,7 @@ interface CaptureProgress {
 const runReader = Effect.fnUntraced(function* <A, E, R>(
   spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
   cwd: string,
-  mode: "capture" | "exclude" | "conversation-files",
+  mode: "capture" | "exclude" | "conversation-files" | "paths",
   manifest: Uint8Array | undefined,
   consume: (
     output: Stream.Stream<Uint8Array, import("effect/PlatformError").PlatformError>,
@@ -115,6 +116,22 @@ const runReader = Effect.fnUntraced(function* <A, E, R>(
     );
   return output;
 });
+
+/** Discover checkout paths as the workload user, using Git with only the staged starting rules. */
+export const listWorkflowCheckpointPaths = (
+  spawner: ChildProcessSpawner.ChildProcessSpawner["Service"],
+  cwd: string,
+  listing: string,
+) =>
+  runReader(spawner, cwd, "paths", Buffer.from(listing), (stream) =>
+    collectUint8StreamText({ stream, maxBytes: 16 * 1024 * 1024 }).pipe(
+      Effect.flatMap(({ text, truncated, invalidUtf8 }) =>
+        truncated || invalidUtf8 || (text !== "" && !text.endsWith("\0"))
+          ? Effect.fail(invalid())
+          : Effect.succeed(text.split("\0").slice(0, -1)),
+      ),
+    ),
+  ).pipe(Effect.scoped, Effect.timeout("60 seconds"));
 
 /** Reads only the fixed checkout-local exclude file. A failed read is never empty rules. */
 export const readWorkflowCheckpointExclude = (

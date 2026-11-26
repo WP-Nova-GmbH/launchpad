@@ -5,16 +5,21 @@ import os
 import re
 import stat
 import struct
+import subprocess
 import sys
+import tempfile
 
 
 MAX_MANIFEST = 32 * 1024 * 1024
 MAX_EXCLUDE = 64 * 1024
 MAX_PATH = 4096
+MAX_PATH_LIST = 16 * 1024 * 1024
 MAX_ROLLOUT = 64 * 1024 * 1024
 MAX_CONVERSATION_FILES = 256
 MAX_CONVERSATION_ENTRIES = 8192
 CODEX_HOME = "/home/launchpad-workflow/.codex"
+INSTALLED_READER = "/opt/launchpad/bin/launchpad-workflow-checkpoint-reader.py"
+WORKFLOW_GIT = "/opt/launchpad/bin/launchpad-workflow-git"
 NATIVE_ID = re.compile(rb"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\n?")
 FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 DIRECTORY_FLAGS = FLAGS | os.O_DIRECTORY
@@ -137,6 +142,97 @@ def stream_exclude(root, owner, out):
             os.close(fd)
 
 
+def read_git_field(pipe):
+    field = bytearray()
+    while len(field) <= MAX_EXCLUDE:
+        byte = pipe.read(1)
+        if byte == b"\0":
+            return bytes(field)
+        if not byte:
+            break
+        field.extend(byte)
+    raise ValueError("Invalid baseline ignore response")
+
+
+def stream_paths(root, owner, listing, out):
+    if not os.path.isabs(listing) or os.path.normpath(listing) != listing or "\0" in listing:
+        raise ValueError("Invalid baseline ignore directory")
+    rules = os.path.join(listing, "rules")
+    listing_info = os.stat(listing, follow_symlinks=False)
+    rules_info = os.stat(rules, follow_symlinks=False)
+    if (not stat.S_ISDIR(listing_info.st_mode) or not stat.S_ISDIR(rules_info.st_mode)
+            or listing_info.st_uid != rules_info.st_uid
+            or (listing_info.st_mode | rules_info.st_mode) & 0o022):
+        raise ValueError("Invalid baseline ignore directory")
+
+    # The listing repo contains committed ignore files and pinned local excludes.
+    # The live checkout supplies paths only, so generated rules cannot hide edits.
+    command = [
+        WORKFLOW_GIT if __file__ == INSTALLED_READER else "/usr/bin/git",
+        "--no-optional-locks", "--git-dir", listing, "--work-tree", rules,
+        "-c", "safe.directory=" + listing, "-c", "safe.directory=" + rules,
+        "-c", "core.bare=false", "-c", "core.ignorecase=false", "-c", "core.excludesFile=/dev/null",
+        "check-ignore", "--no-index", "--verbose", "--non-matching", "-z", "--stdin",
+    ]
+    env = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_FLUSH": "1", "LC_ALL": "C", "TMPDIR": "/tmp"}
+    size = 0
+    with tempfile.TemporaryFile() as errors, subprocess.Popen(
+        command, cwd=rules, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
+    ) as git:
+        def ignored(path):
+            # check-ignore treats a leading : as pathspec magic and rejects literal mode.
+            query = b"./" + path
+            git.stdin.write(query + b"\0")
+            git.stdin.flush()
+            source, line, pattern, returned_path = [read_git_field(git.stdout) for _ in range(4)]
+            if returned_path != query or bool(source) != bool(line) or bool(line) != bool(pattern):
+                raise ValueError("Invalid baseline ignore response")
+            return bool(pattern) and not pattern.startswith(b"!")
+
+        def walk(directory, prefix):
+            nonlocal size
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    name = os.fsencode(entry.name)
+                    if name.lower() == b".git":
+                        if not prefix and name == b".git":
+                            continue
+                        raise ValueError("Unsupported checkout metadata")
+                    path = prefix + name
+                    if len(path) > MAX_PATH:
+                        raise ValueError("Path too long")
+                    info = entry.stat(follow_symlinks=False)
+                    directory_entry = stat.S_ISDIR(info.st_mode)
+                    # Git's untracked listing skips special files such as sockets.
+                    if not (directory_entry or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                        continue
+                    if ignored(path + b"/" if directory_entry else path):
+                        continue
+                    if info.st_uid != owner:
+                        raise ValueError("Invalid checkout entry owner")
+                    if directory_entry:
+                        fd = checked_open(directory, name, info, DIRECTORY_FLAGS, owner)
+                        try:
+                            walk(fd, path + b"/")
+                        finally:
+                            os.close(fd)
+                    else:
+                        size += len(path) + 1
+                        if size > MAX_PATH_LIST:
+                            raise ValueError("Checkout path list is too large")
+                        out.write(path + b"\0")
+
+        try:
+            walk(root, b"")
+            git.stdin.close()
+            if git.stdout.read(1) or git.wait() not in (0, 1) or errors.tell():
+                raise ValueError("Baseline ignores could not be checked")
+        finally:
+            if git.poll() is None:
+                git.kill()
+
+
 def list_conversation_files(root, owner, native_id):
     paths = []
     rollout_count = rollout_size = file_count = file_size = entries = metadata_size = 0
@@ -226,6 +322,11 @@ def main(mode, source, out):
             frame(out, COMPLETE)
         elif mode == "exclude":
             stream_exclude(root, owner, out)
+        elif mode == "paths":
+            path = source.read(MAX_PATH + 1)
+            if len(path) > MAX_PATH:
+                raise ValueError("Baseline ignore directory path is too long")
+            stream_paths(root, owner, path.decode("utf-8"), out)
         elif mode == "conversation-files":
             native_id = source.read(38)
             if os.getcwd() != CODEX_HOME or not NATIVE_ID.fullmatch(native_id):

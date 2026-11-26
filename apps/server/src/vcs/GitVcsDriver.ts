@@ -45,6 +45,7 @@ import * as VcsProcess from "./VcsProcess.ts";
 import { readWorkflowIgnoreRules } from "./WorkflowCheckpointIgnore.ts";
 import { copyWorkflowCheckpointWorkspace } from "./WorkflowCheckpointWorkspace.ts";
 import {
+  listWorkflowCheckpointPaths,
   readWorkflowCheckpointExclude,
   stageWorkflowCheckpoint,
   WorkflowCheckpointReadError,
@@ -538,6 +539,7 @@ const gitCommand = (
     readonly allowNonZeroExit?: boolean;
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
+    readonly onStdoutChunk?: VcsProcess.VcsProcessInput["onStdoutChunk"];
     readonly outputMode?: VcsProcess.VcsProcessInput["outputMode"];
     readonly appendTruncationMarker?: boolean;
   },
@@ -557,6 +559,7 @@ const gitCommand = (
         : {}),
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(options?.maxOutputBytes !== undefined ? { maxOutputBytes: options.maxOutputBytes } : {}),
+      ...(options?.onStdoutChunk !== undefined ? { onStdoutChunk: options.onStdoutChunk } : {}),
       ...(options?.outputMode !== undefined ? { outputMode: options.outputMode } : {}),
       ...(options?.appendTruncationMarker !== undefined
         ? { appendTruncationMarker: options.appendTruncationMarker }
@@ -598,6 +601,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       ...(input.allowNonZeroExit !== undefined ? { allowNonZeroExit: input.allowNonZeroExit } : {}),
       ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
       ...(input.maxOutputBytes !== undefined ? { maxOutputBytes: input.maxOutputBytes } : {}),
+      ...(input.onStdoutChunk !== undefined ? { onStdoutChunk: input.onStdoutChunk } : {}),
       ...(input.outputMode !== undefined ? { outputMode: input.outputMode } : {}),
       ...(input.appendTruncationMarker !== undefined
         ? { appendTruncationMarker: input.appendTruncationMarker }
@@ -956,8 +960,15 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       const objectFormat = (yield* sourceGit(["rev-parse", "--show-object-format"])).stdout.trim();
       if (objectFormat !== "sha1" && objectFormat !== "sha256")
         return yield* unavailable("The workflow Git object format is unsupported.");
-      if (protectedDir)
-        yield* sourceGit(["rev-parse", "--verify", `${WORKFLOW_REVIEW_SOURCE_REF}^{commit}`]);
+      const startingCommit = protectedDir
+        ? (yield* sourceGit([
+            "rev-parse",
+            "--verify",
+            `${WORKFLOW_REVIEW_SOURCE_REF}^{commit}`,
+          ])).stdout.trim()
+        : null;
+      if (startingCommit !== null && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(startingCommit))
+        return yield* localPathError();
       const readHead = Effect.fnUntraced(function* () {
         const result = yield* workloadGit(["rev-parse", "--verify", "HEAD^{commit}"]);
         const head = result.stdout.trim();
@@ -1095,10 +1106,9 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       let workTree = cwd;
       let trackedPaths: ReadonlySet<string> | undefined;
       let recheckPaths: Effect.Effect<void, VcsError> = Effect.void;
-      if (protectedDir) {
-        // Enumerate untracked names under the workload identity and without the
-        // workload's config or index. The listing directory contains no private
-        // objects. The coordinator never lets Git open mutable worktree paths.
+      if (protectedDir && startingCommit !== null) {
+        // The listing repository has no private objects. The workload can read
+        // its rules, while only the coordinator can write them.
         const listing = yield* fileSystem
           .makeTempDirectoryScoped({
             directory: (yield* VmWorkloadTracking) ? "/tmp" : undefined,
@@ -1151,18 +1161,73 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             outputMode: "error",
           });
         const tracked = new Set<string>();
-        const tree = yield* workloadGit(["ls-tree", "-r", "-z", "--full-tree", head]);
-        for (const entry of yield* completePaths(tree)) {
-          if (entry.startsWith("160000 "))
-            return yield* unavailable(
-              "The workflow Git checkpoint does not support embedded repositories.",
-            );
-          const pathStart = entry.indexOf("\t");
-          if (pathStart < 0 || pathStart === entry.length - 1) return yield* localPathError();
-          tracked.add(entry.slice(pathStart + 1));
+        const readTrackedTree = Effect.fnUntraced(function* (tree: VcsProcess.VcsProcessOutput) {
+          const entries = yield* completePaths(tree);
+          for (const entry of entries) {
+            if (entry.startsWith("160000 "))
+              return yield* unavailable(
+                "The workflow Git checkpoint does not support embedded repositories.",
+              );
+            const separator = entry.indexOf("\t");
+            if (separator < 0 || separator === entry.length - 1) return yield* localPathError();
+            tracked.add(entry.slice(separator + 1));
+          }
+          return entries;
+        });
+        if (isolated) {
+          const rules = path.join(listing, "rules");
+          const directories = new Set([rules]);
+          yield* fileSystem.makeDirectory(rules).pipe(Effect.mapError(localPathError));
+          yield* fileSystem.chmod(rules, 0o755).pipe(Effect.mapError(localPathError));
+          const tree = yield* sourceGit(["ls-tree", "-r", "-z", "--full-tree", startingCommit]);
+          for (const entry of yield* readTrackedTree(tree)) {
+            // Git reads regular ignore files. A committed symlink is reviewable
+            // data, and its target must never supply rules for this run.
+            const rule = /^100(?:644|755) blob ([0-9a-f]+)\t([\s\S]+)$/u.exec(entry);
+            if (!rule) continue;
+            const [, oid, relative] = rule;
+            const parts = relative!.split("/");
+            if (parts.at(-1) !== ".gitignore") continue;
+            if (
+              parts.some(
+                (part) => !part || part === "." || part === ".." || part.toLowerCase() === ".git",
+              )
+            )
+              return yield* localPathError();
+            let directory = rules;
+            for (const part of parts.slice(0, -1)) {
+              directory = path.join(directory, part);
+              if (directories.has(directory)) continue;
+              yield* fileSystem.makeDirectory(directory).pipe(Effect.mapError(localPathError));
+              yield* fileSystem.chmod(directory, 0o755).pipe(Effect.mapError(localPathError));
+              directories.add(directory);
+            }
+            const chunks: Uint8Array[] = [];
+            yield* executeReviewGit(protectedDir, {
+              operation,
+              args: ["cat-file", "blob", oid!],
+              maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
+              outputMode: "error",
+              onStdoutChunk: (chunk) => chunks.push(chunk),
+            });
+            const file = path.join(directory, ".gitignore");
+            yield* fileSystem
+              .writeFile(file, Buffer.concat(chunks))
+              .pipe(Effect.mapError(localPathError));
+            yield* fileSystem.chmod(file, 0o644).pipe(Effect.mapError(localPathError));
+          }
         }
+        yield* readTrackedTree(yield* workloadGit(["ls-tree", "-r", "-z", "--full-tree", head]));
         trackedPaths = tracked;
         const readUntracked = Effect.fnUntraced(function* () {
+          if (isolated) {
+            const paths = yield* listWorkflowCheckpointPaths(spawner, cwd, listing).pipe(
+              Effect.mapError(() =>
+                unavailable("The workflow Git checkpoint paths are unavailable."),
+              ),
+            );
+            return new Set(paths.filter((name) => !tracked.has(name)));
+          }
           yield* requireReviewableIgnoreFiles(listGit, tracked);
           const result = yield* listGit(["ls-files", "--others", "--exclude-standard", "-z"]);
           return new Set(yield* completePaths(result, true));
@@ -1238,8 +1303,10 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         const entries = [...trackedPaths].map((name) => `100644 ${emptyBlob}\t${name}\0`).join("");
         yield* checkpointGit(["update-index", "-z", "--index-info"], entries);
       }
-      yield* requireReviewableIgnoreFiles(checkpointGit);
-      yield* checkpointGit([...durableWrite, "add", "-A", "--", "."]);
+      if (!isolated) yield* requireReviewableIgnoreFiles(checkpointGit);
+      // This private tree contains only tracked and baseline-approved paths.
+      // Staged edits to .gitignore must not filter those paths a second time.
+      yield* checkpointGit([...durableWrite, "add", "-A", ...(isolated ? ["-f"] : []), "--", "."]);
       if (
         protectedDir &&
         (yield* checkpointGit(["ls-files", "--stage", "-z"])).stdout
@@ -1249,7 +1316,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         return yield* unavailable(
           "The workflow Git checkpoint does not support embedded repositories.",
         );
-      yield* requireReviewableIgnoreFiles(checkpointGit);
+      if (!isolated) yield* requireReviewableIgnoreFiles(checkpointGit);
       const attributeFiles = yield* checkpointGit([
         "ls-files",
         "-z",
