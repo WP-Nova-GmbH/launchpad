@@ -17,10 +17,12 @@ import {
 } from "../vmWorkload.ts";
 import { VmWorkloadTracking } from "../vmWorkloadCommand.ts";
 import type { makeThreadCheckpointPublisher } from "./ThreadCheckpointPublisher.ts";
+import { ThreadExecution } from "./ThreadExecution.ts";
 import type { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import { ThreadPauseError, type ThreadPauseTransport } from "./ThreadPauseTransport.ts";
 import { ThreadVmQueuedWork } from "./ThreadVmQueueActivity.ts";
 import { makeThreadVmSourceRecovery } from "./ThreadVmSourceRecovery.ts";
+import { adoptWorkflowVmCancellationSeal } from "./WorkflowVmCancellation.ts";
 
 const sameWorkflowCheckpoint = Schema.toEquivalence(
   Schema.UndefinedOr(RelayThreadVmWorkflowCheckpoint),
@@ -37,13 +39,14 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
     path = yield* Path.Path,
     background = yield* ThreadBackgroundLivenessService,
     provider = yield* ProviderService,
+    execution = yield* ThreadExecution,
     tracked = yield* VmWorkloadTracking;
   const readBackgroundRevision = (inventory: typeof VmWorkloadInventory.Type) =>
     readWorkflowVmBackgroundRevision(fs, path, stateDir, inventory);
   const fences = makeThreadExecutionFence(sql),
     recovery = yield* makeThreadVmSourceRecovery(history, checkpoints, readBackgroundRevision);
   const synchronize = Effect.fn("ThreadPauseWorker.synchronize")(function* (threadId: string) {
-    const owner = yield* fences.get(threadId);
+    let owner = yield* fences.get(threadId);
     if (!owner || owner.phase === "retired") return;
     const pause = yield* transport.get(owner);
     if (!pause) return;
@@ -69,6 +72,27 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
     )
       return;
     if (pause.canActivate) {
+      const cancelledFinishedCapture =
+        tracked &&
+        pause.phase === "cancelled" &&
+        pause.sourceSequence === null &&
+        pause.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
+      if (cancelledFinishedCapture && owner.phase === "active" && !pause.sourceReopened) {
+        const current = yield* inspectVmWorkloads({ type: "inspect" });
+        if (current.sealedBy !== null) {
+          // E2B may have paused before the guest saw this reclaim. Close local
+          // admission before taking over the existing stopped-workload seal.
+          yield* fences.beginDrain({ ...input, previousOperationId: owner.operationId });
+          const draining = yield* fences.get(threadId);
+          if (
+            !draining ||
+            draining.phase !== "draining" ||
+            draining.operationId !== pause.operationId
+          )
+            return yield* fail("The VM pause no longer owns this drain.");
+          owner = draining;
+        }
+      }
       if (owner.operationId !== pause.operationId && !pause.workflowCheckpoint) {
         // A Send may cancel the relay reservation before this server sees it.
         // Install that exact operation locally before acknowledging reopening;
@@ -90,12 +114,11 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
         if (tracked) {
           let inventory: typeof VmWorkloadInventory.Type | undefined;
           if (
-            pause.phase === "cancelled" &&
-            pause.sourceSequence === null &&
-            pause.workflowCheckpoint?.finishedWorkspaceRevision !== undefined &&
+            cancelledFinishedCapture &&
             owner.operationId === pause.operationId &&
             owner.phase === "draining"
           ) {
+            yield* adoptWorkflowVmCancellationSeal(sql, input);
             const live = (yield* provider.listSessions()).some(
               (session) => session.threadId === threadId,
             );
@@ -156,6 +179,8 @@ export const makeThreadPauseWorker = Effect.fn("ThreadPauseWorker.make")(functio
                 return yield* fail("Stopped provider output has not been confirmed.");
               yield* provider.flushRuntimeEvents(id);
             }
+            if (current.stopped && current.sealedBy === seal)
+              yield* execution.confirmProcessesStopped(threadId, "vm");
             inventory = current;
           }
           inventory ??= yield* inspectVmWorkloads({ type: "inspect" });

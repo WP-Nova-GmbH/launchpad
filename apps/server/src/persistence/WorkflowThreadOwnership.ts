@@ -117,11 +117,29 @@ export const requireWorkflowVmLifecycleCheckpoint = Effect.fn(
       ? yield* sql`SELECT 1 FROM provider_session_runtime WHERE thread_id=${input.threadId}
       UNION ALL SELECT 1 FROM projection_turns WHERE thread_id=${input.threadId} LIMIT 1`
       : [true];
+  const cancelledWithoutNativeCheckpoint =
+    expected.finishedWorkspaceRevision !== undefined &&
+    run.progress.status === "cancelled" &&
+    saved.checkpointPins.every((pin) => pin.turnId === "") &&
+    !run.sequence?.completed.some((step) => step.checkpoint !== null) &&
+    !(yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${input.threadId} AND turn_id IS NOT NULL
+      UNION ALL SELECT 1 FROM thread_native_checkpoints WHERE thread_id=${input.threadId}
+      UNION ALL SELECT 1 FROM workflow_result_outbox WHERE job_id=${run.jobId} AND native_operation_id IS NOT NULL
+      LIMIT 1`).length;
+  const cancelledBeforeNativeTurn =
+    cancelledWithoutNativeCheckpoint &&
+    !(yield* sql`SELECT 1 FROM checkout_work_admissions WHERE thread_id=${input.threadId}
+      AND kind='provider' AND (turn_id IS NOT NULL OR (work_id LIKE 'send-turn:%' AND rejected=0))
+      LIMIT 1`).length;
   return {
     binding: run.runtime,
+    status: run.progress.status,
     sourceSequence: row.sourceSequence,
+    cancelledWithoutNativeCheckpoint,
+    cancelledBeforeNativeTurn,
     beforeAgent:
       !hasConversation ||
+      cancelledBeforeNativeTurn ||
       (run.progress.checkpoint?.kind === "input" &&
         run.sequence?.completed.every((step) => step.checkpoint === null) === true),
   };

@@ -13,6 +13,7 @@ type Inspect = (
     readonly environmentId: string;
     readonly workflowCheckpoint?: boolean;
     readonly finishedWorkflow?: boolean;
+    readonly cancelledWorkflow?: boolean;
     readonly scope: {
       readonly allocationId: string;
       readonly threadId: ReturnType<typeof ThreadId.make>;
@@ -43,6 +44,7 @@ interface Candidate {
   readonly generation: number;
   readonly workflowCheckpoint: boolean;
   readonly finishedWorkflow: boolean;
+  readonly cancelledWorkflow: boolean;
 }
 
 /** Only a current running binding can supply a fresh idle report. Failed reads remain unknown. */
@@ -84,7 +86,8 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       a.compute_ref AS "computeRef", a.template_id AS "templateId", p.operation_id AS "operationId",
       b.environment_id AS "environmentId", a.thread_id AS "threadId", b.repository_id AS "repositoryId", p.generation,
       (a.resource_kind='organization_workflow') AS "workflowCheckpoint",
-      (a.resource_kind='organization_workflow' AND COALESCE(j.status IN ('done','cancelled','failed'),false)) AS "finishedWorkflow"
+      (a.resource_kind='organization_workflow' AND COALESCE(j.status IN ('done','cancelled','failed'),false)) AS "finishedWorkflow",
+      (a.resource_kind='organization_workflow' AND j.status IS NOT DISTINCT FROM 'cancelled') AS "cancelledWorkflow"
       FROM relay_thread_vm_allocations a
       JOIN relay_thread_vm_provisions p ON p.allocation_id = a.allocation_id
       JOIN relay_thread_vm_capacity c ON c.allocation_id = a.allocation_id AND c.state = 'started'
@@ -116,6 +119,7 @@ export function makeThreadVmActivityWorker(sql: PgClient, inspect: Inspect, host
       environmentId: row.environmentId,
       ...(row.workflowCheckpoint ? { workflowCheckpoint: true } : {}),
       ...(row.finishedWorkflow ? { finishedWorkflow: true } : {}),
+      ...(row.cancelledWorkflow ? { cancelledWorkflow: true } : {}),
       scope: {
         allocationId: row.allocationId,
         threadId: ThreadId.make(row.threadId),

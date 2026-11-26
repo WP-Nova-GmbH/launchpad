@@ -30,6 +30,7 @@ const Activity = Schema.Struct({
     phase: Schema.Literals(["active", "draining", "frozen", "retired"]),
     archived: Schema.Boolean,
     unfinished: Schema.Boolean,
+    cancelledStopped: Schema.optionalKey(Schema.Literal(true)),
     backgroundBusy: Schema.optionalKey(Schema.Boolean),
     backgroundRevision: Schema.optionalKey(
       Schema.String.check(Schema.isPattern(/^[0-9a-f]{32}(?::stopped)?$/u)),
@@ -125,6 +126,7 @@ export function makeE2BThreadVmActivity(
       readonly environmentId: string;
       readonly workflowCheckpoint?: boolean;
       readonly finishedWorkflow?: boolean;
+      readonly cancelledWorkflow?: boolean;
     },
   ) {
     return yield* Effect.tryPromise({
@@ -146,11 +148,24 @@ export function makeE2BThreadVmActivity(
           projection.phase !== "active"
         )
           return "unknown" as const;
-        const processActivity = classifyThreadVmActivity(
-          workloads,
-          identity.workflowCheckpoint,
-          identity.finishedWorkflow,
-        );
+        const cancelledStopped = projection.cancelledStopped === true;
+        if (
+          cancelledStopped &&
+          (!identity.cancelledWorkflow ||
+            !identity.workflowCheckpoint ||
+            !identity.finishedWorkflow ||
+            workloads.sealedBy === null ||
+            !workloads.stopped ||
+            workloads.groups.length !== 0)
+        )
+          return "unknown" as const;
+        const processActivity = cancelledStopped
+          ? "idle"
+          : classifyThreadVmActivity(
+              workloads,
+              identity.workflowCheckpoint,
+              identity.finishedWorkflow,
+            );
         if (processActivity === "unknown") return processActivity;
         if (
           projection.unfinished ||
@@ -164,9 +179,10 @@ export function makeE2BThreadVmActivity(
         if (new Set(processWorkIds).size !== processWorkIds.length) return "unknown" as const;
         // The relay can observe an idle VM while a settled Codex session still
         // holds admissions. The pause drain proves shutdown before releasing them.
-        const backgroundRevision = identity.finishedWorkflow
-          ? projection.backgroundRevision
-          : undefined;
+        const backgroundRevision =
+          identity.finishedWorkflow && !cancelledStopped
+            ? projection.backgroundRevision
+            : undefined;
         if (processActivity === "idle" && (processWorkIds.length || backgroundRevision))
           return {
             activity: "idle" as const,

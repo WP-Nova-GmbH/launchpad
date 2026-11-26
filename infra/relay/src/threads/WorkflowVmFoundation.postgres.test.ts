@@ -2979,140 +2979,179 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
         }).pipe(Effect.provide(NodeFileSystem.layer)),
     );
 
-    it.effect("lets other VMs resume while a cancelled finished pause awaits its guest", () =>
-      Effect.gen(function* () {
-        const f = yield* activeWorkflow();
-        const next = yield* activeWorkflow(false, false, f.hostId);
-        const { sql } = f;
-        const fs = yield* FileSystem.FileSystem;
-        const objects = makeLocalThreadArtifactObjects(fs, yield* fs.makeTempDirectoryScoped());
-        const resumes = makeThreadVmResumeStore(sql);
-        const prepare = Effect.fnUntraced(function* (run: typeof f) {
-          const pauseId = NodeCrypto.randomUUID();
-          const allocation = (yield* makeThreadVmAllocationStore(sql).getAny(run.allocationId))!;
-          const computeRef = allocation.computeRef!;
-          yield* sql`UPDATE relay_workflow_jobs SET status='done',pending_control=NULL,
-            record=record || jsonb_build_object('status','done','progress',${sql.json({
-              status: "done",
+    it.effect.each([false, true])(
+      "waits for the guest after a native pause (before reclaim: %s)",
+      (beforeReclaim) =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const { sql } = f;
+          const fs = yield* FileSystem.FileSystem;
+          const objects = makeLocalThreadArtifactObjects(fs, yield* fs.makeTempDirectoryScoped());
+          const resumes = makeThreadVmResumeStore(sql);
+          const prepare = Effect.fnUntraced(function* (run: typeof f, withoutReclaim = false) {
+            const pauseId = NodeCrypto.randomUUID();
+            const allocation = (yield* makeThreadVmAllocationStore(sql).getAny(run.allocationId))!;
+            const computeRef = allocation.computeRef!;
+            const sandbox = pausedSandbox(
+              computeRef,
+              run.allocationId,
+              run.operationId,
+              run.threadId,
+            );
+            const status = withoutReclaim ? "cancelled" : "done";
+            yield* sql`UPDATE relay_workflow_jobs SET status=${status},pending_control=NULL,
+            record=record || jsonb_build_object('status',${status}::text,'progress',${sql.json({
+              status,
               executionReleased: true,
               threadId: run.threadId,
               revision: 2,
               detail: null,
               checkpoint: null,
             })}) WHERE job_id=${run.workflowJobId}`;
-          yield* sql`INSERT INTO relay_organizations VALUES (${run.organizationId},'Organization','2026','2026')`;
-          yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
+            yield* sql`INSERT INTO relay_organizations VALUES (${run.organizationId},'Organization','2026','2026')`;
+            yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
             VALUES(${run.organizationId},${run.ownerUserId},'admin','2026','2026')`;
-          yield* sql`INSERT INTO relay_codex_vm_connections
+            yield* sql`INSERT INTO relay_codex_vm_connections
             (organization_id,connection_id,issuer,subject,client_id,status,payload_sealed,expires_at,updated_at)
             SELECT organization_id,record#>>'{vmAdmission,codexConnectionId}','issuer','subject','client','connected','sealed','2099-01-01','2026'
             FROM relay_workflow_jobs WHERE job_id=${run.workflowJobId}`;
-          yield* sql`INSERT INTO relay_thread_vm_pauses(allocation_id,operation_id,generation,phase,workflow_checkpoint)
+            if (withoutReclaim) {
+              const publicationId = NodeCrypto.randomUUID();
+              yield* sql`INSERT INTO relay_workflow_recovery_records
+              (publication_id,job_id,thread_id,revision,manifest_artifact_id,manifest_sha256,manifest_size_bytes,manifest)
+              VALUES(${publicationId},${run.workflowJobId},${run.threadId},2,${NodeCrypto.randomUUID()},${"b".repeat(64)},1,
+                ${sql.json({
+                  terminalExecutionReleased: true,
+                  binding: {
+                    allocationId: run.allocationId,
+                    environmentId: run.owner.environmentId,
+                    generation: 1,
+                  },
+                })})`;
+              yield* sql`INSERT INTO relay_workflow_recovery_heads(job_id,publication_id,revision)
+              VALUES(${run.workflowJobId},${publicationId},2)`;
+              const lease = makeThreadVmLeaseWorker(
+                sql,
+                () =>
+                  Effect.fail(
+                    new ThreadVmComputeError({ operation: "lease", message: "Already paused" }),
+                  ),
+                run.hostId,
+                { inspect: () => Effect.succeed(sandbox) },
+              );
+              expect(yield* lease.runOne()).toBe(true);
+              expect((yield* run.capacity.get(run.operationId))?.state).toBe("released");
+            } else {
+              yield* sql`INSERT INTO relay_thread_vm_pauses(allocation_id,operation_id,generation,phase,workflow_checkpoint)
             VALUES(${run.allocationId},${pauseId},1,'pending',${sql.json({
               jobId: run.workflowJobId,
               finishedWorkspaceRevision: 0,
             })})`;
-          yield* sql`INSERT INTO relay_workflow_vm_follow_ups(job_id,reclaim_operation_id)
+              yield* sql`INSERT INTO relay_workflow_vm_follow_ups(job_id,reclaim_operation_id)
             VALUES(${run.workflowJobId},${pauseId})`;
-          expect(
-            yield* resumes.reconcileNativePause({
-              ...run,
-              computeRef,
-              generation: 1,
-              capacityOperationId: run.operationId,
-            }),
-          ).toBe(true);
-          const asGuest = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-            effect.pipe(
-              Effect.provideService(RelayEnvironmentPrincipal, run.principal),
-              Effect.provideService(ThreadArtifactObjectStorage, objects),
-            );
-          return {
-            pauseId,
-            sandbox: pausedSandbox(computeRef, run.allocationId, run.operationId, run.threadId),
-            asGuest,
-            ...finishedFollowUp(run, objects),
-          };
-        });
-        const { open, status, pauseId, sandbox, asGuest } = yield* prepare(f);
-        const following = yield* prepare(next);
-        expect(yield* asGuest(getThreadVmPause(f.owner))).toMatchObject({
-          operationId: pauseId,
-          phase: "cancelled",
-          canActivate: false,
-          sourceReopened: false,
-        });
-        expect(yield* open).toMatchObject({ state: "waiting_capacity" });
-        expect(yield* following.open).toMatchObject({ state: "waiting_capacity" });
-        const sandboxes = new Map([sandbox, following.sandbox].map((vm) => [vm.sandboxId, vm]));
-        const connects: string[] = [];
-        const worker = makeThreadVmResumeWorker(
-          sql,
-          {
-            inspect: (sandboxId) => Effect.sync(() => sandboxes.get(sandboxId) ?? null),
-            recoverIngress: (sandboxId) =>
-              Effect.sync(() => {
-                connects.push(sandboxId);
-                sandboxes.set(sandboxId, {
-                  ...sandboxes.get(sandboxId)!,
-                  state: "running",
-                  endAt: DateTime.toDateUtc(DateTime.makeUnsafe("2099-01-01T00:00:00Z")),
-                });
-                return {
-                  sandboxId,
-                  trafficAccessToken: Redacted.make("resumed-token"),
-                };
-              }),
-          },
-          { reopenAfterResume: () => Effect.die("Only the guest may reopen this pause") },
-          f.hostId,
-          true,
-        );
-        const runOne = () =>
-          worker.runOne().pipe(
-            Effect.provideService(RelaySecretBox, {
-              seal: (value) => Effect.succeed(value),
-              open: (value) => Effect.succeed(value),
-            }),
+              expect(
+                yield* resumes.reconcileNativePause({
+                  ...run,
+                  computeRef,
+                  generation: 1,
+                  capacityOperationId: run.operationId,
+                }),
+              ).toBe(true);
+            }
+            const asGuest = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              effect.pipe(
+                Effect.provideService(RelayEnvironmentPrincipal, run.principal),
+                Effect.provideService(ThreadArtifactObjectStorage, objects),
+              );
+            return {
+              pauseId,
+              sandbox,
+              asGuest,
+              ...finishedFollowUp(run, objects),
+            };
+          });
+          const { open, status, sandbox, asGuest } = yield* prepare(f, beforeReclaim);
+          const next = yield* activeWorkflow(false, false, f.hostId);
+          const following = yield* prepare(next);
+          if (beforeReclaim) expect(yield* asGuest(getThreadVmPause(f.owner))).toBeNull();
+          expect(yield* open).toMatchObject({ state: "waiting_capacity" });
+          const activation = (yield* asGuest(getThreadVmPause(f.owner)))!;
+          const pauseId = activation.operationId;
+          expect(activation).toMatchObject({
+            phase: "cancelled",
+            canActivate: false,
+            sourceReopened: false,
+          });
+          expect(yield* following.open).toMatchObject({ state: "waiting_capacity" });
+          const sandboxes = new Map([sandbox, following.sandbox].map((vm) => [vm.sandboxId, vm]));
+          const connects: string[] = [];
+          const worker = makeThreadVmResumeWorker(
+            sql,
+            {
+              inspect: (sandboxId) => Effect.sync(() => sandboxes.get(sandboxId) ?? null),
+              recoverIngress: (sandboxId) =>
+                Effect.sync(() => {
+                  connects.push(sandboxId);
+                  sandboxes.set(sandboxId, {
+                    ...sandboxes.get(sandboxId)!,
+                    state: "running",
+                    endAt: DateTime.toDateUtc(DateTime.makeUnsafe("2099-01-01T00:00:00Z")),
+                  });
+                  return {
+                    sandboxId,
+                    trafficAccessToken: Redacted.make("resumed-token"),
+                  };
+                }),
+            },
+            { reopenAfterResume: () => Effect.die("Only the guest may reopen this pause") },
+            f.hostId,
+            true,
           );
-        expect(yield* runOne()).toBe(true);
-        expect(connects).toEqual([sandbox.sandboxId]);
-        expect((yield* resumes.get(f.allocationId))?.phase).toBe("resuming");
-        expect(yield* status).toMatchObject({ state: "resuming" });
-        expect(yield* asGuest(getThreadVmPause(f.owner))).toMatchObject({
-          operationId: pauseId,
-          phase: "cancelled",
-          canActivate: true,
-          sourceReopened: false,
-        });
-        expect(
-          yield* sql`SELECT retry_at <= clock_timestamp()+interval '5 seconds' AS soon
+          const runOne = () =>
+            worker.runOne().pipe(
+              Effect.provideService(RelaySecretBox, {
+                seal: (value) => Effect.succeed(value),
+                open: (value) => Effect.succeed(value),
+              }),
+            );
+          expect(yield* runOne()).toBe(true);
+          expect(connects).toEqual([sandbox.sandboxId]);
+          expect((yield* resumes.get(f.allocationId))?.phase).toBe("resuming");
+          expect(yield* status).toMatchObject({ state: "resuming" });
+          expect(yield* asGuest(getThreadVmPause(f.owner))).toMatchObject({
+            operationId: pauseId,
+            phase: "cancelled",
+            canActivate: true,
+            sourceReopened: false,
+          });
+          expect(
+            yield* sql`SELECT retry_at <= clock_timestamp()+interval '5 seconds' AS soon
           FROM relay_thread_vm_resumes WHERE allocation_id=${f.allocationId}`,
-        ).toEqual([{ soon: true }]);
+          ).toEqual([{ soon: true }]);
 
-        // Both requests are due at the next minute sweep. The second VM has waited
-        // longer for its first attempt than the first VM has waited for its retry.
-        yield* sql`UPDATE relay_thread_vm_resumes SET retry_at=clock_timestamp()-CASE
+          // Both requests are due at the next minute sweep. The second VM has waited
+          // longer for its first attempt than the first VM has waited for its retry.
+          yield* sql`UPDATE relay_thread_vm_resumes SET retry_at=clock_timestamp()-CASE
           WHEN allocation_id=${f.allocationId} THEN interval '55 seconds' ELSE interval '1 minute' END
           WHERE allocation_id IN (${f.allocationId},${next.allocationId})`;
-        expect(yield* runOne()).toBe(true);
-        expect(connects).toEqual([sandbox.sandboxId, following.sandbox.sandboxId]);
-        expect((yield* resumes.get(f.allocationId))?.phase).toBe("resuming");
-        expect((yield* resumes.get(next.allocationId))?.phase).toBe("resuming");
-        expect(yield* following.status).toMatchObject({ state: "resuming" });
+          expect(yield* runOne()).toBe(true);
+          expect(connects).toEqual([sandbox.sandboxId, following.sandbox.sandboxId]);
+          expect((yield* resumes.get(f.allocationId))?.phase).toBe("resuming");
+          expect((yield* resumes.get(next.allocationId))?.phase).toBe("resuming");
+          expect(yield* following.status).toMatchObject({ state: "resuming" });
 
-        expect(
-          yield* asGuest(confirmThreadVmPauseActivation({ ...f.owner, operationId: pauseId })),
-        ).toMatchObject({ sourceReopened: true });
-        expect(yield* status).toMatchObject({ state: "resuming" });
-        yield* sql`UPDATE relay_thread_vm_resumes later SET retry_at=older.retry_at+interval '1 second'
+          expect(
+            yield* asGuest(confirmThreadVmPauseActivation({ ...f.owner, operationId: pauseId })),
+          ).toMatchObject({ sourceReopened: true });
+          expect(yield* status).toMatchObject({ state: "resuming" });
+          yield* sql`UPDATE relay_thread_vm_resumes later SET retry_at=older.retry_at+interval '1 second'
           FROM relay_thread_vm_resumes older
           WHERE later.allocation_id=${next.allocationId} AND older.allocation_id=${f.allocationId}`;
-        expect(yield* runOne()).toBe(true);
-        expect(connects).toEqual([sandbox.sandboxId, following.sandbox.sandboxId]);
-        expect((yield* resumes.get(f.allocationId))?.phase).toBe("completed");
-        expect(yield* status).toMatchObject({ state: "running" });
-      }).pipe(Effect.provide(NodeFileSystem.layer)),
+          expect(yield* runOne()).toBe(true);
+          expect(connects).toEqual([sandbox.sandboxId, following.sandbox.sandboxId]);
+          expect((yield* resumes.get(f.allocationId))?.phase).toBe("completed");
+          expect(yield* status).toMatchObject({ state: "running" });
+        }).pipe(Effect.provide(NodeFileSystem.layer)),
     );
 
     it.effect("queues only the exact verified workspace after a finished VM disappears", () =>
@@ -3808,6 +3847,250 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           FROM relay_workflow_jobs j JOIN relay_workflow_saved_results s USING(job_id)
           WHERE j.job_id=${f.workflowJobId}`,
           ).toEqual([{ pr, result: { patch: "saved" } }]);
+        }),
+    );
+
+    for (const pauseReply of ["acknowledged", "lost", "restart"] as const)
+      it.effect(
+        `saves a cancelled workflow before releasing its only VM slot (${pauseReply})`,
+        () =>
+          Effect.gen(function* () {
+            const f = yield* activeWorkflow();
+            const next = yield* seed({ hostId: f.hostId, organizationId: f.organizationId });
+            const { sql } = f;
+            const asVm = Effect.provideService(RelayEnvironmentPrincipal, f.principal);
+            const workIds = ["provider:stopped", "terminal:stopped"];
+            for (const workId of workIds)
+              yield* admitPortableThreadWork({ ...f.owner, workId }).pipe(asVm);
+
+            const connectionId = NodeCrypto.randomUUID();
+            yield* f.capacity.configure(f.hostId, 1);
+            yield* sql`INSERT INTO relay_organizations VALUES (${f.organizationId},'Organization','2026','2026')`;
+            yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
+              VALUES(${f.organizationId},${f.ownerUserId},'admin','2026','2026')`;
+            yield* sql`INSERT INTO relay_codex_vm_connections
+          (organization_id,connection_id,issuer,subject,client_id,status,payload_sealed,expires_at,updated_at)
+          VALUES (${f.organizationId},${connectionId},'issuer','subject','client','connected','sealed','2099-01-01','2026')`;
+            yield* sql`UPDATE relay_workflow_jobs SET status='queued',record=record ||
+          ${sql.json({ status: "queued", queueReason: { code: "vm_waiting_capacity" }, vmAdmission: { codexConnectionId: connectionId } })}
+          WHERE job_id=${next.workflowJobId}`;
+            yield* sql`INSERT INTO relay_workflow_saved_results
+          (result_id,job_id,thread_id,turn_id,revision,result,native_checkpoint_operation_id)
+          VALUES (${NodeCrypto.randomUUID()},${f.workflowJobId},${f.threadId},'test-turn',1,'{"patch":"saved"}','test-checkpoint')`;
+            yield* sql`UPDATE relay_workflow_jobs SET status='cancelled',record=record ||
+          jsonb_build_object('status','cancelled','progress',${sql.json({
+            status: "cancelled",
+            executionReleased: true,
+            threadId: f.threadId,
+            revision: 2,
+            detail: "Cancelled",
+            checkpoint: null,
+          })},'updatedAt',clock_timestamp()-interval '11 minutes')
+          WHERE job_id=${f.workflowJobId}`;
+
+            yield* makeThreadVmActivityWorker(
+              sql,
+              (_sandbox, identity) =>
+                Effect.sync(() => {
+                  expect(identity).toMatchObject({
+                    finishedWorkflow: true,
+                    cancelledWorkflow: true,
+                  });
+                  return { activity: "idle" as const, inactiveWorkIds: workIds };
+                }),
+              f.hostId,
+            ).runOne();
+            expect(
+              yield* sql`SELECT activity,inactive_work_ids AS "inactiveWorkIds"
+          FROM relay_thread_vm_activity WHERE allocation_id=${f.allocationId}`,
+            ).toEqual([{ activity: "idle", inactiveWorkIds: workIds }]);
+            const pauses = makeThreadVmPauseStore(sql);
+            expect(yield* pauses.reserveFinished(f.hostId, undefined)).toBeNull();
+            const publicationId = NodeCrypto.randomUUID();
+            yield* sql`INSERT INTO relay_workflow_recovery_records
+          (publication_id,job_id,thread_id,revision,manifest_artifact_id,manifest_sha256,manifest_size_bytes,manifest)
+          VALUES (${publicationId},${f.workflowJobId},${f.threadId},1,${NodeCrypto.randomUUID()},${"b".repeat(64)},1,
+            ${sql.json({
+              terminalExecutionReleased: true,
+              sourceSequence: 0,
+              binding: {
+                allocationId: f.allocationId,
+                environmentId: f.owner.environmentId,
+                generation: 1,
+              },
+            })})`;
+            yield* sql`INSERT INTO relay_workflow_recovery_heads(job_id,publication_id,revision)
+          VALUES(${f.workflowJobId},${publicationId},1)`;
+            expect(yield* pauses.reserveFinished(f.hostId, undefined)).toBeNull();
+            yield* sql`UPDATE relay_thread_vm_activity SET idle_since=clock_timestamp()-interval '11 minutes'
+          WHERE allocation_id=${f.allocationId}`;
+            expect(yield* f.capacity.finishedVmDueToPause(f.hostId, undefined)).toBeNull();
+            expect(yield* pauses.reserveFinished(f.hostId, undefined)).toBe(f.allocationId);
+
+            const fs = yield* FileSystem.FileSystem;
+            const objects = makeLocalThreadArtifactObjects(fs, yield* fs.makeTempDirectoryScoped());
+            const withStorage = Effect.provideService(ThreadArtifactObjectStorage, objects);
+            const request = (yield* getThreadVmPause(f.owner).pipe(asVm, withStorage))!;
+            const bootId = NodeCrypto.randomUUID();
+            const freeze = freezeThreadVmPause({
+              ...f.owner,
+              operationId: request.operationId,
+              workflowCheckpoint: request.workflowCheckpoint!,
+              bootId,
+              sealEpoch: 3,
+              nativeCheckpointOperationId: null,
+              sourceSequence: 0,
+            }).pipe(asVm, withStorage);
+            expect(yield* Effect.isFailure(freeze)).toBe(true);
+            for (const workId of workIds)
+              yield* completePortableThreadWork({ ...f.owner, workId }).pipe(asVm);
+            expect(yield* freeze).toMatchObject({ phase: "pending" });
+            expect(yield* pauses.claim(f.hostId)).toBeNull();
+            const backups = makeThreadVmBackupStore(sql);
+            const backup = (yield* backups.claim(f.hostId))!;
+            const snapshotId = `cancelled-fixture-${backup.operationId}`;
+            expect(yield* backups.beginCapture(backup)).toBe(true);
+            expect(
+              yield* backups.recordCapture(backup, {
+                snapshotId,
+                sourceTemplateId: snapshotId,
+                sourceBuildId: NodeCrypto.randomUUID(),
+              }),
+            ).toBe(true);
+
+            const sandbox = pausedSandbox(
+              backup.computeRef,
+              f.allocationId,
+              f.operationId,
+              f.threadId,
+            );
+            let observed: SandboxInfo = { ...sandbox, state: "running" };
+            let pauseCalls = 0;
+            const dispatched = yield* Deferred.make<void>();
+            const makeWorker = () =>
+              makeThreadVmPauseWorker(
+                sql,
+                {
+                  inspect: () => Effect.succeed(observed),
+                  pause: () =>
+                    Effect.gen(function* () {
+                      pauseCalls++;
+                      yield* Deferred.succeed(dispatched, undefined);
+                      if (pauseReply === "lost")
+                        return yield* new ThreadVmComputeError({
+                          operation: "pause",
+                          message: "The response was lost",
+                        });
+                      if (pauseReply === "restart") yield* Effect.never;
+                    }),
+                },
+                {
+                  seal: () => Effect.succeed({ bootId, idle: true }),
+                  reopen: () => Effect.die("Keep the VM sealed"),
+                },
+                f.hostId,
+                false,
+              );
+            if (pauseReply === "restart") {
+              const pending = yield* makeWorker().runOne().pipe(Effect.forkScoped);
+              yield* Deferred.await(dispatched);
+              const original = (yield* sql<{
+                claimId: string;
+              }>`SELECT claim_id AS "claimId" FROM relay_thread_vm_pauses
+            WHERE operation_id=${request.operationId}`)[0]!;
+              observed = sandbox;
+              yield* sql`UPDATE relay_thread_vm_pauses SET claim_until=clock_timestamp()-interval '1 second'
+            WHERE operation_id=${request.operationId}`;
+              expect(yield* makeWorker().runOne()).toBe(false);
+              yield* Fiber.interrupt(pending);
+              yield* sql`UPDATE relay_thread_vm_pauses SET pause_dispatched_at=clock_timestamp()-interval '2 minutes'
+            WHERE operation_id=${request.operationId} AND pause_dispatch_claim_id=${original.claimId}`;
+            } else {
+              expect(yield* makeWorker().runOne()).toBe(true);
+            }
+            expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+            expect(yield* next.capacity.admitNext(f.hostId, "all")).toBeNull();
+            const retry = sql`UPDATE relay_thread_vm_pauses SET retry_at=clock_timestamp()
+          WHERE operation_id=${request.operationId}`;
+            observed = { ...sandbox, state: "running" };
+            yield* retry;
+            expect(yield* makeWorker().runOne()).toBe(true);
+            expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+            observed = {
+              ...sandbox,
+              metadata: { ...sandbox.metadata, "launchpad.generation": "2" },
+            };
+            yield* retry;
+            expect(yield* makeWorker().runOne()).toBe(true);
+            expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+            observed = sandbox;
+            yield* retry;
+            expect(yield* makeWorker().runOne()).toBe(true);
+            expect(pauseCalls).toBe(1);
+            expect(
+              yield* sql`SELECT phase, pause_dispatch_claim_id IS NOT NULL AS fenced
+          FROM relay_thread_vm_pauses WHERE operation_id=${request.operationId}`,
+            ).toEqual([{ phase: "completed", fenced: pauseReply !== "acknowledged" }]);
+            if (pauseReply !== "acknowledged") {
+              const followUp = finishedFollowUp(f, objects);
+              const blocked = {
+                state: "unavailable",
+                detail: expect.stringMatching(/could not confirm the VM provider’s pause response/),
+              };
+              expect(yield* followUp.status).toMatchObject(blocked);
+              expect(yield* followUp.open).toMatchObject(blocked);
+              expect(yield* makeThreadVmResumeStore(sql).get(f.allocationId)).toBeNull();
+            }
+            expect((yield* f.capacity.get(f.operationId))?.state).toBe("released");
+            expect(
+              (yield* next.capacity.admitNext(f.hostId, {
+                workflowEnabled: true,
+                workflowOperationId: next.operationId,
+              }))?.operationId,
+            ).toBe(next.operationId);
+            expect(
+              yield* sql`SELECT j.status,s.result FROM relay_workflow_jobs j JOIN relay_workflow_saved_results s USING(job_id)
+          WHERE j.job_id=${f.workflowJobId}`,
+            ).toEqual([{ status: "cancelled", result: { patch: "saved" } }]);
+          }).pipe(Effect.provide(Layer.merge(workflows, NodeFileSystem.layer))),
+      );
+
+    it.effect(
+      "keeps a freshly sealed pause owned when an older lease observation reports paused",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const { sql } = f;
+          const allocations = makeThreadVmAllocationStore(sql);
+          const computeRef = (yield* allocations.getAny(f.allocationId))!.computeRef!;
+          const sandbox = pausedSandbox(computeRef, f.allocationId, f.operationId, f.threadId);
+          const pauseOperationId = NodeCrypto.randomUUID();
+          const worker = makeThreadVmLeaseWorker(
+            sql,
+            () =>
+              Effect.fail(new ThreadVmComputeError({ operation: "lease", message: "VM paused" })),
+            f.hostId,
+            {
+              inspect: () =>
+                Effect.gen(function* () {
+                  // The lease worker selected an ordinary workflow VM. Pause
+                  // ownership can change by the time it receives native state.
+                  yield* sql`INSERT INTO relay_thread_vm_pauses
+                  (allocation_id,operation_id,generation,phase,boot_id,workflow_checkpoint)
+                  VALUES(${f.allocationId},${pauseOperationId},1,'sealed',${NodeCrypto.randomUUID()},
+                    ${sql.json({ jobId: f.workflowJobId, finishedWorkspaceRevision: 0 })})`.pipe(
+                    Effect.orDie,
+                  );
+                  return sandbox;
+                }),
+            },
+          );
+          expect(yield* worker.runOne()).toBe(true);
+          expect((yield* f.capacity.get(f.operationId))?.state).toBe("started");
+          expect((yield* allocations.getAny(f.allocationId))?.state).toBe("running");
+          expect(
+            yield* sql`SELECT phase FROM relay_thread_vm_pauses WHERE operation_id=${pauseOperationId}`,
+          ).toEqual([{ phase: "sealed" }]);
         }),
     );
 

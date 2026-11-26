@@ -81,11 +81,19 @@ describe("thread VM workload activity", () => {
     "finished-codex-without-background-receipt",
     "finished-stopped-background",
     "awaiting-review-codex",
+    "cancelled-stopped",
+    "cancelled-unproven",
+    "cancelled-still-running",
+    "cancelled-with-queued-prompt",
+    "finished-with-cancellation-proof",
   ] as const)
     it.effect(`reads current durable VM activity without waking it (${situation})`, () =>
       Effect.gen(function* () {
         const codexOnly = situation.includes("codex");
-        const finishedWorkflow = situation.startsWith("finished-");
+        const cancelledWorkflow = situation.startsWith("cancelled-");
+        const cancellationReport =
+          cancelledWorkflow || situation === "finished-with-cancellation-proof";
+        const finishedWorkflow = situation.startsWith("finished-") || cancelledWorkflow;
         const backgroundRevision =
           situation === "finished-stopped-background"
             ? `${"a".repeat(32)}:stopped`
@@ -121,10 +129,14 @@ describe("thread VM workload activity", () => {
           archived: situation === "archived",
           unfinished: ["unfinished", "finished-codex-with-unfinished-work"].includes(situation),
           ...(backgroundRevision ? { backgroundRevision } : {}),
+          ...(cancellationReport && situation !== "cancelled-unproven"
+            ? { cancelledStopped: true }
+            : {}),
           backgroundBusy: situation === "finished-codex-with-background-work",
           processWorkIds: codexOnly
             ? ["provider:idle"]
-            : ["stopped-processes", "live-process", "live-probe"].includes(situation)
+            : cancellationReport ||
+                ["stopped-processes", "live-process", "live-probe"].includes(situation)
               ? ["provider:idle", "terminal:closed", "setup:ready"]
               : [],
           queue: {
@@ -146,6 +158,10 @@ describe("thread VM workload activity", () => {
               "finished-codex-without-background-receipt",
               "finished-stopped-background",
               "awaiting-review-codex",
+              "cancelled-stopped",
+              "cancelled-unproven",
+              "cancelled-still-running",
+              "finished-with-cancellation-proof",
             ].includes(situation)
               ? []
               : [{ state: situation === "delivery-unknown" ? "unknown" : "pending" }],
@@ -158,15 +174,23 @@ describe("thread VM workload activity", () => {
               : {
                   workloads: codexOnly
                     ? idleCodex
-                    : situation === "live-process" || situation === "live-probe"
+                    : cancellationReport
                       ? {
                           ...empty,
-                          stopped: false,
-                          groups: [group(situation === "live-probe" ? "probe" : "process")],
+                          sealedBy: "cancel",
+                          ...(situation === "cancelled-still-running"
+                            ? { stopped: false, groups: [group("provider")] }
+                            : {}),
                         }
-                      : finishedWorkflow
-                        ? { ...empty, recoverable: true }
-                        : empty,
+                      : situation === "live-process" || situation === "live-probe"
+                        ? {
+                            ...empty,
+                            stopped: false,
+                            groups: [group(situation === "live-probe" ? "probe" : "process")],
+                          }
+                        : finishedWorkflow
+                          ? { ...empty, recoverable: true }
+                          : empty,
                   projection,
                 },
           ),
@@ -189,6 +213,7 @@ describe("thread VM workload activity", () => {
             operationId: "operation",
             ...(codexOnly || finishedWorkflow ? { workflowCheckpoint: true } : {}),
             ...(finishedWorkflow ? { finishedWorkflow: true } : {}),
+            ...(cancelledWorkflow ? { cancelledWorkflow: true } : {}),
             scope: {
               allocationId: "allocation",
               threadId: ThreadId.make("thread"),
@@ -202,9 +227,12 @@ describe("thread VM workload activity", () => {
           expect(result._tag).toBe("Success");
           if (
             result._tag === "Success" &&
-            ["stopped-processes", "finished-idle-codex", "finished-stopped-background"].includes(
-              situation,
-            )
+            [
+              "stopped-processes",
+              "finished-idle-codex",
+              "finished-stopped-background",
+              "cancelled-stopped",
+            ].includes(situation)
           )
             expect(result.success).toEqual({
               activity: "idle",
@@ -213,9 +241,15 @@ describe("thread VM workload activity", () => {
             });
           else if (result._tag === "Success")
             expect(result.success).toBe(
-              ["held", "foreign-environment", "old-generation", "awaiting-review-codex"].includes(
-                situation,
-              )
+              [
+                "held",
+                "foreign-environment",
+                "old-generation",
+                "awaiting-review-codex",
+                "cancelled-unproven",
+                "cancelled-still-running",
+                "finished-with-cancellation-proof",
+              ].includes(situation)
                 ? "unknown"
                 : [
                       "queued-prompt",
@@ -228,6 +262,7 @@ describe("thread VM workload activity", () => {
                       "finished-codex-with-unfinished-work",
                       "finished-codex-with-background-work",
                       "finished-codex-without-background-receipt",
+                      "cancelled-with-queued-prompt",
                     ].includes(situation)
                   ? "busy"
                   : "idle",

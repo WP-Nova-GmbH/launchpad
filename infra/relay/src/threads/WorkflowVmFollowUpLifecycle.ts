@@ -80,6 +80,11 @@ const resumeUnconfirmed = {
   detail:
     "Launchpad could not confirm that the workflow VM resumed. Saved results are still available.",
 } as const;
+const pauseUnconfirmed = {
+  state: "unavailable",
+  detail:
+    "Launchpad could not confirm the VM provider’s pause response. Saved results are still available. Try Continue in VM again after the pause is confirmed.",
+} as const;
 const restoreUnconfirmed = {
   state: "unavailable",
   detail: "Launchpad could not confirm the workflow VM restore. Saved results are still available.",
@@ -120,6 +125,7 @@ interface Source {
   readonly allocationState: string | null;
   readonly resumePhase: string | null;
   readonly resumeUnconfirmed: boolean;
+  readonly pauseUnconfirmed: boolean;
   readonly awaitingReopen: boolean;
   readonly capacityState: string | null;
   readonly codexState: "ready" | "reconnect" | "replaced";
@@ -146,6 +152,12 @@ const lockSource = Effect.fnUntraced(function* (sql: PgClient, input: WorkflowVm
       a.state AS "allocationState",r.phase AS "resumePhase",c.state AS "capacityState",
       COALESCE(r.phase='resuming' AND r.connect_claim_id IS NOT NULL
         AND (r.claim_until IS NULL OR r.claim_until<=clock_timestamp()),false) AS "resumeUnconfirmed",
+      EXISTS(SELECT 1 FROM relay_thread_vm_pauses pause WHERE pause.allocation_id=a.allocation_id
+        AND pause.generation=t.generation AND pause.workflow_checkpoint->>'jobId'=j.job_id
+        AND pause.workflow_checkpoint ? 'finishedWorkspaceRevision' AND j.status='cancelled'
+        AND pause.pause_dispatch_claim_id IS NOT NULL
+        AND (pause.claim_id IS DISTINCT FROM pause.pause_dispatch_claim_id
+          OR pause.pause_dispatched_at<=clock_timestamp()-interval '2 minutes')) AS "pauseUnconfirmed",
       EXISTS(SELECT 1 FROM relay_thread_vm_pauses pause WHERE pause.allocation_id=a.allocation_id
         AND pause.generation=t.generation AND pause.workflow_checkpoint->>'jobId'=j.job_id
         AND pause.phase IN ('cancelled','completed') AND pause.source_reopened_at IS NULL
@@ -216,6 +228,7 @@ const readRunning = (sql: PgClient, input: WorkflowVmFollowUpRequest, generation
   );
 
 const pendingState = (source: Source): Exclude<WorkflowVmFollowUpView, { state: "running" }> => {
+  if (source.pauseUnconfirmed) return pauseUnconfirmed;
   if (source.snapshotUnconfirmed) return snapshotUnconfirmed;
   if (source.resumeUnconfirmed) return resumeUnconfirmed;
   if (source.restoreIssue === "deletion") return restoreDeletionUnconfirmed;
@@ -279,6 +292,7 @@ export const readWorkflowVmFollowUp = Effect.fn("relay.workflow_vm.follow_up.rea
         source.allocationState === "running" &&
         !source.reclaimOperationId &&
         !source.resumePhase &&
+        !source.pauseUnconfirmed &&
         !source.awaitingReopen
       ) {
         const live = yield* readRunning(sql, input, source.generation);
@@ -310,6 +324,7 @@ export const openWorkflowVmFollowUp = Effect.fn("relay.workflow_vm.follow_up.ope
         const source = yield* lockSource(sql, input);
         if (!source) return unavailable;
         if (
+          source.pauseUnconfirmed ||
           source.reclaimOperationId ||
           source.resumePhase ||
           source.awaitingReopen ||

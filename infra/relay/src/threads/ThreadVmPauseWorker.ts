@@ -84,7 +84,14 @@ export function makeThreadVmPauseWorker(
         // Timeout may stop the exact VM after its source checkpoint was
         // retained but before this worker records the guest seal.
         if (claim.phase === "pending" && !(yield* store.markSealed(claim, claim.bootId))) return;
-        yield* store.finish(claim);
+        if (
+          claim.pauseDispatchClaimId !== null &&
+          (before.templateId !== claim.templateId.split(":")[0] ||
+            before.network?.allowPublicTraffic !== false ||
+            before.lifecycle?.autoResume !== false)
+        )
+          return;
+        yield* store.finish(claim, claim.pauseDispatchClaimId !== null);
         return;
       }
       if (before.state !== "running") return;

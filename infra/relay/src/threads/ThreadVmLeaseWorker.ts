@@ -206,7 +206,10 @@ export function makeThreadVmLeaseWorker(
                 JOIN relay_thread_placements t USING(thread_id)
                 WHERE a.allocation_id=${row.allocationId} AND a.resource_kind='organization_workflow'
                   AND a.compute_ref=${row.computeRef} AND a.state=${row.allocationState}
-                  AND a.deleted_at IS NULL AND NOT ${workflowVmFinishedReclaim(sql)} FOR UPDATE OF a`;
+                  AND a.deleted_at IS NULL AND t.generation=${row.generation}
+                  AND NOT EXISTS(SELECT 1 FROM relay_thread_vm_pauses x WHERE x.allocation_id=a.allocation_id
+                    AND x.generation=t.generation AND x.phase IN ('pending','sealed'))
+                  AND NOT ${workflowVmFinishedReclaim(sql)} FOR UPDATE OF a`;
               if (!allocation) return false;
               const [capacity] = yield* sql`UPDATE relay_thread_vm_capacity c SET state='released'
                 WHERE c.operation_id=${row.capacityOperationId} AND c.allocation_id=${row.allocationId}

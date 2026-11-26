@@ -8,6 +8,7 @@ import {
 } from "./ThreadVmCapacityStore.ts";
 import { releaseThreadNativeCheckpointOperation } from "./ThreadNativeCheckpointStore.ts";
 import type { ThreadVmCaptureSourceReceipt } from "../machines/E2BNativeSnapshotReceipt.ts";
+import { acknowledgeThreadVmPauseBackup } from "./ThreadVmPauseStore.ts";
 import {
   authorizeWorkflowVmCheckpoint,
   lockWorkflowVmCheckpoint,
@@ -387,6 +388,50 @@ export function makeThreadVmResumeStore(sql: PgClient) {
             (workflowJobId ? !native : allocation.nativePausedGeneration !== placement.generation))
         )
           return yield* conflict("VM pause has not been confirmed");
+        if (
+          followUpRequest &&
+          job?.record.status === "cancelled" &&
+          allocation.nativePausedGeneration === placement.generation
+        ) {
+          const [awaitingGuest] = yield* sql`SELECT 1 FROM relay_thread_vm_pauses
+            WHERE allocation_id=${allocation.allocationId} AND generation=${placement.generation}
+              AND phase='cancelled' AND source_reopened_at IS NULL
+              AND workflow_checkpoint->>'jobId'=${job.jobId}
+              AND workflow_checkpoint ? 'finishedWorkspaceRevision'`;
+          if (!awaitingGuest) {
+            // A provider timeout can pause a cancelled VM before a reclaim is
+            // reserved. Give its guest the same activation handshake on wake.
+            yield* acknowledgeThreadVmPauseBackup(sql, allocation.allocationId);
+            const [activation] = yield* sql`INSERT INTO relay_thread_vm_pauses
+              (allocation_id,operation_id,generation,phase,workflow_checkpoint)
+              SELECT b.allocation_id,${operationId()},b.generation,'cancelled',jsonb_build_object(
+                'jobId',h.job_id,'checkpointId',h.publication_id,'checkpointGeneration',0,
+                'publicationId',h.publication_id,'publicationRevision',h.revision,
+                'finishedWorkspaceRevision',f.workspace_revision)
+              FROM relay_workflow_recovery_heads h
+              JOIN relay_workflow_recovery_records r USING(job_id,publication_id,revision)
+              JOIN relay_workflow_vm_follow_ups f USING(job_id)
+              JOIN relay_thread_vm_bindings b ON b.allocation_id=f.allocation_id AND b.generation=f.generation
+              WHERE h.job_id=${job.jobId} AND b.allocation_id=${allocation.allocationId}
+                AND b.generation=${placement.generation} AND b.revoked_at IS NULL
+                AND r.manifest->>'terminalExecutionReleased'='true'
+                AND r.manifest#>>'{binding,allocationId}'=b.allocation_id
+                AND r.manifest#>>'{binding,environmentId}'=b.environment_id
+                AND r.manifest#>>'{binding,generation}'=b.generation::text
+              ON CONFLICT(allocation_id) DO UPDATE SET operation_id=excluded.operation_id,
+                generation=excluded.generation,phase=excluded.phase,workflow_checkpoint=excluded.workflow_checkpoint,
+                boot_id=NULL,source_receipt=NULL,backup_operation_id=NULL,source_sequence=NULL,
+                native_checkpoint_operation_id=NULL,source_frozen_at=NULL,source_reopened_at=NULL,
+                pause_dispatched_at=NULL,pause_acknowledged_at=NULL,claim_id=NULL,claim_until=NULL,
+                retry_at=clock_timestamp()
+              WHERE relay_thread_vm_pauses.phase IN ('cancelled','completed')
+                AND relay_thread_vm_pauses.source_reopened_at IS NOT NULL
+                AND relay_thread_vm_pauses.pause_dispatch_claim_id IS NULL
+              RETURNING allocation_id`;
+            if (!activation)
+              return yield* conflict("The cancelled workflow has no saved state for a safe wake.");
+          }
+        }
         const prior = yield* get(allocation.allocationId);
         if (prior?.phase !== "completed" && prior) {
           if (

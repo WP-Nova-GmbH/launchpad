@@ -28,8 +28,10 @@ import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLive
 import { makeThreadPauseWorker } from "./ThreadPauseWorker.ts";
 import { ThreadPauseError } from "./ThreadPauseTransport.ts";
 import { threadCheckpointId } from "./ThreadNativeCheckpoint.ts";
+import { workflowVmCancellationSeal } from "./WorkflowVmCancellation.ts";
 import {
   attachmentCheckpointFixture,
+  makeAttachmentCheckpointFixture,
   runAttachmentCheckpointTest,
 } from "./testUtils/threadAttachmentCheckpoint.ts";
 
@@ -63,6 +65,15 @@ for (const problem of [
   "finished-restarted-provider-reservation",
   "finished-restarted-provider-absent",
   "finished-restarted-provider-ordinary-seal",
+  "finished-cancelled-workload-seal",
+  "finished-cancelled-timeout-before-drain",
+  "finished-cancelled-timeout-during-drain",
+  "finished-cancelled-timeout-foreign-seal",
+  "finished-cancelled-follow-up-queue",
+  "finished-cancelled-startup",
+  "finished-cancelled-startup-uncertain-send",
+  "finished-cancelled-setup",
+  "finished-cancelled-setup-unsettled",
   "finished-warm-activation-live-rejection",
   "finished-warm-activation-live-reservation",
   "finished-warm-activation-orphan-reservation",
@@ -85,11 +96,23 @@ for (const problem of [
   it.effect(`retains one executing owner during VM pause with ${problem}`, () =>
     runAttachmentCheckpointTest(
       Effect.gen(function* () {
-        const f = yield* attachmentCheckpointFixture,
+        const cancelledStartup = problem.startsWith("finished-cancelled-startup");
+        const uncertainStartupSend = problem === "finished-cancelled-startup-uncertain-send";
+        const cancelledSetup = problem.startsWith("finished-cancelled-setup");
+        const unsettledSetup = problem === "finished-cancelled-setup-unsettled";
+        const withoutNativeTurn = cancelledStartup || cancelledSetup;
+        const f = yield* withoutNativeTurn
+            ? makeAttachmentCheckpointFixture(false)
+            : attachmentCheckpointFixture,
           operationId = NodeCrypto.randomUUID(),
           advancedOperationId = NodeCrypto.randomUUID();
         const maintenance = yield* Semaphore.make(1);
         const finishedWorkflow = problem.startsWith("finished-");
+        const cancellationTimeout = problem.startsWith("finished-cancelled-timeout-");
+        const cancellationSealed =
+          problem === "finished-cancelled-workload-seal" || cancelledStartup || cancellationTimeout;
+        const cancelledWithFollowUp = problem === "finished-cancelled-follow-up-queue";
+        const cancelledWorkflow = cancellationSealed || cancelledWithFollowUp || cancelledSetup;
         const providerStopRollback = problem.startsWith("finished-provider-stop-rollback");
         const restarted = problem.startsWith("finished-restarted-provider-");
         const warmActivation = problem.startsWith("finished-warm-activation-");
@@ -110,6 +133,9 @@ for (const problem of [
           .slice(0, 32);
         let bootId = NodeCrypto.randomUUID();
         let epoch = 1;
+        const runtimeEpisode = NodeCrypto.randomUUID();
+        const cancellationId = "cancel";
+        const cancellationSeal = workflowVmCancellationSeal({ jobId: "job", cancellationId });
         const workflowCheckpoint = {
           jobId: "job",
           checkpointId: operationId,
@@ -123,6 +149,7 @@ for (const problem of [
         };
         if (finishedWorkflow) {
           const base = initial();
+          const status = cancelledWorkflow ? "cancelled" : "done";
           const capsule: WorkflowRunRecovery = {
             format: "workflow-run-recovery-v1",
             frozenConfiguration: { jobId: workflowCheckpoint.jobId, repositoryId: "repo" },
@@ -132,6 +159,17 @@ for (const problem of [
               ...base,
               executionReserved: false,
               actions: [],
+              ...(withoutNativeTurn
+                ? { sequence: { ...base.sequence!, cursor: 0, completed: [] } }
+                : {}),
+              ...(cancelledWorkflow
+                ? {
+                    providerContinuation: {
+                      driver: ProviderDriverKind.make("codex"),
+                      continuationKey: "provider-key",
+                    },
+                  }
+                : {}),
               runtime: {
                 kind: "vm",
                 jobId: workflowCheckpoint.jobId,
@@ -146,19 +184,50 @@ for (const problem of [
               },
               progress: {
                 ...base.progress,
-                status: "done",
+                status,
                 threadId: ThreadId.make(f.owner.threadId),
               },
             },
           };
-          yield* f.sql`INSERT INTO repository_workflow_jobs VALUES(${capsule.run.jobId},${f.owner.threadId},'done',0,${encodeRun(capsule.run)})`;
+          yield* f.sql`INSERT INTO repository_workflow_jobs VALUES(${capsule.run.jobId},${f.owner.threadId},${status},0,${encodeRun(capsule.run)})`;
           yield* f.sql`INSERT INTO workflow_result_outbox(publication_id,job_id,thread_id,revision,binding_json,record_json,
             source_sequence,state_artifact_id,patch_artifact_id,manifest_artifact_id,status,started_at,deadline,retry_at)
             VALUES(${operationId},${capsule.run.jobId},${f.owner.threadId},1,${encodeRunBinding(capsule.run.runtime)},
             ${encodeRecovery(capsule)},0,'state','patch','manifest','acknowledged',0,1,0)`;
         }
-        yield* f.sql`INSERT INTO provider_session_runtime(thread_id,provider_name,adapter_key,status,last_seen_at) VALUES(${f.owner.threadId},'codex','codex','stopped','2026-10-07T00:00:00Z')`;
-        const runtimeEpisode = NodeCrypto.randomUUID();
+        if (!cancelledSetup)
+          yield* f.sql`INSERT INTO provider_session_runtime(thread_id,provider_name,adapter_key,status,last_seen_at) VALUES(${f.owner.threadId},'codex','codex','stopped','2026-10-07T00:00:00Z')`;
+        if (cancellationSealed) {
+          const payload = yield* encodeQueueFixture({
+            providerContinuation: {
+              workflowJobId: workflowCheckpoint.jobId,
+              runtimeEpisode,
+              continuationKey: "provider-key",
+              shutdownConfirmed: true,
+              shutdownEvidenceVersion: 2,
+            },
+            stoppedRuntimeEventsDrained: true,
+            workflowVmCancellation: {
+              jobId: workflowCheckpoint.jobId,
+              threadId: f.owner.threadId,
+              environmentId: f.owner.environmentId,
+              allocationId: "allocation",
+              generation: f.owner.generation,
+              operationId: f.owner.operationId,
+              cancellationId,
+              runtimeEpisode,
+              continuationKey: "provider-key",
+              providerInstanceId: "codex",
+              bootId,
+              epoch,
+            },
+          });
+          yield* f.sql`UPDATE provider_session_runtime SET provider_instance_id='codex',runtime_payload_json=${payload}
+            WHERE thread_id=${f.owner.threadId}`;
+          yield* f.sql`INSERT INTO thread_execution_work(thread_id,work_id,generation,kind,started,completed,relay_completed)
+            VALUES(${f.owner.threadId},'provider:cancelled',1,'provider',1,0,0),
+            (${f.owner.threadId},'terminal:cancelled',1,'terminal',1,0,0)`;
+        }
         const recordWriterDrain = (drained: boolean) =>
           encodeQueueFixture({
             providerContinuation: { runtimeEpisode, continuationKey: "provider-key" },
@@ -172,7 +241,18 @@ for (const problem of [
             Effect.orDie,
           );
         if (orphanedWriter || hiddenWriter) yield* recordWriterDrain(false);
-        yield* f.sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_files_json) VALUES(${f.owner.threadId},${f.nativeInput.turnId},'completed','2026-10-07T00:00:00Z','2026-10-07T00:01:00Z','[]')`;
+        if (withoutNativeTurn) {
+          yield* f.sql`DELETE FROM thread_native_checkpoints WHERE thread_id=${f.owner.threadId}`;
+          if (cancelledStartup)
+            yield* f.sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_files_json)
+              VALUES(${f.owner.threadId},NULL,'interrupted','2026-10-07T00:00:00Z','2026-10-07T00:01:00Z','[]')`;
+          if (uncertainStartupSend)
+            yield* f.sql`INSERT INTO checkout_work_admissions(admission_id,thread_id,work_id,kind,
+              checkout_root,git_common_root,lineage_sequence,completed)
+              VALUES('uncertain',${f.owner.threadId},'send-turn:attempt','provider',
+              '/workspace','/workspace/.git',1,1)`;
+        } else
+          yield* f.sql`INSERT INTO projection_turns(thread_id,turn_id,state,requested_at,completed_at,checkpoint_files_json) VALUES(${f.owner.threadId},${f.nativeInput.turnId},'completed','2026-10-07T00:00:00Z','2026-10-07T00:01:00Z','[]')`;
         let operation: RelayThreadVmPause = {
           threadId: ThreadId.make(f.owner.threadId),
           environmentId: EnvironmentId.make(f.owner.environmentId),
@@ -183,12 +263,14 @@ for (const problem of [
               ? "completed"
               : problem.startsWith("cancelled-before-drain") ||
                   problem.startsWith("native-timeout-cancelled") ||
+                  cancellationTimeout ||
                   warmActivation ||
                   problem === "historical-cancelled"
                 ? "cancelled"
                 : "pending",
           canActivate:
             problem.startsWith("cancelled-before-drain") ||
+            cancellationTimeout ||
             warmActivation ||
             problem === "historical-cancelled",
           sourceReopened:
@@ -203,9 +285,16 @@ for (const problem of [
           ...emptyThreadPromptQueue(),
           entries: [
             {
-              kind: "move",
-              messageId: "move",
-              destination: { kind: "vm" },
+              ...(cancelledWithFollowUp
+                ? {
+                    kind: "prompt",
+                    messageId: "follow-up",
+                    text: "Follow up on the cancelled run",
+                    attachments: [],
+                    runtimeMode: "approval-required",
+                    interactionMode: "default",
+                  }
+                : { kind: "move", messageId: "move", destination: { kind: "vm" } }),
               state: "pending",
               revision: 0,
               acceptedSequence: 1,
@@ -218,7 +307,27 @@ for (const problem of [
           enabled: problem !== "paused-queue",
         });
         const enqueue = f.sql`INSERT INTO projection_thread_prompt_queues(thread_id,state_json) VALUES(${f.owner.threadId},${queueJson})`;
-        if (["queued-work", "archived-queue", "paused-queue"].includes(problem)) yield* enqueue;
+        if (
+          cancelledWithFollowUp ||
+          ["queued-work", "archived-queue", "paused-queue"].includes(problem)
+        )
+          yield* enqueue;
+        if (cancelledSetup) {
+          const stoppedSetup = yield* encodeQueueFixture({
+            ...emptyThreadPromptQueue(),
+            preparation: {
+              originalCommandId: "setup",
+              attemptId: "setup",
+              revision: 1,
+              state: "failed",
+              settled: !unsettledSetup,
+              recipe: null,
+              failure: { reason: "cancelled", detail: "Setup stopped" },
+            },
+          });
+          yield* f.sql`INSERT INTO projection_thread_prompt_queues(thread_id,state_json)
+            VALUES(${f.owner.threadId},${stoppedSetup})`;
+        }
         if (problem === "archived-queue")
           yield* f.sql`UPDATE projection_threads SET archived_at='2026-10-07T00:00:00Z' WHERE thread_id=${f.owner.threadId}`;
         let acknowledgements = 0,
@@ -240,17 +349,18 @@ for (const problem of [
             VALUES(${f.owner.threadId},${`${kind}:idle`},1,${kind},1,0,0)`;
         }
         let liveProvider =
-          finishedWorkflow ||
+          (finishedWorkflow && !cancellationSealed && !cancelledSetup) ||
           ["idle-owned-provider", "provider-with-descendant", "unconfirmed-provider-stop"].includes(
             problem,
           );
         let idleStops = 0;
-        let sealedBy: string | null = null;
+        let sealedBy: string | null = cancellationSealed ? cancellationSeal : null;
         let recoveryAttempts = 0;
         let runtimeReconciliations = 0;
         let cancelAttempts = 0;
         let activationAttempts = 0;
         let flushBackground = Effect.void;
+        let checkpointAvailable = !cancellationSealed;
         const background = ThreadBackgroundLiveness.make();
         if (problem === "finished-background-work")
           background.recordTaskLiveness({
@@ -408,7 +518,10 @@ for (const problem of [
               epoch--;
             }
           }
-          if (command.args[0] === "seal") sealedBy = command.args[2]!;
+          if (command.args[0] === "seal") {
+            if (cancellationSealed && sealedBy === null) epoch++;
+            sealedBy = command.args[2]!;
+          }
           if (command.args[0] === "reopen") {
             if (warmActivation) {
               expect(liveProvider).toBe(false);
@@ -417,6 +530,7 @@ for (const problem of [
             }
             reopenedOperationId = command.args[2];
             sealedBy = null;
+            if (cancellationSealed) epoch++;
           }
           return Effect.succeed(
             ChildProcessSpawner.makeHandle({
@@ -479,7 +593,7 @@ for (const problem of [
                   });
                 operation = { ...operation, phase: "cancelled", canActivate: true };
                 if (finishedWorkflow) {
-                  expect(request.nativePauseFallback).toBeUndefined();
+                  expect(request.nativePauseFallback).toBe(uncertainStartupSend ? true : undefined);
                   return operation;
                 }
                 return yield* new ThreadPauseError({
@@ -490,7 +604,10 @@ for (const problem of [
             activate: () =>
               Effect.gen(function* () {
                 activationAttempts++;
-                if (orphanedWriter && activationAttempts === 1)
+                if (
+                  (orphanedWriter || problem === "finished-cancelled-timeout-before-drain") &&
+                  activationAttempts === 1
+                )
                   return yield* new ThreadPauseError({
                     threadId: f.owner.threadId,
                     detail: "Relay unavailable after the source reopened",
@@ -507,12 +624,13 @@ for (const problem of [
               Effect.gen(function* () {
                 acknowledgements++;
                 expect(input.bootId).toBe(bootId);
-                expect(input.sealEpoch).toBe(1);
+                expect(input.sealEpoch).toBe(cancellationSealed ? 3 : 1);
                 operation = {
                   ...operation,
                   phase: "pending",
                   bootId: input.bootId,
                   nativeCheckpointOperationId: input.nativeCheckpointOperationId,
+                  ...(withoutNativeTurn ? { sourceSequence: input.sourceSequence ?? null } : {}),
                 };
                 return yield* new ThreadPauseError({
                   threadId: f.owner.threadId,
@@ -524,7 +642,7 @@ for (const problem of [
           {
             synchronize: () =>
               Effect.gen(function* () {
-                if (problem === "missing-publication") return;
+                if (problem === "missing-publication" || !checkpointAvailable) return;
                 const key = threadCheckpointId(f.nativeInput.turnId, operationId);
                 yield* f.sql`UPDATE thread_native_checkpoints SET published_artifact_id='native-receipt' WHERE thread_id=${f.owner.threadId} AND checkpoint_id=${key}`;
                 yield* f.sql`UPDATE thread_attachment_checkpoints SET published_artifact_id='chat-receipt' WHERE thread_id=${f.owner.threadId} AND checkpoint_id=${key}`;
@@ -549,6 +667,42 @@ for (const problem of [
               Effect.provideService(VmWorkloadMaintenance, maintenance),
               Effect.provideService(VmControlSpawner, control),
             );
+        if (cancellationTimeout) {
+          if (problem === "finished-cancelled-timeout-during-drain")
+            yield* f.fences.beginDrain({
+              ...f.owner,
+              operationId,
+              previousOperationId: f.owner.operationId,
+              workflowCheckpoint,
+            });
+          const foreign = problem === "finished-cancelled-timeout-foreign-seal";
+          if (foreign) sealedBy = "f".repeat(32);
+          const first = yield* Effect.result(synchronize(f.owner.threadId));
+          if (foreign) {
+            expect(first._tag).toBe("Failure");
+            expect(activationAttempts).toBe(0);
+            expect(sealedBy).toBe("f".repeat(32));
+            return;
+          }
+          if (problem === "finished-cancelled-timeout-before-drain") {
+            expect(first._tag).toBe("Failure");
+            expect(operation.sourceReopened).toBe(false);
+            yield* synchronize(f.owner.threadId);
+            expect(activationAttempts).toBe(2);
+          } else {
+            expect(first._tag).toBe("Success");
+            expect(activationAttempts).toBe(1);
+          }
+          expect(operation.sourceReopened).toBe(true);
+          expect(sealedBy).toBeNull();
+          expect(reopenedOperationId).toBe(operationSeal);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          expect(
+            yield* f.sql`SELECT 1 FROM thread_execution_work WHERE thread_id=${f.owner.threadId}
+              AND (completed=0 OR relay_completed=0)`,
+          ).toEqual([]);
+          return;
+        }
         if (problem === "completed-reopened-before-final-save") {
           const before = (yield* f.fences.get(f.owner.threadId))!;
           yield* f.fences.beginDrain({
@@ -730,6 +884,83 @@ for (const problem of [
           return;
         }
         const first = yield* Effect.result(synchronize(f.owner.threadId));
+        if (uncertainStartupSend) {
+          const readBinding = f.sql`SELECT status,runtime_payload_json AS payload
+            FROM provider_session_runtime WHERE thread_id=${f.owner.threadId}`;
+          expect(first._tag).toBe("Success");
+          expect(operation.phase).toBe("cancelled");
+          expect(sealedBy).toBe(operationSeal);
+          expect(cancelAttempts).toBe(1);
+          expect(captures).toBe(0);
+          expect(acknowledgements).toBe(0);
+          const binding = yield* readBinding;
+          expect(binding).toEqual([{ status: "stopped", payload: expect.any(String) }]);
+          yield* synchronize(f.owner.threadId);
+          expect(operation.sourceReopened).toBe(true);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          expect(sealedBy).toBeNull();
+          expect(yield* readBinding).toEqual(binding);
+          return;
+        }
+        if (unsettledSetup) {
+          expect(first._tag).toBe("Success");
+          expect(operation.phase).toBe("cancelled");
+          expect(acknowledgements).toBe(0);
+          expect(captures).toBe(0);
+          return;
+        }
+        if (withoutNativeTurn) {
+          expect(first._tag).toBe("Failure");
+          expect(sealedBy).toBe(operationSeal);
+          expect(cancelAttempts).toBe(0);
+          expect(captures).toBe(0);
+          expect(acknowledgements).toBe(1);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("frozen");
+          expect(
+            yield* f.sql`SELECT status FROM provider_session_runtime WHERE thread_id=${f.owner.threadId}`,
+          ).toEqual([]);
+          expect(operation.nativeCheckpointOperationId).toBeNull();
+          expect(operation.sourceSequence).not.toBeNull();
+          yield* synchronize(f.owner.threadId);
+          expect(acknowledgements).toBe(1);
+          return;
+        }
+        if (cancellationSealed) {
+          expect(first._tag).toBe("Success");
+          expect(operation.phase).toBe("pending");
+          expect(reopenedOperationId).toBe(cancellationSeal);
+          expect(sealedBy).toBe(operationSeal);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("frozen");
+          expect(idleStops).toBe(0);
+          expect(acknowledgements).toBe(0);
+          expect(
+            yield* f.sql`SELECT kind,completed,relay_completed AS acknowledged FROM thread_execution_work
+              WHERE thread_id=${f.owner.threadId} ORDER BY kind`,
+          ).toEqual([
+            { kind: "provider", completed: 1, acknowledged: 1 },
+            { kind: "terminal", completed: 1, acknowledged: 1 },
+          ]);
+
+          // The stop receipt has been consumed. The frozen source still owns
+          // the exact seal and can finish saving when publication catches up.
+          checkpointAvailable = true;
+          expect((yield* Effect.result(synchronize(f.owner.threadId)))._tag).toBe("Failure");
+          expect(sealedBy).toBe(operationSeal);
+          expect(cancelAttempts).toBe(0);
+          expect(acknowledgements).toBe(1);
+          return;
+        }
+        if (cancelledWithFollowUp) {
+          expect(first._tag).toBe("Success");
+          expect(operation.phase).toBe("cancelled");
+          yield* synchronize(f.owner.threadId);
+          expect(operation.sourceReopened).toBe(true);
+          expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe("active");
+          expect(liveProvider).toBe(true);
+          expect(idleStops).toBe(0);
+          expect(acknowledgements).toBe(0);
+          return;
+        }
         if (problem.startsWith("native-timeout-cancelled")) {
           expect(first._tag).toBe("Success");
           expect((yield* f.fences.get(f.owner.threadId))?.phase).toBe(

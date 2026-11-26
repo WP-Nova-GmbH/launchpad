@@ -41,6 +41,7 @@ export function makeThreadTransferSource(
     readonly operationId: string;
     readonly requireIdleQueue?: boolean;
     readonly workflowCheckpoint?: RelayThreadVmWorkflowCheckpoint;
+    readonly allowSettledCancelledSetup?: true;
   }) {
     const fail = (detail: string) =>
       new ThreadExecutionFenceError({ threadId: input.threadId, detail });
@@ -73,7 +74,10 @@ export function makeThreadTransferSource(
       if (
         queue.handoff ||
         queue.awaitingTurnId ||
-        (queue.preparation && (queue.preparation.state !== "ready" || !queue.preparation.settled))
+        (queue.preparation &&
+          (!queue.preparation.settled ||
+            (queue.preparation.state !== "ready" &&
+              !(input.allowSettledCancelledSetup && queue.preparation.state === "failed"))))
       )
         return yield* fail("Source queue delivery or setup still needs to settle.");
     }

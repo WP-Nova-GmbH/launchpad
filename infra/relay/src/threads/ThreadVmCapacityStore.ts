@@ -195,6 +195,8 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
     linear: OrderedCapacityAdmission["linearWorkflow"],
     requireTerminalCheckpoint = false,
   ) {
+    // A cancelled guest may be idle under its cancellation seal. Only the
+    // checkpoint-backed pause can adopt that seal and finish its cleanup.
     const [candidate] = yield* sql<{ allocationId: string }>`WITH charged AS (
       SELECT c.host_id,a.organization_id,a.resource_kind FROM relay_thread_vm_capacity c
       JOIN relay_thread_vm_allocations a USING(allocation_id)
@@ -236,6 +238,7 @@ export function makeThreadVmCapacityStore(sql: PgClient) {
         AND t.environment_id=b.environment_id AND b.revoked_at IS NULL
         AND t.organization_id=a.organization_id AND t.repository_id=b.repository_id
         AND j.status IN ('done','cancelled','failed') AND j.pending_control IS NULL
+        AND (${requireTerminalCheckpoint} OR j.status<>'cancelled')
         AND j.record#>>'{progress,executionReleased}'='true'
         AND COALESCE(j.record#>'{progress,resultSaving}','null'::jsonb)='null'::jsonb
         AND (NOT ${requireTerminalCheckpoint} OR EXISTS(SELECT 1 FROM relay_workflow_recovery_heads h

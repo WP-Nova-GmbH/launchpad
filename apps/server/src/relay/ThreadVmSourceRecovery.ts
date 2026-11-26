@@ -74,6 +74,13 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
           workflowCheckpoint: input.workflowCheckpoint,
         }).pipe(Effect.mapError((error) => fail(threadId, error.message)))
       : null;
+    const finishedWorkflow = input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
+    const cancelledWorkflow = finishedWorkflow && workflow?.status === "cancelled";
+    const cancellationReclaim =
+      cancelledWorkflow && input.workflowCheckpoint?.backgroundRevision === undefined;
+    const operationSeal = finishedWorkflow
+      ? NodeCrypto.createHash("sha256").update(input.operationId).digest("hex").slice(0, 32)
+      : undefined;
     let owner = yield* fences.get(threadId);
     if (
       !owner ||
@@ -100,9 +107,22 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
     }
     if (owner.operationId !== input.operationId || !["draining", "frozen"].includes(owner.phase))
       return yield* fail(threadId, "Another operation holds this source.");
-    if (!workflow && tracked && owner.phase === "draining")
+    // Transferring a cancellation seal requires closing local admission first.
+    if (tracked && owner.phase === "draining" && (!workflow || cancellationReclaim))
       yield* adoptWorkflowVmCancellationSeal(sql, input);
-    yield* assertThreadVmQueueIdle(sql, threadId);
+    const cancellationInventory =
+      tracked && cancellationReclaim ? yield* inspectVmWorkloads({ type: "inspect" }) : null;
+    const adoptedCancellationSeal =
+      cancellationInventory?.stopped === true && cancellationInventory.sealedBy === operationSeal;
+    const checkpointlessCancellation =
+      adoptedCancellationSeal && workflow?.cancelledBeforeNativeTurn === true;
+    const holdCancelledWorkspace = (error: ThreadVmQueuedWork) =>
+      adoptedCancellationSeal
+        ? fail(threadId, "The cancelled VM still has queued work to reconcile before saving.")
+        : error;
+    yield* assertThreadVmQueueIdle(sql, threadId).pipe(
+      Effect.catchTag("ThreadVmQueuedWork", (error) => Effect.fail(holdCancelledWorkspace(error))),
+    );
     const unsettled = yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${threadId}
       AND (completed_at IS NULL OR state IN ('pending','running') OR checkpoint_status='pending')
       UNION ALL SELECT 1 FROM thread_execution_work WHERE thread_id=${threadId}
@@ -110,11 +130,8 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
           AND (completed=0 OR relay_completed=0) LIMIT 1`;
     if (unsettled.length) return;
     // Routine recovery must not interrupt work that raced the relay idle report.
-    let beforeStop = tracked ? yield* inspectVmWorkloads({ type: "inspect" }) : null;
-    const finishedWorkflow = input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined;
-    const operationSeal = finishedWorkflow
-      ? NodeCrypto.createHash("sha256").update(input.operationId).digest("hex").slice(0, 32)
-      : undefined;
+    let beforeStop =
+      cancellationInventory ?? (tracked ? yield* inspectVmWorkloads({ type: "inspect" }) : null);
     const checkIdleStopRollback = Effect.fnUntraced(function* (
       before: typeof VmWorkloadInventory.Type,
       current: typeof VmWorkloadInventory.Type,
@@ -195,12 +212,13 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
       status: string;
     }>`SELECT status FROM provider_session_runtime WHERE thread_id=${threadId}`;
     if (!runtime && !workflow?.beforeAgent) {
-      if (input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+      if (finishedWorkflow && !adoptedCancellationSeal)
         return yield* new FinishedWorkflowCaptureUnavailable({ threadId });
       return yield* fail(threadId, "Saving VM recovery needs a retained Codex conversation.");
     }
     if (
       !runtime &&
+      !checkpointlessCancellation &&
       (yield* sql`SELECT 1 FROM projection_turns WHERE thread_id=${threadId} LIMIT 1`).length
     )
       return yield* fail(threadId, "The workflow already has a conversation to retain.");
@@ -243,14 +261,59 @@ export const makeThreadVmSourceRecovery = Effect.fn("ThreadVmSourceRecovery.make
       yield* assertEmptyRevision(inventory);
     }
     yield* execution.confirmProcessesStopped(threadId, tracked ? "vm" : "provider");
+    if (
+      runtime &&
+      adoptedCancellationSeal &&
+      workflow?.cancelledWithoutNativeCheckpoint &&
+      input.workflowCheckpoint
+    ) {
+      const workflowCheckpoint = input.workflowCheckpoint;
+      yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const latest = yield* requireWorkflowVmLifecycleCheckpoint(sql, {
+            ...input,
+            workflowCheckpoint,
+          }).pipe(Effect.mapError((error) => fail(threadId, error.message)));
+          if (!latest.cancelledWithoutNativeCheckpoint)
+            return yield* fail(threadId, "A native turn needs recovery before saving this VM.");
+          const [stopped] = yield* sql`SELECT 1 FROM provider_session_runtime
+            WHERE thread_id=${threadId} AND provider_name='codex' AND adapter_key='codex'
+              AND provider_instance_id='codex' AND status='stopped'
+              AND json_extract(runtime_payload_json,'$.providerContinuation.workflowJobId')=${workflowCheckpoint.jobId}
+              AND json_type(runtime_payload_json,'$.providerContinuation.shutdownConfirmed')='true'
+              AND json_extract(runtime_payload_json,'$.providerContinuation.shutdownEvidenceVersion')=2
+              AND json_type(runtime_payload_json,'$.stoppedRuntimeEventsDrained')='true'
+              AND EXISTS(SELECT 1 FROM thread_execution_fences WHERE thread_id=${threadId}
+                AND environment_id=${input.environmentId} AND generation=${input.generation}
+                AND operation_id=${input.operationId} AND phase='draining')`;
+          if (!stopped)
+            return yield* fail(threadId, "The cancelled Codex startup is not confirmed stopped.");
+          // A send may have reached Codex even when no turn was published. The
+          // warm native pause retains that runtime and its files for follow-up.
+          if (!latest.cancelledBeforeNativeTurn)
+            return yield* new FinishedWorkflowCaptureUnavailable({ threadId });
+          // Only startup without a send can use the checkpoint-less cold backup.
+          yield* sql`DELETE FROM provider_session_runtime WHERE thread_id=${threadId}`;
+        }),
+      );
+    }
     const frozen = yield* source
-      .freeze({ ...input, requireIdleQueue: true })
-      .pipe(Effect.provideContext(context));
+      .freeze({
+        ...input,
+        requireIdleQueue: true,
+        ...(cancelledWorkflow ? { allowSettledCancelledSetup: true as const } : {}),
+      })
+      .pipe(
+        Effect.provideContext(context),
+        Effect.catchTag("ThreadVmQueuedWork", (error) =>
+          Effect.fail(holdCancelledWorkspace(error)),
+        ),
+      );
     if (workflow && workflow.sourceSequence > frozen.sourceSequence)
       return yield* fail(threadId, "The saved workflow is newer than the frozen source.");
     if (!frozen.nativeCheckpointTurnId) {
       if (!workflow?.beforeAgent) {
-        if (input.workflowCheckpoint?.finishedWorkspaceRevision !== undefined)
+        if (finishedWorkflow && !adoptedCancellationSeal)
           return yield* new FinishedWorkflowCaptureUnavailable({ threadId });
         return yield* fail(threadId, "Frozen native recovery is unavailable.");
       }
