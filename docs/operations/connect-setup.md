@@ -196,10 +196,9 @@ sources** and installs the app in one Linear workspace. The app binding persists
 starts. Changing the configured organization does not transfer that binding. For a fresh setup,
 grant repository access again and re-enable affected triggers with the new connection.
 
-The webhook receiver can verify delivery while job admission is off. It records observed Issue
-create and status-entry delivery for each team, authorization and webhook generation. Reconnecting
-preserves repository grants and starts delivery verification again. An API read or OAuth success
-alone does not verify webhook delivery.
+The webhook receiver records observed issue creation and status changes for troubleshooting,
+including while job admission is off. Observations are scoped to the team, authorization and
+webhook generation. Reconnecting preserves repository grants and resets these observations.
 
 Keep `LINEAR_WORKFLOW_ADMISSION_ENABLED` absent or `false` in production until the isolated live
 provider and workflow checks pass. Verify install, reconnect, token rotation, signed team

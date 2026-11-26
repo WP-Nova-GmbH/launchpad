@@ -51,11 +51,10 @@ export const prepare = Effect.fn("workflowEvents.prepareSave")(function* (
   if (
     bound.connection.connection_id !== trigger.connectionId ||
     bound.connection.organization_id !== org ||
-    bound.connection.application_id !== config.applicationId ||
-    !Fence.covers(bound.connection, config.generation, trigger.teamId)
+    bound.connection.application_id !== config.applicationId
   )
     return yield* new WorkflowInvalidError({
-      message: "Issue creation and status-entry delivery must be verified for this Linear team.",
+      message: "The selected Linear connection is unavailable for automatic runs.",
     });
   const canonicalKey =
     target.kind === "vm"

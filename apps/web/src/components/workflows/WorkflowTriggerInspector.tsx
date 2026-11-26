@@ -304,7 +304,7 @@ export function WorkflowTriggerInspector({
       disabled={disabled || selected.loading}
       onClick={() => void selected.refresh()}
     >
-      <RefreshCwIcon aria-hidden /> Check readiness again
+      <RefreshCwIcon aria-hidden /> Check again
     </Button>
   );
   return (
@@ -704,15 +704,11 @@ export function WorkflowTriggerInspector({
                 </WorkflowAlert>
               ) : !selected.loading && criteria && !criteria.deliveryReady ? (
                 <WorkflowAlert
-                  title="Event delivery not verified"
+                  title="Automatic runs unavailable"
                   variant="warning"
                   actions={retrySelection}
                 >
-                  <p>
-                    The relay has not verified event delivery for{" "}
-                    {criteria.team?.name ?? "this team"}. Ask your environment administrator to
-                    verify Linear event delivery, then check readiness again.
-                  </p>
+                  Ask your environment administrator to enable automatic Linear runs on this relay.
                 </WorkflowAlert>
               ) : null}
             </div>
@@ -858,7 +854,7 @@ export function WorkflowTriggerInspector({
               !selected.error &&
               (selected.loading || !criteria) ? (
                 <p role="status" className="text-xs text-muted-foreground">
-                  Checking trigger readiness…
+                  Checking trigger settings…
                 </p>
               ) : null}
             </fieldset>

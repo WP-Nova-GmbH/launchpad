@@ -739,7 +739,6 @@ const readSelection = Effect.fn("workflowSources.readSelection")(function* (
     issues.push({ field: "state", message: "The selected status is unavailable in this team." });
   if (input.labelIds.some((id) => !selectedLabels.some((label) => label.id === id)))
     issues.push({ field: "labels", message: "Some selected labels are unavailable in this team." });
-  const config = yield* EventFence.configuration;
   return {
     authorizationEpoch: connection.authorization_epoch,
     team: team ? { id: team.id, name: team.name ?? team.id } : null,
@@ -752,11 +751,7 @@ const readSelection = Effect.fn("workflowSources.readSelection")(function* (
       teamId: label.team?.id ?? null,
     })),
     issues,
-    deliveryReady:
-      !!config?.admissionEnabled &&
-      config.applicationId === connection.application_id &&
-      EventFence.covers(connection, config.generation, input.teamId),
-  } satisfies WorkflowSourceSelection;
+  } satisfies Omit<WorkflowSourceSelection, "deliveryReady">;
 });
 export const selection = Effect.fn("workflowSources.selection")(function* (
   repo: string,
@@ -775,7 +770,7 @@ export const selection = Effect.fn("workflowSources.selection")(function* (
     deliveryReady:
       !!config?.admissionEnabled &&
       config.applicationId === current.connection.application_id &&
-      EventFence.covers(current.connection, config.generation, input.teamId),
+      config.organizationId === current.connection.organization_id,
   };
 });
 export const validateTrigger = Effect.fn("workflowSources.validateTrigger")(function* (

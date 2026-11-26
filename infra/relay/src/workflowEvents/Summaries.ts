@@ -98,8 +98,6 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
           c.health.code === "rate_limited"
             ? "Linear is rate limited. Retry later."
             : "Linear is currently unavailable.";
-      else if (!Fence.covers(c, config.generation, trigger.teamId))
-        reason = "Event delivery is not verified for the selected team.";
       else if (vmIssue) reason = vmIssue;
       else if (target.kind === "vm" && !vmCodex)
         reason = "Connect Codex for this organization before running this workflow.";
@@ -110,7 +108,6 @@ export const summaries = Effect.fn("workflowEvents.summaries")(function* (repo: 
         proof._tag !== "Some" ||
         proof.value.targetKey !== targetKey(row.record.definition) ||
         proof.value.triggerKey !== triggerKey(trigger) ||
-        // Reconnect/configuration recovery is proven by current team delivery above.
         proof.value.connectionId !== c.connection_id
       )
         reason = "Save the trigger settings to validate source and execution target.";

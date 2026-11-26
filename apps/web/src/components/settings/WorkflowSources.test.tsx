@@ -38,7 +38,7 @@ const fixture = vi.hoisted(() => ({
   metadataReads: [] as string[],
   metadataReply: null as null | ((kind: string, cursor?: string) => Response | Promise<Response>),
   failSelection: false,
-  deliveryReady: true,
+  automaticRunsAvailable: true,
   selectionReply: null as
     | null
     | ((body: { teamId: string; stateId?: string; labelIds: string[] }) => Promise<Response>),
@@ -353,7 +353,7 @@ beforeEach(() => {
   fixture.metadataReads = [];
   fixture.metadataReply = null;
   fixture.failSelection = false;
-  fixture.deliveryReady = true;
+  fixture.automaticRunsAvailable = true;
   fixture.selectionReply = null;
   fixture.delivery = "unverified";
   fixture.denyRead = false;
@@ -430,7 +430,7 @@ beforeEach(() => {
           teamId: id === "global" ? null : body.teamId,
         })),
         issues: [],
-        deliveryReady: fixture.deliveryReady,
+        deliveryReady: fixture.automaticRunsAvailable,
       });
     }
     if (request.url.endsWith("/linear/begin")) {
@@ -2582,14 +2582,15 @@ it.effect("discards pending metadata from before reconnect while preserving draf
 
 for (const enabled of [false, true])
   it.effect(
-    `can save a valid rule off while delivery is unverified (initially ${enabled ? "on" : "off"})`,
+    `can save a valid rule off when automatic runs are unavailable (initially ${enabled ? "on" : "off"})`,
     () =>
       Effect.gen(function* () {
         yield* serveRequests;
         yield* Effect.promise(async () => {
-          fixture.deliveryReady = false;
+          fixture.automaticRunsAvailable = false;
           await mountTrigger({ ...triggerInitial, enabled });
-          expect(words()).toContain("environment administrator");
+          expect(words()).toContain("Automatic runs unavailable");
+          expect(words()).toContain("enable automatic Linear runs on this relay");
           expect(enableControl().props.disabled).toBe(!enabled);
           if (enabled) await act(() => enableControl().props.onClick());
           expect(button("Save workflow").props.disabled).toBe(false);
@@ -2648,6 +2649,7 @@ it.effect.each([false, true])(
           await click("Automatic runs on save");
           await drain();
         }
+        const reads = [...fixture.metadataReads];
         let enter!: () => void, release!: () => void;
         const entered = new Promise<void>((resolve) => {
           enter = resolve;
@@ -2664,7 +2666,7 @@ it.effect.each([false, true])(
             state: null,
             labels: [],
             issues: [],
-            deliveryReady: false,
+            deliveryReady: true,
           });
         };
         await act(() => {
@@ -2678,7 +2680,7 @@ it.effect.each([false, true])(
         });
         try {
           expect(enableControl().props.disabled).toBe(!enablePending);
-          expect(words()).toContain("Checking trigger readiness");
+          expect(words()).toContain("Checking trigger settings");
           if (enablePending) {
             expect(enableControl().props.checked).toBe(true);
             expect(words()).toContain("Turns on when saved");
@@ -2688,9 +2690,9 @@ it.effect.each([false, true])(
           await act(async () => release());
         }
         await drain();
-        expect(enableControl().props.disabled).toBe(!enablePending);
-        expect(words()).toContain("Event delivery not verified");
-        expect(button("Save workflow").props.disabled).toBe(enablePending);
+        expect(enableControl().props.disabled).toBe(false);
+        expect(fixture.metadataReads).toEqual(reads);
+        expect(button("Save workflow").props.disabled).toBe(false);
       });
     }),
 );
@@ -2713,12 +2715,13 @@ it.effect.each([false, true])(
 );
 
 it.effect(
-  "enables a VM trigger with the existing Linear rule and discloses repository secrets",
+  "enables a VM trigger before any webhook delivery is verified and discloses repository secrets",
   () =>
     Effect.gen(function* () {
       yield* serveRequests;
       yield* Effect.promise(async () => {
         await mountTrigger(triggerInitial, true, true);
+        expect(words()).not.toContain("Event delivery not verified");
         expect(words()).toContain(
           "Automatic VM runs can use this repository’s workflow variables and secrets.",
         );

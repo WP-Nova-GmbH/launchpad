@@ -247,7 +247,7 @@ describe("automatic offers (PostgreSQL)", () => {
           if (accepted) {
             const nextEventAt = Math.max(yield* clock, Date.parse(current.activated_at) + 1);
             expect((yield* receive(issue(nextEventAt))).status).toBe(200);
-            expect(yield* counts).toEqual({ occurrences: 2, admissions: 1, jobs: 1 });
+            expect(yield* counts).toEqual({ occurrences: 2, admissions: 2, jobs: 2 });
             expect((yield* Store.connection("connection"))?.delivery_evidence).toMatchObject({
               epoch: 2,
               teams: { team: { created: true, entered: false } },

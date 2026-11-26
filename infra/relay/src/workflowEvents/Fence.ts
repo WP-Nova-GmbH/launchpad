@@ -65,11 +65,3 @@ export function evidence(
     ? parsed.value
     : null;
 }
-export const covers = (
-  connection: Pick<Connection, "delivery_evidence" | "authorization_epoch">,
-  generation: string,
-  teamId: string,
-) => {
-  const team = evidence(connection, generation)?.teams[teamId];
-  return Boolean(team?.created && team.entered);
-};

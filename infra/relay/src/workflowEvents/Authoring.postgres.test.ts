@@ -53,10 +53,12 @@ const selected = {
 };
 const query = { grantId: "grant", teamId: "team", stateId: "ready", labelIds: ["global"] };
 describe("workflow authoring reads (PostgreSQL)", () => {
-  it.live("derives Off and On without a provider request or an online executor", () =>
+  it.live("derives Off and On without sample events or an online executor", () =>
     testDb(
       Effect.gen(function* () {
         yield* seed;
+        yield* (yield* RelayDb)
+          .$client`UPDATE relay_workflow_connections SET delivery_evidence=NULL`;
         const enabled = yield* save("enabled");
         const disabled = yield* save("disabled", trigger, false);
         const result = yield* summaries("repo");
@@ -83,11 +85,6 @@ describe("workflow authoring reads (PostgreSQL)", () => {
   );
   for (const [name, change, expected] of [
     [
-      "another team's delivery",
-      'UPDATE relay_workflow_connections SET delivery_evidence=jsonb_set(delivery_evidence,\'{teams}\', \'{"another":{"created":true,"entered":true}}\')',
-      "selected team",
-    ],
-    [
       "withdrawn repository consent",
       "UPDATE relay_workflow_repository_grants SET revoked=true",
       "permission",
@@ -101,11 +98,6 @@ describe("workflow authoring reads (PostgreSQL)", () => {
       "disconnected source",
       "UPDATE relay_workflow_connections SET status='disconnected',payload_sealed=NULL",
       "reconnect",
-    ],
-    [
-      "changed source epoch",
-      "UPDATE relay_workflow_connections SET authorization_epoch=authorization_epoch+1",
-      "selected team",
     ],
     ["removed checkout", "DELETE FROM relay_organization_projects", "execution target"],
   ])
@@ -121,10 +113,12 @@ describe("workflow authoring reads (PostgreSQL)", () => {
         }),
       ),
     );
-  it.live("resolves exact selected names, global label provenance and exact-team delivery", () =>
+  it.live("resolves exact selected names and label provenance before any events arrive", () =>
     testDb(
       Effect.gen(function* () {
         yield* seed;
+        yield* (yield* RelayDb)
+          .$client`UPDATE relay_workflow_connections SET delivery_evidence=NULL`;
         let requests = 0;
         const result = yield* Sources.selection("repo", "maintainer", query).pipe(
           Effect.provide(
@@ -149,7 +143,6 @@ describe("workflow authoring reads (PostgreSQL)", () => {
         expect(missing.issues.map((issue) => issue.field)).toEqual(
           expect.arrayContaining(["team", "state"]),
         );
-        expect(missing.deliveryReady).toBe(false);
       }),
     ),
   );
@@ -290,13 +283,54 @@ const readSelection = transport((request) => {
 
 const enableVmAutomation = (
   input: typeof import("@t3tools/contracts/workflows").SaveRepositoryWorkflow.Type,
+  selectedTrigger = trigger,
 ) =>
   saveRepositoryWorkflow("repo", {
     ...input,
-    automation: { enabled: true, trigger },
+    automation: { enabled: true, trigger: selectedTrigger },
   }).pipe(Effect.provide(readSelection));
 
 describe("VM workflow authoring (PostgreSQL)", () => {
+  it.live.each(["issue_created", "entered_status"] as const)(
+    "can enable %s and queue the first matching event without sample delivery",
+    (event) =>
+      testVmAuthoring(
+        Effect.gen(function* () {
+          yield* seedVmAutomation;
+          const sql = (yield* RelayDb).$client;
+          yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=NULL`;
+          yield* sql`UPDATE relay_codex_vm_connections SET status='connected',payload_sealed='sealed',expires_at='2099-01-01' WHERE organization_id='org'`;
+          const saved = yield* enableVmAutomation(
+            {
+              ...vmInput,
+              definition: {
+                ...vmInput.definition,
+                steps: [
+                  ...vmInput.definition.steps,
+                  { kind: "review", id: "review", title: "Review", role: "maintainer" },
+                  { kind: "action", id: "push", title: "Push", action: "push" },
+                  { kind: "action", id: "pr", title: "Open PR", action: "open_pull_request" },
+                ],
+              },
+            },
+            event === "issue_created" ? trigger : { ...trigger, event, stateId: "ready" },
+          );
+          expect(saved.automation?.enabled).toBe(true);
+          expect((yield* summaries("repo"))[0]).toMatchObject({ state: "on", reason: null });
+          expect(yield* counts).toEqual({ occurrences: 0, admissions: 0, jobs: 0 });
+
+          const row = (yield* Routing.read("flow"))!;
+          const payload = issue(
+            Date.parse(row.effective_after!) + 1,
+            event === "issue_created" ? {} : { action: "update", updatedFrom: { stateId: "todo" } },
+          );
+          expect((yield* receive(payload)).status).toBe(200);
+          expect(yield* counts).toEqual({ occurrences: 1, admissions: 1, jobs: 1 });
+        }),
+        vmSettings,
+      ),
+  );
+
   it.live(
     "enables from a local binding and advances the cutoff when an On rule changes target",
     () =>
@@ -327,7 +361,7 @@ describe("VM workflow authoring (PostgreSQL)", () => {
       ),
   );
 
-  it.live("rejects a placeholder Codex account, invalid VM model, and unsupported VM steps", () =>
+  it.live("rejects a placeholder Codex account, invalid VM model, and invalid base branch", () =>
     testVmAuthoring(
       Effect.gen(function* () {
         yield* seedVmAutomation;
@@ -369,21 +403,6 @@ describe("VM workflow authoring (PostgreSQL)", () => {
         ).toMatchObject({
           _tag: "WorkflowInvalidError",
           message: expect.stringContaining("valid Git branch"),
-        });
-        expect(
-          yield* enableVmAutomation({
-            ...vmInput,
-            definition: {
-              ...vmInput.definition,
-              steps: [
-                ...vmInput.definition.steps,
-                { kind: "action", id: "push", title: "Push", action: "push" },
-              ],
-            },
-          }).pipe(Effect.flip),
-        ).toMatchObject({
-          _tag: "WorkflowInvalidError",
-          message: expect.stringContaining("Remove Push"),
         });
         expect(yield* (yield* Workflows).get("flow")).toBeNull();
       }),
@@ -645,7 +664,7 @@ describe("VM workflow authoring (PostgreSQL)", () => {
 });
 
 it.live(
-  "same-source reconnect restores On after current team delivery without another workflow Save",
+  "same-source reconnect restores On and admits the first matching event without another workflow Save",
   () =>
     testDb(
       Effect.gen(function* () {
@@ -663,72 +682,43 @@ it.live(
         });
         const state = new URL(begin.authorization!.url).searchParams.get("state")!;
         expect(yield* Sources.callback(state, "fixture-code")).toBe("connection");
-        expect((yield* summaries("repo"))[0]?.reason).toContain("selected team");
-        const time = (yield* clock) + 1000;
-        expect((yield* receive(issue(time))).status).toBe(200);
-        expect((yield* counts).jobs).toBe(0);
-        expect((yield* summaries("repo"))[0]?.state).toBe("needs_attention");
-        expect(
-          (yield* receive(issue(time + 1, { action: "update", updatedFrom: { stateId: "todo" } })))
-            .status,
-        ).toBe(200);
         expect((yield* summaries("repo").pipe(Effect.provide(noSummaryIo)))[0]).toMatchObject({
           state: "on",
           reason: null,
         });
-        expect((yield* receive(issue(time + 2))).status).toBe(200);
+        const time = (yield* clock) + 1000;
+        expect((yield* receive(issue(time))).status).toBe(200);
         expect((yield* counts).jobs).toBe(1);
         expect(yield* Routing.read("flow")).toEqual(original);
       }),
     ),
 );
-it.live(
-  "requires current exact-team evidence after a delivery configuration change, not a new enable proof",
-  () =>
-    testDb(
-      Effect.gen(function* () {
-        yield* seed;
-        yield* save();
-        const sql = (yield* RelayDb).$client;
-        const original = yield* Routing.read("flow");
-        const currentConfig = {
-          ...webhookConfig,
-          linearWorkflowWebhook: {
-            ...webhookConfig.linearWorkflowWebhook,
-            generation: "coverage-2",
-          },
-        };
-        expect(
-          (yield* summaries("repo").pipe(
-            Effect.provideService(RelayConfiguration, currentConfig),
-          ))[0]?.reason,
-        ).toContain("selected team");
-        for (const [epoch, teams] of [
-          [0, { team: { created: true, entered: true } }],
-          [1, { other: { created: true, entered: true } }],
-          [1, { team: { created: true, entered: false } }],
-        ] as const) {
-          yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json({ generation: "coverage-2", epoch, teams })}`;
-          expect(
-            (yield* summaries("repo").pipe(
-              Effect.provideService(RelayConfiguration, currentConfig),
-            ))[0]?.state,
-          ).toBe("needs_attention");
-        }
-        yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json({ generation: "coverage-2", epoch: 1, teams: { team: { created: true, entered: true } } })}`;
-        expect(
-          (yield* summaries("repo").pipe(
-            Effect.provideService(RelayConfiguration, currentConfig),
-            Effect.provide(noSummaryIo),
-          ))[0]?.state,
-        ).toBe("on");
-        expect(yield* Routing.read("flow")).toEqual(original);
-        yield* sql`UPDATE relay_organization_projects SET repository_canonical_key='github.com/example/another'`;
-        expect(
-          (yield* summaries("repo").pipe(
-            Effect.provideService(RelayConfiguration, currentConfig),
-          ))[0]?.reason,
-        ).toContain("execution target");
-      }),
-    ),
+it.live("keeps a rule On after a webhook generation change and still detects target drift", () =>
+  testDb(
+    Effect.gen(function* () {
+      yield* seed;
+      yield* save();
+      const sql = (yield* RelayDb).$client;
+      const original = yield* Routing.read("flow");
+      const currentConfig = {
+        ...webhookConfig,
+        linearWorkflowWebhook: {
+          ...webhookConfig.linearWorkflowWebhook,
+          generation: "coverage-2",
+        },
+      };
+      expect(
+        (yield* summaries("repo").pipe(
+          Effect.provideService(RelayConfiguration, currentConfig),
+          Effect.provide(noSummaryIo),
+        ))[0]?.state,
+      ).toBe("on");
+      expect(yield* Routing.read("flow")).toEqual(original);
+      yield* sql`UPDATE relay_organization_projects SET repository_canonical_key='github.com/example/another'`;
+      expect(
+        (yield* summaries("repo").pipe(Effect.provideService(RelayConfiguration, currentConfig)))[0]
+          ?.reason,
+      ).toContain("execution target");
+    }),
+  ),
 );

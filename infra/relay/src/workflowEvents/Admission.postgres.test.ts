@@ -422,6 +422,7 @@ describe("verified event admission (PostgreSQL)", () => {
       testDb(
         Effect.gen(function* () {
           yield* seed;
+          yield* enableBeforeEvent("flow");
           const sql = (yield* RelayDb).$client;
           yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=NULL`;
           const off = {
@@ -438,9 +439,11 @@ describe("verified event admission (PostgreSQL)", () => {
               Effect.provideService(RelayConfiguration, off),
             )).status,
           ).toBe(200);
-          expect(Fence.covers((yield* Store.connection("connection"))!, "coverage-1", "team")).toBe(
-            false,
-          );
+          const firstConnection = (yield* Store.connection("connection"))!;
+          expect(Fence.evidence(firstConnection, "coverage-1")?.teams.team).toEqual({
+            created: true,
+            entered: false,
+          });
           yield* receive(
             issue(start.webhookTimestamp + 1, {
               action: "update",
@@ -448,10 +451,11 @@ describe("verified event admission (PostgreSQL)", () => {
             }),
           ).pipe(Effect.provideService(RelayConfiguration, off));
           const c = (yield* Store.connection("connection"))!;
-          expect(Fence.covers(c, "coverage-1", "team")).toBe(true);
-          expect(Fence.covers(c, "coverage-2", "team")).toBe(false);
-          expect(Fence.covers({ ...c, authorization_epoch: 2 }, "coverage-1", "team")).toBe(false);
-          expect(Fence.covers(c, "coverage-1", "other-team")).toBe(false);
+          expect(Fence.evidence(c, "coverage-1")?.teams).toEqual({
+            team: { created: true, entered: true },
+          });
+          expect(Fence.evidence(c, "coverage-2")).toBeNull();
+          expect(Fence.evidence({ ...c, authorization_epoch: 2 }, "coverage-1")).toBeNull();
           expect(
             (yield* Store.repositorySnapshot("repo", "maintainer")).sources[0]?.source.delivery,
           ).toBe("verified");
@@ -459,7 +463,30 @@ describe("verified event admission (PostgreSQL)", () => {
         }),
       ),
   );
-  it.live("cannot complete a team's delivery coverage during a reconnect", () =>
+  it.live("admits matching issues even when the observed-team limit is reached", () =>
+    testDb(
+      Effect.gen(function* () {
+        yield* seed;
+        yield* enableBeforeEvent("flow");
+        const sql = (yield* RelayDb).$client;
+        const evidence = {
+          generation: "coverage-1",
+          epoch: 1,
+          teams: Object.fromEntries(
+            Array.from({ length: 256 }, (_, index) => [
+              `observed-team-${index}`,
+              { created: true, entered: true },
+            ]),
+          ),
+        };
+        yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json(evidence)}`;
+        expect((yield* receive(issue(yield* clock))).status).toBe(200);
+        expect(yield* counts).toEqual({ occurrences: 1, admissions: 1, jobs: 1 });
+        expect((yield* Store.connection("connection"))?.delivery_evidence).toEqual(evidence);
+      }),
+    ),
+  );
+  it.live("admits matching issues without recording delivery during a reconnect", () =>
     testDb(
       Effect.gen(function* () {
         yield* seed;
@@ -483,7 +510,7 @@ describe("verified event admission (PostgreSQL)", () => {
         yield* Deferred.await(gate.entered);
 
         expect((yield* receive(issue(yield* clock))).status).toBe(200);
-        expect(yield* counts).toEqual({ occurrences: 1, admissions: 0, jobs: 0 });
+        expect(yield* counts).toEqual({ occurrences: 1, admissions: 1, jobs: 1 });
         expect((yield* Store.connection("connection"))?.delivery_evidence).toEqual(incomplete);
 
         yield* Deferred.succeed(gate.release, undefined);

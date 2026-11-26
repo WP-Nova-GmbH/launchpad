@@ -142,21 +142,20 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
           epoch: c.authorization_epoch,
           teams: {},
         };
-        if (!proof.teams[event.facts.teamId] && Object.keys(proof.teams).length >= 256)
-          return { duplicate: false, jobs: 0 };
-        const old = proof.teams[event.facts.teamId] ?? { created: false, entered: false };
+        const observed = proof.teams[event.facts.teamId];
+        const old = observed ?? { created: false, entered: false };
         const next = {
           created: old.created || event.action === "create",
           entered: old.entered || event.entered,
         };
-        // A reconnect can queue against verified coverage, but it cannot establish coverage.
+        // Observation is diagnostic. Its storage cap must never prevent admitting a job.
         if (
           !attempt.exchange_lease_until &&
-          (old.created !== next.created || old.entered !== next.entered)
+          (old.created !== next.created || old.entered !== next.entered) &&
+          (observed || Object.keys(proof.teams).length < 256)
         ) {
           const evidence = { ...proof, teams: { ...proof.teams, [event.facts.teamId]: next } };
           yield* sql`UPDATE relay_workflow_connections SET delivery_evidence=${sql.json(evidence)} WHERE connection_id=${c.connection_id} AND authorization_epoch=${c.authorization_epoch}`;
-          c.delivery_evidence = evidence;
         }
         const jobs: Array<typeof relayWorkflowJobs.$inferInsert> = [];
         const admissions: Array<typeof relayWorkflowAdmissions.$inferInsert> = [];
@@ -190,7 +189,6 @@ export const admit = Effect.fn("workflowEvents.admit")(function* (event: Normali
             !grant ||
             c.connection_id !== trigger.connectionId ||
             !repositories.some((r) => r.repository_id === row.repository_id) ||
-            !Fence.covers(c, config.generation, trigger.teamId) ||
             !row.effective_after ||
             occurrenceTime <=
               Math.max(

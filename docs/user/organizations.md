@@ -182,8 +182,7 @@ Disconnect removes Launchpad's authorization and blocks new starts. Work already
 running can continue. Use **Cancel run** to stop it. If the relay needs configuration, ask the
 relay operator to check it.
 
-Automatic Linear triggers require verified event delivery for the selected team. Manage
-connections and triggers in the web or desktop app. Mobile shows source health.
+Manage Linear connections and triggers in the web or desktop app. Mobile shows source health.
 
 ## Repository workflows
 
@@ -241,8 +240,8 @@ saved version before submitting again. Reloading or restarting the app does not 
 When automatic triggering is available on your relay, open **Trigger settings** in the editor.
 Choose an allowed Linear workspace, a team, and either issue creation or entry into a selected
 status. Optional labels must all match. Organization admins can connect Linear and grant
-repository access from the editor without leaving the draft. Enabling requires verified event
-delivery for that team. A VM target also requires the organization's GitHub App and Codex account.
+repository access from the editor without leaving the draft. A VM target also requires the
+organization's GitHub App and Codex account.
 Automatic VM runs use the repository's workflow variables and secrets and wait for an organization VM slot.
 
 **Save** applies the rule and its On/Off setting to future events. The catalog shows the saved

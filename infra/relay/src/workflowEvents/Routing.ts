@@ -167,11 +167,10 @@ export const save = Effect.fn("workflowEvents.saveRouting")(function* (
             proof.connectionId !== bound.connection.connection_id ||
             proof.generation !== config.generation ||
             proof.triggerKey !== triggerKey(next.trigger) ||
-            proof.targetKey !== targetKey(record.definition) ||
-            !Fence.covers(bound.connection, config.generation, next.trigger!.teamId))
+            proof.targetKey !== targetKey(record.definition))
         )
           return yield* invalid(
-            "Source authority, delivery coverage or target validation changed. Refresh before enabling.",
+            "Source authority or target validation changed. Refresh before enabling.",
           );
         if (next.enabled) {
           const canonicalKey =

@@ -173,6 +173,7 @@ export const WorkflowSourceSelection = Schema.Struct({
       message: Schema.String,
     }),
   ),
+  // Whether the relay is configured to admit automatic runs for the connection.
   deliveryReady: Schema.Boolean,
 });
 export type WorkflowSourceSelection = typeof WorkflowSourceSelection.Type;
