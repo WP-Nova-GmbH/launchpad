@@ -56,6 +56,11 @@ export interface ThreadMoveSubmissionStorage {
 }
 export interface ThreadMoveSubmissionObservation {
   readonly entries: ReadonlyArray<ThreadQueueEntry>;
+  readonly localProjection?: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly snapshotSequence: number;
+  };
   /** Cursor paired with this environment's thread detail, never the shell cursor. */
   readonly projection?: {
     readonly environmentId: string;
@@ -71,6 +76,26 @@ export interface ThreadMoveSubmissionObservation {
     readonly operationId: string | null;
   };
 }
+
+/** Direct acceptance and unrouted source detail share one environment's event cursor. */
+export function threadMoveLocalSnapshotReached(
+  saved: ThreadMoveSubmission,
+  projection: ThreadMoveSubmissionObservation["localProjection"],
+) {
+  return (
+    projection !== undefined &&
+    saved.accepted === true &&
+    saved.rejection === undefined &&
+    saved.acceptedViaRelay !== true &&
+    saved.sourceGeneration === undefined &&
+    saved.executionProof === undefined &&
+    saved.acceptedSequence !== undefined &&
+    projection.environmentId === saved.originEnvironmentId &&
+    projection.threadId === saved.command.threadId &&
+    projection.snapshotSequence >= saved.acceptedSequence
+  );
+}
+
 const storageKey = (scope: ThreadMoveSubmissionScope) => {
   const relayUrl = normalizeSecureRelayUrl(scope.relayUrl);
   if (!relayUrl) throw new Error("Configure Launchpad Connect before moving this thread.");
@@ -112,9 +137,8 @@ export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionS
               : undefined
             : receipt.sequence);
         const acceptedViaRelay =
-          current.acceptedSequence !== undefined
-            ? current.acceptedViaRelay === true
-            : "relay" in receipt;
+          current.acceptedViaRelay === true ||
+          (current.acceptedSequence === undefined && "relay" in receipt);
         if (
           !current.accepted ||
           acceptedSequence !== current.acceptedSequence ||
@@ -185,7 +209,10 @@ export function createThreadMoveSubmissionJournal(storage: ThreadMoveSubmissionS
           projection?.environmentId === proof.environmentId &&
           projection.generation === proof.generation &&
           projection.snapshotSequence >= proof.sequence;
-        if (queued || (!current.rejection && caughtUp)) {
+        const localCaughtUp =
+          observation.localProjection?.environmentId === scope.environmentId &&
+          threadMoveLocalSnapshotReached(current, observation.localProjection);
+        if (queued || localCaughtUp || (!current.rejection && caughtUp)) {
           await storage.remove(storageKey(scope));
           return null;
         }

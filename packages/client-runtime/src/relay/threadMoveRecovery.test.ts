@@ -57,7 +57,7 @@ const detail = (sequence: number) => ({
   data: Option.some(thread),
 });
 
-async function harness() {
+async function harness(admission: "local" | "relay" | "lost" = "relay") {
   const values = new Map<string, string>();
   const locks = new Map<string, Promise<unknown>>();
   const storage: ThreadMoveSubmissionStorage = {
@@ -86,7 +86,12 @@ async function harness() {
       destination: { kind: "vm" },
       createdAt: at,
     }),
-    async (command) => ({ relay: { commandId: command.commandId, position: 1, receipt: null } }),
+    async (command) => {
+      if (admission === "lost") throw new Error("Reply lost");
+      return admission === "local"
+        ? { sequence: 70 }
+        : { relay: { commandId: command.commandId, position: 1, receipt: null } };
+    },
     async () => ({ status: "unknown" }),
     () => true,
   );
@@ -129,6 +134,102 @@ async function harness() {
 }
 
 describe("saved move recovery on the current machine", () => {
+  it("clears the accepted initial move when live source detail has caught up after cancellation", async () => {
+    const h = await harness("local");
+    const before = detail(69);
+    const after = detail(71);
+    expect(threadMoveSnapshotReached(environmentId, before, h.saved, null)).toBe(false);
+    expect(
+      await h.journal.observe(
+        scope,
+        h.saved,
+        threadMoveObservation(environmentId, before, null, null),
+      ),
+    ).toEqual(h.saved);
+    expect(threadMoveSnapshotReached(environmentId, after, h.saved, null)).toBe(true);
+    expect(
+      await h.journal.observe(
+        scope,
+        h.saved,
+        threadMoveObservation(environmentId, after, null, null),
+      ),
+    ).toBeNull();
+    expect(await h.journal.read(scope)).toBeNull();
+    const next = {
+      ...h.saved.command,
+      commandId: CommandId.make("retry-command"),
+      messageId: MessageId.make("retry-message"),
+    };
+    expect(
+      await h.journal.submit(
+        scope,
+        () => next,
+        async () => ({ sequence: 72 }),
+        async () => ({ status: "unknown" }),
+        () => true,
+        { allowExisting: false },
+      ),
+    ).toEqual({ status: "accepted", sequence: 72 });
+    expect((await h.journal.read(scope))?.command).toEqual(next);
+  });
+
+  it("keeps the initial move when detail is cached, belongs to a different source, or has a competing placement", async () => {
+    const h = await harness("local");
+    for (const observation of [
+      threadMoveObservation(environmentId, { ...detail(71), status: "cached" }, null, null),
+      threadMoveObservation(EnvironmentId.make("other"), detail(71), null, null),
+      threadMoveObservation(
+        environmentId,
+        {
+          ...detail(71),
+          data: Option.some({ ...thread, id: ThreadId.make("other-thread") }),
+        },
+        null,
+        null,
+      ),
+      threadMoveObservation(environmentId, detail(71), placement, null),
+      threadMoveObservation(environmentId, detail(71), null, route),
+    ]) {
+      expect(await h.journal.observe(scope, h.saved, observation)).toEqual(h.saved);
+    }
+  });
+
+  it("keeps relay admission on the routed recovery path even after reading an execution receipt", async () => {
+    const h = await harness();
+    await h.journal.reconcile(scope, h.saved, {
+      status: "accepted",
+      sequence: 70,
+    });
+    const saved = (await h.journal.read(scope))!;
+    expect(saved.acceptedViaRelay).toBe(true);
+    expect(
+      await h.journal.observe(
+        scope,
+        saved,
+        threadMoveObservation(environmentId, detail(71), null, null),
+      ),
+    ).toEqual(saved);
+  });
+
+  it("checks a recovered initial local receipt without asking the relay for placement", async () => {
+    const h = await harness("lost");
+    await h.journal.reconcile(scope, h.saved, { status: "accepted", sequence: 70 });
+    let sequence = 69;
+    const options = {
+      ...h.options,
+      checkLocation: async () => {
+        throw new Error("Thread has no relay placement");
+      },
+      readObservation: () => threadMoveObservation(environmentId, detail(sequence), null, null),
+    };
+    expect(await recoverThreadMove(h.journal, scope, h.saved, options)).toMatchObject({
+      accepted: true,
+      acceptedSequence: 70,
+    });
+    sequence = 71;
+    expect(await recoverThreadMove(h.journal, scope, h.saved, options)).toBeNull();
+  });
+
   it("retains execution proof until the paired snapshot catches up, without another receipt RPC", async () => {
     const h = await harness();
     const pending = await recoverThreadMove(h.journal, scope, h.saved, h.options);

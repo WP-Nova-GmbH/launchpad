@@ -5,11 +5,12 @@ import type {
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import type { EnvironmentThreadState } from "../state/threadState.ts";
-import type {
-  createThreadMoveSubmissionJournal,
-  ThreadMoveSubmission,
-  ThreadMoveSubmissionObservation,
-  ThreadMoveSubmissionScope,
+import {
+  threadMoveLocalSnapshotReached,
+  type createThreadMoveSubmissionJournal,
+  type ThreadMoveSubmission,
+  type ThreadMoveSubmissionObservation,
+  type ThreadMoveSubmissionScope,
 } from "./threadMoveSubmission.ts";
 
 type Placement = NonNullable<ThreadMoveSubmissionObservation["placement"]>;
@@ -22,7 +23,17 @@ export function threadMoveObservation(
   routing: ThreadRelayRouting | null,
 ): ThreadMoveSubmissionObservation {
   const thread = Option.getOrNull(state.data);
-  if (state.status !== "live" || !thread || routing?.phase !== "active") return { entries: [] };
+  if (state.status !== "live" || !thread) return { entries: [] };
+  if (routing === null && placement === null && state.snapshotSequence !== undefined)
+    return {
+      entries: [],
+      localProjection: {
+        environmentId,
+        threadId: thread.id,
+        snapshotSequence: state.snapshotSequence,
+      },
+    };
+  if (routing?.phase !== "active") return { entries: [] };
   const currentOwner =
     placement?.operationId === null &&
     placement.environmentId === environmentId &&
@@ -49,7 +60,13 @@ export function threadMoveSnapshotReached(
   saved: ThreadMoveSubmission | null,
   routing: ThreadRelayRouting | null,
 ) {
-  const proof = saved?.executionProof;
+  if (!saved) return false;
+  if (routing === null)
+    return threadMoveLocalSnapshotReached(
+      saved,
+      threadMoveObservation(environmentId, state, null, null).localProjection,
+    );
+  const proof = saved.executionProof;
   return !!(
     proof &&
     proof.environmentId === environmentId &&
@@ -78,6 +95,15 @@ export async function recoverThreadMove(
       throw new Error("The thread or account changed. The move remains saved.");
   };
   ensureCurrent();
+  const local = options.readObservation();
+  if (
+    local.localProjection?.environmentId === scope.environmentId &&
+    local.localProjection.threadId === saved.command.threadId &&
+    saved.originEnvironmentId === scope.environmentId &&
+    saved.sourceGeneration === undefined &&
+    saved.acceptedViaRelay !== true
+  )
+    return journal.observe(scope, saved, local);
   const before = await options.checkLocation();
   ensureCurrent();
   const initial = options.readObservation();
