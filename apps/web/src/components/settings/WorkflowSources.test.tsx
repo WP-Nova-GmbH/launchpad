@@ -64,8 +64,8 @@ vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: fixture.confirm })
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
-vi.mock("../ui/checkbox", () => ({
-  Checkbox: ({
+vi.mock("../ui/switch", () => ({
+  Switch: ({
     checked,
     onCheckedChange,
     ...props
@@ -75,7 +75,7 @@ vi.mock("../ui/checkbox", () => ({
   }) =>
     createElement("button", {
       ...props,
-      role: "checkbox",
+      role: "switch",
       checked,
       onClick: () => onCheckedChange(!checked),
     }),
@@ -158,12 +158,18 @@ vi.mock("../ui/menu", async (importOriginal) => {
       children,
       onClick,
       disabled,
-    }: PropsWithChildren<{ onClick: () => void; disabled?: boolean }>) => {
+      "aria-label": ariaLabel,
+    }: PropsWithChildren<{
+      onClick: () => void;
+      disabled?: boolean;
+      "aria-label"?: string;
+    }>) => {
       const [, setOpen] = useContext(MenuOpen);
       return (
         <button
           type="button"
           disabled={disabled}
+          aria-label={ariaLabel}
           onClick={() => {
             setOpen(false);
             onClick();
@@ -1844,8 +1850,12 @@ it.effect("keeps selected IDs and shows an error when selection metadata is unav
       });
       await drain();
       expect(words()).toContain("Saved selections are retained");
-      expect(words()).toContain("saved-team");
-      expect(words()).toContain("saved-status");
+      const criteria = renderer.root
+        .findAllByProps({ "data-picker": true })
+        .map((picker) => picker.props.value);
+      expect(criteria).toEqual(expect.arrayContaining(["saved-team", "saved-status"]));
+      expect(textContent(renderer.root)).not.toContain("saved-team");
+      expect(textContent(renderer.root)).not.toContain("saved-status");
       expect(change).not.toHaveBeenCalled();
     });
   }),
@@ -1932,7 +1942,8 @@ async function mountTrigger(
   });
   await drain();
 }
-const enableControl = () => renderer.root.findByProps({ role: "checkbox" });
+const enableControl = () => renderer.root.findByProps({ role: "switch" });
+const openTriggerActions = () => act(() => button("Trigger actions").props.onClick());
 const teamPicker = () =>
   renderer.root
     .findAllByProps({ "data-picker": true })
@@ -1966,10 +1977,8 @@ it.effect("lets a maintainer refresh a new workspace grant without losing the tr
         renderer = create(<TriggerEditor />);
       });
       await drain();
-      const refresh = () =>
-        renderer.root
-          .findAllByType("button")
-          .find((node) => node.props["aria-label"] === "Refresh workspace access")!;
+      const refresh = () => button("Refresh workspace access");
+      await openTriggerActions();
       expect(refresh().props.disabled).toBe(false);
       expect(words()).not.toContain("Engineering workspace");
 
@@ -1985,6 +1994,7 @@ it.effect("lets a maintainer refresh a new workspace grant without losing the tr
       await act(() => refresh().props.onClick());
       await started;
       try {
+        await openTriggerActions();
         expect(refresh().props.disabled).toBe(true);
         expect(words()).toContain("Checking workspace access");
         fixture.repo = {
@@ -2240,6 +2250,86 @@ it.effect("rechecks the source when the first metadata page conflicts with reaut
   }),
 );
 
+it.effect("rechecks Linear credentials after a rate limit", () =>
+  Effect.gen(function* () {
+    yield* serveRequests;
+    yield* Effect.promise(async () => {
+      await mountTrigger();
+      fixture.repo = {
+        ...fixture.repo,
+        sources: fixture.repo.sources.map((entry) => ({
+          ...entry,
+          source: { ...entry.source, health: { code: "rate_limited", retryAt: null } },
+        })),
+      };
+
+      await openTriggerActions();
+      await click("Refresh workspace access");
+
+      expect(words()).toContain("Waiting for Linear rate limit");
+      expect(button("Check connection").props.disabled).toBe(false);
+      expect(button("Reconnect Linear")).toBeUndefined();
+
+      fixture.fetch.mockImplementationOnce(async (input, init) => {
+        const request = new Request(input, init);
+        expect(request.method).toBe("POST");
+        expect(new URL(request.url).pathname).toBe(
+          "/v1/repositories/repo/workflow-sources/refresh",
+        );
+        expect(await request.json()).toEqual({ grantId: "grant" });
+        fixture.repo = {
+          ...fixture.repo,
+          sources: fixture.repo.sources.map((entry) => ({ ...entry, source })),
+        };
+        return Response.json(fixture.repo);
+      });
+      await click("Check connection");
+
+      expect(button("Check connection")).toBeUndefined();
+      expect(teamPicker()).toBeDefined();
+    });
+  }),
+);
+
+it.effect(
+  "refreshes degraded Linear status without checking credentials when access is read only",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountTrigger();
+        fixture.repo = {
+          ...fixture.repo,
+          canAllow: false,
+          canManage: false,
+          sources: fixture.repo.sources.map((entry) => ({
+            ...entry,
+            source: { ...entry.source, health: { code: "unavailable", retryAt: null } },
+          })),
+        };
+
+        await openTriggerActions();
+        await click("Refresh workspace access");
+
+        expect(button("Check connection")).toBeUndefined();
+        fixture.fetch.mockImplementationOnce(async (input, init) => {
+          const request = new Request(input, init);
+          expect(request.method).toBe("GET");
+          expect(new URL(request.url).pathname).toBe("/v1/repositories/repo/workflow-sources");
+          fixture.repo = {
+            ...fixture.repo,
+            sources: fixture.repo.sources.map((entry) => ({ ...entry, source })),
+          };
+          return Response.json(fixture.repo);
+        });
+        await click("Refresh status");
+
+        expect(button("Refresh status")).toBeUndefined();
+        expect(teamPicker()).toBeDefined();
+      });
+    }),
+);
+
 it.effect("rechecks the workspace and shows reconnect guidance after metadata loses access", () =>
   Effect.gen(function* () {
     yield* serveRequests;
@@ -2276,8 +2366,7 @@ it.effect("rechecks the workspace and shows reconnect guidance after metadata lo
       await click("Load more teams");
 
       expect(fixture.readCount).toBe(connectionReads + 1);
-      expect(words()).toContain("Reconnect required");
-      expect(button("Review connection")).toBeDefined();
+      expect(button("Reconnect Linear")).toBeDefined();
       expect(button("Retry loading teams")).toBeUndefined();
       expect(teamPicker()).toBeUndefined();
 
@@ -2288,14 +2377,62 @@ it.effect("rechecks the workspace and shows reconnect guidance after metadata lo
           source: { ...entry.source, authorizationEpoch: 2 },
         })),
       };
+      await openTriggerActions();
       await click("Refresh workspace access");
-      expect(button("Review connection")).toBeUndefined();
+      expect(button("Reconnect Linear")).toBeUndefined();
       expect(teamPicker()?.props["data-options"]).toEqual(["Saved team", "New Platform"]);
       expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toEqual(
         triggerInitial,
       );
     });
   }),
+);
+
+it.effect(
+  "keeps known rule names while reconnecting and hides them when the grant is withdrawn",
+  () =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountTrigger();
+        fixture.repo = {
+          ...fixture.repo,
+          sources: fixture.repo.sources.map((entry) => ({
+            ...entry,
+            source: {
+              ...entry.source,
+              authorizationEpoch: 2,
+              status: "reconnect_required",
+              health: { code: "reconnect_required", retryAt: null },
+            },
+          })),
+        };
+
+        await openTriggerActions();
+        await click("Refresh workspace access");
+
+        const ruleValues = () => renderer.root.findAllByType("dd").map(textContent);
+        expect(button("Reconnect Linear")).toBeDefined();
+        expect(teamPicker()).toBeUndefined();
+        expect(ruleValues()).toEqual([
+          "Issue enters a status",
+          "Saved team",
+          "Saved status",
+          "Global label, Team label",
+        ]);
+
+        fixture.repo = { ...fixture.repo, sources: [] };
+        await openTriggerActions();
+        await click("Refresh workspace access");
+
+        expect(ruleValues()).toEqual([
+          "Issue enters a status",
+          "Selected team",
+          "Selected status",
+          "2 selected",
+        ]);
+      });
+    }),
 );
 
 it.effect("keeps loaded picker results and the filter during a same-source focus refresh", () =>
@@ -2425,12 +2562,8 @@ it.effect("discards pending metadata from before reconnect while preserving draf
             source: { ...entry.source, authorizationEpoch: 2 },
           })),
         };
-        await act(() =>
-          renderer.root
-            .findAllByType("button")
-            .find((node) => node.props["aria-label"] === "Refresh workspace access")!
-            .props.onClick(),
-        );
+        await openTriggerActions();
+        await act(() => button("Refresh workspace access").props.onClick());
         await drain();
         expect(words()).toContain("Team after reconnect");
       } finally {
@@ -2473,9 +2606,10 @@ it.effect("does not mistake a failed initial workspace check for removed reposit
       fixture.failRead = true;
       await mountTrigger();
       expect(words()).toContain("Could not check the workspace");
-      expect(words()).toContain("Connection status unknown");
       expect(words()).not.toContain("Repository source access unavailable");
-      expect(words()).toContain("saved-team");
+      expect(decodeAutomation(renderer.root.findByType("output").children.join(""))).toEqual(
+        triggerInitial,
+      );
       expect(enableControl().props.disabled).toBe(true);
     });
   }),
@@ -2503,62 +2637,79 @@ it.effect("keeps metadata controls mounted when a selected label is removed", ()
   }),
 );
 
-it.effect("waits for the changed rule's readiness without remounting metadata controls", () =>
-  Effect.gen(function* () {
-    yield* serveRequests;
-    yield* Effect.promise(async () => {
-      await mountTrigger();
-      let enter!: () => void, release!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        enter = resolve;
-      });
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      fixture.selectionReply = async (body) => {
-        enter();
-        await gate;
-        return Response.json({
-          authorizationEpoch: 1,
-          team: { id: body.teamId, name: "Saved team" },
-          state: null,
-          labels: [],
-          issues: [],
-          deliveryReady: false,
+it.effect.each([false, true])(
+  "checks a changed rule and keeps any pending enablement (pending: %s)",
+  (enablePending) =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountTrigger();
+        if (enablePending) {
+          await click("Automatic runs on save");
+          await drain();
+        }
+        let enter!: () => void, release!: () => void;
+        const entered = new Promise<void>((resolve) => {
+          enter = resolve;
         });
-      };
-      await act(() => {
-        renderer.root
-          .findAllByProps({ "data-picker": true })
-          .find((node) => node.props.value === "entered_status")!
-          .props.onValueChange("issue_created");
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        fixture.selectionReply = async (body) => {
+          enter();
+          await gate;
+          return Response.json({
+            authorizationEpoch: 1,
+            team: { id: body.teamId, name: "Saved team" },
+            state: null,
+            labels: [],
+            issues: [],
+            deliveryReady: false,
+          });
+        };
+        await act(() => {
+          renderer.root
+            .findAllByProps({ "data-picker": true })
+            .find((node) => node.props.value === "entered_status")!
+            .props.onValueChange("issue_created");
+        });
+        await act(async () => {
+          await entered;
+        });
+        try {
+          expect(enableControl().props.disabled).toBe(!enablePending);
+          expect(words()).toContain("Checking trigger readiness");
+          if (enablePending) {
+            expect(enableControl().props.checked).toBe(true);
+            expect(words()).toContain("Turns on when saved");
+            expect(button("Save workflow").props.disabled).toBe(true);
+          }
+        } finally {
+          await act(async () => release());
+        }
+        await drain();
+        expect(enableControl().props.disabled).toBe(!enablePending);
+        expect(words()).toContain("Event delivery not verified");
+        expect(button("Save workflow").props.disabled).toBe(enablePending);
       });
-      await act(async () => {
-        await entered;
-      });
-      expect(enableControl().props.disabled).toBe(true);
-      expect(words()).toContain("Checking trigger readiness");
-      await act(async () => release());
-      await drain();
-      expect(enableControl().props.disabled).toBe(true);
-      expect(words()).toContain("Event delivery not verified");
-      expect(button("Save workflow").props.disabled).toBe(false);
-    });
-  }),
+    }),
 );
 
-it.effect("replaces unusable VM trigger fields with target recovery", () =>
-  Effect.gen(function* () {
-    yield* serveRequests;
-    yield* Effect.promise(async () => {
-      await mountTrigger(triggerInitial, true);
-      expect(words()).toContain("Automatic VM runs unavailable");
-      expect(words()).toContain("Choose a Machine target");
-      expect(renderer.root.findAllByProps({ "data-picker": true })).toHaveLength(0);
-      expect(fixture.metadataReads).toHaveLength(0);
-      expect(saveTrigger).not.toHaveBeenCalled();
-    });
-  }),
+it.effect.each([false, true])(
+  "shows saved configuration alongside recovery when automatic VM runs are unavailable (saved on: %s)",
+  (enabled) =>
+    Effect.gen(function* () {
+      yield* serveRequests;
+      yield* Effect.promise(async () => {
+        await mountTrigger({ ...triggerInitial, enabled }, true);
+        expect(words()).toContain(enabled ? "Saved rule on" : "Saved rule off");
+        expect(words()).toContain("Automatic VM runs unavailable");
+        expect(words()).toContain("Choose a Machine target");
+        expect(renderer.root.findAllByProps({ "data-picker": true })).toHaveLength(0);
+        expect(fixture.metadataReads).toHaveLength(0);
+        expect(saveTrigger).not.toHaveBeenCalled();
+      });
+    }),
 );
 
 it.effect(
@@ -2598,7 +2749,8 @@ it.effect(
           },
         });
         expect(button("Save workflow").props.disabled).toBe(true);
-        await act(() => button("Remove incomplete trigger").props.onClick());
+        await openTriggerActions();
+        await act(() => button("Remove trigger").props.onClick());
         expect(button("Save workflow").props.disabled).toBe(false);
         await act(() => button("Save workflow").props.onClick());
         expect(saveTrigger).toHaveBeenCalledWith({ enabled: false, trigger: null });

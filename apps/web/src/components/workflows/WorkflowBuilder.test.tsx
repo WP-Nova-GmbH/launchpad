@@ -1,5 +1,5 @@
-vi.mock("../ui/checkbox", () => ({
-  Checkbox: ({
+vi.mock("../ui/switch", () => ({
+  Switch: ({
     checked,
     onCheckedChange,
     ...props
@@ -9,7 +9,7 @@ vi.mock("../ui/checkbox", () => ({
   }) =>
     createElement("button", {
       ...props,
-      role: "checkbox",
+      role: "switch",
       checked,
       onClick: () => onCheckedChange(!checked),
     }),
@@ -145,6 +145,48 @@ vi.mock("../ui/tooltip", () => ({
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
+vi.mock("../ui/menu", () => {
+  const MenuOpen = createContext<[boolean, (open: boolean) => void]>([false, () => {}]);
+  return {
+    Menu: ({ children }: PropsWithChildren) => {
+      const state = useState(false);
+      return <MenuOpen.Provider value={state}>{children}</MenuOpen.Provider>;
+    },
+    MenuTrigger: ({
+      render,
+      children,
+    }: PropsWithChildren<{ render: ReactElement<{ onClick: () => void }> }>) => {
+      const [open, setOpen] = useContext(MenuOpen);
+      return cloneElement(render, { onClick: () => setOpen(!open) }, children);
+    },
+    MenuPopup: ({ children }: PropsWithChildren) => (useContext(MenuOpen)[0] ? children : null),
+    MenuItem: ({
+      children,
+      onClick,
+      ...props
+    }: PropsWithChildren<{
+      onClick: () => void;
+      disabled?: boolean;
+      "aria-label"?: string;
+      "aria-describedby"?: string;
+    }>) => {
+      const [, setOpen] = useContext(MenuOpen);
+      return (
+        <button
+          {...props}
+          type="button"
+          onClick={() => {
+            setOpen(false);
+            onClick();
+          }}
+        >
+          {children}
+        </button>
+      );
+    },
+    MenuSeparator: () => null,
+  };
+});
 vi.mock("../ui/input", () => ({
   Input: (props: Record<string, unknown>) => createElement("input", props),
 }));
@@ -321,6 +363,14 @@ async function click(label: string, root = renderer!.root) {
     button(label, root)!.props.onClick();
   });
 }
+const openTriggerActions = () =>
+  act(() =>
+    renderer!.root
+      .findAllByType("button")
+      .find((node) => node.props["aria-label"] === "Trigger actions")!
+      .props.onClick(),
+  );
+
 async function rename(name: string) {
   await act(() =>
     renderer!.root.findByProps({ "aria-label": "Workflow name" }).props.onChange({
@@ -2147,8 +2197,7 @@ describe("VM authoring", () => {
       root.findByProps({ "aria-label": "Workflow settings" }).props.onClick();
     const openTrigger = () =>
       root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick();
-    const toggle = () =>
-      root.findAllByType("button").find((node) => node.props.role === "checkbox")!;
+    const toggle = () => root.findAllByType("button").find((node) => node.props.role === "switch")!;
     const selectVm = () =>
       root.findByProps({ "data-workflow-target": true }).props.onValueChange("vm");
     await act(openSettings);
@@ -2293,7 +2342,7 @@ describe("VM authoring", () => {
     await act(() =>
       root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick(),
     );
-    await act(() => root.findByProps({ role: "checkbox" }).props.onClick());
+    await act(() => root.findByProps({ role: "switch" }).props.onClick());
     const receipt = {
       ...workflow,
       revision: 6,
@@ -2317,14 +2366,17 @@ const recoveryTrigger = {
 } as const;
 const recoveryAuto = { enabled: true, trigger: recoveryTrigger };
 
-describe("Automatic trigger footer", () => {
+describe("Automatic trigger settings", () => {
   const footer = () => renderer!.root.findByType("footer");
   const text = (node: ReactTestInstance | string): string =>
     typeof node === "string" ? node : node.children.map(text).join(" ").replace(/\s+/g, " ").trim();
   const savedState = () =>
-    footer()
+    renderer!.root
       .findAllByType("p")
-      .find((node) => node.props.role === "status")!;
+      .find(
+        (node) =>
+          node.props.role === "status" && /^(Saved rule (off|on)|No saved rule)$/.test(text(node)),
+      )!;
   const openTrigger = () =>
     act(() =>
       renderer!.root.findByProps({ "aria-label": "Configure workflow trigger" }).props.onClick(),
@@ -2395,20 +2447,17 @@ describe("Automatic trigger footer", () => {
         await openTrigger();
         await drain();
 
-        const enable = footer().findByProps({ role: "checkbox" });
+        const enable = footer().findByProps({ role: "switch" });
         expect(enable.props.checked).toBe(false);
         expect(enable.props.disabled).toBe(false);
         const savedAnnouncement = savedState();
         await act(() => enable.props.onClick());
         await drain();
 
-        expect(text(footer().findByType("h3"))).toBe("Automatic runs");
+        expect(enable.props["aria-label"]).toBe("Automatic runs on save");
         expect(savedState()).toBe(savedAnnouncement);
-        expect(text(savedAnnouncement)).toBe("Automatic runs. Saved Off");
-        expect(text(footer())).toContain("Ready to enable");
-        expect(text(footer())).toContain(
-          "Saving will enable this rule for future matching events.",
-        );
+        expect(text(savedAnnouncement)).toBe("Saved rule off");
+        expect(text(footer())).toContain("Turns on when saved");
         expect(button("Save workflow", footer())?.props.disabled).toBe(false);
         expect(editor(workflow.workflowId).automation).toEqual(recoveryAuto);
         expect(editor(workflow.workflowId).baseline?.automation).toEqual(workflow.automation);
@@ -2437,19 +2486,24 @@ describe("Automatic trigger footer", () => {
     read.mockClear();
 
     const savedAnnouncement = savedState();
-    await click("Remove automatic trigger", footer());
+    await openTriggerActions();
+    await click("Remove trigger");
 
     expect(savedState()).toBe(savedAnnouncement);
-    const content = text(footer());
-    expect(text(savedState())).toBe("Automatic runs. Saved On");
+    const content = text(renderer!.root);
+    expect(text(savedState())).toBe("Saved rule on");
     expect(content).toContain("Trigger removal pending");
     expect(content).toContain("The saved rule can still start runs until you save the removal.");
     expect(content).not.toContain("Connection setup needed");
-    const turnOff = button("Turn off automatic runs", footer())!;
-    const description = footer().findByProps({ id: turnOff.props["aria-describedby"] });
+    await openTriggerActions();
+    const turnOff = renderer!.root
+      .findAllByType("button")
+      .find((node) => node.props["aria-label"] === "Turn off automatic runs")!;
+    const description = renderer!.root.findByProps({ id: turnOff.props["aria-describedby"] });
     expect(text(description)).toBe(
       "Stops new automatic runs and keeps your other workflow edits in the draft.",
     );
+    await openTriggerActions();
     expect(editor(workflow.workflowId).baseline?.automation).toEqual(recoveryAuto);
     expect(read).not.toHaveBeenCalled();
 
@@ -2473,8 +2527,8 @@ describe("Automatic trigger footer", () => {
     expect(editor(workflow.workflowId).baseline).toEqual(receipt);
     expect(workflowEditorDirty(editor(workflow.workflowId))).toBe(false);
     expect(savedState()).toBe(savedAnnouncement);
-    expect(text(savedAnnouncement)).toBe("Automatic runs. Saved Off");
-    expect(text(footer())).not.toContain("Trigger removal pending");
+    expect(text(savedAnnouncement)).toBe("No saved rule");
+    expect(text(renderer!.root)).not.toContain("Trigger removal pending");
   });
 
   it("keeps a pending trigger removal when VM automation becomes unavailable", async () => {
@@ -2494,7 +2548,8 @@ describe("Automatic trigger footer", () => {
     await mount(props);
     await openTrigger();
     read.mockClear();
-    await click("Remove automatic trigger", footer());
+    await openTriggerActions();
+    await click("Remove trigger");
 
     await act(() =>
       renderer!.update(
@@ -2785,11 +2840,12 @@ it("cancels only trigger changes while keeping other unsaved workflow edits", as
   await act(() =>
     renderer!.root
       .findAllByType("button")
-      .find((node) => node.props.role === "checkbox")!
+      .find((node) => node.props.role === "switch")!
       .props.onClick(),
   );
   expect(editor(workflow.workflowId).automation?.enabled).toBe(false);
-  await click("Cancel trigger edits");
+  await openTriggerActions();
+  await click("Discard trigger edits");
   expect(editor(workflow.workflowId).automation).toEqual(recoveryAuto);
   expect(editor(workflow.workflowId).definition.name).toBe("Retained workflow name");
   expect(workflowEditorDirty(editor(workflow.workflowId))).toBe(true);
