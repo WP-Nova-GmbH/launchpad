@@ -71,13 +71,14 @@ import {
   advanceWorkflowVmPreparation,
   workflowVmPreparationLayer,
 } from "../jobs/WorkflowVmPreparation.ts";
-import type {
-  RepositoryWorkflowJob,
-  WorkflowResultSaving,
-  WorkflowSavedResult,
-  WorkflowVmDispatchBinding,
-  WorkflowVmFollowUpPublishingRequest,
-  WorkflowVmPublishingRequest,
+import {
+  WORKFLOW_VM_PUBLISHING_PROTOCOL,
+  type RepositoryWorkflowJob,
+  type WorkflowResultSaving,
+  type WorkflowSavedResult,
+  type WorkflowVmDispatchBinding,
+  type WorkflowVmFollowUpPublishingRequest,
+  type WorkflowVmPublishingRequest,
 } from "@t3tools/contracts/workflows";
 import {
   handleWorkflowVmPublishing,
@@ -1591,6 +1592,7 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       "checkout-recovery-timeout",
       "checkout-recovery-cancelled",
       "checkout-recovery-stale-claim",
+      "invalid-commit-subject",
     ].entries()) {
       it.effect(`freezes one workflow preparation when admitted, then its VM is ${outcome}`, () =>
         Effect.gen(function* () {
@@ -1717,6 +1719,36 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect(
             yield* sql`SELECT 1 FROM relay_workflow_run_configurations WHERE job_id=${jobId}`,
           ).toHaveLength(0);
+          if (outcome === "invalid-commit-subject") {
+            const edited = {
+              ...workflow,
+              revision: 2,
+              definition: {
+                ...workflow.definition,
+                steps: [
+                  ...workflow.definition.steps,
+                  {
+                    kind: "action",
+                    id: "push",
+                    title: "Push branch",
+                    action: "push",
+                    commitSubject: "fix({{issueKey}}): update",
+                  },
+                ],
+              },
+            };
+            yield* sql`UPDATE relay_repository_workflows SET revision=2,record=${sql.json(edited)}
+              WHERE workflow_id=${workflowId}`;
+            expect(yield* advance).toMatchObject({
+              status: "failed",
+              workflow: null,
+              runtime: null,
+              detail: expect.stringContaining("needs a run triggered by a Linear issue"),
+            });
+            expect(yield* first.capacity.get(jobId)).toMatchObject({ state: "released" });
+            expect((yield* makeThreadVmAllocationStore(sql).getAny(jobId))?.state).toBe("deleted");
+            return;
+          }
           expect(
             (yield* first.capacity.admitNext(hostId, { workflowEnabled: true }))?.operationId,
           ).toBe(first.operationId);
@@ -2618,6 +2650,55 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       );
     }
 
+    it.effect("cleans up an unstarted publishing workflow on an older VM runner", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow(true, true);
+        const { linearWorkflow } = yield* installLinearAdmission(f);
+        yield* f.sql`UPDATE relay_workflow_jobs SET
+          record=jsonb_set(record,'{workflow,definition,steps}',record#>'{workflow,definition,steps}' || ${f.sql.json(
+            [
+              { kind: "review", id: "review", title: "Review", role: "maintainer" },
+              {
+                kind: "action",
+                id: "push",
+                title: "Push",
+                action: "push",
+                commitSubject: "Implement change",
+              },
+            ],
+          )}) WHERE job_id=${f.workflowJobId}`;
+        const operations: string[] = [];
+        const refresh = refreshAutomaticVm(
+          f,
+          linearWorkflow,
+          Effect.die("An older runner should be rejected before reading the issue"),
+          (input) =>
+            Effect.sync(() => {
+              operations.push(input.workflowControl!.operation);
+              return {
+                accepted: false,
+                workflowResult: {
+                  protocol: 9,
+                  actions: ["push"],
+                  outcome: "missing",
+                  detail: null,
+                  progress: null,
+                },
+              };
+            }),
+        );
+        expect(yield* refresh).toMatchObject({
+          status: "cancelling",
+          startAttempted: false,
+          vmStartRejection: "Update the workflow VM runner before publishing.",
+        });
+        expect(operations).toEqual(["status"]);
+        expect((yield* makeThreadVmAllocationStore(f.sql).getAny(f.allocationId))?.state).toBe(
+          "deleting",
+        );
+      }).pipe(Effect.provide(workflows)),
+    );
+
     it.effect(
       "rechecks a refused automatic VM Start and retains an ambiguous Start when disabled",
       () =>
@@ -2715,6 +2796,63 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect((yield* refresh(false))?.progress?.threadId).toBe(f.threadId);
           expect(requests).toHaveLength(3);
         }).pipe(Effect.provide(workflows)),
+    );
+
+    it.effect("releases a rejected VM Start and fails the run without dispatching it again", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow(true, true);
+        const { linearWorkflow } = yield* installLinearAdmission(f);
+        const detail = "The commit subject exceeds 100 characters after substitution.";
+        const requests: Array<string> = [];
+        const refresh = refreshAutomaticVm(
+          f,
+          linearWorkflow,
+          Effect.succeed(issueResponse("Current title")),
+          (input) =>
+            Effect.sync(() => {
+              const operation = input.workflowControl!.operation;
+              requests.push(operation);
+              return {
+                accepted: false,
+                workflowResult: {
+                  protocol: 9,
+                  outcome: operation === "start" ? "invalid_configuration" : "missing",
+                  detail: operation === "start" ? detail : null,
+                  progress: null,
+                },
+              };
+            }),
+        );
+
+        expect(yield* refresh).toMatchObject({
+          status: "cancelling",
+          startAttempted: false,
+          vmCancellationConfirmed: true,
+          vmStartRejection: detail,
+        });
+        expect((yield* makeThreadVmAllocationStore(f.sql).getAny(f.allocationId))?.state).toBe(
+          "deleting",
+        );
+
+        const deletions: string[] = [];
+        const worker = makeThreadVmCancelledSetupCleanupWorker(
+          f.sql,
+          {
+            inspect: () => Effect.succeed(null),
+            destroy: (id) =>
+              Effect.sync(() => {
+                deletions.push(id);
+              }),
+          },
+          f.hostId,
+        );
+        expect(yield* worker.runOne()).toBe(true);
+        const released = yield* f.capacity.get(f.operationId);
+        expect(released?.state).toBe("released");
+        expect(deletions).toEqual([released?.computeRef]);
+        expect(yield* refresh).toMatchObject({ status: "failed", detail });
+        expect(requests).toEqual(["status", "start"]);
+      }).pipe(Effect.provide(workflows)),
     );
 
     for (const afterRestart of [false, true]) {
@@ -4274,7 +4412,7 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
       }),
     );
 
-    it.effect("authorizes GitHub reads only for the active saved publishing action", () =>
+    it.effect("gates publishing writes and preserves legacy reads", () =>
       Effect.scoped(
         Effect.gen(function* () {
           const f = yield* activeWorkflow();
@@ -4356,7 +4494,10 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
               ],
             )}) WHERE job_id=${f.workflowJobId}`;
 
-          const bot = { name: "launchpad[bot]", email: "launchpad[bot]@users.noreply.github.com" };
+          const bot = {
+            name: "launchpad[bot]",
+            email: "launchpad[bot]@users.noreply.github.com",
+          };
           const credential = { token: "fixture-token", expiresAt: "2099-01-01T00:00:00Z" };
           const minted: Parameters<GithubApp["Service"]["mintRepositoryToken"]>[0][] = [];
           const github = Layer.mock(GithubApp)({
@@ -4379,12 +4520,14 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
               kind: "credential",
               access: "read",
             },
+            vmPublishingProtocol?: number,
           ) =>
             handleWorkflowVmPublishing({
               ...f.owner,
               jobId: f.workflowJobId,
               action: requestedAction,
               request,
+              ...(vmPublishingProtocol === undefined ? {} : { vmPublishingProtocol }),
             }).pipe(
               Effect.provideService(RelayEnvironmentPrincipal, f.principal),
               Effect.provideService(
@@ -4430,15 +4573,46 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
             resultTurnId: savedResult.turnId,
             commitSha: null,
           });
-          for (const request of [
+          const object = Buffer.from(
+            `tree ${action.tree}\nparent ${action.parent}\n\nImplement change\n`,
+          );
+          const commitSha = NodeCrypto.createHash("sha1")
+            .update(`commit ${object.length}\0`)
+            .update(object)
+            .digest("hex");
+          const committed = { ...action, commitSha };
+          expect(
+            yield* publishing(committed, { kind: "retain", commit: object.toString("base64") }),
+          ).toEqual({ kind: "ok" });
+          expect(yield* publishing(committed, { kind: "recover_commit", sha: commitSha })).toEqual({
+            kind: "commit",
+            commit: object.toString("base64"),
+          });
+          const [write, arm] = [
             { kind: "credential", access: "push" },
             { kind: "arm", commandId: NodeCrypto.randomUUID(), pid: 42, identity: "owned" },
-          ] as const) {
-            expect(yield* Effect.flip(publishing(action, request))).toMatchObject({
+          ] as const;
+          for (const request of [write, arm]) {
+            expect(yield* Effect.flip(publishing(committed, request))).toMatchObject({
               _tag: "RelayTenancyNotFoundError",
             });
           }
           expect(minted).toEqual([{ canonicalKey, installationId, access: "read" }]);
+          expect(yield* publishing(committed, write, WORKFLOW_VM_PUBLISHING_PROTOCOL)).toEqual({
+            kind: "credential",
+            ...credential,
+            bot,
+          });
+          expect(yield* publishing(committed, arm, WORKFLOW_VM_PUBLISHING_PROTOCOL)).toEqual({
+            kind: "ok",
+          });
+          expect(yield* publishing(committed, { kind: "stop", commandId: arm.commandId })).toEqual({
+            kind: "ok",
+          });
+          expect(minted).toEqual([
+            { canonicalKey, installationId, access: "read" },
+            { canonicalKey, installationId, access: "workflow-push" },
+          ]);
         }),
       ).pipe(Effect.provide(NodeFileSystem.layer)),
     );
@@ -5302,6 +5476,114 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           expect((yield* personal.capacity.get(nextOperationId))?.state).toBe("waiting");
         }),
     );
+    it.effect(
+      "reconciles a previously sent publishing Retry without sending it to an older VM",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* activeWorkflow();
+          const { sql, organizationId, ownerUserId, workflowJobId, threadId, repositoryId } = f;
+          yield* sql`INSERT INTO relay_organizations VALUES(${organizationId},'Test','2026','2026')`;
+          yield* sql`INSERT INTO relay_organization_members VALUES(${organizationId},${ownerUserId},'admin','2026','2026')`;
+          const actionId = `workflow:${workflowJobId}:action:push:1`;
+          const progress: NonNullable<RepositoryWorkflowJob["progress"]> = {
+            status: "paused",
+            revision: 4,
+            generation: 1,
+            stepId: "push",
+            threadId: ThreadId.make(threadId),
+            detail: null,
+            checkpoint: null,
+            actions: [
+              {
+                actionId,
+                stepId: "push",
+                generation: 1,
+                operation: "push",
+                state: "uncertain",
+                detail: null,
+                commitSha: null,
+                pullRequestUrl: null,
+                retryable: true,
+              },
+            ],
+          };
+          const pending = {
+            userId: ownerUserId,
+            responseId: NodeCrypto.randomUUID(),
+            response: { operation: "retry_action", expectedRevision: progress.revision, actionId },
+            checkpointDispatch: {
+              environmentId: f.owner.environmentId,
+              allocationId: f.allocationId,
+              operationId: f.operationId,
+              generation: f.owner.generation,
+            },
+          };
+          yield* sql`UPDATE relay_workflow_jobs SET status=${progress.status},
+          record=record || ${sql.json({ status: progress.status, progress })},
+          pending_control=${sql.json(pending)} WHERE job_id=${workflowJobId}`;
+          const operations: string[] = [];
+          let reported = progress;
+          yield* Effect.gen(function* () {
+            const store = yield* Workflows;
+            const refresh = refreshWorkflowJob(workflowJobId);
+            expect(yield* refresh).toMatchObject({
+              status: "paused",
+              detail: "Update the workflow VM runner before publishing.",
+            });
+            expect((yield* store.getJob(workflowJobId))?.pendingControl).toEqual(pending);
+            reported = {
+              ...progress,
+              revision: 5,
+              status: "done",
+              actions: [{ ...progress.actions![0]!, state: "completed", retryable: false }],
+            };
+            expect(yield* refresh).toMatchObject({ status: "done", progress: reported });
+            expect((yield* store.getJob(workflowJobId))?.pendingControl).toBeNull();
+            expect(operations).toEqual(["status", "status"]);
+          }).pipe(
+            Effect.provide([
+              workflows,
+              Layer.mock(EnvironmentConnector)({
+                dispatchJob: (input) =>
+                  Effect.sync(() => {
+                    operations.push(input.workflowControl!.operation);
+                    return {
+                      accepted: true,
+                      workflowResult: {
+                        protocol: 9,
+                        outcome: "accepted",
+                        detail: null,
+                        progress: reported,
+                      },
+                    };
+                  }),
+              }),
+              Layer.mock(Organizations)({
+                getMembershipForUser: ({ userId }) =>
+                  Effect.succeed({
+                    userId,
+                    role: "admin",
+                    joinedAt: "now",
+                    organization: { organizationId, name: "Test", createdAt: "now" },
+                  }),
+              }),
+              Layer.mock(Repositories)({
+                getById: () =>
+                  Effect.succeed({
+                    repositoryId,
+                    organizationId,
+                    name: "Test",
+                    canonicalKeys: [],
+                    createdAt: "now",
+                  }),
+              }),
+              Layer.mock(Machines)({}),
+              Layer.mock(OrganizationProjectCatalog)({}),
+            ]),
+          );
+        }),
+    );
+
     it.effect("reconciles same-revision VM saves before delivering a queued Review response", () =>
       Effect.gen(function* () {
         const { sql, organizationId, ownerUserId, workflowJobId, threadId, repositoryId } =

@@ -99,6 +99,32 @@ beforeEach(() => {
 });
 
 describe("workflow writes surviving navigation", () => {
+  it("saves a Machine target after removing its hidden VM commit subject", async () => {
+    const push = { id: "push", kind: "action", title: "Push branch", action: "push" } as const;
+    const steps = [...saved.definition.steps, push];
+    const persisted = { ...saved, definition: { ...saved.definition, steps } };
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      editors: {
+        [key]: {
+          ...editor(),
+          definition: {
+            ...saved.definition,
+            steps: [...saved.definition.steps, { ...push, commitSubject: "{{incomplete" }],
+          },
+        },
+      },
+    }));
+    const save = vi.fn(async () => persisted);
+    expect(await saveWorkflowDraft(scope, saved.workflowId, save)).toEqual(persisted);
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({ definition: persisted.definition }),
+    );
+    expect(appAtomRegistry.get(workflowDraftAtom).editors[key]?.definition).toEqual(
+      persisted.definition,
+    );
+  });
+
   it("keeps Save pending outside its component and prevents a duplicate request", async () => {
     const result = deferred<RepositoryWorkflow>();
     const save = vi.fn(() => result.promise);

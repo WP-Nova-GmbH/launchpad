@@ -211,6 +211,10 @@ to set up a publishing workflow on a Machine or VM.
 **Copy** reads the saved workflow and opens an independent, unsaved draft in the selected repository. Source edits and run history are excluded. Save the draft to create the copy. A VM workflow copied to another repository starts from the destination's default branch. Copies start with automatic triggering Off and no trigger.
 
 **Push branch** commits the saved result, including normal commit hooks, and pushes the job's branch.
+For VM workflows, set **Commit subject** on the Push step if your repository requires a specific
+format, such as `fix({{issueKey}}): update {{workflowName}}`. `{{issueKey}}` is available on runs
+triggered by Linear. Leave the field blank to use `chore: update` followed by the workflow name.
+Commit hooks can validate this message. A hook that rewrites it blocks VM publishing.
 **Open PR** opens a pull request against the base selected when the job was accepted. Add a Push
 after the latest Agent step and a Review before publishing when you want human approval.
 On a VM, the GitHub App needs Contents write for Push and Pull requests write for Open PR.

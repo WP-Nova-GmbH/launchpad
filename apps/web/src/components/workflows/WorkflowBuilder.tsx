@@ -1151,6 +1151,10 @@ function WorkflowBuilderWorkspace({
   const fieldValidationIssue =
     (issue?.field === "name" && missingName) ||
     (issue?.field === "baseBranch" && settingsOpen && !triggerOpen) ||
+    (issue?.field === "commitSubject" &&
+      issue.stepId === selected?.id &&
+      !settingsOpen &&
+      !triggerOpen) ||
     missingStepPrompt;
   const editorIssue = publishingIssueInInspector || fieldValidationIssue ? null : issue;
   const editorError =

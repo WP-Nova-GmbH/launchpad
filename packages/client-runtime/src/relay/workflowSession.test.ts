@@ -1200,6 +1200,25 @@ describe("workflow session and request ownership", () => {
 });
 
 describe("whole workflow validation and presentation", () => {
+  it("focuses an invalid VM Push commit subject when saving", () => {
+    expect(
+      workflowDraftIssue({
+        ...definition,
+        target: { kind: "vm", baseBranch: null },
+        steps: [
+          ...definition.steps,
+          {
+            id: "push",
+            kind: "action",
+            title: "Push branch",
+            action: "push",
+            commitSubject: "fix({{unknown}}): update",
+          },
+        ],
+      }),
+    ).toMatchObject({ stepId: "push", field: "commitSubject" });
+  });
+
   it("finds an invalid Agent regardless of which inspector is mounted", () => {
     const steps = definition.steps.map((step) =>
       step.kind === "agent" ? { ...step, instruction: "  " } : step,

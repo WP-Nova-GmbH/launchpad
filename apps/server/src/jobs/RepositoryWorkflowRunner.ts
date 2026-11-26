@@ -23,8 +23,10 @@ import {
 } from "@t3tools/contracts";
 import {
   WORKFLOW_PROTOCOL,
+  WORKFLOW_VM_PUBLISHING_PROTOCOL,
   isTerminalWorkflowJob,
   workflowApprovalCanRetry,
+  workflowCommitSubjectStartIssue,
   WorkflowVmDispatchBinding,
   type WorkflowControl,
   type WorkflowControlResult,
@@ -1916,6 +1918,7 @@ export const make = Effect.gen(function* () {
         detail: string | null = null,
       ): WorkflowControlResult => ({
         protocol: WORKFLOW_PROTOCOL,
+        ...(vm ? { vmPublishingProtocol: WORKFLOW_VM_PUBLISHING_PROTOCOL } : {}),
         actions: (vm ? vmPublishingSupported : publishingSupported)
           ? actions.canOpenPullRequest
             ? ["push", "open_pull_request"]
@@ -2215,6 +2218,9 @@ export const make = Effect.gen(function* () {
           runtime.projectId !== request.control.projectId
         )
           return result(null, "unavailable", "Invalid workflow target binding.");
+        const issueKey = vm && origin.kind === "automation" ? request.control.issueKey : undefined;
+        const subjectIssue = vm && workflowCommitSubjectStartIssue(workflow.definition, issueKey);
+        if (subjectIssue) return result(null, "invalid_configuration", subjectIssue);
         if (yield* store.isExecuting())
           return result(null, "busy", "Another workflow is executing on this environment.");
         if (!vm)
@@ -2389,6 +2395,7 @@ export const make = Effect.gen(function* () {
           userId: origin.kind === "manual" ? origin.userId : null,
           repositoryCanonicalKey: request.repositoryCanonicalKey,
           instruction: request.instruction,
+          ...(issueKey ? { issueKey } : {}),
           runtime,
           workflow: {
             ...workflow,

@@ -27,6 +27,9 @@ import { workflowVmCodexInstanceId } from "../settings/workflowModels";
 vi.mock("../ui/button", () => ({
   Button: (props: Record<string, unknown>) => createElement("button", props),
 }));
+vi.mock("../ui/input", () => ({
+  Input: (props: Record<string, unknown>) => createElement("input", props),
+}));
 vi.mock("../ui/textarea", () => ({
   Textarea: (props: Record<string, unknown>) => createElement("textarea", props),
 }));
@@ -649,6 +652,24 @@ describe("Workflow step editing", () => {
       expect(inspector).toContain("GitHub access is checked when the run starts.");
     },
   );
+
+  it("edits the VM Push commit subject and clears it back to the default", async () => {
+    await mount({ initial: vmPublishing, selection: "push" });
+    const field = () =>
+      renderer!.root
+        .findAllByType("input")
+        .find((node) => node.props["data-workflow-field"] === "commitSubject")!;
+    const template = "fix({{issueKey}}): update {{workflowName}}";
+    await act(() => field().props.onChange({ target: { value: template } }));
+    expect(definition.steps.find((step) => step.id === "push")).toMatchObject({
+      commitSubject: template,
+    });
+    await act(() => field().props.onChange({ target: { value: "" } }));
+    expect(field().props.value).toBe("");
+    expect(definition.steps.find((step) => step.id === "push")).toMatchObject({
+      commitSubject: undefined,
+    });
+  });
 
   it("offers to repair an Open PR step on a VM without a Machine checkout", async () => {
     await mount({

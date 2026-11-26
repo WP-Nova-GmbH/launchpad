@@ -15,6 +15,7 @@ import {
   WorkflowAutomation as WorkflowAutomationSchema,
   WorkflowStep as WorkflowStepSchema,
   isTerminalWorkflowJob,
+  workflowCommitSubjectError,
   workflowDefinitionError,
   workflowPublishingPrerequisites,
 } from "@t3tools/contracts/workflows";
@@ -757,6 +758,10 @@ export function workflowDraftIssue(definition: WorkflowDefinition) {
     return { message: "Enter a branch name.", stepId: null, field: "baseBranch" };
   for (const step of definition.steps) {
     if (Exit.isSuccess(decodeWorkflowStep(step))) continue;
+    if (step.kind === "action" && step.action === "push" && step.commitSubject !== undefined) {
+      const message = workflowCommitSubjectError(step.commitSubject);
+      if (message) return { message, stepId: step.id, field: "commitSubject" };
+    }
     const field =
       !step.title.trim() || step.title.length > 120
         ? "title"

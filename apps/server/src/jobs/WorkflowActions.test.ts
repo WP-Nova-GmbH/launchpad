@@ -748,7 +748,7 @@ for (const fault of ["commit-reply", "push-reply", "pr-reply"] as const)
   );
 
 it.effect(
-  "recovers a lost VM Push and recognizes the recorded GitHub PR without creating it twice",
+  "publishes an approved VM tree with ignored files and recovers without duplicate GitHub writes",
   () =>
     Effect.gen(function* () {
       const { base, cwd, fs, driver, git } = yield* makeRealGit();
@@ -774,11 +774,42 @@ it.effect(
       const agentHead = yield* git(["rev-parse", "HEAD"]);
       yield* fs.remove(`${cwd}/history-only.txt`);
       yield* fs.writeFileString(`${cwd}/result.txt`, "saved result\n");
-      yield* git(["add", "."]);
-      const tree = yield* git(["write-tree"]);
-      const checkpoint = yield* git(["commit-tree", tree, "-p", base, "-m", "private checkpoint"]);
-      yield* git(["update-ref", "refs/t3/checkpoint", checkpoint]);
-      yield* checkedGit(protectedDir, ["fetch", cwd, "refs/t3/checkpoint:refs/t3/checkpoint"]);
+      const generated = ".vite-hooks/_";
+      yield* fs.makeDirectory(`${cwd}/${generated}`, { recursive: true });
+      yield* fs.writeFileString(`${cwd}/${generated}/.gitignore`, "*\n");
+      yield* fs.writeFileString(`${cwd}/${generated}/pre-commit`, "#!/bin/sh\nexit 0\n");
+      yield* fs.chmod(`${cwd}/${generated}/pre-commit`, 0o755);
+      const checkpointGit = (args: ReadonlyArray<string>) =>
+        checkedGit(cwd, ["--git-dir", protectedDir, "--work-tree", cwd, ...args]);
+      yield* checkpointGit(["add", "-A", "-f", "--", "."]);
+      const tree = yield* checkpointGit(["write-tree"]);
+      const checkpoint = yield* checkpointGit([
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "commit-tree",
+        tree,
+        "-p",
+        base,
+        "-m",
+        "private checkpoint",
+      ]);
+      yield* checkpointGit(["update-ref", "refs/t3/checkpoint", checkpoint]);
+      yield* git(["add", "-A", "--", "."]);
+      assert.equal(yield* git(["ls-files", "--", generated]), "");
+      assert.notEqual(yield* git(["write-tree"]), tree);
+      // Leave the approved tree in the checkout's object store with a blob missing.
+      yield* git(["add", "-f", "--", generated]);
+      assert.equal(yield* git(["write-tree"]), tree);
+      yield* git(["reset", "--quiet", "HEAD", "--", generated]);
+      const reviewedBlob = yield* git(["rev-parse", `${tree}:${generated}/pre-commit`]);
+      const reviewedObjectPath = `${cwd}/.git/objects/${reviewedBlob.slice(0, 2)}/${reviewedBlob.slice(2)}`;
+      yield* fs.remove(reviewedObjectPath);
+      assert.equal(yield* git(["cat-file", "-t", tree]), "tree");
+      const extraPath = `${generated}/local-only`;
+      yield* fs.writeFileString(`${cwd}/${extraPath}`, "unreviewed data\n");
+      yield* git(["add", "-f", "--", extraPath]);
       yield* checkedGit(root, ["clone", "--bare", protectedDir, restoredDir]);
       yield* checkedGit(restoredDir, [
         "fetch",
@@ -792,6 +823,12 @@ it.effect(
         '#!/bin/sh\ntest -z "${GIT_CONFIG_VALUE_0:-}${GH_TOKEN:-}" || exit 73\nprintf called >> .git/hook-calls\n',
       );
       yield* fs.chmod(hook, 0o755);
+      const messageHook = `${cwd}/.git/hooks/commit-msg`;
+      yield* fs.writeFileString(
+        messageHook,
+        '#!/bin/sh\nhead -n 1 "$1" | grep -q "^fix(WP-331): update Ship$"\n',
+      );
+      yield* fs.chmod(messageHook, 0o755);
 
       const original = initial();
       const vmRuntime = {
@@ -808,6 +845,19 @@ it.effect(
       let state: WorkflowRun = {
         ...original,
         runtime: vmRuntime,
+        issueKey: "WP-331",
+        workflow: {
+          ...original.workflow,
+          definition: {
+            ...original.workflow.definition,
+            target: { kind: "vm", baseBranch: null },
+            steps: original.workflow.definition.steps.map((step) =>
+              step.kind === "action" && step.action === "push"
+                ? { ...step, commitSubject: "fix({{issueKey}}): update {{workflowName}}" }
+                : step,
+            ),
+          },
+        },
         baseSha: base,
         jobBranchPrefix: "launchpad",
         worktreePath: cwd,
@@ -827,7 +877,16 @@ it.effect(
             grantId: "repository-grant",
           },
         },
-        actions: [{ ...original.actions![0]!, parent: agentHead, tree, checkpointTurnId: "turn" }],
+        actions: [
+          {
+            ...original.actions![0]!,
+            parent: agentHead,
+            tree,
+            checkpointTurnId: "turn",
+            commitMessage: "Stale pre-fix message with unreviewed data",
+            phase: "commit",
+          },
+        ],
       };
       let remote: string | null = null;
       let retained: { readonly sha: string; readonly object: Uint8Array } | null = null;
@@ -837,6 +896,9 @@ it.effect(
       let prCount = 0;
       let prAttempts = 0;
       let prTokens = 0;
+      let failFirstRemoteRead = true;
+      let transferCommits = 0;
+      const cancelledTransfers: Array<{ bundle: string; source: string }> = [];
       const rejected = new Set<string>();
       const recoveredActions: string[] = [];
       const events: string[] = [];
@@ -919,8 +981,56 @@ it.effect(
         run: (input) =>
           Effect.gen(function* () {
             assert.isTrue(yield* VmCoordinatorProcess);
-            if (input.args.includes("ls-remote"))
+            if (state.progress.status === "cancelling")
+              return yield* new ProcessSpawnError({
+                command: "git",
+                argumentCount: 0,
+                cause: "The VM has sealed command admission",
+              });
+            if (input.args.includes("Approved workflow result")) {
+              const now = `2026-01-01T00:00:${String(++transferCommits).padStart(2, "0")}Z`;
+              return yield* process.run({
+                ...input,
+                env: {
+                  ...input.env,
+                  GIT_AUTHOR_DATE: input.env?.GIT_AUTHOR_DATE ?? now,
+                  GIT_COMMITTER_DATE: input.env?.GIT_COMMITTER_DATE ?? now,
+                },
+              });
+            }
+            const bundleIndex = input.args.indexOf("bundle");
+            if (
+              bundleIndex !== -1 &&
+              input.args[bundleIndex + 1] === "create" &&
+              cancelledTransfers.length === 0
+            ) {
+              const output = yield* process.run(input);
+              const bundle = input.args[bundleIndex + 2]!;
+              const gitDirectoryIndex = input.args.lastIndexOf("--git-dir");
+              const source =
+                gitDirectoryIndex === -1 ? input.cwd! : input.args[gitDirectoryIndex + 1]!;
+              assert.equal(output.code, 0, output.stderr);
+              assert.isTrue(yield* fs.exists(bundle).pipe(Effect.orDie));
+              assert.isTrue(yield* fs.exists(source).pipe(Effect.orDie));
+              cancelledTransfers.push({ bundle, source });
+              state = { ...state, progress: { ...state.progress, status: "cancelling" } };
+              return yield* new ProcessSpawnError({
+                command: "git",
+                argumentCount: 0,
+                cause: "Cancelled after creating the bundle",
+              });
+            }
+            if (input.args.includes("ls-remote")) {
+              if (failFirstRemoteRead) {
+                failFirstRemoteRead = false;
+                return yield* new ProcessSpawnError({
+                  command: "git",
+                  argumentCount: 0,
+                  cause: "Could not read GitHub branch",
+                });
+              }
               return result(remote ? `${remote}\t${ref}\n` : "");
+            }
             const isPush = input.args.includes("push");
             if (isPush || input.command === "/usr/bin/curl") {
               assert.isFalse(input.args.join(" ").includes("synthetic-"));
@@ -1015,7 +1125,8 @@ it.effect(
               deleteCheckpointRefs: () => Effect.void,
             }),
             Layer.mock(GitManager)({
-              prepareWorkflowCommit: () => Effect.succeed({ subject: "Save result", body: "" }),
+              prepareWorkflowCommit: () =>
+                Effect.die("VM commit messages must use the approved tree"),
               prepareWorkflowPullRequest: () =>
                 Effect.succeed({ title: "Save result", body: "Details" }),
             }),
@@ -1026,19 +1137,116 @@ it.effect(
         actions
           .execute(actionId, io)
           .pipe(Effect.provideService(WorkflowReviewGitDirectory, directory));
+      const beforeCancellation = state;
+      yield* fs.writeFileString(reviewedObjectPath, "");
+      const damaged = yield* Effect.flip(execute(id));
+      assert.match(damaged.message, /VM checkout has damaged Git objects/u);
+      assert.isFalse(yield* fs.exists(`${cwd}/.git/hook-calls`));
+      assert.equal(transferCommits, 0);
+      assert.equal(pushCount, 0);
+      yield* fs.remove(reviewedObjectPath);
+      state = beforeCancellation;
+
       yield* Effect.flip(execute(id));
-      const published = retained!.sha;
+      assert.lengthOf(cancelledTransfers, 1);
+      const cancelled = cancelledTransfers[0]!;
+      assert.isFalse(yield* fs.exists(cancelled.bundle));
+      assert.notEqual(cancelled.source, protectedDir);
+      assert.isFalse(yield* fs.exists(cancelled.source));
+      assert.equal(
+        yield* checkedGit(protectedDir, ["for-each-ref", "refs/t3/workflow-publishing-transfer/"]),
+        "",
+      );
+      assert.equal(pushCount, 0);
+      state = beforeCancellation;
+
+      const rewriteMessageHook = `${cwd}/.git/hooks/prepare-commit-msg`;
+      yield* fs.writeFileString(
+        rewriteMessageHook,
+        '#!/bin/sh\nprintf "\\nlocal hook text\\n" >> "$1"\n',
+      );
+      yield* fs.chmod(rewriteMessageHook, 0o755);
+      for (const _attempt of [1, 2]) {
+        assert.match((yield* Effect.flip(execute(id))).message, /hooks changed .*commit message/u);
+        assert.isNull(state.actions![0]!.commitSha);
+        assert.notInclude(state.actions![0]!.commitMessage ?? "", "local hook text");
+        assert.equal(pushCount, 0);
+      }
+      yield* fs.remove(rewriteMessageHook);
+      yield* git(["update-ref", ref, agentHead, yield* git(["rev-parse", "HEAD"])]);
+      yield* fs.remove(`${cwd}/.git/hook-calls`);
+      state = beforeCancellation;
+
+      yield* Effect.flip(execute(id));
+      const preparedSha = state.actions![0]!.commitSha;
+      assert.ok(preparedSha);
+      assert.deepEqual(events, ["retain"]);
+      assert.equal(pushCount, 0);
+
+      const lostPush = yield* Effect.flip(execute(id));
+      const published = state.actions![0]!.commitSha;
+      assert.ok(published, lostPush.message);
+      assert.equal(published, preparedSha);
       assert.equal(remote, published);
-      assert.deepEqual(events.slice(0, 4), ["retain", "arm", "remote-push", "stop"]);
+      assert.equal(yield* checkedGit(protectedDir, ["rev-parse", `${published}^{tree}`]), tree);
+      const publishedMessage = yield* checkedGit(protectedDir, [
+        "show",
+        "-s",
+        "--format=%B",
+        published,
+      ]);
+      assert.match(publishedMessage, /^fix\(WP-331\): update Ship\n\n/u);
+      assert.include(publishedMessage, "result.txt");
+      assert.include(publishedMessage, `${generated}/pre-commit`);
+      assert.notInclude(publishedMessage, extraPath);
+      assert.notInclude(publishedMessage, "unreviewed data");
+      assert.deepEqual(events.slice(0, 5), ["retain", "retain", "arm", "remote-push", "stop"]);
       assert.equal(yield* fs.readFileString(`${cwd}/.git/hook-calls`), "called");
+
+      const preparedRun = state;
+      assert.equal(preparedRun.actions![0]!.commitMessageSource, "verified_result");
+      const legacyPush = {
+        ...preparedRun.actions![0]!,
+        commitMessageSource: "approved_result" as const,
+      };
+      const eventsBeforeLegacyRetry = events.length;
+      remote = null;
+      state = { ...preparedRun, actions: [{ ...legacyPush, phase: "commit", commitSha: null }] };
+      assert.match((yield* Effect.flip(execute(id))).message, /prepared by an older runner/u);
+      assert.isNull(state.actions![0]!.commitSha);
+      state = { ...preparedRun, actions: [legacyPush] };
+      assert.match((yield* Effect.flip(execute(id))).message, /prepared by an older runner/u);
+      assert.equal(pushCount, 1);
+      assert.lengthOf(events, eventsBeforeLegacyRetry);
+      // The same legacy commit can be reconciled when GitHub already points to it.
+      remote = published;
+
+      const packDirectory = `${cwd}/.git/objects/pack`;
+      const firstPacks = (yield* fs.readDirectory(packDirectory)).filter((file) =>
+        file.endsWith(".pack"),
+      );
+      assert.lengthOf(firstPacks, 1);
       // Restore the checkout from before the hook and use a protected repository whose object store lacks the Push commit.
       yield* git(["update-ref", ref, agentHead]);
+      yield* git(["reset", "--quiet", "HEAD", "--", generated]);
+      const indexHook = `${cwd}/.git/hooks/post-index-change`;
+      yield* fs.writeFileString(indexHook, "#!/bin/sh\nprintf called >> .git/index-hook-calls\n");
+      yield* fs.chmod(indexHook, 0o755);
+      yield* checkedGit(restoredDir, ["repack", "-a", "-d", "-f"]);
+      const transfersBeforeRetry = transferCommits;
       yield* execute(id, restoredDir);
+      assert.equal(transferCommits, transfersBeforeRetry);
+      assert.deepEqual(
+        (yield* fs.readDirectory(packDirectory)).filter((file) => file.endsWith(".pack")),
+        firstPacks,
+      );
       assert.equal(pushCount, 1);
       assert.deepEqual(recoveredActions, [id]);
       assert.equal(yield* git(["rev-parse", "HEAD"]), published);
       assert.equal(yield* git(["show", "-s", "--format=%P", "HEAD"]), base);
       assert.equal(yield* fs.readFileString(`${cwd}/.git/hook-calls`), "called");
+      assert.isFalse(yield* fs.exists(`${cwd}/.git/index-hook-calls`));
+      assert.equal(yield* fs.readFileString(`${cwd}/${extraPath}`), "unreviewed data\n");
       assert.equal(state.actions![0]!.state, "completed");
       assert.include(events, "settle-push");
 

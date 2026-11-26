@@ -4,6 +4,7 @@ import {
   WORKFLOW_VM_DEFAULT_CODEX_MODEL,
   WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT,
   isTerminalWorkflowJob,
+  workflowCommitSubjectStartIssue,
   type RepositoryWorkflow,
   type WorkflowQueueReason,
 } from "@t3tools/contracts/workflows";
@@ -175,13 +176,14 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
               expectedLease,
             )).record;
           }
+          const status = job.vmStartRejection ? "failed" : "cancelled";
           return (yield* store.updateJob(
             row,
             {
               ...job,
-              status: "cancelled",
+              status,
               queueReason: null,
-              detail: "Cancelled before workflow execution.",
+              detail: job.vmStartRejection ?? "Cancelled before workflow execution.",
               updatedAt: DateTime.formatIso(yield* DateTime.now),
             },
             null,
@@ -196,6 +198,7 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
       return yield* sql.withTransaction(
         Effect.gen(function* () {
           const cancelled =
+            !job.vmStartRejection &&
             !checkoutFailed &&
             !createRejected &&
             job.status === "cancelling" &&
@@ -203,19 +206,21 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
               ((operation === "cancel" || operation === "retry_cancellation") &&
                 (yield* store.canSettleVmCancellation(row))));
           const status = cancelled ? "cancelled" : "failed";
-          const detail = checkoutFailed
-            ? "Repository checkout failed. Start a new run to try again."
-            : cancelled
-              ? createRejectedAfterCancel
-                ? "Cancelled before the workflow VM was created."
-                : "Cancelled after the workflow VM stopped."
-              : createRejected || createRejectedAfterCancel
-                ? "VM creation was rejected. Check the compute host configuration and start a new run."
-                : preparation.blocker === "workflow_template_stale"
-                  ? "The saved workflow VM build is no longer selected. Start a new run."
-                  : job.startAttempted === false
-                    ? "The workflow VM stopped before execution began. Start a new run to try again."
-                    : "The workflow VM was lost and its result could not be confirmed. Start a new run to try again.";
+          const detail =
+            job.vmStartRejection ??
+            (checkoutFailed
+              ? "Repository checkout failed. Start a new run to try again."
+              : cancelled
+                ? createRejectedAfterCancel
+                  ? "Cancelled before the workflow VM was created."
+                  : "Cancelled after the workflow VM stopped."
+                : createRejected || createRejectedAfterCancel
+                  ? "VM creation was rejected. Check the compute host configuration and start a new run."
+                  : preparation.blocker === "workflow_template_stale"
+                    ? "The saved workflow VM build is no longer selected. Start a new run."
+                    : job.startAttempted === false
+                      ? "The workflow VM stopped before execution began. Start a new run to try again."
+                      : "The workflow VM was lost and its result could not be confirmed. Start a new run to try again.");
           return (yield* store.updateJob(
             row,
             {
@@ -417,6 +422,14 @@ export const advanceWorkflowVmPreparation = Effect.fn("workflowVm.advancePrepara
     const definition = yield* store.get(job.workflowId);
     if (!definition || definition.archived || definition.definition.target.kind !== "vm")
       return job;
+    const subjectIssue = !automatic && workflowCommitSubjectStartIssue(definition.definition);
+    if (subjectIssue)
+      return (yield* store.rejectQueuedVmStart(
+        row,
+        definition.revision,
+        subjectIssue,
+        expectedLease,
+      )).record;
     const publishing = definition.definition.steps.some((step) => step.kind === "action");
     const modelIssue = vmWorkflowDefinitionIssue(
       definition.definition.target.baseBranch,

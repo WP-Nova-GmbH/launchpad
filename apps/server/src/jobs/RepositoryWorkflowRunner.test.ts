@@ -23,7 +23,11 @@ import {
   type OrchestrationReadModel,
   type OrchestrationEvent,
 } from "@t3tools/contracts";
-import { WorkflowControlResult, type RepositoryWorkflow } from "@t3tools/contracts/workflows";
+import {
+  WORKFLOW_VM_PUBLISHING_PROTOCOL,
+  WorkflowControlResult,
+  type RepositoryWorkflow,
+} from "@t3tools/contracts/workflows";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -131,6 +135,65 @@ it.effect("rejects a VM workflow before reserving or starting machine work", () 
       assert.lengthOf(yield* h.starts, 0);
     }),
   ),
+);
+
+it.effect.each([
+  {
+    template: "fix({{issueKey}}): update",
+    name: "Ship",
+    error: /needs a run triggered by a Linear issue/u,
+  },
+  { template: "fix: {{workflowName}}", name: "A".repeat(100), error: /exceeds 100 characters/u },
+])(
+  "rejects a VM Push with an unusable commit subject before Agent work",
+  ({ template, name, error }) =>
+    test(
+      Effect.gen(function* () {
+        const h = yield* harness;
+        const store = yield* Store.WorkflowRunStore;
+        const { fence, binding, start } = yield* prepareVmWorkflow(h);
+        yield* fence.activate(binding);
+        const runner = yield* h.newRunner.pipe(
+          Effect.provideService(
+            WorkflowActions,
+            WorkflowActions.of({
+              available: Effect.succeed(true),
+              vmAvailable: Effect.succeed(true),
+              recover: () => Effect.die("No action should start"),
+              execute: () => Effect.die("No action should start"),
+            }),
+          ),
+        );
+        assert(start.control.operation === "start");
+        const result = yield* runner.handle({
+          ...start,
+          control: {
+            ...start.control,
+            workflow: {
+              ...start.control.workflow,
+              definition: {
+                ...start.control.workflow.definition,
+                name,
+                steps: [
+                  ...workflow.definition.steps,
+                  {
+                    id: "push",
+                    kind: "action",
+                    title: "Push branch",
+                    action: "push",
+                    commitSubject: template,
+                  },
+                ],
+              },
+            },
+          },
+        });
+        assert.equal(result.outcome, "invalid_configuration");
+        assert.match(result.detail!, error);
+        assert.isNull(yield* store.get(start.jobId));
+        assert.lengthOf(yield* h.starts, 0);
+      }),
+    ),
 );
 
 it.effect("durably cancels before acceptance and refuses a delayed Start after restart", () =>
@@ -1659,6 +1722,10 @@ it.effect.each([true, false])(
         const { fence, binding, workflowVm, start } = yield* prepareVmWorkflow(h);
         assert.equal((yield* runner.handle(start)).outcome, "unavailable");
         yield* fence.activate(binding);
+        assert.include(yield* runner.handle({ ...control("status"), workflowVm }), {
+          outcome: "missing",
+          vmPublishingProtocol: WORKFLOW_VM_PUBLISHING_PROTOCOL,
+        });
         assert.equal((yield* runner.handle(start)).progress?.threadId, binding.threadId);
         assert.equal((yield* runner.handle(start)).outcome, "accepted");
         const prompts = yield* h.starts;

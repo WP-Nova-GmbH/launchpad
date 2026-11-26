@@ -315,6 +315,21 @@ export const make = Effect.gen(function* () {
     const row: WorkflowJobRecord = rows[0]!;
     return row;
   });
+  const releaseUnusedVmPreparation = Effect.fnUntraced(function* (row: WorkflowJobRecord) {
+    const sql = db.$client;
+    const [allocation] = yield* sql`UPDATE relay_thread_vm_allocations a
+      SET state='deleted',deleted_at=clock_timestamp()
+      FROM relay_thread_placements t
+      WHERE a.thread_id=t.thread_id AND t.workflow_job_id=${row.jobId}
+        AND t.organization_id=${row.organizationId} AND t.repository_id=${row.repositoryId}
+        AND a.allocation_id=${row.jobId} AND a.resource_kind='organization_workflow'
+        AND a.state='creating' AND a.compute_ref IS NULL AND t.environment_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_provisions p WHERE p.allocation_id=a.allocation_id)
+      RETURNING a.allocation_id`;
+    if (allocation)
+      yield* sql`UPDATE relay_thread_vm_capacity SET state='released'
+        WHERE operation_id=${row.jobId} AND allocation_id=${row.jobId} AND state='waiting'`;
+  });
   return {
     get,
     getJob,
@@ -801,6 +816,39 @@ export const make = Effect.gen(function* () {
       },
     ),
     canSettleVmCancellation,
+    rejectQueuedVmStart: Effect.fn("Workflows.rejectQueuedVmStart")(function* (
+      previous: WorkflowJobRecord,
+      workflowRevision: number,
+      detail: string,
+      expectedLease: string,
+    ) {
+      const job = previous.record;
+      if (
+        !job.vmAdmission ||
+        job.status !== "queued" ||
+        job.workflow !== null ||
+        job.runtime !== null ||
+        previous.pendingControl
+      )
+        return previous;
+      return yield* db.$client
+        .withTransaction(
+          Effect.gen(function* () {
+            const workflow = yield* lockSavedWorkflow(job.workflowId, previous.repositoryId);
+            if (!workflow || workflow.revision !== workflowRevision) return previous;
+            const failed = yield* updateJob(
+              previous,
+              { ...job, status: "failed", queueReason: null, detail, updatedAt: yield* now },
+              null,
+              false,
+              expectedLease,
+            );
+            yield* releaseUnusedVmPreparation(previous);
+            return failed;
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", (cause) => new WorkflowPersistenceError({ cause })));
+    }),
     settleQueuedVmCancellation: Effect.fn("Workflows.settleQueuedVmCancellation")(function* (
       previous: WorkflowJobRecord,
       expectedLease: string,
@@ -840,21 +888,7 @@ export const make = Effect.gen(function* () {
               false,
               expectedLease,
             );
-            if (authorized) {
-              const sql = db.$client;
-              const [allocation] = yield* sql`UPDATE relay_thread_vm_allocations a
-                SET state='deleted',deleted_at=clock_timestamp()
-                FROM relay_thread_placements t
-                WHERE a.thread_id=t.thread_id AND t.workflow_job_id=${previous.jobId}
-                  AND t.organization_id=${previous.organizationId} AND t.repository_id=${previous.repositoryId}
-                  AND a.allocation_id=${previous.jobId} AND a.resource_kind='organization_workflow'
-                  AND a.state='creating' AND a.compute_ref IS NULL AND t.environment_id IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM relay_thread_vm_provisions p WHERE p.allocation_id=a.allocation_id)
-                RETURNING a.allocation_id`;
-              if (allocation)
-                yield* sql`UPDATE relay_thread_vm_capacity SET state='released'
-                  WHERE operation_id=${previous.jobId} AND allocation_id=${previous.jobId} AND state='waiting'`;
-            }
+            if (authorized) yield* releaseUnusedVmPreparation(previous);
             return settled;
           }),
         )

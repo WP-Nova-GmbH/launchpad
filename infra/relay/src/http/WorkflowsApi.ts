@@ -14,6 +14,7 @@ import {
   RespondToWorkflowJob,
   isTerminalWorkflowJob,
   workflowApprovalCanRetry,
+  workflowCommitSubjectStartIssue,
   workflowIsFinishing,
   type RepositoryWorkflowJob,
   type RunRepositoryWorkflow,
@@ -678,6 +679,8 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
     return yield* workflowRunTargetChanged();
   let vm: NonNullable<Parameters<typeof store.createManualJob>[1]["vm"]> | undefined;
   if (workflow.definition.target.kind === "vm") {
+    const subjectIssue = workflowCommitSubjectStartIssue(workflow.definition);
+    if (subjectIssue) return yield* new WorkflowInvalidError({ message: subjectIssue });
     const { settings } = yield* ThreadVmRuntimeConfiguration;
     if (settings?.workflowExecutionEnabled !== true) return yield* vmWorkflowExecutionUnavailable();
     if (!vmJobId)

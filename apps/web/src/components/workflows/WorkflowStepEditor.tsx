@@ -20,7 +20,9 @@ import {
   XIcon,
 } from "lucide-react";
 import {
+  WORKFLOW_COMMIT_SUBJECT_LIMIT,
   WORKFLOW_MAX_STEPS,
+  workflowCommitSubjectError,
   workflowPublishingPrerequisites,
   type WorkflowStep,
   type WorkflowDefinition,
@@ -29,6 +31,7 @@ import {
 import { workflowModelState, workflowVmModelState } from "../settings/workflowModels";
 import { WorkflowAgentModelPicker } from "./WorkflowAgentModelPicker";
 import { Button } from "../ui/button";
+import { Input } from "../ui/input";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Textarea } from "../ui/textarea";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "../ui/select";
@@ -250,6 +253,10 @@ export function WorkflowStepEditor({
     change(definition.steps.map((entry) => (entry.id === update.id ? update : entry)));
   };
   const vm = definition.target.kind === "vm";
+  const commitSubjectError =
+    step?.kind === "action" && step.action === "push" && step.commitSubject
+      ? workflowCommitSubjectError(step.commitSubject)
+      : null;
   const promptError =
     step?.kind === "agent" && !step.instruction.trim()
       ? "Enter instructions for this Agent step."
@@ -484,6 +491,42 @@ export function WorkflowStepEditor({
                 ) : null}
               </div>
             )}
+            {vm && step.kind === "action" && step.action === "push" ? (
+              <div className="space-y-1 text-sm">
+                <label className="block" htmlFor={`${id}-commit-subject`}>
+                  Commit subject
+                </label>
+                <Input
+                  id={`${id}-commit-subject`}
+                  aria-describedby={`${id}-commit-subject-help`}
+                  aria-invalid={commitSubjectError ? true : undefined}
+                  data-workflow-field="commitSubject"
+                  ref={(node) => registerField("commitSubject", node)}
+                  maxLength={2 * WORKFLOW_COMMIT_SUBJECT_LIMIT}
+                  placeholder="chore: update {{workflowName}}"
+                  value={step.commitSubject ?? ""}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    patch({ ...step, commitSubject: value.trim() ? value : undefined });
+                  }}
+                />
+                <p
+                  id={`${id}-commit-subject-help`}
+                  className={
+                    commitSubjectError
+                      ? "text-xs text-destructive-foreground"
+                      : "text-xs text-muted-foreground"
+                  }
+                >
+                  {commitSubjectError ?? (
+                    <>
+                      Leave blank for the default. Use <code>{"{{workflowName}}"}</code> for the
+                      workflow name or <code>{"{{issueKey}}"}</code> for a Linear issue key.
+                    </>
+                  )}
+                </p>
+              </div>
+            ) : null}
             {step.kind === "review" ? (
               <WorkflowReviewReworkPicker
                 steps={definition.steps}

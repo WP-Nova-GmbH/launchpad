@@ -1,6 +1,7 @@
 import * as NodeCrypto from "node:crypto";
 import type { PgClient } from "@effect/sql-pg/PgClient";
 import {
+  WORKFLOW_VM_PUBLISHING_PROTOCOL,
   workflowPublishingPrerequisites,
   type RepositoryWorkflowJob,
   type WorkflowSavedResult,
@@ -248,10 +249,15 @@ function checkCommit(encoded: string, sha: string, parent: string, tree: string)
 
 export const handleWorkflowVmPublishing = Effect.fn("WorkflowVmPublishing.request")(
   function* (input: WorkflowVmPublishingRequest & { environmentId: string; threadId: string }) {
+    const { action, request } = input;
+    if (
+      ((request.kind === "credential" && request.access !== "read") || request.kind === "arm") &&
+      (input.vmPublishingProtocol ?? 0) < WORKFLOW_VM_PUBLISHING_PROTOCOL
+    )
+      return yield* unavailable();
     const sql = (yield* RelayDb).$client;
     const app = yield* GithubApp;
     const objects = yield* ThreadArtifactObjectStorage;
-    const { action, request } = input;
     const transaction = <A, E, R>(use: (record: WorkflowVmPublication) => Effect.Effect<A, E, R>) =>
       withWorkflowVmGuest(input, "active", ({ binding, snapshot }) =>
         Effect.gen(function* () {

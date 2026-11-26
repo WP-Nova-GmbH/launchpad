@@ -1,4 +1,5 @@
 import { CheckpointRef } from "@t3tools/contracts";
+import { prepareWorkflowCommitSubject } from "@t3tools/contracts/workflows";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -746,17 +747,115 @@ export const make = Effect.gen(function* () {
               });
             return { object, raw };
           });
-          const stagingTree = Effect.fnUntraced(function* (expectedTree: string) {
-            yield* checkoutGit(["add", "-A", "--", "."]);
-            if ((yield* checkoutGit(["write-tree"])) !== expectedTree)
-              return yield* new WorkflowActionError({
-                message: "The staged files do not match the saved result.",
+          const stageApprovedTree = Effect.fnUntraced(
+            function* (tree: string) {
+              const plumbingConfig = [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+              ];
+              const checkoutPlumbing = (args: readonly string[]) =>
+                checkoutGit([...plumbingConfig, ...args]);
+              // The same revision can have a different pack after repacking the protected repo.
+              const hasApprovedObjects = Effect.gen(function* () {
+                const probe = yield* git.execute({
+                  operation: "WorkflowActions.probeApprovedObjects",
+                  cwd,
+                  args: [
+                    "--no-replace-objects",
+                    ...plumbingConfig,
+                    "rev-list",
+                    "--objects",
+                    "--quiet",
+                    "--filter=blob:limit=0",
+                    "--missing=print",
+                    tree,
+                    "--",
+                  ],
+                  env: workflowGitEnvironment,
+                  allowNonZeroExit: true,
+                  maxOutputBytes: 4096,
+                });
+                // The blob-size filter reads headers. Git reports damage on stderr even on success.
+                if (probe.exitCode === 0 && (probe.stderr.trim() || probe.stderrTruncated))
+                  return yield* new WorkflowActionError({
+                    message:
+                      "The VM checkout has damaged Git objects. Restore the VM or start a new run.",
+                  });
+                return probe.exitCode === 0 && probe.stdout.length === 0 && !probe.stdoutTruncated;
               });
-          });
+              if (!(yield* hasApprovedObjects)) {
+                const transferDirectory = yield* fs.makeTempDirectoryScoped({
+                  prefix: "workflow-publishing-",
+                });
+                const bundle = `${transferDirectory}/approved.bundle`;
+                const transferRepository = `${transferDirectory}/transfer.git`;
+                yield* fs.makeDirectory(transferRepository, { mode: 0o700 });
+                const transferGit = workflowVmPublishingGit(
+                  processRunner,
+                  transferRepository,
+                  repository,
+                ).git;
+                // Keep the bundle ref in the temporary repo so its cleanup needs no VM workload.
+                yield* transferGit(["init", "--bare", "--template=", "--object-format=sha1"]);
+                yield* fs.writeFileString(
+                  `${transferRepository}/objects/info/alternates`,
+                  `${directory}/objects\n`,
+                  { mode: 0o600 },
+                );
+                const { stdout } = yield* transferGit(
+                  [
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    run.baseSha,
+                    "--no-gpg-sign",
+                    "-m",
+                    "Approved workflow result",
+                  ],
+                  {
+                    identity: {
+                      name: "Launchpad",
+                      email: "launchpad@users.noreply.github.com",
+                      // The same tree and base must produce the same transfer commit on retry.
+                      dates: ["@0 +0000", "@0 +0000"],
+                    },
+                  },
+                );
+                const transferRef = "refs/t3/workflow-publishing-transfer/approved";
+                yield* transferGit(["update-ref", "--no-deref", transferRef, stdout.trim()]);
+                yield* transferGit(["bundle", "create", bundle, transferRef, `^${run.baseSha}`]);
+                yield* fs.chmod(bundle, 0o644);
+                yield* fs.chmod(transferDirectory, 0o711);
+                yield* checkoutPlumbing(["bundle", "unbundle", bundle]).pipe(
+                  Effect.mapError(
+                    () =>
+                      new WorkflowActionError({
+                        message:
+                          "Git could not load the approved result into the VM checkout. Restore the VM or start a new run.",
+                      }),
+                  ),
+                );
+                if (!(yield* hasApprovedObjects))
+                  return yield* new WorkflowActionError({
+                    message:
+                      "The VM checkout is missing Git objects required by the approved result.",
+                  });
+              }
+              // Read-tree replaces only the index, leaving the checkout's files untouched.
+              yield* checkoutPlumbing(["read-tree", tree]);
+              if ((yield* checkoutPlumbing(["write-tree"])) !== tree)
+                return yield* new WorkflowActionError({
+                  message: "The VM could not stage the exact saved result.",
+                });
+            },
+            Effect.scoped,
+            Effect.mapError(error),
+          );
           const hookHeadMatches = Effect.fnUntraced(function* (
             push: WorkflowActionRecord,
             head: string,
-            requireMessage = true,
           ) {
             return (
               (yield* readCommitField(head, "%P")) === push.parent &&
@@ -768,8 +867,7 @@ export const make = Effect.gen(function* () {
                 "--format=%an%x00%ae%x00%cn%x00%ce",
                 head,
               ])) === expectedIdentity &&
-              (!requireMessage ||
-                (yield* readCommitField(head, "%B")) === push.commitMessage?.trim())
+              (yield* readCommitField(head, "%B")) === push.commitMessage?.trim()
             );
           });
           const catchUp = Effect.fnUntraced(function* (
@@ -788,9 +886,7 @@ export const make = Effect.gen(function* () {
                 message: "The VM branch no longer matches this saved result.",
               });
             if (localHead !== sha) {
-              // Stage the verified checkout again so its Git object store has the saved tree.
-              // No worktree files are overwritten. The exact branch ref update is compare-and-swap.
-              yield* stagingTree(push.tree);
+              yield* stageApprovedTree(push.tree);
               const stored = yield* checkoutGit(
                 ["hash-object", "-w", "-t", "commit", "--stdin", "--"],
                 { stdin: raw },
@@ -799,7 +895,6 @@ export const make = Effect.gen(function* () {
                 return yield* new WorkflowActionError({
                   message: "The restored publishing commit differs from GitHub.",
                 });
-              yield* checkoutGit(["-c", "core.hooksPath=/dev/null", "read-tree", sha]);
               yield* checkoutGit([
                 "-c",
                 "core.hooksPath=/dev/null",
@@ -818,6 +913,11 @@ export const make = Effect.gen(function* () {
           const remoteHead = () =>
             protectedGit.remoteHead(readToken.token, ref).pipe(Effect.mapError(error));
           if (action.operation === "push") {
+            const oldCommitMessage = () =>
+              new WorkflowActionError({
+                message:
+                  "This commit was prepared by an older runner. Cancel this job and start a new run to publish a freshly reviewed result.",
+              });
             const head = verifiedHead;
             const { oldRemoteSha, checkpointTurnId, checkpointRef, tree } = action;
             const parent = oldRemoteSha ?? run.baseSha;
@@ -855,21 +955,43 @@ export const make = Effect.gen(function* () {
                   return yield* new WorkflowActionError({ message: "No changes to publish." });
                 sha = parent;
               } else {
-                if (!action.commitMessage) {
-                  if (head !== action.parent)
+                if (head !== action.parent) {
+                  if (!action.commitMessage)
                     return yield* new WorkflowActionError({
                       message: "The prepared job branch changed.",
                     });
-                  const suggestion = yield* (
-                    manager.prepareWorkflowCommit?.({ cwd, threadId: run.progress.threadId }) ??
-                    Effect.succeed(null)
-                  ).pipe(Effect.orElseSucceed(() => null));
-                  const message = suggestion
-                    ? [suggestion.subject, suggestion.body].filter(Boolean).join("\n\n")
-                    : `Update ${run.workflow.definition.name.replace(/\s+/gu, " ").trim().slice(0, 120)}`;
+                  if (action.commitMessageSource !== "verified_result")
+                    return yield* oldCommitMessage();
+                }
+                if (head === action.parent) {
+                  // A failed staging attempt can leave a message from an older runner.
+                  const definition = run.workflow.definition;
+                  const stepId = action.stepId;
+                  const step = definition.steps.find((entry) => entry.id === stepId);
+                  const prepared = prepareWorkflowCommitSubject(
+                    step?.kind === "action" && step.action === "push"
+                      ? step.commitSubject
+                      : undefined,
+                    definition.name,
+                    run.issueKey,
+                  );
+                  if (prepared.error !== undefined)
+                    return yield* new WorkflowActionError({ message: prepared.error });
+                  const summary = yield* protectedText([
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--stat=80,60,20",
+                    parent,
+                    tree,
+                    "--",
+                  ]).pipe(Effect.orElseSucceed(() => ""));
+                  const message = summary ? `${prepared.subject}\n\n${summary}` : prepared.subject;
                   run = yield* edit(io, id, (entry) => ({
                     ...entry,
                     commitMessage: message,
+                    commitMessageSource: "verified_result",
                     phase: "commit",
                   }));
                   action = get(run, id)!;
@@ -882,7 +1004,7 @@ export const make = Effect.gen(function* () {
                   });
                 const ranHooks = checkedHead === action.parent;
                 if (ranHooks) {
-                  yield* stagingTree(action.tree);
+                  yield* stageApprovedTree(action.tree);
                   yield* checkoutGit(
                     [
                       "-c",
@@ -904,16 +1026,11 @@ export const make = Effect.gen(function* () {
                   );
                   checkedHead = yield* verify();
                 }
-                if (!(yield* hookHeadMatches(action, checkedHead, !ranHooks)))
+                if (!(yield* hookHeadMatches(action, checkedHead)))
                   return yield* new WorkflowActionError({
                     message:
-                      "Commit hooks changed the saved result, commit parent or bot identity.",
+                      "Commit hooks changed the saved result, commit message, commit parent or bot identity.",
                   });
-                const message = yield* readCommitField(checkedHead, "%B");
-                if (message !== action.commitMessage) {
-                  run = yield* edit(io, id, (entry) => ({ ...entry, commitMessage: message }));
-                  action = get(run, id)!;
-                }
                 // Local Agent commits can contain intermediate contents that were never saved for review.
                 // Publish the reviewed tree as one runner commit on the pinned publishing history.
                 const [authorDate, committerDate] = (yield* checkoutGit([
@@ -929,7 +1046,7 @@ export const make = Effect.gen(function* () {
                   });
                 const commit = yield* protectedGit
                   .git(["commit-tree", action.tree, "-p", parent, "--no-gpg-sign", "-F", "-"], {
-                    stdin: message + "\n",
+                    stdin: action.commitMessage! + "\n",
                     identity: {
                       ...readToken.bot,
                       dates: [authorDate, committerDate],
@@ -945,15 +1062,22 @@ export const make = Effect.gen(function* () {
               return yield* new WorkflowActionError({
                 message: "The publishing commit is unavailable.",
               });
-            const sourcePush = previousResultPush ?? action;
-            const { object, raw } = yield* approvedObject(sourcePush, sha);
-            yield* vm.retain(id, { sha, object });
-            const observed = yield* remoteHead();
-            if (observed !== sha) {
-              if (observed !== action.oldRemoteSha || sha === parent)
+            const checkRemote = Effect.fnUntraced(function* () {
+              const observed = yield* remoteHead();
+              if (observed !== sha && (observed !== oldRemoteSha || sha === parent))
                 return yield* new WorkflowActionError({
                   message: "The remote job branch changed; no update was attempted.",
                 });
+              return observed;
+            });
+            const legacyHead =
+              action.commitMessageSource === "verified_result" ? undefined : yield* checkRemote();
+            if (legacyHead !== undefined && legacyHead !== sha) return yield* oldCommitMessage();
+            const sourcePush = previousResultPush ?? action;
+            const { object, raw } = yield* approvedObject(sourcePush, sha);
+            yield* vm.retain(id, { sha, object });
+            const observed = legacyHead === undefined ? yield* checkRemote() : legacyHead;
+            if (observed !== sha) {
               if (
                 yield* workflowPushNeedsLfsUpload(protectedGit, {
                   cwd: directory,

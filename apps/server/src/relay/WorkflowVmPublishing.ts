@@ -1,7 +1,8 @@
-import type {
-  WorkflowVmDispatchBinding,
-  WorkflowVmPublishingRequest,
-  WorkflowVmPublishingResponse,
+import {
+  WORKFLOW_VM_PUBLISHING_PROTOCOL,
+  type WorkflowVmDispatchBinding,
+  type WorkflowVmPublishingRequest,
+  type WorkflowVmPublishingResponse,
 } from "@t3tools/contracts/workflows";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import * as Context from "effect/Context";
@@ -69,7 +70,13 @@ export class WorkflowVmPublisher extends Context.Reference<CallPublishing>(
         return yield* client.threadEnvironment
           .workflowVmPublishing({
             params: { environmentId: binding.environmentId, threadId: binding.threadId },
-            payload: { jobId: binding.jobId, generation: binding.generation, action, request },
+            payload: {
+              jobId: binding.jobId,
+              generation: binding.generation,
+              vmPublishingProtocol: WORKFLOW_VM_PUBLISHING_PROTOCOL,
+              action,
+              request,
+            },
           })
           .pipe(
             Effect.flatMap((reply) =>

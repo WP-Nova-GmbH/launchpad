@@ -13,6 +13,48 @@ export const WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT = 500;
 export const WORKFLOW_MAX_STEPS = 32;
 export const WORKFLOW_VM_DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
 export const WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT = "high";
+export const WORKFLOW_COMMIT_SUBJECT_LIMIT = 100;
+
+export function workflowCommitSubjectError(template: string): string | null {
+  if (Array.from(template.trim()).length > WORKFLOW_COMMIT_SUBJECT_LIMIT)
+    return "Keep the commit subject within 100 characters.";
+  if (/\p{Cc}|\u2028|\u2029/u.test(template)) return "Enter a single-line commit subject.";
+  const literals = template.replaceAll(/\{\{(?:workflowName|issueKey)\}\}/gu, "");
+  if (/\{\{|\}\}/u.test(literals)) return "Use {{workflowName}} or {{issueKey}} for placeholders.";
+  return null;
+}
+
+export function resolveWorkflowCommitSubject(
+  template: string | undefined,
+  workflowName: string,
+  issueKey: string | undefined,
+): string | null {
+  const name = workflowName.replace(/[\s\p{Cc}]+/gu, " ").trim() || "workflow result";
+  if (!template) return `chore: update ${Array.from(name).slice(0, 85).join("")}`;
+  if (template.includes("{{issueKey}}") && !/^[A-Za-z0-9][A-Za-z0-9_-]*-\d+$/u.test(issueKey ?? ""))
+    return null;
+  const subject = template.replaceAll(/\{\{(workflowName|issueKey)\}\}/gu, (_, key: string) =>
+    key === "workflowName" ? name : (issueKey ?? ""),
+  );
+  return subject.trim();
+}
+
+export function prepareWorkflowCommitSubject(
+  template: string | undefined,
+  workflowName: string,
+  issueKey: string | undefined,
+) {
+  const subject = resolveWorkflowCommitSubject(template, workflowName, issueKey);
+  if (subject === null)
+    return {
+      error: "This Push step uses {{issueKey}}. It needs a run triggered by a Linear issue.",
+    };
+  if (Array.from(subject).length > WORKFLOW_COMMIT_SUBJECT_LIMIT)
+    return {
+      error: `The commit subject exceeds ${WORKFLOW_COMMIT_SUBJECT_LIMIT} characters after substitution. Shorten the Push step's commit subject and start a new run.`,
+    };
+  return { subject };
+}
 
 export const WorkflowAgentStep = Schema.Struct({
   id: Label,
@@ -41,7 +83,12 @@ export const WorkflowActionStep = Schema.Struct({
   kind: Schema.Literal("action"),
   title: Label,
   action: Schema.Literals(["push", "open_pull_request"]),
-});
+  commitSubject: Schema.optional(
+    TrimmedNonEmptyString.check(
+      Schema.makeFilter((subject) => workflowCommitSubjectError(subject) ?? true),
+    ),
+  ),
+}).check(Schema.makeFilter((step) => step.action === "push" || step.commitSubject === undefined));
 export const WorkflowStep = Schema.Union([
   WorkflowActionStep,
   WorkflowAgentStep,
@@ -116,6 +163,8 @@ export const WorkflowVmDispatchBinding = Schema.Struct({
 });
 export type WorkflowVmDispatchBinding = typeof WorkflowVmDispatchBinding.Type;
 export const WORKFLOW_PROTOCOL = 9;
+export const WORKFLOW_VM_PUBLISHING_PROTOCOL = 2;
+const WorkflowVmPublishingProtocol = Schema.Int.check(Schema.isGreaterThan(0));
 
 const WorkflowGitObjectId = Schema.String.check(Schema.isPattern(/^[0-9a-f]{40}$/u));
 const WorkflowPublicationId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
@@ -162,6 +211,7 @@ export type WorkflowVmPublishingRestore = typeof WorkflowVmPublishingRestore.Typ
 export const WorkflowVmPublishingRequest = Schema.Struct({
   generation: WorkflowVmDispatchBinding.fields.generation,
   jobId: WorkflowPublicationId,
+  vmPublishingProtocol: Schema.optional(WorkflowVmPublishingProtocol),
   action: WorkflowVmPublishingAction,
   request: Schema.Union([
     Schema.Struct({
@@ -354,8 +404,28 @@ export const WorkflowDefinition = Schema.Struct({
     Schema.isMinLength(1),
     Schema.isMaxLength(WORKFLOW_MAX_STEPS),
   ),
-}).check(Schema.makeFilter((definition) => workflowDefinitionError(definition.steps) ?? true));
+}).check(
+  Schema.makeFilter((definition) => {
+    if (
+      definition.target.kind === "machine" &&
+      definition.steps.some((step) => step.kind === "action" && step.commitSubject !== undefined)
+    )
+      return "Only VM Push steps support a custom commit subject.";
+    return workflowDefinitionError(definition.steps) ?? true;
+  }),
+);
 export type WorkflowDefinition = typeof WorkflowDefinition.Type;
+
+export function workflowCommitSubjectStartIssue(definition: WorkflowDefinition, issueKey?: string) {
+  if (definition.target.kind !== "vm") return undefined;
+  for (const step of definition.steps) {
+    if (step.kind !== "action" || step.action !== "push" || step.commitSubject === undefined)
+      continue;
+    const { error } = prepareWorkflowCommitSubject(step.commitSubject, definition.name, issueKey);
+    if (error !== undefined) return error;
+  }
+  return undefined;
+}
 
 const TriggerId = TrimmedNonEmptyString.check(Schema.isMaxLength(191));
 const TriggerBase = {
@@ -605,6 +675,7 @@ export const RepositoryWorkflowJob = Schema.Struct({
   /** Marked before sending: absent on legacy offers means delivery may already have happened. */
   startAttempted: Schema.optional(Schema.Boolean),
   vmCancellationConfirmed: Schema.optional(Schema.Boolean),
+  vmStartRejection: Schema.optionalKey(TrimmedNonEmptyString),
   offerAuthority: Schema.optional(
     Schema.Struct({ authorizationEpoch: Revision, grantGeneration: Revision }),
   ),
@@ -761,6 +832,7 @@ export const WorkflowControl = Schema.Union([
     operation: Schema.Literal("start"),
     workflow: RepositoryWorkflow,
     runtime: WorkflowRuntime,
+    issueKey: Schema.optional(WorkflowIssueSnapshot.fields.identifier),
   }),
   Schema.Struct({
     ...ControlBinding,
@@ -796,7 +868,16 @@ export type WorkflowControl = typeof WorkflowControl.Type;
 export const WorkflowControlResult = Schema.Struct({
   actions: Schema.optional(Schema.Array(Schema.Literals(["push", "open_pull_request"]))),
   protocol: Schema.Literals([1, 2, 3, 4, 5, 6, 7, 8, 9]),
-  outcome: Schema.Literals(["accepted", "cancelled", "missing", "busy", "unavailable", "conflict"]),
+  vmPublishingProtocol: Schema.optional(WorkflowVmPublishingProtocol),
+  outcome: Schema.Literals([
+    "accepted",
+    "cancelled",
+    "missing",
+    "busy",
+    "unavailable",
+    "conflict",
+    "invalid_configuration",
+  ]),
   detail: Schema.NullOr(Schema.String),
   progress: Schema.NullOr(WorkflowJobProgress),
 });

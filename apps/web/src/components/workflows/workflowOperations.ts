@@ -69,7 +69,20 @@ export function normalizeWorkflowDefinitionForSave(
   definition: WorkflowDefinition,
 ): WorkflowDefinition {
   const target = definition.target;
-  if (target.kind !== "vm") return definition;
+  if (target.kind === "machine") {
+    if (
+      !definition.steps.some((step) => step.kind === "action" && step.commitSubject !== undefined)
+    )
+      return definition;
+    return {
+      ...definition,
+      steps: definition.steps.map((step) => {
+        if (step.kind !== "action" || step.commitSubject === undefined) return step;
+        const { commitSubject: _vmOnly, ...machineStep } = step;
+        return machineStep;
+      }),
+    };
+  }
   const baseBranch = target.baseBranch?.trim() ?? null;
   return baseBranch === target.baseBranch
     ? definition

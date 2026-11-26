@@ -245,6 +245,41 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
     ),
   );
 
+  it.live(
+    "rejects a missing issue key in a manual VM commit subject before admitting the run",
+    () =>
+      testAdmission(
+        Effect.gen(function* () {
+          yield* saveRepositoryWorkflow("repo", {
+            workflowId: request.workflowId,
+            expectedRevision: 1,
+            definition: {
+              ...definition,
+              target: { kind: "vm", baseBranch: null },
+              steps: [
+                ...definition.steps,
+                {
+                  id: "push",
+                  kind: "action",
+                  title: "Push branch",
+                  action: "push",
+                  commitSubject: "fix({{issueKey}}): update",
+                },
+              ],
+            },
+            archived: false,
+          }).pipe(withPrincipal("maintainer"));
+
+          const rejected = yield* runRepositoryWorkflow("repo", request).pipe(Effect.flip);
+          expect(rejected).toMatchObject({
+            _tag: "WorkflowInvalidError",
+            message: expect.stringContaining("needs a run triggered by a Linear issue"),
+          });
+          expect(yield* (yield* Workflows).listJobs("repo")).toHaveLength(0);
+        }),
+      ),
+  );
+
   it.live("returns the accepted receipt when a concurrent preflight fails", () =>
     testAdmission(
       Effect.gen(function* () {

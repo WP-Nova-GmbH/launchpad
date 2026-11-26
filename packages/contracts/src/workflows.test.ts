@@ -4,10 +4,12 @@ import { EnvironmentId, ProjectId } from "./baseSchemas.ts";
 import {
   WorkflowDefinition,
   WorkflowCatalog,
+  WorkflowControl,
   WorkflowInvalidError,
   WorkflowJobPageQuery,
   WorkflowRuntime,
   RespondToWorkflowJob,
+  resolveWorkflowCommitSubject,
   workflowZones,
   type WorkflowStep,
 } from "./workflows.ts";
@@ -40,6 +42,49 @@ const definition = (steps: ReadonlyArray<WorkflowStep>) => ({
   steps,
 });
 describe("workflow boundaries", () => {
+  it("validates Push commit subjects and expands frozen run metadata", () => {
+    const push = { id: "push", kind: "action", title: "Push branch", action: "push" } as const;
+    const template = "fix({{issueKey}}): update {{workflowName}}";
+    const vmDefinition = (commitSubject: string) => ({
+      ...definition([agent, { ...push, commitSubject }]),
+      target: { kind: "vm" as const, baseBranch: null },
+    });
+    expect(isDefinition(vmDefinition(template))).toBe(true);
+    expect(isDefinition(vmDefinition("🧪".repeat(100)))).toBe(true);
+    expect(isDefinition(definition([agent, { ...push, commitSubject: template }]))).toBe(false);
+    for (const invalid of ["fix({{issue}}): update", "first line\nsecond line", "a".repeat(101)])
+      expect(isDefinition(vmDefinition(invalid))).toBe(false);
+    expect(resolveWorkflowCommitSubject(undefined, "Ship", undefined)).toBe("chore: update Ship");
+    expect(resolveWorkflowCommitSubject(template, "Ship", "WP-331")).toBe(
+      "fix(WP-331): update Ship",
+    );
+    expect(resolveWorkflowCommitSubject(template, "Ship", undefined)).toBeNull();
+    expect(
+      resolveWorkflowCommitSubject("{{workflowName}} {{issueKey}}", "a".repeat(100), "WP-331"),
+    ).toBe(`${"a".repeat(100)} WP-331`);
+    const decodeControl = Schema.decodeUnknownSync(WorkflowControl);
+    expect(
+      decodeControl({
+        organizationId: "org",
+        repositoryId: "repo",
+        projectId: "project",
+        operation: "start",
+        workflow: {
+          workflowId: "ship",
+          organizationId: "org",
+          repositoryId: "repo",
+          revision: 1,
+          definition: vmDefinition(template),
+          archived: false,
+          createdAt: "now",
+          updatedAt: "now",
+        },
+        runtime: { kind: "vm", threadId: "thread" },
+        issueKey: "WP-331",
+      }),
+    ).toMatchObject({ issueKey: "WP-331", workflow: { definition: vmDefinition(template) } });
+  });
+
   it("round-trips VM start failures and accepts errors from older relays", () => {
     const decode = Schema.decodeUnknownSync(WorkflowInvalidError);
     const encode = Schema.encodeSync(WorkflowInvalidError);

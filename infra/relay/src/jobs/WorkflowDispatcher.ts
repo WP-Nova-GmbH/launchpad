@@ -2,6 +2,7 @@ import { WorkflowOrigin } from "@t3tools/contracts";
 import { RelayJobId } from "@t3tools/contracts/relay";
 import {
   WORKFLOW_PROTOCOL,
+  WORKFLOW_VM_PUBLISHING_PROTOCOL,
   WorkflowInvalidError,
   WorkflowManualControl,
   WorkflowResultSaving,
@@ -72,6 +73,12 @@ const sameManualControl = Schema.toEquivalence(WorkflowManualControl);
 const sameResultSaving = Schema.toEquivalence(Schema.UndefinedOr(WorkflowResultSaving));
 const isWorkflowInvalidError = Schema.is(WorkflowInvalidError);
 const isWorkflowQueued = Schema.is(WorkflowQueued);
+
+const publishingRunnerUpdate = "Update the workflow VM runner before publishing.";
+
+function supportsVmPublishing(result: WorkflowControlResult) {
+  return (result.vmPublishingProtocol ?? 0) >= WORKFLOW_VM_PUBLISHING_PROTOCOL;
+}
 
 function isMachinePreflightUnavailable(error: EnvironmentConnectorError) {
   if (error._tag === "EnvironmentMintRequestTimedOut") return true;
@@ -186,6 +193,25 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     const preparation = job.vmAdmission
       ? yield* Effect.serviceOption(WorkflowVmPreparation)
       : Option.none();
+    const rejectVmStart = Effect.fnUntraced(function* (detail: string) {
+      row = yield* update(
+        row!,
+        {
+          ...job,
+          status: "cancelling",
+          startAttempted: false,
+          vmCancellationConfirmed: true,
+          vmStartRejection: detail,
+          queueReason: null,
+          detail,
+          updatedAt: now,
+        },
+        null,
+      );
+      return Option.isSome(preparation)
+        ? yield* preparation.value.advance(row, leaseUntil)
+        : row.record;
+    });
     const vmRuntime = job.runtime?.kind === "vm" ? job.runtime : null;
     if (job.vmAdmission && vmRuntime === null) {
       if (row!.pendingControl?.response.operation === "cancel")
@@ -456,7 +482,13 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           repositoryCanonicalKey: canonicalKey,
           baseBranch: vm?.snapshot.branch ?? "HEAD",
           instruction: job.instruction,
-          workflowControl,
+          workflowControl:
+            vm &&
+            origin.kind === "automation" &&
+            workflowControl.operation === "start" &&
+            job.issueSnapshot
+              ? { ...workflowControl, issueKey: job.issueSnapshot.identifier }
+              : workflowControl,
           ...(vm ? { workflowVmBinding: vm.binding } : {}),
         })
         .pipe(
@@ -570,6 +602,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       row = yield* update(row!, { ...job, requiredProtocol: 6 }, row!.pendingControl, false);
       job = row.record;
     }
+    let knownRetryOutcome: WorkflowControlResult | undefined;
     if (
       control.operation === "approve" ||
       control.operation === "input" ||
@@ -584,6 +617,17 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         return yield* new WorkflowInvalidError({
           message: "Update this environment before responding to this workflow.",
         });
+      if (
+        vm &&
+        control.operation === "retry_action" &&
+        !supportsVmPublishing(capability.workflowResult)
+      ) {
+        if (!capability.workflowResult.progress)
+          return yield* new WorkflowInvalidError({ message: publishingRunnerUpdate });
+        knownRetryOutcome = capability.workflowResult;
+        // An older runner can still confirm a publication that was already sent.
+        reconcilingCheckpoint = !!row!.pendingControl?.checkpointDispatch;
+      }
       if (vm && row!.pendingControl) {
         const current = yield* store.getJob(jobId);
         if (!current || current.revision !== row!.revision || current.leaseUntil !== leaseUntil)
@@ -622,6 +666,7 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
       }
       if (
         vm &&
+        !knownRetryOutcome &&
         Option.isSome(db) &&
         row!.pendingControl?.responseId &&
         (isWorkflowCheckpointResponse(control) || control.operation === "retry_action")
@@ -670,19 +715,30 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
     }
     const mayRetireOffer = !vm && job.startAttempted === false;
     const firstVmStart = vm !== null && automaticVm && job.startAttempted === false;
+    const vmPublishing =
+      vm !== null && workflow.definition.steps.some((step) => step.kind === "action");
     let knownStart: WorkflowControlResult | undefined;
-    if (origin.kind === "automation" && control.operation === "start") {
-      const capability = yield* dispatch({ ...binding, operation: "status" });
+    if ((origin.kind === "automation" || vmPublishing) && control.operation === "start") {
+      const { workflowResult: capability } = yield* dispatch({ ...binding, operation: "status" });
+      const publishingError =
+        vmPublishing && capability && !supportsVmPublishing(capability)
+          ? publishingRunnerUpdate
+          : workflow.definition.steps.some(
+                (step) => step.kind === "action" && !capability?.actions?.includes(step.action),
+              )
+            ? "This environment does not support the workflow's publishing steps."
+            : null;
       if (
-        !capability.workflowResult ||
-        capability.workflowResult.protocol < (job.requiredProtocol ?? 8)
-      ) {
+        vmPublishing &&
+        job.startAttempted === false &&
+        capability?.outcome === "missing" &&
+        capability.progress === null &&
+        publishingError
+      )
+        return yield* rejectVmStart(publishingError);
+      if (!capability || capability.protocol < (job.requiredProtocol ?? 8)) {
         // A confirmed missing result relinquishes an unaccepted offer; unknown delivery stays pinned.
-        if (
-          mayRetireOffer &&
-          capability.workflowResult?.outcome === "missing" &&
-          capability.workflowResult.progress === null
-        )
+        if (mayRetireOffer && capability?.outcome === "missing" && capability.progress === null)
           return (yield* update(
             { ...row!, repositoryCanonicalKey: null },
             {
@@ -696,27 +752,18 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
             false,
           )).record;
         return yield* new WorkflowInvalidError({
-          message: "Update this environment to reconcile this automatic workflow.",
+          message: vmPublishing
+            ? publishingRunnerUpdate
+            : "Update this environment to reconcile this automatic workflow.",
         });
       }
-      if (
-        vm &&
-        !firstVmStart &&
-        (capability.workflowResult.progress || capability.workflowResult.outcome === "cancelled")
-      )
-        knownStart = capability.workflowResult;
+      if (vm && !firstVmStart && (capability.progress || capability.outcome === "cancelled"))
+        knownStart = capability;
       if (automaticVm && !firstVmStart && !vmExecutionEnabled && !knownStart) return job;
-      const supported = capability.workflowResult.actions ?? [];
-      if (
-        workflow.definition.steps.some(
-          (step) => step.kind === "action" && !supported.includes(step.action),
-        )
-      )
-        return yield* new WorkflowInvalidError({
-          message: "This environment does not support the workflow's publishing steps.",
-        });
+      if (!knownStart && publishingError)
+        return yield* new WorkflowInvalidError({ message: publishingError });
       // Persist before sending: a crash or timeout leaves every later delivery frozen.
-      if (mayRetireOffer || firstVmStart) {
+      if (origin.kind === "automation" && (mayRetireOffer || firstVmStart)) {
         const automatic = yield* Effect.serviceOption(AutomaticOffers);
         if (automatic._tag === "None")
           return yield* new WorkflowQueued({ code: "source_unavailable", retryAt: null });
@@ -726,11 +773,11 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         job = row.record;
       }
     }
-    if (control.operation === "start" && origin.kind === "manual") {
+    if (control.operation === "start" && origin.kind === "manual" && !knownStart) {
       row = yield* update(row!, { ...job, startAttempted: true }, row!.pendingControl, false);
       job = row.record;
     }
-    const outcome = knownStart ?? (yield* dispatch(control)).workflowResult;
+    const outcome = knownStart ?? knownRetryOutcome ?? (yield* dispatch(control)).workflowResult;
     if (!outcome)
       return yield* new WorkflowInvalidError({
         message: "This environment did not answer with the workflow protocol.",
@@ -754,6 +801,18 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
           outcome.progress.checkpoint?.checkpointId === job.progress?.checkpoint?.checkpointId);
       let progress = outcome.progress;
       let detail = outcome.detail ?? progress.detail;
+      if (
+        vm &&
+        !supportsVmPublishing(outcome) &&
+        progress.status === "paused" &&
+        progress.actions?.some(
+          (action) =>
+            action.stepId === progress.stepId &&
+            action.generation === progress.generation &&
+            action.state !== "completed",
+        )
+      )
+        detail = publishingRunnerUpdate;
       let publicationOutcome = job.publicationOutcome;
       const activeStep = job.workflow?.definition.steps.find(
         (step) => step.id === job.progress?.stepId,
@@ -829,6 +888,10 @@ export const refreshWorkflowJob = Effect.fn("WorkflowDispatcher.refresh")(functi
         );
       return row.record;
     }
+    if (vm && control.operation === "start" && outcome.outcome === "invalid_configuration")
+      return yield* rejectVmStart(
+        outcome.detail?.trim() || "The workflow configuration is invalid.",
+      );
     if (outcome.protocol >= 2 && outcome.outcome === "cancelled") {
       if (vm && Option.isSome(preparation)) {
         row = yield* update(row!, {
