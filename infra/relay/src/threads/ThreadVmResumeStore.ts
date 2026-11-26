@@ -395,7 +395,7 @@ export function makeThreadVmResumeStore(sql: PgClient) {
         ) {
           const [awaitingGuest] = yield* sql`SELECT 1 FROM relay_thread_vm_pauses
             WHERE allocation_id=${allocation.allocationId} AND generation=${placement.generation}
-              AND phase='cancelled' AND source_reopened_at IS NULL
+              AND phase IN ('cancelled','completed') AND source_reopened_at IS NULL
               AND workflow_checkpoint->>'jobId'=${job.jobId}
               AND workflow_checkpoint ? 'finishedWorkspaceRevision'`;
           if (!awaitingGuest) {

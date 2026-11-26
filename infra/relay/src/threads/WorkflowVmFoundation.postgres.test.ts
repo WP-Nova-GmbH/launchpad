@@ -3863,14 +3863,18 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
             for (const workId of workIds)
               yield* admitPortableThreadWork({ ...f.owner, workId }).pipe(asVm);
 
-            const connectionId = NodeCrypto.randomUUID();
             yield* f.capacity.configure(f.hostId, 1);
             yield* sql`INSERT INTO relay_organizations VALUES (${f.organizationId},'Organization','2026','2026')`;
             yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
               VALUES(${f.organizationId},${f.ownerUserId},'admin','2026','2026')`;
-            yield* sql`INSERT INTO relay_codex_vm_connections
+            const [connection] = yield* sql<{
+              connectionId: string;
+            }>`INSERT INTO relay_codex_vm_connections
           (organization_id,connection_id,issuer,subject,client_id,status,payload_sealed,expires_at,updated_at)
-          VALUES (${f.organizationId},${connectionId},'issuer','subject','client','connected','sealed','2099-01-01','2026')`;
+          SELECT organization_id,record#>>'{vmAdmission,codexConnectionId}','issuer','subject','client',
+            'connected','sealed','2099-01-01','2026' FROM relay_workflow_jobs WHERE job_id=${f.workflowJobId}
+          RETURNING connection_id AS "connectionId"`;
+            const connectionId = connection!.connectionId;
             yield* sql`UPDATE relay_workflow_jobs SET status='queued',record=record ||
           ${sql.json({ status: "queued", queueReason: { code: "vm_waiting_capacity" }, vmAdmission: { codexConnectionId: connectionId } })}
           WHERE job_id=${next.workflowJobId}`;
@@ -4052,6 +4056,33 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
               yield* sql`SELECT j.status,s.result FROM relay_workflow_jobs j JOIN relay_workflow_saved_results s USING(job_id)
           WHERE j.job_id=${f.workflowJobId}`,
             ).toEqual([{ status: "cancelled", result: { patch: "saved" } }]);
+            if (pauseReply === "acknowledged") {
+              const lease = makeThreadVmLeaseWorker(
+                sql,
+                () => Effect.die("Inspecting a paused VM must not renew its lease"),
+                f.hostId,
+                { inspect: () => Effect.succeed(sandbox) },
+              );
+              expect(yield* lease.runOne("paused")).toBe(true);
+              expect(
+                yield* sql`SELECT native_paused_generation AS generation
+                  FROM relay_thread_vm_allocations WHERE allocation_id=${f.allocationId}`,
+              ).toEqual([{ generation: f.owner.generation }]);
+
+              const receipt = sql`SELECT * FROM relay_thread_vm_pauses WHERE allocation_id=${f.allocationId}`;
+              const [completed] = yield* receipt;
+              expect(completed).toMatchObject({
+                operation_id: request.operationId,
+                phase: "completed",
+                source_reopened_at: null,
+              });
+              expect(yield* finishedFollowUp(f, objects).open).toMatchObject({
+                state: "waiting_capacity",
+              });
+              const resume = yield* makeThreadVmResumeStore(sql).get(f.allocationId);
+              expect(resume?.phase).toBe("waiting");
+              expect(yield* receipt).toEqual([completed]);
+            }
           }).pipe(Effect.provide(Layer.merge(workflows, NodeFileSystem.layer))),
       );
 
