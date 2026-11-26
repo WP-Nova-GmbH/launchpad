@@ -300,13 +300,6 @@ export function WorkflowStepEditor({
                       : "Review"}
               </p>
             </div>
-            <span
-              className="shrink-0 whitespace-nowrap text-muted-foreground text-xs tabular-nums"
-              aria-live="polite"
-              aria-atomic="true"
-            >
-              Step {index + 1}
-            </span>
             <div className="flex items-center gap-1">
               <Menu
                 onOpenChange={(open) => {
@@ -390,6 +383,9 @@ export function WorkflowStepEditor({
               </Button>
             </div>
           </header>
+          <span className="sr-only" aria-live="polite" aria-atomic="true">
+            Step {index + 1}
+          </span>
           <fieldset disabled={disabled} className={styles["workflow-inspector-fields"]}>
             {step.kind === "agent" || step.kind === "input" ? (
               <div

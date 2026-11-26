@@ -132,6 +132,13 @@
   z-index: 2;
 }
 .workflow-canvas-scroll {
+  --workflow-row-inset: calc(22px * var(--workflow-zoom));
+  --workflow-next-node-inset: var(--workflow-row-inset);
+  --workflow-trigger-row-height: 65px;
+  --workflow-trigger-height: 34px;
+  --workflow-trigger-tail: calc(
+    (var(--workflow-trigger-row-height) - var(--workflow-trigger-height)) / 2
+  );
   flex: 1;
   min-height: 0;
   overflow: auto;
@@ -168,7 +175,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 65px;
+  min-height: var(--workflow-trigger-row-height);
 }
 .workflow-start::after,
 .workflow-start-insert::before,
@@ -181,7 +188,7 @@
   pointer-events: none;
 }
 .workflow-start::after {
-  top: calc(50% + 15px);
+  top: calc(100% - var(--workflow-trigger-tail));
   bottom: 0;
 }
 .workflow-start-marker {
@@ -189,7 +196,8 @@
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 12px;
+  height: var(--workflow-trigger-height);
+  padding-inline: 12px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--popover);
@@ -215,6 +223,7 @@
   padding-left: calc(var(--workflow-shift) * 2);
   min-height: 44px;
   align-items: center;
+  z-index: 1;
 }
 .workflow-start-insert::before {
   top: 0;
@@ -234,7 +243,7 @@
   display: flex;
   align-items: center;
   flex-direction: column;
-  padding: calc(22px * var(--workflow-zoom)) 16px 0;
+  padding: var(--workflow-row-inset) 16px 0;
 }
 .workflow-canvas-row::after {
   top: 0;
@@ -412,6 +421,8 @@
   outline-offset: -2px;
 }
 .workflow-connection-slot {
+  /* The connector continues through the next row's inset after the slot ends. */
+  --workflow-insert-offset: calc(var(--workflow-next-node-inset) / 2);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -419,7 +430,16 @@
   height: 44px;
   z-index: 1;
 }
+.workflow-zone:last-of-type .workflow-canvas-row:last-child .workflow-connection-slot {
+  --workflow-insert-offset: 0px;
+}
+.workflow-start-insert:has(+ .workflow-zone) {
+  --workflow-insert-offset: calc(
+    (var(--workflow-next-node-inset) - var(--workflow-trigger-tail)) / 2
+  );
+}
 .workflow-insert {
+  translate: 0 var(--workflow-insert-offset, 0px);
   display: grid;
   place-items: center;
   width: 28px;
@@ -565,13 +585,27 @@
 @container workflow-canvas (max-width:640px) {
   .workflow-canvas-scroll {
     --workflow-shift: 0px;
+    --workflow-row-inset: 14px;
+    --workflow-trigger-tail: 0px;
+    --workflow-zone-label-height: 26px;
+    --workflow-zone-label-gap: 12px;
+  }
+  .workflow-start-insert,
+  .workflow-zone:not(:last-of-type) .workflow-canvas-row:last-child .workflow-connection-slot {
+    --workflow-next-node-inset: calc(
+      var(--workflow-row-inset) + var(--workflow-zone-label-height) + var(--workflow-zone-label-gap)
+    );
   }
   .workflow-zone-label {
     position: relative;
     left: auto;
     top: auto;
     align-self: flex-start;
-    margin-bottom: 12px;
+    margin-bottom: var(--workflow-zone-label-gap);
+    white-space: nowrap;
+  }
+  .workflow-canvas-row > .workflow-zone-label {
+    height: var(--workflow-zone-label-height);
   }
   .workflow-start {
     flex-direction: column;
@@ -581,11 +615,8 @@
   .workflow-start .workflow-zone-label {
     top: auto;
   }
-  .workflow-canvas-row {
-    padding-top: 14px;
-  }
   .workflow-zone:not([data-kind="agent"]) .workflow-canvas-row::before {
-    top: 14px;
+    top: var(--workflow-row-inset);
   }
 }
 @media (max-width: 600px) {
@@ -600,6 +631,18 @@
   }
 }
 @media (pointer: coarse) {
+  @container workflow-canvas (max-width: 360px) {
+    .workflow-canvas-scroll {
+      --workflow-zone-label-height: 44px;
+    }
+    .workflow-canvas-row > .workflow-zone-label {
+      /* Leave the 22px add radius and a 4px gap either side of the connector. */
+      max-inline-size: calc(50% - 26px);
+      line-height: 16px;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+  }
   .workflow-target-summary {
     min-height: 44px;
   }
