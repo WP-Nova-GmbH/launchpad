@@ -42,6 +42,7 @@ import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ThreadBackgroundLivenessService } from "../orchestration/ThreadBackgroundLiveness.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { OrchestrationEventStore } from "../persistence/Services/OrchestrationEventStore.ts";
 import {
   layer as SessionLayer,
   ProviderSessionRuntimeRepository,
@@ -51,15 +52,21 @@ import { makeThreadMoveTransferIntent } from "../persistence/ThreadMoveTransferI
 import { makeCheckoutCapture } from "../persistence/CheckoutCapture.ts";
 import { ProcessRunner, layer as RunnerLayer } from "../processRunner.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import { exportCodexConversation } from "../provider/Drivers/CodexConversationTransfer.ts";
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
-import { ProviderService } from "../provider/Services/ProviderService.ts";
+import {
+  ProviderService,
+  type ProviderServiceShape,
+} from "../provider/Services/ProviderService.ts";
 import { TerminalManager } from "../terminal/Manager.ts";
 import { SetupProcessAdapter } from "../terminal/SetupProcessAdapter.ts";
+import { makeThreadAttachmentCheckpoint } from "./ThreadAttachmentCheckpoint.ts";
 import { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import { ThreadMoveError, type ThreadMoveTransport } from "./ThreadMoveTransport.ts";
-import { makeThreadMoveWorker } from "./ThreadMoveWorker.ts";
+import { makeThreadMoveWorker as makeWorker } from "./ThreadMoveWorker.ts";
 import { makeThreadMoveSweep } from "./ThreadRelayCoordinator.ts";
+import { makeThreadNativeCheckpoint } from "./ThreadNativeCheckpoint.ts";
 import { ThreadVmProviderAuth, makeThreadVmProviderAuth } from "./ThreadVmProviderAuth.ts";
 import { ProviderAuthService } from "../provider/Services/ProviderAuthService.ts";
 import {
@@ -79,6 +86,12 @@ const sourceId = EnvironmentId.make("source"),
   projectId = ProjectId.make("project");
 const driverKind = ProviderDriverKind.make("codex"),
   unused = () => Effect.die("Unexpected provider call");
+const makeThreadMoveWorker = (
+  transport: Parameters<typeof makeWorker>[0],
+  history: Parameters<typeof makeWorker>[1],
+  commands: Parameters<typeof makeWorker>[2],
+  checkpoints: Parameters<typeof makeWorker>[3] = { synchronize: unused },
+) => makeWorker(transport, history, commands, checkpoints);
 const status: ServerProvider = {
   instanceId,
   driver: driverKind,
@@ -191,6 +204,7 @@ const moveDetail = queue.pipe(
 );
 
 for (const lost of [
+  "frozen-checkpoint-receipts",
   "published",
   "recovery-publish",
   "recovery-ready",
@@ -290,7 +304,9 @@ for (const lost of [
                                               lost === "destination-unconfirmed-repository" ||
                                               lost === "destination-repointed-during-download"
                                             ? `blocks ${lost} before installing a checkout or changing local files`
-                                            : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
+                                            : lost === "frozen-checkpoint-receipts"
+                                              ? "waits for both exact frozen checkpoint receipts before publishing or repairing a move"
+                                              : `moves the complete workspace and queued prompt once despite a lost ${lost} reply`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -952,6 +968,148 @@ for (const lost of [
             const captures = makeCheckoutCapture(sql);
             const execution = yield* ThreadExecution;
             const sibling = ThreadId.make("sibling");
+            if (lost === "frozen-checkpoint-receipts") {
+              const turnId = TurnId.make("settled-turn");
+              const nativeThreadId = "01900000-0000-7000-8000-000000000076";
+              const codexHome = path.join(root, "codex"),
+                sessions = path.join(codexHome, "sessions", "2026", "10", "07");
+              const rollout = path.join(
+                sessions,
+                `rollout-2026-10-07T00-00-00-${nativeThreadId}.jsonl`,
+              );
+              yield* fs.makeDirectory(sessions, { recursive: true });
+              yield* fs.writeFileString(
+                rollout,
+                (yield* encodeMoveJson({
+                  ordinal: 0,
+                  timestamp: at,
+                  type: "session_meta",
+                  payload: {
+                    id: nativeThreadId,
+                    cli_version: "0.159.3",
+                    history_mode: "paginated",
+                  },
+                })) + "\n",
+              );
+              yield* (yield* ProviderSessionRuntimeRepository).upsert({
+                threadId,
+                providerName: "codex",
+                providerInstanceId: instanceId,
+                adapterKey: "codex",
+                runtimeMode: "full-access",
+                status: "stopped",
+                lastSeenAt: at,
+                resumeCursor: { threadId: nativeThreadId },
+                runtimePayload: null,
+              });
+              yield* sql`INSERT INTO projection_turns
+                (thread_id,turn_id,state,requested_at,completed_at,checkpoint_status,checkpoint_files_json)
+                VALUES (${threadId},${turnId},'completed',${at},${at},'ready','[]')`;
+              const native = makeThreadNativeCheckpoint(sql);
+              const attachments = makeThreadAttachmentCheckpoint(
+                sql,
+                yield* OrchestrationEventStore,
+              );
+              const { attachmentsDir } = yield* ServerConfig;
+              const artifactRoot = path.join(root, "frozen-checkpoints");
+              const provider: ProviderServiceShape = {
+                ...(yield* ProviderService),
+                flushRuntimeEvents: () => Effect.void,
+                checkpointConversation: (input) =>
+                  Effect.gen(function* () {
+                    yield* native.capture({ ...input, artifactRoot }, (stage) =>
+                      exportCodexConversation({
+                        codexHome,
+                        rolloutPath: rollout,
+                        threadId: nativeThreadId,
+                        artifactRoot: stage,
+                      }).pipe(
+                        Effect.map((archive) => ({ directory: archive.directory, nativeThreadId })),
+                      ),
+                    );
+                    yield* attachments.capture({
+                      ...input,
+                      artifactRoot,
+                      attachmentsDir,
+                      generation: 1,
+                    });
+                  }).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fs),
+                    Effect.provideService(Path.Path, path),
+                    Effect.orDie,
+                  ),
+              };
+              const publications: string[] = [];
+              let settleCheckpoint = Effect.void;
+              const restart = makeThreadMoveWorker(transport, history, commands, {
+                synchronize: (currentThreadId, operationId) =>
+                  Effect.gen(function* () {
+                    expect(currentThreadId).toBe(threadId);
+                    expect(operationId).toBe(remote?.operationId);
+                    publications.push(operationId!);
+                    yield* settleCheckpoint;
+                  }),
+              }).pipe(Effect.provideService(ProviderService, provider));
+              source = yield* restart;
+              yield* source.source(threadId);
+              expect(remote?.phase).toBe("frozen");
+              expect(remote?.manifestArtifactId).toBeNull();
+              expect(uploadStarts).toBe(0);
+              yield* sql`UPDATE thread_native_checkpoints SET published_artifact_id='native-receipt'
+                WHERE thread_id=${threadId} AND capture_operation_id=${remote!.operationId}`;
+              yield* source.source(threadId);
+              expect(remote?.manifestArtifactId).toBeNull();
+              const acknowledgeAttachments = sql`UPDATE thread_attachment_checkpoints SET published_artifact_id='attachment-receipt'
+                WHERE thread_id=${threadId} AND checkpoint_id=${`frozen:${remote!.operationId}`}`;
+              yield* acknowledgeAttachments;
+              yield* source.source(threadId);
+              expect(remote?.recoveryVerified).toBe(true);
+              const published = remote!.manifestArtifactId;
+              expect(published).toBeTruthy();
+              const completedUploads = uploadStarts;
+
+              remote = { ...remote!, recoveryVerified: false };
+              yield* sql`UPDATE thread_attachment_checkpoints SET published_artifact_id=NULL
+                WHERE thread_id=${threadId} AND checkpoint_id=${`frozen:${remote.operationId}`}`;
+              source = yield* restart;
+              yield* source.source(threadId);
+              expect(remote?.recoveryVerified).toBe(false);
+              settleCheckpoint = Effect.gen(function* () {
+                yield* acknowledgeAttachments;
+                yield* sql`UPDATE thread_execution_fences SET phase='draining' WHERE thread_id=${threadId}`;
+              }).pipe(Effect.orDie);
+              expect(yield* Effect.flip(source.source(threadId))).toMatchObject({
+                detail: "The source archive does not match its frozen ownership.",
+              });
+              expect(remote?.recoveryVerified).toBe(false);
+              yield* sql`UPDATE thread_execution_fences SET phase='frozen' WHERE thread_id=${threadId}`;
+              settleCheckpoint = Effect.void;
+              yield* source.source(threadId);
+              expect(remote).toMatchObject({
+                manifestArtifactId: published,
+                recoveryVerified: true,
+              });
+              expect(uploadStarts).toBe(completedUploads);
+              expect(publications).toEqual(Array(4).fill(remote!.operationId));
+
+              remote = { ...remote!, recoveryVerified: false };
+              yield* sql`UPDATE thread_attachment_checkpoints SET manifest_sha256=${"0".repeat(64)}
+                WHERE thread_id=${threadId} AND checkpoint_id=${`frozen:${remote.operationId}`}`;
+              expect(yield* Effect.flip(source.source(threadId))).toMatchObject({
+                detail: expect.stringContaining(
+                  "saved Codex or attachment checkpoint is missing or changed",
+                ),
+                requiresRetry: true,
+              });
+              expect(publications).toHaveLength(4);
+              expect(remote).toMatchObject({
+                manifestArtifactId: published,
+                recoveryVerified: false,
+              });
+              expect((yield* fences.get(threadId))?.phase).toBe("frozen");
+              expect(uploadStarts).toBe(completedUploads);
+              return;
+            }
             if (lost.startsWith("encoding-cancel-")) {
               const pending = yield* queue;
               const head = pending.entries[0]!;

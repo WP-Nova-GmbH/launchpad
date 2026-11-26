@@ -84,6 +84,7 @@ import {
 } from "./ThreadMoveTransport.ts";
 import type { makeThreadHistorySync } from "./ThreadHistorySync.ts";
 import type { makeThreadCommandSync } from "./ThreadCommandSync.ts";
+import type { makeThreadCheckpointPublisher } from "./ThreadCheckpointPublisher.ts";
 
 const decodeQueue = Schema.decodeEffect(Schema.fromJsonString(ThreadPromptQueue));
 const decodeModel = Schema.decodeEffect(Schema.fromJsonString(ModelSelection));
@@ -118,6 +119,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
   transport: ThreadMoveTransport,
   history: ReturnType<typeof makeThreadHistorySync>,
   commands: ReturnType<typeof makeThreadCommandSync>,
+  checkpoints: Pick<ReturnType<typeof makeThreadCheckpointPublisher>, "synchronize">,
 ) {
   const sql = yield* SqlClient.SqlClient;
   const config = yield* ServerConfig;
@@ -261,6 +263,9 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
     if (
       current?.phase !== "frozen" ||
       current.operationId !== owner.operationId ||
+      current.environmentId !== owner.environmentId ||
+      current.generation !== owner.generation ||
+      current.relayUrl !== owner.relayUrl ||
       saved.manifest.history.threadId !== owner.threadId ||
       saved.manifest.history.operationId !== owner.operationId ||
       saved.manifest.history.generation !== owner.generation ||
@@ -268,6 +273,42 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
       saved.manifest.history.sourceSequence !== current.frozenSequence
     )
       return yield* fail(owner.threadId, "The source archive does not match its frozen ownership.");
+  });
+  const frozenCheckpointPublished = Effect.fnUntraced(function* (
+    owner: ThreadMoveOwner,
+    saved: Effect.Success<ReturnType<typeof sourceArchive>>,
+  ) {
+    if (!saved.manifest.native) return true;
+    const native = yield* workspaceFileHash(path.join(saved.directory, "native", "manifest.json"));
+    const attachments = yield* workspaceFileHash(
+      path.join(saved.directory, "attachments", "manifest.json"),
+    );
+    const exactCheckpoint = sql<{
+      nativeReceipt: string | null;
+      attachmentReceipt: string | null;
+    }>`SELECT n.published_artifact_id AS "nativeReceipt",a.published_artifact_id AS "attachmentReceipt"
+      FROM thread_native_checkpoints n
+      JOIN thread_attachment_checkpoints a USING (thread_id,generation,checkpoint_id)
+      WHERE n.thread_id=${owner.threadId} AND n.generation=${owner.generation}
+        AND n.environment_id=${owner.environmentId} AND n.capture_operation_id=${owner.operationId}
+        AND n.source_sequence=${saved.manifest.history.sourceSequence}
+        AND a.environment_id=n.environment_id AND a.source_sequence=n.source_sequence
+        AND n.manifest_sha256=${native.sha256} AND a.manifest_sha256=${attachments.sha256}`;
+    const mismatch = () =>
+      fail(
+        owner.threadId,
+        "The saved Codex or attachment checkpoint is missing or changed. Restore it before retrying, or cancel the move and start again.",
+        true,
+      );
+    let [point] = yield* exactCheckpoint;
+    if (!point) return yield* mismatch();
+    if (point.nativeReceipt === null || point.attachmentReceipt === null) {
+      yield* checkpoints.synchronize(owner.threadId, owner.operationId);
+      [point] = yield* exactCheckpoint;
+      if (!point) return yield* mismatch();
+    }
+    yield* verifySourceOwner(owner, saved);
+    return point.nativeReceipt !== null && point.attachmentReceipt !== null;
   });
   const within = (root: string, candidate: string) =>
     candidate === root ||
@@ -927,12 +968,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         attempt,
       );
       // Repair the exact saved archive even when a failed commit left a retained error.
-      if (move.manifestArtifactId !== null && move.recoveryVerified !== true) {
-        const receipt = yield* transport.publish(owner, move.manifestArtifactId);
-        if (receipt.manifestArtifactId !== move.manifestArtifactId)
-          return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
-      }
-      if (move.manifestArtifactId !== null && sourceFailed) {
+      if (move.manifestArtifactId !== null && (move.recoveryVerified !== true || sourceFailed)) {
         const sourcePath = operationPath(owner, "source");
         if (!(yield* fs.exists(sourcePath)))
           return yield* fail(
@@ -952,6 +988,13 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
             true,
           );
         yield* verifySourceOwner(owner, saved);
+        if (move.recoveryVerified !== true) {
+          if (!(yield* frozenCheckpointPublished(owner, saved))) return;
+          const receipt = yield* transport.publish(owner, move.manifestArtifactId);
+          if (receipt.manifestArtifactId !== move.manifestArtifactId)
+            return yield* fail(threadId, "The recovery receipt belongs to another move archive.");
+        }
+        if (!sourceFailed) return;
         const retained = yield* transport.get(owner);
         yield* assertThreadMoveIdentity(owner, retained);
         if (
@@ -1116,6 +1159,7 @@ export const makeThreadMoveWorker = Effect.fn("ThreadMoveWorker.make")(function*
         return yield* fail(threadId, "The frozen source changed after the move began.");
       // Publication verifies every artifact. Keep the source frozen while the destination imports it.
       if (move.manifestArtifactId !== null) return;
+      if (!(yield* frozenCheckpointPublished(owner, saved))) return;
       yield* progress.stage("packing");
       const pack =
         encodingPolicy === "workspace-raw-v2-8MiB"

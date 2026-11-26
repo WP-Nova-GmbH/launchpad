@@ -246,7 +246,7 @@ export const layer = Layer.effect(
         ),
     );
 
-    const moves = yield* makeThreadMoveWorker(authority.moves, history, commands);
+    const moves = yield* makeThreadMoveWorker(authority.moves, history, commands, checkpoints);
     const enrollment = yield* makeThreadLocalEnrollmentWorker(authority.enrollment, history);
     const backups = yield* makeThreadBackupSourceWorker(authority.backups, history, checkpoints);
     const pauses = yield* makeThreadPauseWorker(
