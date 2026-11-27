@@ -143,7 +143,9 @@ if ! sudo -n docker image inspect "$relay_image" >/dev/null 2>&1; then
   git archive --format=tar "$revision" |
     sudo -n docker build -t "$relay_image" -f infra/relay/Dockerfile -
 fi
-vp i --frozen-lockfile
+# Include host build and verification tools without installing mobile or desktop.
+vp i --frozen-lockfile --filter @t3tools/monorepo \
+  --filter 'launchpad-relay...' --filter '@t3tools/scripts...'
 E2B_RUNTIME_DIR="$runtime_dir" bash infra/beta/bootstrap-e2b.sh
 
 export E2B_API_URL=http://127.0.0.1:3000 E2B_SANDBOX_URL=http://127.0.0.1:3002
