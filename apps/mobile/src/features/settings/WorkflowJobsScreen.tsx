@@ -20,6 +20,7 @@ import {
   emptyWorkflowJobRead,
   workflowStepState,
   workflowStatusLabel,
+  workflowRunStatus,
   workflowJobAccessLost,
   beginWorkflowReview,
   bindWorkflowReviewPlacement,
@@ -87,6 +88,7 @@ import {
 import { AppText as Text, AppTextInput } from "../../components/AppText";
 import { ScreenScrollView } from "../../components/ScreenScrollView";
 import { runtime } from "../../lib/runtime";
+import { workflowJobsDestination } from "../../lib/adaptive-navigation";
 import { uuidv4 } from "../../lib/uuid";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openPortableThreadChat } from "../../state/threads";
@@ -770,6 +772,11 @@ function WorkflowJobsContent(props: Props) {
     }
   };
   const backToJobs = () => {
+    const linkedRepositoryId = props.route.params?.repositoryId ?? repositoryId;
+    if (props.route.params?.jobId && linkedRepositoryId) {
+      navigation.navigate("SettingsSheet", workflowJobsDestination(linkedRepositoryId));
+      return;
+    }
     setSelectedJobId(null);
     void loadJobs();
   };
@@ -1553,11 +1560,13 @@ function WorkflowJobsContent(props: Props) {
               </Text>
             ) : (
               jobs.map((job) => {
+                const { label } = workflowRunStatus(job);
+                const recovery = workflowVmRecoveryDisplay(job.vmRecovery)?.title;
                 const subtitle = [
                   job.originSummary?.workflowName ?? "Workflow run",
                   job.originSummary?.kind === "automation" && "Started by workflow",
                   (job.targetKind ?? job.runtime?.kind) === "vm" && "Workflow VM",
-                  workflowVmRecoveryDisplay(job.vmRecovery)?.title,
+                  recovery !== label && recovery,
                   `Submitted ${new Date(job.createdAt).toLocaleString()}`,
                 ]
                   .filter(Boolean)
@@ -1568,7 +1577,7 @@ function WorkflowJobsContent(props: Props) {
                     icon="arrow.triangle.branch"
                     label={job.instruction}
                     subtitle={subtitle}
-                    value={workflowStatusLabel(job.status)}
+                    value={label}
                     valuePosition="trailing"
                     disabled={busy}
                     onPress={() => setSelectedJobId(job.jobId)}

@@ -305,6 +305,62 @@ it("opens attention rows for input, review, and specific blockers", async () => 
   ]);
 });
 
+it("shows pending manual controls in both active and attention views until the checkpoint reopens", async () => {
+  const review = {
+    ...row("Review held run"),
+    status: "awaiting_review",
+    needsAttention: true,
+  } as const;
+  const input = {
+    ...row("Answer held run"),
+    status: "awaiting_input",
+    needsAttention: true,
+  } as const;
+  const pending = [
+    { ...review, manualPauseState: "pause_requested" },
+    { ...input, manualPauseState: "resume_requested" },
+  ] satisfies WorkflowJobPage["jobs"];
+  fixture.call.mockResolvedValue({ jobs: pending, nextCursor: null });
+  await act(async () => {
+    renderer = create(screen());
+  });
+  for (const view of ["Active", "Needs attention"]) {
+    if (view === "Needs attention") await press(view);
+    expect(content()).toContain("Pause requested");
+    expect(content()).toContain("Resume requested");
+    expect(content()).not.toContain("Needs review");
+    expect(content()).not.toContain("Needs input");
+    await press("View run for Workflow run: Review held run");
+    await press("View run for Workflow run: Answer held run");
+  }
+  fixture.call.mockResolvedValue({ jobs: [review, input], nextCursor: null });
+  await press("Refresh runs");
+  await press("Open review for Workflow run: Review held run");
+  await press("View input for Workflow run: Answer held run");
+});
+
+it("opens cancellation blockers and shows a pending retry on the next attention refresh", async () => {
+  const cleanup = { ...row("Stop the run"), status: "cancelling", needsAttention: true } as const;
+  fixture.call.mockResolvedValue({
+    jobs: [{ ...cleanup, cancellationState: "retry_needed" }],
+    nextCursor: null,
+  });
+  await act(async () => {
+    renderer = create(screen());
+  });
+  expect(content()).toContain("Cancellation needs attention");
+  await press("Needs attention");
+  await press("View blocker for Workflow run: Stop the run");
+  fixture.call.mockResolvedValue({
+    jobs: [{ ...cleanup, cancellationState: "pending" }],
+    nextCursor: null,
+  });
+  await press("Refresh runs");
+  expect(content()).toContain("Cancellation pending");
+  expect(content()).not.toContain("View blocker");
+  await press("View run for Workflow run: Stop the run");
+});
+
 it("shows submitted checkpoints as pending until a refresh makes them actionable", async () => {
   const input = { ...row("Answer during preparation"), status: "awaiting_input" as const };
   const review = { ...row("Review the result"), status: "awaiting_review" as const };

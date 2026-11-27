@@ -10,6 +10,43 @@ import { remoteHttpClientLayer } from "../rpc/http.ts";
 import { layer, ManagedRelayTenancyClient } from "./managedRelayTenancy.ts";
 import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
 import { relayProtectedErrorMessage } from "./errorPresentation.ts";
+import { createManagedRelaySession, readActiveWorkflowRunsPage } from "./managedRelayState.ts";
+
+it.effect(
+  "reads the active workflow run shelf with the current account token and continuation",
+  () =>
+    Effect.gen(function* () {
+      const session = createManagedRelaySession({
+        accountId: "user",
+        readClerkToken: async () => "token",
+      });
+      const empty = { organizationId: "org", jobs: [], total: 0, nextCursor: null };
+      const result = yield* readActiveWorkflowRunsPage(session, {
+        limit: 20,
+        cursor: "continuation",
+      }).pipe(
+        Effect.provide(
+          layer({ relayUrl: "https://relay.example.test" }).pipe(
+            Layer.provide(
+              remoteHttpClientLayer(async (input, init) => {
+                const request = new Request(input, init);
+                const url = new URL(request.url);
+                expect(request.method).toBe("GET");
+                expect(request.headers.get("authorization")).toBe("Bearer token");
+                expect(url.pathname).toBe("/v1/workflow-jobs/active");
+                expect(Object.fromEntries(url.searchParams)).toEqual({
+                  limit: "20",
+                  cursor: "continuation",
+                });
+                return Response.json(empty);
+              }),
+            ),
+          ),
+        ),
+      );
+      expect(result).toEqual(empty);
+    }),
+);
 
 const decodeVmCreateRequest = Schema.decodeUnknownSync(RelayThreadVmCreateRequest);
 

@@ -1,4 +1,5 @@
 import type {
+  ActiveWorkflowRun,
   RepositoryWorkflow,
   WorkflowSavedResult,
   WorkflowAutomation,
@@ -837,6 +838,75 @@ export const workflowStatusLabel = (status: string) =>
     cancelled: "Cancelled",
     failed: "Failed",
   })[status] ?? status.replaceAll("_", " ");
+
+const completionLabels = {
+  saving_result: "Saving run data",
+  retrying_save: "Waiting for retry confirmation",
+  save_failed: "Save failed",
+  finishing: "Finishing run",
+  completion_blocked: "Completion blocked",
+} satisfies Record<NonNullable<RepositoryWorkflowJobSummary["completionState"]>, string>;
+
+export function workflowRunStatus(
+  job: Pick<
+    ActiveWorkflowRun,
+    | "status"
+    | "cancellationState"
+    | "completionState"
+    | "checkpointResponsePending"
+    | "vmRecovery"
+    | "manualPauseState"
+    | "queueReason"
+    | "needsAttention"
+  >,
+) {
+  const recovery = job.vmRecovery?.state;
+  if (recovery === "recovery_error" || recovery === "waiting_codex") {
+    return { label: "Blocked", kind: "blocked" } as const;
+  }
+  if (job.completionState) {
+    const blocked =
+      job.completionState === "save_failed" || job.completionState === "completion_blocked";
+    return {
+      label: completionLabels[job.completionState],
+      kind: blocked ? "blocked" : "waiting",
+    } as const;
+  }
+  if (recovery === "restoring") return { label: "Restoring workspace", kind: "waiting" } as const;
+  if (recovery === "resuming") return { label: "Resuming workflow VM", kind: "waiting" } as const;
+  if (job.checkpointResponsePending) {
+    const queued = recovery === "waiting_capacity" || recovery === "paused" || recovery === "saved";
+    return {
+      label: queued ? "Response queued" : "Waiting for confirmation",
+      kind: "waiting",
+    } as const;
+  }
+  if (recovery === "waiting_capacity")
+    return { label: "Waiting for a VM slot", kind: "waiting" } as const;
+  if (job.cancellationState === "retry_needed")
+    return { label: "Cancellation needs attention", kind: "blocked" } as const;
+  if (job.cancellationState === "pending")
+    return { label: "Cancellation pending", kind: "waiting" } as const;
+  if (job.manualPauseState === "pause_requested")
+    return { label: "Pause requested", kind: "waiting" } as const;
+  if (job.manualPauseState === "resume_requested")
+    return { label: "Resume requested", kind: "waiting" } as const;
+  if (job.manualPauseState === "paused") return { label: "Paused", kind: "paused" } as const;
+  if (job.status === "queued" || job.status === "preparing") {
+    if (job.queueReason?.code === "vm_waiting_capacity")
+      return { label: "Waiting for a VM slot", kind: "waiting" } as const;
+    if (job.needsAttention) return { label: "Blocked", kind: "blocked" } as const;
+  }
+  const kind =
+    job.status === "awaiting_review" || job.status === "awaiting_input"
+      ? "checkpoint"
+      : job.status === "running"
+        ? "running"
+        : job.status === "paused"
+          ? "paused"
+          : "waiting";
+  return { label: workflowStatusLabel(job.status), kind } as const;
+}
 interface JobRequest {
   readonly accountId: string;
   readonly key: string;

@@ -34,9 +34,11 @@ vi.mock("./linkEnvironment", () => ({ decodedRelayClientError: () => (error: unk
 vi.mock("../lib/runtime", async () => {
   const Context = await import("effect/Context");
   const Effect = await import("effect/Effect");
+  const Layer = await import("effect/Layer");
   const { ManagedRelayTenancy } = await import("@t3tools/client-runtime/relay");
   const context = () => Context.make(ManagedRelayTenancy.ManagedRelayTenancyClient, fixture.client);
   return {
+    runtimeContextLayer: Layer.empty,
     runtime: {
       contextEffect: Effect.sync(context),
       runPromise: <A, E>(
@@ -193,6 +195,53 @@ async function mountAdmin() {
   });
   await act(async () => admin.refresh());
 }
+
+function deferred<A>() {
+  let resolve!: (value: A) => void;
+  const promise = new Promise<A>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+it.effect("waits for fresh repository grants when refreshing a cached catalog", () =>
+  Effect.gen(function* () {
+    yield* runRelayRequests;
+    yield* Effect.promise(async () => {
+      const started = deferred<void>();
+      const grants = deferred<ReadonlyArray<RelayRepositorySummary>>();
+      let delayed = false;
+      fixture.client = {
+        ...fixture.client,
+        listRepositories: () =>
+          delayed
+            ? Effect.promise(() => {
+                started.resolve();
+                return grants.promise;
+              })
+            : Effect.succeed([]),
+      };
+      await mountAdmin();
+      expect(catalog.data?.repositories).toEqual([]);
+      delayed = true;
+      let finished = false;
+      let refreshed!: Promise<void>;
+      await act(async () => {
+        refreshed = catalog.refresh().then(() => {
+          finished = true;
+        });
+        await started.promise;
+      });
+      expect(finished).toBe(false);
+      expect(catalog.data?.repositories).toEqual([]);
+      await act(async () => {
+        grants.resolve([repository]);
+        await refreshed;
+      });
+      expect(catalog.data?.repositories).toEqual([repository]);
+    });
+  }),
+);
 
 it.effect("retains GitHub data as unverified until its own reads recover", () =>
   Effect.gen(function* () {

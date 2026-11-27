@@ -6,6 +6,7 @@ import type {
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
 import { EnvironmentId, ORCHESTRATION_WS_METHODS, ProjectId, ThreadId } from "@t3tools/contracts";
+import type { ActiveWorkflowRunPageQuery } from "@t3tools/contracts/workflows";
 import {
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
@@ -196,6 +197,14 @@ function readSessionClerkToken(
     ),
   );
 }
+
+export const readActiveWorkflowRunsPage = Effect.fn("clientRuntime.readActiveWorkflowRunsPage")(
+  function* (session: ManagedRelaySession, query: ActiveWorkflowRunPageQuery) {
+    const clerkToken = yield* readSessionClerkToken(session);
+    const relay = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    return yield* relay.pageActiveWorkflowRuns({ clerkToken, query });
+  },
+);
 
 /** Removes an environment from the signed-in account without contacting that environment. */
 export const deregisterManagedRelayEnvironment = Effect.fn(

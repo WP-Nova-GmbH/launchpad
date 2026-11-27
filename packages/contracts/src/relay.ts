@@ -44,6 +44,8 @@ import {
   RepositoryWorkflowJobSummary,
   WorkflowJobPageQuery,
   WorkflowJobPage,
+  ActiveWorkflowRunPageQuery,
+  ActiveWorkflowRunPage,
   SaveRepositoryWorkflow,
   RunRepositoryWorkflow,
   RespondToWorkflowJob,
@@ -4538,6 +4540,12 @@ export type RelayWorkflowVmFollowUp = typeof RelayWorkflowVmFollowUp.Type;
 
 const RelayWorkflowsGroup = HttpApiGroup.make("workflows")
   .add(
+    HttpApiEndpoint.get("pageActiveJobs", "/v1/workflow-jobs/active", {
+      headers: RelayBearerRequestHeaders,
+      query: ActiveWorkflowRunPageQuery,
+      success: ActiveWorkflowRunPage,
+      error: WorkflowErrors,
+    }),
     HttpApiEndpoint.get("list", "/v1/repositories/:repositoryId/workflows", {
       headers: RelayBearerRequestHeaders,
       params: RelayRepositoryParams,

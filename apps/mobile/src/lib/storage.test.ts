@@ -237,19 +237,23 @@ describe("mobile connection storage", () => {
       savePreferencesPatch({
         threadListSettledShelfExpanded: false,
         threadListSnoozedShelfExpanded: true,
+        workflowRunsShelfExpanded: false,
       }),
     ).resolves.toEqual({
       threadListSettledShelfExpanded: false,
       threadListSnoozedShelfExpanded: true,
+      workflowRunsShelfExpanded: false,
     });
 
     await expect(loadPreferences()).resolves.toEqual({
       threadListSettledShelfExpanded: false,
       threadListSnoozedShelfExpanded: true,
+      workflowRunsShelfExpanded: false,
     });
     expect(JSON.parse(mocks.getPreferencesJson() ?? "")).toEqual({
       threadListSettledShelfExpanded: false,
       threadListSnoozedShelfExpanded: true,
+      workflowRunsShelfExpanded: false,
     });
   });
 
@@ -261,6 +265,7 @@ describe("mobile connection storage", () => {
         threadListV2SnoozedShelfExpanded: true,
         threadListSettledShelfExpanded: "false",
         threadListSnoozedShelfExpanded: 1,
+        workflowRunsShelfExpanded: "false",
       }),
       10,
     );

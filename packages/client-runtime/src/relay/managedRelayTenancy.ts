@@ -106,6 +106,8 @@ import {
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
 import { normalizeSecureRelayUrl } from "@t3tools/shared/relayUrl";
 import type {
+  ActiveWorkflowRunPage,
+  ActiveWorkflowRunPageQuery,
   WorkflowSavedResult,
   RepositoryWorkflow,
   RepositoryWorkflowJob,
@@ -195,6 +197,10 @@ export class ManagedRelayTenancyClient extends Context.Service<
       readonly repositoryId: RelayRepositoryId;
       readonly query: WorkflowJobPageQuery;
     }) => Effect.Effect<WorkflowJobPage, ManagedRelayClientError>;
+    readonly pageActiveWorkflowRuns: (input: {
+      readonly clerkToken: string;
+      readonly query: ActiveWorkflowRunPageQuery;
+    }) => Effect.Effect<ActiveWorkflowRunPage, ManagedRelayClientError>;
     readonly runWorkflow: (input: {
       readonly clerkToken: string;
       readonly repositoryId: RelayRepositoryId;
@@ -678,6 +684,7 @@ function disabledTenancyClient(relayUrl: string): ManagedRelayTenancyClient["Ser
     saveWorkflow: unavailable("clientRuntime.managedRelayTenancy.saveWorkflow"),
     listWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.listWorkflowJobs"),
     pageWorkflowJobs: unavailable("clientRuntime.managedRelayTenancy.pageWorkflowJobs"),
+    pageActiveWorkflowRuns: unavailable("clientRuntime.managedRelayTenancy.pageActiveWorkflowRuns"),
     runWorkflow: unavailable("clientRuntime.managedRelayTenancy.runWorkflow"),
     getWorkflowJob: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJob"),
     getWorkflowJobResult: unavailable("clientRuntime.managedRelayTenancy.getWorkflowJobResult"),
@@ -940,6 +947,16 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
           .pipe(
             Effect.mapError(relayRequestError("pageWorkflowJobs")),
             timeoutRelayRequest("pageWorkflowJobs"),
+          );
+      },
+    ),
+    pageActiveWorkflowRuns: Effect.fn("clientRuntime.managedRelayTenancy.pageActiveWorkflowRuns")(
+      function* (input) {
+        return yield* client.workflows
+          .pageActiveJobs({ headers: bearerHeaders(input.clerkToken), query: input.query })
+          .pipe(
+            Effect.mapError(relayRequestError("pageActiveWorkflowRuns")),
+            timeoutRelayRequest("pageActiveWorkflowRuns"),
           );
       },
     ),

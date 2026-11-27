@@ -59,10 +59,11 @@ const fixture = vi.hoisted(() => ({
   navigate: vi.fn(),
   refreshCatalog: vi.fn<() => void | Promise<void>>(),
   codexStatus: vi.fn<() => Promise<"connected" | "disconnected" | "reconnect_required">>(),
-  realDepartureGuard: false,
+  realRouter: false,
   realRun: false,
   organizationRole: "admin" as "admin" | "member",
   tab: "runs",
+  repositoryId: "repository",
   workflowId: undefined as string | undefined,
   jobId: undefined as string | undefined,
   runsReturn: undefined as WorkflowRunsReturn | undefined,
@@ -97,7 +98,7 @@ vi.mock("@tanstack/react-router", async () => {
   return {
     ...router,
     Link: (props: ComponentProps<typeof router.Link>) => {
-      if (fixture.realDepartureGuard) return createElement(router.Link, props);
+      if (fixture.realRouter) return createElement(router.Link, props);
       const { to, params, ...attributes } = props;
       const values = typeof params === "object" ? params : {};
       const href = to?.replace(/\$(\w+)/gu, (_, key: string) =>
@@ -106,6 +107,7 @@ vi.mock("@tanstack/react-router", async () => {
       return createElement("a", { ...attributes, href });
     },
     useNavigate: () => fixture.navigate,
+    useRouter: () => (fixture.realRouter ? router.useRouter() : { subscribe: () => {} }),
     useLocation: ({
       select,
     }: {
@@ -117,10 +119,10 @@ vi.mock("@tanstack/react-router", async () => {
         state: { __TSR_key: "workflows-page", workflowRunsReturn: fixture.runsReturn },
       }),
     useParams: (options: Parameters<typeof router.useParams>[0]) => {
-      const readParams = fixture.realDepartureGuard
+      const readParams = fixture.realRouter
         ? router.useParams
         : () => ({
-            repositoryId: "repository",
+            repositoryId: fixture.repositoryId,
             workflowId: fixture.workflowId,
             jobId: fixture.jobId,
           });
@@ -136,10 +138,9 @@ vi.mock(import("../../cloud/publicConfig"), async (importOriginal) => ({
 vi.mock("../../cloud/managedRelayState", () => ({
   useManagedRelayOrganizationCatalog: () => {
     const [, refreshSnapshot] = useState(0);
-    const refresh = useCallback(() => {
-      const result = fixture.refreshCatalog();
-      if (result) void result.then(() => refreshSnapshot((version) => version + 1));
-      else refreshSnapshot((version) => version + 1);
+    const refresh = useCallback(async () => {
+      await fixture.refreshCatalog();
+      refreshSnapshot((version) => version + 1);
     }, []);
     return {
       data: fixture.repositoryError
@@ -172,7 +173,7 @@ vi.mock("./WorkflowEditorDepartureGuard", async () => {
   >("./WorkflowEditorDepartureGuard");
   return {
     WorkflowEditorDepartureGuard: (props: ComponentProps<typeof WorkflowEditorDepartureGuard>) =>
-      fixture.realDepartureGuard ? <WorkflowEditorDepartureGuard {...props} /> : null,
+      fixture.realRouter ? <WorkflowEditorDepartureGuard {...props} /> : null,
   };
 });
 vi.mock("./WorkflowRun", async () => {
@@ -182,7 +183,7 @@ vi.mock("./WorkflowRun", async () => {
       fixture.realRun ? <WorkflowRun {...props} /> : null,
   };
 });
-vi.mock("./WorkflowJob", () => ({ WorkflowJob: () => null }));
+vi.mock("./WorkflowJob", () => ({ WorkflowJob: ({ jobId }: { jobId: string }) => <p>{jobId}</p> }));
 vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
 vi.mock("../../hooks/useSettings", () => ({
   useEnvironmentSettings: () => DEFAULT_UNIFIED_SETTINGS,
@@ -523,10 +524,11 @@ beforeEach(() => {
   fixture.refreshCatalog.mockReset();
   fixture.codexStatus.mockReset().mockResolvedValue("connected");
   fixture.save.mockReset();
-  fixture.realDepartureGuard = false;
+  fixture.realRouter = false;
   fixture.realRun = false;
   fixture.organizationRole = "admin";
   fixture.tab = "runs";
+  fixture.repositoryId = "repository";
   fixture.workflowId = undefined;
   fixture.jobId = undefined;
   fixture.runsReturn = undefined;
@@ -720,6 +722,129 @@ const serve = Effect.gen(function* () {
     Queue.take(reads).pipe(Effect.flatMap((read) => read.pipe(Effect.forkScoped))),
   ).pipe(Effect.forkScoped);
 });
+
+function enableWorkflowRouter() {
+  fixture.realRouter = true;
+  vi.stubGlobal("document", { activeElement: null, addEventListener() {} });
+  vi.stubGlobal("HTMLElement", function FixtureElement() {});
+  vi.stubGlobal("window", {
+    origin: "http://localhost",
+    matchMedia: () => Object.assign(new EventTarget(), { matches: false }),
+    addEventListener() {},
+    removeEventListener() {},
+    scrollTo() {},
+  });
+  vi.stubGlobal("self", {});
+  vi.stubGlobal("history", {});
+  vi.stubGlobal("addEventListener", () => {});
+  vi.stubGlobal("scrollTo", () => {});
+}
+
+it.effect.each(["first", "second"])(
+  "opens the %s run after access is granted to the current unavailable repository",
+  (jobId) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        enableWorkflowRouter();
+        fixture.repositories = [];
+        fixture.definitions.mockResolvedValue([]);
+        const root = createRootRoute({ component: Outlet });
+        const run = createRoute({
+          getParentRoute: () => root,
+          path: "/workflows/$repositoryId/jobs/$jobId",
+          component: () => <WorkflowsPage view="job" />,
+        });
+        const router = createRouter({
+          isServer: false,
+          routeTree: root.addChildren([run]),
+          history: createMemoryHistory({ initialEntries: ["/workflows/repository/jobs/first"] }),
+        });
+        const openRun = (jobId: string) =>
+          router.navigate({
+            to: "/workflows/$repositoryId/jobs/$jobId",
+            params: { repositoryId, jobId },
+          });
+        await router.load();
+        await act(() => {
+          renderer = create(
+            <AppAtomRegistryProvider>
+              <RouterProvider router={router} />
+            </AppAtomRegistryProvider>,
+          );
+        });
+        expect(content()).toContain("Repository unavailable");
+        expect(fixture.refreshCatalog).toHaveBeenCalledTimes(1);
+        fixture.refreshCatalog.mockImplementationOnce(() => {
+          fixture.repositories = catalog.repositories;
+        });
+        await act(() => openRun(jobId));
+        await act(async () => {
+          await Promise.all(deliveries);
+        });
+        expect(content()).toContain(jobId);
+        await act(() => openRun("third"));
+        expect(content()).toContain("third");
+        expect(fixture.refreshCatalog).toHaveBeenCalledTimes(2);
+      });
+    }),
+);
+
+it.effect.each(["granted", "denied", "offline"] as const)(
+  "checks the new repository before opening its run or clearing its drafts (%s)",
+  (outcome) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.definitions.mockResolvedValue([]);
+        fixture.jobId = "First run";
+        const runPage = () => (
+          <AppAtomRegistryProvider>
+            <WorkflowsPage view="job" />
+          </AppAtomRegistryProvider>
+        );
+        await act(() => {
+          renderer = create(runPage());
+        });
+        await act(async () => {
+          await Promise.all(deliveries);
+        });
+        expect(content()).toContain("First run");
+
+        const draft = newWorkflowDraft([], "review", true)!;
+        startNewWorkflowDraft(appAtomRegistry, destinationScope, () => draft);
+        const draftKey = workflowSessionKey(destinationScope, draft.workflowId);
+        const access = deferred<void>();
+        fixture.refreshCatalog.mockReturnValueOnce(access.promise);
+        fixture.repositoryId = otherRepositoryId;
+        fixture.jobId = "Second run";
+        await act(() => {
+          renderer!.update(runPage());
+        });
+        expect(content()).not.toContain("Repository unavailable");
+        expect(content()).not.toContain("Second run");
+        expect(appAtomRegistry.get(workflowDraftAtom).editors[draftKey]).toEqual(draft);
+
+        if (outcome === "granted")
+          fixture.repositories = [...catalog.repositories, otherRepository];
+        if (outcome === "offline") fixture.repositoryError = "Relay unavailable";
+        await act(() => access.resolve());
+        await act(async () => {
+          await Promise.all(deliveries);
+        });
+        expect(content()).toContain(
+          outcome === "granted"
+            ? "Second run"
+            : outcome === "denied"
+              ? "Repository unavailable"
+              : "Relay unavailable",
+        );
+        expect(appAtomRegistry.get(workflowDraftAtom).editors[draftKey]).toEqual(
+          outcome === "denied" ? undefined : draft,
+        );
+      });
+    }),
+);
 
 it.effect("keeps the Runs list context when leaving a Run while the catalog loads", () =>
   Effect.gen(function* () {
@@ -1587,25 +1712,12 @@ it.effect("keeps later draft edits when a save retry succeeds during departure",
   Effect.gen(function* () {
     yield* serve;
     yield* Effect.promise(async () => {
-      fixture.realDepartureGuard = true;
+      enableWorkflowRouter();
       fixture.tab = "workflows";
       fixture.vmAuthoring = { models: null };
       fixture.definitions.mockResolvedValue([]);
 
       // Memory history uses the same navigation blockers as the desktop client.
-      vi.stubGlobal("document", { activeElement: null, addEventListener() {} });
-      vi.stubGlobal("HTMLElement", function FixtureElement() {});
-      vi.stubGlobal("window", {
-        origin: "http://localhost",
-        matchMedia: () => Object.assign(new EventTarget(), { matches: false }),
-        addEventListener() {},
-        removeEventListener() {},
-        scrollTo() {},
-      });
-      vi.stubGlobal("self", {});
-      vi.stubGlobal("history", {});
-      vi.stubGlobal("addEventListener", () => {});
-      vi.stubGlobal("scrollTo", () => {});
       const root = createRootRoute({ component: Outlet });
       const repo = createRoute({
         getParentRoute: () => root,

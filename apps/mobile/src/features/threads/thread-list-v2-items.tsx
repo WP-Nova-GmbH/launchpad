@@ -102,7 +102,7 @@ const COPY_THREAD_ID_ACTION: MenuAction = {
 /** Rounded-row radius shared with the v1 sidebar rows. */
 const SIDEBAR_V2_ROW_RADIUS = 12;
 
-function ThreadListV2Section(props: {
+export function ThreadListV2Section(props: {
   readonly label: string;
   readonly pane?: "screen" | "sidebar";
   readonly tone?: "default" | "snoozed";
@@ -117,7 +117,8 @@ function ThreadListV2Section(props: {
   const snoozed = props.tone === "snoozed";
   const sidebarPane = props.pane === "sidebar";
   const className = cn(
-    "mb-1.5 mt-4 flex-row items-center gap-2.5",
+    "flex-row items-center gap-2.5",
+    props.disclosure ? "min-h-[44px] pb-1.5 pt-4 android:min-h-[48px]" : "mb-1.5 mt-4",
     props.pane === "sidebar" ? "px-3" : "px-5",
   );
   const content = (

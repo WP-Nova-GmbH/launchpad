@@ -28,7 +28,7 @@ import {
   settleWorkflowJobPage,
   readWorkflowJobPages,
   workflowSessionKey,
-  workflowStatusLabel,
+  workflowRunStatus,
   type WorkflowScope,
   type WorkflowJobPageRequest,
 } from "@t3tools/client-runtime/relay/workflow-session";
@@ -84,17 +84,10 @@ function returnedRunId(
   );
 }
 
-const completionStatusLabels = {
-  saving_result: "Saving run data",
-  retrying_save: "Waiting for retry confirmation",
-  save_failed: "Save failed",
-  finishing: "Finishing run",
-  completion_blocked: "Completion blocked",
-} satisfies Record<NonNullable<RepositoryWorkflowJobSummary["completionState"]>, string>;
-
 function runAttentionPresentation(
   job: RepositoryWorkflowJobSummary,
   recovery: ReturnType<typeof workflowVmRecoveryDisplay>,
+  label: string,
 ) {
   const responsePending = job.checkpointResponsePending === true;
   const recoveryTask = job.vmRecovery
@@ -102,7 +95,7 @@ function runAttentionPresentation(
     : undefined;
   if (recoveryTask?.warning) {
     return {
-      status: "Blocked",
+      status: label,
       action: "View blocker",
       icon: recoveryTask.icon,
       detail: recoveryTask.title,
@@ -122,7 +115,7 @@ function runAttentionPresentation(
           ? workflowFinalCheckDetail(rawDetail)
           : rawDetail;
     return {
-      status: completionStatusLabels[job.completionState],
+      status: label,
       action: blocked ? "View blocker" : "View run",
       icon: blocked ? TriangleAlertIcon : undefined,
       detail: null,
@@ -130,36 +123,42 @@ function runAttentionPresentation(
     };
   }
   if (recoveryTask && (recovery?.pending || responsePending)) {
-    return { status: recoveryTask.title, action: "View run", detail: null };
+    return { status: label, action: "View run", detail: null };
   }
-  if (job.status === "queued" && job.queueReason?.code === "vm_waiting_capacity") {
+  if (job.cancellationState === "retry_needed")
+    return { status: label, action: "View blocker", icon: TriangleAlertIcon };
+  if (
+    (job.status === "queued" || job.status === "preparing") &&
+    job.queueReason?.code === "vm_waiting_capacity"
+  ) {
     const task = workflowQueuedTask(job, job.detail);
     return {
-      status: task?.title ?? workflowStatusLabel(job.status),
+      status: label,
       action: "View run",
       detail: task ? null : undefined,
     };
   }
-  if (responsePending) return { status: "Waiting for confirmation", action: "View run" };
+  if (responsePending || job.manualPauseState || job.cancellationState === "pending")
+    return { status: label, action: "View run" };
   if (job.needsAttention === false) return null;
 
   if (job.status === "awaiting_input") {
     return {
-      status: workflowStatusLabel(job.status),
+      status: label,
       action: "View input",
       icon: MessageSquareIcon,
     };
   }
   if (job.status === "awaiting_review") {
     return {
-      status: workflowStatusLabel(job.status),
+      status: label,
       action: "Open review",
       icon: ClipboardCheckIcon,
     };
   }
   if (job.needsAttention && (job.status === "queued" || job.status === "preparing")) {
     return {
-      status: "Blocked",
+      status: label,
       action: "View blocker",
       icon: TriangleAlertIcon,
       detail: workflowQueuedTask(job, job.detail)?.title,
@@ -612,21 +611,30 @@ function WorkflowJobsList({
                   .name ??
                 "Workflow run";
               const vmRecovery = workflowVmRecoveryDisplay(job.vmRecovery);
-              const atCheckpoint =
-                job.status === "awaiting_review" || job.status === "awaiting_input";
+              const runStatus = workflowRunStatus(job);
               const attentionRow =
-                view === "attention" ? runAttentionPresentation(job, vmRecovery) : null;
+                view === "attention"
+                  ? runAttentionPresentation(job, vmRecovery, runStatus.label)
+                  : null;
               const AttentionIcon = attentionRow?.icon;
               const needsAttention =
                 vmRecovery || view === "attention" ? job.needsAttention : undefined;
+              const pending =
+                job.checkpointResponsePending ||
+                job.cancellationState === "pending" ||
+                job.manualPauseState ||
+                job.completionState ||
+                vmRecovery?.pending;
               const attentionStyle = attentionRow
                 ? !!AttentionIcon
-                : (needsAttention ??
-                  (vmRecovery?.warning || (!vmRecovery?.pending && atCheckpoint)));
-              const statusLabel = attentionRow?.status ?? workflowStatusLabel(job.status);
+                : runStatus.kind === "blocked" ||
+                  (!pending && (needsAttention ?? runStatus.kind === "checkpoint"));
+              const statusLabel = attentionRow?.status ?? runStatus.label;
               const actionLabel =
                 attentionRow?.action ??
-                (view !== "attention" && job.status === "awaiting_review"
+                (view !== "attention" &&
+                job.status === "awaiting_review" &&
+                runStatus.kind === "checkpoint"
                   ? "Open review"
                   : "View run");
               const context =

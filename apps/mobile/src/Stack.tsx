@@ -104,6 +104,7 @@ import {
   SettingsLegalDocumentExternalHeaderButton,
 } from "./features/settings/components/SettingsLegalDocumentRouteScreen";
 import { useAppShortcuts } from "./features/shortcuts/useAppShortcuts";
+import { isWorkspaceVisible } from "./lib/adaptive-navigation";
 import { useIncomingShare } from "./features/sharing/IncomingShareProvider";
 import {
   EMPTY_INCOMING_SHARE_PRESENTATION_STATE,
@@ -180,6 +181,18 @@ const LEGAL_DOCUMENT_HEADER_OPTIONS: AppScreenOptions = {
   headerRight: () => <SettingsLegalDocumentExternalHeaderButton />,
   presentation: "fullScreenModal",
 };
+
+const THREAD_SETTINGS_OPTIONS = {
+  gestureEnabled: true,
+  headerShown: false,
+  ...(Platform.OS === "android"
+    ? { presentation: "card" as const }
+    : {
+        ...FORM_SHEET_PRESENTATION_OPTIONS,
+        sheetAllowedDetents: [1],
+        sheetGrabberVisible: true,
+      }),
+} satisfies NativeStackNavigationOptions;
 
 const SettingsContentStack = createNativeStackNavigator({
   initialRouteName: "Settings",
@@ -457,17 +470,7 @@ const NewTaskSheetStack = createNativeStackNavigator({
     ThreadSettings: createNativeStackScreen({
       screen: NewTaskThreadSettingsRouteScreen,
       linking: "draft/settings",
-      options: {
-        gestureEnabled: true,
-        headerShown: false,
-        ...(Platform.OS === "android"
-          ? { presentation: "card" as const }
-          : {
-              ...FORM_SHEET_PRESENTATION_OPTIONS,
-              sheetAllowedDetents: [1],
-              sheetGrabberVisible: true,
-            }),
-      },
+      options: THREAD_SETTINGS_OPTIONS,
     }),
     AddProject: createNativeStackScreen({
       screen: AddProjectSourceRoute,
@@ -540,6 +543,7 @@ function ThreadOutboxDrainWorker() {
 function RootStackLayout(props: {
   readonly children: React.ReactNode;
   readonly state: NavigationState;
+  readonly descriptors: Readonly<Record<string, { options: NativeStackNavigationOptions }>>;
 }) {
   const navigation = useNavigation();
   const { pendingShare } = useIncomingShare();
@@ -581,6 +585,7 @@ function RootStackLayout(props: {
         <AdaptiveWorkspaceLayout
           pathname={workspaceLocation.pathname}
           workspaceRouteKey={workspaceLocation.routeKey}
+          workspaceVisible={isWorkspaceVisible(props.state, props.descriptors, Platform.OS)}
         >
           {props.children}
           <HardwareKeyboardCommandOverlay />
@@ -711,17 +716,7 @@ const RootStackConfig = createNativeStackNavigator({
     // `threads/:environmentId/:threadId`, where this sheet is one tap away.
     ThreadSettingsSheet: createNativeStackScreen({
       screen: ExistingThreadSettingsRouteScreen,
-      options: {
-        gestureEnabled: true,
-        headerShown: false,
-        ...(Platform.OS === "android"
-          ? { presentation: "card" as const }
-          : {
-              ...FORM_SHEET_PRESENTATION_OPTIONS,
-              sheetAllowedDetents: [1],
-              sheetGrabberVisible: true,
-            }),
-      },
+      options: THREAD_SETTINGS_OPTIONS,
     }),
     GitOverview: createNativeStackScreen({
       screen: GitOverviewSheet,

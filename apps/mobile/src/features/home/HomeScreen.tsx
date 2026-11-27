@@ -52,6 +52,7 @@ import {
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
   type ThreadListV2ListItem,
 } from "../threads/threadListV2";
+import { useWorkflowRunsShelf } from "../threads/WorkflowRunsShelf";
 import { useThreadListV2ShelfPreferences } from "../threads/use-thread-list-v2-shelf-preferences";
 import type { HomeListFilterMenuEnvironment } from "./home-list-filter-menu";
 import {
@@ -212,6 +213,7 @@ function HomeTopContentSpacer() {
 /* ─── Main screen ────────────────────────────────────────────────────── */
 
 export function HomeScreen(props: HomeScreenProps) {
+  const workflowRunsShelf = useWorkflowRunsShelf("screen", !props.searchQuery.trim());
   const queuedThreadKeys = useQueuedThreadKeys();
   const openSwipeableRef = useRef<SwipeableMethods | null>(null);
   const insets = useSafeAreaInsets();
@@ -854,7 +856,35 @@ export function HomeScreen(props: HomeScreenProps) {
     projectCount: props.projects.length,
   });
 
-  if (!hasAnyThreads) {
+  const noThreadsContent = !hasAnyThreads ? (
+    <View className="w-full max-w-[430px]">
+      <EmptyState
+        title={emptyState.title}
+        detail={emptyState.detail}
+        actionLabel={!props.catalogState.hasReadyEnvironment ? "Add environment" : undefined}
+        onAction={!props.catalogState.hasReadyEnvironment ? props.onAddConnection : undefined}
+        action={
+          Platform.OS === "android" && !props.catalogState.hasReadyEnvironment ? (
+            <MaterialFloatingActionButton
+              label="Add environment"
+              icon="plus"
+              variant="extended"
+              tone="primary"
+              onPress={props.onAddConnection}
+            />
+          ) : undefined
+        }
+        variant="plain"
+      />
+      {emptyState.loading ? (
+        <View className="mt-4 items-center">
+          <ActivityIndicator colorClassName="accent-icon-muted" />
+        </View>
+      ) : null}
+    </View>
+  ) : null;
+
+  if (!hasAnyThreads && !workflowRunsShelf) {
     return (
       <View className="flex-1 bg-screen android:bg-header">
         <View
@@ -867,31 +897,7 @@ export function HomeScreen(props: HomeScreenProps) {
             paddingTop: NATIVE_LIQUID_GLASS_SUPPORTED ? insets.top + 72 : 0,
           }}
         >
-          <View className="w-full max-w-[430px]">
-            <EmptyState
-              title={emptyState.title}
-              detail={emptyState.detail}
-              actionLabel={!props.catalogState.hasReadyEnvironment ? "Add environment" : undefined}
-              onAction={!props.catalogState.hasReadyEnvironment ? props.onAddConnection : undefined}
-              action={
-                Platform.OS === "android" && !props.catalogState.hasReadyEnvironment ? (
-                  <MaterialFloatingActionButton
-                    label="Add environment"
-                    icon="plus"
-                    variant="extended"
-                    tone="primary"
-                    onPress={props.onAddConnection}
-                  />
-                ) : undefined
-              }
-              variant="plain"
-            />
-            {emptyState.loading ? (
-              <View className="mt-4 items-center">
-                <ActivityIndicator colorClassName="accent-icon-muted" />
-              </View>
-            ) : null}
-          </View>
+          {noThreadsContent}
         </View>
       </View>
     );
@@ -928,7 +934,7 @@ export function HomeScreen(props: HomeScreenProps) {
       />
     );
 
-  if (Platform.OS === "android" && threadListV2Items.length === 0) {
+  if (Platform.OS === "android" && threadListV2Items.length === 0 && !workflowRunsShelf) {
     return (
       <View className="flex-1 bg-header">
         <View
@@ -966,14 +972,17 @@ export function HomeScreen(props: HomeScreenProps) {
             extraData={v2ExtraData}
             ListHeaderComponent={listHeader}
             ListFooterComponent={
-              settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
-                <ThreadListV2ShowMoreRow
-                  hiddenCount={threadListV2Layout.hiddenSettledCount}
-                  onPress={showMoreSettled}
-                />
-              ) : null
+              <>
+                {settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
+                  <ThreadListV2ShowMoreRow
+                    hiddenCount={threadListV2Layout.hiddenSettledCount}
+                    onPress={showMoreSettled}
+                  />
+                ) : null}
+                {workflowRunsShelf}
+              </>
             }
-            ListEmptyComponent={v2ListEmpty}
+            ListEmptyComponent={noThreadsContent ?? v2ListEmpty}
             style={{ flex: 1 }}
             automaticallyAdjustsScrollIndicatorInsets={Platform.OS === "ios"}
             contentInsetAdjustmentBehavior={Platform.OS === "ios" ? "automatic" : "never"}

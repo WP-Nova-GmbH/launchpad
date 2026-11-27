@@ -2,6 +2,7 @@ export * as Discovery from "./discovery.ts";
 export * from "./errorPresentation.ts";
 export * as ManagedRelay from "./managedRelay.ts";
 export * from "./workflowRepositories.ts";
+export * from "./activeWorkflowRuns.ts";
 export * as WorkflowSources from "./workflowSources.ts";
 export * as CodexVmSignIn from "./codexVmSignIn.ts";
 export * as ManagedRelayTenancy from "./managedRelayTenancy.ts";

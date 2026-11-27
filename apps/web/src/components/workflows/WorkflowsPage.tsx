@@ -17,8 +17,15 @@ import {
 } from "lucide-react";
 import { RepositorySourcesButton } from "./WorkflowSources";
 import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
-import { Link, useLocation, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { useEffect, useLayoutEffect, useState, useCallback, useRef } from "react";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRouter,
+  useSearch,
+} from "@tanstack/react-router";
+import { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   RelayRepositoryId,
   type RelayRepositorySummary,
@@ -231,13 +238,40 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
   const { openAuthPrompt } = useT3ConnectAuthPrompt();
   const catalog = useManagedRelayOrganizationCatalog({ allowMissingProjects: true });
   const { refresh: refreshCatalog } = catalog;
-  useEffect(refreshCatalog, [refreshCatalog]);
   const navigate = useNavigate();
+  const router = useRouter();
   const params = useParams({ strict: false });
   const repositoryId = "repositoryId" in params ? params.repositoryId : undefined;
+  const [accessAttempt, setAccessAttempt] = useState(0);
+  const selection = useMemo(
+    () => ({ accountId: catalog.accountId, repositoryId, accessAttempt }),
+    [catalog.accountId, repositoryId, accessAttempt],
+  );
+  const [checkedSelection, setCheckedSelection] = useState<typeof selection | null>(null);
+  useEffect(() => {
+    let current = true;
+    void refreshCatalog().then(() => {
+      if (current) setCheckedSelection(selection);
+    });
+    return () => {
+      current = false;
+    };
+  }, [selection, refreshCatalog]);
   const entry = catalog.data?.repositories.find(
     (entry) => entry.repository.repositoryId === repositoryId,
   );
+  const retryOnJobNavigation =
+    view === "job" && checkedSelection === selection && (!entry || !!catalog.error);
+  useEffect(() => {
+    if (!retryOnJobNavigation) return;
+    // Clicking the current run also triggers navigation, with the same job ID and history key.
+    return router.subscribe("onBeforeNavigate", ({ toLocation }) => {
+      const { routeParams } = router.getMatchedRoutes(toLocation.pathname);
+      if (routeParams.repositoryId === repositoryId && routeParams.jobId) {
+        setAccessAttempt((attempt) => attempt + 1);
+      }
+    });
+  }, [retryOnJobNavigation, repositoryId, router]);
   const entryOrganizationId = entry?.repository.organizationId;
   const entryRepositoryId = entry?.repository.repositoryId;
   const scope =
@@ -245,10 +279,13 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
       ? { accountId: userId, organizationId: entryOrganizationId, repositoryId: entryRepositoryId }
       : null;
   const emptyChooser = !repositoryId && catalog.data?.repositories.length === 0;
+  const checkingAccess = !!repositoryId && (!entry || view === "job");
   if (
     !isLoaded ||
     (isSignedIn &&
-      (catalog.accountId !== userId || (catalog.isPending && (!catalog.data || emptyChooser))))
+      (catalog.accountId !== userId ||
+        (checkingAccess && checkedSelection !== selection) ||
+        (catalog.isPending && (!catalog.data || emptyChooser || (repositoryId && !entry)))))
   )
     return <WorkflowPageLoading />;
   if (!isSignedIn || !userId)
@@ -260,7 +297,7 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
         actions={<Button onClick={() => openAuthPrompt()}>Sign in</Button>}
       />
     );
-  if (!catalog.data || (emptyChooser && catalog.error))
+  if (!catalog.data || (catalog.error && (emptyChooser || checkingAccess)))
     return (
       <WorkflowNotice
         title={catalog.error ? "Could not load repositories" : "Organization required"}
@@ -287,7 +324,6 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
           organizationId: catalog.data.membership.organization.organizationId,
           repositoryId: RelayRepositoryId.make(repositoryId),
         }}
-        confirmed={!catalog.isPending && !catalog.error}
       />
     );
   if (!entry || !scope)
@@ -343,18 +379,12 @@ function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
   );
 }
 
-function UnavailableWorkflowRepository({
-  scope,
-  confirmed,
-}: {
-  scope: WorkflowScope;
-  confirmed: boolean;
-}) {
+function UnavailableWorkflowRepository({ scope }: { scope: WorkflowScope }) {
   const { accountId, organizationId, repositoryId } = scope;
   const navigate = useNavigate();
   useEffect(() => {
-    if (confirmed) clearWorkflowScope(appAtomRegistry, { accountId, organizationId, repositoryId });
-  }, [confirmed, accountId, organizationId, repositoryId]);
+    clearWorkflowScope(appAtomRegistry, { accountId, organizationId, repositoryId });
+  }, [accountId, organizationId, repositoryId]);
   return (
     <WorkflowNotice
       title="Repository unavailable"

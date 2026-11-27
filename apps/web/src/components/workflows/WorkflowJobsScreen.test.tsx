@@ -45,7 +45,7 @@ const fixture = vi.hoisted(() => ({
   openResult: vi.fn(),
   alert: vi.fn(),
   review: vi.fn(),
-  job: vi.fn<() => RepositoryWorkflowJob>(),
+  job: vi.fn<(jobId: string) => RepositoryWorkflowJob>(),
   respond: vi.fn<(payload: typeof RespondToWorkflowJob.Type) => RepositoryWorkflowJob>(),
 }));
 const host = (name: string) => (props: PropsWithChildren<Record<string, unknown>>) =>
@@ -81,6 +81,7 @@ vi.mock("../../../../mobile/src/features/settings/SavedWorkflowResults", () => (
 }));
 vi.mock("../../../../mobile/node_modules/react-native/index.js", () => ({
   View: host("view"),
+  ScrollView: host("scroll-view"),
   Text: host("text"),
   TextInput: host("input"),
   Pressable: host("button"),
@@ -215,12 +216,15 @@ const client = {
           message: cause instanceof Error ? cause.message : "Recent list failed",
         }),
     }),
-  getWorkflowJob: () => Effect.sync(() => fixture.job()),
+  getWorkflowJob: ({ jobId }: { jobId: string }) => Effect.sync(() => fixture.job(jobId)),
   respondToWorkflowJob: ({ payload }: { payload: typeof RespondToWorkflowJob.Type }) =>
     Effect.sync(() => fixture.respond(payload)),
 };
 type Params = { repositoryId?: string; jobId?: string };
 type Props = { route: { params: Params | undefined } };
+const { workflowJobsDestination } = await vi.importActual<{
+  workflowJobsDestination: (repositoryId: string, jobId: string) => unknown;
+}>("../../../../mobile/src/lib/adaptive-navigation");
 const { WorkflowJobsScreen } = await vi.importActual<{ WorkflowJobsScreen: ComponentType<Props> }>(
   "../../../../mobile/src/features/settings/WorkflowJobsScreen",
 );
@@ -241,14 +245,15 @@ function text(node: ReactTestRendererJSON | ReactTestRendererJSON[] | string | n
   return (node.children ?? []).map(text).join(" ");
 }
 const content = () => text(renderer!.toJSON());
+const jobsRoute = (params: Params | undefined) => (
+  <AppAtomRegistryProvider>
+    <WorkflowJobsScreen route={{ params }} />
+  </AppAtomRegistryProvider>
+);
 async function mount(params: Params | undefined, waitForList = true) {
   const start = deliveries.length;
   await act(async () => {
-    renderer = create(
-      <AppAtomRegistryProvider>
-        <WorkflowJobsScreen route={{ params }} />
-      </AppAtomRegistryProvider>,
-    );
+    renderer = create(jobsRoute(params));
   });
   // The catalog owns three receipts; selected-job reads stay independent of a delayed list.
   await act(async () => {
@@ -259,20 +264,31 @@ async function mount(params: Params | undefined, waitForList = true) {
     if (params?.jobId) await deliveries[start + 4];
   });
 }
+async function finishReadsSince(start: number) {
+  while (start < deliveries.length) {
+    const pending = deliveries.slice(start);
+    start += pending.length;
+    await act(async () => {
+      await Promise.all(pending);
+    });
+  }
+}
 async function press(label: string, waitForRead = true) {
   const before = deliveries.length;
   await act(async () => {
-    renderer!.root
-      .findAll(
-        (node) => typeof node.props.label === "string" && typeof node.props.onPress === "function",
-      )
-      .find((node) => node.props.label === label)!
-      .props.onPress();
+    const button = renderer!.root.findAll((node) => {
+      if (typeof node.props.onPress !== "function") return false;
+      if (node.props.label === label) return true;
+      return (
+        node.props.accessibilityRole === "button" &&
+        node.findAll((child) => String(child.type) === "text" && child.children.join("") === label)
+          .length > 0
+      );
+    })[0];
+    expect(button, `Button "${label}"`).toBeDefined();
+    button!.props.onPress();
   });
-  if (waitForRead)
-    await act(async () => {
-      await Promise.all(deliveries.slice(before));
-    });
+  if (waitForRead) await finishReadsSince(before);
 }
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -281,7 +297,15 @@ beforeEach(() => {
   fixture.appState = "active";
   fixture.appStateListeners.clear();
   fixture.projectsAvailable = true;
-  fixture.navigate.mockReset();
+  fixture.navigate.mockReset().mockImplementation((screen, destination) => {
+    if (
+      screen === "SettingsSheet" &&
+      destination?.screen === "SettingsContent" &&
+      destination.params?.screen === "SettingsWorkflowJobs"
+    ) {
+      renderer!.update(jobsRoute(destination.params.params));
+    }
+  });
   fixture.alert.mockReset();
   fixture.review.mockReset();
   fixture.openResult.mockReset().mockResolvedValue({
@@ -376,7 +400,9 @@ effectIt.layer(
         jobId: vmReview.jobId,
       });
       expect(content()).not.toContain("Review changed");
-      expect(content()).toContain("Cancel job");
+      await press("Run actions");
+      expect(content()).toContain("Cancel run");
+      await press("Inspect saved diff");
       expect(content()).not.toContain("Request changes");
       const approval = renderer!.root
         .findAll((node) => String(node.type) === "action")
@@ -390,6 +416,7 @@ effectIt.layer(
       await act(() => renderer!.unmount());
       await mount({ repositoryId: "A", jobId: vmReview.jobId });
       expect(content()).not.toContain("Review changed");
+      await press("Inspect saved diff");
       const returnedApproval = renderer!.root
         .findAll((node) => String(node.type) === "action")
         .find((node) => node.props.label === "Approve result")!;
@@ -455,9 +482,11 @@ effectIt.layer(
     expect(content()).toContain("Workflow VM");
     await press(queuedAutomaticVm.jobId);
     expect(content()).toContain("Workflow VM");
+    await press("Run context");
     expect(content()).toContain("Started by workflow");
     expect(content()).toContain("Waiting for a VM slot.");
-    expect(content()).not.toContain("Cancel job");
+    expect(content()).not.toContain("Run actions");
+    expect(content()).not.toContain("Cancel run");
   });
 
   screenTest("cancels a queued automatic VM run when the viewer has permission", async () => {
@@ -472,7 +501,8 @@ effectIt.layer(
       return cancelled;
     });
     await mount({ repositoryId: "A", jobId: queued.jobId });
-    await press("Cancel job");
+    await press("Run actions");
+    await press("Cancel run");
     expect(fixture.respond).not.toHaveBeenCalled();
     const actions = fixture.alert.mock.calls[0]![2] as ReadonlyArray<{
       text: string;
@@ -537,6 +567,7 @@ effectIt.layer(
       await mount({ repositoryId: "A", jobId: resultJob.jobId });
       await press("Inspect agent result");
       await press("Back to jobs");
+      fixture.navigate.mockClear();
       await press(resultJob.jobId);
       const resultControl = () =>
         renderer!.root
@@ -686,32 +717,23 @@ effectIt.layer(
               .props.onChangeText("Keep this response"),
           );
         }
-        const before = deliveries.length;
-        await act(async () => {
-          renderer!.root
-            .findAll((node) => String(node.type) === "action")
-            .findLast(
-              (node) =>
-                node.props.label ===
-                (operation === "approve"
-                  ? "Approve result"
-                  : operation === "input"
-                    ? "Submit answer"
-                    : "Send changes"),
-            )!
-            .props.onPress();
-        });
-        await act(async () => {
-          await Promise.all(deliveries.slice(before));
-        });
+        await press(
+          operation === "approve"
+            ? "Approve result"
+            : operation === "input"
+              ? "Submit answer"
+              : "Send changes",
+        );
         expect(fixture.respond).toHaveBeenCalledTimes(1);
         expect(fixture.respond.mock.calls[0]![0].operation).toBe(operation);
         expect(content()).toContain("Response pending; waiting for the environment.");
         const pendingActions = renderer!.root.findAll(
-          (node) => String(node.type) === "action" && node.props.label === "Response pending",
+          (node) =>
+            typeof node.props.onPress === "function" && node.props.label === "Response pending",
         );
         expect(pendingActions.length).toBeGreaterThan(0);
         expect(pendingActions.every((node) => node.props.disabled)).toBe(true);
+        await press("Run actions");
         expect(
           renderer!.root.findAll(
             (node) => String(node.type) === "action" && node.props.label === "Pause workflow",
@@ -720,7 +742,7 @@ effectIt.layer(
         expect(
           renderer!.root
             .findAll((node) => String(node.type) === "action")
-            .find((node) => node.props.label === "Cancel job")!.props.disabled,
+            .find((node) => node.props.label === "Cancel run")!.props.disabled,
         ).toBe(false);
         await act(async () => {
           pendingActions[0]!.props.onPress();
@@ -800,15 +822,13 @@ effectIt.layer(
       expect(content()).toContain("ENG-123");
       expect(content()).not.toContain("Frozen requirements");
       const readsBefore = deliveries.length;
-      const disclosure = () =>
-        renderer!.root
-          .findAll((node) => node.type === "button")
-          .find((node) => node.props.accessibilityState !== undefined)!;
-      await act(() => disclosure().props.onPress());
+      await press("Run context");
+      expect(content()).not.toContain("Frozen requirements");
+      await press("Issue details");
       expect(content()).toContain("Frozen requirements");
       expect(content()).toContain("Ready");
       expect(deliveries.length).toBe(readsBefore);
-      await act(() => disclosure().props.onPress());
+      await press("Issue details");
       expect(content()).not.toContain("Frozen requirements");
     },
   );
@@ -846,18 +866,14 @@ effectIt.layer(
       });
       await mount({ repositoryId: "A", jobId: detail.jobId });
       expect(content()).toContain("ENG-123");
+      await press("Run context");
       if (status === "queued") {
         expect(content()).toContain("Issue details will be read before this job starts.");
       } else {
         expect(content()).not.toContain("will be read");
         expect(content()).not.toContain("Stored legacy instructions");
         const before = deliveries.length;
-        await act(() =>
-          renderer!.root
-            .findAll((node) => node.type === "button")
-            .find((node) => node.props.accessibilityState !== undefined)!
-            .props.onPress(),
-        );
+        await press("Issue details");
         expect(content()).toContain("No issue snapshot was saved");
         expect(content()).toContain("Stored legacy instructions");
         expect(deliveries.length).toBe(before);
@@ -956,15 +972,47 @@ effectIt.layer(
     },
   );
 
-  screenTest("loads recent runs after an incoming job route and Back to jobs", async () => {
-    fixture.list.mockResolvedValue([summary("Recent A run")]);
-    await mount({ repositoryId: "A", jobId: detail.jobId });
-    expect(content()).toContain("Older direct job");
+  screenTest("keeps the accepted checkpoint pending after Back to jobs", async () => {
+    fixture.job.mockReturnValue({
+      ...vmReview,
+      responsePending: true,
+      pendingResponseOperation: "approve",
+    });
+    fixture.list.mockResolvedValue([
+      { ...summary(vmReview.jobId), status: "awaiting_review", checkpointResponsePending: true },
+    ]);
+    await mount({ repositoryId: "A", jobId: vmReview.jobId });
+    expect(content()).toContain(vmReview.instruction);
     await press("Back to jobs");
-    expect(content()).toContain("Recent A run");
-    expect(content()).not.toContain("No runs in this view");
+    expect(content()).toContain(vmReview.jobId);
+    expect(content()).toContain("Waiting for confirmation");
+    expect(content()).not.toContain("Needs review");
     expect(fixture.list).toHaveBeenCalledWith("A");
   });
+  screenTest(
+    "reopens the same sidebar run after switching runs and going back to jobs",
+    async () => {
+      fixture.job.mockImplementation((jobId) => ({ ...detail, ...summary(jobId) }));
+      fixture.list.mockResolvedValue([summary("Listed run")]);
+      await mount({ repositoryId: "A", jobId: "First run" });
+      expect(content()).toContain("First run");
+      const openSecondRun = async () => {
+        const before = deliveries.length;
+        await act(async () =>
+          fixture.navigate("SettingsSheet", workflowJobsDestination("A", "Second run")),
+        );
+        await finishReadsSince(before);
+      };
+      await openSecondRun();
+      expect(content()).toContain("Second run");
+      await press("Back to jobs");
+      expect(content()).toContain("Listed run");
+      expect(content()).not.toContain("Back to jobs");
+      await openSecondRun();
+      expect(content()).toContain("Back to jobs");
+      expect(content()).toContain("Second run");
+    },
+  );
   screenTest(
     "shows loading rather than an empty list while a selected repository is unread",
     async () => {

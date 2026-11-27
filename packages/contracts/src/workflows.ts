@@ -793,6 +793,10 @@ export const RepositoryWorkflowJobSummary = Schema.Struct({
   needsAttention: Schema.optional(Schema.Boolean),
   /** Active checkpoint response awaiting executor acknowledgement. */
   checkpointResponsePending: Schema.optional(Schema.Boolean),
+  cancellationState: Schema.optional(Schema.Literals(["retry_needed", "pending"])),
+  manualPauseState: Schema.optional(
+    Schema.Literals(["pause_requested", "resume_requested", "paused"]),
+  ),
   /** Result saving or final checks that take precedence over a retained checkpoint. */
   completionState: Schema.optional(
     Schema.Literals([
@@ -823,6 +827,38 @@ export const WorkflowJobPage = Schema.Struct({
   nextCursor: Schema.NullOr(Schema.String),
 });
 export type WorkflowJobPage = typeof WorkflowJobPage.Type;
+
+export const ActiveWorkflowRun = Schema.Struct({
+  queueReason: Schema.optional(
+    Schema.NullOr(Schema.Struct({ code: WorkflowQueueReason.fields.code })),
+  ),
+  needsAttention: RepositoryWorkflowJobSummary.fields.needsAttention,
+  manualPauseState: RepositoryWorkflowJobSummary.fields.manualPauseState,
+  checkpointResponsePending: RepositoryWorkflowJobSummary.fields.checkpointResponsePending,
+  cancellationState: RepositoryWorkflowJobSummary.fields.cancellationState,
+  completionState: RepositoryWorkflowJobSummary.fields.completionState,
+  vmRecovery: Schema.optionalKey(Schema.Struct({ state: WorkflowVmRecovery.fields.state })),
+  jobId: RepositoryWorkflowJob.fields.jobId,
+  repositoryId: RepositoryWorkflowJob.fields.repositoryId,
+  repositoryName: Schema.String,
+  title: Schema.String,
+  issueIdentifier: Schema.NullOr(Schema.String),
+  status: RepositoryWorkflowJob.fields.status,
+  createdAt: RepositoryWorkflowJob.fields.createdAt,
+});
+export type ActiveWorkflowRun = typeof ActiveWorkflowRun.Type;
+export const ActiveWorkflowRunPageQuery = Schema.Struct({
+  cursor: WorkflowJobPageQuery.fields.cursor,
+  limit: WorkflowJobPageQuery.fields.limit,
+});
+export type ActiveWorkflowRunPageQuery = typeof ActiveWorkflowRunPageQuery.Type;
+export const ActiveWorkflowRunPage = Schema.Struct({
+  organizationId: Schema.NullOr(TrimmedNonEmptyString),
+  total: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  jobs: Schema.Array(ActiveWorkflowRun),
+  nextCursor: Schema.NullOr(Schema.String),
+});
+export type ActiveWorkflowRunPage = typeof ActiveWorkflowRunPage.Type;
 
 const ControlBinding = {
   organizationId: TrimmedNonEmptyString,

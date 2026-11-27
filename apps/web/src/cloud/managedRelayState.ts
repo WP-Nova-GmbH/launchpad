@@ -22,7 +22,7 @@ import type { EnvironmentId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 import { useCallback, useEffect } from "react";
 
 import { runtime } from "../lib/runtime";
@@ -166,10 +166,16 @@ export function useManagedRelayOrganizationCatalog(options?: {
       });
     }
   }, [snapshot.error, snapshot.errorTraceId]);
-  const refresh = useCallback(() => {
-    if (accountId) {
-      manager.refresh(appAtomRegistry, accountId);
-    }
+  const refresh = useCallback(async () => {
+    if (!accountId) return;
+    manager.refresh(appAtomRegistry, accountId);
+    // Consumers that verify access must wait for the new read, including when
+    // the atom is still exposing cached repositories during revalidation.
+    await Effect.runPromise(
+      AtomRegistry.getResult(appAtomRegistry, manager.catalogAtom(accountId), {
+        suspendOnWaiting: true,
+      }).pipe(Effect.exit),
+    );
   }, [accountId, manager]);
 
   return {

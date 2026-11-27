@@ -33,6 +33,7 @@ import { prepare as prepareAutomationSave } from "../workflowEvents/Preparation.
 import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
+import { pageActiveWorkflowRuns } from "../jobs/ActiveWorkflowRuns.ts";
 import {
   isWorkflowCheckpointResponse,
   lockWorkflowVmCheckpoint,
@@ -828,6 +829,12 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
             updatedAt: record.updatedAt,
           })),
         };
+      }).pipe(errors),
+    )
+    .handle("pageActiveJobs", ({ query }) =>
+      Effect.gen(function* () {
+        const { userId } = yield* RelayClientPrincipal;
+        return yield* pageActiveWorkflowRuns(yield* RelayDb, userId, query);
       }).pipe(errors),
     )
     .handle("pageJobs", ({ params, query }) =>

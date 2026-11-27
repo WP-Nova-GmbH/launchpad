@@ -2,9 +2,6 @@ import {
   RepositoryWorkflow,
   RepositoryWorkflowJob,
   isTerminalWorkflowJob,
-  workflowIsFinishing,
-  type RepositoryWorkflowJobSummary,
-  type WorkflowJobProgress,
   WorkflowConflictError,
   WorkflowInvalidError,
   type WorkflowJobPageQuery,
@@ -25,6 +22,16 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Routing from "../workflowEvents/Routing.ts";
 import { vmWorkflowExecutionUnavailable, workflowRunTargetChanged } from "./WorkflowTarget.ts";
+import {
+  cancellationState,
+  checkpointResponsePending,
+  finalChecks,
+  manualPauseState,
+  resultSave,
+  resultSaveState,
+  summaryNeedsAttention,
+  workflowRunCompletionState,
+} from "./WorkflowRunStatus.ts";
 import { RelayDb } from "../db.ts";
 import { relayRepositoryWorkflows, relayWorkflowJobs } from "../persistence/schema.ts";
 import { getRepositoryWorkflowConfiguration } from "./RepositoryWorkflowConfiguration.ts";
@@ -559,8 +566,7 @@ export const make = Effect.gen(function* () {
       const history = query.view === "history";
       const limit = query.limit ?? 50;
       const needsAttention = sql<boolean>`(
-        (${jobs.summary}->>'needsAttention' IS NOT DISTINCT FROM 'true'
-          AND ${jobs.summary}#>>'{queueReason,code}' IS DISTINCT FROM 'vm_waiting_capacity')
+        ${summaryNeedsAttention}
         OR (${jobs.record}#>>'{runtime,kind}'='vm'
           AND (${jobs.status} IN ('awaiting_review','awaiting_input')
             OR (${jobs.status}='cancelling'
@@ -574,60 +580,14 @@ export const make = Effect.gen(function* () {
               AND t.organization_id=${jobs.organizationId} AND t.repository_id=${jobs.repositoryId}
               AND r.phase<>'completed' AND r.error_code='boot_deletion_unconfirmed'
               AND r.boot_recovery_started_at IS NOT NULL AND r.boot_receipt IS NOT NULL))) IS TRUE)`;
-      const pendingOperation = sql`${jobs.pendingControl}#>>'{response,operation}'`;
-      // Match canReplaceBlockedCheckpoint in WorkflowsApi. Retry saving stays available
-      // when the VM checkpoint response has never reached the executor.
-      const blockedByRetryableSave = sql<boolean>`(
-        ${jobs.record}#>>'{runtime,kind}' = 'vm'
-        AND ${jobs.pendingControl}->>'responseId' IS NOT NULL
-        AND ${jobs.pendingControl}->>'checkpointDispatch' IS NULL
-        AND ${jobs.record}#>>'{progress,resultSaving,state}' = 'failed'
-        AND ${jobs.record}#>>'{progress,resultSaving,retryable}' = 'true'
-      )`;
-      const checkpointResponsePending = sql<boolean>`(
-        (${jobs.status} = 'awaiting_review'
-          AND ${jobs.record}#>>'{progress,approvalPending}' = 'true')
-        OR (
-          ((${jobs.status} = 'awaiting_input' AND ${pendingOperation} = 'input')
-            OR (${jobs.status} = 'awaiting_review' AND ${pendingOperation} IN ('request_changes', 'approve')))
-            AND ${blockedByRetryableSave} IS NOT TRUE
-        )
-      ) IS TRUE`;
-      const approvalPending = sql<boolean>`(
-        ${pendingOperation} = 'approve'
-        OR ${jobs.record}#>>'{progress,approvalPending}' = 'true'
-      ) IS TRUE`;
-      const resultSave = sql`${jobs.record}#>'{progress,resultSaving}'`;
-      const resultSaveState = sql<RepositoryWorkflowJobSummary["completionState"] | null>`
-        CASE WHEN ${jobs.status} IN ('awaiting_input', 'awaiting_review', 'finishing') THEN
-          CASE ${resultSave}->>'state'
-            WHEN 'saving' THEN 'saving_result'
-            WHEN 'failed' THEN
-              CASE WHEN ${pendingOperation} = 'retry_saving'
-                AND ${jobs.pendingControl}#>>'{response,publicationId}' = ${resultSave}->>'publicationId'
-                THEN 'retrying_save' ELSE 'save_failed' END
-          END
-        END`;
-      const finalChecks = sql<{
-        stepIds: readonly string[];
-        steps: WorkflowJobProgress["steps"] | null;
-        detail: string | null;
-        retryableApproval: boolean | null;
-        approvalPending: boolean;
-      } | null>`
-        CASE WHEN ${jobs.status} IN ('awaiting_review', 'finishing') THEN jsonb_build_object(
-          'stepIds', jsonb_path_query_array(${jobs.record}, '$.workflow.definition.steps[*].id'),
-          'steps', ${jobs.record}#>'{progress,steps}',
-          'detail', ${jobs.record}#>>'{progress,detail}',
-          'retryableApproval', ${jobs.record}#>'{progress,retryableApproval}',
-          'approvalPending', ${approvalPending}
-        ) END`;
       const rows = yield* persist(
         db
           .select({
             summary: jobs.summary,
             needsAttention,
+            cancellationState,
             checkpointResponsePending,
+            manualPauseState,
             resultSaveState,
             resultSaveDetail: sql<
               string | null
@@ -664,29 +624,19 @@ export const make = Effect.gen(function* () {
           ({
             summary,
             needsAttention,
+            cancellationState,
             checkpointResponsePending,
+            manualPauseState,
             targetKind,
             resultSaveState,
             resultSaveDetail,
             finalChecks,
           }) => {
-            let completionState = resultSaveState;
-            if (
-              !completionState &&
-              finalChecks &&
-              workflowIsFinishing({
-                status: summary.status,
-                workflow: { definition: { steps: finalChecks.stepIds.map((id) => ({ id })) } },
-                progress: { steps: finalChecks.steps ?? undefined },
-              })
-            ) {
-              // The detail client clears retryableApproval for cancel-only messages. Those
-              // messages still indicate a blocked completion even when retry is unavailable.
-              const blocked =
-                !finalChecks.approvalPending &&
-                (finalChecks.retryableApproval === true || !!finalChecks.detail?.trim());
-              completionState = blocked ? "completion_blocked" : "finishing";
-            }
+            const completionState = workflowRunCompletionState(
+              summary.status,
+              resultSaveState,
+              finalChecks,
+            );
             const reason = (
               completionState === "save_failed"
                 ? resultSaveDetail
@@ -701,7 +651,9 @@ export const make = Effect.gen(function* () {
             return {
               ...summary,
               needsAttention,
+              ...(cancellationState ? { cancellationState } : {}),
               ...(checkpointResponsePending ? { checkpointResponsePending } : {}),
+              ...(manualPauseState ? { manualPauseState } : {}),
               ...(completionState ? { completionState } : {}),
               ...(completionDetail ? { completionDetail } : {}),
               targetKind,

@@ -263,6 +263,9 @@ requirements. Source or issue access problems hold the run and show recovery gui
 a source prevents new handoffs. Work already marked Starting may continue. Use Cancel run to stop
 existing work.
 
+Open **Workflow Runs** below your threads to follow active runs across the repositories you can
+access. Select a run to see its progress or respond when it needs review or input.
+
 **Runs** opens with active jobs, oldest first, including jobs from archived workflows. Use
 **Needs attention** to find human checkpoints, pauses and blocked jobs, or **History** for completed
 runs, newest first. Load more runs to reach older history or further active jobs. Refresh starts from
