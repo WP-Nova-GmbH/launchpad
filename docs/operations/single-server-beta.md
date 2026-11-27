@@ -43,7 +43,12 @@ git switch --detach "${BETA_COMMIT:?Set BETA_COMMIT to the beta commit}"
 ```
 
 Install `vp` as described in [Development](development.md#first-checkout) and run
-`vp i --frozen-lockfile` from this checkout before starting or building E2B.
+the following from this checkout before starting or building E2B:
+
+```sh
+vp i --frozen-lockfile --filter @t3tools/monorepo \
+  --filter 'launchpad-relay...' --filter '@t3tools/scripts...'
+```
 
 ## Deploy the relay
 

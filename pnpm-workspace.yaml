@@ -99,6 +99,9 @@ minimumReleaseAgeExclude:
   - cn@0.3.2
 
 overrides:
+  # The relay uses Drizzle with PostgreSQL. Its optional Expo peer otherwise
+  # pulls the mobile runtime into filtered relay installs.
+  "drizzle-orm>expo-sqlite": "-"
   # Earlier React Navigation declarations create a circular type alias in TypeScript 7.
   "@react-navigation/core": 7.21.13
   # The dbus-next patch drops usocket from the package, but pnpm resolves from the
