@@ -82,6 +82,8 @@ import {
   invalidateWorkflowJobRead,
   emptyWorkflowJobRead,
   workflowStatusLabel,
+  workflowAgentActivityView,
+  workflowActivityTimeLabel,
   workflowJobAccessLost,
   requireFreshWorkflowReviewRead,
   workflowReviewApprovalState,
@@ -126,10 +128,10 @@ import {
 
 type Operation = Exclude<WorkflowControl["operation"], "start" | "status">;
 type SavedReviewRender = { key: string; visitId: string };
-type MachineResultDestination =
+type WorkflowResultDestination =
   | { kind: "conversation" }
   | { kind: "diff"; checkpoint: WorkflowResultCheckpoint; review: boolean };
-type MachineResultOpening = { destination: MachineResultDestination } & (
+type WorkflowResultOpening = { destination: WorkflowResultDestination } & (
   | { status: "opening" }
   | { status: "failed"; detail: string }
 );
@@ -357,9 +359,9 @@ export function WorkflowJob({
     return (state.__TSR_key ?? state.key) === runEntryKey;
   }, [history, runEntryKey]);
   const openResult = useAtomCommand(openPortableThreadChat, { reportFailure: false });
-  const [machineResult, setMachineResult] = useState<MachineResultOpening | null>(null);
-  const openingResult = machineResult?.status === "opening" ? machineResult.destination.kind : null;
-  const resultError = machineResult?.status === "failed" ? machineResult : null;
+  const [resultLookup, setResultLookup] = useState<WorkflowResultOpening | null>(null);
+  const openingResult = resultLookup?.status === "opening" ? resultLookup.destination.kind : null;
+  const resultError = resultLookup?.status === "failed" ? resultLookup : null;
   const retryResultButton = useRef<HTMLButtonElement>(null);
   const resultActions = useRef<HTMLDivElement>(null);
   const restoreOpeningFocus = useRef(false);
@@ -440,20 +442,43 @@ export function WorkflowJob({
     selectedJob?.runtime?.kind === "machine" ? selectedJob.runtime.environmentId : undefined;
   const resultThreadId =
     selectedJob?.progress?.hasThread === false ? undefined : selectedJob?.progress?.threadId;
-  const resultRequest = useRef<{
-    key: string;
-    entryKey: string | undefined;
-    review: boolean;
-  } | null>(null);
+  const agentActivity = workflowAgentActivityView(selectedJob);
+  const liveVmConversation = agentActivity?.available === true;
+  const liveStepId = liveVmConversation ? selectedJob?.progress?.stepId : undefined;
+  const liveGeneration = liveVmConversation ? selectedJob?.progress?.generation : undefined;
+  const liveRetry = liveVmConversation ? selectedJob?.progress?.agentRetryAttempt : undefined;
+  const resultCanOpen = !!resultThreadId && (!!resultEnvironmentId || liveVmConversation);
+  const resultScope =
+    resultCanOpen && !(liveVmConversation && read.error)
+      ? JSON.stringify([
+          key,
+          runEntryKey,
+          resultEnvironmentId,
+          resultThreadId,
+          liveStepId,
+          liveGeneration,
+          liveRetry,
+        ])
+      : null;
+  const resultRequest = useRef<{ scope: string; review: boolean } | null>(null);
   useLayoutEffect(() => {
-    if (!resultEnvironmentId || !resultThreadId) return;
-    return () => {
-      const request = resultRequest.current;
-      if (request?.key === key && request.entryKey === runEntryKey) resultRequest.current = null;
-      setMachineResult(null);
+    if (!resultScope) return;
+    const clear = () => {
+      if (resultRequest.current?.scope === resultScope) resultRequest.current = null;
+      setResultLookup(null);
       restoreOpeningFocus.current = false;
     };
-  }, [key, runEntryKey, resultEnvironmentId, resultThreadId]);
+    if (!liveVmConversation) return clear;
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden" && resultRequest.current?.scope === resultScope)
+        clear();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clear();
+    };
+  }, [resultScope, liveVmConversation]);
   useLayoutEffect(() => {
     if (!openingResult || !restoreOpeningFocus.current) return;
     restoreOpeningFocus.current = false;
@@ -839,10 +864,11 @@ export function WorkflowJob({
       settleWorkflowJobRequest(appAtomRegistry, request, workflowError(cause));
     }
   };
-  const inspect = async (destination: MachineResultDestination) => {
+  const inspect = async (destination: WorkflowResultDestination) => {
     if (
+      !resultScope ||
       !isRunEntryCurrent() ||
-      !resultEnvironmentId ||
+      (destination.kind === "diff" && !resultEnvironmentId) ||
       !resultThreadId ||
       resultRequest.current ||
       (destination.kind === "diff" && checkingReturnedReview)
@@ -850,36 +876,53 @@ export function WorkflowJob({
       return;
     const session = appAtomRegistry.get(managedRelaySessionAtom);
     const request = {
-      key,
-      entryKey: runEntryKey,
+      scope: resultScope,
       review: destination.kind === "diff" && destination.review,
     };
     resultRequest.current = request;
     const owns = () => {
-      const current = appAtomRegistry.get(workflowJobReadAtom).jobs[key]?.job;
+      const state = appAtomRegistry.get(workflowJobReadAtom);
+      const currentRead = state.jobs[key];
+      const current = currentRead?.job;
       return (
         resultRequest.current === request &&
         isRunEntryCurrent() &&
         appAtomRegistry.get(managedRelaySessionAtom) === session &&
-        current?.runtime?.kind === "machine" &&
-        current.runtime.environmentId === resultEnvironmentId &&
-        current.progress?.threadId === resultThreadId &&
-        current.progress.hasThread !== false
+        current?.progress?.threadId === resultThreadId &&
+        current.progress.hasThread !== false &&
+        (resultEnvironmentId
+          ? current.runtime?.kind === "machine" &&
+            current.runtime.environmentId === resultEnvironmentId
+          : state.activeKey === key &&
+            currentRead?.error === null &&
+            document.visibilityState !== "hidden" &&
+            current.progress.stepId === liveStepId &&
+            current.progress.generation === liveGeneration &&
+            current.progress.agentRetryAttempt === liveRetry &&
+            workflowAgentActivityView(current)?.available === true)
       );
     };
+    if (!owns()) {
+      resultRequest.current = null;
+      return;
+    }
     const retry = retryResultButton.current;
     restoreOpeningFocus.current = !!retry && retry.ownerDocument.activeElement === retry;
-    setMachineResult({ status: "opening", destination });
+    setResultLookup({ status: "opening", destination });
     let failure: string | undefined;
     try {
       const result = await openResult({
         threadId: resultThreadId,
         title: selectedJob?.workflow?.definition.name ?? "Workflow result",
-        workflowResult: { ...scope, originalEnvironmentId: resultEnvironmentId },
+        workflowResult: resultEnvironmentId
+          ? { ...scope, originalEnvironmentId: resultEnvironmentId }
+          : { ...scope, jobId },
       });
       if (!owns()) return;
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
       const { environmentId, threadId, workflowVmGeneration } = result.value;
+      if (liveVmConversation && (threadId !== resultThreadId || workflowVmGeneration === undefined))
+        throw new Error("The Agent conversation changed. Refresh the run and try again.");
       const params = { environmentId, threadId };
       const machineReviewVisitId =
         destination.kind === "diff" && destination.review ? randomUUID() : undefined;
@@ -937,7 +980,7 @@ export function WorkflowJob({
     } finally {
       if (resultRequest.current === request) {
         resultRequest.current = null;
-        setMachineResult(
+        setResultLookup(
           failure === undefined ? null : { status: "failed", destination, detail: failure },
         );
       }
@@ -1435,7 +1478,7 @@ export function WorkflowJob({
       </Button>
     ) : null;
   const conversationActions =
-    resultEnvironmentId && resultThreadId && (!composingFeedback || openingResult) ? (
+    resultCanOpen && (!composingFeedback || openingResult) ? (
       <div ref={resultActions} className="flex min-w-0 flex-wrap gap-2 empty:hidden">
         {!showReviewInspection ? inspectDiffAction : null}
         {openingResult === "conversation" ||
@@ -1452,7 +1495,7 @@ export function WorkflowJob({
             }
             aria-busy={openingResult === "conversation" || undefined}
             aria-disabled={openingResult === "conversation" || undefined}
-            disabled={openingResult === "diff"}
+            disabled={openingResult === "diff" || !resultScope}
             onClick={() => void inspect({ kind: "conversation" })}
           >
             {openingResult === "conversation" ? (
@@ -2087,6 +2130,32 @@ export function WorkflowJob({
                         {taskTitle}
                       </h2>
                     ) : null}
+                    {agentActivity ? (
+                      <div aria-label="Agent activity" role="group" className="min-w-0 space-y-1">
+                        {agentActivity.message ? (
+                          <p className="line-clamp-3 wrap-anywhere whitespace-pre-line text-sm">
+                            {agentActivity.message}
+                          </p>
+                        ) : null}
+                        {agentActivity.tool ? (
+                          <p className="text-sm text-muted-foreground">{agentActivity.tool}</p>
+                        ) : null}
+                        {agentActivity.updatedAt ? (
+                          <time
+                            className="block text-xs text-muted-foreground"
+                            dateTime={agentActivity.updatedAt}
+                          >
+                            {workflowActivityTimeLabel(agentActivity.updatedAt)}
+                          </time>
+                        ) : !agentActivity.message && !agentActivity.tool ? (
+                          <p className="text-sm text-muted-foreground">
+                            {agentActivity.available
+                              ? "Waiting for the Agent’s first update."
+                              : "Live activity is unavailable."}
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
                     {conversationInTask && nextStep ? (
                       <p className="text-xs text-muted-foreground">Up next is {nextStep.title}.</p>
                     ) : null}
@@ -2191,7 +2260,7 @@ export function WorkflowJob({
             ? conversationActions
             : null}
           {/* Keep result feedback in place as the action row moves between run states. */}
-          {resultEnvironmentId && resultThreadId ? (
+          {resultCanOpen ? (
             <span role="status" className="sr-only">
               {openingResult ? resultOpeningLabel : ""}
             </span>

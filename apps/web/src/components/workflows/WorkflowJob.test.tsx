@@ -3055,6 +3055,183 @@ describe("workflow run outcomes", () => {
     },
   };
 
+  describe("live VM Agent activity", () => {
+    const active = {
+      ...job,
+      workflow: {
+        ...workflow,
+        definition: { ...workflow.definition, target: { kind: "vm", baseBranch: null } },
+      },
+      runtime: { kind: "vm", threadId: job.progress!.threadId },
+      status: "running",
+      progress: {
+        ...job.progress!,
+        status: "running",
+        checkpoint: null,
+        stepId: "agent",
+        generation: 0,
+        hasThread: true,
+        steps: [{ stepId: "agent", generation: 0, status: "running" }],
+      },
+      agentActivity: {
+        message: "I found the deployment check.",
+        tool: "Running command",
+        updatedAt: "2026-11-27T09:18:12.000Z",
+      },
+    } satisfies RepositoryWorkflowJob;
+    const activity = () => renderer!.root.findByProps({ "aria-label": "Agent activity" });
+
+    it("updates the current Agent preview and opens its read-only conversation on demand", async () => {
+      fixture.call.mockResolvedValue(active);
+      await mount(false);
+      expect(text(activity())).toContain(active.agentActivity.message);
+      expect(text(activity())).toContain(active.agentActivity.tool);
+      expect(activity().findByType("time").props.dateTime).toBe(active.agentActivity.updatedAt);
+      expect(fixture.open).not.toHaveBeenCalled();
+
+      fixture.call.mockResolvedValue({
+        ...active,
+        agentActivity: { ...active.agentActivity, tool: null, message: "The checks passed." },
+      });
+      await pollRun();
+      expect(text(activity())).toContain("The checks passed.");
+      expect(text(activity())).not.toContain(active.agentActivity.tool);
+
+      await press("Open conversation");
+      expect(fixture.open).toHaveBeenCalledExactlyOnceWith({
+        title: workflow.definition.name,
+        threadId: active.runtime.threadId,
+        workflowResult: { ...scope, jobId: job.jobId },
+      });
+      expect(fixture.navigate.mock.calls[0]![0].state({}).workflowOrigin).toMatchObject({
+        jobId: job.jobId,
+        threadId: active.runtime.threadId,
+        workflowVmResultReader: true,
+      });
+    });
+
+    it.each([
+      { environmentId: "vm", threadId: "thread" },
+      { environmentId: "vm", threadId: "other", workflowVmGeneration: 1 },
+    ])("keeps the run open when the result reader cannot confirm its VM thread", async (value) => {
+      fixture.call.mockResolvedValue(active);
+      fixture.open.mockResolvedValueOnce({ _tag: "Success", value });
+      await mount(false);
+      await press("Open conversation");
+      expect(fixture.navigate).not.toHaveBeenCalled();
+      expect(text(renderer!.root)).toContain("The Agent conversation changed.");
+    });
+
+    it("discards a pending conversation when the tab is hidden and shown before the run refreshes", async () => {
+      const tab = Object.assign(new EventTarget(), { visibilityState: "visible" });
+      vi.stubGlobal("document", tab);
+      const opening = deferred();
+      const refresh = deferred();
+      fixture.open.mockReturnValueOnce(opening.promise);
+      fixture.call.mockResolvedValue(active);
+      await mount();
+      await press("Open conversation");
+
+      await act(() => {
+        tab.visibilityState = "hidden";
+        tab.dispatchEvent(new Event("visibilitychange"));
+      });
+      fixture.call.mockReturnValueOnce(refresh.promise);
+      await act(() => {
+        tab.visibilityState = "visible";
+        tab.dispatchEvent(new Event("visibilitychange"));
+      });
+      await act(async () => {
+        opening.resolve({
+          _tag: "Success",
+          value: { environmentId: "vm", threadId: "thread", workflowVmGeneration: 1 },
+        });
+        await opening.promise;
+      });
+      expect(fixture.navigate).not.toHaveBeenCalled();
+      await act(async () => {
+        refresh.resolve({ ...active, status: "awaiting_review" });
+        await refresh.promise;
+      });
+      expect(findButton("Open conversation")).toBeUndefined();
+    });
+
+    it("discards a pending conversation after a failed poll and allows a fresh open after recovery", async () => {
+      const opening = deferred();
+      fixture.open.mockReturnValueOnce(opening.promise);
+      fixture.call.mockResolvedValue(active);
+      await mount();
+      await press("Open conversation");
+      fixture.call.mockRejectedValueOnce(new Error("Could not refresh the run."));
+      await pollRun();
+      expect(findButton("Open conversation").props.disabled).toBe(true);
+
+      await pollRun();
+      expect(conversationOpeningIsBlocked()).toBe(false);
+      await act(async () => {
+        opening.resolve({
+          _tag: "Success",
+          value: { environmentId: "vm", threadId: "thread", workflowVmGeneration: 1 },
+        });
+        await opening.promise;
+      });
+      expect(fixture.navigate).not.toHaveBeenCalled();
+      await press("Open conversation");
+      expect(fixture.navigate).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      { generation: 1, agentRetryAttempt: undefined },
+      { generation: 0, agentRetryAttempt: 1 },
+    ])(
+      "drops a stale conversation lookup and the old message on a new attempt (%o)",
+      async (attempt) => {
+        const pending = deferred();
+        fixture.open.mockReturnValueOnce(pending.promise);
+        fixture.call.mockResolvedValue(active);
+        await mount();
+        await press("Open conversation");
+        fixture.call.mockResolvedValue({
+          ...active,
+          progress: {
+            ...active.progress,
+            ...attempt,
+            steps: [{ stepId: "agent", generation: attempt.generation, status: "running" }],
+          },
+          agentActivity: { message: null, tool: null, updatedAt: null },
+        });
+        await pollRun();
+        await act(async () => {
+          pending.resolve({
+            _tag: "Success",
+            value: { environmentId: "vm", threadId: "thread", workflowVmGeneration: 1 },
+          });
+          await pending.promise;
+        });
+        expect(fixture.navigate).not.toHaveBeenCalled();
+        expect(text(activity())).toContain("Waiting for the Agent’s first update.");
+        expect(text(activity())).not.toContain(active.agentActivity.message);
+        expect(conversationOpeningIsBlocked()).toBe(false);
+      },
+    );
+
+    it("does not offer a live viewer for unavailable or finished VM steps", async () => {
+      fixture.call.mockResolvedValue({ ...active, agentActivity: undefined });
+      await mount();
+      expect(text(activity())).toContain("Live activity is unavailable.");
+      expect(findButton("Open conversation")).toBeUndefined();
+
+      fixture.call.mockResolvedValue({
+        ...active,
+        status: "done",
+        progress: { ...active.progress, status: "done", stepId: "push" },
+      });
+      await pollRun();
+      expect(text(renderer!.root)).not.toContain(active.agentActivity.message);
+      expect(findButton("Open conversation")).toBeUndefined();
+    });
+  });
+
   it("updates the ordered progress rows as a run moves through checkpoints and fails", async () => {
     const runWorkflow = {
       ...workflow,

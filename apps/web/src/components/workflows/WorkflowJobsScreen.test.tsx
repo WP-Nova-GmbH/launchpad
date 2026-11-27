@@ -23,7 +23,7 @@ import {
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry, AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import { RelayRepositoryId, RelayTenancyForbiddenError } from "@t3tools/contracts/relay";
 import type {
   RepositoryWorkflowJob,
   RespondToWorkflowJob,
@@ -379,6 +379,186 @@ effectIt.layer(
     progress: { ...resultJob.progress!, status: "awaiting_review" },
     viewerControls: { canApprove: true, canRespond: false, canCancel: true },
   } satisfies RepositoryWorkflowJob;
+
+  const workingAgent = {
+    ...vmReview,
+    status: "running",
+    workflow: {
+      workflowId: "workflow",
+      repositoryId: "A",
+      organizationId: "organization",
+      revision: 1,
+      archived: false,
+      createdAt: vmReview.createdAt,
+      updatedAt: vmReview.updatedAt,
+      definition: {
+        name: "Implement issue",
+        target: { kind: "vm", baseBranch: null },
+        steps: [
+          {
+            id: "agent",
+            kind: "agent",
+            title: "Implement",
+            instruction: "Implement the issue.",
+            modelSelection: null,
+          },
+          { id: "review", kind: "review", title: "Review", role: "member" },
+        ],
+      },
+    },
+    progress: {
+      ...vmReview.progress,
+      status: "running",
+      stepId: "agent",
+      generation: 0,
+      hasThread: true,
+      steps: [{ stepId: "agent", generation: 0, status: "running" }],
+      checkpoint: null,
+    },
+    agentActivity: {
+      message: "I found the dependency that causes this.",
+      tool: "Running a command",
+      updatedAt: "2026-11-27T09:04:00.000Z",
+    },
+  } satisfies RepositoryWorkflowJob;
+
+  screenTest(
+    "shows current Agent activity and opens its VM conversation read-only on request",
+    async () => {
+      fixture.job.mockReturnValue(workingAgent);
+      await mount({ repositoryId: "A", jobId: workingAgent.jobId });
+      expect(content()).toContain(workingAgent.agentActivity.message);
+      expect(content()).toContain(workingAgent.agentActivity.tool);
+      expect(content()).toContain("Last activity");
+      expect(fixture.openResult).not.toHaveBeenCalled();
+      await press("Open conversation");
+      expect(fixture.openResult).toHaveBeenCalledExactlyOnceWith({
+        threadId: workingAgent.progress.threadId,
+        title: "Implement issue",
+        workflowResult: {
+          accountId: fixture.accountId,
+          repositoryId: "A",
+          organizationId: "organization",
+          jobId: workingAgent.jobId,
+        },
+      });
+      expect(fixture.navigate).toHaveBeenCalledWith(
+        "Thread",
+        expect.objectContaining({
+          environmentId: "moved-vm",
+          threadId: workingAgent.progress.threadId,
+          workflowOrigin: expect.objectContaining({ workflowVmResultReader: true }),
+        }),
+      );
+    },
+  );
+
+  screenTest("discards an open from the previous Agent attempt when rework begins", async () => {
+    fixture.job.mockReturnValue(workingAgent);
+    const opening = deferred<unknown>();
+    fixture.openResult.mockReturnValueOnce(opening.promise);
+    await mount({ repositoryId: "A", jobId: workingAgent.jobId });
+    await press("Open conversation");
+    fixture.job.mockReturnValue({
+      ...workingAgent,
+      progress: {
+        ...workingAgent.progress,
+        revision: 6,
+        generation: 1,
+        steps: [{ stepId: "agent", generation: 1, status: "running" }],
+      },
+      agentActivity: { message: null, tool: null, updatedAt: null },
+    });
+    const before = deliveries.length;
+    await act(() => {
+      for (const notify of fixture.appStateListeners) notify("active");
+    });
+    await act(async () => {
+      await Promise.all(deliveries.slice(before));
+    });
+    expect(content()).toContain("Waiting for the Agent’s first update.");
+    expect(content()).not.toContain(workingAgent.agentActivity.message);
+    const openButton = () =>
+      renderer!.root.findAll((node) => node.props.label === "Open conversation")[0]!;
+    expect(openButton().props.disabled).toBe(false);
+    const secondOpening = deferred<unknown>();
+    fixture.openResult.mockReturnValueOnce(secondOpening.promise);
+    await press("Open conversation");
+    expect(fixture.openResult).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      opening.resolve({
+        _tag: "Success",
+        value: {
+          environmentId: "moved-vm",
+          threadId: workingAgent.progress.threadId,
+          workflowVmGeneration: 1,
+        },
+      });
+      await opening.promise;
+    });
+    expect(fixture.navigate).not.toHaveBeenCalled();
+    expect(openButton().props.disabled).toBe(true);
+    await act(async () => {
+      secondOpening.resolve({
+        _tag: "Success",
+        value: {
+          environmentId: "current-vm",
+          threadId: workingAgent.progress.threadId,
+          workflowVmGeneration: 2,
+        },
+      });
+      await secondOpening.promise;
+    });
+    expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith(
+      "Thread",
+      expect.objectContaining({
+        environmentId: "current-vm",
+        workflowOrigin: expect.objectContaining({ workflowVmResultReader: true }),
+      }),
+    );
+  });
+
+  screenTest(
+    "removes visible Agent activity and discards an open when repository access is revoked",
+    async () => {
+      fixture.job.mockReturnValue(workingAgent);
+      const opening = deferred<unknown>();
+      fixture.openResult.mockReturnValueOnce(opening.promise);
+      await mount({ repositoryId: "A", jobId: workingAgent.jobId });
+      await press("Open conversation");
+      fixture.job.mockImplementation(() => {
+        throw new Error("Repository access removed.", {
+          cause: new RelayTenancyForbiddenError({
+            code: "tenancy_forbidden",
+            reason: "no_repository_access",
+            traceId: "trace",
+          }),
+        });
+      });
+      const before = deliveries.length;
+      await act(() => {
+        for (const notify of fixture.appStateListeners) notify("active");
+      });
+      await act(async () => {
+        await Promise.all(deliveries.slice(before));
+      });
+      expect(content()).toContain("Repository access removed.");
+      expect(content()).not.toContain(workingAgent.agentActivity.message);
+      expect(content()).not.toContain("Open conversation");
+      await act(async () => {
+        opening.resolve({
+          _tag: "Success",
+          value: {
+            environmentId: "moved-vm",
+            threadId: workingAgent.progress.threadId,
+            workflowVmGeneration: 1,
+          },
+        });
+        await opening.promise;
+      });
+      expect(fixture.navigate).not.toHaveBeenCalled();
+    },
+  );
 
   screenTest(
     "opens the exact VM Review and blocks approval after returning from a stale checkpoint",

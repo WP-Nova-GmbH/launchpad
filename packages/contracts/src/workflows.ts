@@ -14,6 +14,7 @@ export const WORKFLOW_MAX_STEPS = 32;
 export const WORKFLOW_VM_DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
 export const WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT = "high";
 export const WORKFLOW_COMMIT_SUBJECT_LIMIT = 100;
+export const WORKFLOW_AGENT_ACTIVITY_MESSAGE_LIMIT = 500;
 
 /** The first Agent prompt keeps its original ID even when an Input step precedes it. */
 export function workflowAgentPromptId(
@@ -676,6 +677,14 @@ export type WorkflowVmRecovery = typeof WorkflowVmRecovery.Type;
 
 export const RepositoryWorkflowJob = Schema.Struct({
   issueSnapshot: Schema.optional(WorkflowIssueSnapshot),
+  /** Read from the current VM journal only when viewing this run. */
+  agentActivity: Schema.optionalKey(
+    Schema.Struct({
+      message: Schema.NullOr(Schema.String),
+      tool: Schema.NullOr(Schema.String),
+      updatedAt: Schema.NullOr(Schema.String),
+    }),
+  ),
   publicationOutcome: Schema.optionalKey(
     Schema.Struct({
       state: Schema.Literals(["confirmed", "unknown"]),
@@ -746,6 +755,25 @@ export const RepositoryWorkflowJob = Schema.Struct({
   updatedAt: Schema.String,
 });
 export type RepositoryWorkflowJob = typeof RepositoryWorkflowJob.Type;
+
+export function runningWorkflowVmAgent(job: RepositoryWorkflowJob | null | undefined) {
+  const progress = job?.progress;
+  if (
+    job?.runtime?.kind !== "vm" ||
+    job.status !== "running" ||
+    progress?.status !== "running" ||
+    progress.threadId !== job.runtime.threadId ||
+    progress.hasThread === false ||
+    progress.checkpoint ||
+    progress.resultSaving ||
+    job.vmRecovery
+  )
+    return undefined;
+  return job.workflow?.definition.steps.find(
+    (step): step is typeof WorkflowAgentStep.Type =>
+      step.id === progress.stepId && step.kind === "agent",
+  );
+}
 
 type WorkflowStepCompletion = {
   readonly workflow: {

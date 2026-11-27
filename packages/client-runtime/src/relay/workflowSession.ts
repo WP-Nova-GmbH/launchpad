@@ -16,6 +16,7 @@ import {
   WorkflowAutomation as WorkflowAutomationSchema,
   WorkflowStep as WorkflowStepSchema,
   isTerminalWorkflowJob,
+  runningWorkflowVmAgent,
   workflowCommitSubjectError,
   workflowDefinitionError,
   workflowPublishingPrerequisites,
@@ -820,6 +821,29 @@ export function workflowStepState(job: RepositoryWorkflowJob | null | undefined,
   return progress?.checkpoint?.stepId === stepId || progress?.stepId === stepId
     ? "running"
     : "pending";
+}
+
+export function workflowAgentActivityView(job: RepositoryWorkflowJob | null | undefined) {
+  if (!runningWorkflowVmAgent(job)) return null;
+  const activity = job?.agentActivity;
+  return {
+    message: activity?.message ?? null,
+    tool: activity?.tool ?? null,
+    updatedAt: activity?.updatedAt ?? null,
+    available: activity !== undefined,
+  };
+}
+
+export function workflowActivityTimeLabel(updatedAt: string, now = Date.now()): string {
+  const seconds = Math.max(0, Math.floor((now - Date.parse(updatedAt)) / 1000));
+  if (!Number.isFinite(seconds)) return "Last activity time unavailable";
+  if (seconds < 5) return "Last activity just now";
+  const ago = (count: number, unit: string) =>
+    `Last activity ${count} ${unit}${count === 1 ? "" : "s"} ago`;
+  if (seconds < 60) return ago(seconds, "second");
+  if (seconds < 3600) return ago(Math.floor(seconds / 60), "minute");
+  if (seconds < 86400) return ago(Math.floor(seconds / 3600), "hour");
+  return ago(Math.floor(seconds / 86400), "day");
 }
 
 export const workflowStatusLabel = (status: string) =>

@@ -21,6 +21,8 @@ import {
   workflowStepState,
   workflowStatusLabel,
   workflowRunStatus,
+  workflowAgentActivityView,
+  workflowActivityTimeLabel,
   workflowJobAccessLost,
   beginWorkflowReview,
   bindWorkflowReviewPlacement,
@@ -224,22 +226,47 @@ function WorkflowJobsContent(props: Props) {
     [userId, organizationId, repositoryId],
   );
   const jobKey = scope && selectedJobId ? workflowSessionKey(scope, selectedJobId) : "";
-  const resultRequest = useRef<{ key: string } | null>(null);
+  const resultRequest = useRef<{ key: string; liveAttempt: string | null } | null>(null);
   const [openingResult, setOpeningResult] = useState<string | null>(null);
-  useLayoutEffect(
-    () => () => {
+  useLayoutEffect(() => {
+    return () => {
       if (resultRequest.current?.key !== jobKey) return;
       resultRequest.current = null;
       setOpeningResult(null);
-    },
-    [jobKey],
-  );
+    };
+  }, [jobKey]);
   const listKey = scope ? workflowSessionKey(scope, `runs:${listView}`) : "";
   const jobs = recent.key === listKey ? recent.jobs : null;
   const read = reads.jobs[jobKey] ?? emptyWorkflowJobRead;
   const reviewApproval = workflowReviewApprovalState(drafts.reviews[jobKey], read);
   const checkingReturnedReview = reviewApproval === "checking";
   const selectedJob = read.job;
+  const agentActivity = workflowAgentActivityView(selectedJob);
+  const liveAttempt =
+    focused && !read.error && agentActivity?.available && selectedJob?.progress
+      ? JSON.stringify([
+          jobKey,
+          selectedJob.progress.threadId,
+          selectedJob.progress.stepId,
+          selectedJob.progress.generation,
+          selectedJob.progress.agentRetryAttempt,
+        ])
+      : null;
+  useLayoutEffect(() => {
+    if (!liveAttempt) return;
+    const discard = () => {
+      if (resultRequest.current?.liveAttempt !== liveAttempt) return;
+      resultRequest.current = null;
+      setOpeningResult(null);
+    };
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active") discard();
+    });
+    return () => {
+      subscription.remove();
+      discard();
+    };
+  }, [liveAttempt]);
   const publicationOutcome =
     selectedJob?.status === "cancelled" && selectedJob.runtime?.kind === "vm"
       ? selectedJob.publicationOutcome
@@ -705,7 +732,26 @@ function WorkflowJobsContent(props: Props) {
       (diff && checkingReturnedReview)
     )
       return;
-    const request = { key: jobKey };
+    // An Agent can enter Review or start rework while the reader connection opens.
+    const liveAgent = !diff && agentActivity !== null;
+    const currentTarget = () => {
+      if (!liveAgent) return true;
+      const current = appAtomRegistry.get(workflowJobReadAtom);
+      const latest = current.jobs[jobKey];
+      return (
+        AppState.currentState === "active" &&
+        current.activeKey === jobKey &&
+        current.accountId === scope.accountId &&
+        !latest?.error &&
+        workflowAgentActivityView(latest?.job)?.available === true &&
+        latest?.job?.progress?.threadId === selectedJob.progress?.threadId &&
+        latest?.job?.progress?.stepId === selectedJob.progress?.stepId &&
+        latest?.job?.progress?.generation === selectedJob.progress?.generation &&
+        latest?.job?.progress?.agentRetryAttempt === selectedJob.progress?.agentRetryAttempt
+      );
+    };
+    if ((liveAgent && !liveAttempt) || !currentTarget()) return;
+    const request = { key: jobKey, liveAttempt: liveAgent ? liveAttempt : null };
     resultRequest.current = request;
     setOpeningResult(jobKey);
     setError(null);
@@ -728,11 +774,17 @@ function WorkflowJobsContent(props: Props) {
       });
       if (
         resultRequest.current !== request ||
-        appAtomRegistry.get(managedRelaySessionAtom) !== session
+        appAtomRegistry.get(managedRelaySessionAtom) !== session ||
+        !currentTarget()
       )
         return;
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
       const { environmentId, threadId, workflowVmGeneration } = result.value;
+      if (
+        liveAgent &&
+        (threadId !== selectedJob.progress.threadId || workflowVmGeneration === undefined)
+      )
+        throw new Error("The Agent conversation changed. Refresh the run and try again.");
       if (reviewVisitId && workflowVmGeneration !== undefined)
         bindWorkflowReviewPlacement(appAtomRegistry, scope, selectedJob.jobId, reviewVisitId, {
           environmentId,
@@ -761,7 +813,8 @@ function WorkflowJobsContent(props: Props) {
     } catch (cause) {
       if (
         resultRequest.current === request &&
-        appAtomRegistry.get(managedRelaySessionAtom) === session
+        appAtomRegistry.get(managedRelaySessionAtom) === session &&
+        currentTarget()
       )
         setError(cause instanceof Error ? cause.message : "Could not open this result. Try again.");
     } finally {
@@ -970,6 +1023,41 @@ function WorkflowJobsContent(props: Props) {
                   disabled={busy || openingResult === jobKey}
                   onPress={() => void openResult(false)}
                 />
+              ) : null}
+              {agentActivity ? (
+                <View className="gap-2">
+                  {agentActivity.message ? (
+                    <Text selectable numberOfLines={4} className="text-foreground">
+                      {agentActivity.message}
+                    </Text>
+                  ) : null}
+                  {agentActivity.tool ? (
+                    <Text className="text-sm font-t3-medium text-foreground">
+                      {agentActivity.tool}
+                    </Text>
+                  ) : null}
+                  {!agentActivity.message && !agentActivity.tool && !agentActivity.updatedAt ? (
+                    <Text className="text-sm text-foreground-muted">
+                      {agentActivity.available
+                        ? "Waiting for the Agent’s first update."
+                        : "Live activity is unavailable."}
+                    </Text>
+                  ) : null}
+                  {agentActivity.updatedAt ? (
+                    <Text className="text-xs text-foreground-muted">
+                      {workflowActivityTimeLabel(agentActivity.updatedAt)}
+                    </Text>
+                  ) : null}
+                  {agentActivity.available && selectedJob.progress?.hasThread !== false ? (
+                    <MaterialButton
+                      tone="secondary"
+                      fullWidth
+                      label="Open conversation"
+                      disabled={busy || !!read.error || openingResult === jobKey}
+                      onPress={() => void openResult(false)}
+                    />
+                  ) : null}
+                </View>
               ) : null}
               {primaryMachineDiff ? (
                 <MaterialButton

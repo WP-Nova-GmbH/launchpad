@@ -34,6 +34,7 @@ import { wakeWorkflows } from "../jobs/WorkflowWake.ts";
 import { Workflows, WorkflowPersistenceError, type WorkflowJobRecord } from "../jobs/Workflows.ts";
 import { refreshWorkflowJob } from "../jobs/WorkflowDispatcher.ts";
 import { pageActiveWorkflowRuns } from "../jobs/ActiveWorkflowRuns.ts";
+import { readWorkflowAgentActivity } from "../jobs/WorkflowAgentActivity.ts";
 import {
   isWorkflowCheckpointResponse,
   lockWorkflowVmCheckpoint,
@@ -81,7 +82,11 @@ function canReplaceBlockedCheckpoint(row: WorkflowJobRecord) {
 const jobForClient = (row: WorkflowJobRecord): RepositoryWorkflowJob => {
   const pending = canReplaceBlockedCheckpoint(row) ? undefined : row.pendingControl?.response;
   const operation = pending?.operation;
-  const { pendingResponseId: _storedResponseId, ...record } = row.record;
+  const {
+    pendingResponseId: _storedResponseId,
+    agentActivity: _storedActivity,
+    ...record
+  } = row.record;
   const { progress } = record;
   return {
     ...record,
@@ -882,7 +887,13 @@ export const workflowsApi = HttpApiBuilder.group(RelayApi, "workflows", (handler
         const latestRow = (yield* (yield* Workflows).getJob(params.jobId)) ?? row;
         if (latestRow.organizationId !== latestMembership.organization.organizationId)
           return yield* tenancyNotFound("repository_not_found");
-        return yield* withViewerControls(latestRow, latestMembership);
+        const selected = yield* withViewerControls(latestRow, latestMembership);
+        const activity = yield* readWorkflowAgentActivity(
+          (yield* RelayDb).$client,
+          latestRow,
+          latestMembership.userId,
+        );
+        return activity ? { ...selected, agentActivity: activity } : selected;
       }).pipe(errors),
     )
     .handle("getJobResult", ({ params }) =>

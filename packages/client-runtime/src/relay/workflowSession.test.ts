@@ -25,6 +25,8 @@ import {
   updateWorkflowDrafts,
   clearWorkflowScope,
   workflowDraftIssue,
+  workflowActivityTimeLabel,
+  workflowAgentActivityView,
   workflowStepState,
   startNewWorkflowDraft,
   workflowJobAccessLost,
@@ -97,6 +99,50 @@ const setup = () => {
 };
 afterEach(() => {
   for (const registry of registries.splice(0)) registry.dispose();
+});
+
+it("keeps live activity on the executing VM Agent and uses the event time across refreshes", () => {
+  const run = job();
+  const threadId = run.progress!.threadId;
+  const target = { kind: "vm", baseBranch: null } as const;
+  const active: RepositoryWorkflowJob = {
+    ...run,
+    runtime: { kind: "vm", threadId },
+    workflow: {
+      workflowId: run.workflowId,
+      repositoryId: run.repositoryId,
+      organizationId: "org",
+      archived: false,
+      revision: 1,
+      definition: { ...definition, target },
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+    },
+  };
+  expect(workflowAgentActivityView(active)?.available).toBe(false);
+  const time = "2026-11-27T10:00:00.000Z";
+  const withEvent = {
+    ...active,
+    agentActivity: { message: "Inspecting the setup.", tool: null, updatedAt: time },
+  };
+  expect(workflowAgentActivityView(withEvent)).toEqual({
+    ...withEvent.agentActivity,
+    available: true,
+  });
+  expect(workflowActivityTimeLabel(time, Date.parse(time) + 12_000)).toBe(
+    "Last activity 12 seconds ago",
+  );
+  expect(workflowActivityTimeLabel(time, Date.parse(time) + 65_000)).toBe(
+    "Last activity 1 minute ago",
+  );
+  expect(workflowAgentActivityView({ ...withEvent, status: "awaiting_review" })).toBeNull();
+  expect(
+    workflowAgentActivityView({ ...withEvent, progress: { ...run.progress!, stepId: "review" } }),
+  ).toBeNull();
+  expect(
+    workflowAgentActivityView({ ...withEvent, vmRecovery: { state: "restoring" } }),
+  ).toBeNull();
+  expect(workflowAgentActivityView({ ...withEvent, runtime: run.runtime })).toBeNull();
 });
 
 describe("workflow window close details", () => {

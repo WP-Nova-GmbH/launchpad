@@ -2,10 +2,10 @@ import { describe, expect, it } from "@effect/vitest";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodeEffectCrypto from "@effect/platform-node/NodeCrypto";
 import * as PgClient from "@effect/sql-pg/PgClient";
-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, OrchestrationEvent, ProjectId, ThreadId } from "@t3tools/contracts";
 import { RelayEnvironmentPrincipal, RelayClientPrincipal } from "@t3tools/contracts/relay";
 import * as PgDrizzle from "drizzle-orm/effect-postgres";
-import { DateTime, Deferred, Effect, Fiber, FileSystem, Layer, Redacted } from "effect";
+import { DateTime, Deferred, Effect, Fiber, FileSystem, Layer, Redacted, Schema } from "effect";
 import type { SandboxInfo } from "e2b";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeCrypto from "node:crypto";
@@ -24,6 +24,8 @@ import {
 import { ThreadArtifactObjectError, ThreadArtifactObjectStorage } from "./ThreadArtifactObjects.ts";
 import { makeLocalThreadArtifactObjects } from "./ThreadArtifactLocalObjects.ts";
 import { makeThreadArtifactStore } from "./ThreadArtifactStore.ts";
+import { readWorkflowAgentActivity } from "../jobs/WorkflowAgentActivity.ts";
+import { makeThreadJournalStore } from "./ThreadJournalStore.ts";
 import { makeThreadPlacementStore } from "./ThreadPlacementStore.ts";
 import { makeThreadVmAllocationStore } from "./ThreadVmAllocationStore.ts";
 import { makeThreadVmActivityStore } from "./ThreadVmActivityStore.ts";
@@ -118,6 +120,7 @@ import {
 } from "../http/ThreadEnvironmentApi.ts";
 
 const databaseUrl = process.env.LAUNCHPAD_VM_TEST_DATABASE_URL;
+const decodeJournalEvent = Schema.decodeUnknownSync(OrchestrationEvent);
 const database = Layer.effectDiscard(
   Effect.gen(function* () {
     if (!databaseUrl || !/^\/launchpad_vm_test_[a-z0-9_]+$/.test(new URL(databaseUrl).pathname))
@@ -532,6 +535,197 @@ const finishedFollowUp = (
 
 describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Postgres)", () => {
   it.layer(services)((it) => {
+    it.effect("reads only the current workflow Agent attempt from the mirrored journal", () =>
+      Effect.gen(function* () {
+        const f = yield* activeWorkflow();
+        const { sql, workflowJobId, ownerUserId, organizationId, repositoryId, threadId } = f;
+        const store = yield* Workflows;
+        const initial = (yield* store.getJob(workflowJobId))!;
+        const progress = {
+          ...initial.record.progress,
+          status: "running" as const,
+          revision: 1,
+          generation: 0,
+          stepId: "agent",
+          threadId: ThreadId.make(threadId),
+          checkpoint: null,
+          detail: null,
+        };
+        const running = (yield* store.updateJob(initial, { ...initial.record, progress }))!;
+        yield* sql`INSERT INTO relay_organizations VALUES(${organizationId},'Org','2026','2026')`;
+        yield* sql`INSERT INTO relay_organization_members VALUES(${organizationId},${ownerUserId},'member','2026','2026')`;
+        yield* sql`INSERT INTO relay_repository_access(repository_id,organization_id,user_id,role,created_at,updated_at)
+          VALUES(${repositoryId},${organizationId},${ownerUserId},'developer','2026','2026')`;
+        const read = (row = running) => readWorkflowAgentActivity(sql, row, ownerUserId);
+        const waiting = { message: null, tool: null, updatedAt: null };
+        expect(yield* read()).toEqual(waiting);
+
+        let sequence = 0;
+        const time = (at = sequence) => new Date(Date.UTC(2026, 0, 1, 0, 0, at)).toISOString();
+        const append = (type: string, payload: Record<string, unknown>) => {
+          sequence++;
+          return makeThreadJournalStore(sql).append({
+            ...f.owner,
+            event: decodeJournalEvent({
+              type,
+              eventId: NodeCrypto.randomUUID(),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              sequence,
+              occurredAt: time(),
+              commandId: null,
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+              payload: { createdAt: time(), updatedAt: time(), ...payload, threadId },
+            }),
+          });
+        };
+        const admit = (messageId: string, turnId: string) =>
+          append("thread.prompt-queue-changed", {
+            awaitingTurnId: turnId,
+            admission: {
+              messageId,
+              turnId,
+              attemptId: NodeCrypto.randomUUID(),
+              evidence: "provider-ack",
+            },
+          });
+        const message = (
+          messageId: string,
+          text: string,
+          streaming: boolean,
+          role = "assistant",
+          turnId = "first",
+        ) => append("thread.message-sent", { messageId, text, streaming, role, turnId });
+        const tool = (
+          kind: string,
+          toolCallId: string,
+          itemType: string,
+          parentToolUseId?: string,
+        ) =>
+          append("thread.activity-appended", {
+            activity: {
+              id: NodeCrypto.randomUUID(),
+              createdAt: time(sequence + 1),
+              tone: "tool",
+              kind,
+              turnId: "first",
+              summary: "private command",
+              payload: { itemType, toolCallId, parentToolUseId, detail: "private output" },
+            },
+          });
+
+        const firstPrompt = `workflow:${workflowJobId}:prompt`;
+        yield* message(firstPrompt, "private workflow instructions", false, "user");
+        yield* admit(firstPrompt, "first");
+        yield* message("finished", "[redacted] ", true);
+        yield* message("finished", "x".repeat(800), true);
+        yield* message("finished", "", false);
+        const excerpt = "[redacted] " + "x".repeat(489);
+        const finishedAt = time();
+        yield* message("whitespace", "\n\t", true);
+        yield* message("whitespace", "", false);
+        yield* message("thought", "private reasoning", false, "reasoning");
+        yield* message("prompt", "private prompt", false, "user");
+        yield* message("different", "different turn", false, "assistant", "other");
+        yield* message("unfinished", "partial", true);
+        yield* tool("tool.started", "child", "file_change", "parent");
+        expect(yield* read()).toEqual({ message: excerpt, tool: null, updatedAt: finishedAt });
+        yield* tool("tool.started", "exec", "command_execution");
+        yield* tool("tool.started", "edit", "file_change");
+        expect((yield* read())?.tool).toBe("Editing files");
+        yield* tool("tool.completed", "edit", "file_change");
+        const editCompletedAt = time();
+        yield* tool("tool.updated", "edit", "file_change");
+        expect(yield* read()).toEqual({
+          message: excerpt,
+          tool: "Running a command",
+          updatedAt: editCompletedAt,
+        });
+        yield* tool("tool.completed", "exec", "command_execution");
+        expect(yield* read()).toEqual({ message: excerpt, tool: null, updatedAt: time() });
+        expect(yield* store.getJob(workflowJobId)).toEqual(running);
+        expect(
+          (yield* store.pageJobs(repositoryId, { view: "active" })).jobs[0],
+        ).not.toHaveProperty("agentActivity");
+
+        yield* tool("tool.started", "last", "web_search");
+        const lastActivityAt = time();
+        yield* append("thread.prompt-queue-changed", {
+          awaitingTurnId: null,
+          finalizedTurnId: "first",
+        });
+        expect(yield* read()).toEqual({ message: excerpt, tool: null, updatedAt: lastActivityAt });
+
+        const rework = (yield* store.updateJob(running, {
+          ...running.record,
+          progress: { ...progress, revision: 2, generation: 1 },
+        }))!;
+        expect(yield* read()).toBeUndefined();
+        expect(yield* read(rework)).toEqual(waiting);
+        yield* admit(`workflow:${workflowJobId}:step:agent:1:prompt`, "second");
+        yield* message("reworked", "\nUpdated tests.\t", false, "assistant", "second");
+        const beforeAppend = {
+          message: "Updated tests.",
+          tool: null,
+          updatedAt: time(),
+        };
+        const readingHistory = yield* Deferred.make<void>();
+        const proceed = yield* Deferred.make<void>();
+        const reader = yield* read(rework).pipe(
+          Effect.provideService(CurrentTransformer, (statement) =>
+            statement.compile()[0].includes("FROM relay_thread_current_queues")
+              ? Deferred.succeed(readingHistory, undefined).pipe(
+                  Effect.andThen(Deferred.await(proceed)),
+                  Effect.as(statement),
+                )
+              : Effect.succeed(statement),
+          ),
+          Effect.forkChild,
+        );
+        try {
+          expect(
+            yield* Effect.raceFirst(
+              Deferred.await(readingHistory).pipe(Effect.as(true)),
+              Fiber.await(reader).pipe(Effect.as(false)),
+            ),
+          ).toBe(true);
+          yield* sql.withTransaction(
+            Effect.gen(function* () {
+              // Journal writers take this lock for each append.
+              yield* sql`SELECT thread_id FROM relay_thread_placements WHERE thread_id=${threadId} FOR UPDATE NOWAIT`;
+              yield* message("new-update", "Committed.", false, "assistant", "second");
+            }),
+          );
+        } finally {
+          yield* Deferred.succeed(proceed, undefined);
+        }
+        expect(yield* Fiber.join(reader)).toEqual(beforeAppend);
+        expect(yield* read(rework)).toEqual({
+          message: "Committed.",
+          tool: null,
+          updatedAt: time(),
+        });
+        const unavailable = yield* read(rework).pipe(
+          Effect.provideService(CurrentTransformer, (statement) =>
+            Effect.succeed(
+              statement.compile()[0].includes("FROM relay_thread_current_queues")
+                ? sql`SELECT 1 / 0`
+                : statement,
+            ),
+          ),
+        );
+        expect(unavailable).toBeUndefined();
+        yield* sql`UPDATE relay_thread_vm_allocations SET state='paused' WHERE allocation_id=${f.allocationId}`;
+        expect(yield* read(rework)).toBeUndefined();
+        expect(
+          yield* sql`SELECT 1 FROM relay_thread_vm_resumes WHERE allocation_id=${f.allocationId}`,
+        ).toHaveLength(0);
+        yield* sql`DELETE FROM relay_repository_access WHERE repository_id=${repositoryId} AND user_id=${ownerUserId}`;
+        expect((yield* Effect.flip(read(rework)))._tag).toBe("RelayTenancyNotFoundError");
+      }).pipe(Effect.provide(workflows)),
+    );
     it.effect(
       "keeps provider-paused publishing owned and requires a matching backup after source loss",
       () =>
