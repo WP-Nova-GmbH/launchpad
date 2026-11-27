@@ -320,6 +320,7 @@ const view = (
     Parameters<typeof SavedWorkflowResults>[0],
     | "showCancellationDetail"
     | "showSupersededReviewApproval"
+    | "reviewActions"
     | "onResultsAvailableChange"
     | "revealPartialResultRef"
   > = {},
@@ -1304,9 +1305,7 @@ it("rechecks a different thread returned by a page before showing its saved resu
     ]);
 
     await act(() => recheck.resolve(replacementPage));
-    expect(pickerOptions().map((option) => option.props["data-result-id"])).toEqual([
-      replacement.resultId,
-    ]);
+    expect(findPicker()).toBeUndefined();
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(replacement.resultId);
   }));
 
@@ -1439,7 +1438,7 @@ it.each(["open popup", "closed trigger", "elsewhere"] as const)(
           const label = host["aria-label"];
           if (type === "input") return search;
           if (host["data-result-picker-popup"]) return popup;
-          if (type === "button" && typeof label === "string" && label.startsWith("Saved result:"))
+          if (type === "button" && typeof label === "string" && label.startsWith("Result history:"))
             return trigger;
           return label === "Saved workflow results" ? section : null;
         },
@@ -1541,13 +1540,24 @@ it("keeps earlier results read-only and returns to the exact current review", ()
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(true);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only"');
-    await act(() => renderer.update(view(job, true, { showSupersededReviewApproval: true })));
+    const approve = vi.fn();
+    await act(() =>
+      renderer.update(
+        view(job, true, {
+          showSupersededReviewApproval: true,
+          reviewActions: createElement("button", { onClick: approve }, "Approve result"),
+        }),
+      ),
+    );
+    expect(findButton("Approve result", renderer.root.findByType("header"))).toBeDefined();
     await selectSavedResult(earlier.resultId);
     await act(() => renderer.root.findByType("pre").props.options.onPostRender());
     expect(fixture.target).toHaveBeenLastCalledWith(false);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only result"');
     expect(findButton("Approve result")).toBeUndefined();
     await press("Return to current review");
+    await press("Approve result", renderer.root.findByType("header"));
+    expect(approve).toHaveBeenCalledOnce();
     expect(renderer.root.findByType("pre").props.items[0].id).toContain(result.resultId);
     expect(fixture.target).toHaveBeenLastCalledWith(true);
     expect(JSON.stringify(renderer.toJSON())).toContain('"Read-only"');
@@ -1849,7 +1859,8 @@ it("retries the initial results list before loading the selected patch", () =>
     expect(fixture.read).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ resultId: result.resultId }),
     );
-    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findByType("header").findByType("h3").children).toEqual([result.stepId]);
     expect(findButton("Retry loading results")).toBeUndefined();
   }));
 
@@ -1912,7 +1923,8 @@ it("keeps the selected result when a missing conversation rechecks accessible re
     await press("Conversation");
 
     expect(fixture.list).toHaveBeenCalledTimes(2);
-    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findByType("header").findByType("h3").children).toEqual([result.stepId]);
     expect(findButton("Retry conversation")).toBeDefined();
     expect(findButton("Retry loading results")).toBeUndefined();
 
@@ -1993,7 +2005,8 @@ it("checks a later ambiguous denial even while an earlier access check is pendin
       void findButton("Download release-notes.txt")!.props.onClick();
     });
     expect(fixture.list).toHaveBeenCalledTimes(2);
-    expect(findPicker()?.props["data-selection"]).toBe(result.resultId);
+    expect(findPicker()).toBeUndefined();
+    expect(renderer.root.findByType("header").findByType("h3").children).toEqual([result.stepId]);
 
     await act(async () => {
       void findButton("Download rollback-steps.txt")!.props.onClick();
@@ -2294,6 +2307,73 @@ it("distinguishes the viewer, collaborators and workflow authors in a saved tran
     expect(renderer.root.findAllByType("h4")).toHaveLength(0);
   }));
 
+it("folds only the current run's generated Linear prompt and retains its exact text", () =>
+  withClient(async () => {
+    const issue = {
+      identifier: "REL-42",
+      title: "Release notes",
+      url: "https://linear.app/team/issue/REL-42",
+      workspaceId: "workspace",
+      issueId: "issue",
+      description: "Line one.\nLine two.",
+      team: { id: "team", name: "Platform" },
+      status: { id: "status", name: "Todo" },
+      labels: [],
+      issueUpdatedAt: result.createdAt,
+      retrievedAt: result.createdAt,
+      credentialVersion: 1,
+      authorizationEpoch: 1,
+    };
+    const instruction = `Linear issue ${issue.identifier}: ${issue.title}\n${issue.url}\nTeam: Platform (team)\nStatus: Todo (status)\nLabels: None\nIssue description (external task context):\n${issue.description}`;
+    const prompt = [
+      "Verify the release.",
+      `Job context:\n${instruction}`,
+      "Input for Confirm scope from Maya:\nAnswer: Include the API.",
+      "Requested changes: verify the rollback.",
+      "Keep all changes local. Continue only the current workflow step; human review and input checkpoints are handled by the workflow.",
+    ].join("\n\n");
+    const origin = {
+      kind: "automation",
+      jobId: job.jobId,
+      workflowId: job.workflowId,
+      workflowName: "Release",
+    };
+    fixture.history.mockResolvedValue({
+      entries: [
+        savedConversationStart(),
+        ...[origin, undefined, { ...origin, jobId: "older" }, origin].map((workflowOrigin, i) =>
+          historyEntry(i + 2, "thread.message-sent", {
+            messageId: `prompt-${i}`,
+            role: "user",
+            turnId: result.turnId,
+            streaming: false,
+            text: i === 3 ? "Legacy prompt with other context." : prompt,
+            createdAt: result.createdAt,
+            ...(workflowOrigin ? { workflowOrigin } : {}),
+          }),
+        ),
+      ],
+    });
+    await mount({ ...completedJob, issueSnapshot: issue, instruction });
+    await press("Conversation");
+    const [generated, ...others] = renderer.root.findAllByType("article");
+    const details = generated!.findByType("details");
+    expect(details.findByType("summary").children).toEqual(["Full workflow prompt"]);
+    expect(details.findByType("pre").children).toEqual([prompt]);
+    expect(generated!.findAllByType("p").flatMap((node) => node.children)).toContain(
+      "Verify the release.",
+    );
+    expect(generated!.findAllByType("p").flatMap((node) => node.children)).toContain("REL-42");
+    const visibleParagraphs = generated!.findAllByType("p").flatMap((node) => node.children);
+    expect(visibleParagraphs).toContain("Requested changes: verify the rollback.");
+    expect(visibleParagraphs).toContain(
+      "Input for Confirm scope from Maya:\nAnswer: Include the API.",
+    );
+    expect(visibleParagraphs.join(" ")).not.toContain("Keep all changes local.");
+    expect(others).toHaveLength(3);
+    for (const article of others) expect(article.findAllByType("details")).toHaveLength(0);
+  }));
+
 it("shows local day headings across message pages without repeating a page's first day", () =>
   withClient(async () => {
     const firstDay = new Date(2026, 10, 23, 16);
@@ -2456,7 +2536,7 @@ it("keeps an open transcript in the current time zone after the window regains f
     const savedResult = { ...result, createdAt: "2026-11-24T00:10:00Z" };
     fixture.list.mockResolvedValue({
       results: [savedResult],
-      nextCursor: null,
+      nextCursor: 10,
       threadId: "thread",
       generation: 1,
     });

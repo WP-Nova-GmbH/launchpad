@@ -1509,7 +1509,14 @@ function WorkflowRepositoryView({
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             {!catalogPage ? (
               <Button variant="ghost" onClick={back}>
-                {view === "job" ? "← Back to runs" : "← Workflows"}
+                {view === "job" ? (
+                  "← Back to runs"
+                ) : (
+                  <>
+                    <ArrowLeftIcon aria-hidden />
+                    Back to workflows
+                  </>
+                )}
               </Button>
             ) : null}
             <div className={catalogPage ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}>
@@ -1564,15 +1571,10 @@ function WorkflowRepositoryView({
           <WorkflowAlert
             title="Workflow unavailable"
             actions={
-              <>
-                <Button variant="outline" onClick={refreshView}>
-                  <RefreshCwIcon aria-hidden />
-                  Refresh workflows
-                </Button>
-                <Button variant="ghost" onClick={back}>
-                  Back to workflows
-                </Button>
-              </>
+              <Button variant="outline" onClick={refreshView}>
+                <RefreshCwIcon aria-hidden />
+                Refresh workflows
+              </Button>
             }
           >
             This workflow may have been removed or your access may have changed. Refresh or return

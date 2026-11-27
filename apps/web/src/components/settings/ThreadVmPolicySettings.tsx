@@ -11,14 +11,15 @@ import {
 import type { ThreadVmCapabilities, ThreadVmPolicyRecord } from "@t3tools/contracts/relay";
 import * as Effect from "effect/Effect";
 import { threadVmCapabilityLabel } from "@t3tools/client-runtime/relay/threadVmControls";
-import { MonitorIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronRightIcon, MonitorIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { decodedRelayClientError } from "../../cloud/linkEnvironment";
 import { resolveRelayClerkTokenOptions } from "../../cloud/publicConfig";
+import { requestConfirmDialog } from "../../confirmDialog";
 import { runtime } from "../../lib/runtime";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
-import { SettingsRow, SettingsSearchTarget, SettingsSection } from "./settingsLayout";
+import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 import { WorkflowVmPolicySettings } from "./WorkflowVmPolicySettings";
 
@@ -30,7 +31,16 @@ export function ThreadVmPolicySettings({
   readonly organizationId: string;
 }) {
   const { userId } = useAuth();
-  return <ThreadVmPolicyEditor key={userId} isAdmin={isAdmin} organizationId={organizationId} />;
+  return (
+    <>
+      <ThreadVmPolicyEditor
+        key={JSON.stringify([userId, organizationId, isAdmin])}
+        isAdmin={isAdmin}
+        organizationId={organizationId}
+      />
+      <WorkflowVmPolicySettings organizationId={organizationId} />
+    </>
+  );
 }
 
 function ThreadVmPolicyEditor({
@@ -68,6 +78,11 @@ function ThreadVmPolicyEditor({
         ),
       );
       if (request !== epoch.current) return;
+      if (next.organizationId !== organizationId) {
+        throw new Error(
+          "Your organization changed. Reopen Organization settings to load its VM policy.",
+        );
+      }
       setCapabilities(health.threadVmCapabilities ?? null);
       setRecord(next);
       setDraft(threadVmPolicyDraft(next.policy));
@@ -77,7 +92,7 @@ function ThreadVmPolicyEditor({
     } finally {
       if (request === epoch.current) setBusy(false);
     }
-  }, [getToken]);
+  }, [getToken, organizationId]);
 
   useEffect(() => {
     void load();
@@ -86,16 +101,39 @@ function ThreadVmPolicyEditor({
     };
   }, [load]);
 
-  const save = async () => {
-    if (!record || !draft || !isAdmin || busy) return;
-    let policy;
+  const editedPolicy = useMemo(() => {
+    if (!draft) return null;
     try {
-      policy = parseThreadVmPolicyDraft(draft);
+      return parseThreadVmPolicyDraft(draft);
     } catch {
-      setError(THREAD_VM_POLICY_INPUT_ERROR);
-      return;
+      return null;
     }
+  }, [draft]);
+  const dirty = !!(
+    draft &&
+    record &&
+    (!editedPolicy ||
+      editedPolicy.calendarTimeZone !== record.policy.calendarTimeZone ||
+      THREAD_VM_POLICY_FIELDS.some(({ key }) => editedPolicy[key] !== record.policy[key]))
+  );
+
+  const reload = async () => {
     const request = epoch.current;
+    if (
+      dirty &&
+      !(await requestConfirmDialog(
+        "Discard unsaved policy changes?\nReloading restores the saved Thread VM policy.",
+        { variant: "destructive" },
+      ))
+    )
+      return;
+    if (request === epoch.current) await load();
+  };
+
+  const save = async () => {
+    if (!record || !editedPolicy || !dirty || !isAdmin || busy) return;
+    const policy = editedPolicy;
+    const request = ++epoch.current;
     setBusy(true);
     setError(null);
     setSaved(false);
@@ -135,28 +173,36 @@ function ThreadVmPolicyEditor({
           ? "These limits apply to everyone in your organization."
           : "An organization admin can change these limits."}
       </p>
-      <div className="grid gap-2 px-3 py-2 sm:px-4">
-        <p className="text-sm text-muted-foreground">
-          The relay enables VM automation separately from these limits. Changing a number does not
-          turn a worker on.
-        </p>
-        {(
-          [
-            ["configured", "VM host"],
-            ["autoPause", "Pause inactive VMs"],
-            ["autoBackup", "Automatic workspace backups"],
-            ["autoDelete", "Save and stop inactive VMs"],
-            ["replacement", "Replace an idle VM at the limit"],
-          ] as const
-        ).map(([key, label]) => (
-          <div key={key} className="flex justify-between gap-3 text-sm">
-            <span>{label}</span>
-            <span className="text-muted-foreground">
-              {threadVmCapabilityLabel(capabilities, key)}
-            </span>
-          </div>
-        ))}
-      </div>
+      <details className="group/automation">
+        <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md px-3 py-3 text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring sm:px-4 [&::-webkit-details-marker]:hidden">
+          <ChevronRightIcon
+            aria-hidden
+            className="size-4 shrink-0 text-muted-foreground group-open/automation:rotate-90"
+          />
+          Automation status
+        </summary>
+        <div className="grid gap-2 px-3 pb-3 sm:px-4">
+          <p className="text-sm text-muted-foreground">
+            The relay controls which automations are active.
+          </p>
+          {(
+            [
+              ["configured", "VM host"],
+              ["autoPause", "Pause inactive VMs"],
+              ["autoBackup", "Automatic workspace backups"],
+              ["autoDelete", "Save and stop inactive VMs"],
+              ["replacement", "Replace an idle VM at the limit"],
+            ] as const
+          ).map(([key, label]) => (
+            <div key={key} className="flex justify-between gap-3 text-sm">
+              <span>{label}</span>
+              <span className="text-muted-foreground">
+                {threadVmCapabilityLabel(capabilities, key)}
+              </span>
+            </div>
+          ))}
+        </div>
+      </details>
       {draft ? (
         <>
           {THREAD_VM_POLICY_FIELDS.map((field) => (
@@ -165,21 +211,26 @@ function ThreadVmPolicyEditor({
               title={field.label}
               description={field.description}
               control={
-                <div className="w-28">
-                  <Input
-                    size="sm"
-                    type="number"
-                    min={field.min}
-                    step={1}
-                    aria-label={field.label}
-                    disabled={busy || !isAdmin}
-                    value={draft[field.key]}
-                    onChange={(event) => {
-                      setDraft({ ...draft, [field.key]: event.target.value });
-                      setSaved(false);
-                    }}
-                  />
-                </div>
+                isAdmin ? (
+                  <div className="w-28">
+                    <Input
+                      size="sm"
+                      type="number"
+                      min={field.min}
+                      step={1}
+                      aria-label={field.label}
+                      disabled={busy}
+                      value={draft[field.key]}
+                      onChange={(event) => {
+                        setDraft({ ...draft, [field.key]: event.target.value });
+                        setSaved(false);
+                        setError(null);
+                      }}
+                    />
+                  </div>
+                ) : (
+                  <span className="text-sm tabular-nums">{draft[field.key]}</span>
+                )
               }
             />
           ))}
@@ -187,52 +238,65 @@ function ThreadVmPolicyEditor({
             title="Calendar time zone"
             description="Idle deletion counts Monday–Friday. Saved workspace retention counts calendar days in this time zone."
             control={
-              <div className="w-48">
-                <Input
-                  size="sm"
-                  aria-label="Calendar time zone"
-                  disabled={busy || !isAdmin}
-                  value={draft.calendarTimeZone}
-                  onChange={(event) => {
-                    setDraft({ ...draft, calendarTimeZone: event.target.value });
-                    setSaved(false);
-                  }}
-                />
-              </div>
+              isAdmin ? (
+                <div className="w-48 max-w-full">
+                  <Input
+                    size="sm"
+                    aria-label="Calendar time zone"
+                    disabled={busy}
+                    value={draft.calendarTimeZone}
+                    onChange={(event) => {
+                      setDraft({ ...draft, calendarTimeZone: event.target.value });
+                      setSaved(false);
+                      setError(null);
+                    }}
+                  />
+                </div>
+              ) : (
+                <span className="break-all text-sm">{draft.calendarTimeZone}</span>
+              )
             }
           />
         </>
       ) : busy ? (
-        <p role="status" className="px-3 text-sm sm:px-4">
+        <p role="status" className="px-3 py-3 text-sm sm:px-4">
           Loading VM policy…
         </p>
       ) : null}
+      {draft && !editedPolicy ? (
+        <p role="alert" className="px-3 py-3 text-sm text-destructive sm:px-4">
+          {THREAD_VM_POLICY_INPUT_ERROR}
+        </p>
+      ) : null}
       {error ? (
-        <p role="alert" className="px-3 text-sm text-destructive sm:px-4">
+        <p role="alert" className="px-3 py-3 text-sm text-destructive sm:px-4">
           {error}
         </p>
       ) : null}
       {saved ? (
-        <p role="status" className="px-3 text-sm text-muted-foreground sm:px-4">
+        <p role="status" className="px-3 py-3 text-sm text-muted-foreground sm:px-4">
           VM policy saved.
         </p>
       ) : null}
-      <div className="flex gap-2 px-3 py-3 sm:px-4">
-        <Button variant="ghost" render={<Link to="/settings/vms" />}>
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-3 sm:px-4">
+        <Button size="sm" variant="ghost" render={<Link to="/settings/vms" />}>
           VM threads
         </Button>
-        {isAdmin ? (
-          <Button disabled={busy || !draft} onClick={() => void save()}>
-            Save policy
+        <div className="ml-auto flex flex-wrap justify-end gap-2">
+          <Button size="sm" variant="outline" disabled={busy} onClick={() => void reload()}>
+            Reload policy
           </Button>
-        ) : null}
-        <Button variant="outline" disabled={busy} onClick={() => void load()}>
-          Reload policy
-        </Button>
+          {isAdmin ? (
+            <Button
+              size="sm"
+              disabled={busy || !dirty || !editedPolicy}
+              onClick={() => void save()}
+            >
+              Save policy
+            </Button>
+          ) : null}
+        </div>
       </div>
-      <SettingsSearchTarget id={searchableSetting("workflow-vms").id}>
-        <WorkflowVmPolicySettings organizationId={organizationId} />
-      </SettingsSearchTarget>
     </SettingsSection>
   );
 }

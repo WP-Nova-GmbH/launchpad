@@ -39,6 +39,7 @@ import {
   sameWorkflowAutomation,
   sameWorkflowDefinition,
   type WorkflowScope,
+  type WorkflowRunDraft,
   type WorkflowEditorDraft,
 } from "@t3tools/client-runtime/relay/workflow-session";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
@@ -812,7 +813,9 @@ function WorkflowBuilderEditor({
     savedTarget.baseBranch === branchFailure.branch
       ? branchFailure.branch
       : undefined;
-  const hasRunSubmission = hasWorkflowRunSubmission(runDraft, !archived && !vmRunUnavailable);
+  const savedCheckoutIssue = currentSaved
+    ? workflowMachineCheckoutIssue(currentSaved, projects, projectsUnavailable)
+    : null;
   return (
     <WorkflowBuilderWorkspace
       repositoryName={repositoryName}
@@ -838,8 +841,8 @@ function WorkflowBuilderEditor({
       discardSavedRevision={discardSavedRevision}
       discardReloadStatus={discardReloadStatus}
       vmRunUnavailable={vmRunUnavailable}
-      hasRunSubmission={hasRunSubmission}
-      hasRunInstructions={!!runDraft?.instruction.trim()}
+      runDraft={runDraft}
+      savedCheckoutIssue={savedCheckoutIssue}
       reading={reading}
       notice={notice}
       issue={issue}
@@ -892,8 +895,8 @@ function WorkflowBuilderWorkspace({
   discardSavedRevision,
   discardReloadStatus,
   vmRunUnavailable,
-  hasRunSubmission,
-  hasRunInstructions,
+  runDraft,
+  savedCheckoutIssue,
   reading,
   notice,
   issue,
@@ -930,8 +933,8 @@ function WorkflowBuilderWorkspace({
   discardSavedRevision: number;
   discardReloadStatus: DiscardReloadStatus;
   vmRunUnavailable: boolean;
-  hasRunSubmission: boolean;
-  hasRunInstructions: boolean;
+  runDraft: WorkflowRunDraft | undefined;
+  savedCheckoutIssue: ReturnType<typeof workflowMachineCheckoutIssue>;
   reading: boolean;
   notice: string | null;
   issue: ReturnType<typeof workflowDraftIssue>;
@@ -950,10 +953,20 @@ function WorkflowBuilderWorkspace({
   scope: WorkflowScope;
 }) {
   const navigate = useNavigate();
-  const runBlocked = archived || vmRunUnavailable;
-  const hasRetainedInstructions = runBlocked && hasRunInstructions;
+  const runBlocked = archived || vmRunUnavailable || savedCheckoutIssue !== null;
+  const hasRunSubmission = hasWorkflowRunSubmission(runDraft, !runBlocked);
+  const hasRetainedInstructions = runBlocked && !!runDraft?.instruction.trim();
+  const startedJobId =
+    savedCheckoutIssue && !archived && !hasRunSubmission && !hasRetainedInstructions
+      ? runDraft?.startedJobId
+      : null;
+  const repairCheckout =
+    !archived && !hasRunSubmission && !hasRetainedInstructions && !startedJobId
+      ? savedCheckoutIssue
+      : null;
   const canOpenRun =
-    !!draft.baseline && (hasRunSubmission || hasRetainedInstructions || (!pending && !runBlocked));
+    !!draft.baseline &&
+    (hasRunSubmission || hasRetainedInstructions || !!startedJobId || (!pending && !runBlocked));
   const vm = draft.definition.target.kind === "vm" ? draft.definition.target : null;
   const models = useWorkflowEditorModels(draft.definition, vmAuthoring?.models);
   const [settingsOpen, setSettingsOpen] = useState(
@@ -1197,11 +1210,18 @@ function WorkflowBuilderWorkspace({
     (!savedMachine ||
       machine.environmentId !== savedMachine.environmentId ||
       machine.projectId !== savedMachine.projectId);
+  const canChooseVm = !!vmAuthoring && (vmAutomationAvailable || !automation.enabled);
+  const savedMachineNeedsEnrollment =
+    !!savedMachine &&
+    !projects.length &&
+    !projectsUnavailable &&
+    (!canChooseVm || !vmExecutionAvailable);
   const showMachineEnrollment =
     !projects.length &&
     !projectsUnavailable &&
     ((latestSavedTarget?.kind === "vm" && !!vm && !!vmAuthoring && draft.targetConfirmed) ||
-      targetSwitch === "machine");
+      targetSwitch === "machine" ||
+      (!!machine && savedMachineNeedsEnrollment));
   const modelIssues =
     targetSwitch === "vm" && draft.targetConfirmed
       ? draft.definition.steps.flatMap((step) => {
@@ -1258,7 +1278,6 @@ function WorkflowBuilderWorkspace({
       : draft.targetConfirmed && (target || vm)
         ? "Save the execution target before restoring this workflow."
         : "Choose and save an available execution target before restoring this workflow.";
-  const canChooseVm = !!vmAuthoring && (vmAutomationAvailable || !automation.enabled);
   const savedMachineFallback =
     baselineMachine && savedMachine && equivalentWorkflowTargets(baselineMachine, savedMachine)
       ? baselineMachine
@@ -1284,7 +1303,9 @@ function WorkflowBuilderWorkspace({
         ? "refresh-checkouts"
         : "close-settings";
   const recoveryField =
-    !projectsUnavailable && !projects.length && canChooseVm ? "target:vm" : machineSettingsField;
+    !projectsUnavailable && !projects.length && canChooseVm && !savedMachineNeedsEnrollment
+      ? "target:vm"
+      : machineSettingsField;
   const branchRecoveryField =
     vm && draft.targetConfirmed && unavailableSavedBranch !== undefined
       ? vm.baseBranch === null
@@ -1846,9 +1867,11 @@ function WorkflowBuilderWorkspace({
     />
   ) : settingsOpen ? (
     <div>
-      <header className={styles["workflow-settings-header"]}>
-        <Settings2Icon size={18} aria-hidden />
-        <h2 className="min-w-0 flex-1 text-sm font-medium">Workflow settings</h2>
+      <header className={styles["workflow-inspector-header"]}>
+        <span className={styles["workflow-node-icon"]}>
+          <Settings2Icon aria-hidden />
+        </span>
+        <h2 className="min-w-0 flex-1 text-base font-semibold">Workflow settings</h2>
         <Button
           type="button"
           variant="ghost"
@@ -2048,8 +2071,14 @@ function WorkflowBuilderWorkspace({
             </div>
           ) : showMachineEnrollment ? (
             <WorkflowAlert
-              title="No Machine checkout available"
-              variant={targetSwitch === "machine" ? "warning" : "info"}
+              title={
+                savedMachineNeedsEnrollment && checkoutWarning
+                  ? checkoutWarning
+                  : "No Machine checkout available"
+              }
+              variant={
+                savedMachineNeedsEnrollment || targetSwitch === "machine" ? "warning" : "info"
+              }
               announce={false}
               actions={
                 <Button
@@ -2063,6 +2092,9 @@ function WorkflowBuilderWorkspace({
                 </Button>
               }
             >
+              {savedMachineNeedsEnrollment && checkoutWarning ? (
+                <p>Your workflow edits are kept.</p>
+              ) : null}
               {organizationAdmin ? (
                 <>
                   <p>Connect an organization machine with a checkout of this repository.</p>
@@ -2556,30 +2588,63 @@ function WorkflowBuilderWorkspace({
           >
             <Settings2Icon />
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            disabled={!canOpenRun}
-            aria-describedby={vmRunUnavailable ? "workflow-vm-run-unavailable" : undefined}
-            onClick={() => {
-              if (canOpenRun)
-                void navigate({
-                  to: "/workflows/$repositoryId/$workflowId/run",
-                  params: { repositoryId: scope.repositoryId, workflowId: draft.workflowId },
-                });
-            }}
-          >
-            {hasRunSubmission || hasRetainedInstructions ? (
-              <ChevronRightIcon aria-hidden />
-            ) : (
-              <PlayIcon aria-hidden />
-            )}
-            {hasRunSubmission
-              ? "View run submission"
-              : hasRetainedInstructions
-                ? "View retained instructions"
-                : "Run"}
-          </Button>
+          {repairCheckout ? (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={pending}
+              onClick={() => {
+                if (repairCheckout === "unavailable") refreshProjects();
+                else {
+                  openSettings();
+                  setFocusRequest({ field: recoveryField, stepId: null });
+                }
+              }}
+            >
+              {repairCheckout === "unavailable" ? (
+                <RefreshCwIcon aria-hidden />
+              ) : (
+                <MonitorIcon aria-hidden />
+              )}
+              {repairCheckout === "unavailable"
+                ? "Retry loading checkouts"
+                : savedMachineNeedsEnrollment
+                  ? "View checkout options"
+                  : "Change checkout"}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              disabled={!canOpenRun}
+              aria-describedby={vmRunUnavailable ? "workflow-vm-run-unavailable" : undefined}
+              onClick={() => {
+                if (startedJobId)
+                  void navigate({
+                    to: "/workflows/$repositoryId/jobs/$jobId",
+                    params: { repositoryId: scope.repositoryId, jobId: startedJobId },
+                  });
+                else if (canOpenRun)
+                  void navigate({
+                    to: "/workflows/$repositoryId/$workflowId/run",
+                    params: { repositoryId: scope.repositoryId, workflowId: draft.workflowId },
+                  });
+              }}
+            >
+              {hasRunSubmission || hasRetainedInstructions || startedJobId ? (
+                <ChevronRightIcon aria-hidden />
+              ) : (
+                <PlayIcon aria-hidden />
+              )}
+              {hasRunSubmission
+                ? "View run submission"
+                : hasRetainedInstructions
+                  ? "View retained instructions"
+                  : startedJobId
+                    ? "View started run"
+                    : "Run"}
+            </Button>
+          )}
           <div className="grid w-28 shrink-0">
             <Button
               type="submit"

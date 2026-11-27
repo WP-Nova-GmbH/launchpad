@@ -129,13 +129,13 @@ export function SavedWorkflowResultPicker({
           render={<Button type="button" size="sm" variant="outline" />}
           aria-label={
             selected
-              ? `Saved result: ${selectedTitle}, ${selectedTime ? `saved ${savedTime.format(selectedTime)}` : "save time unavailable"}`
-              : "Saved result"
+              ? `Result history: ${selectedTitle}, ${selectedTime ? `saved ${savedTime.format(selectedTime)}` : "save time unavailable"}`
+              : "Result history"
           }
           className="max-w-full"
         >
           <HistoryIcon aria-hidden />
-          <span className="min-w-0 truncate">{selectedTitle}</span>
+          Result history
           <ChevronDownIcon aria-hidden />
         </ComboboxTrigger>
         <ComboboxPopup

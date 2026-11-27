@@ -18,7 +18,8 @@ import { decodedRelayClientError } from "../../cloud/linkEnvironment";
 import { runtime } from "../../lib/runtime";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
-import { SettingsRow } from "./settingsLayout";
+import { SettingsRow, SettingsSection } from "./settingsLayout";
+import { searchableSetting } from "./settingsSearch";
 
 type Controller = ReturnType<typeof WorkflowVmPolicy.makeWorkflowVmPolicyController>;
 const isScopeError = Schema.is(WorkflowVmPolicy.WorkflowVmPolicyScopeError);
@@ -84,17 +85,17 @@ export function WorkflowVmPolicyForm({ controller }: { readonly controller: Cont
   const limitLabel = "Concurrent workflow VM limit";
 
   return (
-    <div className="mt-3 border-t border-border py-3">
-      <h3 className="flex items-center gap-2 px-3 text-sm font-medium sm:px-4">
-        <ServerIcon aria-hidden className="size-4 text-muted-foreground" />
-        Workflow VMs
-      </h3>
+    <SettingsSection
+      id={searchableSetting("workflow-vms").id}
+      title="Workflow VMs"
+      icon={<ServerIcon className="size-4 text-muted-foreground" />}
+    >
       {state.loading ? (
-        <p role="status" className="px-3 pt-3 text-sm text-muted-foreground sm:px-4">
+        <p role="status" className="px-3 py-3 text-sm text-muted-foreground sm:px-4">
           Loading workflow VM limit…
         </p>
       ) : state.readError ? (
-        <div className="px-3 pt-3 sm:px-4">
+        <div className="px-3 py-3 sm:px-4">
           <WorkflowAlert
             title="Couldn’t load the VM limit"
             actions={
@@ -133,36 +134,24 @@ export function WorkflowVmPolicyForm({ controller }: { readonly controller: Cont
             }
             control={
               state.canEdit ? (
-                <div className="flex min-w-0 flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="w-24">
-                      <Input
-                        size="sm"
-                        type="number"
-                        min={0}
-                        max={2147483647}
-                        step={1}
-                        aria-label={limitLabel}
-                        aria-describedby={
-                          draftStatus === "unchanged" && !state.saved
-                            ? descriptionId
-                            : `${descriptionId} ${draftMessageId}`
-                        }
-                        aria-invalid={invalid || undefined}
-                        disabled={state.saving}
-                        value={state.draft}
-                        onChange={(event) => controller.edit(event.target.value)}
-                      />
-                    </div>
-                    <Button
-                      type="button"
-                      size="sm"
-                      disabled={state.saving || draftStatus !== "changed"}
-                      onClick={() => void controller.save()}
-                    >
-                      {state.saving ? "Saving…" : "Save limit"}
-                    </Button>
-                  </div>
+                <div className="flex w-28 min-w-0 flex-col gap-1">
+                  <Input
+                    size="sm"
+                    type="number"
+                    min={0}
+                    max={2147483647}
+                    step={1}
+                    aria-label={limitLabel}
+                    aria-describedby={
+                      draftStatus === "unchanged" && !state.saved
+                        ? descriptionId
+                        : `${descriptionId} ${draftMessageId}`
+                    }
+                    aria-invalid={invalid || undefined}
+                    disabled={state.saving}
+                    value={state.draft}
+                    onChange={(event) => controller.edit(event.target.value)}
+                  />
                   <div aria-live="polite" id={draftMessageId} className="max-w-48 text-xs">
                     {invalid ? (
                       <p className="text-destructive">{WORKFLOW_VM_LIMIT_INPUT_ERROR}</p>
@@ -185,12 +174,12 @@ export function WorkflowVmPolicyForm({ controller }: { readonly controller: Cont
             }
           />
           {state.capabilities?.execution === false ? (
-            <p className="px-3 text-xs text-muted-foreground sm:px-4">
+            <p className="px-3 py-3 text-xs text-muted-foreground sm:px-4">
               VM workflow execution is not available yet.
             </p>
           ) : null}
           {state.saveError ? (
-            <div className="px-3 pt-2 sm:px-4">
+            <div className="px-3 py-3 sm:px-4">
               <WorkflowAlert
                 title="Could not save the VM limit"
                 actions={
@@ -208,14 +197,26 @@ export function WorkflowVmPolicyForm({ controller }: { readonly controller: Cont
               </WorkflowAlert>
             </div>
           ) : null}
+          {state.canEdit ? (
+            <div className="flex justify-end px-3 py-3 sm:px-4">
+              <Button
+                type="button"
+                size="sm"
+                disabled={state.saving || draftStatus !== "changed"}
+                onClick={() => void controller.save()}
+              >
+                {state.saving ? "Saving…" : "Save limit"}
+              </Button>
+            </div>
+          ) : null}
         </>
       ) : (
-        <div className="px-3 pt-3 sm:px-4">
+        <div className="px-3 py-3 sm:px-4">
           <WorkflowAlert title="Workflow VM settings unavailable" variant="info">
             This relay doesn’t support workflow VM configuration.
           </WorkflowAlert>
         </div>
       )}
-    </div>
+    </SettingsSection>
   );
 }

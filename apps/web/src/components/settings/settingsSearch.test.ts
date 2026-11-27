@@ -49,6 +49,11 @@ describe("searchSettings", () => {
     expect(searchSettings(query).map((item) => item.id)).toContain("send-shortcut");
   });
 
+  it("takes VM policy searches to the matching organization settings card", () => {
+    expect(searchSettings("workflow concurrency")[0]?.id).toBe("workflow-vms");
+    expect(searchSettings("automation status")[0]?.id).toBe("organization-thread-vms");
+  });
+
   it("matches titles, sections, and remembered setting details", () => {
     expect(searchSettings("word", ITEMS).map((item) => item.id)).toEqual(["word-wrap"]);
     expect(searchSettings("network", ITEMS).map((item) => item.id)).toEqual(["network-access"]);

@@ -314,7 +314,7 @@ export function WorkflowTriggerInspector({
           <ZapIcon aria-hidden />
         </span>
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
-          <h2 className="text-sm font-medium">Trigger</h2>
+          <h2 className="text-base font-semibold">Trigger</h2>
           <p role="status" aria-atomic="true">
             <Badge size="sm" variant={savedStatusUnknown ? "warning" : "secondary"}>
               {savedRunStatus}

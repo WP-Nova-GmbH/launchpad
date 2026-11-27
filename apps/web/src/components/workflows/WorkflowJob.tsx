@@ -471,7 +471,11 @@ export function WorkflowJob({
   const [collapsedDraftKey, setCollapsedDraftKey] = useState<string | null>(null);
   const feedbackInput = useRef<HTMLTextAreaElement>(null);
   const feedbackButton = useRef<HTMLButtonElement>(null);
-  const feedbackFocus = useRef<"input" | "button" | null>(null);
+  const feedbackFocus = useRef<{
+    target: "input" | "button";
+    key: string;
+    fallback?: HTMLElement;
+  } | null>(null);
   const checkpoint = selectedJob?.progress?.checkpoint;
   const vmReview = selectedJob?.runtime?.kind === "vm";
   const savedReviewKey =
@@ -610,9 +614,22 @@ export function WorkflowJob({
     matchesReviewOnReturn,
   ]);
   useLayoutEffect(() => {
-    if (feedbackFocus.current === "input") feedbackInput.current?.focus();
-    if (feedbackFocus.current === "button") feedbackButton.current?.focus();
+    const intent = feedbackFocus.current;
+    if (!intent) return;
     feedbackFocus.current = null;
+    if (
+      intent.key !== feedbackKey ||
+      (intent.fallback && intent.fallback.ownerDocument.activeElement !== intent.fallback)
+    )
+      return;
+    const target = intent.target === "input" ? feedbackInput.current : feedbackButton.current;
+    if (target) {
+      target.focus();
+    } else if (intent.target === "button" && reviewSection.current) {
+      // The result list can still be loading when the feedback form closes.
+      if (!intent.fallback) reviewSection.current.focus();
+      feedbackFocus.current = { ...intent, fallback: reviewSection.current };
+    }
   });
   const busy = !!read.mutation;
   const refresh = useCallback(
@@ -1582,7 +1599,7 @@ export function WorkflowJob({
                   variant="ghost"
                   size="sm"
                   onClick={() => {
-                    feedbackFocus.current = "button";
+                    feedbackFocus.current = { target: "button", key: feedbackKey };
                     setFeedbackView({ key: feedbackKey, open: false });
                   }}
                 >
@@ -1614,6 +1631,62 @@ export function WorkflowJob({
       ) : null}
     </>
   ) : null;
+  const reviewActions =
+    !recovery &&
+    (approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
+    !manualHold &&
+    !composingFeedback &&
+    !checkpointResponsePending &&
+    (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) ? (
+      <div className="flex flex-wrap items-center gap-2">
+        {approval ? (
+          <Button
+            variant={
+              waiting &&
+              selectedJob.runtime?.kind !== "vm" &&
+              checkpoint?.kind !== "input" &&
+              selectedJob.progress?.hasThread !== false
+                ? "outline"
+                : "default"
+            }
+            disabled={
+              busy ||
+              reviewNeedsInspection ||
+              checkingReturnedReview ||
+              (!!machine && openingResult === "diff") ||
+              waitingForSavedReviewRender ||
+              manualState.checkpointBlocked ||
+              approvalPending
+            }
+            onClick={() => void respond("approve")}
+          >
+            {approvalPending
+              ? "Approval pending"
+              : manualState.responsePending
+                ? "Response pending"
+                : selectedJob.progress?.retryableApproval
+                  ? "Retry approval"
+                  : "Approve result"}
+          </Button>
+        ) : null}
+        {waiting && viewerControls.canRespond && !approvalPending ? (
+          <Button
+            variant="outline"
+            disabled={busy || manualState.checkpointBlocked}
+            ref={feedbackButton}
+            onClick={() => {
+              feedbackFocus.current = { target: "input", key: feedbackKey };
+              setFeedbackView({ key: feedbackKey, open: true });
+            }}
+          >
+            Request changes
+          </Button>
+        ) : null}
+        {waiting && !input && viewerControls.canRespond && response.trim() ? (
+          <p className="text-xs text-muted-foreground">Feedback draft kept</p>
+        ) : null}
+      </div>
+    ) : null;
   return (
     <div className="min-w-0 w-full space-y-6 wrap-anywhere">
       {runNavigation}
@@ -2099,6 +2172,7 @@ export function WorkflowJob({
               canConfigure={canConfigure}
               onReviewTargetChange={setReviewingCurrentResult}
               onReviewRenderChange={onSavedReviewRenderChange}
+              reviewActions={showingReview ? reviewActions : null}
               showSupersededReviewApproval={approval && !manualHold && !confirmationPending}
               onResultsAvailableChange={
                 completed || canContinueInVm ? onSavedResultsAvailableChange : undefined
@@ -2186,61 +2260,7 @@ export function WorkflowJob({
                 : "Let the saved diff load before returning to approve."}
             </WorkflowAlert>
           ) : null}
-          {!recovery &&
-          (approval || (waiting && !input && viewerControls.canRespond && !approvalPending)) &&
-          !manualHold &&
-          !composingFeedback &&
-          !checkpointResponsePending &&
-          (selectedJob.runtime?.kind !== "vm" || reviewingCurrentResult) ? (
-            <div className="flex flex-wrap items-center gap-2">
-              {approval ? (
-                <Button
-                  variant={
-                    waiting &&
-                    selectedJob.runtime?.kind !== "vm" &&
-                    checkpoint?.kind !== "input" &&
-                    selectedJob.progress?.hasThread !== false
-                      ? "outline"
-                      : "default"
-                  }
-                  disabled={
-                    busy ||
-                    reviewNeedsInspection ||
-                    checkingReturnedReview ||
-                    (!!machine && openingResult === "diff") ||
-                    waitingForSavedReviewRender ||
-                    manualState.checkpointBlocked ||
-                    approvalPending
-                  }
-                  onClick={() => void respond("approve")}
-                >
-                  {approvalPending
-                    ? "Approval pending"
-                    : manualState.responsePending
-                      ? "Response pending"
-                      : selectedJob.progress?.retryableApproval
-                        ? "Retry approval"
-                        : "Approve result"}
-                </Button>
-              ) : null}
-              {waiting && viewerControls.canRespond && !approvalPending ? (
-                <Button
-                  variant="outline"
-                  disabled={busy || manualState.checkpointBlocked}
-                  ref={feedbackButton}
-                  onClick={() => {
-                    feedbackFocus.current = "input";
-                    setFeedbackView({ key: feedbackKey, open: true });
-                  }}
-                >
-                  Request changes
-                </Button>
-              ) : null}
-              {waiting && !input && viewerControls.canRespond && response.trim() ? (
-                <p className="text-xs text-muted-foreground">Feedback draft kept</p>
-              ) : null}
-            </div>
-          ) : null}
+          {vmReview && showingReview ? null : reviewActions}
         </section>
         {vmRun ? null : runInstructions}
         <WorkflowUnsentDrafts

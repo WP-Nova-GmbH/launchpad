@@ -132,15 +132,18 @@ vi.mock("./SavedWorkflowResults", () => ({
     job,
     resultsRef,
     showCancellationDetail = true,
+    reviewActions,
   }: {
     job: RepositoryWorkflowJob;
     resultsRef?: Ref<HTMLElement>;
     showCancellationDetail?: boolean;
+    reviewActions?: PropsWithChildren["children"];
   }) =>
     createElement(
       "section",
       { ref: resultsRef, "aria-label": "Saved workflow results" },
       "Saved results",
+      reviewActions,
       showCancellationDetail && job.status === "cancelled"
         ? (job.detail ?? job.progress?.detail)
         : null,

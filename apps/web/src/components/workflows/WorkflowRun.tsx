@@ -196,12 +196,6 @@ function WorkflowRunForm({
   const editor = drafts.accountId === scope.accountId ? drafts.editors[key] : undefined;
   const unsavedDefinition =
     !!editor && !sameWorkflowDefinition(editor.definition, workflow.definition);
-  const backToWorkflows = () =>
-    navigate({
-      to: "/workflows/$repositoryId",
-      params: { repositoryId: scope.repositoryId },
-      search: { tab: "workflows" },
-    });
   const checkRuns = () =>
     navigate({
       to: "/workflows/$repositoryId",
@@ -724,7 +718,7 @@ function WorkflowRunForm({
   ) : null;
   if (runBlocked)
     return (
-      <div className="min-w-0 w-full space-y-5">
+      <div className="min-w-0 w-full max-w-xl space-y-5">
         <h1 ref={runHeading} tabIndex={-1} className="text-xl font-semibold">
           Run {workflow.definition.name}
         </h1>
@@ -740,25 +734,20 @@ function WorkflowRunForm({
           }
           variant="warning"
           actions={
-            <>
-              {!workflow.archived && checkoutIssue === "unavailable" ? (
-                <Button ref={registerRecoveryRegion} variant="outline" onClick={refreshProjects}>
-                  <RefreshCwIcon aria-hidden />
-                  Retry loading checkouts
-                </Button>
-              ) : canConfigure ? (
-                <Button variant="outline" onClick={editWorkflow}>
-                  {workflow.archived
-                    ? "Open workflow settings"
-                    : checkoutIssue === "missing"
-                      ? "Change checkout"
-                      : "Edit workflow"}
-                </Button>
-              ) : null}
-              <Button variant="ghost" onClick={backToWorkflows}>
-                Back to workflows
+            !workflow.archived && checkoutIssue === "unavailable" ? (
+              <Button ref={registerRecoveryRegion} variant="outline" onClick={refreshProjects}>
+                <RefreshCwIcon aria-hidden />
+                Retry loading checkouts
               </Button>
-            </>
+            ) : canConfigure ? (
+              <Button variant="outline" onClick={editWorkflow}>
+                {workflow.archived
+                  ? "Open workflow settings"
+                  : checkoutIssue === "missing"
+                    ? "Change checkout"
+                    : "Edit workflow"}
+              </Button>
+            ) : undefined
           }
         >
           {workflow.archived
@@ -775,7 +764,7 @@ function WorkflowRunForm({
         {earlierRecovery}
         {additionalRunError}
         {draft.instruction.trim() ? (
-          <label className="block max-w-xl space-y-2">
+          <label className="block space-y-2">
             <span className="text-sm font-medium">Retained instructions</span>
             <Textarea readOnly value={draft.instruction} />
           </label>
@@ -786,7 +775,7 @@ function WorkflowRunForm({
       </div>
     );
   const instructions = (label: string, required: boolean) => (
-    <label className="block max-w-xl space-y-2">
+    <label className="block space-y-2">
       <span className="text-sm font-medium">{label}</span>
       <Textarea
         required={required}
@@ -806,7 +795,7 @@ function WorkflowRunForm({
   );
   return (
     <form
-      className="min-w-0 w-full space-y-5"
+      className="min-w-0 w-full max-w-xl space-y-5"
       onSubmit={(event) => {
         event.preventDefault();
         void submit({ kind: "start" });
@@ -933,7 +922,7 @@ function WorkflowRunForm({
       {previousSubmission ? (
         <details ref={registerRecoveryRegion} className="rounded-lg border px-3.5 py-2.5">
           <summary className="cursor-pointer text-sm font-medium">New run draft</summary>
-          <div className="mt-3 max-w-xl space-y-3">
+          <div className="mt-3 space-y-3">
             {instructions("Instructions for a separate run", false)}
             <Button
               ref={additionalRunControl}
@@ -958,11 +947,8 @@ function WorkflowRunForm({
           </p>
         </>
       )}
-      <div className="flex max-w-xl flex-wrap items-center justify-between gap-3">
-        <Button type="button" variant="ghost" size="sm" onClick={backToWorkflows}>
-          Back to workflows
-        </Button>
-        {!previousSubmission && !canRetryStart ? (
+      {!previousSubmission && !canRetryStart ? (
+        <div className="flex justify-end">
           <Button
             ref={registerStartRun}
             type="submit"
@@ -973,8 +959,8 @@ function WorkflowRunForm({
             <PlayIcon aria-hidden />
             {pending ? "Submitting…" : "Run workflow"}
           </Button>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
       <AlertDialog
         open={confirming}
         onOpenChange={(open) => {

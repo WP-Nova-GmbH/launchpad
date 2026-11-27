@@ -486,6 +486,33 @@ for (const [surface, Component] of [
       expect(fixture.commands.openChat).not.toHaveBeenCalled();
     });
 
+    it.runIf(surface === "web")(
+      "keeps paging and VM action feedback on the control in use",
+      async () => {
+        fixture.index = {
+          entries: [entry("First", "saved"), entry("Second", "saved")],
+          next: "older",
+        };
+        await render();
+        const page = deferred<{ _tag: "Success"; value: null }>();
+        fixture.commands.loadIndex.mockReturnValueOnce(page.promise);
+        await click("More threads");
+        expect(content()).toContain("Loading more threads…");
+        expect(content()).not.toContain("Refreshing…");
+        await act(() => page.resolve({ _tag: "Success", value: null }));
+
+        const restore = deferred<boolean>();
+        fixture.run.mockReturnValueOnce(restore.promise);
+        await click("Restore VM");
+        const rows = renderer!.root.findAllByType("li");
+        expect(text(rows[0]!.children)).toContain("Restoring…");
+        expect(text(rows[1]!.children)).toContain("Restore VM");
+        expect(content()).not.toContain("Refreshing…");
+        await act(() => restore.resolve(false));
+        expect(content()).not.toContain("Restoring…");
+      },
+    );
+
     it("opens the current placement without dispatching a VM action", async () => {
       fixture.index.entries = [entry("First")];
       await render();

@@ -10,8 +10,11 @@ import { ThreadVmPolicySettings } from "./ThreadVmPolicySettings";
 const requests = vi.hoisted(() => ({
   pending: [] as Promise<unknown>[],
   workflowReads: 0,
+  threadReads: 0,
+  confirm: vi.fn<(message: string) => Promise<boolean>>(),
   enqueue: (_work: Effect.Effect<void>) => {},
 }));
+vi.mock("../../confirmDialog", () => ({ requestConfirmDialog: requests.confirm }));
 vi.mock("@clerk/react", () => {
   const getToken = async () => "token";
   return { useAuth: () => ({ userId: "user", getToken }) };
@@ -42,12 +45,14 @@ vi.mock("../../lib/runtime", async () => {
             role: "admin",
             joinedAt: "2026",
           });
-        if (path === "/v1/organization/thread-vm-policy")
+        if (path === "/v1/organization/thread-vm-policy") {
+          requests.threadReads++;
           return Response.json({
             organizationId: "org",
             revision: 1,
             policy: DEFAULT_THREAD_VM_POLICY,
           });
+        }
         if (path === "/v1/organization/workflow-vm-policy") {
           requests.workflowReads++;
           if (requests.workflowReads === 1) throw new Error("Fixture transport failure");
@@ -94,7 +99,6 @@ vi.mock("./settingsSearch", () => ({
   searchableSetting: (id: string) => ({ id }),
 }));
 vi.mock("./settingsLayout", () => ({
-  SettingsSearchTarget: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   SettingsSection: ({ children }: { children: ReactNode }) => <section>{children}</section>,
   SettingsRow: ({
     title,
@@ -130,6 +134,8 @@ beforeEach(() => {
   vi.stubEnv("VITE_CLERK_JWT_TEMPLATE", "fixture");
   requests.pending = [];
   requests.workflowReads = 0;
+  requests.threadReads = 0;
+  requests.confirm.mockReset();
 });
 afterEach(async () => {
   await act(() => renderer?.unmount());
@@ -138,7 +144,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-it.effect("keeps personal policy edits intact when the workflow policy read and retry fail", () =>
+const renderPolicies = (isAdmin = true) =>
   Effect.gen(function* () {
     const queue = yield* Queue.unbounded<Effect.Effect<void>>();
     requests.enqueue = (work) => {
@@ -149,12 +155,19 @@ it.effect("keeps personal policy edits intact when the workflow policy read and 
     );
     yield* Effect.promise(async () => {
       await act(async () => {
-        renderer = create(<ThreadVmPolicySettings isAdmin organizationId="org" />);
+        renderer = create(<ThreadVmPolicySettings isAdmin={isAdmin} organizationId="org" />);
       });
       await act(async () => {
         await Promise.allSettled(requests.pending);
       });
-      const view = renderer!;
+    });
+    return renderer!;
+  });
+
+it.effect("keeps personal policy edits intact when the workflow policy read and retry fail", () =>
+  Effect.gen(function* () {
+    const view = yield* renderPolicies();
+    yield* Effect.promise(async () => {
       const workflowAlert = () =>
         view.root.findAllByType("div").find((element) => element.props.role === "alert")!;
       const initialAlert = visibleText(workflowAlert());
@@ -184,5 +197,52 @@ it.effect("keeps personal policy edits intact when the workflow policy read and 
       expect(retryAlert).toContain("Relay encountered an internal error");
       expect(retryAlert).not.toContain("Check your connection and try again.");
     });
+  }),
+);
+
+it.effect("only reloads a changed Thread VM policy after confirming", () =>
+  Effect.gen(function* () {
+    const view = yield* renderPolicies();
+    const limit = () => view.root.findByProps({ "aria-label": "VMs per user" });
+    const button = (label: string) =>
+      view.root.findAllByType("button").find((item) => visibleText(item).trim() === label)!;
+    yield* Effect.promise(async () => {
+      expect(button("Save policy").props.disabled).toBe(true);
+      await act(() => limit().props.onChange({ target: { value: "03" } }));
+      expect(button("Save policy").props.disabled).toBe(true);
+      await act(() => limit().props.onChange({ target: { value: "" } }));
+      expect(button("Save policy").props.disabled).toBe(true);
+      expect(visibleText(view.root)).toContain("Enter whole numbers");
+      requests.confirm.mockResolvedValueOnce(false);
+      await act(async () => button("Reload policy").props.onClick());
+      expect(requests.threadReads).toBe(1);
+      expect(limit().props.value).toBe("");
+      await act(() => limit().props.onChange({ target: { value: "7" } }));
+      expect(button("Save policy").props.disabled).toBe(false);
+      requests.confirm.mockResolvedValueOnce(true);
+      await act(async () => button("Reload policy").props.onClick());
+      await act(async () => {
+        await Promise.allSettled(requests.pending);
+      });
+      expect(requests.threadReads).toBe(2);
+      expect(limit().props.value).toBe("3");
+      expect(button("Save policy").props.disabled).toBe(true);
+      await act(async () => button("Reload policy").props.onClick());
+      await act(async () => {
+        await Promise.allSettled(requests.pending);
+      });
+      expect(requests.threadReads).toBe(3);
+      expect(requests.confirm).toHaveBeenCalledTimes(2);
+    });
+  }),
+);
+
+it.effect("shows members the saved Thread VM policy as read-only values", () =>
+  Effect.gen(function* () {
+    const view = yield* renderPolicies(false);
+    expect(visibleText(view.root)).toContain("An organization admin can change these limits.");
+    expect(visibleText(view.root)).toContain("UTC");
+    expect(view.root.findAllByType("input")).toHaveLength(0);
+    expect(visibleText(view.root)).not.toContain("Save policy");
   }),
 );

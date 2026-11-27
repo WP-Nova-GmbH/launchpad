@@ -307,7 +307,7 @@ export function WorkflowStepEditor({
                       : "Review"}
               </p>
             </div>
-            <div className="flex items-center gap-1">
+            <div className="flex shrink-0 items-center gap-1 pointer-coarse:gap-4">
               <Menu
                 onOpenChange={(open) => {
                   if (open) skipMenuFocus.current = false;
@@ -317,7 +317,12 @@ export function WorkflowStepEditor({
                   disabled={disabled}
                   ref={(node) => registerField("actions", node)}
                   render={
-                    <Button type="button" variant="ghost" size="icon" aria-label="Step actions" />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Step actions"
+                    />
                   }
                 >
                   <EllipsisIcon aria-hidden />
@@ -381,7 +386,7 @@ export function WorkflowStepEditor({
               <Button
                 type="button"
                 variant="ghost"
-                size="icon"
+                size="icon-sm"
                 aria-label="Close settings"
                 ref={(node) => registerField("close", node)}
                 onClick={close}

@@ -120,12 +120,15 @@ function LibraryBody() {
     threadId: ThreadId;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<
+    "refresh" | "more" | { threadId: ThreadId; label: string } | null
+  >(null);
+  const busy = pending !== null;
   const [overviewSession, setOverviewSession] = useState(session);
   if (overviewSession !== session) {
     setOverviewSession(session);
     setExpandedThreadId(null);
-    setBusy(false);
+    setPending(null);
     setError(null);
   }
   useEffect(() => {
@@ -138,19 +141,20 @@ function LibraryBody() {
     });
     return () => controller.abort();
   }, [session, loadIndex]);
+  const readIndex = async (abort: AbortController, after?: string) => {
+    const result = await loadIndex(after === undefined ? { preserveLoadedPages: true } : { after });
+    if (!abort.signal.aborted && result._tag === "Failure")
+      setError(failureMessage(result, "Could not read saved threads."));
+  };
   const load = async (after?: string) => {
     const abort = overviewAbort.current;
-    if (!abort || abort.signal.aborted) return;
-    setBusy(true);
+    if (!abort || abort.signal.aborted || busy) return;
+    setPending(after === undefined ? "refresh" : "more");
     setError(null);
     try {
-      const result = await loadIndex(
-        after === undefined ? { preserveLoadedPages: true } : { after },
-      );
-      if (!abort.signal.aborted && result._tag === "Failure")
-        setError(failureMessage(result, "Could not read saved threads."));
+      await readIndex(abort, after);
     } finally {
-      if (!abort.signal.aborted) setBusy(false);
+      if (!abort.signal.aborted) setPending(null);
     }
   };
   const capabilityState = useAtomValue(threadVmControls.capabilitiesAtom);
@@ -165,7 +169,11 @@ function LibraryBody() {
       setSelection({ session, threadId });
       return;
     }
-    setBusy(true);
+    setPending({
+      threadId,
+      label:
+        label === "Open chat" ? "Opening…" : label === "Resume VM" ? "Resuming…" : "Restoring…",
+    });
     setError(null);
     const environmentId = EnvironmentId.make(entry.placement.environmentId);
     try {
@@ -197,14 +205,14 @@ function LibraryBody() {
         });
         if (success && !abort.signal.aborted) {
           setSelection({ session, threadId });
-          await load();
+          await readIndex(abort);
         }
       }
     } catch (cause) {
       if (!abort.signal.aborted)
         setError(cause instanceof Error ? cause.message : "Could not start the VM action.");
     } finally {
-      if (!abort.signal.aborted) setBusy(false);
+      if (!abort.signal.aborted) setPending(null);
     }
   };
   const summary =
@@ -235,7 +243,7 @@ function LibraryBody() {
         )}
         {!selected && (
           <div className="flex items-center gap-2">
-            {busy && (
+            {pending === "refresh" && (
               <span role="status" className="text-xs text-muted-foreground">
                 Refreshing…
               </span>
@@ -313,7 +321,7 @@ function LibraryBody() {
                 aria-hidden
                 className="hidden grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)_minmax(0,0.75fr)_8rem] gap-4 border-b border-border/60 px-4 py-3 text-xs text-muted-foreground @min-[40rem]/vm-conversations:grid"
               >
-                <span>Conversation</span>
+                <span className="ps-5.5">Conversation</span>
                 <span>Location</span>
                 <span>Last work</span>
                 <span />
@@ -323,6 +331,10 @@ function LibraryBody() {
                   const threadId = ThreadId.make(entry.placement.threadId);
                   const presentation = portableThreadOverviewPresentation(entry);
                   const action = portableThreadOverviewAction(entry, capabilities);
+                  const pendingLabel =
+                    pending && typeof pending === "object" && pending.threadId === threadId
+                      ? pending.label
+                      : null;
                   return (
                     <li key={threadId}>
                       <Collapsible
@@ -396,9 +408,10 @@ function LibraryBody() {
                                 (["Resume VM", "Restore VM"].includes(action) &&
                                   (lifecycle.busy || !lifecycle.ready))
                               }
+                              aria-busy={Boolean(pendingLabel) || undefined}
                               onClick={() => void runPrimary(entry)}
                             >
-                              {action}
+                              {pendingLabel ?? action}
                             </Button>
                           </div>
                         </div>
@@ -475,9 +488,10 @@ function LibraryBody() {
               size="sm"
               variant="secondary"
               disabled={busy}
+              aria-busy={pending === "more" || undefined}
               onClick={() => void load(index.next!)}
             >
-              More threads
+              {pending === "more" ? "Loading more threads…" : "More threads"}
             </Button>
           )}
           {index && index.entries.length > 0 && (

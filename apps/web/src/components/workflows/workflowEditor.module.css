@@ -482,6 +482,7 @@
 }
 .workflow-inspector-header {
   display: flex;
+  min-height: 78px;
   align-items: center;
   gap: 10px;
   padding: 18px;
@@ -493,17 +494,12 @@
   padding: 20px 18px;
   min-width: 0;
 }
-.workflow-settings-header,
 .workflow-settings-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 10px 14px;
+  padding: 10px 18px;
 }
-.workflow-settings-header {
-  border-bottom: 1px solid var(--border);
-}
-.workflow-settings-header > svg,
 .workflow-settings-option > svg {
   color: var(--muted-foreground);
   flex: none;
@@ -511,7 +507,7 @@
 .workflow-settings-execution {
   display: grid;
   gap: 10px;
-  padding: 14px;
+  padding: 18px;
 }
 .workflow-settings-execution > [data-slot="radio-group"] {
   gap: 6px;

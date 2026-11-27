@@ -1110,6 +1110,102 @@ describe("Execution target settings", () => {
     );
   };
 
+  it("opens the replacement checkout picker for the saved target while keeping unsaved edits", async () => {
+    const other = { ...project, projectId: ProjectId.make("other") };
+    await mount(false, { workflow: savedMachine, projects: [other] });
+    await changeName("Edited workflow");
+    expect(recoveryButton("Run")).toBeUndefined();
+
+    await act(() => recoveryButton("Change checkout").props.onClick());
+    expect(focusDocument.activeElement).toBe(field("checkout"));
+    await chooseCheckout(other);
+
+    expect(editor().definition.name).toBe("Edited workflow");
+    expect(recoveryButton("Change checkout")).toBeDefined();
+    expect(recoveryButton("Run")).toBeUndefined();
+  });
+
+  it.each([
+    { vmAuthoring: false, organizationAdmin: true },
+    { vmAuthoring: true, organizationAdmin: false },
+  ])(
+    "opens checkout enrollment when the saved Machine has no runnable alternative ($organizationAdmin)",
+    async ({ vmAuthoring, organizationAdmin }) => {
+      const refreshProjects = vi.fn();
+      await mount(vmAuthoring, {
+        workflow: savedMachine,
+        projects: [],
+        vmExecutionAvailable: false,
+        organizationAdmin,
+        refreshProjects,
+      });
+      await act(() => recoveryButton("View checkout options").props.onClick());
+      expect(focusDocument.activeElement).toBe(field("refresh-checkouts"));
+      expect(visibleText(settings())).toContain(
+        organizationAdmin ? "Where to connect" : "Ask an organization admin",
+      );
+      await act(() => recoveryButton("Refresh checkouts").props.onClick());
+      expect(refreshProjects).toHaveBeenCalledOnce();
+      expect(recoveryButton("Run")).toBeUndefined();
+    },
+  );
+  it("retries a failed checkout lookup and enables Run once the saved checkout is verified", async () => {
+    const refreshProjects = vi.fn();
+    await mount(false, { workflow: savedMachine, projectsUnavailable: true, refreshProjects });
+    await act(() => recoveryButton("Retry loading checkouts").props.onClick());
+    expect(refreshProjects).toHaveBeenCalledOnce();
+    expect(recoveryButton("Run")).toBeUndefined();
+
+    await updateBuilder({ projectsUnavailable: false });
+    await act(() => recoveryButton("Run").props.onClick());
+    expect(navigate).toHaveBeenCalledWith({
+      to: "/workflows/$repositoryId/$workflowId/run",
+      params: { repositoryId: scope.repositoryId, workflowId: savedMachine.workflowId },
+    });
+  });
+
+  it.each([
+    { label: "View run submission", instruction: "", submitted: true, startedJobId: null },
+    {
+      label: "View retained instructions",
+      instruction: "Keep this",
+      submitted: false,
+      startedJobId: null,
+    },
+    { label: "View started run", instruction: "", submitted: false, startedJobId: "confirmed-run" },
+  ])(
+    "keeps $label reachable with a missing saved checkout",
+    async ({ label, instruction, submitted, startedJobId }) => {
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        runs: {
+          ...state.runs,
+          [workflowSessionKey(scope, savedMachine.workflowId)]: {
+            instruction,
+            operation: submitted
+              ? { state: "uncertain", requestId: "submitted", instruction: "Original instructions" }
+              : null,
+            startedJobId,
+            error: null,
+          },
+        },
+      }));
+      await mount(false, { workflow: savedMachine, projects: [] });
+      await act(() => recoveryButton(label).props.onClick());
+      expect(navigate).toHaveBeenCalledWith(
+        startedJobId
+          ? {
+              to: "/workflows/$repositoryId/jobs/$jobId",
+              params: { repositoryId: scope.repositoryId, jobId: startedJobId },
+            }
+          : {
+              to: "/workflows/$repositoryId/$workflowId/run",
+              params: { repositoryId: scope.repositoryId, workflowId: savedMachine.workflowId },
+            },
+      );
+    },
+  );
+
   it("keeps a target switch in the draft until ordinary Save confirms it", async () => {
     request.mockResolvedValue({ status: "connected" });
     const firstCheckout = {

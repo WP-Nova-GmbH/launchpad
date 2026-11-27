@@ -4,6 +4,7 @@ import { memo, type Ref } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { OrchestrationMessage, ChatAttachment } from "@t3tools/contracts";
+import type { WorkflowIssueSnapshot } from "@t3tools/contracts/workflows";
 import { cn } from "../../lib/utils";
 import { parseTimestampDate } from "../../timestampFormat";
 import { Button } from "../ui/button";
@@ -15,11 +16,33 @@ const SAVED_MARKDOWN_PLUGINS = [remarkGfm];
 
 const SavedMessageMarkdown = memo(ReactMarkdown);
 
+function linearPromptPreview(text: string, issue: WorkflowIssueSnapshot, instruction: string) {
+  // Only fold the exact issue block recorded for this run. Other text can include checkpoint answers or rework.
+  if (
+    !issue.identifier ||
+    !instruction.startsWith(`Linear issue ${issue.identifier}: ${issue.title}\n${issue.url}\n`)
+  )
+    return null;
+  const block = `\n\nJob context:\n${instruction}`;
+  const start = text.lastIndexOf(block);
+  if (start <= 0) return null;
+  const tail = text.slice(start + block.length);
+  if (tail && !tail.startsWith("\n\n")) return null;
+  const constraint =
+    "\n\nKeep all changes local. Continue only the current workflow step; human review and input checkpoints are handled by the workflow.";
+  return {
+    step: text.slice(0, start),
+    context: tail.endsWith(constraint) ? tail.slice(0, -constraint.length) : tail,
+  };
+}
+
 export const SavedConversationMessage = memo(function SavedConversationMessage({
   message,
   busy,
   attachmentDownloads,
   viewerAccountId,
+  linearIssue,
+  issueInstruction,
   timeZone,
   focusRef,
   onDownload,
@@ -28,6 +51,8 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
   busy: boolean;
   attachmentDownloads?: ReadonlyMap<string, AttachmentDownloadState>;
   viewerAccountId?: string;
+  linearIssue?: WorkflowIssueSnapshot | undefined;
+  issueInstruction?: string | undefined;
   timeZone?: string;
   focusRef?: Ref<HTMLElement> | undefined;
   onDownload: (file: ChatAttachment) => Promise<void>;
@@ -36,6 +61,10 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
   const workflowTranscript = viewerAccountId !== undefined;
   const workflowPrompt =
     workflowTranscript && isUser && message.workflowOrigin?.kind === "automation";
+  const preview =
+    workflowPrompt && linearIssue && issueInstruction
+      ? linearPromptPreview(message.text, linearIssue, issueInstruction)
+      : null;
   const roleLabel = isUser ? "You" : message.role === "system" ? "System" : "Assistant";
   let authorLabel = message.author?.displayName ?? roleLabel;
   if (workflowTranscript) {
@@ -60,8 +89,24 @@ export const SavedConversationMessage = memo(function SavedConversationMessage({
         )}
       >
         <SavedMessageMarkdown remarkPlugins={SAVED_MARKDOWN_PLUGINS}>
-          {message.text}
+          {preview?.step ?? message.text}
         </SavedMessageMarkdown>
+        {preview && linearIssue ? (
+          <>
+            <p className="text-xs text-muted-foreground">Linear issue {linearIssue.identifier}</p>
+            {preview.context && (
+              <SavedMessageMarkdown remarkPlugins={SAVED_MARKDOWN_PLUGINS}>
+                {preview.context}
+              </SavedMessageMarkdown>
+            )}
+            <details>
+              <summary className="w-fit cursor-pointer py-1 text-xs text-muted-foreground">
+                Full workflow prompt
+              </summary>
+              <pre className="whitespace-pre-wrap wrap-anywhere">{message.text}</pre>
+            </details>
+          </>
+        ) : null}
       </div>
       {message.attachments?.length && attachmentDownloads ? (
         <ul

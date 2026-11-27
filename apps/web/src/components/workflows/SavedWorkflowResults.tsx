@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ReactNode,
   type RefObject,
 } from "react";
 import type { CodeViewHandle } from "@pierre/diffs/react";
@@ -178,6 +179,7 @@ export function SavedWorkflowResults({
   onReviewRenderChange,
   onResultsAvailableChange,
   showCancellationDetail = true,
+  reviewActions,
   showSupersededReviewApproval,
   revealPartialResultRef,
   resultsRef,
@@ -190,6 +192,7 @@ export function SavedWorkflowResults({
   onReviewRenderChange?: (checkpoint: WorkflowResultCheckpoint | null) => void;
   onResultsAvailableChange?: ((available: boolean) => void) | undefined;
   showCancellationDetail?: boolean;
+  reviewActions?: ReactNode;
   showSupersededReviewApproval?: boolean;
   revealPartialResultRef?: RefObject<(() => void) | null>;
   resultsRef?: RefObject<HTMLElement | null>;
@@ -673,7 +676,8 @@ export function SavedWorkflowResults({
     target?.focus({ preventScroll: true });
     target?.scrollIntoView?.({ block: "nearest" });
   }, [contentRead, conversation, partialResultHidden, view]);
-  const pickerKey = index?.results.length && !partialResultHidden ? resultsScope : null;
+  const pickerKey =
+    !partialResultHidden && (results.length > 1 || historyKey !== null) ? resultsScope : null;
   useLayoutEffect(() => {
     if (restorePickerFocus.current) {
       restorePickerFocus.current = false;
@@ -1348,11 +1352,18 @@ export function SavedWorkflowResults({
     });
     return showHeadings ? headings : null;
   }, [messages, savedAt, timeZone]);
+  const currentReviewActions = reviewingCurrent ? reviewActions : null;
   const resultView = (
     <div id={`${tabId}-saved-results`} className="space-y-3" hidden={partialResultHidden}>
-      <header className="flex flex-wrap items-start justify-between gap-3">
+      <header
+        className={cn(
+          "flex flex-wrap items-center justify-between gap-3",
+          currentReviewActions &&
+            "top-0 z-10 border-b bg-background py-2 sm:[@media(min-height:32rem)]:sticky",
+        )}
+      >
         {result ? (
-          <div className="min-w-0 space-y-1">
+          <div className={cn("min-w-0 space-y-1", currentReviewActions && "flex-1 basis-52")}>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
               <h3 className="text-sm font-medium wrap-anywhere">{stepTitle(result.stepId)}</h3>
               <Badge variant="secondary">
@@ -1378,6 +1389,7 @@ export function SavedWorkflowResults({
             </div>
           </div>
         ) : null}
+        {currentReviewActions}
         {pickerKey && index ? (
           <SavedWorkflowResultPicker
             key={pickerKey}
@@ -1695,6 +1707,13 @@ export function SavedWorkflowResults({
                       <SavedConversationMessage
                         message={message}
                         viewerAccountId={scope.accountId}
+                        issueInstruction={job.instruction}
+                        linearIssue={
+                          message.workflowOrigin?.jobId === job.jobId &&
+                          message.workflowOrigin.workflowId === job.workflowId
+                            ? job.issueSnapshot
+                            : undefined
+                        }
                         timeZone={timeZone}
                         busy={readingConversation !== null}
                         focusRef={

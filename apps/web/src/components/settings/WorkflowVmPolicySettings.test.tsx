@@ -9,6 +9,7 @@ vi.mock("@clerk/react", () => ({
 }));
 vi.mock("../../lib/runtime", () => ({ runtime: {} }));
 vi.mock("./settingsLayout", () => ({
+  SettingsSection: ({ children }: { children: ReactNode }) => <section>{children}</section>,
   SettingsRow: ({
     title,
     description,
