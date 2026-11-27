@@ -46,7 +46,8 @@ export function workflowVmSecretMask(input: WorkflowVmAttemptEnvironment) {
           "decision",
           "class",
           "responseMode",
-        ].includes(key)
+        ].includes(key) ||
+        (event.type === "turn.completed" && key === "failureReason")
           ? value
           : mask(value),
       ]),

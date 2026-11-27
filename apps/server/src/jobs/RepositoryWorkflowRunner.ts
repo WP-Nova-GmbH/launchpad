@@ -53,6 +53,7 @@ import { CheckpointStore } from "../checkpointing/CheckpointStore.ts";
 import { GitVcsDriver, isGitHubHttpsRemote } from "../vcs/GitVcsDriver.ts";
 import { WORKFLOW_CHECKPOINT_READ_TIMEOUT_MS } from "../vcs/WorkflowCheckpointReader.ts";
 import { SetupProcessJournal } from "../terminal/SetupProcessJournal.ts";
+import { capacityRetryTurnId } from "../orchestration/promptQueueDecider.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderRegistry } from "../provider/Services/ProviderRegistry.ts";
@@ -146,8 +147,13 @@ function resolvedWorkflowTurnId(thread: OrchestrationThread | null, promptId: st
   return thread?.promptQueue?.finalizedTurnId === turnId ? turnId : null;
 }
 
+function workflowPromptCommandId(run: WorkflowRun) {
+  return CommandId.make(workflowPromptId(run).replace(/:prompt$/, ":start"));
+}
+
 const { unknownResult, incompleteResult, stoppedTurn, missingCheckpoint, unconfirmedDelivery } =
   workflowTurnPauseDetails;
+const modelCapacityDelays = [30, 60, 120] as const;
 
 function canReconcileWorkflowTurn(run: WorkflowRun) {
   const status = run.progress.status;
@@ -327,6 +333,9 @@ export function reconcileWorkflowRun(
     ["stopped", "error", "interrupted"].includes(thread.session.status)
   )
     return withProgress("paused", stoppedTurn);
+  // A durable admission can survive a restart that lost the enqueue acknowledgement.
+  if (run.capacityRetry && !run.promptDispatched)
+    return { ...withProgress("running", null), promptDispatched: true };
   return run.progress.status === "running"
     ? { ...run, worktreePath }
     : withProgress("running", null);
@@ -448,6 +457,59 @@ export const make = Effect.gen(function* () {
     // after observing finalization, which is written after the checkpoint.
     const confirmed = yield* readThread(run);
     return resolvedWorkflowTurnId(confirmed, promptId) === turnId ? confirmed : null;
+  });
+  const scheduleCapacityRetry = Effect.fnUntraced(function* (
+    run: WorkflowRun,
+    paused: WorkflowRun,
+    thread: OrchestrationThread | null,
+  ) {
+    const queue = thread?.promptQueue;
+    if (
+      !queue ||
+      run.runtime.kind !== "vm" ||
+      run.providerContinuation?.driver !== "codex" ||
+      !run.sequence ||
+      activeWorkflowStep(run)?.kind !== "agent" ||
+      !run.executionReserved
+    )
+      return paused;
+    const failedTurnId = capacityRetryTurnId(queue);
+    if (!failedTurnId || resolvedWorkflowTurnId(thread, workflowPromptId(run)) !== failedTurnId)
+      return paused;
+    const previousRetries = run.capacityRetry?.attempt ?? 0;
+    const delay = modelCapacityDelays[previousRetries];
+    const pauseWithDetail = (detail: string) =>
+      detail === paused.progress.detail
+        ? paused
+        : {
+            ...paused,
+            progress: { ...paused.progress, revision: run.progress.revision + 1, detail },
+          };
+    if (delay === undefined)
+      return pauseWithDetail(
+        `The Codex model is still at capacity after ${previousRetries} retries. Cancel this run and try again later.`,
+      );
+    const pin = yield* store.getCapturedWorkflowTurn(run.runtime, failedTurnId);
+    if (!pin?.baselineCommitId) return pauseWithDetail(missingCheckpoint);
+    const now = yield* DateTime.now;
+    const attempt = previousRetries + 1;
+    return {
+      ...paused,
+      capacityRetry: {
+        attempt,
+        afterTurnId: failedTurnId,
+        queueRevision: queue.revision,
+        dueAt: DateTime.formatIso(DateTime.add(now, { seconds: delay })),
+      },
+      promptDispatched: false,
+      ...(run.manualPause ? { manualPause: { state: "paused" as const, promptId: null } } : {}),
+      progress: {
+        ...paused.progress,
+        status: "preparing" as const,
+        revision: run.progress.revision + 1,
+        detail: `Codex is at capacity. Retry ${attempt} of ${modelCapacityDelays.length} is scheduled in ${delay} seconds.`,
+      },
+    };
   });
   const readLegacyFinalization = Effect.fnUntraced(function* (
     run: WorkflowRun,
@@ -580,6 +642,8 @@ export const make = Effect.gen(function* () {
     run: WorkflowRun,
   ) {
     if (!workflowAllowsPrompt(run, workflowPromptId(run))) return run;
+    // The relay already checks every active run. Persist the deadline so retries also survive a restart.
+    if (run.capacityRetry && (yield* timestamp) < run.capacityRetry.dueAt) return run;
     if (run.progress.status === "waiting_capacity") {
       const step = activeWorkflowStep(run);
       if (step?.kind !== "agent") return run;
@@ -660,17 +724,34 @@ export const make = Effect.gen(function* () {
         const acknowledgement = yield* engine
           .dispatch({
             type: "thread.prompt.enqueue",
-            commandId: CommandId.make(workflowPromptId(run).replace(/:prompt$/, ":start")),
+            commandId: workflowPromptCommandId(run),
             threadId: run.progress.threadId,
             message: {
               messageId: MessageId.make(workflowPromptId(run)),
-              text: `${task.stepInstruction}\n\nJob context:\n${task.jobContext}\n\n${task.reviewConstraint}`,
+              text: [
+                ...(run.capacityRetry
+                  ? [
+                      "Continue the same Agent step after a model capacity error. Check the conversation and current files for work already done before repeating any action.",
+                    ]
+                  : []),
+                task.stepInstruction,
+                `Job context:\n${task.jobContext}`,
+                task.reviewConstraint,
+              ].join("\n\n"),
               attachments: [],
             },
             runtimeMode: "approval-required",
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
             modelSelection: run.modelSelection,
-            createdAt: run.sequence?.stepStartedAt ?? run.createdAt,
+            createdAt: run.capacityRetry?.dueAt ?? run.sequence?.stepStartedAt ?? run.createdAt,
+            ...(run.capacityRetry
+              ? {
+                  resumeAfterModelCapacity: {
+                    turnId: run.capacityRetry.afterTurnId,
+                    queueRevision: run.capacityRetry.queueRevision,
+                  },
+                }
+              : {}),
             ...(workflowRunOrigin(run).kind === "automation"
               ? {
                   workflowOrigin: {
@@ -727,6 +808,15 @@ export const make = Effect.gen(function* () {
         return yield* store.save({
           ...run,
           promptDispatched: true,
+          ...(run.capacityRetry
+            ? {
+                progress: {
+                  ...run.progress,
+                  revision: run.progress.revision + 1,
+                  detail: `Starting Codex capacity retry ${run.capacityRetry.attempt} of ${modelCapacityDelays.length}.`,
+                },
+              }
+            : {}),
           ...(run.sequence ? { sequence: { ...run.sequence, started: true } } : {}),
         });
       }),
@@ -1722,6 +1812,7 @@ export const make = Effect.gen(function* () {
       providerShutdownConfirmed,
       legacyFinalization,
     );
+    if (canRecoverPausedWorkflowTurn(next)) next = yield* scheduleCapacityRetry(run, next, thread);
     if (
       run.runtime.kind === "vm" &&
       run.progress.status !== "awaiting_review" &&
@@ -1815,11 +1906,14 @@ export const make = Effect.gen(function* () {
       ["failed", "cancelled"].includes(next.progress.status) &&
       thread
     ) {
-      const turnId = resolvedWorkflowTurnId(thread, workflowPromptId(next));
       const step = activeWorkflowStep(next);
-      if (turnId && step?.kind === "agent" && !(yield* store.getSaveResult(next.jobId, turnId))) {
-        const pin = yield* store.getCapturedWorkflowTurn(next.runtime, turnId);
-        if (pin)
+      if (step?.kind === "agent") {
+        const turnId = resolvedWorkflowTurnId(thread, workflowPromptId(next));
+        let pin = turnId ? yield* store.getCapturedWorkflowTurn(next.runtime, turnId) : null;
+        // The retry may have stopped before it captured any edits of its own.
+        if (!pin && next.capacityRetry)
+          pin = yield* store.getCapturedWorkflowTurn(next.runtime, next.capacityRetry.afterTurnId);
+        if (pin && !(yield* store.getSaveResult(next.jobId, pin.turnId))) {
           partial = {
             resultId: yield* crypto.randomUUIDv4,
             stepId: step.id,
@@ -1827,6 +1921,18 @@ export const make = Effect.gen(function* () {
             createdAt: next.sequence?.stepStartedAt ?? next.createdAt,
             ...pin,
           };
+          if (
+            next.progress.status === "cancelled" &&
+            pin.turnId === next.capacityRetry?.afterTurnId
+          )
+            next = {
+              ...next,
+              progress: {
+                ...next.progress,
+                detail: "Cancelled. The partial result contains the last captured Agent changes.",
+              },
+            };
+        }
       }
     }
     if (partial || !equivalentRuns(next, run)) yield* store.save(next, partial);
@@ -2134,8 +2240,24 @@ export const make = Effect.gen(function* () {
           return result(run, "conflict", "This job cannot be paused in its current state.");
         if (control.operation === "resume" && !run.manualPause)
           return result(run, "conflict", "This job has no manual pause to resume.");
+        if (control.operation === "pause" && run.capacityRetry && !run.promptDispatched) {
+          // Pause can arrive after enqueue commits but before either acknowledgement or admission.
+          const receipt = yield* commandReceipts
+            .getByCommandId({ commandId: workflowPromptCommandId(run) })
+            .pipe(Effect.orDie);
+          if (Option.isSome(receipt) && receipt.value.status === "accepted") {
+            if (
+              receipt.value.aggregateKind !== "thread" ||
+              receipt.value.aggregateId !== run.progress.threadId
+            )
+              return result(run, "conflict", "The saved Agent retry belongs to another thread.");
+            run = { ...run, promptDispatched: true };
+          }
+        }
         const active =
-          run.executionReserved && ["preparing", "running"].includes(run.progress.status);
+          run.executionReserved &&
+          ["preparing", "running"].includes(run.progress.status) &&
+          !(run.capacityRetry && !run.promptDispatched);
         run = yield* store.save({
           ...run,
           manualPause:

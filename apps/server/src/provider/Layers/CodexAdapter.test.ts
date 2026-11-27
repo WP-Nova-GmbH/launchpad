@@ -3373,19 +3373,22 @@ function codexErrorNotification(input: {
   readonly id: string;
   readonly message: string;
   readonly codexErrorInfo?: string;
+  readonly willRetry?: boolean;
+  readonly turnId?: string;
 }): ProviderEvent {
+  const turnId = input.turnId ?? "turn-limit";
   return {
     id: asEventId(input.id),
     kind: "notification",
     provider: ProviderDriverKind.make("codex"),
     threadId: asThreadId("thread-1"),
-    turnId: asTurnId("turn-limit"),
+    turnId: asTurnId(turnId),
     createdAt: USAGE_LIMIT_NOW,
     method: "error",
     payload: {
       threadId: "thread-1",
-      turnId: "turn-limit",
-      willRetry: false,
+      turnId,
+      willRetry: input.willRetry ?? false,
       error: {
         message: input.message,
         ...(input.codexErrorInfo ? { codexErrorInfo: input.codexErrorInfo } : {}),
@@ -3457,6 +3460,56 @@ function codexUsageLimitTurnFailed(id: string, turnId = "turn-limit"): ProviderE
 }
 
 usageLimitLayer("CodexAdapterLive usage limits", (it) => {
+  it.effect("classifies only terminal model-capacity failures, scoped to the failing turn", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startUsageLimitRuntime();
+      const message = "Selected model is at capacity. Please try a different model.";
+      const errors = {
+        overloaded: { message: "Server busy", codexErrorInfo: "serverOverloaded" },
+        generic: { message, codexErrorInfo: "other" },
+        unclassified: { message },
+        capacity429: { message, codexErrorInfo: "rateLimitExceeded" },
+        rateLimit: { message: "Rate limit exceeded", codexErrorInfo: "rateLimitExceeded" },
+        credits: { message: CODEX_OUT_OF_CREDITS, codexErrorInfo: "usageLimitExceeded" },
+        upload: { message: "Upload is at capacity" },
+        unauthorized: { message, codexErrorInfo: "unauthorized" },
+      };
+      const failed = (
+        turnId: string,
+        error: { message: string; codexErrorInfo?: string } | null,
+      ) => ({
+        ...codexTurnEvent("turn/completed", turnId),
+        payload: { threadId: "thread-1", turn: { id: turnId, status: "failed", items: [], error } },
+      });
+      const completions = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.completed"),
+        Stream.take(Object.keys(errors).length + 4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      for (const [turnId, error] of Object.entries(errors)) {
+        yield* runtime.emit(failed(turnId, error));
+      }
+      yield* runtime.emit(
+        codexErrorNotification({ id: "retrying", turnId: "retrying", message, willRetry: true }),
+      );
+      yield* runtime.emit(failed("retrying", null));
+      yield* runtime.emit(codexErrorNotification({ id: "terminal", turnId: "terminal", message }));
+      yield* runtime.emit(failed("unrelated-turn", null));
+      yield* runtime.emit(failed("terminal", null));
+      yield* runtime.emit(
+        codexErrorNotification({ id: "recovered", turnId: "recovered", message }),
+      );
+      yield* runtime.emit(codexTurnEvent("turn/completed", "recovered"));
+      NodeAssert.deepStrictEqual(
+        Array.from(yield* Fiber.join(completions))
+          .filter((event) => event.payload.failureReason === "model-capacity")
+          .map((event) => event.turnId),
+        ["overloaded", "generic", "unclassified", "capacity429", "terminal"],
+      );
+    }),
+  );
+
   it.effect("names the exhausted window and the workspace's missing credits", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startUsageLimitRuntime();

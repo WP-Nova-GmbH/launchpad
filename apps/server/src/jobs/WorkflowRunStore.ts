@@ -8,6 +8,7 @@ import {
   AuthOrchestrationOperateScope,
   WorkflowOrigin,
   TrimmedNonEmptyString,
+  TurnId,
   sameWorkflowOrigin,
 } from "@t3tools/contracts";
 import {
@@ -106,6 +107,14 @@ const WorkflowRunRuntime = Schema.Union([
   Schema.Struct({ ...WorkflowVmDispatchBinding.fields, kind: Schema.Literal("vm") }),
 ]);
 export const WorkflowRun = Schema.Struct({
+  capacityRetry: Schema.optional(
+    Schema.Struct({
+      attempt: Schema.Int,
+      afterTurnId: TurnId,
+      queueRevision: Schema.Int,
+      dueAt: Schema.String,
+    }),
+  ),
   actions: Schema.optional(Schema.Array(WorkflowActionRecord)),
   publication: Schema.optional(
     Schema.Struct({

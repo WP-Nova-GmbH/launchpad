@@ -39,6 +39,7 @@ import * as Stream from "effect/Stream";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
+import * as CheckpointDiffQuery from "../../checkpointing/CheckpointDiffQuery.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { WorkflowRunStore, layer as WorkflowRunStoreLayer } from "../../jobs/WorkflowRunStore.ts";
 import { workflowPromptId, workflowTurnPauseDetails } from "../../jobs/workflowSequence.ts";
@@ -390,7 +391,7 @@ describe("CheckpointReactor", () => {
     const reviewSecrets = options?.workflowReviewSecrets;
     const layer = CheckpointReactorLive.pipe(
       Layer.provideMerge(options?.workflowVm ? WorkflowRunStoreLayer : Layer.empty),
-      Layer.provide(
+      Layer.provideMerge(
         reviewSecrets
           ? Layer.mock(WorkflowVmAttempts, {
               readReviewSecrets: () => Effect.succeed(Redacted.make(reviewSecrets)),
@@ -569,6 +570,317 @@ describe("CheckpointReactor", () => {
     };
   }
 
+  const seedWorkflowVmRun = Effect.fnUntraced(function* (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+  ) {
+    const sql = yield* Effect.promise(() => runtime!.runPromise(SqlClient.SqlClient));
+    const store = yield* Effect.promise(() => runtime!.runPromise(WorkflowRunStore));
+    const threadId = ThreadId.make("thread-1");
+    const projectId = asProjectId("project-1");
+    const createdAt = "2026-01-01T00:00:00.000Z";
+    const binding = {
+      jobId: "job-1",
+      organizationId: "org-1",
+      repositoryId: "repo-1",
+      threadId,
+      allocationId: "allocation",
+      operationId: "operation",
+      environmentId: EnvironmentId.make("guest"),
+      generation: 1,
+      projectId,
+    };
+    yield* sql`INSERT INTO thread_execution_fences
+    (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+    VALUES (${threadId}, 'https://relay.invalid', ${binding.environmentId}, ${projectId},
+            ${binding.generation}, ${binding.operationId}, 'active')`;
+    const modelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5-codex",
+    };
+    expect(
+      yield* store.tryAccept({
+        jobId: binding.jobId,
+        userId: "user",
+        repositoryCanonicalKey: "github.com/acme/repo",
+        instruction: "Implement the change",
+        workflow: {
+          workflowId: "workflow-1",
+          organizationId: binding.organizationId,
+          repositoryId: binding.repositoryId,
+          revision: 1,
+          archived: false,
+          createdAt,
+          updatedAt: createdAt,
+          definition: {
+            name: "Review",
+            target: { kind: "vm", baseBranch: null },
+            steps: [
+              {
+                id: "agent",
+                kind: "agent",
+                title: "Implement",
+                instruction: "Implement",
+                modelSelection: null,
+              },
+            ],
+          },
+        },
+        runtime: { ...binding, kind: "vm" },
+        progress: { revision: 1, status: "running", threadId, detail: null, checkpoint: null },
+        modelSelection,
+        baseBranch: "main",
+        baseSha: runGit(harness.cwd, ["rev-parse", "HEAD"]).trim(),
+        createdAt,
+        promptDispatched: true,
+        executionReserved: true,
+        worktreePath: harness.cwd,
+        preparedHead: null,
+        approvedBy: null,
+      }),
+    ).toBe(true);
+    const baselineRef = checkpointRefForThreadTurn(threadId, 0);
+    const baseline = yield* harness.checkpointStore.captureCheckpoint({
+      cwd: harness.cwd,
+      checkpointRef: baselineRef,
+      strictWorkflowCapture: true,
+    });
+    expect(baseline.workflowIgnoreRules).toBeDefined();
+    expect(
+      yield* store.saveCheckpointPin(
+        binding,
+        "",
+        0,
+        {
+          commitId: baseline.commitId,
+          treeId: baseline.treeId,
+          checkpointRef: baselineRef,
+          baselineCommitId: baseline.commitId,
+        },
+        null,
+        undefined,
+        baseline.workflowIgnoreRules,
+      ),
+    ).not.toBeNull();
+    return { store, threadId, createdAt, binding, modelSelection, baseline, baselineRef };
+  });
+
+  effectIt.effect.each(["same step", "no edits", "wrong predecessor", "unrelated turn"] as const)(
+    "captures the whole Agent diff after model capacity retries: %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            seedFilesystemCheckpoints: false,
+            workflowVm: true,
+            workflowReviewSecrets: [],
+            nativeCheckpoint: () => Effect.void,
+          }),
+        );
+        const { store, threadId, createdAt, binding, baseline } = yield* seedWorkflowVmRun(harness);
+        const query = yield* Effect.promise(() => runtime!.runPromise(CheckpointDiffQuery.make));
+        const original = (yield* store.get(binding.jobId))!;
+        const agent = original.workflow.definition.steps[0]!;
+        const workflow = {
+          ...original.workflow,
+          definition: {
+            ...original.workflow.definition,
+            steps: [agent, { ...agent, id: "second" }],
+          },
+        };
+        const sequence = {
+          cursor: 0,
+          started: true,
+          generation: 0,
+          completed: [],
+          responses: [],
+          feedback: null,
+          stepStartedAt: createdAt,
+        };
+        let expectedBaseline = baseline.commitId;
+        // Turns 1 and 2 fail after edits. Turn 3 finishes the retried step; turn 4 is a new step.
+        for (let n = 1; n <= 4; n++) {
+          const turnId = asTurnId(`turn-${n}`);
+          const queue = (yield* Effect.promise(harness.readModel)).threads[0]!.promptQueue;
+          const run = {
+            ...original,
+            workflow,
+            sequence: {
+              ...sequence,
+              cursor: n === 4 ? 1 : 0,
+              completed:
+                n === 4
+                  ? [
+                      {
+                        stepId: agent.id,
+                        generation: 0,
+                        head: null,
+                        checkpoint: {
+                          checkpointId: "finished",
+                          turnId: "turn-3",
+                          checkpointRef: checkpointRefForThreadTurn(threadId, 3),
+                          checkpointTurnCount: 3,
+                        },
+                      },
+                    ]
+                  : [],
+            },
+            capacityRetry:
+              n === 2 || n === 3
+                ? {
+                    attempt: n - 1,
+                    afterTurnId: asTurnId(
+                      scenario === "wrong predecessor" ? "unrelated" : `turn-${n - 1}`,
+                    ),
+                    queueRevision: queue!.revision,
+                    dueAt: createdAt,
+                  }
+                : undefined,
+          };
+          yield* store.save(run);
+          let revision = queue?.revision ?? 0;
+          if (queue && !queue.enabled) {
+            yield* harness.engine.dispatch({
+              type: "thread.queue.resume",
+              threadId,
+              commandId: CommandId.make(`resume-${n}`),
+              expectedRevision: revision,
+              createdAt,
+            });
+            revision++;
+          }
+          const messageId = MessageId.make(
+            n === 2 && scenario === "unrelated turn" ? "another-prompt" : workflowPromptId(run),
+          );
+          const attemptId = CommandId.make(`claim-${n}`);
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.enqueue",
+            threadId,
+            commandId: CommandId.make(`enqueue-${n}`),
+            message: { messageId, text: "Continue working.", attachments: [] },
+            runtimeMode: "approval-required",
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            createdAt,
+          });
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.claim",
+            threadId,
+            commandId: attemptId,
+            messageId,
+            expectedRevision: 1,
+            expectedControlRevision: revision,
+            createdAt,
+          });
+          yield* harness.engine.dispatch({
+            type: "thread.prompt.admit",
+            threadId,
+            commandId: CommandId.make(`admit-${n}`),
+            turnId,
+            attemptId,
+            evidence: "provider-ack",
+            createdAt,
+          });
+          const turnFiles = n === 3 && scenario === "no edits" ? [] : [`work-${n}.txt`];
+          for (const file of turnFiles)
+            NodeFS.writeFileSync(NodePath.join(harness.cwd, file), `edit ${n}\n`);
+          if ((n === 1 || n === 3) && scenario === "same step") {
+            // Replay after saving the Git pin. Only the first turn also saved its card before restart.
+            const checkpointRef = checkpointRefForThreadTurn(threadId, n);
+            const captured = yield* harness.checkpointStore.captureCheckpoint({
+              cwd: harness.cwd,
+              checkpointRef,
+              strictWorkflowCapture: true,
+              workflowIgnoreRules: baseline.workflowIgnoreRules!,
+            });
+            expect(
+              yield* store.saveCheckpointPin(binding, turnId, n, {
+                ...captured,
+                checkpointRef,
+                baselineCommitId: baseline.commitId,
+              }),
+            ).not.toBeNull();
+            if (n === 1)
+              yield* harness.engine.dispatch({
+                type: "thread.turn.diff.complete",
+                commandId: CommandId.make("recorded-before-restart"),
+                threadId,
+                turnId,
+                status: "error",
+                createdAt,
+                completedAt: createdAt,
+                checkpointRef,
+                checkpointTurnCount: n,
+                assistantMessageId: MessageId.make("assistant-1"),
+                files: [],
+              });
+          }
+          harness.provider.emit({
+            type: "turn.completed",
+            eventId: EventId.make(`finish-${n}`),
+            provider: ProviderDriverKind.make("codex"),
+            turnId,
+            threadId,
+            createdAt,
+            payload:
+              n <= 2
+                ? {
+                    state: "failed",
+                    failureReason: "model-capacity",
+                    errorMessage: "Model at capacity",
+                  }
+                : { state: "completed" },
+          });
+          yield* Effect.promise(harness.drain);
+          const pin = yield* store.getCapturedWorkflowTurn(binding, turnId);
+          const thread = (yield* Effect.promise(harness.readModel)).threads[0]!;
+          const finalization = thread.promptQueue?.finalization;
+          if (n === 2 && (scenario === "wrong predecessor" || scenario === "unrelated turn")) {
+            expect(pin).toBeNull();
+            expect(finalization?.checkpoint).toBe("error");
+            return;
+          }
+          expect(finalization).toMatchObject({
+            turnId,
+            checkpoint: "ready",
+            outcome: n <= 2 ? "failed" : "completed",
+          });
+          expect(pin?.baselineCommitId).toBe(expectedBaseline);
+          if (n === 2 || n === 3) {
+            expect(
+              thread.checkpoints
+                .find((entry) => entry.turnId === turnId)
+                ?.files.map((file) => file.path),
+            ).toEqual(turnFiles);
+          }
+          if (n === 3) {
+            const input = {
+              threadId,
+              fromTurnCount: n - 1,
+              toTurnCount: n,
+              ignoreWhitespace: false,
+            };
+            const turn = yield* query.getTurnDiff(input);
+            const review = yield* query.getTurnDiff({
+              ...input,
+              expectedTurnId: turnId,
+              strictWorkflowReview: true,
+            });
+            const patchSince = (ref: string) =>
+              runGit(harness.cwd, ["diff", "--no-color", "--no-ext-diff", ref, pin!.commitId]);
+            expect(turn.diff).toBe(patchSince(checkpointRefForThreadTurn(threadId, n - 1)));
+            expect(review.diff).toBe(patchSince(baseline.commitId));
+          }
+          if (n === 3 || n === 4) {
+            expect(
+              runGit(harness.cwd, ["diff", "--name-only", pin!.baselineCommitId, pin!.commitId])
+                .trim()
+                .split("\n"),
+            ).toEqual(n === 3 ? ["work-1.txt", "work-2.txt", ...turnFiles] : ["work-4.txt"]);
+            expectedBaseline = pin!.commitId;
+          }
+        }
+      }),
+  );
+
   effectIt.effect.each(["safe summary", "secret filename", "verification unavailable"] as const)(
     "publishes pinned VM checkpoints without Git status with %s",
     (summary) =>
@@ -589,98 +901,12 @@ describe("CheckpointReactor", () => {
               Queue.offer(observedCompletions, turnId).pipe(Effect.asVoid),
           }),
         );
-        const sql = yield* Effect.promise(() => runtime!.runPromise(SqlClient.SqlClient));
-        const store = yield* Effect.promise(() => runtime!.runPromise(WorkflowRunStore));
-        const threadId = ThreadId.make("thread-1");
-        const projectId = asProjectId("project-1");
-        const createdAt = "2026-01-01T00:00:00.000Z";
-        const binding = {
-          jobId: "job-1",
-          organizationId: "org-1",
-          repositoryId: "repo-1",
-          threadId,
-          allocationId: "allocation",
-          operationId: "operation",
-          environmentId: EnvironmentId.make("guest"),
-          generation: 1,
-          projectId,
-        };
-        yield* sql`INSERT INTO thread_execution_fences
-        (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
-        VALUES (${threadId}, 'https://relay.invalid', ${binding.environmentId}, ${projectId},
-                ${binding.generation}, ${binding.operationId}, 'active')`;
-        const modelSelection = {
-          instanceId: ProviderInstanceId.make("codex"),
-          model: "gpt-5-codex",
-        };
-        expect(
-          yield* store.tryAccept({
-            jobId: binding.jobId,
-            userId: "user",
-            repositoryCanonicalKey: "github.com/acme/repo",
-            instruction: "Implement the change",
-            workflow: {
-              workflowId: "workflow-1",
-              organizationId: binding.organizationId,
-              repositoryId: binding.repositoryId,
-              revision: 1,
-              archived: false,
-              createdAt,
-              updatedAt: createdAt,
-              definition: {
-                name: "Review",
-                target: { kind: "vm", baseBranch: null },
-                steps: [
-                  {
-                    id: "agent",
-                    kind: "agent",
-                    title: "Implement",
-                    instruction: "Implement",
-                    modelSelection: null,
-                  },
-                ],
-              },
-            },
-            runtime: { ...binding, kind: "vm" },
-            progress: { revision: 1, status: "running", threadId, detail: null, checkpoint: null },
-            modelSelection,
-            baseBranch: "main",
-            baseSha: runGit(harness.cwd, ["rev-parse", "HEAD"]).trim(),
-            createdAt,
-            promptDispatched: true,
-            executionReserved: true,
-            worktreePath: harness.cwd,
-            preparedHead: null,
-            approvedBy: null,
-          }),
-        ).toBe(true);
+        const { store, threadId, createdAt, binding, modelSelection, baseline, baselineRef } =
+          yield* seedWorkflowVmRun(harness);
         const capture = (checkpointRef: CheckpointRef) =>
           harness.checkpointStore.captureCheckpoint({ cwd: harness.cwd, checkpointRef });
-        const baselineRef = checkpointRefForThreadTurn(threadId, 0);
         const firstRef = checkpointRefForThreadTurn(threadId, 1);
         const secondRef = checkpointRefForThreadTurn(threadId, 2);
-        const baseline = yield* harness.checkpointStore.captureCheckpoint({
-          cwd: harness.cwd,
-          checkpointRef: baselineRef,
-          strictWorkflowCapture: true,
-        });
-        expect(baseline.workflowIgnoreRules).toBeDefined();
-        expect(
-          yield* store.saveCheckpointPin(
-            binding,
-            "",
-            0,
-            {
-              commitId: baseline.commitId,
-              treeId: baseline.treeId,
-              checkpointRef: baselineRef,
-              baselineCommitId: baseline.commitId,
-            },
-            null,
-            undefined,
-            baseline.workflowIgnoreRules,
-          ),
-        ).not.toBeNull();
 
         const publishCompletion = (turnId: TurnId) =>
           harness.provider.emit({
@@ -976,6 +1202,7 @@ describe("CheckpointReactor", () => {
   effectIt.effect.each([
     ["completed", null],
     ["failed", null],
+    ["failed", "ready"],
     ["completed", "ready"],
     ["completed", "error"],
   ] as const)(
@@ -1044,7 +1271,11 @@ describe("CheckpointReactor", () => {
           createdAt,
           payload: {
             state,
-            ...(state === "failed" ? { errorMessage: "usage limit exceeded" } : {}),
+            ...(state === "failed"
+              ? existingCheckpoint
+                ? { failureReason: "model-capacity" as const, errorMessage: "Model at capacity" }
+                : { errorMessage: "usage limit exceeded" }
+              : {}),
           },
         });
         yield* Effect.promise(() => harness.drain());
@@ -1055,6 +1286,7 @@ describe("CheckpointReactor", () => {
           turnId,
           outcome: state,
           checkpoint: existingCheckpoint ?? "skipped",
+          ...(state === "failed" && existingCheckpoint ? { failureReason: "model-capacity" } : {}),
         });
         expect(thread.promptQueue?.enabled).toBe(
           state === "completed" && existingCheckpoint !== "error",

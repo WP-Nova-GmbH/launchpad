@@ -9,6 +9,31 @@ import { classifyApprovalRequest } from "../jobs/approvalClassification.ts";
 import { workflowVmSecretMask } from "./workflowVmSecretMask.ts";
 
 describe("workflow VM output masking", () => {
+  it("preserves the typed capacity reason when a secret appears in the failure message", () => {
+    const mask = workflowVmSecretMask({
+      environment: { SECRET: "capacity" },
+      hasSecrets: true,
+      secretNames: ["SECRET"],
+    });
+    const completion = mask({
+      eventId: EventId.make("capacity-event"),
+      threadId: ThreadId.make("workflow"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      type: "turn.completed",
+      payload: {
+        state: "failed",
+        failureReason: "model-capacity",
+        errorMessage: "Selected model is at capacity. Please try a different model.",
+      },
+    });
+    expect(completion?.payload).toEqual({
+      state: "failed",
+      failureReason: "model-capacity",
+      errorMessage: "Selected model is at [redacted]. Please try a different model.",
+    });
+  });
+
   it("withholds split chunks and preserves a masked final result", () => {
     const mask = workflowVmSecretMask({
       environment: { SECRET: "a+b[.\nsecret-tail", VARIABLE: "visible" },

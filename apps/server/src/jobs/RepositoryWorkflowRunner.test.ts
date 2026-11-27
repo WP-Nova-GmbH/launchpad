@@ -16,6 +16,7 @@ import {
   MessageId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ThreadPromptQueue,
   ThreadId,
   TurnId,
   EventId,
@@ -49,8 +50,10 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import { WorkflowVmAttempts } from "../relay/WorkflowVmAttempts.ts";
 import { decodeWorkflowResultCapture } from "./WorkflowResultOutbox.ts";
 const decodeRecovery = Schema.decodeUnknownEffect(Schema.fromJsonString(Store.WorkflowRunRecovery));
+const encodePromptQueue = Schema.encodeEffect(Schema.fromJsonString(ThreadPromptQueue));
 import {
   type WorkflowRequest,
+  type WorkflowRunnerError,
   type RepositoryWorkflowRunnerShape,
 } from "./RepositoryWorkflowRunner.ts";
 import { decidePromptQueueCommand } from "../orchestration/promptQueueDecider.ts";
@@ -1505,6 +1508,393 @@ const prepareVmWorkflow = Effect.fnUntraced(function* (h: Effect.Success<typeof 
   yield* fence.prepare({ ...binding, relayUrl: "https://relay.test" });
   return { fence, binding, workflowVm, start };
 });
+
+const capacityFixture = Effect.fnUntraced(function* () {
+  const h = yield* harness;
+  const { binding, fence, workflowVm, start } = yield* prepareVmWorkflow(h);
+  yield* fence.activate(binding);
+  const store = yield* Store.WorkflowRunStore;
+  const scope = yield* Scope.make();
+  yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+  const runner = yield* h.newRunner.pipe(Effect.provideService(Scope.Scope, scope));
+  assert.equal((yield* runner.handle(start)).outcome, "accepted");
+  const status = { ...control("status"), workflowVm };
+  const baseline = {
+    checkpointRef: CheckpointRef.make("refs/t3/checkpoints/workflow-base"),
+    commitId: "pinned-baseline",
+    treeId: "baseline-tree",
+    baselineCommitId: "pinned-baseline",
+  };
+  yield* store.saveCheckpointPin(binding, "", 0, baseline, null, undefined, new Uint8Array());
+
+  const changeQueue = Effect.fnUntraced(function* (
+    command: Parameters<typeof decidePromptQueueCommand>[1],
+  ) {
+    const thread = (yield* Ref.get(h.currentThread))!;
+    const events = yield* decidePromptQueueCommand(thread, command, false);
+    let state: OrchestrationReadModel = { ...createEmptyReadModel(NOW), threads: [thread] };
+    for (const event of events)
+      state = yield* projectEvent(state, { ...event, sequence: state.snapshotSequence + 1 });
+    yield* Ref.set(h.currentThread, state.threads[0]!);
+    return state.threads[0]!;
+  });
+
+  // As in the real failure, the user message survives admission cleanup and
+  // the partial Git pin exists even though the provider turn ended in error.
+  const finalize = Effect.fnUntraced(function* (
+    outcome: "model-capacity" | "unclassified" | "checkpoint-error" | "no-pin" | "completed",
+    onSessionError?: Effect.Effect<void, WorkflowRunnerError>,
+  ) {
+    const prompt = (yield* h.starts).at(-1)!;
+    const previous = (yield* Ref.get(h.currentThread))!;
+    const current = completed(previous, prompt.message.messageId);
+    const point = current.checkpoints.at(-1)!;
+    const { turnId } = point;
+    const failed = outcome !== "completed";
+    const admitted = {
+      ...current,
+      worktreePath: null,
+      session: { ...current.session!, status: failed ? ("error" as const) : ("ready" as const) },
+      latestTurn: {
+        ...current.latestTurn!,
+        state: failed ? ("error" as const) : ("completed" as const),
+      },
+      checkpoints: current.checkpoints.map((entry) =>
+        failed && entry.turnId === turnId ? { ...entry, status: "error" as const } : entry,
+      ),
+      messages: [
+        ...previous.messages,
+        {
+          id: prompt.message.messageId,
+          turnId,
+          text: prompt.message.text,
+          role: "user" as const,
+          streaming: false,
+          createdAt: NOW,
+          updatedAt: NOW,
+        },
+      ],
+      promptQueue: {
+        ...current.promptQueue!,
+        entries: [],
+        awaitingTurnId: turnId,
+        finalizedTurnId: previous.promptQueue!.finalizedTurnId,
+      },
+    };
+    if (onSessionError) {
+      yield* Ref.set(h.currentThread, {
+        ...admitted,
+        latestTurn: { ...admitted.latestTurn, state: "running", completedAt: null },
+        checkpoints: previous.checkpoints,
+      });
+      // A paused run can pin a late checkpoint only for a durably admitted turn.
+      const queueJson = yield* encodePromptQueue(admitted.promptQueue);
+      yield* (yield* SqlClient.SqlClient)`INSERT INTO projection_thread_prompt_queues(thread_id,state_json)
+        VALUES (${binding.threadId},${queueJson})`;
+      yield* onSessionError;
+    }
+    if (outcome !== "no-pin" && outcome !== "checkpoint-error")
+      assert.isNotNull(
+        yield* store.saveCheckpointPin(binding, turnId, point.checkpointTurnCount, {
+          ...baseline,
+          checkpointRef: point.checkpointRef,
+          commitId: `commit-${turnId}`,
+          treeId: "prepared-tree",
+        }),
+      );
+    yield* Ref.set(h.currentThread, admitted);
+    const finalized = yield* changeQueue({
+      type: "thread.queue.finalize",
+      commandId: CommandId.make(`finalize-${turnId}`),
+      threadId: binding.threadId,
+      turnId,
+      createdAt: NOW,
+      outcome: failed ? "failed" : "completed",
+      checkpoint: outcome === "checkpoint-error" ? "error" : "ready",
+      ...(failed && outcome !== "unclassified" ? { failureReason: "model-capacity" as const } : {}),
+      ...(failed
+        ? { detail: outcome === "unclassified" ? "Rate limit reached" : "Model is at capacity" }
+        : {}),
+    });
+    assert.equal(finalized.promptQueue?.finalizedTurnId, turnId);
+    assert.isEmpty(finalized.promptQueue!.admissions);
+    if (failed) assert.isFalse(finalized.promptQueue!.enabled);
+    return turnId;
+  });
+  return { h, binding, workflowVm, scope, runner, status, finalize, changeQueue };
+});
+
+it.effect.each(["queued", "admitted before restart"] as const)(
+  "lets an accepted capacity retry finish on Pause when its acknowledgement was lost (%s)",
+  (phase) =>
+    test(
+      Effect.gen(function* () {
+        const { h, binding, workflowVm, scope, runner, status, finalize, changeQueue } =
+          yield* capacityFixture();
+        yield* finalize("model-capacity");
+        let progress = (yield* runner.handle(status)).progress!;
+        yield* Ref.set(h.promptOutage, "after");
+        yield* TestClock.adjust("30 seconds");
+        const outage = yield* Effect.flip(runner.handle(status));
+        assert.include(outage.message, "acknowledgement lost");
+        const queue = (yield* Ref.get(h.currentThread))!.promptQueue!;
+        const retry = queue.entries[0]!;
+        let activeRunner = runner;
+        if (phase === "admitted before restart") {
+          const attemptId = CommandId.make("claim-retry");
+          yield* changeQueue({
+            type: "thread.prompt.claim",
+            commandId: attemptId,
+            threadId: binding.threadId,
+            messageId: retry.messageId,
+            expectedRevision: retry.revision,
+            expectedControlRevision: queue.revision,
+            createdAt: NOW,
+          });
+          yield* changeQueue({
+            type: "thread.prompt.admit",
+            commandId: CommandId.make("admit-retry"),
+            threadId: binding.threadId,
+            attemptId,
+            turnId: TurnId.make("job-1-turn-2"),
+            evidence: "provider-ack",
+            createdAt: NOW,
+          });
+          yield* Scope.close(scope, Exit.void);
+          activeRunner = yield* h.newRunner;
+          progress = (yield* activeRunner.handle(status)).progress!;
+          assert.equal(progress.status, "running");
+        }
+        const holding = (yield* activeRunner.handle({
+          ...manualRequest(progress, "pause"),
+          workflowVm,
+        })).progress!;
+        assert.equal(holding.manualPause?.state, "requested");
+        const successfulTurn = yield* finalize("completed");
+        yield* activeRunner.handle(status);
+        yield* (yield* SqlClient.SqlClient)`UPDATE workflow_result_outbox SET status='acknowledged'
+          WHERE job_id=${binding.jobId} AND json_extract(result_json,'$.turnId')=${successfulTurn}`;
+        const paused = (yield* activeRunner.handle(status)).progress!;
+        assert.equal(paused.status, "paused");
+        assert.equal(paused.manualPause?.state, "paused");
+        assert.equal(paused.stepId, "review");
+        assert(paused.checkpoint && "turnId" in paused.checkpoint);
+        assert.equal(paused.checkpoint.turnId, successfulTurn);
+        assert.lengthOf(yield* h.starts, 2);
+      }),
+    ),
+);
+
+it.effect("recognizes a model-capacity finalization after a provisional stopped Agent pause", () =>
+  test(
+    Effect.gen(function* () {
+      const { h, runner, status, finalize } = yield* capacityFixture();
+      const failedTurn = yield* finalize(
+        "model-capacity",
+        Effect.gen(function* () {
+          const provisional = (yield* runner.handle(status)).progress!;
+          assert.equal(provisional.status, "paused");
+          assert.include(provisional.detail!, "could not be reattached after stopping");
+          assert.isUndefined(provisional.agentRetryAttempt);
+        }),
+      );
+      const next = (yield* runner.handle(status)).progress!;
+      assert.equal(next.agentRetryAttempt, 1);
+      yield* TestClock.adjust("30 seconds");
+      yield* runner.handle(status);
+      assert.equal((yield* h.starts).at(1)?.resumeAfterModelCapacity?.turnId, failedTurn);
+    }),
+  ),
+);
+
+it.effect.each(["another prompt", "a user pause"] as const)(
+  "preserves the queue when %s arrives during model-capacity backoff",
+  (change) =>
+    test(
+      Effect.gen(function* () {
+        const { h, runner, status, finalize, changeQueue } = yield* capacityFixture();
+        yield* finalize("model-capacity");
+        assert.equal((yield* runner.handle(status)).progress?.agentRetryAttempt, 1);
+        const prompt = (yield* h.starts)[0]!;
+        const commandId = CommandId.make("concurrent-queue-edit");
+        const queue = (yield* changeQueue(
+          change === "another prompt"
+            ? {
+                ...prompt,
+                commandId,
+                message: { ...prompt.message, messageId: MessageId.make("unrelated-work") },
+              }
+            : { type: "thread.queue.pause", commandId, threadId: prompt.threadId, createdAt: NOW },
+        )).promptQueue!;
+        yield* TestClock.adjust("30 seconds");
+        const stopped = (yield* runner.handle(status)).progress!;
+        assert.equal(stopped.status, "paused");
+        yield* TestClock.adjust("5 minutes");
+        yield* runner.handle(status);
+        assert.deepEqual((yield* Ref.get(h.currentThread))!.promptQueue, queue);
+        assert.isFalse(queue.enabled);
+      }),
+    ),
+);
+
+it.effect(
+  "resumes a model-capacity failure at its original deadline after a restart and saves the successful retry",
+  () =>
+    test(
+      Effect.gen(function* () {
+        const { h, binding, runner, scope, status, finalize } = yield* capacityFixture();
+        const initial = (yield* h.starts)[0]!;
+        const failedTurn = yield* finalize("model-capacity");
+        const scheduled = (yield* runner.handle(status)).progress!;
+        assert.equal(scheduled.status, "preparing");
+        assert.equal(scheduled.agentRetryAttempt, 1);
+        assert.match(scheduled.detail ?? "", /capacity/i);
+        assert.isNull(scheduled.checkpoint);
+        yield* TestClock.adjust("18 seconds");
+        yield* runner.handle(status);
+        yield* Scope.close(scope, Exit.void);
+        const restarted = yield* h.newRunner;
+        yield* TestClock.adjust("11 seconds");
+        yield* restarted.handle(status);
+        assert.lengthOf(yield* h.starts, 1);
+        yield* TestClock.adjust("1 second");
+        yield* restarted.handle(status);
+        yield* restarted.handle(status);
+        const attempts = yield* h.starts;
+        assert.lengthOf(attempts, 2);
+        const retry = attempts[1]!;
+        assert.equal(retry.threadId, initial.threadId);
+        assert.notEqual(retry.message.messageId, initial.message.messageId);
+        assert.equal(retry.resumeAfterModelCapacity?.turnId, failedTurn);
+        assert.isDefined(initial.modelSelection);
+        assert.deepEqual(retry.modelSelection, initial.modelSelection);
+        assert.isUndefined(retry.bootstrap);
+        const queue = (yield* Ref.get(h.currentThread))!.promptQueue!;
+        assert.isTrue(queue.enabled);
+        assert.deepEqual(
+          queue.entries.map((entry) => entry.messageId),
+          [retry.message.messageId],
+        );
+
+        const successfulTurn = yield* finalize("completed");
+        yield* restarted.handle(status);
+        yield* (yield* SqlClient.SqlClient)`UPDATE workflow_result_outbox SET status='acknowledged'
+      WHERE job_id=${binding.jobId} AND json_extract(result_json,'$.turnId')=${successfulTurn}`;
+        const review = (yield* restarted.handle(status)).progress!;
+        assert.equal(review.status, "awaiting_review");
+        assert.equal(review.stepId, "review");
+        assert.equal(review.generation, scheduled.generation);
+        assert(review.checkpoint && "turnId" in review.checkpoint);
+        assert.equal(review.checkpoint.turnId, successfulTurn);
+      }),
+    ),
+);
+
+it.effect("stops after three model-capacity retries with increasing delays", () =>
+  test(
+    Effect.gen(function* () {
+      const { h, runner, status, finalize } = yield* capacityFixture();
+      for (const delay of [30, 60, 120]) {
+        const before = (yield* h.starts).length;
+        yield* finalize("model-capacity");
+        assert.equal((yield* runner.handle(status)).progress?.status, "preparing");
+        yield* TestClock.adjust((delay - 1) * 1_000);
+        yield* runner.handle(status);
+        assert.lengthOf(yield* h.starts, before);
+        yield* TestClock.adjust("1 second");
+        yield* runner.handle(status);
+        assert.lengthOf(yield* h.starts, before + 1);
+      }
+      yield* finalize("model-capacity");
+      const exhausted = (yield* runner.handle(status)).progress!;
+      assert.equal(exhausted.status, "paused");
+      assert.match(exhausted.detail ?? "", /capacity/i);
+      yield* TestClock.adjust("5 minutes");
+      yield* runner.handle(status);
+      const attempts = yield* h.starts;
+      assert.lengthOf(attempts, 4);
+      assert.equal(new Set(attempts.map((attempt) => attempt.message.messageId)).size, 4);
+    }),
+  ),
+);
+
+it.effect.each(["cancel", "pause"] as const)(
+  "respects %s during the model-capacity delay",
+  (action) =>
+    test(
+      Effect.gen(function* () {
+        const { h, runner, workflowVm, status, finalize } = yield* capacityFixture();
+        yield* finalize("model-capacity");
+        const pending = (yield* runner.handle(status)).progress!;
+        assert.equal(pending.agentRetryAttempt, 1);
+        if (action === "cancel") yield* TestClock.adjust("30 seconds");
+        const operation = action === "pause" ? manualRequest(pending, "pause") : control("cancel");
+        yield* runner.handle({ ...operation, workflowVm });
+        yield* TestClock.adjust("2 minutes");
+        const held = (yield* runner.handle(status)).progress!;
+        assert.lengthOf(yield* h.starts, 1);
+        if (action === "pause") {
+          assert.equal(held.status, "paused");
+          yield* runner.handle({ ...manualRequest(held, "resume"), workflowVm });
+          yield* runner.handle(status);
+          assert.lengthOf(yield* h.starts, 2);
+        } else {
+          assert.include(["cancelling", "cancelled"], held.status);
+        }
+      }),
+    ),
+);
+
+it.effect.each(["unclassified", "checkpoint-error", "no-pin"] as const)(
+  "does not retry a failed Agent without model-capacity proof and a saved workspace (%s)",
+  (outcome) =>
+    test(
+      Effect.gen(function* () {
+        const { h, runner, status, finalize } = yield* capacityFixture();
+        yield* finalize(outcome);
+        assert.equal((yield* runner.handle(status)).progress?.status, "paused");
+        yield* TestClock.adjust("5 minutes");
+        yield* runner.handle(status);
+        assert.lengthOf(yield* h.starts, 1);
+      }),
+    ),
+);
+
+it.effect.each(["checkpoint-error", "unclassified"] as const)(
+  "retains the latest captured Agent edits when cancelling a capacity retry (%s)",
+  (retryOutcome) =>
+    test(
+      Effect.gen(function* () {
+        const { h, binding, runner, workflowVm, status, finalize } = yield* capacityFixture();
+        const firstTurn = yield* finalize("model-capacity");
+        assert.equal((yield* runner.handle(status)).progress?.agentRetryAttempt, 1);
+        yield* TestClock.adjust("30 seconds");
+        yield* runner.handle(status);
+        const retryTurn = yield* finalize(retryOutcome);
+        assert.equal((yield* runner.handle(status)).progress?.status, "paused");
+        yield* runner.handle({ ...control("cancel"), workflowVm });
+        yield* Ref.update(h.currentThread, (thread) => ({ ...thread!, session: null }));
+        yield* Ref.set(h.providerProof, true);
+        const cancelled = (yield* runner.handle(status)).progress;
+        assert.equal(cancelled?.status, "cancelled");
+        if (retryOutcome === "checkpoint-error")
+          assert.include(cancelled?.detail, "last captured Agent changes");
+        yield* runner.handle(status);
+
+        const sql = yield* SqlClient.SqlClient;
+        const [row, ...others] = yield* sql<{ result: string }>`
+          SELECT result_json AS result FROM workflow_result_outbox
+          WHERE job_id=${binding.jobId} AND result_json IS NOT NULL`;
+        assert(row);
+        assert.isEmpty(others);
+        const capture = yield* decodeWorkflowResultCapture(row.result);
+        const expectedTurn = retryOutcome === "checkpoint-error" ? firstTurn : retryTurn;
+        assert.equal(capture.turnId, expectedTurn);
+        assert.equal(capture.commitId, `commit-${expectedTurn}`);
+        assert.equal(capture.outcome, "cancelled");
+      }),
+    ),
+);
 
 it.effect("keeps the original VM workload cancellation identity across new retry commands", () =>
   test(

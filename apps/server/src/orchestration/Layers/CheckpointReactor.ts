@@ -8,6 +8,7 @@ import {
   TurnId,
   type OrchestrationEvent,
   type ProviderRuntimeEvent,
+  type ThreadPromptQueue,
   type VcsStatusLocalResult,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -34,6 +35,7 @@ import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
 import { WorkflowRunStore } from "../../jobs/WorkflowRunStore.ts";
 import {
   activeWorkflowStep,
+  admittedWorkflowTurnId,
   canRecoverPausedWorkflowTurn,
   workflowAllowsPrompt,
   workflowPromptId,
@@ -258,6 +260,7 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly turnId: TurnId;
     readonly thread: {
+      readonly promptQueue?: ThreadPromptQueue | undefined;
       readonly checkpoints: ReadonlyArray<{
         readonly turnId: TurnId;
         readonly checkpointTurnCount: number;
@@ -293,7 +296,8 @@ const make = Effect.gen(function* () {
       const workflowIgnoreRules = yield* workflows.getWorkflowIgnoreRules(binding);
       if (workflowIgnoreRules === null) return yield* unavailable;
       let pin = yield* workflows.getCheckpointPinForRun(binding, input.turnId, targetCheckpointRef);
-      if (!pin) {
+      let turnBaseline = pin?.baselineCommitId;
+      if (!pin || run.capacityRetry) {
         const previous = input.thread.checkpoints.find(
           (checkpoint) => checkpoint.checkpointTurnCount === fromTurnCount,
         );
@@ -307,22 +311,44 @@ const make = Effect.gen(function* () {
                   previous.checkpointRef,
                 )
               : null;
-        if (!baseline || !(yield* workflows.isVmFenceActive(binding))) return yield* unavailable;
-        const captured = yield* checkpointStore.captureCheckpoint({
-          cwd: input.cwd,
-          checkpointRef: targetCheckpointRef,
-          strictWorkflowCapture: true,
-          workflowIgnoreRules,
-        });
-        pin = yield* workflows.saveCheckpointPin(binding, input.turnId, input.turnCount, {
-          ...captured,
-          checkpointRef: targetCheckpointRef,
-          baselineCommitId: baseline.commitId,
-        });
+        if (!baseline) return yield* unavailable;
+        turnBaseline = baseline.commitId;
+        let baselineCommitId = baseline.commitId;
+        if (run.capacityRetry) {
+          const promptId = workflowPromptId(run);
+          const retryTurn =
+            admittedWorkflowTurnId(input.thread.promptQueue, promptId) ??
+            input.thread.messages.find(
+              (message) => message.role === "user" && message.id === promptId,
+            )?.turnId;
+          if (
+            !baseline.baselineCommitId ||
+            previous?.turnId !== run.capacityRetry.afterTurnId ||
+            previous.checkpointRef !== fromCheckpointRef ||
+            retryTurn !== input.turnId
+          )
+            return yield* unavailable;
+          // Review spans all attempts. The conversation card describes just this turn.
+          baselineCommitId = baseline.baselineCommitId;
+        }
+        if (!pin) {
+          if (!(yield* workflows.isVmFenceActive(binding))) return yield* unavailable;
+          const captured = yield* checkpointStore.captureCheckpoint({
+            cwd: input.cwd,
+            checkpointRef: targetCheckpointRef,
+            strictWorkflowCapture: true,
+            workflowIgnoreRules,
+          });
+          pin = yield* workflows.saveCheckpointPin(binding, input.turnId, input.turnCount, {
+            ...captured,
+            checkpointRef: targetCheckpointRef,
+            baselineCommitId,
+          });
+        }
       }
-      if (!pin) return yield* unavailable;
+      if (!pin || !turnBaseline) return yield* unavailable;
       pinnedPair = {
-        from: CheckpointRef.make(pin.baselineCommitId),
+        from: CheckpointRef.make(turnBaseline),
         to: CheckpointRef.make(pin.commitId),
       };
     }
@@ -525,7 +551,21 @@ const make = Effect.gen(function* () {
 
       // A replay must finalize with the result already saved for this turn.
       // Runtime placeholders still require real Git capture.
-      if (existing && existing.status !== "missing") return existing.status;
+      if (existing && existing.status !== "missing") {
+        // The turn failed, but its files may already have been captured before a restart.
+        if (
+          existing.status === "error" &&
+          event.type === "turn.completed" &&
+          event.payload.state === "failed" &&
+          event.payload.failureReason === "model-capacity" &&
+          run?.runtime.kind === "vm" &&
+          existing.checkpointRef ===
+            checkpointRefForThreadTurn(event.threadId, existing.checkpointTurnCount) &&
+          (yield* workflows.getCheckpointPinForRun(run.runtime, turnId, existing.checkpointRef))
+        )
+          return "ready" as const;
+        return existing.status;
+      }
 
       const projects = yield* resolveThreadProjects(thread.projectId);
       const checkpointCwd = yield* resolveCheckpointCwd({
@@ -1170,6 +1210,9 @@ const make = Effect.gen(function* () {
           turnId,
           outcome,
           checkpoint,
+          ...(event.type === "turn.completed" && outcome === "failed" && event.payload.failureReason
+            ? { failureReason: event.payload.failureReason }
+            : {}),
           ...(resumeWorkflowAttemptId ? { resumeWorkflowAttemptId } : {}),
           ...(event.type === "turn.completed" && event.payload.errorMessage
             ? { detail: event.payload.errorMessage }

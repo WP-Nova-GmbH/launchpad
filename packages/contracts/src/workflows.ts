@@ -15,6 +15,21 @@ export const WORKFLOW_VM_DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
 export const WORKFLOW_VM_DEFAULT_CODEX_REASONING_EFFORT = "high";
 export const WORKFLOW_COMMIT_SUBJECT_LIMIT = 100;
 
+/** The first Agent prompt keeps its original ID even when an Input step precedes it. */
+export function workflowAgentPromptId(
+  jobId: string,
+  stepId: string | undefined,
+  generation: number,
+  hasPreviousAgentResult: boolean,
+  retryAttempt = 0,
+) {
+  if (retryAttempt > 0)
+    return `workflow:${jobId}:step:${stepId}:${generation}:retry:${retryAttempt}:prompt`;
+  return generation === 0 && !hasPreviousAgentResult
+    ? `workflow:${jobId}:prompt`
+    : `workflow:${jobId}:step:${stepId}:${generation}:prompt`;
+}
+
 export function workflowCommitSubjectError(template: string): string | null {
   if (Array.from(template.trim()).length > WORKFLOW_COMMIT_SUBJECT_LIMIT)
     return "Keep the commit subject within 100 characters.";
@@ -604,6 +619,7 @@ export const WorkflowActionProgress = Schema.Struct({
   retryable: Schema.Boolean,
 });
 export const WorkflowJobProgress = Schema.Struct({
+  agentRetryAttempt: Schema.optional(Revision),
   resultSaving: Schema.optional(WorkflowResultSaving),
   executionReleased: Schema.optional(Schema.Boolean),
   /** Set by relay deletion admission, independently of whether an Agent ever started. */

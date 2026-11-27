@@ -1002,10 +1002,12 @@ export const ThreadPromptAdmission = Schema.Struct({
   turnId: TurnId,
   evidence: Schema.Literals(["provider-ack", "harness-dispatch", "local-command"]),
 });
+export const ThreadTurnFailureReason = Schema.Literal("model-capacity");
 const ThreadQueueFinalization = Schema.Struct({
   turnId: TurnId,
   outcome: Schema.Literals(["completed", "failed", "interrupted"]),
   checkpoint: Schema.Literals(["ready", "skipped", "error"]),
+  failureReason: Schema.optionalKey(ThreadTurnFailureReason),
 });
 export const ThreadPromptQueue = Schema.Struct({
   preparation: Schema.optional(ThreadPreparation),
@@ -1581,6 +1583,13 @@ const PromptEnqueueFields = {
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
 };
 const ThreadPromptEnqueueCommand = Schema.Struct({
+  /** Internal workflow continuation after a confirmed, checkpointed Codex capacity failure. */
+  resumeAfterModelCapacity: Schema.optional(
+    Schema.Struct({
+      turnId: TurnId,
+      queueRevision: NonNegativeInt,
+    }),
+  ),
   workflowOrigin: Schema.optional(WorkflowAttribution),
   type: Schema.Literal("thread.prompt.enqueue"),
   ...PromptEnqueueFields,

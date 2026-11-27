@@ -266,6 +266,7 @@ export const harness = Effect.gen(function* () {
     reasoning: "Within the task",
   });
   const receipts = new Map<string, OrchestrationCommandInvariantError | null>();
+  const receiptThreads = new Map<string, ThreadId>();
   const retryMode = yield* Ref.make<"normal" | "before_retry" | "after_retry" | "reject_retry">(
     "normal",
   );
@@ -354,7 +355,7 @@ export const harness = Effect.gen(function* () {
             ? Option.some({
                 commandId,
                 aggregateKind: "thread" as const,
-                aggregateId: ThreadId.make("workflow:job-1:agent"),
+                aggregateId: receiptThreads.get(commandId)!,
                 acceptedAt: NOW,
                 resultSequence: 1,
                 status: receipts.get(commandId) ? ("rejected" as const) : ("accepted" as const),
@@ -381,6 +382,7 @@ export const harness = Effect.gen(function* () {
               });
             return { sequence: 1 };
           }
+          if ("threadId" in command) receiptThreads.set(command.commandId, command.threadId);
           const promptFailure =
             command.type === "thread.prompt.enqueue" ? yield* Ref.get(promptOutage) : "none";
           if (promptFailure !== "none") yield* Ref.set(promptOutage, "none");
@@ -435,6 +437,7 @@ export const harness = Effect.gen(function* () {
           if (
             command.type === "thread.preparation.update" ||
             command.type === "thread.preparation.retry" ||
+            (command.type === "thread.prompt.enqueue" && command.resumeAfterModelCapacity) ||
             command.type === "thread.queue.resolve"
           ) {
             if (

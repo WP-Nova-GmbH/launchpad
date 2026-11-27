@@ -149,6 +149,7 @@ export const make = Effect.gen(function* () {
     binding: WorkflowVmDispatchBinding,
     context: ProjectionSnapshotQuery.ProjectionThreadCheckpointContext,
     turnCount: number,
+    side: "from" | "to",
   ) {
     const threadId = binding.threadId;
     if (turnCount === 0) {
@@ -159,8 +160,11 @@ export const make = Effect.gen(function* () {
       );
       if (pin) return CheckpointRef.make(pin.commitId);
     } else {
+      // A failed provider turn can still have a verified Git pin for the next turn's diff.
       const checkpoint = context.checkpoints.find(
-        (entry) => entry.checkpointTurnCount === turnCount && entry.status === "ready",
+        (entry) =>
+          entry.checkpointTurnCount === turnCount &&
+          (entry.status === "ready" || (side === "from" && entry.status === "error")),
       );
       if (checkpoint) {
         const pin = yield* workflowRuns.getCheckpointPinForTurn(
@@ -330,8 +334,14 @@ export const make = Effect.gen(function* () {
           binding,
           threadContext.value,
           input.fromTurnCount,
+          "from",
         );
-        toCheckpointRef = yield* readWorkflowPin(binding, threadContext.value, input.toTurnCount);
+        toCheckpointRef = yield* readWorkflowPin(
+          binding,
+          threadContext.value,
+          input.toTurnCount,
+          "to",
+        );
       } else {
         const from =
           input.fromTurnCount === 0
@@ -463,8 +473,8 @@ export const make = Effect.gen(function* () {
       const context = yield* projectionSnapshotQuery.getThreadCheckpointContext(input.threadId);
       if (Option.isNone(context))
         return yield* new CheckpointThreadNotFoundError({ operation, threadId: input.threadId });
-      fromCheckpointRef = yield* readWorkflowPin(binding, context.value, 0);
-      toCheckpointRef = yield* readWorkflowPin(binding, context.value, input.toTurnCount);
+      fromCheckpointRef = yield* readWorkflowPin(binding, context.value, 0, "from");
+      toCheckpointRef = yield* readWorkflowPin(binding, context.value, input.toTurnCount, "to");
     }
     const diff = yield* readDiff(binding, input.threadId, input.toTurnCount, {
       cwd: workspaceCwd,

@@ -701,6 +701,21 @@ function toTurnStatus(
   }
 }
 
+function isCodexModelCapacityError(
+  error: EffectCodexSchema.V2TurnCompletedNotification__TurnError,
+) {
+  if (error.codexErrorInfo === "serverOverloaded") return true;
+  // Codex can forward this provider response with no specific model-capacity code.
+  return (
+    error.message.trim() === "Selected model is at capacity. Please try a different model." &&
+    (error.codexErrorInfo == null ||
+      error.codexErrorInfo === "other" ||
+      error.codexErrorInfo === "rateLimitExceeded" ||
+      error.codexErrorInfo === "internalServerError" ||
+      typeof error.codexErrorInfo === "object")
+  );
+}
+
 function normalizeItemType(raw: string | undefined | null): string {
   const type = trimText(raw);
   if (!type) return "item";
@@ -2621,6 +2636,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // after the stop and often sparse, so keep the session's merged view of
         // it and read it when a turn fails on the limit.
         let rateLimits: CodexRateLimitSnapshot | undefined;
+        // Some app-server versions send the error separately from the failed turn.
+        let capacityErrorTurnId: string | undefined;
         const createRuntime = options?.makeRuntime ?? makeCodexSessionRuntime;
         nativeAttempted = true;
         const runtime = yield* createRuntime(runtimeInput).pipe(
@@ -2695,6 +2712,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 EffectCodexSchema.V2ErrorNotification,
                 event.payload,
               );
+              if (errorPayload && !errorPayload.willRetry) {
+                if (isCodexModelCapacityError(errorPayload.error)) {
+                  capacityErrorTurnId = errorPayload.turnId;
+                } else if (errorPayload.turnId === capacityErrorTurnId) {
+                  capacityErrorTurnId = undefined;
+                }
+              }
               // The failed `turn/completed` repeats this sentence and is answered
               // below; relaying both would show the limit twice.
               if (errorPayload?.error.codexErrorInfo === "usageLimitExceeded") return;
@@ -2702,6 +2726,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
 
             let usageLimitError: ProviderRuntimeEvent | undefined;
             let usageLimitMessage: string | undefined;
+            let failedAtCapacity = false;
             if (event.method === "turn/completed") {
               const completedPayload = readPayload(
                 EffectCodexSchema.V2TurnCompletedNotification,
@@ -2711,6 +2736,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                 completedPayload?.turn.status === "failed"
                   ? completedPayload.turn.error
                   : undefined;
+              if (completedPayload?.turn.status === "failed") {
+                failedAtCapacity = turnError
+                  ? isCodexModelCapacityError(turnError)
+                  : capacityErrorTurnId === completedPayload.turn.id;
+              }
+              if (capacityErrorTurnId === completedPayload?.turn.id)
+                capacityErrorTurnId = undefined;
               if (turnError?.codexErrorInfo === "usageLimitExceeded") {
                 usageLimitMessage = codexUsageLimitMessage(rateLimits, event.createdAt);
                 usageLimitError = {
@@ -2732,6 +2764,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                   ...runtimeEvent,
                   payload: {
                     ...runtimeEvent.payload,
+                    ...(failedAtCapacity ? { failureReason: "model-capacity" as const } : {}),
                     ...(usageLimitMessage ? { errorMessage: usageLimitMessage } : {}),
                     tokenUsage: completeCodexTurnTokenUsage(
                       turnTokenUsage,

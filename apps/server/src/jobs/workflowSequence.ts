@@ -1,6 +1,7 @@
 import type { ThreadPromptQueue } from "@t3tools/contracts";
 import {
   isTerminalWorkflowJob,
+  workflowAgentPromptId,
   WORKFLOW_RESPONSE_SUMMARY_COUNT_LIMIT,
   WORKFLOW_RESPONSE_SUMMARY_TEXT_LIMIT,
 } from "@t3tools/contracts/workflows";
@@ -11,10 +12,13 @@ export const activeWorkflowStep = (run: WorkflowRun) =>
 
 export function workflowPromptId(run: WorkflowRun) {
   const sequence = run.sequence;
-  return !sequence ||
-    (sequence.generation === 0 && !sequence.completed.some((step) => step.checkpoint))
-    ? `workflow:${run.jobId}:prompt`
-    : `workflow:${run.jobId}:step:${activeWorkflowStep(run)?.id}:${sequence.generation}:prompt`;
+  return workflowAgentPromptId(
+    run.jobId,
+    activeWorkflowStep(run)?.id,
+    sequence?.generation ?? 0,
+    sequence?.completed.some((step) => step.checkpoint) === true,
+    run.capacityRetry?.attempt,
+  );
 }
 
 /** A requested hold permits only the already-reserved Agent step to finish. */
@@ -95,6 +99,7 @@ export function advanceWorkflow(run: WorkflowRun): WorkflowRun {
         : null;
   return {
     ...run,
+    capacityRetry: undefined,
     promptDispatched: false,
     executionReserved: false,
     preparedHead: run.preparedHead ?? latestResult?.head ?? null,
@@ -135,6 +140,7 @@ export function workflowProgress(run: WorkflowRun): WorkflowRun["progress"] {
   };
   return {
     ...progress,
+    ...(run.capacityRetry ? { agentRetryAttempt: run.capacityRetry.attempt } : {}),
     hasThread: sequence.started,
     steps: run.workflow.definition.steps.map((step, index) => ({
       stepId: step.id,

@@ -272,6 +272,10 @@ before explicitly starting another; it may create an additional job.
 Runs marked **Started by workflow** and their automatic prompts identify the workflow that
 started them. Human checkpoint responses still identify the person who responded.
 
+If Codex reports that the model is at capacity, the VM keeps the Agent’s work and retries the
+same step after 30 seconds, one minute, and two minutes. Run details shows the pending retry.
+If the third retry also hits capacity, the run pauses.
+
 For VM workflows, **Saved results** keeps each Agent's exact changes, conversation and captured
 attachments readable without connecting to the VM, including after its disk expires. Choose an
 Agent result to inspect an earlier version or load older results after rework. These results remain

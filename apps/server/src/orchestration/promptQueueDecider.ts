@@ -3,6 +3,7 @@ import type {
   OrchestrationEvent,
   OrchestrationThread,
   ThreadPromptQueueChangedPayload,
+  ThreadPromptQueue,
   ThreadPromptPauseReason,
 } from "@t3tools/contracts";
 import { EventId, isImportedAgentSessionMessageId } from "@t3tools/contracts";
@@ -25,6 +26,26 @@ type PlannedEvent = OrchestrationEvent extends infer T
     ? Omit<T, "sequence">
     : never
   : never;
+
+/** Scheduling and dispatch must see the same settled, empty, capacity-paused queue. */
+export function capacityRetryTurnId(queue: ThreadPromptQueue) {
+  const failure = queue.finalization;
+  if (
+    queue.enabled ||
+    queue.handoff ||
+    queue.awaitingTurnId ||
+    queue.entries.length ||
+    queue.admissions.length ||
+    (queue.preparation && (!queue.preparation.settled || queue.preparation.state !== "ready")) ||
+    (queue.pauseReason?.code !== "usage-limit" && queue.pauseReason?.code !== "failed") ||
+    failure?.outcome !== "failed" ||
+    failure.failureReason !== "model-capacity" ||
+    failure.checkpoint !== "ready" ||
+    queue.finalizedTurnId !== failure.turnId
+  )
+    return null;
+  return failure.turnId;
+}
 
 /** Queue decisions run inside the engine's ordered transaction, never in a client scheduler. */
 export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(function* (
@@ -352,6 +373,17 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
     }
 
     case "thread.prompt.enqueue": {
+      const retry = command.resumeAfterModelCapacity;
+      if (
+        retry &&
+        (queue.revision !== retry.queueRevision ||
+          capacityRetryTurnId(queue) !== retry.turnId ||
+          busy ||
+          blocked)
+      )
+        return yield* fail(
+          "The queue changed after Codex reported model capacity. Review this run before continuing.",
+        );
       if (isImportedAgentSessionMessageId(command.message.messageId))
         return yield* fail("This message id is reserved for imported history.");
       if (thread.archivedAt !== null)
@@ -380,6 +412,9 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
         ...resets,
         change({
           ...initialQueueState,
+          ...(retry
+            ? { control: { enabled: true, revision: queue.revision + 1, pauseReason: null } }
+            : {}),
           entry: {
             kind: "prompt",
             ...command.message,
@@ -764,6 +799,9 @@ export const decidePromptQueueCommand = Effect.fn("decidePromptQueueCommand")(fu
             turnId: command.turnId,
             outcome: command.outcome,
             checkpoint: command.checkpoint,
+            ...(command.outcome === "failed" && command.failureReason
+              ? { failureReason: command.failureReason }
+              : {}),
           },
           ...(failure && (queue.enabled || resolvedUnknown)
             ? {
