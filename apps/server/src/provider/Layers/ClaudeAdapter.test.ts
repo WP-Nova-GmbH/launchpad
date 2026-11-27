@@ -1,4 +1,9 @@
 // @effect-diagnostics abortControllerInEffect:off - Tests hand-built AbortSignals to the SDK query stub to exercise cancellation.
+import { query as createActualSdkQuery } from "@anthropic-ai/claude-agent-sdk";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { makeClaudeNativeProcess } from "./ClaudeNativeProcess.ts";
+import { FakeClaudeChild } from "./ClaudeNativeProcess.testFixtures.ts";
+import { FakeClaudeQuery } from "./ClaudeQuery.testFixtures.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
@@ -25,6 +30,9 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { assert, describe, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
+import * as NodeChildProcess from "node:child_process";
+import * as Exit from "effect/Exit";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -49,8 +57,19 @@ import {
 } from "../ClaudeModelCatalog.testFixtures.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import type { ProviderSessionStartOptions } from "../Services/ProviderAdapter.ts";
 import type { ClaudeScopedLimitNames } from "./claudeUsageLimits.ts";
 import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
+vi.mock("node:child_process", { spy: true });
+
+const fakeNativeProcess = () =>
+  Effect.succeed({
+    spawn: () => {
+      throw new Error("Fixture queries do not run a native CLI.");
+    },
+    stop: Effect.void,
+    wasSpawnAttempted: () => true,
+  });
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -59,112 +78,10 @@ class ClaudeAdapter extends Context.Service<ClaudeAdapter, ClaudeAdapterShape>()
   "t3/provider/Layers/ClaudeAdapter.test/ClaudeAdapter",
 ) {}
 
-class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
-  private readonly queue: Array<SDKMessage> = [];
-  private readonly waiters: Array<{
-    readonly resolve: (value: IteratorResult<SDKMessage>) => void;
-    readonly reject: (reason: unknown) => void;
-  }> = [];
-  private done = false;
-  private failure: unknown | undefined;
-
-  public readonly setModelCalls: Array<string | undefined> = [];
-  public readonly setPermissionModeCalls: Array<string> = [];
-  public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
-  public closeCalls = 0;
-  public closeError: unknown | undefined;
-
-  emit(message: SDKMessage): void {
-    if (this.done) {
-      return;
-    }
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter.resolve({ done: false, value: message });
-      return;
-    }
-    this.queue.push(message);
-  }
-
-  fail(cause: unknown): void {
-    if (this.done) {
-      return;
-    }
-    this.done = true;
-    this.failure = cause;
-    for (const waiter of this.waiters.splice(0)) {
-      waiter.reject(cause);
-    }
-  }
-
-  finish(): void {
-    if (this.done) {
-      return;
-    }
-    this.done = true;
-    this.failure = undefined;
-    for (const waiter of this.waiters.splice(0)) {
-      waiter.resolve({ done: true, value: undefined });
-    }
-  }
-
-  readonly setModel = async (model?: string): Promise<void> => {
-    this.setModelCalls.push(model);
-  };
-
-  readonly setPermissionMode = async (mode: PermissionMode): Promise<void> => {
-    this.setPermissionModeCalls.push(mode);
-  };
-
-  readonly setMaxThinkingTokens = async (maxThinkingTokens: number | null): Promise<void> => {
-    this.setMaxThinkingTokensCalls.push(maxThinkingTokens);
-  };
-
-  readonly close = (): void => {
-    this.closeCalls += 1;
-    if (this.closeError !== undefined) {
-      throw this.closeError;
-    }
-    this.finish();
-  };
-
-  [Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
-    return {
-      next: () => {
-        if (this.queue.length > 0) {
-          const value = this.queue.shift();
-          if (value) {
-            return Promise.resolve({
-              done: false,
-              value,
-            });
-          }
-        }
-        if (this.failure !== undefined) {
-          const failure = this.failure;
-          this.failure = undefined;
-          return Promise.reject(failure);
-        }
-        if (this.done) {
-          return Promise.resolve({
-            done: true,
-            value: undefined,
-          });
-        }
-        return new Promise((resolve, reject) => {
-          this.waiters.push({
-            resolve,
-            reject,
-          });
-        });
-      },
-    };
-  }
-}
-
 function makeHarness(config?: {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: ClaudeAdapterLiveOptions["nativeEventLogger"];
+  readonly createNativeProcess?: ClaudeAdapterLiveOptions["createNativeProcess"];
   readonly cwd?: string;
   readonly baseDir?: string;
   readonly claudeConfig?: Partial<ClaudeSettings>;
@@ -184,6 +101,7 @@ function makeHarness(config?: {
     | undefined;
 
   const adapterOptions: ClaudeAdapterLiveOptions = {
+    createNativeProcess: config?.createNativeProcess ?? fakeNativeProcess,
     ...(config?.environment ? { environment: config.environment } : {}),
     ...(config?.instanceId ? { instanceId: config.instanceId } : {}),
     ...(config?.scopedLimitNames ? { scopedLimitNames: config.scopedLimitNames } : {}),
@@ -369,6 +287,25 @@ const sendCompletedClaudeTurn = (
   });
 
 describe("ClaudeAdapterLive", () => {
+  it.effect(
+    "rejects missing local approval and user-input callbacks before native dispatch",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "approval-required" });
+        const queries = harness.queries.length;
+        for (const response of [
+          adapter.respondToRequest(THREAD_ID, ApprovalRequestId.make("missing"), "accept"),
+          adapter.respondToUserInput(THREAD_ID, ApprovalRequestId.make("missing"), {}),
+        ])
+          assert.equal((yield* Effect.flip(response))._tag, "ProviderAdapterValidationError");
+        assert.equal(harness.queries.length, queries);
+        yield* adapter.stopSession(THREAD_ID);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
   it.effect("returns validation error for non-claude provider on startSession", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -406,6 +343,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          createNativeProcess: fakeNativeProcess,
           createQuery: () => {
             throw cause;
           },
@@ -1202,7 +1140,7 @@ describe("ClaudeAdapterLive", () => {
     );
     NodeFS.writeFileSync(
       NodePath.join(homeDir, "settings.json"),
-      JSON.stringify({ skillOverrides: { deploy: "off" } }),
+      encodeUnknownJsonString({ skillOverrides: { deploy: "off" } }),
     );
     const harness = makeHarness({ claudeConfig: { homePath: homeDir } });
     return Effect.gen(function* () {
@@ -3374,7 +3312,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("keeps the session available when process close fails", () => {
+  it.effect("retains a hidden cleanup context when SDK close fails", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
@@ -3392,8 +3330,11 @@ describe("ClaudeAdapterLive", () => {
         assert.equal(result.failure._tag, "ProviderAdapterProcessError");
       }
       assert.equal(harness.query.closeCalls, 1);
-      assert.equal(yield* adapter.hasSession(session.threadId), true);
-      assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+      assert.equal(yield* adapter.hasSession(session.threadId), false);
+      assert.equal((yield* adapter.listSessions()).length, 0);
+      harness.query.closeError = undefined;
+      yield* adapter.stopSession(session.threadId);
+      assert.equal(yield* adapter.isSessionStopConfirmed!(session.threadId), true);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -3407,6 +3348,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          createNativeProcess: fakeNativeProcess,
           createQuery: () => {
             const query = new FakeClaudeQuery();
             queries.push(query);
@@ -3443,7 +3385,7 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(result._tag, "Failure");
       assert.equal(queries[0]?.closeCalls, 1);
       assert.equal(queries[1]?.closeCalls, 1);
-      assert.equal(yield* adapter.hasSession(THREAD_ID), true);
+      assert.equal(yield* adapter.hasSession(THREAD_ID), false);
       assert.equal(yield* adapter.hasSession(RESUME_THREAD_ID), false);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -4242,6 +4184,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          createNativeProcess: fakeNativeProcess,
           createQuery: () => {
             const query = new FakeClaudeQuery();
             queries.push(query);
@@ -4325,6 +4268,7 @@ describe("ClaudeAdapterLive", () => {
       Effect.gen(function* () {
         const claudeConfig = decodeClaudeSettings({});
         return yield* makeClaudeAdapter(claudeConfig, {
+          createNativeProcess: fakeNativeProcess,
           createQuery: (input) => {
             // Simulate the SDK consuming the prompt iterable
             (async () => {
@@ -8356,4 +8300,667 @@ describe("ClaudeAdapterLive", () => {
       Effect.provide(harness.layer),
     );
   });
+});
+
+it.effect("rejects missing and malformed required Claude cursors before creating a query", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const adapter = yield* ClaudeAdapter;
+    for (const resumeCursor of [undefined, {}, { resume: "not-a-native-session" }]) {
+      const result = yield* adapter
+        .startSession(
+          {
+            threadId: ThreadId.make("strict-history"),
+            runtimeMode: "approval-required",
+            resumeCursor,
+          },
+          { requireResume: true },
+        )
+        .pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+    }
+    assert.equal((yield* adapter.listSessions()).length, 0);
+    assert.equal(harness.getLastCreateQueryInput(), undefined);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("does not adopt a replacement Claude conversation during strict resume", () => {
+  const harness = makeHarness();
+  return Effect.gen(function* () {
+    const adapter = yield* ClaudeAdapter;
+    const events = yield* adapter.streamEvents.pipe(
+      Stream.takeUntil((event) => event.type === "session.exited"),
+      Stream.runCollect,
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession(
+      {
+        threadId: THREAD_ID,
+        runtimeMode: "approval-required",
+        resumeCursor: { resume: CLAUDE_ORIGINAL_SESSION_ID },
+      },
+      { requireResume: true },
+    );
+    harness.query.emit({
+      type: "system",
+      subtype: "init",
+      apiKeySource: "none",
+      claude_code_version: "test",
+      cwd: "/tmp/claude-adapter-test",
+      tools: [],
+      mcp_servers: [],
+      model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+      permissionMode: "default",
+      slash_commands: [],
+      output_style: "default",
+      skills: [],
+      plugins: [],
+      session_id: CLAUDE_FORK_SESSION_ID,
+      uuid: "replaced-resume-init",
+    } as unknown as SDKMessage);
+    const observed = Array.from(yield* Fiber.join(events));
+    assert.isTrue(observed.some((event) => event.type === "runtime.error"));
+    assert.isFalse(observed.some((event) => event.type === "thread.started"));
+    assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    assert.equal(harness.getLastCreateQueryInput()?.options.resume, CLAUDE_ORIGINAL_SESSION_ID);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("retries retained Claude cleanup after its receipt fails", () => {
+  const harness = makeHarness();
+  const dispose = harness.query.return;
+  let failCleanup = true;
+  vi.spyOn(harness.query, "return").mockImplementation(() =>
+    failCleanup ? Promise.reject(new Error("cleanup receipt failed")) : dispose(),
+  );
+  return Effect.gen(function* () {
+    const adapter = yield* ClaudeAdapter;
+    yield* adapter.startSession({ threadId: THREAD_ID, runtimeMode: "approval-required" });
+    const stopped = yield* adapter.stopSession(THREAD_ID).pipe(Effect.exit);
+    assert.equal(Exit.isFailure(stopped), true);
+    assert.equal(yield* adapter.isSessionStopConfirmed!(THREAD_ID), false);
+    assert.equal(yield* adapter.hasSession(THREAD_ID), false);
+    failCleanup = false;
+    yield* adapter.stopSession(THREAD_ID);
+    assert.equal(yield* adapter.isSessionStopConfirmed!(THREAD_ID), true);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("real SDK disposal cannot confirm an episode while its native child survives", () =>
+  Effect.gen(function* () {
+    const child = new FakeClaudeChild();
+    const entered = yield* Deferred.make<void>();
+    let sdk: ReturnType<typeof createActualSdkQuery> | undefined;
+    const signal = vi.spyOn(process, "kill").mockImplementation((_pid, value) => {
+      if (value === 0) throw Object.assign(new Error("absent"), { code: "ESRCH" });
+      Deferred.doneUnsafe(entered, Effect.void);
+      return true;
+    });
+    const adapterLayer = Layer.effect(
+      ClaudeAdapter,
+      makeClaudeAdapter(decodeClaudeSettings({}), {
+        modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
+        createNativeProcess: (threadId) =>
+          makeClaudeNativeProcess(threadId, { spawn: () => child.asNativeChild() }),
+        createQuery: (input) => {
+          sdk = createActualSdkQuery(input);
+          return sdk;
+        },
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(NodeServices.layer),
+    );
+    try {
+      yield* Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const id = ThreadId.make("real-sdk-native-proof");
+        yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+        const episode = yield* adapter.getSessionRuntimeEpisode!(id);
+        // The installed SDK returns on its two-second cleanup bound, not native exit.
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        sdk!.close();
+        const returned = sdk!.return!();
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_500));
+        yield* Effect.promise(() => returned);
+        assert.equal(child.exitCode, null);
+        const stopping = yield* adapter.stopSession(id, episode).pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), false);
+        child.exit(null, "SIGTERM");
+        yield* Fiber.join(stopping);
+        assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), true);
+      }).pipe(Effect.provide(adapterLayer));
+    } finally {
+      child.exit();
+      signal.mockRestore();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  }).pipe(Effect.provideService(HostProcessPlatform, "linux")),
+);
+
+it.effect("native failure retains the original episode and does not begin SDK disposal", () =>
+  Effect.gen(function* () {
+    let fail = true;
+    const entered = yield* Deferred.make<void>();
+    const released = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      createNativeProcess: (threadId) =>
+        Effect.succeed({
+          spawn: () => {
+            throw new Error("fixture native process is already captured");
+          },
+          wasSpawnAttempted: () => true,
+          stop: Effect.suspend(() =>
+            fail
+              ? Effect.fail(
+                  new ProviderAdapterProcessError({
+                    provider: ProviderDriverKind.make("claudeAgent"),
+                    threadId,
+                    detail: "Native group still present.",
+                  }),
+                )
+              : Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(released))),
+          ),
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const id = ThreadId.make("native-failure-retry");
+      yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+      const episode = yield* adapter.getSessionRuntimeEpisode!(id);
+      assert.equal((yield* adapter.stopSession(id, episode).pipe(Effect.result))._tag, "Failure");
+      assert.equal(yield* adapter.hasSession(id), false);
+      assert.equal(harness.query.closeCalls, 0);
+      assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), false);
+      fail = false;
+      const stopping = yield* adapter.stopSession(id, episode).pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      assert.equal(harness.query.closeCalls, 0);
+      assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), false);
+      yield* Deferred.succeed(released, undefined);
+      yield* Fiber.join(stopping);
+      assert.equal(harness.query.closeCalls, 1);
+      assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), true);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect(
+  "Windows tree termination precedes SDK EOF even when EOF exits the leader immediately",
+  () =>
+    Effect.gen(function* () {
+      const child = new FakeClaudeChild();
+      const order: string[] = [];
+      vi.mocked(NodeChildProcess.execFile).mockImplementation((...args) => {
+        order.push("taskkill");
+        child.exit(null, "SIGKILL");
+        const callback = args[3];
+        if (typeof callback === "function") callback(null, "", "");
+        return child.asNativeChild();
+      });
+      const layer = Layer.effect(
+        ClaudeAdapter,
+        makeClaudeAdapter(decodeClaudeSettings({}), {
+          createNativeProcess: (id) =>
+            makeClaudeNativeProcess(id, { spawn: () => child.asNativeChild() }),
+          createQuery: (input) => {
+            input.options.spawnClaudeCodeProcess!({
+              command: "fixture",
+              args: [],
+              env: {},
+              signal: new AbortController().signal,
+            });
+            const query = new FakeClaudeQuery();
+            const close = query.close.bind(query);
+            (query as { close: () => void }).close = () => {
+              order.push("EOF");
+              child.exit();
+              close();
+            };
+            return query;
+          },
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      try {
+        yield* Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          const id = ThreadId.make("windows-native-tree-before-EOF");
+          yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+          const episode = yield* adapter.getSessionRuntimeEpisode!(id);
+          yield* adapter.stopSession(id, episode);
+          assert.deepEqual(order, ["taskkill", "EOF"]);
+          assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), true);
+        }).pipe(Effect.provide(layer));
+      } finally {
+        vi.mocked(NodeChildProcess.execFile).mockRestore();
+      }
+    }).pipe(Effect.provideService(HostProcessPlatform, "win32")),
+);
+
+it.effect.each(["success", "failure-retry"] as const)(
+  "buffered SDK messages cannot close input before Windows tree proof: %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const child = new FakeClaudeChild();
+      const entered = yield* Deferred.make<void>();
+      let taskkillCallback:
+        | ((error: Error | null, stdout: string, stderr: string) => void)
+        | undefined;
+      let nextCommand = entered;
+      let treeConfirmed = false;
+      let eofBeforeProof = false;
+      let discarded: Deferred.Deferred<"pulled" | "disposed"> | undefined;
+      let eventDelivered = false;
+      child.stdin.on("finish", () => {
+        eofBeforeProof = !treeConfirmed;
+        child.exit();
+      });
+      vi.mocked(NodeChildProcess.execFile).mockImplementation((...args) => {
+        taskkillCallback = args[3] as typeof taskkillCallback;
+        Deferred.doneUnsafe(nextCommand, Effect.void);
+        return child.asNativeChild();
+      });
+      const layer = Layer.effect(
+        ClaudeAdapter,
+        makeClaudeAdapter(decodeClaudeSettings({}), {
+          modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
+          createNativeProcess: (id) =>
+            makeClaudeNativeProcess(id, { spawn: () => child.asNativeChild() }),
+          createQuery: (input) => {
+            const sdk = createActualSdkQuery(input);
+            const iterator = sdk[Symbol.asyncIterator]();
+            return {
+              setModel: (model) => sdk.setModel(model),
+              setPermissionMode: (mode) => sdk.setPermissionMode(mode),
+              setMaxThinkingTokens: (tokens) => sdk.setMaxThinkingTokens(tokens),
+              close: () => sdk.close(),
+              return: () => sdk.return!(),
+              [Symbol.asyncIterator]: () => ({
+                next: async () => {
+                  if (eventDelivered && discarded)
+                    Deferred.doneUnsafe(discarded, Effect.succeed("pulled"));
+                  const result = await iterator.next();
+                  if (
+                    !result.done &&
+                    result.value.type === "system" &&
+                    result.value.subtype === "status"
+                  )
+                    eventDelivered = true;
+                  return result;
+                },
+                return: async () => {
+                  if (discarded) Deferred.doneUnsafe(discarded, Effect.succeed("disposed"));
+                  return iterator.return!();
+                },
+              }),
+            };
+          },
+        }),
+      ).pipe(
+        Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      try {
+        yield* Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          const id = ThreadId.make(`buffered-native-stop-${outcome}`);
+          yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+          const episode = yield* adapter.getSessionRuntimeEpisode!(id);
+          discarded = yield* Deferred.make<"pulled" | "disposed">();
+          const stopping = yield* adapter
+            .stopSession(id, episode)
+            .pipe(Effect.result, Effect.forkScoped);
+          yield* Deferred.await(entered);
+          child.stdout.write(
+            encodeUnknownJsonString({
+              type: "system",
+              subtype: "status",
+              status: null,
+              uuid: "buffered",
+              session_id: "native",
+            }) + "\n",
+          );
+          const consumed = yield* Deferred.await(discarded);
+          if (consumed !== "pulled") {
+            // Settle the old implementation's held command before reporting its ordering failure.
+            taskkillCallback!(new Error("tree ownership lost"), "", "");
+            yield* Fiber.join(stopping);
+            child.exit();
+            assert.equal(consumed, "pulled");
+          }
+          assert.equal(eofBeforeProof, false);
+          assert.equal(child.exitCode, null);
+          assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), false);
+          if (outcome === "failure-retry") {
+            taskkillCallback!(new Error("tree kill denied"), "", "");
+            assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+            assert.equal(child.exitCode, null);
+            discarded = yield* Deferred.make<"pulled" | "disposed">();
+            eventDelivered = false;
+            child.stdout.write(
+              encodeUnknownJsonString({
+                type: "system",
+                subtype: "status",
+                status: null,
+                uuid: "after-failure",
+                session_id: "native",
+              }) + "\n",
+            );
+            assert.equal(yield* Deferred.await(discarded), "pulled");
+            nextCommand = yield* Deferred.make<void>();
+            const retry = yield* adapter.stopAll().pipe(Effect.forkScoped);
+            yield* Deferred.await(nextCommand);
+            treeConfirmed = true;
+            taskkillCallback!(null, "", "");
+            child.exit(null, "SIGKILL");
+            yield* Fiber.join(retry);
+          } else {
+            treeConfirmed = true;
+            taskkillCallback!(null, "", "");
+            child.exit(null, "SIGKILL");
+            yield* Fiber.join(stopping);
+          }
+          assert.equal(eofBeforeProof, false);
+          assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), true);
+        }).pipe(Effect.provide(layer));
+      } finally {
+        child.exit();
+        vi.mocked(NodeChildProcess.execFile).mockRestore();
+      }
+    }).pipe(Effect.provideService(HostProcessPlatform, "win32")),
+);
+
+it.effect(
+  "interrupted native stop stays fenced and concurrent cleanup retries the same Claude child",
+  () =>
+    Effect.gen(function* () {
+      const child = new FakeClaudeChild();
+      let entered = yield* Deferred.make<void>();
+      const signals: number[] = [];
+      const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (signal === 0) throw Object.assign(new Error("absent"), { code: "ESRCH" });
+        signals.push(pid);
+        Deferred.doneUnsafe(entered, Effect.void);
+        return true;
+      });
+      const harness = makeHarness({
+        createNativeProcess: (id) =>
+          makeClaudeNativeProcess(id, { spawn: () => child.asNativeChild() }).pipe(
+            Effect.tap((native) =>
+              Effect.sync(() =>
+                native.spawn({
+                  command: "fixture",
+                  args: [],
+                  env: {},
+                  signal: new AbortController().signal,
+                }),
+              ),
+            ),
+          ),
+      });
+      try {
+        yield* Effect.gen(function* () {
+          const adapter = yield* ClaudeAdapter;
+          const id = ThreadId.make("interrupted-original-claude");
+          yield* adapter.startSession({ threadId: id, runtimeMode: "approval-required" });
+          const episode = yield* adapter.getSessionRuntimeEpisode!(id);
+          const first = yield* adapter.stopSession(id, episode).pipe(Effect.forkScoped);
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(first);
+          assert.equal(harness.query.closeCalls, 0);
+          assert.equal(yield* adapter.hasSession(id), false);
+          assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), false);
+          entered = yield* Deferred.make<void>();
+          const retry = yield* adapter.stopSession(id, episode).pipe(Effect.forkScoped);
+          yield* Deferred.await(entered);
+          const concurrent = yield* adapter.stopAll().pipe(Effect.forkScoped);
+          assert.equal(harness.query.closeCalls, 0);
+          child.exit(null, "SIGTERM");
+          yield* Fiber.join(retry);
+          yield* Fiber.join(concurrent);
+          assert.deepEqual(signals, [-child.pid, -child.pid]);
+          assert.equal(harness.query.closeCalls, 1);
+          assert.equal(yield* adapter.isSessionStopConfirmed!(id, episode), true);
+        }).pipe(Effect.provide(harness.layer));
+      } finally {
+        child.exit();
+        kill.mockRestore();
+      }
+    }).pipe(Effect.provideService(HostProcessPlatform, "linux")),
+);
+
+const policyRefreshCases: ReadonlyArray<{
+  readonly name: string;
+  readonly initialRequireResume: boolean;
+  readonly update: ProviderSessionStartOptions;
+  readonly partial?: boolean;
+  readonly rejects?: boolean;
+  readonly replaceHook?: boolean;
+  readonly withoutHook?: boolean;
+  readonly undefinedPolicy?: boolean;
+}> = [
+  {
+    name: "strict partial rewind",
+    initialRequireResume: true,
+    update: { requireResume: true },
+    partial: true,
+  },
+  { name: "relaxed full rewind", initialRequireResume: true, update: { requireResume: false } },
+  {
+    name: "newly strict full rewind",
+    initialRequireResume: false,
+    update: { requireResume: true },
+    rejects: true,
+  },
+  { name: "empty strict update", initialRequireResume: true, update: {}, rejects: true },
+  {
+    name: "undefined strict update",
+    initialRequireResume: true,
+    update: {},
+    undefinedPolicy: true,
+    rejects: true,
+  },
+  { name: "empty ordinary update", initialRequireResume: false, update: {} },
+  {
+    name: "different lifecycle hook",
+    initialRequireResume: false,
+    update: { requireResume: false },
+    replaceHook: true,
+  },
+  {
+    name: "standalone context",
+    initialRequireResume: false,
+    update: { requireResume: false },
+    replaceHook: true,
+    withoutHook: true,
+  },
+];
+
+it.effect.each(
+  policyRefreshCases.flatMap((scenario) =>
+    (["updateSessionOptions", "sendTurn"] as const).map((setter) => ({ ...scenario, setter })),
+  ),
+)("Claude policy refresh preserves restart ownership: $setter / $name", (scenario) => {
+  const firstPromptId = "550e8400-e29b-41d4-a716-446655440030";
+  const secondPromptId = "550e8400-e29b-41d4-a716-446655440050";
+  const history = [
+    claudeHistoryMessage({ type: "user", uuid: firstPromptId }),
+    claudeHistoryMessage({ type: "assistant", uuid: "550e8400-e29b-41d4-a716-446655440040" }),
+    claudeHistoryMessage({ type: "user", uuid: secondPromptId }),
+    claudeHistoryMessage({ type: "assistant", uuid: "550e8400-e29b-41d4-a716-446655440060" }),
+  ];
+  let acquisitions = 0;
+  const registeredEpisodes: string[] = [];
+  const incomingHook = vi.fn(() => Effect.void);
+  const harness = makeHarness({
+    getSessionMessages: (id) =>
+      Promise.resolve(
+        id === CLAUDE_ORIGINAL_SESSION_ID
+          ? history
+          : history
+              .slice(0, 2)
+              .map((message) => ({ ...message, session_id: CLAUDE_FORK_SESSION_ID })),
+      ),
+    forkSession: () => Promise.resolve({ sessionId: CLAUDE_FORK_SESSION_ID }),
+    createNativeProcess: () =>
+      Effect.sync(() => {
+        acquisitions++;
+        return {
+          spawn: () => {
+            throw new Error("Fixture queries do not spawn a CLI.");
+          },
+          stop: Effect.void,
+          wasSpawnAttempted: () => true,
+        };
+      }),
+  });
+  return Effect.gen(function* () {
+    const adapter = yield* ClaudeAdapter;
+    yield* adapter.startSession(
+      {
+        threadId: THREAD_ID,
+        runtimeMode: "full-access",
+        resumeCursor: {
+          resume: CLAUDE_ORIGINAL_SESSION_ID,
+          turnCount: 2,
+          turnStartMessageIds: [firstPromptId, secondPromptId],
+        },
+      },
+      {
+        requireResume: scenario.initialRequireResume,
+        ...(scenario.withoutHook
+          ? {}
+          : {
+              beforeStart: (episode: string) =>
+                Effect.sync(() => {
+                  // Registration precedes both native ownership and SDK query acquisition.
+                  assert.equal(acquisitions, registeredEpisodes.length);
+                  assert.equal(
+                    harness.getLastCreateQueryInput() === undefined ? 0 : harness.queries.length,
+                    registeredEpisodes.length,
+                  );
+                  registeredEpisodes.push(episode);
+                }),
+            }),
+      },
+    );
+    const originalEpisode = yield* adapter.getSessionRuntimeEpisode!(THREAD_ID);
+    assert(originalEpisode);
+    const update: ProviderSessionStartOptions = {
+      ...scenario.update,
+      ...(scenario.replaceHook ? { beforeStart: incomingHook } : {}),
+    };
+    // Exercise explicit undefined from untyped callers without widening the production options.
+    if (scenario.undefinedPolicy)
+      Object.defineProperty(update, "requireResume", { value: undefined });
+    if (!scenario.replaceHook) Object.defineProperty(update, "beforeStart", { value: undefined });
+    let turns = 2;
+    if (scenario.setter === "updateSessionOptions") {
+      yield* adapter.updateSessionOptions!(THREAD_ID, update);
+    } else {
+      const sending = yield* adapter
+        .sendTurn(
+          { threadId: THREAD_ID, input: "Next prompt", attachments: [] },
+          { sessionOptions: update, onAdmitted: () => Effect.void },
+        )
+        .pipe(Effect.forkChild);
+      const prompt = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert(prompt?.uuid);
+      history.push(claudeHistoryMessage({ type: "user", uuid: prompt.uuid }));
+      history.push(
+        claudeHistoryMessage({ type: "assistant", uuid: "550e8400-e29b-41d4-a716-446655440070" }),
+      );
+      const turn = yield* Fiber.join(sending);
+      const completed = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "turn.completed",
+      ).pipe(Stream.runHead, Effect.forkChild);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        errors: [],
+        session_id: CLAUDE_ORIGINAL_SESSION_ID,
+        uuid: `result-${turn.turnId}`,
+      } as unknown as SDKMessage);
+      assert.equal((yield* Fiber.join(completed))._tag, "Some");
+      turns++;
+    }
+    const result = yield* adapter
+      .rollbackThread(THREAD_ID, scenario.partial ? turns - 1 : turns)
+      .pipe(Effect.result);
+    assert.equal(result._tag, scenario.rejects ? "Failure" : "Success");
+    assert.equal(incomingHook.mock.calls.length, 0);
+    if (scenario.rejects) {
+      if (result._tag === "Failure")
+        assert.instanceOf(result.failure, ProviderAdapterValidationError);
+      assert.equal(acquisitions, 1);
+      assert.equal(registeredEpisodes.length, 1);
+      assert.isFalse(yield* adapter.hasSession(THREAD_ID));
+      return;
+    }
+    const replacementEpisode = yield* adapter.getSessionRuntimeEpisode!(THREAD_ID);
+    assert(replacementEpisode);
+    assert.notEqual(replacementEpisode, originalEpisode);
+    assert.deepEqual(
+      registeredEpisodes,
+      scenario.withoutHook ? [] : [originalEpisode, replacementEpisode],
+    );
+    assert.equal(acquisitions, 2);
+    assert.equal(harness.queries.length, 2);
+    assert.equal(
+      harness.getLastCreateQueryInput()?.options.resume,
+      scenario.partial ? CLAUDE_FORK_SESSION_ID : undefined,
+    );
+    assert.equal(harness.query.closeCalls, 1);
+    yield* adapter.stopSession(THREAD_ID, replacementEpisode);
+    assert.isTrue(yield* adapter.isSessionStopConfirmed!(THREAD_ID, replacementEpisode));
+    assert.isFalse(yield* adapter.hasSession(THREAD_ID));
+    assert.equal(harness.queries[1]!.closeCalls, 1);
+  }).pipe(Effect.provide(harness.layer));
+});
+
+it.effect("Claude sendTurn with omitted policy retains strict restart policy and ownership", () => {
+  const harness = makeHarness({ getSessionMessages: () => Promise.resolve([]) });
+  const episodes: string[] = [];
+  return Effect.gen(function* () {
+    const adapter = yield* ClaudeAdapter;
+    yield* adapter.startSession(
+      {
+        threadId: THREAD_ID,
+        runtimeMode: "full-access",
+        resumeCursor: { resume: CLAUDE_ORIGINAL_SESSION_ID },
+      },
+      {
+        requireResume: true,
+        beforeStart: (episode) =>
+          Effect.sync(() => {
+            episodes.push(episode);
+          }),
+      },
+    );
+    const sending = yield* adapter
+      .sendTurn(
+        { threadId: THREAD_ID, input: "Next prompt", attachments: [] },
+        { onAdmitted: () => Effect.void },
+      )
+      .pipe(Effect.forkChild);
+    yield* Effect.promise(() => readFirstPromptMessage(harness.getLastCreateQueryInput()));
+    yield* Fiber.join(sending);
+    const result = yield* adapter.rollbackThread(THREAD_ID, 1).pipe(Effect.result);
+    assert.equal(result._tag, "Failure");
+    assert.equal(episodes.length, 1);
+    assert.equal(harness.queries.length, 1);
+    assert.isFalse(yield* adapter.hasSession(THREAD_ID));
+  }).pipe(Effect.provide(harness.layer));
 });

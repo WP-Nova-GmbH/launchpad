@@ -1,5 +1,6 @@
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
-import type { ScopedThreadRef, TurnId } from "@t3tools/contracts";
+import type { WorkflowResultOrigin } from "@t3tools/client-runtime/relay/workflow-result";
+import { TurnId, type ScopedThreadRef } from "@t3tools/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
@@ -8,17 +9,38 @@ import { resolveStorage } from "./lib/storage";
 export type DiffPanelSelection =
   | { kind: "branch"; baseRef: string | null }
   | { kind: "unstaged" }
-  | { kind: "turn"; turnId: TurnId; filePath: string | null; revealRequestId: number };
+  | {
+      kind: "turn";
+      turnId: TurnId;
+      filePath: string | null;
+      revealRequestId: number;
+      checkpointTurnCount?: number;
+    };
 
 const DEFAULT_SELECTION: DiffPanelSelection = { kind: "unstaged" };
+type WorkflowDiffOrigin = Pick<
+  WorkflowResultOrigin,
+  "reviewCheckpoint" | "reviewVisitId" | "savedDiffCheckpoint"
+>;
 
 interface DiffPanelStoreState {
   byThreadKey: Record<string, DiffPanelSelection>;
   branchBaseRefByThreadKey: Record<string, string | null>;
   selectGitScope: (ref: ScopedThreadRef, scope: "branch" | "unstaged") => void;
   selectBranchBaseRef: (ref: ScopedThreadRef, baseRef: string | null) => void;
-  selectTurn: (ref: ScopedThreadRef, turnId: TurnId, filePath?: string) => void;
-  reconcileTurnSelection: (ref: ScopedThreadRef, availableTurnIds: ReadonlyArray<TurnId>) => void;
+  selectTurn: (
+    ref: ScopedThreadRef,
+    turnId: TurnId,
+    filePath?: string,
+    checkpointTurnCount?: number,
+  ) => void;
+  reconcileTurnSelection: (
+    ref: ScopedThreadRef,
+    availableTurnIds: ReadonlyArray<TurnId>,
+    origin?: WorkflowDiffOrigin | null,
+    declaredReviewVisitId?: string,
+    checkpointOnly?: boolean,
+  ) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
 
@@ -69,7 +91,7 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             },
           };
         }),
-      selectTurn: (ref, turnId, filePath) =>
+      selectTurn: (ref, turnId, filePath, checkpointTurnCount) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const previous = state.byThreadKey[threadKey];
@@ -81,26 +103,34 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
                 turnId,
                 filePath: filePath?.trim() || null,
                 revealRequestId: previous?.kind === "turn" ? previous.revealRequestId + 1 : 1,
+                ...(checkpointTurnCount !== undefined ? { checkpointTurnCount } : {}),
               },
             },
           };
         }),
-      reconcileTurnSelection: (ref, availableTurnIds) =>
+      reconcileTurnSelection: (
+        ref,
+        availableTurnIds,
+        origin,
+        declaredReviewVisitId,
+        checkpointOnly,
+      ) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const previous = state.byThreadKey[threadKey];
-          const latestTurnId = availableTurnIds[0];
-          if (
-            previous?.kind !== "turn" ||
-            latestTurnId === undefined ||
-            availableTurnIds.includes(previous.turnId)
-          ) {
-            return state;
-          }
+          if (!previous) return state;
+          const { selection } = resolveDiffPanelSelection(
+            previous,
+            availableTurnIds,
+            origin,
+            declaredReviewVisitId,
+            checkpointOnly,
+          );
+          if (selection === previous) return state;
           return {
             byThreadKey: {
               ...state.byThreadKey,
-              [threadKey]: { ...previous, turnId: latestTurnId },
+              [threadKey]: selection,
             },
           };
         }),
@@ -136,4 +166,81 @@ export function selectThreadDiffPanelSelection(
 ): DiffPanelSelection {
   if (!ref) return DEFAULT_SELECTION;
   return byThreadKey[scopedThreadKey(ref)] ?? DEFAULT_SELECTION;
+}
+
+function resolveDiffPanelScope(
+  selection: DiffPanelSelection,
+  origin: WorkflowDiffOrigin | null | undefined,
+  reviewBlocked: boolean,
+) {
+  const turnId = selection.kind === "turn" ? selection.turnId : undefined;
+  const reviewCheckpoint =
+    !reviewBlocked && turnId && origin?.reviewCheckpoint?.turnId === turnId
+      ? origin.reviewCheckpoint
+      : undefined;
+  const savedDiffCheckpoint =
+    !reviewBlocked && turnId && origin?.savedDiffCheckpoint?.turnId === turnId
+      ? origin.savedDiffCheckpoint
+      : undefined;
+  const workflowReview =
+    reviewCheckpoint && turnId && origin?.reviewVisitId
+      ? {
+          visitId: origin.reviewVisitId,
+          expectedTurnId: turnId,
+          checkpointTurnCount: reviewCheckpoint.checkpointTurnCount,
+        }
+      : null;
+  return { selection, reviewBlocked, reviewCheckpoint, savedDiffCheckpoint, workflowReview };
+}
+
+export function resolveDiffPanelSelection(
+  storedSelection: DiffPanelSelection,
+  availableTurnIds: ReadonlyArray<TurnId>,
+  origin: WorkflowDiffOrigin | null | undefined,
+  declaredReviewVisitId?: string,
+  checkpointOnly = false,
+) {
+  const reviewBlocked =
+    declaredReviewVisitId !== undefined &&
+    (!origin?.reviewVisitId ||
+      origin.reviewVisitId !== declaredReviewVisitId ||
+      !origin.reviewCheckpoint);
+  const latestTurnId = availableTurnIds[0];
+  const checkpoint = origin?.reviewCheckpoint;
+  const fallbackTurnId = checkpoint ? TurnId.make(checkpoint.turnId) : latestTurnId;
+  let selection: DiffPanelSelection =
+    checkpointOnly && !reviewBlocked && storedSelection.kind !== "turn" && fallbackTurnId
+      ? {
+          kind: "turn",
+          turnId: fallbackTurnId,
+          filePath: null,
+          revealRequestId: 0,
+          ...(checkpoint ? { checkpointTurnCount: checkpoint.checkpointTurnCount } : {}),
+        }
+      : storedSelection;
+  if (
+    !checkpointOnly &&
+    !reviewBlocked &&
+    !origin?.reviewVisitId &&
+    selection.kind === "turn" &&
+    selection.checkpointTurnCount !== undefined
+  ) {
+    // Older checkout review visits stored the count without its route origin.
+    const { checkpointTurnCount: _legacy, ...turn } = selection;
+    selection = turn;
+  }
+  const scope = resolveDiffPanelScope(selection, origin, reviewBlocked);
+  if (
+    reviewBlocked ||
+    scope.reviewCheckpoint ||
+    scope.savedDiffCheckpoint ||
+    selection.kind !== "turn" ||
+    selection.checkpointTurnCount !== undefined ||
+    latestTurnId === undefined ||
+    availableTurnIds.includes(selection.turnId)
+  )
+    return scope;
+
+  const latest = { ...selection, turnId: latestTurnId };
+  return resolveDiffPanelScope(latest, origin, reviewBlocked);
 }

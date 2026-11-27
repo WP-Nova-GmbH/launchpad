@@ -37,6 +37,9 @@ export type ApprovalDisposition =
   /** Needs the supervisor model. */
   | { readonly kind: "consult"; readonly toolKind: ProviderRuntimeToolKind };
 
+export const MASKED_UNSAFE_WORKFLOW_APPROVAL =
+  "This workflow operation was denied before its details were masked.";
+
 /**
  * Commands that escape the checkpointed workspace. `refs/t3/checkpoints/*`
  * makes local mistakes cheap to reverse; these have no such backstop, and
@@ -72,6 +75,8 @@ export function classifyApprovalRequest(input: {
   readonly requestType: string | undefined;
   readonly detail: string | undefined;
 }): ApprovalDisposition {
+  if (input.detail === MASKED_UNSAFE_WORKFLOW_APPROVAL)
+    return { kind: "deny", reason: "This operation leaves the workflow's prepared workspace." };
   const toolKind = providerRuntimeToolKindForRequestType(input.requestType);
 
   if (toolKind === "file-read") {
@@ -80,6 +85,10 @@ export function classifyApprovalRequest(input: {
     // avoids by classifying first.
     return { kind: "auto-approve", reason: "Reading files needs no supervision." };
   }
+
+  // A file-change approval describes a patch. Its paths may contain shell
+  // words, but any later attempt to execute them requires its own approval.
+  if (toolKind === "file-change") return { kind: "consult", toolKind };
 
   const detail = input.detail ?? "";
   for (const { pattern, what } of ESCAPES_THE_WORKSPACE) {

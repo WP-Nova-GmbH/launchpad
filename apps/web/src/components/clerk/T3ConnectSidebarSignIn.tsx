@@ -6,7 +6,11 @@ import { hasCloudPublicConfig } from "../../cloud/publicConfig";
 import { SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "../ui/sidebar";
 import { MobileClientsUserProfilePage } from "./MobileClientsUserProfilePage";
 import { T3ConnectUserProfilePage } from "./T3ConnectUserProfilePage";
-import { useT3ConnectAuthPrompt } from "./useT3ConnectAuthPrompt";
+import {
+  retryT3ConnectSignIn,
+  T3_CONNECT_SIGN_IN_ERROR,
+  useT3ConnectAuthPrompt,
+} from "./useT3ConnectAuthPrompt";
 
 export function T3ConnectSidebarSignIn() {
   if (!hasCloudPublicConfig()) return null;
@@ -60,22 +64,24 @@ function ConfiguredT3ConnectSidebarAvatar() {
 }
 
 function ConfiguredT3ConnectSidebarSignIn() {
-  const { isLoaded, isSignedIn } = useAuth();
-  const { authPrompt, openAuthPrompt } = useT3ConnectAuthPrompt();
+  const { isSignedIn } = useAuth();
+  const { status, openAuthPrompt } = useT3ConnectAuthPrompt();
 
-  if (!isLoaded || isSignedIn) return null;
+  if (isSignedIn || status === "loading") return null;
 
   return (
-    <>
-      <SidebarMenu>
-        <SidebarMenuItem>
-          <SidebarMenuButton onClick={openAuthPrompt}>
-            <LogInIcon />
-            <span>Sign in to Launchpad Connect</span>
-          </SidebarMenuButton>
-        </SidebarMenuItem>
-      </SidebarMenu>
-      {authPrompt}
-    </>
+    <SidebarMenu>
+      <SidebarMenuItem>
+        {status === "error" ? (
+          <p role="alert" className="px-2 py-1 text-xs text-muted-foreground">
+            {T3_CONNECT_SIGN_IN_ERROR}
+          </p>
+        ) : null}
+        <SidebarMenuButton onClick={status === "error" ? retryT3ConnectSignIn : openAuthPrompt}>
+          <LogInIcon />
+          <span>{status === "error" ? "Retry sign-in" : "Sign in to Launchpad Connect"}</span>
+        </SidebarMenuButton>
+      </SidebarMenuItem>
+    </SidebarMenu>
   );
 }

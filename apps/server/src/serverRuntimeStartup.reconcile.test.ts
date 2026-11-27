@@ -56,12 +56,14 @@ const makeThread = (
 
 const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
   ({
+    checkpointWorkflowConversation: () => Effect.die("Unexpected workflow capture"),
     startSession: () => Effect.die("unused"),
     sendTurn: () => Effect.die("unused"),
     compactThread: () => Effect.die("unused"),
     interruptTurn: () => Effect.die("unused"),
     respondToRequest: () => Effect.die("unused"),
     respondToUserInput: () => Effect.die("unused"),
+    isWorkflowSessionStopConfirmed: () => Effect.succeed(false),
     stopSession: () => Effect.die("unused"),
     listSessions: () => Effect.succeed(liveThreadIds.map((threadId) => ({ threadId }) as never)),
     getCapabilities: () => Effect.die("unused"),
@@ -151,6 +153,7 @@ it.effect("marks active running sessions that have persisted resume state", () =
           ),
         ),
       upsert: (binding) => Effect.sync(() => upserts.push(binding)),
+      confirmShutdown: () => Effect.succeed(false),
       recordImportedTranscript: () => Effect.die("unused"),
       getProvider: () => Effect.die("unused"),
       listThreadIds: () => Effect.die("unused"),
@@ -280,6 +283,7 @@ it.effect.each(
                 firstMarkerCleared ? Deferred.succeed(continuationCleared, undefined) : Effect.void,
               ),
             ),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.die("unused"),
           getProvider: () => Effect.die("unused"),
           listThreadIds: () => Effect.die("unused"),
@@ -411,6 +415,7 @@ it.effect("does not continue archived or deleted marked sessions", () => {
         });
       },
       upsert: () => Effect.void,
+      confirmShutdown: () => Effect.succeed(false),
       recordImportedTranscript: () => Effect.die("unused"),
       getProvider: () => Effect.die("unused"),
       listThreadIds: () => Effect.die("unused"),
@@ -465,6 +470,7 @@ it.effect("retries continuation preparation before settling a persistent failure
           },
         }),
       upsert: () => Effect.void,
+      confirmShutdown: () => Effect.succeed(false),
       recordImportedTranscript: () => Effect.die("unused"),
       getProvider: () => Effect.die("unused"),
       listThreadIds: () => Effect.die("unused"),
@@ -537,6 +543,7 @@ it.effect("reconciles multiple active and archived orphans but skips live sessio
           ),
         ),
       upsert: (binding) => Effect.sync(() => upserts.push(binding)),
+      confirmShutdown: () => Effect.succeed(false),
       recordImportedTranscript: () => Effect.die("unused"),
       getProvider: () => Effect.die("unused"),
       listThreadIds: () => Effect.die("unused"),
@@ -615,6 +622,7 @@ it.effect(
                   providerInstanceId,
                 }),
         upsert: () => Effect.fail(writeFailure),
+        confirmShutdown: () => Effect.succeed(false),
         recordImportedTranscript: () => Effect.die("unused"),
         getProvider: () => Effect.die("unused"),
         listThreadIds: () => Effect.die("unused"),
@@ -653,6 +661,7 @@ it.effect("retries failed projections and continues after a persistent failure",
     directory: {
       getBinding: () => Effect.succeedNone,
       upsert: () => Effect.void,
+      confirmShutdown: () => Effect.succeed(false),
       recordImportedTranscript: () => Effect.die("unused"),
       getProvider: () => Effect.die("unused"),
       listThreadIds: () => Effect.die("unused"),
@@ -703,6 +712,7 @@ it.effect("does not fail startup when the live provider session inventory cannot
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, {
       getBinding: () => Effect.die("unused"),
       upsert: () => Effect.die("unused"),
+      confirmShutdown: () => Effect.succeed(false),
       recordImportedTranscript: () => Effect.die("unused"),
       getProvider: () => Effect.die("unused"),
       listThreadIds: () => Effect.die("unused"),
@@ -784,6 +794,7 @@ for (const scenario of [
           Effect.sync(() => {
             upserts.push(binding);
           }),
+        confirmShutdown: () => Effect.succeed(false),
         recordImportedTranscript: () => Effect.die("unused"),
         getProvider: () => Effect.die("unused"),
         listThreadIds: () => Effect.die("unused"),
@@ -858,6 +869,7 @@ for (const preparedStatus of [
               if (binding.status !== "starting" || sends.length === 0) return;
               yield* Deferred.succeed(cleared, undefined);
             }),
+          confirmShutdown: () => Effect.succeed(false),
           recordImportedTranscript: () => Effect.die("unused"),
           getProvider: () => Effect.die("unused"),
           listThreadIds: () => Effect.die("unused"),
@@ -962,6 +974,7 @@ it.effect("settles failed opt-in recovery without retrying the provider turn", (
           Effect.sync(() => {
             binding = next;
           }),
+        confirmShutdown: () => Effect.succeed(false),
         recordImportedTranscript: () => Effect.die("unused"),
         getProvider: () => Effect.die("unused"),
         listThreadIds: () => Effect.die("unused"),

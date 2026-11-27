@@ -1,3 +1,4 @@
+import { WorkflowAttribution } from "@t3tools/contracts";
 import {
   getPromptQueue,
   listPromptQueues,
@@ -33,6 +34,7 @@ import {
   type OrchestrationSession,
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
+  type ThreadRelayRouting,
   ModelSelection,
   ProjectId,
   ThreadLinkedPullRequest,
@@ -43,6 +45,7 @@ import {
   ThreadPullRequestStack,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
+import type { WorkflowJobProgress } from "@t3tools/contracts/workflows";
 import { legacyLinkedPullRequestOf } from "@t3tools/shared/threadPullRequests";
 import * as Arr from "effect/Array";
 import * as Effect from "effect/Effect";
@@ -54,6 +57,7 @@ import * as Struct from "effect/Struct";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
 
+import { workflowProgressStatus } from "../../jobs/workflowSequence.ts";
 import {
   isPersistenceError,
   toPersistenceDecodeError,
@@ -122,6 +126,7 @@ const ProjectionThreadMessageDbRowSchema = ProjectionThreadMessage.mapFields(
     attachments: Schema.NullOr(Schema.fromJsonString(Schema.Array(ChatAttachment))),
     context: Schema.NullOr(Schema.fromJsonString(OrchestrationMessageContext)),
     author: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
+    workflowOrigin: Schema.NullOr(Schema.fromJsonString(WorkflowAttribution)),
     editedBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
     steeredBy: Schema.NullOr(Schema.fromJsonString(AuthSessionUser)),
   }),
@@ -743,6 +748,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -1354,6 +1360,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         attachments_json AS "attachments",
         context_json AS "context",
         author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
         is_streaming AS "isStreaming",
@@ -1390,6 +1397,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -1806,6 +1814,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           attachments_json AS "attachments",
           context_json AS "context",
           author_json AS "author",
+          workflow_origin_json AS "workflowOrigin",
           edited_by_json AS "editedBy",
           steered_by_json AS "steeredBy",
           is_streaming AS "isStreaming",
@@ -2219,6 +2228,7 @@ pending_approval_requests AS (
                   ...(row.attachments !== null ? { attachments: row.attachments } : {}),
                   ...(row.context !== null ? { context: row.context } : {}),
                   ...(row.author !== null ? { author: row.author } : {}),
+                  ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
                   ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
                   ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
                   turnId: row.turnId,
@@ -2660,6 +2670,15 @@ pending_approval_requests AS (
         }),
       );
 
+  const listRelayRouting = Effect.fn("ProjectionSnapshotQuery.listRelayRouting")(function* (
+    threadId?: string,
+  ) {
+    const rows = yield* sql<ThreadRelayRouting & { threadId: string }>`SELECT
+      thread_id AS "threadId", relay_url AS "relayUrl", generation, phase FROM thread_execution_fences
+      ${threadId === undefined ? sql`` : sql`WHERE thread_id = ${threadId}`}`;
+    return new Map(rows.map(({ threadId, ...route }) => [threadId, route] as const));
+  });
+
   const getShellSnapshot: ProjectionSnapshotQueryShape["getShellSnapshot"] = () =>
     sql
       .withTransaction(
@@ -2751,6 +2770,7 @@ pending_approval_requests AS (
               );
               const pullRequestsByThread = groupPullRequestRowsByThread(pullRequestRows);
 
+              const relayRouting = yield* listRelayRouting();
               const queueSummaries = yield* listPromptQueueSummaries(sql);
               const snapshot = {
                 snapshotSequence: computeSnapshotSequence(stateRows),
@@ -2766,6 +2786,9 @@ pending_approval_requests AS (
                     ? Result.succeed({
                         ...(queueSummaries.has(row.threadId)
                           ? { promptQueueSummary: queueSummaries.get(row.threadId) }
+                          : {}),
+                        ...(relayRouting.has(row.threadId)
+                          ? { relayRouting: relayRouting.get(row.threadId) }
                           : {}),
                         id: row.threadId,
                         projectId: row.projectId,
@@ -2921,6 +2944,7 @@ pending_approval_requests AS (
                 sessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
               );
 
+              const relayRouting = yield* listRelayRouting();
               const queueSummaries = yield* listPromptQueueSummaries(sql);
               const snapshot = {
                 snapshotSequence: computeSnapshotSequence(stateRows),
@@ -2934,6 +2958,9 @@ pending_approval_requests AS (
                 threads: threadRows.map((row): OrchestrationThreadShell => ({
                   ...(queueSummaries.has(row.threadId)
                     ? { promptQueueSummary: queueSummaries.get(row.threadId) }
+                    : {}),
+                  ...(relayRouting.has(row.threadId)
+                    ? { relayRouting: relayRouting.get(row.threadId) }
                     : {}),
                   id: row.threadId,
                   projectId: row.projectId,
@@ -3322,8 +3349,14 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThreadShell>();
       }
 
+      const route = (yield* listRelayRouting(threadId).pipe(
+        Effect.mapError(
+          toPersistenceSqlError("ProjectionSnapshotQuery.getThreadShellById:relayRouting"),
+        ),
+      )).get(threadId);
       const promptQueueSummary = yield* getPromptQueueSummary(sql, threadId);
       return Option.some({
+        ...(route ? { relayRouting: route } : {}),
         ...(promptQueueSummary ? { promptQueueSummary } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
@@ -3411,6 +3444,7 @@ pending_approval_requests AS (
         ...(row.attachments !== null ? { attachments: row.attachments } : {}),
         ...(row.context !== null ? { context: row.context } : {}),
         ...(row.author !== null ? { author: row.author } : {}),
+        ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
         ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
         ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
       },
@@ -3633,8 +3667,33 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThread>();
       }
 
+      const [workflowJob] = threadId.startsWith("workflow:")
+        ? yield* sql<{
+            jobId: string;
+            repositoryId: string;
+            status: WorkflowJobProgress["status"];
+            pauseState: string | null;
+          }>`SELECT job_id AS "jobId",
+              json_extract(record_json, '$.workflow.repositoryId') AS "repositoryId",
+              status,
+              json_extract(record_json, '$.manualPause.state') AS "pauseState"
+            FROM repository_workflow_jobs
+            WHERE thread_id = ${threadId} AND status NOT IN ('done', 'cancelled', 'failed')`.pipe(
+            Effect.orDie,
+          )
+        : [];
       const promptQueue = yield* getPromptQueue(sql, threadId);
       const thread = {
+        workflowJob: workflowJob
+          ? {
+              jobId: workflowJob.jobId,
+              repositoryId: workflowJob.repositoryId,
+              status: workflowProgressStatus(
+                workflowJob.status,
+                workflowJob.pauseState === "paused",
+              ),
+            }
+          : null,
         ...(promptQueue ? { promptQueue } : {}),
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
@@ -3677,6 +3736,7 @@ pending_approval_requests AS (
             turnId: row.turnId,
             streaming: row.isStreaming === 1,
             ...(row.author !== null ? { author: row.author } : {}),
+            ...(row.workflowOrigin !== null ? { workflowOrigin: row.workflowOrigin } : {}),
             ...(row.editedBy !== null ? { editedBy: row.editedBy } : {}),
             ...(row.steeredBy !== null ? { steeredBy: row.steeredBy } : {}),
             createdAt: row.createdAt,

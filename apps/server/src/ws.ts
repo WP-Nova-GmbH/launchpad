@@ -1,6 +1,8 @@
 import { currentSessionChanges } from "./auth/currentSession.ts";
 import { makeSessionPresenceReporter } from "./orchestration/sessionPresence.ts";
 import * as Deferred from "effect/Deferred";
+import { WorkflowRunStore } from "./jobs/WorkflowRunStore.ts";
+import { WorkflowVmFollowUpPublisher } from "./relay/WorkflowVmFollowUpPush.ts";
 import { RepositoryAccess, stampCommandAuthor as stampActor } from "./auth/RepositoryAccess.ts";
 import {
   authorizeOrchestrationCommand,
@@ -28,6 +30,7 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
+  AuthOrchestrationReadScope,
   ORCHESTRATION_PROTOCOL_VERSION,
   ORCHESTRATION_PROTOCOL_QUERY_PARAM,
   AuthAccessStreamError,
@@ -48,6 +51,7 @@ import {
   type OrchestrationClientOrigin,
   type OrchestrationCommand,
   type GitActionProgressEvent,
+  GitManagerError,
   type GitManagerServiceError,
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
@@ -69,6 +73,8 @@ import {
   ProjectWriteFileError,
   ProviderUploadFeedbackError,
   ProviderSetupError,
+  ProviderDriverKind,
+  ProviderInstanceId,
   RelayClientInstallFailedError,
   type RelayClientInstallProgressEvent,
   ServerSelfUpdateError,
@@ -82,6 +88,8 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  AuthOrchestrationOperateScope,
+  AuthWorkflowVmFollowUpScope,
   ThreadId,
   type ThreadPresenceReportInput,
   TerminalProcessExitError,
@@ -124,6 +132,11 @@ import {
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { CurrentWorkflowVmFollowUpActor } from "./relay/ThreadExecutionRelay.ts";
+import { ThreadExecution } from "./relay/ThreadExecution.ts";
+import { makeThreadExecutionFence } from "./persistence/ThreadExecutionFence.ts";
+import { CheckoutAdmission, makeCheckoutCapture } from "./persistence/CheckoutCapture.ts";
+import { resolveCheckoutPath } from "./workspace/CheckoutAccess.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import {
   makeCreationDispatcher,
@@ -141,7 +154,11 @@ import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
+import { makeCodexVmSignIn, supportsCodexVmSignIn } from "./cloud/CodexVmSignIn.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
+import { ProviderInstanceRegistryMutator } from "./provider/Services/ProviderInstanceRegistryMutator.ts";
+import { deriveProviderInstanceConfigMap } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
+import { ThreadVmCodexAuthContext } from "./relay/ThreadVmCodexAuthSource.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
 import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
@@ -170,7 +187,10 @@ import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
-import { importRecentAgentThreads } from "./project/AgentSessionImporter.ts";
+import {
+  importRecentAgentThreads,
+  importRecentAgentThreadsWithProgress,
+} from "./project/AgentSessionImporter.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -531,6 +551,8 @@ const makeWsRpcLayer = (
   reportSessionPresence: (input: ThreadPresenceReportInput) => Effect.Effect<void>,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  codexVmSignInSupported: boolean,
+  codexVmSignInOrigin: string | undefined,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -539,22 +561,161 @@ const makeWsRpcLayer = (
       // Authorship comes from the authenticated session, never from the wire:
       // a client cannot claim to be someone else.
       const access = yield* RepositoryAccess;
+      const workflowJobs = yield* WorkflowRunStore;
+      // The live workflow VM is a result reader. Generic read scopes also cover
+      // filesystem browsing and native session discovery, so keep this list explicit.
+      const workflowVmResultMethods = new Set<string>([
+        ORCHESTRATION_WS_METHODS.subscribeShell,
+        ORCHESTRATION_WS_METHODS.subscribeThread,
+        ORCHESTRATION_WS_METHODS.getTurnDiff,
+        ORCHESTRATION_WS_METHODS.getFullThreadDiff,
+        WS_METHODS.serverProbe,
+        WS_METHODS.serverGetConfig,
+        WS_METHODS.serverReportClientActivity,
+        WS_METHODS.subscribeServerConfig,
+        WS_METHODS.subscribeServerLifecycle,
+        WS_METHODS.subscribeAuthSession,
+      ]);
+      const workflowVmFollowUp = currentSession.scopes.includes(AuthWorkflowVmFollowUpScope)
+        ? access.workflowFollowUp
+        : undefined;
+      const workflowVmFollowUpMethods = new Set<string>([
+        WS_METHODS.vcsRefreshStatus,
+        WS_METHODS.subscribeVcsStatus,
+        WS_METHODS.vcsListRefs,
+        WS_METHODS.gitRunStackedAction,
+        WS_METHODS.workflowVmFollowUpPush,
+        WS_METHODS.terminalOpen,
+        WS_METHODS.terminalAttach,
+        WS_METHODS.terminalWrite,
+        WS_METHODS.terminalResize,
+        WS_METHODS.terminalClear,
+        WS_METHODS.terminalRestart,
+        WS_METHODS.terminalClose,
+        WS_METHODS.subscribeTerminalEvents,
+        WS_METHODS.subscribeTerminalMetadata,
+      ]);
+      const followUpDenied = () =>
+        new EnvironmentAuthorizationError({
+          message: "Follow-up access to this workflow VM is unavailable.",
+          requiredScope: AuthWorkflowVmFollowUpScope,
+        });
+      const authorizeWorkflowVmFollowUp = (threadId?: string) =>
+        Effect.gen(function* () {
+          if (
+            !workflowVmFollowUp ||
+            !currentSession.user ||
+            (threadId !== undefined && threadId !== workflowVmFollowUp.threadId)
+          )
+            return yield* followUpDenied();
+          yield* workflowVmFollowUp.requireActor(currentSession);
+          return currentSession.user.userId;
+        });
+      const workflowMutationMethods = new Set<string>([
+        WS_METHODS.vcsPull,
+        WS_METHODS.gitRunStackedAction,
+        WS_METHODS.gitPreparePullRequestThread,
+        WS_METHODS.vcsCreateWorktree,
+        WS_METHODS.vcsRemoveWorktree,
+        WS_METHODS.vcsCreateRef,
+        WS_METHODS.vcsSwitchRef,
+        WS_METHODS.projectsWriteFile,
+        WS_METHODS.terminalOpen,
+        WS_METHODS.terminalWrite,
+        WS_METHODS.terminalAttach,
+        WS_METHODS.terminalRestart,
+        WS_METHODS.terminalClose,
+        WS_METHODS.vcsInit,
+        WS_METHODS.worktreeSetupCancel,
+        WS_METHODS.projectsRemove,
+      ]);
       const stampCommandAuthor = (command: OrchestrationCommand) =>
         stampActor(command, currentSession);
       const repositoryInputSchema = Schema.Struct({
         threadId: Schema.optional(Schema.NullOr(Schema.String)),
         projectId: Schema.optional(Schema.NullOr(Schema.String)),
+        cwd: Schema.optional(Schema.String),
+        action: Schema.optional(Schema.String),
+        featureBranch: Schema.optional(Schema.Boolean),
+        worktreePath: Schema.optional(Schema.NullOr(Schema.String)),
+        path: Schema.optional(Schema.NullOr(Schema.String)),
         reference: Schema.optional(
           Schema.Union([Schema.String, Schema.Struct({ projectId: Schema.String })]),
         ),
       });
-      const authorizeRepositoryInput = (input: unknown) =>
+      const authorizeRepositoryInput = (input: unknown, method?: string) =>
         Effect.gen(function* () {
-          if (!(yield* access.status).enabled) return;
-          yield* access.requireMember(currentSession);
           const resource = yield* Schema.decodeUnknownEffect(repositoryInputSchema)(input).pipe(
             Effect.orDie,
           );
+          if (access.workflowVm && method && !workflowVmResultMethods.has(method)) {
+            if (!workflowVmFollowUpMethods.has(method)) return yield* followUpDenied();
+            yield* authorizeWorkflowVmFollowUp(resource.threadId ?? undefined);
+            if (
+              method === WS_METHODS.gitRunStackedAction &&
+              (resource.action !== "commit" || resource.featureBranch)
+            )
+              return yield* followUpDenied();
+            if (resource.cwd || resource.worktreePath || resource.projectId) {
+              const bound = yield* projectionSnapshotQuery
+                .getThreadShellById(workflowVmFollowUp!.threadId)
+                .pipe(Effect.mapError(followUpDenied));
+              if (Option.isNone(bound)) return yield* followUpDenied();
+              const project = yield* projectionSnapshotQuery
+                .getProjectShellById(bound.value.projectId)
+                .pipe(Effect.mapError(followUpDenied));
+              if (
+                Option.isNone(project) ||
+                (resource.projectId && resource.projectId !== bound.value.projectId)
+              )
+                return yield* followUpDenied();
+              const root = bound.value.worktreePath ?? project.value.workspaceRoot;
+              const path = yield* Path.Path;
+              const fs = yield* FileSystem.FileSystem;
+              const expected = yield* resolveCheckoutPath(root, fs, path).pipe(
+                Effect.mapError(followUpDenied),
+              );
+              for (const candidate of [resource.cwd, resource.worktreePath]) {
+                if (
+                  candidate !== undefined &&
+                  candidate !== null &&
+                  (yield* resolveCheckoutPath(candidate, fs, path).pipe(
+                    Effect.mapError(followUpDenied),
+                  )) !== expected
+                )
+                  return yield* followUpDenied();
+              }
+            }
+          }
+          if (
+            method !== undefined &&
+            workflowMutationMethods.has(method) &&
+            (method !== WS_METHODS.terminalAttach || resource.cwd !== undefined)
+          ) {
+            if (resource.cwd) yield* workflowJobs.requireWorkspace(resource.cwd);
+            if (resource.worktreePath) yield* workflowJobs.requireWorkspace(resource.worktreePath);
+            if (resource.path) {
+              const path = yield* Path.Path;
+              yield* workflowJobs.requireWorkspace(
+                path.resolve(resource.cwd ?? ".", resource.path),
+              );
+            }
+            const runs = yield* workflowJobs.owners();
+            if (
+              runs.some(
+                (run) =>
+                  run.threadId === resource.threadId ||
+                  (method === WS_METHODS.projectsRemove && run.projectId === resource.projectId),
+              )
+            ) {
+              return yield* new EnvironmentAuthorizationError({
+                message: "This resource belongs to an active workflow job. Use the job controls.",
+                requiredScope: AuthOrchestrationOperateScope,
+              });
+            }
+          }
+          if (!(yield* access.status).enabled) return;
+          yield* access.requireMember(currentSession);
           if (resource.threadId)
             yield* access.requireThread(currentSession, ThreadId.make(resource.threadId));
           if (resource.projectId)
@@ -591,7 +752,7 @@ const makeWsRpcLayer = (
       const filterSnapshot = <
         A extends {
           readonly projects: ReadonlyArray<{ readonly id: ProjectId }>;
-          readonly threads: ReadonlyArray<{ readonly projectId: ProjectId }>;
+          readonly threads: ReadonlyArray<{ readonly id: ThreadId; readonly projectId: ProjectId }>;
         },
       >(
         snapshot: A,
@@ -600,11 +761,18 @@ const makeWsRpcLayer = (
           Effect.map((ids) => ({
             ...snapshot,
             projects: snapshot.projects.filter((p) => ids === undefined || ids.has(p.id)),
-            threads: snapshot.threads.filter((t) => ids === undefined || ids.has(t.projectId)),
+            threads: snapshot.threads.filter(
+              (t) =>
+                (ids === undefined || ids.has(t.projectId)) &&
+                (access.threadId === undefined || access.threadId === t.id),
+            ),
           })),
         );
       const crypto = yield* Crypto.Crypto;
       const sql = yield* SqlClient.SqlClient;
+      const checkoutCaptures = makeCheckoutCapture(sql);
+      const bootstrapFileSystem = yield* FileSystem.FileSystem;
+      const bootstrapPath = yield* Path.Path;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       /** A reference's host-level link key; the project's own host where the ref names none. */
       const resolvePullRequestSyncKey = (reference: PullRequestRef) =>
@@ -629,10 +797,10 @@ const makeWsRpcLayer = (
       const dispatchFromClient: OrchestrationEngine.OrchestrationEngineShape["dispatch"] = (
         command,
       ) =>
-        orchestrationEngine.dispatch(
-          command,
-          hasClientOrigin ? { origin: clientOrigin } : undefined,
-        );
+        orchestrationEngine.dispatch(command, {
+          directClientCommand: true,
+          ...(hasClientOrigin ? { origin: clientOrigin } : {}),
+        });
       const recordClientCommandAnalytics = (command: OrchestrationCommand) => {
         switch (command.type) {
           case "thread.create":
@@ -671,6 +839,7 @@ const makeWsRpcLayer = (
       const providerSessionDirectory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const providerAuth = yield* ProviderAuthService;
+      const codexVmSignIn = yield* makeCodexVmSignIn(codexVmSignInSupported, codexVmSignInOrigin);
       const providerInstances = yield* ProviderInstanceRegistry;
       const providerInstallation = yield* makeProviderInstallation();
       const serverUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
@@ -811,6 +980,28 @@ const makeWsRpcLayer = (
               }),
           ),
         );
+      const followUpActor = workflowVmFollowUp ? currentSession.user?.userId : undefined;
+      const resolveTerminalLaunch = Effect.fnUntraced(function* <
+        Input extends {
+          readonly threadId: string;
+          readonly terminalId: string;
+          readonly cwd?: string | undefined;
+        },
+      >(input: Input) {
+        if (!workflowVmFollowUp || !input.cwd) return input;
+        const env = yield* workflowVmFollowUp.readEnvironment(currentSession).pipe(
+          Effect.mapError(
+            () =>
+              new TerminalProcessExitError({
+                threadId: input.threadId,
+                terminalId: input.terminalId,
+                terminalPid: 0,
+                detail: "Launchpad could not authorize the workflow environment for this terminal.",
+              }),
+          ),
+        );
+        return { ...input, env: { ...env }, providerInstanceId: undefined };
+      });
       const observeRpcEffect = <A, E, R>(
         method: string,
         effect: Effect.Effect<A, E, R>,
@@ -819,8 +1010,13 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcEffect(
           method,
-          authorizeRepositoryInput(input ?? {}).pipe(
-            Effect.andThen(authorizeEffect(requiredScopeForRpcMethod(method), effect)),
+          authorizeRepositoryInput(input ?? {}, method).pipe(
+            Effect.andThen(
+              authorizeEffect(
+                requiredScopeForRpcMethod(method),
+                effect.pipe(Effect.provideService(CurrentWorkflowVmFollowUpActor, followUpActor)),
+              ),
+            ),
           ),
           traceAttributes,
         );
@@ -833,8 +1029,13 @@ const makeWsRpcLayer = (
         instrumentRpcStream(
           method,
           Stream.unwrap(
-            authorizeRepositoryInput(input ?? {}).pipe(
-              Effect.as(authorizeStream(requiredScopeForRpcMethod(method), stream)),
+            authorizeRepositoryInput(input ?? {}, method).pipe(
+              Effect.as(
+                authorizeStream(
+                  requiredScopeForRpcMethod(method),
+                  stream.pipe(Stream.provideService(CurrentWorkflowVmFollowUpActor, followUpActor)),
+                ),
+              ),
             ),
           ),
           traceAttributes,
@@ -851,8 +1052,20 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStreamEffect(
           method,
-          authorizeRepositoryInput(input ?? {}).pipe(
-            Effect.andThen(authorizeEffect(requiredScopeForRpcMethod(method), effect)),
+          authorizeRepositoryInput(input ?? {}, method).pipe(
+            Effect.andThen(
+              authorizeEffect(
+                requiredScopeForRpcMethod(method),
+                effect.pipe(
+                  Effect.provideService(CurrentWorkflowVmFollowUpActor, followUpActor),
+                  Effect.map((stream) =>
+                    stream.pipe(
+                      Stream.provideService(CurrentWorkflowVmFollowUpActor, followUpActor),
+                    ),
+                  ),
+                ),
+              ),
+            ),
           ),
           traceAttributes,
         );
@@ -1119,6 +1332,12 @@ const makeWsRpcLayer = (
           if (!(yield* access.status).enabled) return true;
           if (item.kind === "thread-removed") return visibleThreads.delete(item.threadId);
           if (item.kind === "project-removed") return visibleProjects.delete(item.projectId);
+          if (
+            item.kind === "thread-upserted" &&
+            access.threadId !== undefined &&
+            item.thread.id !== access.threadId
+          )
+            return false;
           const projectId =
             item.kind === "project-upserted" ? item.project.id : item.thread.projectId;
           const allowed = yield* access.requireProject(currentSession, projectId).pipe(
@@ -1242,6 +1461,66 @@ const makeWsRpcLayer = (
           let targetProjectId = bootstrap?.createThread?.projectId;
           let targetProjectCwd = bootstrap?.prepareWorktree?.projectCwd;
           let targetWorktreePath = bootstrap?.createThread?.worktreePath ?? null;
+          const existingThread = bootstrap?.createThread
+            ? undefined
+            : yield* projectionSnapshotQuery.getThreadShellById(command.threadId).pipe(
+                Effect.map(Option.getOrUndefined),
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "The setup thread could not be read."),
+                ),
+              );
+          const projectId = targetProjectId ?? existingThread?.projectId;
+          const project = projectId
+            ? yield* projectionSnapshotQuery.getProjectShellById(projectId).pipe(
+                Effect.map(Option.getOrUndefined),
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "The setup project could not be read."),
+                ),
+              )
+            : undefined;
+          const sourceRoot =
+            bootstrap?.prepareWorktree?.projectCwd ??
+            targetWorktreePath ??
+            existingThread?.worktreePath ??
+            project?.workspaceRoot;
+          if (!sourceRoot)
+            return yield* new OrchestrationDispatchCommandError({
+              message: "The setup checkout is unavailable.",
+            });
+          const setupAdmissions = new Map<string, string>();
+          const admitSetupScope = Effect.fnUntraced(function* (root: string) {
+            const checkoutRoot = yield* resolveCheckoutPath(
+              root,
+              bootstrapFileSystem,
+              bootstrapPath,
+            ).pipe(
+              Effect.mapError((cause) =>
+                toDispatchCommandError(cause, "The setup checkout could not be resolved."),
+              ),
+            );
+            const prior = setupAdmissions.get(checkoutRoot);
+            if (prior) return prior;
+            const admitted = yield* checkoutCaptures
+              .admit({
+                threadId: command.threadId,
+                kind: "setup",
+                workId: `bootstrap:${command.commandId}:${checkoutRoot}`,
+                checkoutRoot,
+              })
+              .pipe(
+                Effect.mapError((cause) =>
+                  toDispatchCommandError(cause, "The setup checkout is unavailable."),
+                ),
+              );
+            if (admitted.decision !== "start")
+              return yield* new OrchestrationDispatchCommandError({
+                message: "This setup attempt needs reconciliation before it can run again.",
+              });
+            setupAdmissions.set(checkoutRoot, admitted.admissionId);
+            return admitted.admissionId;
+          });
+          const sourceAdmission = yield* admitSetupScope(sourceRoot);
+          let targetAdmission = sourceAdmission;
           // The setup script's terminal, once started. Cancel closes only this
           // one so terminals the user opened meanwhile survive.
           let setupTerminalId: string | null = null;
@@ -1490,7 +1769,7 @@ const makeWsRpcLayer = (
                 return null;
               }
               return completionFiber;
-            });
+            }).pipe(Effect.provideService(CheckoutAdmission, targetAdmission));
 
           const bootstrapProgram = Effect.gen(function* () {
             const prepareWorktree = bootstrap?.prepareWorktree;
@@ -1680,10 +1959,11 @@ const makeWsRpcLayer = (
                   progress: {
                     // Git has registered the directory at this point, so a
                     // cancel during the submodule step can still remove it.
-                    onWorktreeClaimed: (path) =>
-                      Effect.sync(() => {
-                        targetWorktreePath = path;
-                      }),
+                    onWorktreeClaimed: (claimedPath) =>
+                      Effect.gen(function* () {
+                        targetWorktreePath = claimedPath;
+                        targetAdmission = yield* admitSetupScope(claimedPath);
+                      }).pipe(Effect.orDie),
                     onCheckoutProgress: ({ percent, completed, total }) => {
                       checkoutTotal = total;
                       return worktreeSetupTracker.stage(threadId, "checkout", {
@@ -1755,6 +2035,7 @@ const makeWsRpcLayer = (
                 }),
               }));
               targetWorktreePath = worktree.worktree.path;
+              targetAdmission = yield* admitSetupScope(targetWorktreePath);
               yield* dispatchFromClient({
                 type: "thread.meta.update",
                 commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
@@ -1762,9 +2043,13 @@ const makeWsRpcLayer = (
                 branch: worktree.worktree.refName,
                 worktreePath: targetWorktreePath,
               });
-              yield* refreshGitStatus(targetWorktreePath);
+              yield* refreshGitStatus(targetWorktreePath).pipe(
+                Effect.provideService(CheckoutAdmission, targetAdmission),
+              );
             }
 
+            if (sourceAdmission !== targetAdmission)
+              yield* checkoutCaptures.complete(sourceAdmission);
             const pendingSetupScript = yield* runSetupProgram();
 
             yield* track(worktreeSetupTracker.stageStatus(threadId, "agent", "running"));
@@ -1895,6 +2180,9 @@ const makeWsRpcLayer = (
                               force: true,
                             })
                             .pipe(
+                              // Keep the target's drain permission; source Git work
+                              // must enter normally after releasing its admission.
+                              Effect.provideService(CheckoutAdmission, targetAdmission),
                               Effect.retry({ times: 4, schedule: Schedule.spaced("500 millis") }),
                             ),
                         ),
@@ -1934,6 +2222,13 @@ const makeWsRpcLayer = (
                   ),
               ).pipe(Effect.andThen(cleanupAndFail(cause, dispatchError)));
             }),
+            Effect.ensuring(
+              Effect.suspend(() =>
+                Effect.forEach(setupAdmissions.values(), checkoutCaptures.complete, {
+                  discard: true,
+                }).pipe(Effect.orDie),
+              ),
+            ),
             // Cancellation must finish recording and rollback after the bootstrap is interrupted.
             Effect.uninterruptible,
           );
@@ -1965,7 +2260,9 @@ const makeWsRpcLayer = (
               })
             : settledBootstrapProgram;
 
-          return yield* runBootstrap;
+          return yield* runBootstrap.pipe(
+            Effect.provideService(CheckoutAdmission, sourceAdmission),
+          );
         });
 
       const dispatchNormalizedCommand = (
@@ -2021,7 +2318,18 @@ const makeWsRpcLayer = (
             : undefined;
 
           return {
-            environment,
+            environment: workflowVmFollowUp
+              ? {
+                  ...environment,
+                  capabilities: {
+                    ...environment.capabilities,
+                    workflowVmFollowUp: {
+                      threadId: workflowVmFollowUp.threadId,
+                      generation: workflowVmFollowUp.generation,
+                    },
+                  },
+                }
+              : environment,
             auth,
             cwd: config.cwd,
             keybindingsConfigPath: config.keybindingsConfigPath,
@@ -2072,6 +2380,22 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
+              // Replay is also a client write path. Portable commands must enter
+              // the relay inbox before any local receipt or dispatch is considered.
+              if ("threadId" in command) {
+                yield* makeThreadExecutionFence(sql)
+                  .assertDirectClientAllowed(command.threadId, command.type)
+                  .pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new EnvironmentAuthorizationError({
+                          message: error.message,
+                          requiredScope: AuthOrchestrationReadScope,
+                          reason: "portable-thread",
+                        }),
+                    ),
+                  );
+              }
               const replay = yield* access.withFence(
                 replayAuthorizedOrchestrationCommand(currentSession, command),
               );
@@ -2108,7 +2432,8 @@ const makeWsRpcLayer = (
                 : false;
               const result = yield* (
                 normalizedCommand.type === "thread.delete" ||
-                normalizedCommand.type === "project.delete"
+                normalizedCommand.type === "project.delete" ||
+                normalizedCommand.type === "thread.archive"
                   ? startup
                       .enqueueCommand(
                         dispatchDeletion(
@@ -2184,8 +2509,8 @@ const makeWsRpcLayer = (
                   );
                 }
 
-                // Archive removes the thread from view, so its user-opened
-                // terminal panes close with it.
+                // Setup handles were finalized by the lifecycle preflight.
+                // Close the remaining user-opened terminal panes with the thread.
                 yield* terminalManager.close({ threadId: archiveCommand.threadId }).pipe(
                   Effect.catch((error) =>
                     Effect.logWarning("failed to close thread terminals after archive", {
@@ -2237,6 +2562,36 @@ const makeWsRpcLayer = (
                 ),
               ),
           ),
+        [ORCHESTRATION_WS_METHODS.getThreadRepositoryKey]: ({ threadId }) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.getThreadRepositoryKey,
+            access
+              .withFence(
+                Effect.gen(function* () {
+                  yield* access.requireThread(currentSession, threadId);
+                  const [source] = yield* sql<{ checkout: string }>`SELECT
+                  COALESCE(t.worktree_path,p.workspace_root) AS checkout
+                  FROM projection_threads t JOIN projection_projects p USING(project_id)
+                  WHERE t.thread_id=${threadId} AND t.deleted_at IS NULL AND p.deleted_at IS NULL`;
+                  if (!source) return null;
+                  const repository = yield* repositoryIdentityResolver.resolve(source.checkout, {
+                    refresh: true,
+                  });
+                  return repository?.canonicalKey ?? null;
+                }),
+              )
+              .pipe(
+                Effect.mapError((cause) =>
+                  cause._tag === "EnvironmentAuthorizationError"
+                    ? cause
+                    : new OrchestrationGetSnapshotError({
+                        message: "Could not identify this thread’s Git repository.",
+                        cause,
+                      }),
+                ),
+              ),
+            { "rpc.aggregate": "orchestration" },
+          ),
         [ORCHESTRATION_WS_METHODS.getWorkflowScript]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getWorkflowScript,
@@ -2248,13 +2603,46 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getTurnDiff,
             checkpointDiffQuery.getTurnDiff(input).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationGetTurnDiffError({
-                    message: "Failed to load turn diff",
-                    cause,
-                  }),
-              ),
+              Effect.mapError((cause) => {
+                let message = "Failed to load turn diff";
+                if (
+                  cause._tag === "CheckpointWorkflowDiffRestrictedError" ||
+                  cause._tag === "CheckpointWorkflowPinUnavailableError"
+                ) {
+                  message = cause.message;
+                } else if (
+                  input.strictWorkflowReview ||
+                  input.requireComplete ||
+                  access.workflowVm
+                ) {
+                  if (cause._tag === "VcsProcessExitError") {
+                    message =
+                      "The saved workflow checkpoint could not be read. Refresh the run, or cancel it and start again.";
+                  } else if (cause._tag === "VcsProcessOutputLimitError") {
+                    message =
+                      "This checkpoint diff is too large to review. Request a smaller change or cancel the run.";
+                  } else if (cause._tag === "VcsProcessOutputReadError") {
+                    switch (cause.reason) {
+                      case "invalid_utf8":
+                        message =
+                          "This checkpoint diff contains text that is not valid UTF-8. Request a UTF-8 change or cancel the run.";
+                        break;
+                      case "binary_summary":
+                        message =
+                          "Git only provided a binary summary for a changed file. Request a change with a text diff or cancel the run.";
+                        break;
+                      case "nul_byte":
+                        message =
+                          "This checkpoint diff contains a NUL byte. Request a change with a text diff or cancel the run.";
+                        break;
+                    }
+                  }
+                }
+                return new OrchestrationGetTurnDiffError({
+                  message,
+                  ...(access.workflowVm ? {} : { cause }),
+                });
+              }),
             ),
             { "rpc.aggregate": "orchestration" },
             input,
@@ -2266,8 +2654,14 @@ const makeWsRpcLayer = (
               Effect.mapError(
                 (cause) =>
                   new OrchestrationGetFullThreadDiffError({
-                    message: "Failed to load full thread diff",
-                    cause,
+                    message:
+                      cause._tag === "CheckpointWorkflowDiffRestrictedError" ||
+                      cause._tag === "CheckpointWorkflowPinUnavailableError"
+                        ? cause.message
+                        : access.workflowVm && cause._tag === "VcsProcessOutputLimitError"
+                          ? "This checkpoint diff is too large to display."
+                          : "Failed to load full thread diff",
+                    ...(access.workflowVm ? {} : { cause }),
                   }),
               ),
             ),
@@ -2279,10 +2673,17 @@ const makeWsRpcLayer = (
             ORCHESTRATION_WS_METHODS.searchThreads,
             access.projectIds(currentSession).pipe(
               Effect.flatMap((ids) =>
-                projectionSnapshotQuery.searchThreads(
-                  input,
-                  ids === undefined ? undefined : [...ids],
-                ),
+                projectionSnapshotQuery
+                  .searchThreads(input, ids === undefined ? undefined : [...ids])
+                  .pipe(
+                    Effect.map((result) => ({
+                      ...result,
+                      matches: result.matches.filter(
+                        (match) =>
+                          access.threadId === undefined || match.threadId === access.threadId,
+                      ),
+                    })),
+                  ),
               ),
               Effect.mapError(
                 (cause) =>
@@ -2494,6 +2895,21 @@ const makeWsRpcLayer = (
                 isThreadDetailEvent(event);
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
+                // Preserve source batches so synchronization cannot overtake buffered events.
+                Stream.mapArrayEffect((events) =>
+                  events.some(
+                    (event) =>
+                      event.aggregateId === input.threadId &&
+                      event.type === "thread.placement-imported",
+                  )
+                    ? Effect.fail(
+                        new OrchestrationGetSnapshotError({
+                          message: "Thread moved; reload its imported history.",
+                          cause: input.threadId,
+                        }),
+                      )
+                    : Effect.succeed(events),
+                ),
                 Stream.filter(isThisThreadDetailEvent),
                 Stream.map((event) => ({
                   kind: "event" as const,
@@ -2536,7 +2952,7 @@ const makeWsRpcLayer = (
                   liveStream.pipe(
                     Stream.runForEachArray(liveBuffer.offerAll),
                     Effect.raceFirst(liveBuffer.failed),
-                    Effect.catchTags({ OrchestrationGetSnapshotError: () => Effect.void }),
+                    Effect.catchTags({ OrchestrationGetSnapshotError: liveBuffer.close }),
                   ),
                   { startImmediately: true },
                 );
@@ -2706,6 +3122,67 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,
             Effect.gen(function* () {
+              const target =
+                input.instanceId === undefined
+                  ? undefined
+                  : yield* providerInstances.getInstance(input.instanceId);
+              const codexTarget =
+                input.instanceId === undefined ||
+                target?.driverKind === "codex" ||
+                (yield* providerInstances.listUnavailable).some(
+                  (provider) =>
+                    provider.instanceId === input.instanceId && provider.driver === "codex",
+                );
+              if (codexTarget) {
+                const source = yield* ThreadVmCodexAuthContext;
+                yield* source.withReloadLock(
+                  Effect.gen(function* () {
+                    const changed = yield* source.refresh.pipe(
+                      Effect.mapError(
+                        (error) =>
+                          new ProviderSetupError({
+                            instanceId: input.instanceId ?? ProviderInstanceId.make("codex"),
+                            operation: "refresh-models",
+                            detail: error.message,
+                          }),
+                      ),
+                    );
+                    if (changed) {
+                      const mutator = yield* Effect.serviceOption(ProviderInstanceRegistryMutator);
+                      if (Option.isNone(mutator))
+                        return yield* new ProviderSetupError({
+                          instanceId: input.instanceId ?? ProviderInstanceId.make("codex"),
+                          operation: "refresh-models",
+                          detail:
+                            "This server cannot reload VM authentication. Restart the VM server and retry.",
+                        });
+                      yield* mutator.value.reconcile(
+                        deriveProviderInstanceConfigMap(
+                          yield* serverSettings.getSettings.pipe(
+                            Effect.mapError(
+                              () =>
+                                new ProviderSetupError({
+                                  instanceId: input.instanceId ?? ProviderInstanceId.make("codex"),
+                                  operation: "refresh-models",
+                                  detail: "Could not read provider settings. Retry the refresh.",
+                                }),
+                            ),
+                          ),
+                        ),
+                        {
+                          rebuildDrivers: new Set([ProviderDriverKind.make("codex")]),
+                        },
+                      );
+                      if (
+                        (yield* providerInstances.listInstances).some(
+                          (instance) => instance.driverKind === "codex",
+                        )
+                      )
+                        yield* source.markApplied;
+                    }
+                  }),
+                );
+              }
               // Only explicit catalog refreshes bypass T3's caches. Workspace
               // discovery and background status checks retain their timers.
               if (input.refreshModels) {
@@ -2927,6 +3404,17 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "provider" },
             input,
           ),
+        [WS_METHODS.codexVmSignInCapability]: () =>
+          observeRpcEffect(
+            WS_METHODS.codexVmSignInCapability,
+            Effect.succeed({ supported: codexVmSignIn.supported }),
+          ),
+        [WS_METHODS.codexVmSignInStart]: () =>
+          observeRpcEffect(WS_METHODS.codexVmSignInStart, codexVmSignIn.start),
+        [WS_METHODS.codexVmSignInWait]: (input) =>
+          observeRpcEffect(WS_METHODS.codexVmSignInWait, codexVmSignIn.wait(input.bridgeId)),
+        [WS_METHODS.codexVmSignInCancel]: (input) =>
+          observeRpcEffect(WS_METHODS.codexVmSignInCancel, codexVmSignIn.cancel(input.bridgeId)),
         [WS_METHODS.providerAuthRespond]: (input) =>
           observeRpcEffect(
             WS_METHODS.providerAuthRespond,
@@ -3794,6 +4282,28 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "workspace" },
             input,
           ),
+        [WS_METHODS.agentSessionsImportWithProgress]: (input) =>
+          observeRpcStream(
+            WS_METHODS.agentSessionsImportWithProgress,
+            importRecentAgentThreadsWithProgress(input).pipe(
+              Stream.provideService(AgentSessionScanner.AgentSessionScanner, agentSessionScanner),
+              Stream.provideService(
+                OrchestrationEngine.OrchestrationEngineService,
+                orchestrationEngine,
+              ),
+              Stream.provideService(
+                ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+                projectionSnapshotQuery,
+              ),
+              Stream.provideService(Crypto.Crypto, crypto),
+              Stream.provideService(
+                ProviderSessionDirectory.ProviderSessionDirectory,
+                providerSessionDirectory,
+              ),
+            ),
+            { "rpc.aggregate": "workspace" },
+            input,
+          ),
         [WS_METHODS.assetsCreateUrl]: (input) =>
           observeRpcEffect(
             WS_METHODS.assetsCreateUrl,
@@ -3888,7 +4398,9 @@ const makeWsRpcLayer = (
           observeRpcStream(
             WS_METHODS.subscribeVcsStatus,
             vcsStatusBroadcaster.streamStatus(input, {
-              automaticRemoteRefreshInterval: automaticGitFetchInterval,
+              automaticRemoteRefreshInterval: workflowVmFollowUp
+                ? Effect.succeed(Duration.zero)
+                : automaticGitFetchInterval,
             }),
             {
               "rpc.aggregate": "vcs",
@@ -3934,7 +4446,8 @@ const makeWsRpcLayer = (
               });
               if (Option.isSome(thread) && thread.value.promptQueue?.preparation) {
                 const preparation = thread.value.promptQueue.preparation;
-                if (preparation.state === "ready") return { cancelled: false };
+                if (preparation.state === "ready" && preparation.settled)
+                  return { cancelled: false };
                 yield* dispatchFromClient({
                   type: "thread.queue.pause",
                   threadId: input.threadId,
@@ -3975,43 +4488,82 @@ const makeWsRpcLayer = (
             { "rpc.aggregate": "git" },
             input,
           ),
+        [WS_METHODS.workflowVmFollowUpPush]: (input) =>
+          Effect.gen(function* () {
+            const actorUserId = yield* authorizeWorkflowVmFollowUp(input.threadId);
+            const binding = yield* workflowJobs.getVmBindingForThread(input.threadId);
+            if (!binding || binding.generation !== workflowVmFollowUp?.generation)
+              return yield* followUpDenied();
+            return yield* (yield* WorkflowVmFollowUpPublisher).push({
+              ...input,
+              actorUserId,
+              jobId: binding.jobId,
+              generation: binding.generation,
+            });
+          }),
         [WS_METHODS.gitRunStackedAction]: (input) =>
           observeRpcStream(
             WS_METHODS.gitRunStackedAction,
             Stream.callback<GitActionProgressEvent, GitManagerServiceError>((queue) =>
-              gitWorkflow
-                .runStackedAction(input, {
+              Effect.gen(function* () {
+                const commit = gitWorkflow.runStackedAction(input, {
                   actionId: input.actionId,
                   progressReporter: {
                     publish: (event) => Queue.offer(queue, event).pipe(Effect.asVoid),
                   },
-                })
-                .pipe(
-                  Effect.matchCauseEffect({
-                    onFailure: (cause) => Queue.failCause(queue, cause),
-                    onSuccess: (result) =>
-                      (input.threadId === undefined
-                        ? Effect.void
-                        : linkCreatedPullRequest({
-                            threadId: input.threadId,
-                            result,
-                            commandId: serverCommandId("pr-created-link"),
-                          }).pipe(
-                            Effect.provideService(
-                              OrchestrationEngine.OrchestrationEngineService,
-                              orchestrationEngine,
-                            ),
-                            Effect.provideService(
-                              ProjectionSnapshotQuery.ProjectionSnapshotQuery,
-                              projectionSnapshotQuery,
-                            ),
-                          )
-                      ).pipe(
-                        Effect.andThen(refreshGitStatus(input.cwd)),
-                        Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
-                      ),
-                  }),
-                ),
+                });
+                if (!workflowVmFollowUp) return yield* commit;
+                const execution = yield* Effect.serviceOption(ThreadExecution);
+                const unavailable = () =>
+                  new GitManagerError({
+                    operation: "commit",
+                    cwd: input.cwd,
+                    detail: "The workflow VM is not ready to accept a local commit.",
+                  });
+                if (Option.isNone(execution)) return yield* unavailable();
+                const lease = execution.value;
+                const work = {
+                  kind: "workspace" as const,
+                  threadId: workflowVmFollowUp.threadId,
+                  expectedGeneration: workflowVmFollowUp.generation,
+                  workId: `follow-up-commit:${input.actionId}`,
+                };
+                return yield* Effect.acquireUseRelease(
+                  lease.begin(work).pipe(
+                    Effect.mapError(unavailable),
+                    Effect.flatMap((decision) =>
+                      decision === "start" ? Effect.void : Effect.fail(unavailable()),
+                    ),
+                  ),
+                  () => commit,
+                  () => lease.confirmStopped(work).pipe(Effect.ignore({ log: true })),
+                );
+              }).pipe(
+                Effect.matchCauseEffect({
+                  onFailure: (cause) => Queue.failCause(queue, cause),
+                  onSuccess: (result) =>
+                    (input.threadId === undefined
+                      ? Effect.void
+                      : linkCreatedPullRequest({
+                          threadId: input.threadId,
+                          result,
+                          commandId: serverCommandId("pr-created-link"),
+                        }).pipe(
+                          Effect.provideService(
+                            OrchestrationEngine.OrchestrationEngineService,
+                            orchestrationEngine,
+                          ),
+                          Effect.provideService(
+                            ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+                            projectionSnapshotQuery,
+                          ),
+                        )
+                    ).pipe(
+                      Effect.andThen(refreshGitStatus(input.cwd)),
+                      Effect.andThen(Queue.end(queue).pipe(Effect.asVoid)),
+                    ),
+                }),
+              ),
             ),
             { "rpc.aggregate": "vcs" },
             input,
@@ -4053,7 +4605,16 @@ const makeWsRpcLayer = (
         [WS_METHODS.vcsRemoveWorktree]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsRemoveWorktree,
-            gitWorkflow.removeWorktree(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            Effect.gen(function* () {
+              const path = yield* Path.Path;
+              // Git accepts worktree-name shorthand. Pass the same full path
+              // that was checked by authorization so it cannot select another target.
+              yield* gitWorkflow.removeWorktree({
+                ...input,
+                path: path.resolve(input.cwd, input.path),
+              });
+              yield* refreshGitStatus(input.cwd);
+            }),
             { "rpc.aggregate": "vcs" },
             input,
           ),
@@ -4099,7 +4660,10 @@ const makeWsRpcLayer = (
         [WS_METHODS.terminalOpen]: (input) =>
           observeRpcEffect(
             WS_METHODS.terminalOpen,
-            drainTerminalCleanup(input).pipe(Effect.andThen(terminalManager.open(input))),
+            drainTerminalCleanup(input).pipe(
+              Effect.andThen(resolveTerminalLaunch(input)),
+              Effect.flatMap(terminalManager.open),
+            ),
             {
               "rpc.aggregate": "terminal",
             },
@@ -4137,9 +4701,10 @@ const makeWsRpcLayer = (
                   let ready = !lifetime;
                   yield* Effect.acquireRelease(
                     drainTerminalCleanup(input).pipe(
-                      Effect.andThen(
+                      Effect.andThen(resolveTerminalLaunch(input)),
+                      Effect.flatMap((terminalInput) =>
                         terminalManager.attachStream(
-                          input,
+                          terminalInput,
                           (event) =>
                             ready
                               ? Queue.offer(queue, event).pipe(Effect.asVoid)
@@ -4190,8 +4755,8 @@ const makeWsRpcLayer = (
                       return yield* lifetime.guard(Effect.void);
                     }
                     ready = true;
-                    yield* Queue.offerAll(queue, pending);
-                    pending.length = 0;
+                    // Queue retains offered arrays; detach this buffer before reusing it.
+                    yield* Queue.offerAll(queue, pending.splice(0));
                   }
                 }),
               );
@@ -4230,7 +4795,10 @@ const makeWsRpcLayer = (
         [WS_METHODS.terminalRestart]: (input) =>
           observeRpcEffect(
             WS_METHODS.terminalRestart,
-            drainTerminalCleanup(input).pipe(Effect.andThen(terminalManager.restart(input))),
+            drainTerminalCleanup(input).pipe(
+              Effect.andThen(resolveTerminalLaunch(input)),
+              Effect.flatMap(terminalManager.restart),
+            ),
             {
               "rpc.aggregate": "terminal",
             },
@@ -4835,6 +5403,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                 Deferred.succeed(policyClosed, undefined).pipe(
                   Effect.andThen(Deferred.await(policyDrained)),
                 ),
+                session,
               ),
             ),
             Effect.catch(() => failEnvironmentAuthInvalid("invalid_credential")),
@@ -4877,6 +5446,15 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               reportSessionPresence,
               clientAnalyticsProps,
               previewAutomationBroker,
+              supportsCodexVmSignIn({
+                origin: request.headers.origin,
+                host: request.headers.host,
+                remoteAddress: Option.getOrUndefined(request.remoteAddress),
+                forwarded: ["forwarded", "x-forwarded-for", "x-forwarded-host"].some(
+                  (header) => request.headers[header] !== undefined,
+                ),
+              }),
+              request.headers.origin,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),

@@ -17,6 +17,7 @@ const composerDraftFileMocks = vi.hoisted(() => {
   let releaseRead: (() => void) | null = null;
   let readBarrier = Promise.resolve();
   let nextWriteBarrier: Promise<void> | null = null;
+  let nextWriteStarted: (() => void) | null = null;
   let onWrite: (() => void) | null = null;
   const writes: string[] = [];
   const readImage = vi.fn(async () => "YWJj");
@@ -46,6 +47,17 @@ const composerDraftFileMocks = vi.hoisted(() => {
     },
     setNextWriteBarrier(barrier: Promise<void> | null) {
       nextWriteBarrier = barrier;
+      nextWriteStarted = null;
+    },
+    blockNextWrite() {
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => {
+        nextWriteStarted = resolve;
+      });
+      nextWriteBarrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { started, release };
     },
     setOnWrite(callback: (() => void) | null) {
       onWrite = callback;
@@ -88,6 +100,8 @@ const composerDraftFileMocks = vi.hoisted(() => {
         if (nextWriteBarrier) {
           const barrier = nextWriteBarrier;
           nextWriteBarrier = null;
+          nextWriteStarted?.();
+          nextWriteStarted = null;
           return barrier.then(() => {
             document = value;
             writes.push(value);
@@ -117,6 +131,17 @@ vi.mock("expo-file-system", () => ({
   Directory: composerDraftFileMocks.Directory,
   File: composerDraftFileMocks.File,
   Paths: { document: { uri: "file:///documents" } },
+}));
+
+// Expo writes synchronously, but the handoff also awaits file opening. Gate
+// that I/O boundary explicitly to exercise edits while persistence is pending.
+vi.mock("../lib/atomic-file", () => ({
+  writeFileAtomically: async (
+    file: InstanceType<typeof composerDraftFileMocks.File>,
+    value: string,
+  ) => {
+    await file.write(value);
+  },
 }));
 
 vi.mock("../lib/composerImages", async (importOriginal) => ({
@@ -152,6 +177,7 @@ import { formatComposerContextReference } from "@t3tools/shared/composerContextR
 import { appAtomRegistry } from "./atom-registry";
 import { threadOutboxManager } from "./thread-outbox";
 import {
+  handoffMovedThreadDraft,
   appendComposerDraftAttachments,
   captureComposerDraftInsertion,
   countComposerDraftAttachmentsAfterSelection,
@@ -2683,5 +2709,303 @@ describe("mobile composer drafts", () => {
       },
     });
     expect(composerAttachmentCleanupMocks.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe("portable thread draft handoff", () => {
+  const input = {
+    sourceKey: "mac:thread",
+    destinationKey: "vm:thread",
+    stillCurrent: () => true,
+  };
+
+  it.each(["edit", "create", "delete"] as const)(
+    "preserves an unrelated draft %s during the atomic move write and after reload",
+    async (change) => {
+      await waitForComposerDraftsLoaded();
+      appAtomRegistry.set(composerDraftsAtom, {
+        "mac:thread": { text: "Incoming", attachments: [] },
+        "mac:other": { text: "Before", attachments: [] },
+      });
+      const barrier = composerDraftFileMocks.blockNextWrite();
+      const moving = handoffMovedThreadDraft(input);
+      const rejected = expect(moving).rejects.toThrow("Your drafts are saved; try again.");
+      await barrier.started;
+      const drafts = { ...appAtomRegistry.get(composerDraftsAtom) };
+      if (change === "delete") delete drafts["mac:other"];
+      else
+        drafts[change === "create" ? "mac:new" : "mac:other"] = {
+          text: "Latest",
+          attachments: [],
+        };
+      appAtomRegistry.set(composerDraftsAtom, drafts);
+      barrier.release();
+      await rejected;
+      expect(appAtomRegistry.get(composerDraftsAtom)).toEqual(drafts);
+      expect(
+        decodePersistedComposerState(JSON.parse(composerDraftFileMocks.getDocument())).drafts,
+      ).toEqual(drafts);
+
+      resetComposerDraftsLoadState();
+      appAtomRegistry.set(composerDraftsAtom, {});
+      await waitForComposerDraftsLoaded();
+      expect(appAtomRegistry.get(composerDraftsAtom)).toEqual(drafts);
+    },
+  );
+
+  it.each(["model", "archive", "account"] as const)(
+    "preserves the latest %s metadata during the atomic move write and after reload",
+    async (change) => {
+      await waitForComposerDraftsLoaded();
+      appAtomRegistry.set(composerDraftsAtom, {
+        "mac:thread": { text: "Incoming", attachments: [] },
+      });
+      appAtomRegistry.set(composerCloudDraftsAtom, { accountId: "before", signedOut: {} });
+      const barrier = composerDraftFileMocks.blockNextWrite();
+      const moving = handoffMovedThreadDraft(input);
+      const rejected = expect(moving).rejects.toThrow("Your drafts are saved; try again.");
+      await barrier.started;
+      if (change === "model") {
+        appAtomRegistry.set(stickyComposerModelSelectionAtom, {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.6-sol",
+        });
+      } else {
+        appAtomRegistry.set(composerCloudDraftsAtom, {
+          accountId: change === "account" ? "after" : "before",
+          signedOut: {
+            before: {
+              drafts: { "mac:archived": { text: "Archived", attachments: [] } },
+              queuedMessages: [],
+            },
+          },
+        });
+      }
+      const expected = {
+        drafts: appAtomRegistry.get(composerDraftsAtom),
+        stickyModelSelection: appAtomRegistry.get(stickyComposerModelSelectionAtom),
+        cloudDrafts: appAtomRegistry.get(composerCloudDraftsAtom),
+      };
+      barrier.release();
+      await rejected;
+      expect(
+        decodePersistedComposerState(JSON.parse(composerDraftFileMocks.getDocument())),
+      ).toMatchObject(expected);
+      resetComposerDraftsLoadState();
+      appAtomRegistry.set(composerDraftsAtom, {});
+      appAtomRegistry.set(stickyComposerModelSelectionAtom, null);
+      appAtomRegistry.set(composerCloudDraftsAtom, { accountId: null, signedOut: {} });
+      await waitForComposerDraftsLoaded();
+      expect(appAtomRegistry.get(composerDraftsAtom)).toEqual(expected.drafts);
+      expect(appAtomRegistry.get(stickyComposerModelSelectionAtom)).toEqual(
+        expected.stickyModelSelection,
+      );
+      expect(appAtomRegistry.get(composerCloudDraftsAtom)).toEqual(expected.cloudDrafts);
+    },
+  );
+
+  it("checks the whole document after waiting for earlier queued writes", async () => {
+    await waitForComposerDraftsLoaded();
+    setComposerDraftText("mac:thread", "Incoming");
+    const barrier = composerDraftFileMocks.blockNextWrite();
+    const flushing = flushComposerDrafts();
+    await barrier.started;
+    let captured!: () => void;
+    const snapshotCaptured = new Promise<void>((resolve) => {
+      captured = resolve;
+    });
+    const moving = handoffMovedThreadDraft({
+      ...input,
+      stillCurrent: () => {
+        captured();
+        return true;
+      },
+    });
+    const rejected = expect(moving).rejects.toThrow("Your drafts are saved; try again.");
+    await snapshotCaptured;
+    appAtomRegistry.set(composerDraftsAtom, {
+      ...appAtomRegistry.get(composerDraftsAtom),
+      "mac:new": { text: "While queued", attachments: [] },
+    });
+    composerDraftFileMocks.resetWrites();
+    barrier.release();
+    await flushing;
+    await rejected;
+    expect(
+      composerDraftFileMocks.getWrites().map((value) => JSON.parse(value).drafts["vm:thread"]),
+    ).toEqual([undefined, undefined]);
+    expect(
+      decodePersistedComposerState(JSON.parse(composerDraftFileMocks.getDocument())).drafts[
+        "mac:new"
+      ]?.text,
+    ).toBe("While queued");
+  });
+
+  it("does not claim drafts were saved when repairing a changed document fails", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Incoming", attachments: [] },
+    });
+    const barrier = composerDraftFileMocks.blockNextWrite();
+    const moving = handoffMovedThreadDraft(input);
+    const rejected = expect(moving).rejects.toThrow("could not be saved");
+    await barrier.started;
+    appAtomRegistry.set(composerDraftsAtom, {
+      ...appAtomRegistry.get(composerDraftsAtom),
+      "mac:new": { text: "Unsaved latest", attachments: [] },
+    });
+    composerDraftFileMocks.setWriteError(new Error("disk full"));
+    barrier.release();
+    await rejected;
+    expect(appAtomRegistry.get(composerDraftsAtom)["mac:new"]?.text).toBe("Unsaved latest");
+    expect(appAtomRegistry.get(composerDraftsAtom)["vm:thread"]).toBeUndefined();
+    composerDraftFileMocks.setWriteError(null);
+    await flushComposerDrafts();
+    expect(
+      decodePersistedComposerState(JSON.parse(composerDraftFileMocks.getDocument())).drafts[
+        "mac:new"
+      ]?.text,
+    ).toBe("Unsaved latest");
+  });
+
+  it("keeps repairing until edits during the repair are also durable", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Incoming", attachments: [] },
+    });
+    const initial = composerDraftFileMocks.blockNextWrite();
+    const moving = handoffMovedThreadDraft(input);
+    const rejected = expect(moving).rejects.toThrow("Your drafts are saved; try again.");
+    await initial.started;
+    appAtomRegistry.set(composerDraftsAtom, {
+      ...appAtomRegistry.get(composerDraftsAtom),
+      "mac:other": { text: "First edit", attachments: [] },
+    });
+    const repair = composerDraftFileMocks.blockNextWrite();
+    initial.release();
+    await repair.started;
+    appAtomRegistry.set(composerDraftsAtom, {
+      ...appAtomRegistry.get(composerDraftsAtom),
+      "mac:other": { text: "Second edit", attachments: [] },
+    });
+    repair.release();
+    await rejected;
+    expect(
+      decodePersistedComposerState(JSON.parse(composerDraftFileMocks.getDocument())).drafts,
+    ).toEqual(appAtomRegistry.get(composerDraftsAtom));
+    expect(appAtomRegistry.get(composerDraftsAtom)["mac:other"]?.text).toBe("Second edit");
+    expect(appAtomRegistry.get(composerDraftsAtom)["vm:thread"]).toBeUndefined();
+  });
+
+  it("repairs newer drafts even when the initial write reports a failure", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Incoming", attachments: [] },
+    });
+    const barrier = composerDraftFileMocks.blockNextWrite();
+    const moving = handoffMovedThreadDraft(input);
+    const rejected = expect(moving).rejects.toThrow("Your drafts are saved; try again.");
+    await barrier.started;
+    appAtomRegistry.set(composerDraftsAtom, {
+      ...appAtomRegistry.get(composerDraftsAtom),
+      "mac:other": { text: "Latest", attachments: [] },
+    });
+    composerDraftFileMocks.setOnWrite(() => {
+      composerDraftFileMocks.setOnWrite(null);
+      throw new Error("Write outcome uncertain");
+    });
+    barrier.release();
+    await rejected;
+    expect(
+      decodePersistedComposerState(JSON.parse(composerDraftFileMocks.getDocument())).drafts,
+    ).toEqual(appAtomRegistry.get(composerDraftsAtom));
+    expect(appAtomRegistry.get(composerDraftsAtom)["mac:other"]?.text).toBe("Latest");
+  });
+
+  it("persists the destination before releasing the original device draft", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Keep my prompt", attachments: [] },
+    });
+    composerDraftFileMocks.resetWrites();
+    await handoffMovedThreadDraft({
+      sourceKey: "mac:thread",
+      destinationKey: "vm:thread",
+      stillCurrent: () => true,
+    });
+    const written = composerDraftFileMocks.getWrites().map((value) => JSON.parse(value));
+    expect(written[0].drafts["mac:thread"]).toBeUndefined();
+    expect(written[0].drafts["vm:thread"].text).toBe("Keep my prompt");
+    expect(appAtomRegistry.get(composerDraftsAtom)["mac:thread"]).toBeUndefined();
+    expect(appAtomRegistry.get(composerDraftsAtom)["vm:thread"]?.text).toBe("Keep my prompt");
+  });
+
+  it("retains the original after a destination persistence failure", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Keep my prompt", attachments: [] },
+    });
+    composerDraftFileMocks.setWriteError(new Error("disk full"));
+    await expect(
+      handoffMovedThreadDraft({
+        sourceKey: "mac:thread",
+        destinationKey: "vm:thread",
+        stillCurrent: () => true,
+      }),
+    ).rejects.toThrow();
+    expect(appAtomRegistry.get(composerDraftsAtom)["mac:thread"]?.text).toBe("Keep my prompt");
+    composerDraftFileMocks.setWriteError(null);
+  });
+
+  it("preserves both conflicting prompts without truncation", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Incoming", attachments: [] },
+      "vm:thread": { text: "Existing", attachments: [] },
+    });
+    const input = {
+      sourceKey: "mac:thread",
+      destinationKey: "vm:thread",
+      stillCurrent: () => true,
+    };
+    const result = await handoffMovedThreadDraft(input);
+    expect(result.conflict?.source.text).toBe("Incoming");
+    await handoffMovedThreadDraft({
+      ...input,
+      choice: { use: "source", conflict: result.conflict! },
+    });
+    expect(appAtomRegistry.get(composerDraftsAtom)["mac:thread"]?.text).toBe("Existing");
+    expect(appAtomRegistry.get(composerDraftsAtom)["vm:thread"]?.text).toBe("Incoming");
+  });
+  it("durably preserves both conflicting drafts even if execution stops immediately after the atomic write", async () => {
+    await waitForComposerDraftsLoaded();
+    appAtomRegistry.set(composerDraftsAtom, {
+      "mac:thread": { text: "Incoming", attachments: [] },
+      "vm:thread": { text: "Existing", attachments: [] },
+    });
+    const input = {
+      sourceKey: "mac:thread",
+      destinationKey: "vm:thread",
+      stillCurrent: () => true,
+    };
+    const result = await handoffMovedThreadDraft(input);
+    composerDraftFileMocks.setOnWrite(() => {
+      throw new Error("interrupted after durable write");
+    });
+    try {
+      await expect(
+        handoffMovedThreadDraft({
+          ...input,
+          choice: { use: "source", conflict: result.conflict! },
+        }),
+      ).rejects.toThrow();
+      const durable = JSON.parse(composerDraftFileMocks.getDocument());
+      expect(durable.drafts["mac:thread"].text).toBe("Existing");
+      expect(durable.drafts["vm:thread"].text).toBe("Incoming");
+      expect(appAtomRegistry.get(composerDraftsAtom)["mac:thread"]?.text).toBe("Incoming");
+      expect(appAtomRegistry.get(composerDraftsAtom)["vm:thread"]?.text).toBe("Existing");
+    } finally {
+      composerDraftFileMocks.setOnWrite(null);
+    }
   });
 });

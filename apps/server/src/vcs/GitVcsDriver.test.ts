@@ -246,6 +246,47 @@ it.effect("checkpoint capture refuses a truncated nested repository listing", ()
   }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
 );
 
+it.effect.each([
+  { command: "ls-files", prefix: ".gitattributes\0" },
+  { command: "check-attr", prefix: ".gitattributes\0filter\0unspecified\0" },
+] as const)(
+  "strict checkpoint capture refuses a truncated $command result",
+  ({ command, prefix }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const liveProcess = yield* VcsProcess.VcsProcess;
+      const driver = yield* GitVcsDriver.makeVcsDriverShape();
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-filter-output-" });
+      const { checkpointRef } = yield* makeCheckpointFixture(driver, cwd);
+      yield* fs.writeFileString(path.join(cwd, ".gitattributes"), "file.txt filter=probe\n");
+      const captureDriver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+        Effect.provideService(VcsProcess.VcsProcess, {
+          run: (input) =>
+            liveProcess.run(
+              input.args.includes(command) && !input.args.includes(":(glob)**/.gitattributes")
+                ? { ...input, maxOutputBytes: prefix.length }
+                : input,
+            ),
+        }),
+      );
+
+      const error = yield* Effect.flip(
+        captureDriver.checkpoints.captureCheckpoint({
+          cwd,
+          checkpointRef,
+          strictWorkflowCapture: true,
+        }),
+      );
+      assert.deepInclude(
+        error,
+        { _tag: "VcsProcessOutputLimitError", stream: "stdout" },
+        error.message,
+      );
+      assert.isFalse(yield* driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef }));
+    }).pipe(Effect.provide(GitCaptureContractLayer)),
+);
+
 it.effect("checkpoint recovery refuses excessive candidates before probing", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1087,6 +1128,7 @@ it.effect("GitVcsDriver flushes checkpoint objects and refs to disk before publi
       "-c",
       "core.fsyncMethod=fsync",
       "update-ref",
+      "--no-deref",
       "refs/t3/checkpoints/thread/turn/1",
       "commit0000",
     ]);

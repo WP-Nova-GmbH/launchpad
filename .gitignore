@@ -21,6 +21,7 @@ apps/web/.playwright
 apps/web/playwright-report
 apps/web/src/components/__screenshots__
 .vitest-*
+/.vite-hooks/_/
 __screenshots__/
 .tanstack
 squashfs-root/
@@ -44,3 +45,4 @@ node_modules/
 
 # pnpm content-addressable store; never belongs in the repo.
 .pnpm-store/
+infra/e2b/__pycache__/

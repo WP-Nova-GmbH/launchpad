@@ -339,19 +339,17 @@ export function CloudEnvironmentConnectRows({
           : availability === "checking"
             ? "bg-warning"
             : "bg-muted-foreground/35";
+    const relayStatusText =
+      availability === "online"
+        ? "Online"
+        : availability === "offline"
+          ? "Offline"
+          : availability === "checking"
+            ? "Checking status…"
+            : (Option.getOrNull(error)?.message ?? "Status unavailable");
     const statusText =
-      unsupported && !savedEnvironment
-        ? "Launchpad Connect · Not added · Client not supported"
-        : savedConnection
-          ? savedConnection.statusText
-          : availability === "online"
-            ? "Launchpad Connect · Not added · Relay online"
-            : availability === "offline"
-              ? "Launchpad Connect · Not added · Relay offline"
-              : availability === "checking"
-                ? "Launchpad Connect · Not added · Checking relay status…"
-                : (Option.getOrNull(error)?.message ??
-                  "Launchpad Connect · Not added · Relay status unavailable");
+      savedConnection?.statusText ??
+      `Launchpad Connect\nNot added\nRelay: ${relayStatusText}${unsupported ? "\nClient not supported" : ""}`;
     if (selection) {
       return (
         <label
@@ -436,7 +434,7 @@ export function CloudEnvironmentConnectRows({
             </div>
             <p
               className={cn(
-                "mt-1 truncate text-xs",
+                "mt-1 space-y-1 text-xs",
                 savedConnection?.tone === "error" ||
                   (savedConnection?.tone === "connecting" && savedEnvironment?.connection.error) ||
                   (savedConnection === null && availability === "error")
@@ -444,7 +442,18 @@ export function CloudEnvironmentConnectRows({
                   : "text-muted-foreground",
               )}
             >
-              {statusText}
+              {savedConnection ? (
+                <span>{statusText}</span>
+              ) : (
+                <>
+                  <span className="block">Launchpad Connect</span>
+                  <span className="flex flex-wrap gap-x-4 gap-y-1">
+                    <span>Not added</span>
+                    <span>Relay: {relayStatusText}</span>
+                  </span>
+                  {unsupported ? <span className="block">Client not supported</span> : null}
+                </>
+              )}
             </p>
           </div>
           {unsupported && !savedEnvironment ? (

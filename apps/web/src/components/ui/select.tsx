@@ -9,6 +9,7 @@ import type * as React from "react";
 import { cn } from "~/lib/utils";
 
 const Select = SelectPrimitive.Root;
+const SelectItemIndicator = SelectPrimitive.ItemIndicator;
 
 const selectTriggerVariants = cva(
   "relative inline-flex cursor-pointer select-none items-center justify-between gap-2 border rounded-lg text-left text-base outline-none transition-[color,box-shadow,background-color] data-disabled:pointer-events-none data-disabled:opacity-64 sm:text-sm [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4.5 sm:[&_svg:not([class*='size-'])]:size-4",
@@ -217,6 +218,7 @@ export {
   SelectPopup,
   SelectPopup as SelectContent,
   SelectItem,
+  SelectItemIndicator,
   SelectGroup,
   SelectGroupLabel,
 };

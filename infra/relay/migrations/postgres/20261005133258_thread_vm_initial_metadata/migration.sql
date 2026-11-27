@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_setups" ADD COLUMN "initial_state" text;

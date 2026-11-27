@@ -12,10 +12,11 @@ vi.mock("@clerk/react", () => ({
   useAuth: vi.fn(),
 }));
 
-vi.mock("../lib/runtime", () => ({
+vi.mock("../lib/runtime", async () => ({
   runtime: {
     runPromiseExit: vi.fn(),
   },
+  runtimeContextLayer: (await import("effect/Layer")).empty,
 }));
 
 vi.mock("../connection/catalog", () => ({

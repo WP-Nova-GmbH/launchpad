@@ -386,6 +386,24 @@ describe("resolveEnvironmentOptionLabel", () => {
 });
 
 describe("shouldShowEnvironmentIndicator", () => {
+  it("keeps Run on available for existing threads with only a local or unresolved host", () => {
+    for (const activeEnvironment of [{ isPrimary: true }, null]) {
+      const visible = shouldShowEnvironmentIndicator({
+        activeEnvironment,
+        canPickEnvironment: false,
+        existingThread: true,
+      });
+      expect(visible).toBe(true);
+      expect(
+        shouldShowComposerContextStrip({
+          hasActiveProject: true,
+          isGitRepo: false,
+          showEnvironmentIndicator: visible,
+          hostsRestingComposerControls: false,
+        }),
+      ).toBe(true);
+    }
+  });
   it("shows the indicator whenever multiple environments are pickable", () => {
     expect(
       shouldShowEnvironmentIndicator({
@@ -527,6 +545,12 @@ describe("resolveCurrentWorkspaceLabel", () => {
 });
 
 describe("resolveLockedWorkspaceLabel", () => {
+  it("names the dedicated VM workspace for checkout and transferred worktree paths", () => {
+    expect(resolveLockedWorkspaceLabel(null, "local", true)).toBe("VM workspace");
+    expect(resolveLockedWorkspaceLabel("/workspace/worktree", "worktree", true)).toBe(
+      "VM workspace",
+    );
+  });
   it("uses a shorter label for the main repo checkout", () => {
     expect(resolveLockedWorkspaceLabel(null, "local")).toBe("Local checkout");
   });

@@ -45,7 +45,7 @@ resource "hcloud_firewall" "relay" {
 }
 
 # The whole hosted control plane on one machine: Postgres, the relay Node
-# server, Caddy for TLS, and Docker for the org machines the relay provisions.
+# server, and Caddy for TLS. E2B thread VMs run on a separate Linux host.
 resource "hcloud_server" "relay_01" {
   name        = "launchpad-relay-01"
   image       = "ubuntu-24.04"

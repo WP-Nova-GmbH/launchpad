@@ -9,6 +9,7 @@ import {
 import { isElectron } from "../../env";
 import { AuthSurfaceShell } from "../auth/AuthSurfaceShell";
 import { resolveClerkSignInProps } from "../clerk/authRedirect";
+import { retryT3ConnectSignIn, T3_CONNECT_SIGN_IN_ERROR } from "../clerk/useT3ConnectAuthPrompt";
 import { Button } from "../ui/button";
 
 function ConnectCliAuthMessage({
@@ -86,6 +87,23 @@ export function ConnectCliAuthorizeSurface() {
     return (
       <AuthSurfaceShell>
         <ConnectCliAuthMessage {...invalidLinkMessage} />
+      </AuthSurfaceShell>
+    );
+  }
+
+  if (clerk.status === "error") {
+    return (
+      <AuthSurfaceShell>
+        <ConnectCliAuthMessage
+          eyebrow="Browser authorization"
+          title={T3_CONNECT_SIGN_IN_ERROR}
+          description="Reload this page to try again."
+        />
+        <div className="mt-6">
+          <Button type="button" onClick={retryT3ConnectSignIn}>
+            Retry sign-in
+          </Button>
+        </div>
       </AuthSurfaceShell>
     );
   }

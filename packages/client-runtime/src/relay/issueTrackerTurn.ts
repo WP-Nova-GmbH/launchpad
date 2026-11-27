@@ -33,6 +33,13 @@ export const authorizeIssueTrackerTurn = Effect.fn("issueTrackers.authorizeTurn"
   if (expectedAccountId !== undefined && expectedAccountId !== (session?.accountId ?? null)) {
     return yield* fail();
   }
+  const target = supervisor.target;
+  if (
+    target._tag === "RelayConnectionTarget" &&
+    "threadId" in command &&
+    target.workflowFollowUp?.threadId === command.threadId
+  )
+    return command;
   if (!session || !registry) return command;
   return yield* Effect.gen(function* () {
     const relay = yield* Effect.serviceOption(ManagedRelayClient);

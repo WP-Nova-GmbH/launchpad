@@ -1,3 +1,5 @@
+import * as CheckoutAccess from "../src/workspace/CheckoutAccess.ts";
+import { threadExecutionTestLayerForDatabase } from "../src/provider/testUtils/threadExecutionTestLayer.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 
@@ -453,6 +455,8 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(orchestrationReactorLayer),
       Layer.provideMerge(providerRegistryLayer),
+      Layer.provide(threadExecutionTestLayerForDatabase),
+      Layer.provide(CheckoutAccess.layer),
       Layer.provide(persistenceLayer),
       Layer.provideMerge(RepositoryIdentityResolver.layer),
       Layer.provideMerge(ServerSettingsService.layerTest()),

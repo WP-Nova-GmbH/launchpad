@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_artifact_pins" ADD COLUMN "expires_at" timestamp with time zone;

@@ -1,3 +1,4 @@
+import { threadExecutionTestLayerForDatabase } from "../src/provider/testUtils/threadExecutionTestLayer.ts";
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
 import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts/settings";
@@ -93,6 +94,7 @@ const makeIntegrationFixture = (options?: { readonly analytics?: Layer.Layer<Ana
 
     const shared = Layer.mergeAll(
       directoryLayer,
+      threadExecutionTestLayerForDatabase,
       Layer.succeed(ProviderAdapterRegistry, registry),
       ServerConfig.layerTest(cwd, cwd).pipe(Layer.provide(NodeServices.layer)),
       ServerSettingsService.layerTest(DEFAULT_SERVER_SETTINGS),
@@ -101,6 +103,7 @@ const makeIntegrationFixture = (options?: { readonly analytics?: Layer.Layer<Ana
     ).pipe(Layer.provide(SqlitePersistenceMemory));
 
     const layer = makeProviderServiceLive().pipe(
+      Layer.provide(SqlitePersistenceMemory),
       Layer.provide(NodeServices.layer),
       Layer.provide(shared),
     );

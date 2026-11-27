@@ -7,6 +7,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
 
@@ -16,6 +17,10 @@ const isJsonRpcId = Schema.is(JsonRpcId);
 const isJsonRpcResponseEnvelope = Schema.is(JsonRpcResponseEnvelope);
 const isCodexAppServerError = Schema.is(CodexError.CodexAppServerError);
 const MAX_BUFFERED_RAW_MESSAGES = 32;
+const IDLE_FENCE_PREFIX = "launchpad-idle:";
+const IDLE_FENCE_BODY_LENGTH = IDLE_FENCE_PREFIX.length + 32;
+const IDLE_FENCE_START = 0x1e;
+const IDLE_FENCE_END = 0x1f;
 
 export interface CodexAppServerProtocolLogEvent {
   readonly direction: "incoming" | "outgoing";
@@ -46,10 +51,16 @@ export interface CodexAppServerPatchedProtocolOptions {
   readonly onRequest?: (
     request: CodexAppServerIncomingRequest,
   ) => Effect.Effect<unknown, CodexError.CodexAppServerError>;
+  /** Runs after preceding messages are dispatched. A partial message or a late request vetoes the fence. */
+  readonly onIdleInputFence?: (nonce: string, completeFrame: boolean) => Effect.Effect<void>;
   readonly onTermination?: (error: CodexError.CodexAppServerError) => Effect.Effect<void, never>;
 }
 
 export interface CodexAppServerPatchedProtocol {
+  /** Close admission only after native requests settle; input remains drainable. */
+  readonly reserveIdleShutdown: Effect.Effect<boolean>;
+  readonly releaseIdleShutdown: Effect.Effect<void>;
+  readonly awaitInputDrained: Effect.Effect<void, CodexError.CodexAppServerError>;
   readonly incomingNotifications: Stream.Stream<CodexAppServerIncomingNotification>;
   readonly incomingRequests: Stream.Stream<CodexAppServerIncomingRequest>;
   readonly request: (
@@ -168,7 +179,11 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const terminationSignal = yield* Deferred.make<void>();
+    const inputDrained = yield* Deferred.make<void, CodexError.CodexAppServerError>();
     const activeRequestHandlers = yield* Ref.make(0);
+    const admission = yield* Semaphore.make(1);
+    let idleShutdownReserved = false;
+    let requestAfterIdleReservation = false;
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
       if (event.direction === "incoming" && !options.logIncoming) {
@@ -217,8 +232,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ] as const;
       }).pipe(Effect.flatten);
 
-    const offerOutgoing = (message: Record<string, unknown>) =>
+    const offerOutgoing = (message: Record<string, unknown>, response = false) =>
       Effect.gen(function* () {
+        if (idleShutdownReserved && !response)
+          return yield* new CodexError.CodexAppServerInputStreamEndedError({});
         const failure = yield* Ref.get(terminationFailure);
         if (Option.isSome(failure)) return yield* failure.value;
 
@@ -241,7 +258,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             () => new CodexError.CodexAppServerInputStreamEndedError({}),
           );
         }
-      });
+      }).pipe(admission.withPermits(1));
 
     const removePending = (requestId: string) =>
       Ref.update(pending, (current) => {
@@ -268,12 +285,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       }).pipe(Effect.flatten);
 
     const respond = (requestId: string | number, result: unknown) =>
-      offerOutgoing(toProtocolMessage(requestId, { result }));
+      offerOutgoing(toProtocolMessage(requestId, { result }), true);
 
     const respondError = (
       requestId: string | number,
       error: CodexError.CodexAppServerRequestError,
-    ) => offerOutgoing(toProtocolMessage(requestId, { error: error.toProtocolError() }));
+    ) => offerOutgoing(toProtocolMessage(requestId, { error: error.toProtocolError() }), true);
 
     const handleResponse = (response: typeof JsonRpcResponseEnvelope.Type) => {
       const requestId = String(response.id);
@@ -299,17 +316,27 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Queue.offer(incomingRequests, request).pipe(
         Effect.flatMap(() => {
           const handler = options.onRequest;
-          if (!handler) return Effect.void;
+          if (!handler) {
+            if (idleShutdownReserved) requestAfterIdleReservation = true;
+            return Effect.void;
+          }
 
-          return Ref.modify(activeRequestHandlers, (count) =>
-            count >= MAX_BUFFERED_RAW_MESSAGES ? [false, count] : [true, count + 1],
-          ).pipe(
+          return Ref.modify(activeRequestHandlers, (count) => {
+            if (idleShutdownReserved) requestAfterIdleReservation = true;
+            return (idleShutdownReserved && !options.onIdleInputFence) ||
+              count >= MAX_BUFFERED_RAW_MESSAGES
+              ? [false, count]
+              : [true, count + 1];
+          }).pipe(
+            admission.withPermits(1),
             Effect.flatMap((accepted) => {
               if (!accepted) {
                 return respondError(
                   request.id,
                   CodexError.CodexAppServerRequestError.overloaded(
-                    "Too many Codex requests are already active.",
+                    idleShutdownReserved && !options.onIdleInputFence
+                      ? "Codex provider is stopping."
+                      : "Too many Codex requests are already active.",
                   ),
                 );
               }
@@ -395,35 +422,85 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       );
     };
 
-    yield* options.stdio.stdin.pipe(
-      Stream.interruptWhen(Deferred.await(terminationSignal)),
-      Stream.decodeText(),
-      Stream.runForEach((chunk) =>
-        Effect.sync(() => {
-          const lines: Array<string> = [];
-          let start = 0;
-          for (
-            let newline = chunk.indexOf("\n");
-            newline !== -1;
-            newline = chunk.indexOf("\n", start)
-          ) {
-            remainder.push(chunk.slice(start, newline));
-            lines.push(remainder.join("").replace(/\r$/, ""));
-            remainder.length = 0;
-            start = newline + 1;
-          }
-          // Keep unfinished lines in fragments so each chunk is scanned only once.
-          if (start < chunk.length) {
-            remainder.push(chunk.slice(start));
-          }
-          return lines;
-        }).pipe(Effect.flatMap((lines) => Effect.forEach(lines, handleLine, { discard: true }))),
-      ),
+    const handleChunk = Effect.fnUntraced(function* (chunk: string) {
+      const lines: Array<string> = [];
+      let start = 0;
+      for (
+        let newline = chunk.indexOf("\n");
+        newline !== -1;
+        newline = chunk.indexOf("\n", start)
+      ) {
+        remainder.push(chunk.slice(start, newline));
+        lines.push(remainder.join("").replace(/\r$/, ""));
+        remainder.length = 0;
+        start = newline + 1;
+      }
+      // Keep unfinished lines in fragments so each chunk is scanned only once.
+      if (start < chunk.length) remainder.push(chunk.slice(start));
+      yield* Effect.forEach(lines, handleLine, { discard: true });
+    });
+    const input = options.stdio.stdin.pipe(Stream.interruptWhen(Deferred.await(terminationSignal)));
+    const readInputWithFences = Effect.fnUntraced(function* (
+      onIdleInputFence: NonNullable<CodexAppServerPatchedProtocolOptions["onIdleInputFence"]>,
+    ) {
+      const decoder = new TextDecoder();
+      let fence: string | undefined;
+      let completeFrame = true;
+      const invalidFence = () =>
+        new CodexError.CodexAppServerTransportError({
+          operation: "read-input-stream",
+          cause: "Invalid idle input fence",
+        });
+      yield* input.pipe(
+        Stream.runForEach(
+          Effect.fnUntraced(function* (chunk) {
+            let offset = 0;
+            while (offset < chunk.length) {
+              if (fence === undefined) {
+                const start = chunk.indexOf(IDLE_FENCE_START, offset);
+                const bytes = chunk.subarray(offset, start === -1 ? undefined : start);
+                if (bytes.length > 0) {
+                  completeFrame = bytes[bytes.length - 1] === 0x0a;
+                  // Strip the fence before decoding. It can split a UTF-8 character.
+                  yield* handleChunk(decoder.decode(bytes, { stream: true }));
+                }
+                if (start === -1) break;
+                offset = start + 1;
+                fence = "";
+              } else {
+                const end = chunk.indexOf(IDLE_FENCE_END, offset);
+                const bytes = chunk.subarray(offset, end === -1 ? undefined : end);
+                if (fence.length + bytes.length > IDLE_FENCE_BODY_LENGTH)
+                  return yield* invalidFence();
+                fence += String.fromCharCode(...bytes);
+                if (end === -1) break;
+                const nonce = fence.slice(IDLE_FENCE_PREFIX.length);
+                if (!fence.startsWith(IDLE_FENCE_PREFIX) || !/^[a-f0-9]{32}$/u.test(nonce))
+                  return yield* invalidFence();
+                yield* onIdleInputFence(nonce, completeFrame && !requestAfterIdleReservation);
+                fence = undefined;
+                offset = end + 1;
+              }
+            }
+          }),
+        ),
+      );
+      if (fence !== undefined) return yield* invalidFence();
+      yield* handleChunk(decoder.decode());
+    });
+
+    yield* (
+      options.onIdleInputFence
+        ? readInputWithFences(options.onIdleInputFence)
+        : input.pipe(Stream.decodeText(), Stream.runForEach(handleChunk))
+    ).pipe(
       Effect.matchEffect({
-        onFailure: (error) =>
-          handleTermination(() =>
-            Effect.succeed(normalizeIncomingError(error, "read-input-stream")),
-          ),
+        onFailure: (error) => {
+          const failure = normalizeIncomingError(error, "read-input-stream");
+          return Deferred.fail(inputDrained, failure).pipe(
+            Effect.andThen(handleTermination(() => Effect.succeed(failure))),
+          );
+        },
         onSuccess: () =>
           Effect.sync(() => {
             const line = remainder.join("");
@@ -432,13 +509,29 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           }).pipe(
             Effect.flatMap(handleLine),
             Effect.matchEffect({
-              onFailure: (error) => handleTermination(() => Effect.succeed(error)),
-              onSuccess: () =>
-                handleTermination(
-                  () =>
-                    options.terminationError ??
-                    Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
+              onFailure: (error) =>
+                Deferred.fail(inputDrained, error).pipe(
+                  Effect.andThen(handleTermination(() => Effect.succeed(error))),
                 ),
+              onSuccess: () =>
+                Effect.gen(function* () {
+                  if (yield* Ref.get(terminationHandled)) {
+                    const failure = yield* Ref.get(terminationFailure);
+                    return yield* Deferred.fail(
+                      inputDrained,
+                      Option.getOrElse(
+                        failure,
+                        () => new CodexError.CodexAppServerInputStreamEndedError({}),
+                      ),
+                    );
+                  }
+                  yield* Deferred.succeed(inputDrained, undefined);
+                  yield* handleTermination(
+                    () =>
+                      options.terminationError ??
+                      Effect.succeed(new CodexError.CodexAppServerInputStreamEndedError({})),
+                  );
+                }),
             }),
           ),
       }),
@@ -474,6 +567,24 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       });
 
     return {
+      reserveIdleShutdown: Effect.gen(function* () {
+        if (idleShutdownReserved) return true;
+        if (
+          (yield* Ref.get(pending)).size ||
+          (yield* Ref.get(activeRequestHandlers)) ||
+          (yield* Queue.size(outgoing)) > 0 ||
+          remainder.length ||
+          (yield* Ref.get(terminationHandled))
+        )
+          return false;
+        idleShutdownReserved = true;
+        requestAfterIdleReservation = false;
+        return true;
+      }).pipe(admission.withPermits(1)),
+      releaseIdleShutdown: Effect.sync(() => {
+        idleShutdownReserved = false;
+      }).pipe(admission.withPermits(1)),
+      awaitInputDrained: Deferred.await(inputDrained),
       incomingNotifications: Stream.fromQueue(incomingNotifications),
       incomingRequests: Stream.fromQueue(incomingRequests),
       request,

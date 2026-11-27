@@ -1,4 +1,9 @@
-import { AuthStandardClientScopes, EnvironmentId } from "@t3tools/contracts";
+import {
+  AuthOrchestrationReadScope,
+  AuthStandardClientScopes,
+  EnvironmentId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   RelayEnvironmentConnectScope,
   type RelayEnvironmentConnectResponse,
@@ -65,13 +70,13 @@ const websocketTicket = (ticket: string) =>
     expiresAt: "2026-06-06T01:00:00.000Z",
   });
 
-const accessToken = (token: string) =>
+const accessToken = (token: string, scope = AuthStandardClientScopes.join(" ")) =>
   Response.json({
     access_token: token,
     issued_token_type: "urn:ietf:params:oauth:token-type:access_token",
     token_type: "DPoP",
     expires_in: 3_600,
-    scope: AuthStandardClientScopes.join(" "),
+    scope,
   });
 
 const authInvalid = () =>
@@ -340,6 +345,51 @@ describe("RemoteEnvironmentAuthorization", () => {
     }),
   );
 
+  it.effect("keeps a workflow follow-up connection separate from its saved viewer token", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        initialToken: new TokenStore.RemoteDpopAccessToken({
+          environmentId: ENVIRONMENT_ID,
+          accountId: "account-1",
+          label: DESCRIPTOR.label,
+          endpoint: ENDPOINT,
+          accessToken: "viewer-token",
+          expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+          dpopThumbprint: "thumbprint-1",
+        }),
+        responses: [
+          websocketTicket("viewer-one"),
+          Response.json(DESCRIPTOR),
+          accessToken("follow-up-token"),
+          websocketTicket("follow-up"),
+          websocketTicket("viewer-two"),
+        ],
+      });
+      const workflowFollowUp = { threadId: ThreadId.make("workflow:job"), generation: 3 };
+      yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        const target = { expectedEnvironmentId: ENVIRONMENT_ID };
+        expect((yield* remote.authorizeDpop(target)).httpAuthorization).toMatchObject({
+          _tag: "Dpop",
+          accessToken: "viewer-token",
+        });
+        expect(
+          (yield* remote.authorizeDpop({ ...target, workflowFollowUp })).httpAuthorization,
+        ).toMatchObject({ _tag: "Dpop", accessToken: "follow-up-token" });
+        expect((yield* remote.authorizeDpop(target)).httpAuthorization).toMatchObject({
+          _tag: "Dpop",
+          accessToken: "viewer-token",
+        });
+      }).pipe(Effect.provide(harness.layer));
+      expect(yield* Ref.get(harness.relayInputs)).toEqual([
+        expect.objectContaining({ workflowFollowUp }),
+      ]);
+      expect((yield* Ref.get(harness.tokens)).get(ENVIRONMENT_ID)?.accessToken).toBe(
+        "viewer-token",
+      );
+    }),
+  );
+
   it.effect("refreshes and persists an expired environment token", () =>
     Effect.gen(function* () {
       const expired = new TokenStore.RemoteDpopAccessToken({
@@ -523,6 +573,31 @@ describe("RemoteEnvironmentAuthorization", () => {
       expect(harness.fetch.calls).toHaveLength(0);
       expect(yield* Ref.get(harness.bootstrapCalls)).toBe(0);
       expect(yield* Ref.get(harness.proofInputs)).toEqual([]);
+    }),
+  );
+
+  it.effect("exchanges a relay reviewer credential without requesting broader scopes", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        responses: [
+          Response.json(DESCRIPTOR),
+          accessToken("review-access-token", AuthOrchestrationReadScope),
+        ],
+      });
+      const authorized = yield* Effect.gen(function* () {
+        const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+        return yield* remote.authorizeDpopHttp({ expectedEnvironmentId: ENVIRONMENT_ID });
+      }).pipe(Effect.provide(harness.layer));
+      expect(authorized.httpAuthorization.accessToken).toBe("review-access-token");
+
+      const [url, request] = harness.fetch.calls[1]!;
+      expect(String(url)).toBe(`${ENDPOINT.httpBaseUrl}/oauth/token`);
+      expect(new Headers(request.headers).get("dpop")).toBe(`proof:${url}`);
+      const body = new URLSearchParams(String(request.body));
+      expect(body.has("scope")).toBe(false);
+      expect(body.get("subject_token")).toBe(BOOTSTRAP.credential);
+      expect(body.get("client_label")).toBe("Launchpad Test");
+      expect(body.get("client_device_type")).toBe("mobile");
     }),
   );
 

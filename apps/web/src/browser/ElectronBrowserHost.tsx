@@ -20,7 +20,9 @@ export function ElectronBrowserHost() {
     () =>
       Object.entries(previewByThreadKey).flatMap(([threadKey, previewState]) => {
         const threadRef = parseScopedThreadKey(threadKey);
-        return threadRef
+        // An RPC snapshot may arrive before the first server epoch. Mounting
+        // then would recreate the guest on hydration and replay one-time URLs.
+        return threadRef && previewState.serverEpoch !== null
           ? Object.values(previewState.sessions).map((snapshot) => ({
               threadRef,
               snapshot,

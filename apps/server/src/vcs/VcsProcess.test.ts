@@ -1,6 +1,11 @@
+import * as CheckoutAccess from "../workspace/CheckoutAccess.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import * as FileSystem from "effect/FileSystem";
+import * as Redacted from "effect/Redacted";
+import { ThreadVmRepositoryCredentialError } from "../relay/ThreadVmRepositoryCredentials.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
-import { HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
+import { HostProcessPlatform, HostProcessWorkingDirectory } from "@t3tools/shared/hostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
@@ -22,6 +27,7 @@ import {
 } from "@t3tools/contracts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as OrganizationSourceControlCredentials from "../relay/OrganizationSourceControlCredentials.ts";
+import { WorkflowVmGuest } from "../vmWorkloadCommand.ts";
 import * as VcsProcess from "./VcsProcess.ts";
 
 const encodeExitError = Schema.encodeEffect(Schema.fromJsonString(VcsProcessExitError));
@@ -593,6 +599,7 @@ describe("VcsProcess.run on a managed executor", () => {
   const organizationLayer = Layer.succeed(
     OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
     OrganizationSourceControlCredentials.OrganizationSourceControlCredentials.of({
+      threadVm: null,
       github: Effect.succeed({
         token: "ghs_organization",
         expiresAt: DateTime.makeUnsafe(0),
@@ -603,7 +610,11 @@ describe("VcsProcess.run on a managed executor", () => {
   const provideExecutor = <A, E, R>(effect: Effect.Effect<A, E, R | VcsProcess.VcsProcess>) =>
     effect.pipe(
       Effect.provide(
-        VcsProcess.layer.pipe(Layer.provide(NodeServices.layer), Layer.provide(organizationLayer)),
+        VcsProcess.layer.pipe(
+          Layer.provide(CheckoutAccess.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+          Layer.provide(NodeServices.layer),
+          Layer.provide(organizationLayer),
+        ),
       ),
     );
   const printGhToken = {
@@ -641,5 +652,353 @@ describe("VcsProcess.run on a managed executor", () => {
       Effect.map((result) => expect(result.stdout).not.toBe("ghs_organization")),
       provideLive,
     ),
+  );
+
+  it.effect.skipIf(HostProcessPlatform.defaultValue() === "win32")(
+    "secures workflow Git with runner or ambient credentials",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "launchpad-managed-vcs-" });
+        const credentialUrl = "https://github.com/acme/repo.git";
+        const gh = `${cwd}/gh`;
+        yield* fs.writeFileString(
+          gh,
+          `#!/bin/sh\n[ "$*" = 'auth git-credential get' ] || exit 1\nprintf 'username=fixture\\npassword=%s\\n' "$GH_TOKEN"\n`,
+        );
+        yield* fs.chmod(gh, 0o700);
+        const input = {
+          ...baseInput,
+          cwd,
+          env: {
+            PATH: `${cwd}:${process.env.PATH ?? ""}`,
+            GIT_CONFIG_COUNT: "0",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_NOSYSTEM: "1",
+          },
+        };
+        const setupGit = (...args: string[]) => run({ ...input, args }).pipe(provideLive);
+        yield* setupGit("init", "--quiet");
+        const hook = `${cwd}/.git/hooks/pre-commit`;
+        yield* fs.writeFileString(hook, "#!/bin/sh\nexit 1\n");
+        yield* fs.chmod(hook, 0o700);
+        const commitArgs = [
+          "-c",
+          "user.name=Fixture",
+          "-c",
+          "user.email=fixture@example.invalid",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Fixture",
+        ];
+        const local = yield* run({
+          ...input,
+          credentials: "none",
+          args: commitArgs,
+          allowNonZeroExit: true,
+        }).pipe(provideExecutor);
+        expect(local.exitCode).not.toBe(0);
+        yield* setupGit("config", `http.${credentialUrl}.followRedirects`, "true");
+        yield* setupGit("config", `credential.${credentialUrl}.useHttpPath`, "false");
+        yield* setupGit(
+          "config",
+          `credential.${credentialUrl}.helper`,
+          "!f() { printf 'username=local\\npassword=local\\n'; }; f",
+        );
+        const askpass = `${cwd}/askpass`;
+        yield* fs.writeFileString(
+          askpass,
+          "#!/bin/sh\necho 'fixture askpass invoked' >&2\nexit 1\n",
+        );
+        yield* fs.chmod(askpass, 0o700);
+        yield* setupGit("config", "core.askPass", askpass);
+        const otherRepo = "https://github.com/acme/other.git";
+        yield* setupGit("config", `url.${otherRepo}.insteadOf`, credentialUrl);
+        yield* setupGit("config", `url.${otherRepo}.pushInsteadOf`, "launchpad-workflow://");
+        const workflowGit = { ...input, credentials: "github", credentialUrl } as const;
+        const modes = [
+          { provide: provideExecutor, password: "ghs_organization", useHttpPath: true },
+          { provide: provideLive, password: "local", useHttpPath: false },
+        ];
+        for (const { provide, password, useHttpPath } of modes) {
+          yield* run({ ...workflowGit, args: commitArgs }).pipe(provide);
+          const redirect = yield* run({
+            ...workflowGit,
+            args: ["config", "--get-urlmatch", "http.followRedirects", credentialUrl],
+          }).pipe(provide);
+          expect(redirect.stdout.trim()).toBe("false");
+          const credential = yield* run({
+            ...workflowGit,
+            args: ["credential", "fill"],
+            stdin: `url=${credentialUrl}\n\n`,
+          }).pipe(provide);
+          expect(credential.stdout).toContain(`password=${password}\n`);
+          expect(credential.stdout.includes("path=acme/repo.git\n")).toBe(useHttpPath);
+          for (const otherUrl of [
+            "https://github.com/acme/repo-other.git",
+            "https://example.invalid/acme/repo.git",
+          ]) {
+            const outside = yield* run({
+              ...workflowGit,
+              args: ["credential", "fill"],
+              stdin: `url=${otherUrl}\n\n`,
+              allowNonZeroExit: true,
+            }).pipe(provide);
+            expect(outside.exitCode).not.toBe(0);
+            expect(outside.stdout).toBe("");
+            expect(outside.stderr).not.toContain("fixture askpass invoked");
+          }
+        }
+
+        // Inspect the actual launch arguments without a network connection.
+        const git = `${cwd}/git`;
+        yield* fs.writeFileString(
+          git,
+          `#!/bin/sh\nprintf '%s\\n' "$GIT_ALLOW_PROTOCOL" "$GIT_TERMINAL_PROMPT" "$GIT_ASKPASS" "$SSH_ASKPASS" "$@"\n`,
+        );
+        yield* fs.chmod(git, 0o700);
+        const realGit = (...args: string[]) =>
+          run({ ...input, env: { ...input.env, PATH: process.env.PATH }, args }).pipe(provideLive);
+        const aliases = new Set<string>();
+        for (const { provide } of modes) {
+          for (const operation of ["fetch", "push", "ls-remote"]) {
+            const proxyOption = `--config-env=http.${credentialUrl}.proxy=TEST_GIT_PROXY`;
+            const launched = yield* run({
+              ...workflowGit,
+              args: [proxyOption, operation, "--", credentialUrl],
+              env: { ...input.env, GIT_ASKPASS: askpass, SSH_ASKPASS: askpass, TEST_GIT_PROXY: "" },
+            }).pipe(provide);
+            const lines = launched.stdout.trim().split("\n");
+            expect(lines.slice(0, 4)).toEqual(["https", "0", "", ""]);
+            const alias = lines.at(-1)!;
+            expect(alias).toMatch(/^launchpad-workflow:\/\/[\da-f-]+$/);
+            expect(aliases.has(alias)).toBe(false);
+            aliases.add(alias);
+            const command = lines.indexOf(operation);
+            expect(lines[command - 1]).toBe(proxyOption);
+            expect(lines.slice(command)).toEqual([
+              operation,
+              ...(operation === "ls-remote" ? [] : ["--no-recurse-submodules"]),
+              "--",
+              alias,
+            ]);
+            // Ask real Git to resolve the exact arguments without opening a transport.
+            yield* realGit("config", "remote.verify.url", alias);
+            const resolved = yield* realGit(
+              ...lines.slice(4, command - 1),
+              "remote",
+              "get-url",
+              ...(operation === "push" ? ["--push"] : []),
+              "--all",
+              "--",
+              "verify",
+            );
+            expect(resolved.stdout.trim()).toBe(credentialUrl);
+          }
+        }
+        yield* run({ ...workflowGit, args: ["push", "--", otherRepo] }).pipe(
+          provideExecutor,
+          Effect.flip,
+          Effect.tap((error) =>
+            Effect.sync(() => expect(error.message).toContain("approved workflow repository")),
+          ),
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps runner credentials away from owned local Git and explicit opt-outs", () =>
+    Effect.gen(function* () {
+      const launches: ProcessRunner.ProcessRunInput[] = [];
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: (input) =>
+            Effect.sync(() => {
+              launches.push(input);
+              return {
+                code: ChildProcessSpawner.ExitCode(0),
+                stdout: "",
+                stderr: "",
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              };
+            }),
+        }),
+        Effect.provideService(
+          OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+          { threadVm: null, github: Effect.die("Local Git must not request runner credentials.") },
+        ),
+      );
+      const owner = {
+        executable: "/runner",
+        capture: () => Effect.void,
+        arm: Effect.void,
+        completed: () => Effect.void,
+        stop: Effect.void,
+      } satisfies ProcessRunner.OwnedCommand;
+      const input = { ...baseInput, args: ["add", "-A"], env: { GIT_INDEX_FILE: "/tmp/index" } };
+      yield* service
+        .run(input)
+        .pipe(Effect.provideService(ProcessRunner.CurrentWorkflowCommand, Effect.succeed(owner)));
+      yield* service.run({ ...input, credentials: "none" });
+      yield* service.run({ ...input, credentials: "github" });
+      expect(launches).toHaveLength(3);
+      expect(launches[0]?.owner).toBe(owner);
+      for (const launch of launches) {
+        expect(launch.args).toEqual(input.args);
+        expect(launch.env).toEqual(input.env);
+      }
+    }),
+  );
+});
+
+describe("VcsProcess private thread VM", () => {
+  it.effect("runs local Git inside a workflow guest without exposing repository credentials", () =>
+    Effect.gen(function* () {
+      const inputs: ProcessRunner.ProcessRunInput[] = [];
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: (input) =>
+            Effect.sync(() => {
+              inputs.push(input);
+              return {
+                code: ChildProcessSpawner.ExitCode(0),
+                stdout: " M tracked.txt",
+                stderr: "",
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              };
+            }),
+        }),
+        Effect.provideService(
+          OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+          {
+            github: Effect.die("The workload cannot mint organization credentials."),
+            threadVm: { github: Effect.die("The workload cannot mint VM credentials.") },
+          },
+        ),
+      );
+      const input = {
+        ...baseInput,
+        env: { GH_TOKEN: "token", GIT_CONFIG_PARAMETERS: "test", GIT_INDEX_FILE: "/tmp/index" },
+      };
+      const git = yield* service.run(input);
+      expect(git.stdout).toBe(" M tracked.txt");
+      expect(inputs[0]?.args).toEqual(baseInput.args);
+      expect(inputs[0]?.env?.GH_TOKEN).toBeUndefined();
+      expect(inputs[0]?.env?.GIT_CONFIG_PARAMETERS).toBeUndefined();
+      expect(inputs[0]?.env?.GIT_INDEX_FILE).toBe("/tmp/index");
+      expect(
+        yield* service.run({ ...input, command: "gh", args: ["pr", "list"] }).pipe(Effect.flip),
+      ).toMatchObject({ failureKind: "authentication" });
+      expect(inputs).toHaveLength(1);
+    }).pipe(Effect.provideService(WorkflowVmGuest, true)),
+  );
+
+  it.effect(
+    "keeps local Git offline, strips broader credentials, and fails closed on denied GitHub access",
+    () =>
+      Effect.gen(function* () {
+        let mints = 0;
+        let denied = false;
+        const inputs: Array<ProcessRunner.ProcessRunInput> = [];
+        const service = yield* VcsProcess.make.pipe(
+          Effect.provideService(ProcessRunner.ProcessRunner, {
+            run: (input) =>
+              Effect.sync(() => {
+                inputs.push(input);
+                return {
+                  code: ChildProcessSpawner.ExitCode(0),
+                  stdout: "",
+                  stderr: "",
+                  timedOut: false,
+                  stdoutInvalidUtf8: false,
+                  stderrInvalidUtf8: false,
+                  stdoutTruncated: false,
+                  stderrTruncated: false,
+                };
+              }),
+          }),
+          Effect.provideService(
+            OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+            {
+              github: Effect.die("private VMs must never use organization-wide credentials"),
+              threadVm: {
+                github: Effect.suspend(() => {
+                  mints++;
+                  return denied
+                    ? Effect.fail(new ThreadVmRepositoryCredentialError())
+                    : Effect.succeed(Redacted.make("scoped-token"));
+                }),
+              },
+            },
+          ),
+        );
+        const input = {
+          ...baseInput,
+          env: {
+            GH_TOKEN: "broad",
+            GITHUB_TOKEN: "broad",
+            T3CODE_RUNNER_GH_TOKEN: "broad",
+            GIT_TERMINAL_PROMPT: "1",
+          },
+        };
+        yield* service.run(input);
+        expect(mints).toBe(0);
+        expect(inputs[0]?.env).toMatchObject({
+          GH_TOKEN: "",
+          GITHUB_TOKEN: "",
+          T3CODE_RUNNER_GH_TOKEN: "",
+          GIT_TERMINAL_PROMPT: "0",
+        });
+        expect(inputs[0]?.args).toContain("credential.useHttpPath=true");
+        yield* service.run({ ...input, command: "gh", args: ["--version"] });
+        expect(mints).toBe(0);
+        yield* service.run({ ...input, command: "gh", args: ["api", "rate_limit"] });
+        expect(mints).toBe(1);
+        expect(inputs[2]?.env?.GH_TOKEN).toBe("scoped-token");
+        expect(inputs[2]?.args).not.toContain("scoped-token");
+        denied = true;
+        expect(
+          yield* service.run({ ...input, command: "gh", args: ["pr", "list"] }).pipe(Effect.flip),
+        ).toMatchObject({ failureKind: "authentication" });
+        expect(inputs).toHaveLength(3);
+        yield* service.run(input);
+        expect(inputs).toHaveLength(4);
+        expect(mints).toBe(2);
+      }),
+  );
+
+  it.effect(
+    "runs real local Git with an unavailable relay and never invokes the credential helper",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "launchpad-private-vm-git-" });
+        const service = yield* VcsProcess.make.pipe(
+          Effect.provideService(
+            OrganizationSourceControlCredentials.OrganizationSourceControlCredentials,
+            {
+              github: Effect.die("no broad credential"),
+              threadVm: { github: Effect.die("offline Git must not mint credentials") },
+            },
+          ),
+          Effect.provide(ProcessRunner.layer),
+        );
+        yield* service.run({ ...baseInput, cwd, args: ["init", "--quiet"] });
+        const result = yield* service.run({ ...baseInput, cwd });
+        expect(result.stdout).toBe("");
+        const config = yield* fs.readFileString(`${cwd}/.git/config`);
+        expect(config).not.toContain("credential");
+        expect(config).not.toContain("token");
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

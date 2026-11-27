@@ -66,6 +66,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 import {
   COMPOSER_DRAFT_STORAGE_KEY,
+  handoffMovedThreadDraft,
+  composerTargetKey,
   beginBackgroundDraftSubmissionByRef,
   clearComposerDraftsEnvironment,
   composerDraftHasUserContent,
@@ -3401,5 +3403,148 @@ describe("composerDraftStore attachment references", () => {
     expect(merged.draftsByThreadKey[threadKeyFor(threadId, TEST_ENVIRONMENT_ID)]?.prompt).toBe(
       prompt,
     );
+  });
+});
+
+describe("moved thread drafts", () => {
+  beforeEach(resetComposerDraftStore);
+  const source = scopeThreadRef(TEST_ENVIRONMENT_ID, ThreadId.make("moved-thread"));
+  const destination = scopeThreadRef(OTHER_TEST_ENVIRONMENT_ID, source.threadId);
+  const input = { source, destination, stillCurrent: () => true, recoverFile: async () => null };
+
+  it("moves unsent text to the new environment and does not merge it again on retry", async () => {
+    useComposerDraftStore.getState().setPrompt(source, "Keep this draft");
+    await handoffMovedThreadDraft(input);
+    expect(useComposerDraftStore.getState().getComposerDraft(destination)?.prompt).toBe(
+      "Keep this draft",
+    );
+    expect(useComposerDraftStore.getState().getComposerDraft(source)).toBeNull();
+    await handoffMovedThreadDraft(input);
+    expect(useComposerDraftStore.getState().getComposerDraft(destination)?.prompt).toBe(
+      "Keep this draft",
+    );
+  });
+
+  it("asks before a conflict and retains the unselected draft", async () => {
+    useComposerDraftStore.getState().setPrompt(source, "Incoming");
+    useComposerDraftStore.getState().setPrompt(destination, "Existing");
+    const result = await handoffMovedThreadDraft(input);
+    expect(result.conflict?.source.prompt).toBe("Incoming");
+    expect(useComposerDraftStore.getState().getComposerDraft(destination)?.prompt).toBe("Existing");
+    await handoffMovedThreadDraft({
+      ...input,
+      choice: { use: "source", conflict: result.conflict! },
+    });
+    expect(useComposerDraftStore.getState().getComposerDraft(destination)?.prompt).toBe("Incoming");
+    expect(useComposerDraftStore.getState().getComposerDraft(source)?.prompt).toBe("Existing");
+  });
+
+  it("does not overwrite text typed after a conflict was displayed", async () => {
+    useComposerDraftStore.getState().setPrompt(source, "Incoming");
+    useComposerDraftStore.getState().setPrompt(destination, "Existing");
+    const result = await handoffMovedThreadDraft(input);
+    useComposerDraftStore.getState().setPrompt(destination, "New edits");
+    await expect(
+      handoffMovedThreadDraft({ ...input, choice: { use: "source", conflict: result.conflict! } }),
+    ).rejects.toThrow("draft changed");
+    expect(useComposerDraftStore.getState().getComposerDraft(destination)?.prompt).toBe(
+      "New edits",
+    );
+  });
+
+  it("leaves both drafts untouched after the authenticated scope changes", async () => {
+    useComposerDraftStore.getState().setPrompt(source, "Keep this draft");
+    await expect(handoffMovedThreadDraft({ ...input, stillCurrent: () => false })).rejects.toThrow(
+      "account",
+    );
+    expect(useComposerDraftStore.getState().getComposerDraft(source)?.prompt).toBe(
+      "Keep this draft",
+    );
+    expect(useComposerDraftStore.getState().getComposerDraft(destination)).toBeNull();
+  });
+  it("retains the source when the durable destination write fails", async () => {
+    useComposerDraftStore.getState().setPrompt(source, "Keep this draft");
+    const stringify = vi.spyOn(JSON, "stringify").mockImplementationOnce(() => {
+      throw new Error("disk full");
+    });
+    try {
+      await expect(handoffMovedThreadDraft(input)).rejects.toThrow("disk full");
+      expect(useComposerDraftStore.getState().getComposerDraft(source)?.prompt).toBe(
+        "Keep this draft",
+      );
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
+  it("keeps an unavailable upload as a visible reattach marker with its durable source reference", async () => {
+    useComposerDraftStore.getState().addFiles(source, [
+      {
+        ...makeFile("file"),
+        file: null,
+        uploadedAttachmentId: "old-upload",
+        uploadEnvironmentId: source.environmentId,
+      },
+    ]);
+    await handoffMovedThreadDraft(input);
+    expect(
+      composerFileNeedsReattach(
+        useComposerDraftStore.getState().getComposerDraft(destination)!.files[0]!,
+      ),
+    ).toBe(true);
+    expect(
+      useComposerDraftStore.getState().getComposerDraft(destination)?.files[0]?.recoveryUpload,
+    ).toEqual({ attachmentId: "old-upload", environmentId: source.environmentId });
+  });
+
+  it("carries terminal output as a snapshot rather than a live terminal in the new machine", async () => {
+    useComposerDraftStore.getState().setTerminalContexts(source, [
+      makeTerminalContext({
+        id: "term",
+        terminalId: "live-source-terminal",
+        text: "captured output",
+      }),
+    ]);
+    await handoffMovedThreadDraft(input);
+    const terminal = useComposerDraftStore.getState().getComposerDraft(destination)
+      ?.terminalContexts[0];
+    expect(terminal?.terminalId).toBe("snapshot:term");
+    expect(terminal?.terminalLabel).toContain("snapshot");
+    expect(terminal?.text).toBe("captured output");
+  });
+  it("preserves recovered upload access through reload before a destination upload finishes", async () => {
+    const file = makeFile("file");
+    useComposerDraftStore.getState().addFiles(source, [
+      {
+        ...file,
+        file: null,
+        uploadedAttachmentId: "old-upload",
+        uploadEnvironmentId: source.environmentId,
+      },
+    ]);
+    await handoffMovedThreadDraft({ ...input, recoverFile: async () => file.file });
+    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+    expect(
+      persisted.draftsByThreadKey[composerTargetKey(destination)]?.files?.[0]?.recoveryUpload,
+    ).toEqual({ attachmentId: "old-upload", environmentId: source.environmentId });
+    useComposerDraftStore.setState({ draftsByThreadKey: {} });
+    await useComposerDraftStore.persist.rehydrate();
+    const restored = useComposerDraftStore.getState().getComposerDraft(destination)?.files[0];
+    expect(restored?.file).toBeNull();
+    expect(restored?.recoveryUpload).toEqual({
+      attachmentId: "old-upload",
+      environmentId: source.environmentId,
+    });
+  });
+
+  it("writes image bytes into the destination snapshot before clearing the source", async () => {
+    const image = makeImage({ id: "image", previewUrl: "blob:test" });
+    useComposerDraftStore.getState().addImages(source, [image]);
+    await handoffMovedThreadDraft(input);
+    const persisted = partializeComposerDraftStoreState(useComposerDraftStore.getState());
+    expect(
+      persisted.draftsByThreadKey[composerTargetKey(destination)]?.attachments[0]?.dataUrl,
+    ).toContain("data:image/png;base64,");
+    expect(useComposerDraftStore.getState().getComposerDraft(source)).toBeNull();
   });
 });

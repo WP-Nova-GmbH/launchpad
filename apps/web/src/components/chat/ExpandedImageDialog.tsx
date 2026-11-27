@@ -9,6 +9,7 @@ import {
 } from "react";
 import { ChevronLeftIcon, ChevronRightIcon, ImageIcon, TextIcon, XIcon } from "lucide-react";
 import { Button } from "../ui/button";
+import { isWindowAlertDialogOpen } from "../../lib/windowAlertDialog";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 import type { ExpandedImageItem, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { resolveExternalWebLinkHost } from "./externalLinkContextMenu";
@@ -142,7 +143,7 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
 
   useEffect(() => {
     const onEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== "Escape" || isContextMenuOpen()) return;
+      if (event.key !== "Escape" || isContextMenuOpen() || isWindowAlertDialogOpen()) return;
       event.preventDefault();
       event.stopPropagation();
       onClose();

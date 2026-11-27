@@ -1,3 +1,5 @@
+import type { KeybindingCommand } from "@t3tools/contracts";
+
 export type TerminalFocusOwner = "drawer" | "right-panel";
 
 export function getTerminalFocusOwner(): TerminalFocusOwner | null {
@@ -11,4 +13,18 @@ export function getTerminalFocusOwner(): TerminalFocusOwner | null {
 
 export function isTerminalFocused(): boolean {
   return getTerminalFocusOwner() !== null;
+}
+
+export function isDrawerTerminalShortcut(
+  command: KeybindingCommand,
+  focusOwner: TerminalFocusOwner | null,
+): boolean {
+  return (
+    command === "terminal.toggle" ||
+    (focusOwner === "drawer" &&
+      (command === "terminal.split" ||
+        command === "terminal.splitVertical" ||
+        command === "terminal.new" ||
+        command === "terminal.close"))
+  );
 }

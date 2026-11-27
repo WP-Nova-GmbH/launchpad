@@ -2,7 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
-import { CommandId, ProjectId, ThreadId } from "./baseSchemas.ts";
+import { CommandId, MessageId, ProjectId, ThreadId } from "./baseSchemas.ts";
 
 import {
   ProjectIconOverride,
@@ -10,6 +10,7 @@ import {
   DEFAULT_RUNTIME_MODE,
   type ChatImageAttachment,
   ClientOrchestrationCommand,
+  PortableThreadCommand,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationDispatchCommandError,
@@ -47,6 +48,7 @@ const decodeProjectCreatedPayload = Schema.decodeUnknownEffect(ProjectCreatedPay
 const decodeProjectMetaUpdatedPayload = Schema.decodeUnknownEffect(ProjectMetaUpdatedPayload);
 const decodeThreadTurnStartCommand = Schema.decodeUnknownEffect(ThreadTurnStartCommand);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const decodePortableThreadCommand = Schema.decodeUnknownEffect(PortableThreadCommand);
 const decodeOrchestrationMessage = Schema.decodeUnknownEffect(OrchestrationMessage);
 const decodeThreadMessageSentPayload = Schema.decodeUnknownEffect(ThreadMessageSentPayload);
 const decodeThreadTurnStartRequestedPayload = Schema.decodeUnknownEffect(
@@ -1686,5 +1688,28 @@ it.effect("encodes compatible icons inside snapshots and client commands", () =>
     });
     if (command.type !== "project.meta.update") throw new Error("Unexpected command");
     assert.deepEqual(yield* decodeNightlyIcon(command.projectIcon), fallback);
+  }),
+);
+
+it.effect("keeps pending and claimed move progress internal to the worker", () =>
+  Effect.gen(function* () {
+    const pending = {
+      type: "thread.move.progress" as const,
+      commandId: CommandId.make("pending-notice"),
+      threadId: ThreadId.make("thread-1"),
+      messageId: MessageId.make("move-1"),
+      expectedRevision: 1,
+      detail: "Local process shutdown is unverified.",
+      blocked: true,
+      createdAt: "2026-10-19T10:00:00.000Z",
+    };
+    for (const command of [
+      pending,
+      { ...pending, operationId: CommandId.make("claimed-operation") },
+    ]) {
+      assert.deepStrictEqual(yield* decodeOrchestrationCommand(command), command);
+      assert.ok(yield* decodeClientOrchestrationCommand(command).pipe(Effect.flip));
+      assert.ok(yield* decodePortableThreadCommand(command).pipe(Effect.flip));
+    }
   }),
 );

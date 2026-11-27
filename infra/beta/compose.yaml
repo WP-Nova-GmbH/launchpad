@@ -1,0 +1,87 @@
+name: launchpad-beta
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    env_file: ${BETA_STATE_DIR:?}/postgres.env
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      # The PostgreSQL image's temporary initialization server listens on a Unix socket.
+      test: [CMD, pg_isready, -q, -h, 127.0.0.1, -U, launchpad_relay, -d, launchpad_relay]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: local
+
+  relay:
+    image: ${BETA_RELAY_IMAGE:?}
+    pull_policy: never
+    restart: unless-stopped
+    network_mode: host
+    # Resolve newly provisioned Cloudflare VM hostnames through Cloudflare DNS.
+    dns: [1.1.1.1, 1.0.0.1]
+    env_file:
+      - path: ${BETA_STATE_DIR:?}/provisioned.env
+        format: raw
+      - path: ${BETA_STATE_DIR:?}/relay.env
+        format: raw
+      - path: ${BETA_STATE_DIR:?}/runner.env
+        format: raw
+    volumes:
+      - type: bind
+        source: ${BETA_STATE_DIR:?}/relay-data
+        target: /var/lib/launchpad-relay
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - --eval
+        - >-
+          fetch('http://127.0.0.1:8610/health').then(async response => {
+            if (!response.ok ||
+              response.headers.get('x-launchpad-deployment-id') !== process.env.DEV_RELAY_DEPLOYMENT_ID) process.exit(1);
+            const health = await response.json();
+            if (health.ok !== true ||
+              health.threadVmCapabilities?.configured !== true ||
+              health.workflowVmCapabilities?.execution !== true) process.exit(1);
+          }).catch(() => process.exit(1));
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: local
+
+  tunnel:
+    image: cloudflare/cloudflared:2026.5.2
+    restart: unless-stopped
+    network_mode: host
+    # Read the root-owned 0600 token file without granting network capabilities.
+    user: "0:0"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [tunnel, --metrics, "127.0.0.1:8611", run, --token-file, /run/secrets/tunnel.token]
+    volumes:
+      - type: bind
+        source: ${BETA_STATE_DIR:?}/tunnel.token
+        target: /run/secrets/tunnel.token
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      relay:
+        condition: service_healthy
+    logging:
+      driver: local
+
+volumes:
+  postgres:

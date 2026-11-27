@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import { isElectron } from "./env";
 import { isMacPlatform } from "./lib/utils";
+import { isWindowAlertDialogOpen } from "./lib/windowAlertDialog";
 
 export interface ShortcutEventLike {
   getModifierState?: (key: "AltGraph") => boolean;
@@ -246,7 +247,7 @@ export function resolveShortcutCommand(
     if (!binding) continue;
     if (!matchesWhenClause(binding.whenAst, context)) continue;
     if (!matchesShortcut(event, binding.shortcut, platform)) continue;
-    return binding.command;
+    return isWindowAlertDialogOpen() ? null : binding.command;
   }
   return null;
 }

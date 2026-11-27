@@ -1,3 +1,5 @@
+import { managedTunnelsDisabled } from "./config.ts";
+import { VmControlSpawner } from "../vmWorkloadCommand.ts";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import * as Clock from "effect/Clock";
@@ -129,7 +131,8 @@ const stopConnector = (connector: ActiveConnector | null) =>
 
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const tunnelsDisabled = yield* managedTunnelsDisabled;
+  const spawner = (yield* VmControlSpawner) ?? (yield* ChildProcessSpawner.ChildProcessSpawner);
   const relayClient = yield* RelayClient.RelayClient;
   const activeRef = yield* Ref.make<ActiveConnector | null>(null);
   const desiredConfigRef = yield* Ref.make<RelayManagedEndpointRuntimeConfig | null>(null);
@@ -268,9 +271,9 @@ export const make = Effect.gen(function* () {
   };
 
   reconcileConfig = Effect.fn("CloudManagedEndpointRuntime.reconcileConfig")(function* (config) {
-    if (!config || config.providerKind !== "cloudflare_tunnel") {
+    if (tunnelsDisabled || !config || config.providerKind !== "cloudflare_tunnel") {
       yield* stopActive;
-      return config
+      return config && !tunnelsDisabled
         ? { status: "unsupported", providerKind: config.providerKind }
         : { status: "disabled" };
     }
@@ -411,7 +414,8 @@ export const make = Effect.gen(function* () {
   const runtime = CloudManagedEndpointRuntime.of({
     applyConfig,
     recoveryRequests: Stream.fromQueue(recoveryRequests),
-    requestRecovery: (config) => Queue.offer(recoveryRequests, config).pipe(Effect.asVoid),
+    requestRecovery: (config) =>
+      tunnelsDisabled ? Effect.void : Queue.offer(recoveryRequests, config).pipe(Effect.asVoid),
     withLinkStateLock: linkStateSemaphore.withPermits(1),
   });
 

@@ -31,6 +31,10 @@ class TreeRow {
   getAttribute(name: string) {
     return name === "data-item-path" ? this.path : null;
   }
+
+  hasAttribute(name: string) {
+    return this.getAttribute(name) !== null;
+  }
 }
 
 describe("diff tree file activation", () => {
@@ -44,9 +48,11 @@ describe("diff tree file activation", () => {
   function Panel({
     files = entries,
     selectedPath = null,
+    onActivateFile,
   }: {
     files?: DiffFileTreeEntry[];
     selectedPath?: string | null;
+    onActivateFile?: (path: string, input: { keyboard: boolean }) => void;
   }) {
     const reveal = useCodeViewFileReveal(viewer, "working-tree");
     return (
@@ -54,7 +60,9 @@ describe("diff tree file activation", () => {
         entries={files}
         ariaLabel="Working tree files"
         selectedPath={selectedPath}
-        onSelectFile={(path) => reveal(`${path}\0${path}`)}
+        {...(onActivateFile
+          ? { onActivateFile }
+          : { onSelectFile: (path: string) => reveal(`${path}\0${path}`) })}
       />
     );
   }
@@ -82,9 +90,8 @@ describe("diff tree file activation", () => {
       ...modifiers,
     } as MouseEvent<HTMLElement>;
     await act(async () => {
-      renderer!.root
-        .find((node) => String(node.type) === "file-tree-container")
-        .props.onClickCapture?.(event);
+      const host = renderer!.root.find((node) => String(node.type) === "file-tree-container");
+      host.props.onClickCapture?.(event);
       const tree = model();
       const item = tree.getItem(path)!;
       if (event.ctrlKey || event.metaKey) {
@@ -97,6 +104,7 @@ describe("diff tree file activation", () => {
       }
       item.focus();
       if ("toggle" in item && !event.ctrlKey && !event.metaKey && !event.shiftKey) item.toggle();
+      host.props.onClick?.(event);
     });
   }
 
@@ -161,6 +169,25 @@ describe("diff tree file activation", () => {
     await activate("01-tall.ts", { detail: 0 });
     await activate("01-tall.ts", { detail: 0 });
     expect(targets).toHaveLength(3);
+  });
+
+  it("distinguishes explicit activation from tree selection and focus changes", async () => {
+    const onActivateFile = vi.fn();
+    await mount({
+      files: [...entries, { path: "logs/saved.txt", status: "added" }],
+      onActivateFile,
+    });
+    await act(async () => model().getItem("01-tall.ts")!.focus());
+    await activate("02-short.ts", { detail: 1, ctrlKey: true });
+    await activate("logs/", { detail: 0 });
+    expect(onActivateFile).not.toHaveBeenCalled();
+
+    await activate("02-short.ts", { detail: 1 });
+    await activate("02-short.ts", { detail: 0 });
+    expect(onActivateFile.mock.calls).toEqual([
+      ["02-short.ts", { keyboard: false }],
+      ["02-short.ts", { keyboard: true }],
+    ]);
   });
 
   it.each(["ctrlKey", "metaKey"] as const)(

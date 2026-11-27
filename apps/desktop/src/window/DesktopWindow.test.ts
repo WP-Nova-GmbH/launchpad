@@ -19,6 +19,7 @@ import { vi } from "vite-plus/test";
 
 vi.mock("electron", async (importOriginal) => ({
   ...(await importOriginal<typeof import("electron")>()),
+  dialog: { showMessageBoxSync: vi.fn(() => 0) },
   session: {
     fromPartition: vi.fn(() => ({
       getUserAgent: vi.fn(() => "Mozilla/5.0 Electron/41.5.0 t3code/1.2.3"),
@@ -47,9 +48,11 @@ import * as ElectronShell from "../electron/ElectronShell.ts";
 import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import {
+  CONFIRM_WINDOW_CLOSE_CHANNEL,
   MENU_ACTION_CHANNEL,
   SNAP_SHOT_EVENT_CHANNEL,
   TRACKPAD_SCROLL_END_CHANNEL,
+  WINDOW_CLOSE_BLOCKED_CHANNEL,
   WINDOW_FULLSCREEN_STATE_CHANNEL,
 } from "../ipc/channels.ts";
 import * as DesktopServerExposure from "../backend/DesktopServerExposure.ts";
@@ -71,6 +74,7 @@ const environmentInput = {
 function makeFakeBrowserWindow() {
   const windowListeners = new Map<string, (...args: readonly unknown[]) => void>();
   const webContentsListeners = new Map<string, (...args: readonly unknown[]) => void>();
+  const ipcHandlers = new Map<string, (...args: readonly unknown[]) => unknown>();
   let zoomLevel = 0;
   const webContents = {
     copyImageAt: vi.fn(),
@@ -79,6 +83,11 @@ function makeFakeBrowserWindow() {
     getURL: vi.fn(() => "t3code-dev://app/"),
     getZoomLevel: vi.fn(() => zoomLevel),
     getZoomFactor: vi.fn(() => 1.2 ** zoomLevel),
+    ipc: {
+      handle: (channel: string, handler: (...args: readonly unknown[]) => unknown) =>
+        ipcHandlers.set(channel, handler),
+    },
+    mainFrame: {},
     setZoomLevel: vi.fn((level: number) => {
       zoomLevel = level;
     }),
@@ -127,14 +136,17 @@ function makeFakeBrowserWindow() {
 
   return {
     window: window as unknown as Electron.BrowserWindow,
+    close: window.close,
     getBounds: window.getBounds,
     getNormalBounds: window.getNormalBounds,
     isDestroyed: window.isDestroyed,
     isFullScreen: window.isFullScreen,
     isMaximized: window.isMaximized,
     isMinimized: window.isMinimized,
+    ipcHandlers,
     loadURL: window.loadURL,
     maximize: window.maximize,
+    mainFrame: webContents.mainFrame,
     openDevTools: webContents.openDevTools,
     reload: webContents.reload,
     send: webContents.send,
@@ -1253,6 +1265,91 @@ describe("DesktopWindow", () => {
             height: 930,
           },
         ]);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("allows one native window close retry from the frame that blocked it", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const close = fakeWindow.windowListeners.get("close");
+        const vetoUnload = fakeWindow.webContentsListeners.get("will-prevent-unload");
+        const confirm = fakeWindow.ipcHandlers.get(CONFIRM_WINDOW_CLOSE_CHANNEL);
+        const navigate = fakeWindow.webContentsListeners.get("did-start-navigation");
+        if (!close || !vetoUnload || !confirm || !navigate) {
+          return yield* Effect.die("window close handlers were not registered");
+        }
+
+        const fromMainFrame = { senderFrame: fakeWindow.mainFrame };
+        const preventDefault = vi.fn();
+        assert.throws(() => confirm(fromMainFrame), "There is no window close to confirm.");
+        close();
+        vetoUnload({ preventDefault });
+        assert.deepEqual(fakeWindow.send.mock.calls, [[WINDOW_CLOSE_BLOCKED_CHANNEL]]);
+        assert.isFalse(preventDefault.mock.calls.length > 0);
+        assert.throws(() => confirm({ senderFrame: {} }), "There is no window close to confirm.");
+        assert.throws(() => confirm(fromMainFrame, true), "There is no window close to confirm.");
+        assert.isFalse(fakeWindow.close.mock.calls.length > 0);
+
+        navigate({ isMainFrame: true, isSameDocument: true });
+        fakeWindow.close.mockImplementationOnce(() => {
+          close();
+          vetoUnload({ preventDefault });
+        });
+        confirm(fromMainFrame);
+        assert.lengthOf(preventDefault.mock.calls, 1);
+        assert.lengthOf(fakeWindow.close.mock.calls, 1);
+        assert.lengthOf(fakeWindow.send.mock.calls, 1);
+        assert.throws(() => confirm(fromMainFrame), "There is no window close to confirm.");
+
+        close();
+        vetoUnload({ preventDefault });
+        navigate({ isMainFrame: true, isSameDocument: false });
+        assert.throws(() => confirm(fromMainFrame), "There is no window close to confirm.");
+        assert.lengthOf(preventDefault.mock.calls, 1);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("keeps dirty reloads separate from native window close requests", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = makeTestLayer({
+        window: fakeWindow.window,
+        createCount,
+        mainWindow,
+      });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const vetoUnload = fakeWindow.webContentsListeners.get("will-prevent-unload");
+        if (!vetoUnload) {
+          return yield* Effect.die("window unload handler was not registered");
+        }
+
+        vi.mocked(Electron.dialog.showMessageBoxSync).mockReturnValueOnce(0).mockReturnValueOnce(1);
+        const preventDefault = vi.fn();
+
+        vetoUnload({ preventDefault });
+        assert.lengthOf(preventDefault.mock.calls, 0);
+        vetoUnload({ preventDefault });
+        assert.lengthOf(preventDefault.mock.calls, 1);
+        assert.lengthOf(fakeWindow.send.mock.calls, 0);
+        assert.lengthOf(fakeWindow.close.mock.calls, 0);
       }).pipe(Effect.provide(layer));
     }),
   );

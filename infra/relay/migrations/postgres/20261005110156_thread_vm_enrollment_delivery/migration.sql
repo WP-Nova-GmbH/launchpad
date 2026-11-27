@@ -1,0 +1,3 @@
+ALTER TABLE "relay_thread_vm_enrollments" ADD COLUMN "installed_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_enrollments" DROP CONSTRAINT "relay_thread_vm_enrollments_claim", ADD CONSTRAINT "relay_thread_vm_enrollments_claim" CHECK (("environment_id" IS NULL AND "environment_public_key" IS NULL AND "sealed_response" IS NULL AND "credential_id" IS NULL AND "sealed_seed" IS NOT NULL AND "installed_at" IS NULL)
+      OR ("environment_id" IS NOT NULL AND "environment_public_key" IS NOT NULL AND "sealed_response" IS NOT NULL AND "credential_id" IS NOT NULL AND ("installed_at" IS NULL OR "sealed_seed" IS NULL)));

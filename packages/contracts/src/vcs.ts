@@ -207,6 +207,7 @@ export class VcsProcessOutputReadError extends Schema.TaggedError<VcsProcessOutp
   {
     ...VcsProcessBoundaryErrorFields,
     stream: Schema.Literals(["stdout", "stderr", "exitCode"]),
+    reason: Schema.optionalKey(Schema.Literals(["invalid_utf8", "binary_summary", "nul_byte"])),
     cause: Schema.Defect(),
   },
 ) {

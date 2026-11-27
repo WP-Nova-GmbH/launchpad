@@ -44,7 +44,8 @@ import {
   probeCodexSkillsForCwd,
   withCodexAppServerClient,
 } from "../Layers/CodexProvider.ts";
-import { resolveCodexLaunchArgs } from "../Layers/codexLaunchArgs.ts";
+import { managedCodexEnvironment, resolveCodexLaunchArgs } from "../Layers/codexLaunchArgs.ts";
+import { ThreadVmCodexAuthContext } from "../../relay/ThreadVmCodexAuthSource.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import * as ModelManifest from "../ModelManifest.ts";
@@ -139,6 +140,14 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
       const modelManifest = yield* ModelManifest.ModelManifest;
+      const authContext = yield* ThreadVmCodexAuthContext;
+      const managedAuth = yield* authContext.current.pipe(
+        Effect.mapError(
+          (error) =>
+            new ProviderDriverError({ driver: DRIVER_KIND, instanceId, detail: error.message }),
+        ),
+      );
+      const authPreflight = managedAuth?.preflight ?? authContext.personalPreflight;
       const inheritedEnv = mergeProviderInstanceEnvironment(environment);
       const homeLayout = yield* resolveCodexHomeLayout(config);
       const continuationIdentity = codexContinuationIdentity(homeLayout);
@@ -164,11 +173,13 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       // with a shadow home that is the private auth overlay, never the
       // shared one another instance may be signed in to.
       const authStoreDirectory = homeLayout.effectiveHomePath ?? homeLayout.sharedHomePath;
-      const { environment: processEnv } = yield* applyOrganizationProviderAccount({
-        provider: "codex",
-        environment: inheritedEnv,
-        authStoreDirectory,
-      });
+      const processEnv = managedAuth
+        ? managedCodexEnvironment(inheritedEnv)
+        : (yield* applyOrganizationProviderAccount({
+            provider: "codex",
+            environment: inheritedEnv,
+            authStoreDirectory,
+          })).environment;
       // Codex loads user-level skills from `$CODEX_HOME/skills`. That is a
       // shared directory: a shadow home reaches it through a symlink, so the
       // one placement serves every instance on this home.
@@ -192,6 +203,9 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         enabled,
         binaryPath: expandHomePath(config.binaryPath),
         homePath: homeLayout.effectiveHomePath ?? "",
+        ...(managedAuth
+          ? { launchArgs: resolveCodexLaunchArgs(config.launchArgs, inheritedEnv) }
+          : {}),
       } satisfies CodexSettings;
       const accountAuthEnvironment = {
         ...processEnv,
@@ -228,7 +242,13 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const checkProvider = modelManifest.refreshInBackground.pipe(
         Effect.andThen(
           Effect.zipWith(
-            checkCodexProviderStatus(effectiveConfig, undefined, processEnv),
+            checkCodexProviderStatus(
+              effectiveConfig,
+              undefined,
+              processEnv,
+              managedAuth ?? undefined,
+              authPreflight,
+            ),
             modelManifest.current,
             (draft, manifest) =>
               stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER_KIND)),
@@ -283,25 +303,40 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         instanceId,
         environment: processEnv,
         models,
+        ...(managedAuth ? { managedAuth } : {}),
+        authPreflight,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
-      const textGeneration = yield* makeCodexTextGeneration(effectiveConfig, processEnv, models);
+      const textGeneration = yield* makeCodexTextGeneration(
+        effectiveConfig,
+        processEnv,
+        models,
+        managedAuth ?? undefined,
+        authPreflight,
+      );
       const snapshotForCwd = (cwd: string) =>
         !effectiveConfig.enabled
           ? snapshot.getSnapshot
           : Effect.all([
               snapshot.getSnapshot,
-              probeCodexSkillsForCwd({
-                binaryPath: effectiveConfig.binaryPath,
-                homePath: effectiveConfig.homePath,
-                launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
-                cwd,
-                environment: processEnv,
-              }).pipe(
-                Effect.scoped,
-                Effect.timeout("20 seconds"),
-                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              ),
+              authPreflight
+                .pipe(
+                  Effect.andThen(
+                    probeCodexSkillsForCwd({
+                      binaryPath: effectiveConfig.binaryPath,
+                      homePath: effectiveConfig.homePath,
+                      launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
+                      cwd,
+                      environment: processEnv,
+                      ...(managedAuth ? { managedConnectionId: managedAuth.connectionId } : {}),
+                    }),
+                  ),
+                )
+                .pipe(
+                  Effect.scoped,
+                  Effect.timeout("20 seconds"),
+                  Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+                ),
             ]).pipe(
               Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })),
               Effect.mapError(
@@ -389,11 +424,9 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         enabled,
         snapshot,
         snapshotForCwd,
-        consumeResetCredit,
+        ...(managedAuth ? {} : { consumeResetCredit, accountAuth, accountExport }),
         adapter,
         textGeneration,
-        accountAuth,
-        accountExport,
       } satisfies ProviderInstance;
     }),
 };

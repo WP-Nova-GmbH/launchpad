@@ -19,10 +19,12 @@ import * as ElectronShell from "../electron/ElectronShell.ts";
 import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import {
+  CONFIRM_WINDOW_CLOSE_CHANNEL,
   MENU_ACTION_CHANNEL,
   QUIT_SHORTCUT_CHANNEL,
   SNAP_SHOT_EVENT_CHANNEL,
   TRACKPAD_SCROLL_END_CHANNEL,
+  WINDOW_CLOSE_BLOCKED_CHANNEL,
   WINDOW_FULLSCREEN_STATE_CHANNEL,
 } from "../ipc/channels.ts";
 import * as PreviewManager from "../preview/Manager.ts";
@@ -674,8 +676,52 @@ export const make = Effect.gen(function* () {
     window.on("move", scheduleBoundsPersist);
     window.on("maximize", scheduleBoundsPersist);
     window.on("unmaximize", scheduleBoundsPersist);
+    let closeAttempt: "initial" | "confirmed" | undefined;
+    let blockedCloseFrame: Electron.WebFrameMain | undefined;
+    const resetWindowClose = () => {
+      closeAttempt = undefined;
+      blockedCloseFrame = undefined;
+    };
     window.on("close", () => {
+      closeAttempt ??= "initial";
       runFork(flushBoundsPersist);
+    });
+    window.webContents.on("will-prevent-unload", (event) => {
+      const attempt = closeAttempt;
+      closeAttempt = undefined;
+      if (attempt === "confirmed") {
+        // Electron interprets this as allowing the blocked unload.
+        event.preventDefault();
+      } else if (attempt === "initial") {
+        blockedCloseFrame = window.webContents.mainFrame;
+        window.webContents.send(WINDOW_CLOSE_BLOCKED_CHANNEL);
+      } else {
+        const choice = Electron.dialog.showMessageBoxSync(window, {
+          type: "warning",
+          message: "Leave this page and discard unsaved workflow work?",
+          buttons: ["Stay", "Leave page"],
+          defaultId: 0,
+          cancelId: 0,
+        });
+        if (choice === 1) event.preventDefault();
+      }
+    });
+    window.webContents.ipc.handle(CONFIRM_WINDOW_CLOSE_CHANNEL, (event, ...args: unknown[]) => {
+      if (
+        args.length > 0 ||
+        !blockedCloseFrame ||
+        event.senderFrame !== blockedCloseFrame ||
+        event.senderFrame !== window.webContents.mainFrame ||
+        window.isDestroyed()
+      ) {
+        throw new Error("There is no window close to confirm.");
+      }
+      blockedCloseFrame = undefined;
+      closeAttempt = "confirmed";
+      window.close();
+    });
+    window.webContents.on("did-start-navigation", ({ isMainFrame, isSameDocument }) => {
+      if (isMainFrame && !isSameDocument) resetWindowClose();
     });
 
     if (environment.platform === "darwin") {
@@ -773,6 +819,7 @@ export const make = Effect.gen(function* () {
       },
     );
     window.webContents.on("render-process-gone", (_event, details) => {
+      resetWindowClose();
       const recoverable =
         details.reason === "crashed" ||
         details.reason === "oom" ||

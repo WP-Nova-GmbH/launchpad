@@ -5,10 +5,12 @@ import type {
   RelayOrganizationProject,
   RelayRepositorySummary,
 } from "@t3tools/contracts/relay";
-import type { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ORCHESTRATION_WS_METHODS, ProjectId, ThreadId } from "@t3tools/contracts";
+import type { ActiveWorkflowRunPageQuery } from "@t3tools/contracts/workflows";
 import {
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
+  RelayTenancyNotFoundError,
 } from "@t3tools/contracts/relay";
 import { decodeRelayJwt } from "@t3tools/shared/relayJwt";
 import * as Cause from "effect/Cause";
@@ -21,6 +23,8 @@ import * as Stream from "effect/Stream";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import { findErrorTraceId } from "../errors/errorTrace.ts";
+import { EnvironmentRegistry } from "../connection/registry.ts";
+import { request } from "../rpc/client.ts";
 import * as ManagedRelay from "./managedRelay.ts";
 import * as ManagedRelayTenancy from "./managedRelayTenancy.ts";
 import { relayProtectedErrorMessage } from "./errorPresentation.ts";
@@ -194,6 +198,14 @@ function readSessionClerkToken(
   );
 }
 
+export const readActiveWorkflowRunsPage = Effect.fn("clientRuntime.readActiveWorkflowRunsPage")(
+  function* (session: ManagedRelaySession, query: ActiveWorkflowRunPageQuery) {
+    const clerkToken = yield* readSessionClerkToken(session);
+    const relay = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+    return yield* relay.pageActiveWorkflowRuns({ clerkToken, query });
+  },
+);
+
 /** Removes an environment from the signed-in account without contacting that environment. */
 export const deregisterManagedRelayEnvironment = Effect.fn(
   "clientRuntime.managedRelaySession.deregisterEnvironment",
@@ -225,6 +237,75 @@ function requireClerkToken(
     );
   }
   return readSessionClerkToken(session);
+}
+
+/** Check the exact source checkout or its existing private relay placement. */
+export function createThreadVmRepositoryEligibility<R, E>(
+  runtime: Atom.AtomRuntime<
+    ManagedRelayTenancy.ManagedRelayTenancyClient | EnvironmentRegistry | R,
+    E
+  >,
+) {
+  const inputSchema = Schema.Struct({
+    accountId: Schema.String,
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    projectId: ProjectId,
+    // Recheck when the thread switches checkout while Run on is open.
+    checkoutPath: Schema.String,
+    binding: Schema.NullOr(Schema.Struct({ generation: Schema.Number, relayUrl: Schema.String })),
+  });
+  const keySchema = Schema.fromJsonString(inputSchema);
+  const encodeKey = Schema.encodeSync(keySchema);
+  const decodeKey = Schema.decodeSync(keySchema);
+  const inactive = Atom.make(AsyncResult.initial<boolean>());
+  const notFound = Schema.is(RelayTenancyNotFoundError);
+  const lookup = Atom.family((key: string) =>
+    runtime
+      .atom((get) =>
+        Effect.gen(function* () {
+          const input = decodeKey(key);
+          const clerkToken = yield* requireClerkToken(get, input.accountId);
+          const relay = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
+          const { threadId, environmentId, projectId, binding } = input;
+          if (binding) {
+            // The source and client can reach the same relay through different URLs.
+            const placement = yield* relay
+              .getPortableThreadPlacement({ clerkToken, threadId })
+              .pipe(
+                Effect.catchIf(
+                  (error) => isManagedRelayRequestFailedError(error) && notFound(error.cause),
+                  () => Effect.succeed(null),
+                ),
+              );
+            return (
+              placement?.threadId === threadId &&
+              placement.environmentId === environmentId &&
+              placement.projectId === projectId &&
+              placement.generation === binding.generation
+            );
+          }
+          const environment = yield* EnvironmentRegistry;
+          const canonicalKey = yield* environment.run(
+            environmentId,
+            request(ORCHESTRATION_WS_METHODS.getThreadRepositoryKey, { threadId }),
+          );
+          if (!canonicalKey) return false;
+          return (yield* relay.lookupRepository({ clerkToken, canonicalKey })).match !== null;
+        }),
+      )
+      .pipe(Atom.swr({ staleTime: 0, revalidateOnMount: true })),
+  );
+  return (input: typeof inputSchema.Type | null) => (input ? lookup(encodeKey(input)) : inactive);
+}
+
+export function threadVmRepositoryBlocker(result: AsyncResult.AsyncResult<boolean, unknown>) {
+  if (result.waiting || AsyncResult.isInitial(result)) return "Checking repository registration…";
+  if (AsyncResult.isFailure(result))
+    return "Could not check repository registration. Reopen Run on to retry.";
+  return result.value
+    ? null
+    : "Register this repository in Organization settings or ask an admin for access.";
 }
 
 function statusKey(input: {
@@ -452,6 +533,7 @@ export interface ManagedRelayOrganizationCatalogSnapshot {
   readonly membership: RelayOrganizationMembership;
   readonly repositories: ReadonlyArray<RelayRepositorySummary>;
   readonly projects: ReadonlyArray<RelayOrganizationProject>;
+  readonly projectsUnavailable?: true;
 }
 
 /**
@@ -461,7 +543,11 @@ export interface ManagedRelayOrganizationCatalogSnapshot {
  */
 export function createManagedRelayOrganizationCatalogQueryManager(
   runtime: Atom.AtomRuntime<ManagedRelayTenancy.ManagedRelayTenancyClient>,
-  options?: { readonly staleTimeMs?: number; readonly idleTtlMs?: number },
+  options?: {
+    readonly staleTimeMs?: number;
+    readonly idleTtlMs?: number;
+    readonly allowMissingProjects?: boolean;
+  },
 ) {
   const staleTime = options?.staleTimeMs ?? DEFAULT_STALE_TIME_MS;
   const idleTtl = options?.idleTtlMs ?? DEFAULT_IDLE_TTL_MS;
@@ -471,20 +557,42 @@ export function createManagedRelayOrganizationCatalogQueryManager(
         Effect.gen(function* () {
           const clerkToken = yield* requireClerkToken(get, accountId);
           const relay = yield* ManagedRelayTenancy.ManagedRelayTenancyClient;
-          return yield* Effect.all(
+          const readProjects = relay
+            .listOrganizationProjects({ clerkToken })
+            .pipe(
+              Effect.map(
+                (
+                  projects,
+                ): Pick<
+                  ManagedRelayOrganizationCatalogSnapshot,
+                  "projects" | "projectsUnavailable"
+                > => ({ projects }),
+              ),
+            );
+          const { membership, repositories, projectCatalog } = yield* Effect.all(
             {
               membership: relay.getOrganization({ clerkToken }),
               repositories: relay.listRepositories({ clerkToken }),
-              projects: relay.listOrganizationProjects({ clerkToken }),
+              projectCatalog: options?.allowMissingProjects
+                ? readProjects.pipe(
+                    Effect.orElseSucceed(() => ({
+                      projects: [],
+                      projectsUnavailable: true as const,
+                    })),
+                  )
+                : readProjects,
             },
             { concurrency: "unbounded" },
           );
+          return { membership, repositories, ...projectCatalog };
         }),
       )
       .pipe(
         Atom.swr({ staleTime, revalidateOnMount: true }),
         Atom.setIdleTTL(idleTtl),
-        Atom.withLabel(`managed-relay:organization-catalog:${accountId}`),
+        Atom.withLabel(
+          `managed-relay:organization-catalog:${accountId}${options?.allowMissingProjects ? ":workflows" : ""}`,
+        ),
       ),
   );
 

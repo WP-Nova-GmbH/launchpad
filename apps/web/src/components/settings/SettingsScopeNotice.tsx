@@ -1,10 +1,9 @@
+import type { ReactNode } from "react";
 import { Button } from "../ui/button";
 import { Alert, AlertAction, AlertDescription } from "../ui/alert";
 import { SettingsPageContainer } from "./settingsLayout";
 import { useSettingsScope } from "./SettingsScopeContext";
-import { useEnvironments } from "../../state/environments";
 import type { SettingsScopeSearch } from "./settingsScope";
-import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import type { EnvironmentId } from "@t3tools/contracts";
 
@@ -20,18 +19,22 @@ export function SettingsScopeNotice({
   targetId?: string;
   eligibleEnvironmentIds?: readonly EnvironmentId[];
 }) {
-  const { selectScope, search } = useSettingsScope();
+  const { availableEnvironments: environments, groups, selectScope, search } = useSettingsScope();
   const navigate = useNavigate({ from: "/settings" });
   const pathname = useLocation({ select: (location) => location.pathname });
-  const { environments } = useEnvironments();
-  const groups = useSettingsProjectGroups();
-  const choices: { label: string; search: SettingsScopeSearch }[] =
+  const choices: { label: ReactNode; search: SettingsScopeSearch }[] =
     target === "checkout"
       ? groups
           .filter((group) => !search.project || group.projectKey === search.project)
           .flatMap((group) =>
             group.memberProjects.map((member) => ({
-              label: `${group.displayName} · ${member.environmentLabel ?? "Environment"} · ${member.workspaceRoot}`,
+              label: (
+                <span className="min-w-0">
+                  <span className="block">{group.displayName}</span>
+                  <span className="block">{member.environmentLabel ?? "Environment"}</span>
+                  <span className="block break-all font-mono">{member.workspaceRoot}</span>
+                </span>
+              ),
               search: {
                 project: group.projectKey,
                 machine: member.environmentId,

@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import type { Project, Thread } from "../types";
+import { workflowResultGitAccess } from "../lib/workflowResultGitAccess";
 import {
+  allowedSearchOverlayMode,
   buildBrowseGroups,
   buildCommandPaletteProjectMetadata,
   buildProjectActionItems,
@@ -199,6 +201,24 @@ describe("buildCommandPaletteProjectMetadata", () => {
 
 describe("reduceCommandPaletteUiState", () => {
   const closedState = { open: false, mode: "command", openIntent: null } as const;
+
+  it.each(["files", "content"] as const)(
+    "keeps the command palette usable without opening %s for a workflow result",
+    (mode) => {
+      const threadId = "workflow:result";
+      for (const capabilities of [undefined, { workflowVmResultReader: true }]) {
+        const { canReadCheckoutGit } = workflowResultGitAccess({ capabilities, threadId });
+        expect(allowedSearchOverlayMode(mode, canReadCheckoutGit)).toBeNull();
+        expect(allowedSearchOverlayMode("command", canReadCheckoutGit)).toBe("command");
+      }
+
+      const { canReadCheckoutGit } = workflowResultGitAccess({
+        capabilities: { workflowVmResultReader: false },
+        threadId,
+      });
+      expect(allowedSearchOverlayMode(mode, canReadCheckoutGit)).toBe(mode);
+    },
+  );
 
   it("toggles each overlay mode open and closed", () => {
     const filesOpen = reduceCommandPaletteUiState(closedState, {

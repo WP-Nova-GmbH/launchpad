@@ -81,6 +81,7 @@ export type ServerAuthSessionMethod = typeof ServerAuthSessionMethod.Type;
 export const AuthOrchestrationReadScope = "orchestration:read" as const;
 export const AuthOrchestrationOperateScope = "orchestration:operate" as const;
 export const AuthTerminalOperateScope = "terminal:operate" as const;
+export const AuthWorkflowVmFollowUpScope = "workflow-vm:follow-up" as const;
 export const AuthReviewWriteScope = "review:write" as const;
 export const AuthAccessReadScope = "access:read" as const;
 export const AuthAccessWriteScope = "access:write" as const;
@@ -90,6 +91,7 @@ export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,
   AuthTerminalOperateScope,
+  AuthWorkflowVmFollowUpScope,
   AuthReviewWriteScope,
   AuthAccessReadScope,
   AuthAccessWriteScope,
@@ -282,6 +284,11 @@ export const AuthDesktopIdentityRequest = Schema.Struct({
 });
 export type AuthDesktopIdentityRequest = typeof AuthDesktopIdentityRequest.Type;
 
+export const AuthBrowserIdentityResult = Schema.Struct({
+  user: Schema.NullOr(AuthSessionUser),
+});
+export type AuthBrowserIdentityResult = typeof AuthBrowserIdentityResult.Type;
+
 export const AuthDesktopIdentityResult = Schema.Struct({
   ...AuthAccessTokenResult.fields,
   user: Schema.NullOr(AuthSessionUser),
@@ -349,6 +356,7 @@ export class EnvironmentAuthorizationError extends Schema.TaggedError<Environmen
   {
     message: Schema.String,
     requiredScope: AuthEnvironmentScope,
+    reason: Schema.optional(Schema.Literal("portable-thread")),
   },
 ) {}
 
@@ -414,6 +422,7 @@ export const AuthSessionState = Schema.Struct({
   auth: ServerAuthDescriptor,
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),
+  user: Schema.optionalKey(AuthSessionUser),
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
 });
 export type AuthSessionState = typeof AuthSessionState.Type;

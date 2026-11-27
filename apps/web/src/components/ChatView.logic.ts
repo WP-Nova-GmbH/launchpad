@@ -1211,6 +1211,24 @@ export interface LocalDispatchSnapshot {
   latestTurnStartFailureId: string | null;
 }
 
+/** Shared prompt delivery has its own status; Thinking starts with provider execution. */
+export function hasTimelineWork(input: {
+  sharedPromptQueue: boolean;
+  isWorking: boolean;
+  runningTurnId: TurnId | null;
+  isPreparingWorktree: boolean;
+  isCompacting: boolean;
+  isRevertingCheckpoint: boolean;
+}): boolean {
+  if (!input.sharedPromptQueue) return input.isWorking;
+  return (
+    input.runningTurnId !== null ||
+    input.isPreparingWorktree ||
+    input.isCompacting ||
+    input.isRevertingCheckpoint
+  );
+}
+
 export function latestTurnStartFailureId(
   activeThread: Thread | undefined,
   latestUserMessageId: ChatMessage["id"] | null,

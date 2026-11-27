@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_activity" ADD COLUMN "inactive_work_ids" jsonb DEFAULT '[]' NOT NULL;

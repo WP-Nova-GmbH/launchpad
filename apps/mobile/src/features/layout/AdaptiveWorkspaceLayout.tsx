@@ -57,6 +57,7 @@ import {
 import { AndroidHomeFabLayout } from "../home/AndroidHomeFab";
 import { HomeListOptionsProvider } from "../home/home-list-options";
 import { ThreadNavigationSidebar } from "../threads/ThreadNavigationSidebar";
+import { useWorkflowRunsShelf } from "../threads/WorkflowRunsShelf";
 import { RenderErrorBoundary, RenderFailureView } from "../../components/RenderErrorBoundary";
 import { WORKSPACE_PANE_TIMING } from "./workspace-pane-animation";
 import { WorkspaceInspectorPane } from "./workspace-inspector-pane";
@@ -205,6 +206,7 @@ export function AdaptiveWorkspaceLayout(props: {
   readonly children: ReactNode;
   readonly pathname: string;
   readonly workspaceRouteKey: string | undefined;
+  readonly workspaceVisible: boolean;
 }) {
   const preferencesResult = useAtomValue(mobilePreferencesAtom);
   if (!AsyncResult.isSuccess(preferencesResult)) {
@@ -229,6 +231,7 @@ function AdaptiveWorkspaceLayoutContent(
     readonly children: ReactNode;
     readonly pathname: string;
     readonly workspaceRouteKey: string | undefined;
+    readonly workspaceVisible: boolean;
   } & {
     readonly projectGroupingMode: SidebarProjectGroupingMode;
   },
@@ -296,6 +299,13 @@ function AdaptiveWorkspaceLayoutContent(
       showPrimarySidebar,
       width,
     ],
+  );
+  const workflowRunsShelf = useWorkflowRunsShelf(
+    "sidebar",
+    shouldRenderPrimarySidebar &&
+      panes.primarySidebarVisible &&
+      props.workspaceVisible &&
+      !primarySidebarSearchQuery.trim(),
   );
   const activeThread = parseActiveThreadPath(pathname);
   const environmentId = activeThread?.environmentId ?? null;
@@ -592,6 +602,7 @@ function AdaptiveWorkspaceLayoutContent(
                 >
                   <AndroidHomeFabLayout sidebar onStartNewTask={handleStartNewTask}>
                     <ThreadNavigationSidebar
+                      workflowRunsShelf={workflowRunsShelf}
                       width={layout.listPaneWidth}
                       visible={panes.primarySidebarVisible}
                       onRequestVisibility={revealPrimarySidebar}

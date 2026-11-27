@@ -201,11 +201,11 @@ const SKILL_PLACING_DRIVERS: ReadonlySet<ProviderDriverKind> = new Set(
  *
  * Composing via `Layer.provideMerge` makes the watcher's deps available
  * from the mutable layer while still surfacing the registry as an output.
- * The mutator tag is technically also exposed; only this module imports
- * it, so the visibility leak is harmless in practice.
+ * The internal mutator is also exposed so pending VM authentication can await
+ * a provider rebuild before checking readiness.
  */
 export const ProviderInstanceRegistryHydrationLive: Layer.Layer<
-  ProviderInstanceRegistry,
+  ProviderInstanceRegistry | ProviderInstanceRegistryMutator,
   never,
   BuiltInDriversEnv | ServerSettingsService
 > = Layer.unwrap(
@@ -226,4 +226,8 @@ export const ProviderInstanceRegistryHydrationLive: Layer.Layer<
 
     return SettingsWatcherLive.pipe(Layer.provideMerge(mutableLayer));
   }),
-) as Layer.Layer<ProviderInstanceRegistry, never, BuiltInDriversEnv | ServerSettingsService>;
+) as Layer.Layer<
+  ProviderInstanceRegistry | ProviderInstanceRegistryMutator,
+  never,
+  BuiltInDriversEnv | ServerSettingsService
+>;

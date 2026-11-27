@@ -18,6 +18,7 @@ import * as TextGeneration from "./TextGeneration.ts";
 import { makeGrokTextGeneration } from "./GrokTextGeneration.ts";
 import { execScriptSource, writeFakeCli } from "../testUtils/fakeCli.ts";
 const decodeGrokSettings = Schema.decodeSync(GrokSettings);
+const encodeRequests = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../scripts/acp-mock-agent.ts");
@@ -67,6 +68,34 @@ function readJsonRpcRequests(
 }
 
 it.layer(GrokTextGenerationTestLayer)("GrokTextGeneration", (it) => {
+  it.effect("forwards workflow approval context into the actual model prompt", () =>
+    Effect.gen(function* () {
+      const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "grok-workflow-approval-"));
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(dir, { recursive: true, force: true })),
+      );
+      const logPath = NodePath.join(dir, "requests.ndjson");
+      yield* withFakeAcpGrok(
+        {
+          T3_ACP_REQUEST_LOG_PATH: logPath,
+          T3_ACP_PROMPT_RESPONSE_TEXT: '{"verdict":"approve","reasoning":"In scope"}',
+        },
+        (textGeneration) =>
+          textGeneration.generateApprovalVerdict({
+            cwd: process.cwd(),
+            toolKind: "command",
+            requestType: "command_execution_approval",
+            stepInstruction: "s".repeat(5_000),
+            jobContext: "JOB_CONTEXT",
+            reviewConstraint: "REVIEW_REQUIRED",
+            modelSelection: createModelSelection(ProviderInstanceId.make("grok"), "grok-mock-alt"),
+          }),
+      );
+      const requests = yield* encodeRequests(readJsonRpcRequests(logPath));
+      expect(requests).toContain("JOB_CONTEXT");
+      expect(requests).toContain("REVIEW_REQUIRED");
+    }),
+  );
   it.effect("uses ACP with disabled tool capabilities and forwards the requested model id", () => {
     const requestLogDir = NodeFS.mkdtempSync(
       NodePath.join(NodeOS.tmpdir(), "t3code-grok-text-log-"),

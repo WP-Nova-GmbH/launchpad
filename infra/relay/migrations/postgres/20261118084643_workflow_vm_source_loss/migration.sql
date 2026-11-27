@@ -1,0 +1,3 @@
+ALTER TABLE "relay_thread_vm_final_saves" ALTER COLUMN "idle_since" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" ADD CONSTRAINT "relay_thread_vm_final_saves_idle_since" CHECK ("reason" = 'source_loss' OR "idle_since" IS NOT NULL);--> statement-breakpoint
+ALTER TABLE "relay_thread_vm_final_saves" DROP CONSTRAINT "relay_thread_vm_final_saves_reason", ADD CONSTRAINT "relay_thread_vm_final_saves_reason" CHECK ("reason" IN ('idle','replacement','source_loss'));

@@ -1,3 +1,5 @@
+import { portableThreadCommandLayer } from "@t3tools/client-runtime/relay/portableThreads";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 import { Connection } from "@t3tools/client-runtime/connection";
 import { shellSnapshotLoaderLayer } from "@t3tools/client-runtime/state/shell";
 import { threadSnapshotLoaderLayer } from "@t3tools/client-runtime/state/threads";
@@ -41,6 +43,7 @@ const providedClientConnectionLayer = snapshotLoaderLayer.pipe(
   Layer.provideMerge(
     Layer.mergeAll(
       runtimeContextLayer,
+      portableThreadCommandLayer(appAtomRegistry).pipe(Layer.provide(runtimeContextLayer)),
       providedConnectionPlatformLayer,
       backgroundActivityObserverLayer,
     ),

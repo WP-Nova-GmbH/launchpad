@@ -15,10 +15,14 @@ import {
   ThreadId,
   type AgentSessionImportInput,
   type AgentSessionImportResult,
+  type AgentSessionImportProgress,
+  type AgentSessionImportProgressEvent,
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import * as Crypto from "effect/Crypto";
+import * as Clock from "effect/Clock";
+import * as Queue from "effect/Queue";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -100,6 +104,7 @@ function hasImportBlockingActivity(
 /** Import recent transcript text and persist the cursor needed to resume its provider session. */
 export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(function* (
   input: AgentSessionImportInput,
+  onProgress?: (progress: AgentSessionImportProgress) => Effect.Effect<void>,
 ) {
   const scanner = yield* AgentSessionScanner.AgentSessionScanner;
   const engine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -129,13 +134,32 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
     .pipe(
       Effect.mapError((cause) => new AgentSessionScanError({ operation: "read-projects", cause })),
     );
-  const threads = scanner.recentThreads(
-    workspaceRoot,
-    completedSources.map((entry) => entry.source),
-  );
   const importedThreadIds = new Set<ThreadId>();
   let importedCount = 0;
   let skippedCount = 0;
+  const report = (reading: AgentSessionImportProgress["reading"] = null) =>
+    onProgress?.({ importedCount, skippedCount, reading }) ?? Effect.void;
+  yield* report();
+  let lastReadProgressAt = 0;
+  const threads = scanner.recentThreads(
+    workspaceRoot,
+    completedSources.map((entry) => entry.source),
+    onProgress === undefined
+      ? undefined
+      : (reading) =>
+          Effect.gen(function* () {
+            const now = yield* Clock.currentTimeMillis;
+            // Counts always publish after persistence; large-file updates are capped at five per second.
+            if (
+              reading.bytesRead === 0 ||
+              reading.bytesRead === reading.totalBytes ||
+              now - lastReadProgressAt >= 200
+            ) {
+              lastReadProgressAt = now;
+              yield* report(reading);
+            }
+          }),
+  );
 
   yield* Stream.runForEach(threads, (outcome) =>
     Effect.gen(function* () {
@@ -291,8 +315,25 @@ export const importRecentAgentThreads = Effect.fn("importRecentAgentThreads")(fu
       } else {
         skippedCount += 1;
       }
-    }),
+    }).pipe(Effect.andThen(() => report())),
   );
 
   return { importedCount, skippedCount } satisfies AgentSessionImportResult;
 });
+
+/** One stream owns one import; disconnects interrupt it, and retries retain persisted histories. */
+export const importRecentAgentThreadsWithProgress = (input: AgentSessionImportInput) =>
+  Stream.callback<
+    AgentSessionImportProgressEvent,
+    Effect.Error<ReturnType<typeof importRecentAgentThreads>>,
+    Effect.Services<ReturnType<typeof importRecentAgentThreads>>
+  >((queue) =>
+    importRecentAgentThreads(input, (progress) =>
+      Queue.offer(queue, { type: "progress", progress }).pipe(Effect.asVoid),
+    ).pipe(
+      Effect.flatMap((result) => Queue.offer(queue, { type: "complete", result })),
+      Effect.catchCause((cause) => Queue.failCause(queue, cause)),
+      Effect.andThen(Queue.end(queue)),
+      Effect.forkScoped,
+    ),
+  );

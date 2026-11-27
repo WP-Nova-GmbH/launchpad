@@ -41,6 +41,33 @@ export { snoozeWakeLabel };
 export type ThreadListV2Status = "approval" | "input" | "working" | "failed" | "ready";
 export type ThreadListV2SwipeAction = "archive" | "settle" | "unsettle" | "snooze" | "unsnooze";
 
+export function canMutateThreadListRow(
+  threadId: string,
+  capabilities: { readonly workflowVmResultReader?: boolean } | undefined,
+): boolean {
+  // A cached workflow thread can appear in the list before its server descriptor.
+  return (
+    !capabilities?.workflowVmResultReader &&
+    (capabilities !== undefined || !threadId.startsWith("workflow:"))
+  );
+}
+
+export function getThreadListV2ArrangementThreads(
+  threads: readonly EnvironmentThreadShell[],
+  configs: ReadonlyMap<
+    EnvironmentId,
+    {
+      readonly environment: {
+        readonly capabilities: { readonly workflowVmResultReader?: boolean };
+      };
+    }
+  >,
+): readonly EnvironmentThreadShell[] {
+  return threads.filter((thread) =>
+    canMutateThreadListRow(thread.id, configs.get(thread.environmentId)?.environment.capabilities),
+  );
+}
+
 export function resolveThreadListV2SnoozeMenuSelection(input: {
   readonly event: string;
   readonly displayedPresets: ReadonlyArray<SnoozePreset>;
@@ -496,6 +523,7 @@ export function buildThreadListV2ListItems(input: {
 export function buildThreadListV2Items(input: {
   readonly pendingOrder?: PendingThreadOrder | null;
   readonly threads: ReadonlyArray<EnvironmentThreadShell>;
+  readonly arrangementThreads?: ReadonlyArray<EnvironmentThreadShell>;
   readonly environmentId: EnvironmentId | null;
   readonly projectRefs?: ReadonlyArray<{
     readonly environmentId: EnvironmentId;
@@ -534,6 +562,7 @@ export function buildThreadListV2Items(input: {
           input.pendingOrder,
           getThreadListV2OrderedSection({
             ...input,
+            threads: input.arrangementThreads ?? input.threads,
             section: input.pendingOrder.section,
             pendingOrder: null,
           }),

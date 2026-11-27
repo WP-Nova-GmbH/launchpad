@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { beforeEach, vi } from "vite-plus/test";
@@ -162,13 +163,78 @@ describe("DesktopClerk", () => {
 
       assert.isTrue(Exit.isSuccess(exit));
       assert.equal(quit.mock.calls.length, 0);
-      assert.deepEqual(registeredEvents, ["second-instance"]);
+      assert.deepEqual(registeredEvents, ["second-instance", "open-url"]);
     }).pipe(
       Effect.provide(makeDesktopClerkLayer()),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
       Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
     );
   });
+
+  it.effect.each([true, false])(
+    "reveals the existing window only for this build's Codex return URL (development: %s)",
+    (isDevelopment) =>
+      Effect.gen(function* () {
+        storageMock.mockReturnValue(storageAdapter);
+        createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+        const listeners = new Map<string, (...args: readonly unknown[]) => void>();
+        const mainWindow = { id: 42 };
+        let receipt = yield* Deferred.make<void>();
+        let reveals = 0;
+        const electronApp = {
+          quit: Effect.void,
+          on: (name: string, listener: (...args: readonly unknown[]) => void) =>
+            Effect.sync(() => {
+              listeners.set(name, listener);
+            }),
+        } as unknown as ElectronApp.ElectronApp["Service"];
+        const electronWindow = {
+          currentMainOrFirst: Effect.succeedSome(mainWindow),
+          reveal: (window: unknown) =>
+            Effect.gen(function* () {
+              assert.strictEqual(window, mainWindow);
+              reveals++;
+              yield* Deferred.succeed(receipt, undefined);
+            }),
+        } as unknown as ElectronWindow.ElectronWindow["Service"];
+        yield* Effect.gen(function* () {
+          const clerk = yield* DesktopClerk.DesktopClerk;
+          yield* clerk.configure;
+          const scheme = isDevelopment ? "t3code-dev" : "t3code";
+          const otherScheme = isDevelopment ? "t3code" : "t3code-dev";
+          const returnUrl = `${scheme}://codex-vm-sign-in`;
+          const onOpenUrl = listeners.get("open-url")!;
+          for (const url of [
+            "not a URL",
+            "https://example.com/codex-vm-sign-in",
+            `${otherScheme}://codex-vm-sign-in`,
+            `${scheme}://app/?__clerk_status=complete`,
+            `${returnUrl}/other`,
+            `${returnUrl}?code=untrusted`,
+            `${returnUrl}#settings`,
+          ]) {
+            const preventDefault = vi.fn();
+            onOpenUrl({ preventDefault }, url);
+            assert.equal(preventDefault.mock.calls.length, 0);
+          }
+          const preventDefault = vi.fn();
+          onOpenUrl({ preventDefault }, returnUrl);
+          yield* Deferred.await(receipt);
+          assert.equal(preventDefault.mock.calls.length, 1);
+          assert.equal(reveals, 1);
+
+          receipt = yield* Deferred.make<void>();
+          listeners.get("second-instance")!();
+          yield* Deferred.await(receipt);
+          assert.equal(reveals, 2);
+        }).pipe(
+          Effect.provide(makeDesktopClerkLayer(isDevelopment)),
+          Effect.provideService(ElectronApp.ElectronApp, electronApp),
+          Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+          Effect.scoped,
+        );
+      }),
+  );
 
   it.effect("quits and interrupts startup in a secondary instance", () => {
     storageMock.mockReturnValue(storageAdapter);

@@ -1303,10 +1303,10 @@ export function makeCursorAdapter(
         const ctx = yield* requireSession(threadId);
         const pending = ctx.pendingApprovals.get(requestId);
         if (!pending) {
-          return yield* new ProviderAdapterRequestError({
+          return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
-            method: "session/request_permission",
-            detail: `Unknown pending approval request: ${requestId}`,
+            operation: "respondToRequest",
+            issue: `Unknown pending approval request: ${requestId}`,
           });
         }
         yield* Deferred.succeed(pending.decision, decision);
@@ -1321,10 +1321,10 @@ export function makeCursorAdapter(
         const ctx = yield* requireSession(threadId);
         const pending = ctx.pendingUserInputs.get(requestId);
         if (!pending) {
-          return yield* new ProviderAdapterRequestError({
+          return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
-            method: "cursor/ask_question",
-            detail: `Unknown pending user-input request: ${requestId}`,
+            operation: "respondToUserInput",
+            issue: `Unknown pending user-input request: ${requestId}`,
           });
         }
         yield* Deferred.succeed(pending.answers, answers);
@@ -1346,10 +1346,10 @@ export function makeCursorAdapter(
             issue: "numTurns must be an integer >= 1.",
           });
         }
-        return yield* new ProviderAdapterRequestError({
+        return yield* new ProviderAdapterValidationError({
           provider: PROVIDER,
-          method: "thread/rollback",
-          detail: "Cursor ACP sessions do not support provider-side rollback.",
+          operation: "rollbackThread",
+          issue: "Cursor ACP sessions do not support provider-side rollback.",
         });
       });
 

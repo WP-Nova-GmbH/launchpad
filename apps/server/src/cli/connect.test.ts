@@ -53,6 +53,29 @@ it.effect("keeps a successful connection when a remote service update is pending
   }),
 );
 
+it.effect("does not resolve or install a relay client when managed tunnels are disabled", () =>
+  Effect.gen(function* () {
+    const error = yield* Effect.flip(
+      acquireRelayClientForLink(
+        {
+          resolve: Effect.die("disabled connector resolved"),
+          install: Effect.die("disabled connector installed"),
+          installWithProgress: () => Effect.die("disabled connector installed"),
+        },
+        () => Effect.die("disabled install confirmation requested"),
+        () => Effect.die("disabled install progress reported"),
+      ),
+    );
+    assert.equal(error._tag, "EnvironmentCloudEndpointUnavailableError");
+  }).pipe(
+    Effect.provide(
+      ConfigProvider.layer(
+        ConfigProvider.fromEnv({ env: { T3CODE_DISABLE_MANAGED_TUNNELS: "1" } }),
+      ),
+    ),
+  ),
+);
+
 it.effect("does not install the relay client when the user declines the managed download", () =>
   Effect.gen(function* () {
     let installCalls = 0;

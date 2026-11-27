@@ -1,4 +1,4 @@
-import { assert, describe, it } from "vite-plus/test";
+import { assert, describe, it, vi } from "vite-plus/test";
 import {
   compileResolvedKeybindingsConfig,
   DEFAULT_RESOLVED_KEYBINDINGS,
@@ -832,6 +832,31 @@ describe("cross-command precedence", () => {
 });
 
 describe("resolveShortcutCommand", () => {
+  it("suspends app shortcuts until the foreground window confirmation closes", () => {
+    const querySelector = vi.fn().mockReturnValue({});
+    const options = { platform: "MacIntel" };
+    const steer = event({ key: "Enter", metaKey: true, shiftKey: true });
+    const stash = event({ key: "s", metaKey: true });
+    vi.stubGlobal("document", { querySelector });
+
+    try {
+      assert.isNull(resolveShortcutCommand(steer, DEFAULT_RESOLVED_KEYBINDINGS, options));
+      assert.isNull(resolveShortcutCommand(stash, DEFAULT_RESOLVED_KEYBINDINGS, options));
+
+      querySelector.mockReturnValue(null);
+      assert.strictEqual(
+        resolveShortcutCommand(steer, DEFAULT_RESOLVED_KEYBINDINGS, options),
+        "thread.steerQueuedMessage",
+      );
+      assert.strictEqual(
+        resolveShortcutCommand(stash, DEFAULT_RESOLVED_KEYBINDINGS, options),
+        "composer.stash",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("resolves a custom stop-thread shortcut", () => {
     const keybindings = compile([{ shortcut: modShortcut("escape"), command: "thread.stop" }]);
 
@@ -1376,4 +1401,33 @@ describe("composer and pull request shortcuts", () => {
       );
     });
   }
+});
+
+describe("VM thread shortcut", () => {
+  it("opens VM threads outside the terminal and respects platform modifier keys", () => {
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "v", metaKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "mac", context: { terminalFocus: false } },
+      ),
+      "threadVms.open",
+    );
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "v", ctrlKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "windows", context: { terminalFocus: false } },
+      ),
+      "threadVms.open",
+    );
+    assert.equal(
+      resolveShortcutCommand(
+        event({ key: "v", ctrlKey: true, altKey: true }),
+        DEFAULT_RESOLVED_KEYBINDINGS,
+        { platform: "windows", context: { terminalFocus: true } },
+      ),
+      null,
+    );
+  });
 });

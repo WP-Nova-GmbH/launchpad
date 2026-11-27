@@ -308,7 +308,7 @@ describe("web cloud link environment client", () => {
     }),
   );
 
-  it.effect("links publish-only without a managed tunnel", () =>
+  it.effect("links publish-only from a dev browser using the backend's cookie and origin", () =>
     Effect.gen(function* () {
       const fetchMock = vi
         .fn()
@@ -339,6 +339,15 @@ describe("web cloud link environment client", () => {
           Response.json({ ok: true, endpointRuntimeStatus: { status: "disabled" } }),
         );
       vi.stubGlobal("fetch", fetchMock);
+      vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:5996");
+      vi.stubEnv("VITE_HTTP_URL", TARGET.httpBaseUrl);
+      vi.stubEnv("VITE_WS_URL", TARGET.wsBaseUrl);
+      vi.stubGlobal("window", {
+        location: {
+          href: "http://127.0.0.1:5996/settings/connections",
+          origin: "http://127.0.0.1:5996",
+        },
+      });
 
       yield* withServices(
         linkPrimaryEnvironmentToCloud({
@@ -348,13 +357,35 @@ describe("web cloud link environment client", () => {
         }),
       );
 
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const proofRequest = new Request(fetchMock.mock.calls[1]?.[0], fetchMock.mock.calls[1]?.[1]);
+      const configRequest = new Request(fetchMock.mock.calls[3]?.[0], fetchMock.mock.calls[3]?.[1]);
+      expect(proofRequest.url).toBe(`${TARGET.httpBaseUrl}/api/connect/link-proof`);
+      expect(configRequest.url).toBe(`${TARGET.httpBaseUrl}/api/connect/relay-config`);
+      for (const request of [proofRequest, configRequest]) {
+        expect(request.credentials).toBe("include");
+        expect(request.headers.get("authorization")).toBeNull();
+      }
+      for (const index of [0, 2]) {
+        const request = new Request(
+          fetchMock.mock.calls[index]?.[0],
+          fetchMock.mock.calls[index]?.[1],
+        );
+        expect(new URL(request.url).origin).toBe("https://relay.example.test");
+        expect(request.credentials).not.toBe("include");
+      }
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       expect(JSON.parse(bodyText(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
         managedTunnelsEnabled: false,
       });
       // @effect-diagnostics-next-line preferSchemaOverJson:off
       expect(JSON.parse(bodyText(fetchMock.mock.calls[1]?.[1]?.body))).toMatchObject({
-        endpoint: { providerKind: "manual" },
+        endpoint: {
+          httpBaseUrl: TARGET.httpBaseUrl,
+          wsBaseUrl: TARGET.wsBaseUrl,
+          providerKind: "manual",
+        },
+        origin: { localHttpHost: "127.0.0.1", localHttpPort: 3000 },
       });
     }),
   );

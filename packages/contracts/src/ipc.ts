@@ -1255,6 +1255,9 @@ export interface DesktopBridge {
    * them.
    */
   onQuitShortcut?: (listener: (event: QuitShortcutHintEvent) => void) => () => void;
+  /** Present when the desktop shell supports confirming a blocked native window close. */
+  onWindowCloseBlocked?: (listener: () => void) => () => void;
+  confirmWindowClose?: () => Promise<void>;
   getWindowFullscreenState: () => boolean;
   onWindowFullscreenStateChange: (listener: (fullscreen: boolean) => void) => () => void;
   getUpdateState: () => Promise<DesktopUpdateState>;

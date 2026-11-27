@@ -1,0 +1,1 @@
+ALTER TABLE "relay_thread_vm_provisions" ADD COLUMN "ingress_recovery_claim_id" varchar(64);

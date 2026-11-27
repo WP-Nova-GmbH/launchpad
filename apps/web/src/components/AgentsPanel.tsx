@@ -28,6 +28,7 @@ import { cn } from "~/lib/utils";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Button } from "~/components/ui/button";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "~/components/ui/tooltip";
 
 /**
  * In-flight states all present as Working (one steady state, per the
@@ -41,7 +42,7 @@ const STATUS_VISUALS: Record<RuntimeSubagent["status"], { dotClass: string; labe
   waiting: { dotClass: "bg-info", label: "Working" },
   // Idle reads as settled (muted, not sky): a resting Codex child looks done
   // unless resumed — live-test: sky idle dots read as stuck in-progress.
-  idle: { dotClass: "bg-muted-foreground/50", label: "Idle · resumable" },
+  idle: { dotClass: "bg-muted-foreground/50", label: "Idle (resumable)" },
   completed: { dotClass: "bg-success", label: "Completed" },
   failed: { dotClass: "bg-destructive", label: "Failed" },
   cancelled: { dotClass: "bg-muted-foreground/60", label: "Stopped" },
@@ -147,8 +148,7 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
     agent.role?.trim().toLocaleLowerCase() === agent.title.trim().toLocaleLowerCase()
       ? null
       : agent.role;
-  const metadata = [
-    modelLabel,
+  const metrics = [
     agent.usage ? `${formatSubagentTokenCount(agent.usage.totalTokens)} tok` : "— tok",
     agent.usage?.toolUses !== undefined ? `${agent.usage.toolUses} tools` : null,
     agent.activationCount > 1 ? `run ${agent.activationCount}` : null,
@@ -168,7 +168,8 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
         ) : null}
       </span>
       <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-2xs text-muted-foreground/80">
-        <span className="inline-flex items-center gap-1">
+        <span className="inline-flex items-center gap-2">
+          <span>{statusLabel}</span>
           <AgentElapsed agent={agent} />
           {agent.status === "completed" ? (
             <Check aria-hidden className="size-3 text-success" />
@@ -183,10 +184,24 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
       >
         {activity ?? statusLabel}
       </span>
-      <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-2xs tabular-nums text-muted-foreground/70">
-        {metadata.join(" · ")}
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <span
+              tabIndex={0}
+              className="col-start-2 row-start-3 min-w-0 truncate font-mono text-2xs text-muted-foreground/70"
+            />
+          }
+        >
+          {modelLabel ?? "Model unavailable"}
+        </TooltipTrigger>
+        <TooltipPopup>{modelLabel ?? "Model unavailable"}</TooltipPopup>
+      </Tooltip>
+      <span className="col-start-3 row-start-3 flex justify-end gap-3 whitespace-nowrap font-mono text-2xs tabular-nums text-muted-foreground/70">
+        {metrics.map((metric) => (
+          <span key={metric}>{metric}</span>
+        ))}
       </span>
-      <span className="sr-only">{statusLabel}</span>
     </div>
   );
 }
@@ -486,11 +501,11 @@ function CollapsedWorkflowSection({
         <span className="truncate text-sm">
           {group.workflow.workflowName ?? group.workflow.title}
         </span>
-        <span className="ml-auto flex items-center gap-1.5 font-mono text-2xs text-muted-foreground/80">
+        <span className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1 font-mono text-2xs text-muted-foreground/80">
           {failed > 0 ? <span className="text-destructive-foreground">{failed} failed</span> : null}
           <span>{members.length} agents</span>
-          <span className="tabular-nums">· {formatSubagentTokenCount(totalTokens)} tok</span>
-          {elapsed ? <span className="tabular-nums">· {elapsed}</span> : null}
+          <span className="tabular-nums">{formatSubagentTokenCount(totalTokens)} tok</span>
+          {elapsed ? <span className="tabular-nums">{elapsed}</span> : null}
           <ChevronRight aria-hidden className="size-3" />
         </span>
       </button>

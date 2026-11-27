@@ -1,8 +1,13 @@
 import { filterComposerPullRequestMatches } from "@t3tools/shared/composerPullRequestMatches";
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, TurnId } from "@t3tools/contracts";
+import { environmentRpcKey } from "@t3tools/client-runtime/state/runtime";
+import {
+  buildCheckpointDiffTargets,
+  isCompleteWorkflowReviewDiff,
+} from "@t3tools/client-runtime/state/threads";
 
-import { buildCheckpointDiffTargets, normalizeComposerPathSearchQuery } from "./queryTargets";
+import { normalizeComposerPathSearchQuery } from "./queryTargets";
 
 describe("appQueries", () => {
   it("normalizes composer path search input", () => {
@@ -59,6 +64,67 @@ describe("appQueries", () => {
         },
       },
     });
+  });
+  it.each([0, 3])(
+    "loads a strict workflow review from checkpoint %i without ordinary cache entries",
+    (fromTurnCount) => {
+      const target = {
+        environmentId: EnvironmentId.make("environment-a"),
+        threadId: ThreadId.make("thread-a"),
+        fromTurnCount,
+        toTurnCount: fromTurnCount + 1,
+        ignoreWhitespace: false,
+      };
+      const ordinary = buildCheckpointDiffTargets({ ...target, requestKey: "first" });
+      const cached = (ordinary.fullThread ?? ordinary.turn)!;
+      const expectedTurnId = TurnId.make("turn-a");
+      const strict = {
+        ...target,
+        ignoreWhitespace: true,
+        strictWorkflowReview: true,
+        expectedTurnId,
+      };
+      const firstVisit = buildCheckpointDiffTargets({ ...strict, requestKey: "first" });
+      const first = firstVisit.turn!;
+      const second = buildCheckpointDiffTargets({ ...strict, requestKey: "second" }).turn!;
+      const otherTurn = buildCheckpointDiffTargets({
+        ...strict,
+        expectedTurnId: TurnId.make("turn-b"),
+        requestKey: "first",
+      }).turn!;
+      expect(firstVisit.fullThread).toBeNull();
+      expect(first.input).toEqual({
+        threadId: target.threadId,
+        fromTurnCount,
+        toTurnCount: target.toTurnCount,
+        ignoreWhitespace: false,
+        strictWorkflowReview: true,
+        expectedTurnId,
+      });
+      expect(second.input).toEqual(first.input);
+      expect(new Set([cached, first, second, otherTurn].map(environmentRpcKey)).size).toBe(4);
+    },
+  );
+
+  it("treats a complete result as unavailable without the exact target turn", () => {
+    const expectedTurnId = TurnId.make("current-turn");
+    const oldReply = {
+      threadId: ThreadId.make("thread"),
+      fromTurnCount: 0,
+      toTurnCount: 1,
+      diff: "",
+      completeWorkflowReview: true as const,
+    };
+    expect(isCompleteWorkflowReviewDiff(oldReply, expectedTurnId)).toBe(false);
+    expect(
+      isCompleteWorkflowReviewDiff(
+        { ...oldReply, targetTurnId: TurnId.make("old-turn") },
+        expectedTurnId,
+      ),
+    ).toBe(false);
+    expect(
+      isCompleteWorkflowReviewDiff({ ...oldReply, targetTurnId: expectedTurnId }, expectedTurnId),
+    ).toBe(true);
   });
 });
 

@@ -4,7 +4,7 @@ import { ChevronDownIcon, LayersIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { SidebarProjectSnapshot } from "../../sidebarProjectGrouping";
-import { useEnvironments, type EnvironmentPresentation } from "../../state/environments";
+import type { EnvironmentPresentation } from "../../state/environments";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { InlineButton } from "../ui/button";
@@ -29,11 +29,12 @@ import {
   settingsScopeEnvironmentLabel,
 } from "./settingsScopeAxis";
 
-/** Pages whose every row is saved on this client; they have no scope to pick. */
-export const SETTINGS_DEVICE_ONLY_PATHS: ReadonlySet<string> = new Set([
+/** Pages independent of the selected project or environment. */
+export const SETTINGS_UNSCOPED_PATHS: ReadonlySet<string> = new Set([
   "/settings/appearance",
   "/settings/snap-shot",
   "/settings/connections",
+  "/settings/vms",
 ]);
 
 interface SettingsScopeMenuProps {
@@ -52,12 +53,11 @@ interface SettingsScopeMenuProps {
 export function SettingsScopeSentence() {
   const scope = useOptionalSettingsScope();
   const pathname = useLocation({ select: (location) => location.pathname });
-  const { environments } = useEnvironments();
-  if (scope === null || SETTINGS_DEVICE_ONLY_PATHS.has(pathname)) return null;
+  if (scope === null || SETTINGS_UNSCOPED_PATHS.has(pathname)) return null;
   const props: SettingsScopeMenuProps = {
     value: scope.search,
     groups: scope.groups,
-    environments,
+    environments: scope.availableEnvironments,
     onChange: scope.selectScope,
   };
   return (

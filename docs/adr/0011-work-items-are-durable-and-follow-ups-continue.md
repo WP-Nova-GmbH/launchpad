@@ -13,11 +13,34 @@ which pins that work item to the [executor](../internals/glossary.md#executor) h
 
 Three shapes, and they are not variations of one thing:
 
-| trigger                         | shape                 | requires                                                                                     |
-| ------------------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
-| a person acts in the app        | imperative            | nothing new                                                                                  |
-| an issue enters a watched state | external state change | an [integration](../internals/glossary.md#integration), inbound webhooks, **and write-back** |
-| a follow-up on completed work   | continuation          | knowing what was already implemented                                                         |
+| trigger                         | shape                 | requires                                                                    |
+| ------------------------------- | --------------------- | --------------------------------------------------------------------------- |
+| a person acts in the app        | imperative            | nothing new                                                                 |
+| an issue enters a watched state | external state change | an [integration](../internals/glossary.md#integration) and inbound webhooks |
+| a follow-up on completed work   | continuation          | knowing what was already implemented                                        |
+
+Each repository workflow selects its own Linear team or Jira project, optional issue labels,
+and triggering event or status transition. This makes routing explicit when several repositories
+use the same automation connection; sharing a connection does not make every event start work
+in every repository. Matching is independent for each enabled workflow: an event matching several
+workflows creates a job for each, without workflow priorities or a first-match rule.
+
+Each distinct matching event creates a new job, even if another job for the same issue and
+workflow is queued, running, or waiting for review. Repeated delivery of the same event creates
+no additional job. An event-triggered job does not update, restart, or continue an existing job;
+continuation is an explicit follow-up.
+
+Later changes to an issue’s team, status or labels do not rematch or cancel jobs already created
+from its events. A team move within the same Linear workspace therefore does not block a queued
+job while its original connection can still read the issue. Current source access is still required
+for a new handoff.
+
+An edited event trigger applies only to events occurring after the edit is saved. Delayed older
+events cannot newly match its changed criteria, while already-created jobs are retained. Edits
+only to the workflow's name or execution steps/settings do not change event eligibility.
+
+Event automation does not require issue write-back. Automatic issue comments and status changes
+remain deferred.
 
 The third is why work items must be durable: "an issue that was implemented" is only meaningful
 if something outlived the job that implemented it.
@@ -30,6 +53,12 @@ posting a pull-request link. The snapshot is what correctness needs: without it,
 mid-job silently changes what a running agent was told, and there is no way to reconstruct the
 actual instruction afterwards. Same replayability requirement as
 [ADR-0004](./0004-thread-portability-is-deferred-not-designed-away.md).
+
+An event’s routing facts and a job’s issue snapshot are distinct: matching uses the facts at the
+event, while the instructions use a read before handoff. The snapshot is frozen when the relay
+persists the offer, before its network delivery. A timeout cannot justify changing those instructions
+or their target: a delayed request could still start the old offer. Source withdrawal blocks a new
+handoff but does not revoke an offer already saved; cancellation is the explicit stop control.
 
 ## Continuation
 
@@ -55,8 +84,12 @@ Forking a work item's thread, or resetting it to start clean, are wanted and def
   [ADR-0012](./0012-executors-mirror-their-event-log-to-the-relay.md) the history survives, so the
   failure mode is degraded — a follow-up starts a new job with a cold thread — rather than lost
   work. Reclamation should still warn about what it is unpinning.
-- **Integrations are bidirectional and org-credentialed.** Reading issue state and writing back
-  both use organization credentials held on the relay, never on a machine running agents — the
-  same placement as chat tokens.
+- **Automation connections are reusable, with explicit repository authorization.** Connect an
+  external workspace or site once for automation, then allow selected repositories to use it.
+  This avoids repeated setup for repositories sharing an issue tracker without silently sharing
+  personal connections through organization membership. Provider authorization can still depend
+  on the connecting person's permissions; repository authorization does not remove that dependency.
+  Credentials remain on the relay. Personal prompt access and owner-only write approval keep their
+  existing authorization model.
 - Work items give the "box you drop a task definition into" a home, and give the app a unit to
   show progress against that survives more than one run.

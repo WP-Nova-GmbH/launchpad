@@ -41,7 +41,14 @@ function useMemberProjectFiles(scope: ReturnType<typeof resolveSettingsScope>) {
 
 function useResolvedSettingsScope(search: SettingsScopeSearch) {
   const groups = useSettingsProjectGroups();
-  const { environments: availableEnvironments } = useEnvironments();
+  const { environments } = useEnvironments();
+  const availableEnvironments = useMemo(
+    () =>
+      environments.filter(
+        (environment) => !environment.serverConfig?.environment.capabilities.workflowVmResultReader,
+      ),
+    [environments],
+  );
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const scope = useMemo(
     () => resolveSettingsScope(search, groups, availableEnvironments),
@@ -67,7 +74,7 @@ function useResolvedSettingsScope(search: SettingsScopeSearch) {
       ) ??
       targets[0] ??
       null;
-    return { scope, groups, ...selected, targets, target };
+    return { scope, groups, availableEnvironments, ...selected, targets, target };
   }, [availableEnvironments, groups, primaryEnvironmentId, projectFiles, scope]);
 }
 

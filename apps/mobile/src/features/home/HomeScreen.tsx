@@ -44,6 +44,7 @@ import {
 import { useThreadRowProviderInstanceResolver } from "../threads/thread-provider-instance";
 import {
   buildThreadListV2Items,
+  getThreadListV2ArrangementThreads,
   getThreadListV2OrderedSection,
   buildThreadListV2ListItems,
   threadListV2ListItemsAreEqual,
@@ -51,6 +52,7 @@ import {
   THREAD_LIST_V2_SETTLED_PAGE_COUNT,
   type ThreadListV2ListItem,
 } from "../threads/threadListV2";
+import { useWorkflowRunsShelf } from "../threads/WorkflowRunsShelf";
 import { useThreadListV2ShelfPreferences } from "../threads/use-thread-list-v2-shelf-preferences";
 import type { HomeListFilterMenuEnvironment } from "./home-list-filter-menu";
 import {
@@ -211,6 +213,7 @@ function HomeTopContentSpacer() {
 /* ─── Main screen ────────────────────────────────────────────────────── */
 
 export function HomeScreen(props: HomeScreenProps) {
+  const workflowRunsShelf = useWorkflowRunsShelf("screen", !props.searchQuery.trim());
   const queuedThreadKeys = useQueuedThreadKeys();
   const openSwipeableRef = useRef<SwipeableMethods | null>(null);
   const insets = useSafeAreaInsets();
@@ -516,13 +519,17 @@ export function HomeScreen(props: HomeScreenProps) {
   // the memoized rows' props comparison on every parent render.
   const resolveProviderInstance = useThreadRowProviderInstanceResolver(serverConfigs);
   const pendingOrder = usePendingThreadOrder(nowMinute, snoozeWakeTick);
+  const arrangementThreads = useMemo(
+    () => getThreadListV2ArrangementThreads(props.threads, serverConfigs),
+    [props.threads, serverConfigs],
+  );
   // Up/down menu availability for every card, computed once per section per
   // rebuild (see computeThreadMoveAvailability): per-thread planner calls made
   // list construction quadratic, and this list rebuilds on every minute tick.
   const threadMoveAvailability = useMemo(() => {
     const sectionAvailability = (section: "pinned" | "active") =>
       computeThreadMoveAvailability({
-        allThreads: props.threads,
+        allThreads: arrangementThreads,
         section,
         pendingOrder,
         reorderableEnvironmentIds: new Set(
@@ -535,7 +542,7 @@ export function HomeScreen(props: HomeScreenProps) {
           ),
         ),
         ordered: getThreadListV2OrderedSection({
-          threads: props.threads,
+          threads: arrangementThreads,
           section,
           pendingOrder,
           now: new Date().toISOString(),
@@ -547,7 +554,7 @@ export function HomeScreen(props: HomeScreenProps) {
     return new Map([...sectionAvailability("pinned"), ...sectionAvailability("active")]);
   }, [
     serverConfigs,
-    props.threads,
+    arrangementThreads,
     pendingOrder,
     queuedThreadKeys,
     settlementEnvironmentIds,
@@ -561,6 +568,7 @@ export function HomeScreen(props: HomeScreenProps) {
     return buildThreadListV2Items({
       pendingOrder,
       threads: props.threads.filter((thread) => thread.archivedAt === null),
+      arrangementThreads,
       environmentId: props.selectedEnvironmentId,
       projectRefs: v2ScopedProjectGroup === null ? null : v2ScopedProjectGroup.projectRefs,
       searchQuery: props.searchQuery,
@@ -576,6 +584,7 @@ export function HomeScreen(props: HomeScreenProps) {
     });
   }, [
     pendingOrder,
+    arrangementThreads,
     queuedThreadKeys,
     nowMinute,
     snoozeWakeTick,
@@ -847,7 +856,35 @@ export function HomeScreen(props: HomeScreenProps) {
     projectCount: props.projects.length,
   });
 
-  if (!hasAnyThreads) {
+  const noThreadsContent = !hasAnyThreads ? (
+    <View className="w-full max-w-[430px]">
+      <EmptyState
+        title={emptyState.title}
+        detail={emptyState.detail}
+        actionLabel={!props.catalogState.hasReadyEnvironment ? "Add environment" : undefined}
+        onAction={!props.catalogState.hasReadyEnvironment ? props.onAddConnection : undefined}
+        action={
+          Platform.OS === "android" && !props.catalogState.hasReadyEnvironment ? (
+            <MaterialFloatingActionButton
+              label="Add environment"
+              icon="plus"
+              variant="extended"
+              tone="primary"
+              onPress={props.onAddConnection}
+            />
+          ) : undefined
+        }
+        variant="plain"
+      />
+      {emptyState.loading ? (
+        <View className="mt-4 items-center">
+          <ActivityIndicator colorClassName="accent-icon-muted" />
+        </View>
+      ) : null}
+    </View>
+  ) : null;
+
+  if (!hasAnyThreads && !workflowRunsShelf) {
     return (
       <View className="flex-1 bg-screen android:bg-header">
         <View
@@ -860,41 +897,13 @@ export function HomeScreen(props: HomeScreenProps) {
             paddingTop: NATIVE_LIQUID_GLASS_SUPPORTED ? insets.top + 72 : 0,
           }}
         >
-          <View className="w-full max-w-[430px]">
-            <EmptyState
-              title={emptyState.title}
-              detail={emptyState.detail}
-              actionLabel={!props.catalogState.hasReadyEnvironment ? "Add environment" : undefined}
-              onAction={!props.catalogState.hasReadyEnvironment ? props.onAddConnection : undefined}
-              action={
-                Platform.OS === "android" && !props.catalogState.hasReadyEnvironment ? (
-                  <MaterialFloatingActionButton
-                    label="Add environment"
-                    icon="plus"
-                    variant="extended"
-                    tone="primary"
-                    onPress={props.onAddConnection}
-                  />
-                ) : undefined
-              }
-              variant="plain"
-            />
-            {emptyState.loading ? (
-              <View className="mt-4 items-center">
-                <ActivityIndicator colorClassName="accent-icon-muted" />
-              </View>
-            ) : null}
-          </View>
+          {noThreadsContent}
         </View>
       </View>
     );
   }
 
   const listHeader = Platform.OS === "ios" ? null : <HomeTopContentSpacer />;
-
-  // Project scoping lives in the header filter menu (no inline chip row on
-  // mobile — the menu is the one filter surface).
-  const v2ListHeader = listHeader;
 
   // Use the v2 project scope for its empty state. Snoozed threads need no
   // special empty state: their shelf header is a list row even while collapsed.
@@ -925,7 +934,7 @@ export function HomeScreen(props: HomeScreenProps) {
       />
     );
 
-  if (Platform.OS === "android" && threadListV2Items.length === 0) {
+  if (Platform.OS === "android" && threadListV2Items.length === 0 && !workflowRunsShelf) {
     return (
       <View className="flex-1 bg-header">
         <View
@@ -961,16 +970,19 @@ export function HomeScreen(props: HomeScreenProps) {
             drawDistance={500}
             recycleItems
             extraData={v2ExtraData}
-            ListHeaderComponent={v2ListHeader}
+            ListHeaderComponent={listHeader}
             ListFooterComponent={
-              settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
-                <ThreadListV2ShowMoreRow
-                  hiddenCount={threadListV2Layout.hiddenSettledCount}
-                  onPress={showMoreSettled}
-                />
-              ) : null
+              <>
+                {settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
+                  <ThreadListV2ShowMoreRow
+                    hiddenCount={threadListV2Layout.hiddenSettledCount}
+                    onPress={showMoreSettled}
+                  />
+                ) : null}
+                {workflowRunsShelf}
+              </>
             }
-            ListEmptyComponent={v2ListEmpty}
+            ListEmptyComponent={noThreadsContent ?? v2ListEmpty}
             style={{ flex: 1 }}
             automaticallyAdjustsScrollIndicatorInsets={Platform.OS === "ios"}
             contentInsetAdjustmentBehavior={Platform.OS === "ios" ? "automatic" : "never"}

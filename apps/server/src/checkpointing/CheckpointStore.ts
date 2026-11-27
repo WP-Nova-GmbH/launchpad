@@ -19,13 +19,15 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
 import type { CheckpointStoreError } from "./Errors.ts";
-import type { VcsCheckpointOps } from "../vcs/VcsDriver.ts";
+import type {
+  CapturedCheckpoint,
+  VcsCaptureCheckpointInput,
+  VcsCheckpointOps,
+  VcsPinnedCheckpointInput,
+} from "../vcs/VcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 
-export interface CaptureCheckpointInput {
-  readonly cwd: string;
-  readonly checkpointRef: CheckpointRef;
-}
+export type CaptureCheckpointInput = VcsCaptureCheckpointInput;
 
 export interface RestoreCheckpointInput {
   readonly cwd: string;
@@ -40,11 +42,14 @@ export interface DiffCheckpointsInput {
   readonly fallbackFromToHead?: boolean;
   readonly ignoreWhitespace: boolean;
   readonly format?: "patch" | "numstat";
+  readonly requireComplete?: boolean;
+  readonly pinned?: boolean;
 }
 
 export interface DeleteCheckpointRefsInput {
   readonly cwd: string;
   readonly checkpointRefs: ReadonlyArray<CheckpointRef>;
+  readonly pinned?: boolean;
 }
 
 /** Service tag for checkpoint persistence and restore operations. */
@@ -61,12 +66,15 @@ export class CheckpointStore extends Context.Service<
      */
     readonly captureCheckpoint: (
       input: CaptureCheckpointInput,
-    ) => Effect.Effect<void, CheckpointStoreError>;
+    ) => Effect.Effect<CapturedCheckpoint, CheckpointStoreError>;
 
     /** Check whether a checkpoint ref exists. */
     readonly hasCheckpointRef: (
       input: Omit<RestoreCheckpointInput, "fallbackToHead">,
     ) => Effect.Effect<boolean, CheckpointStoreError>;
+    readonly resolvePinnedTree: (
+      input: VcsPinnedCheckpointInput,
+    ) => Effect.Effect<string | null, CheckpointStoreError>;
 
     /**
      * Restore workspace and staging state to a checkpoint.
@@ -105,16 +113,20 @@ export const make = Effect.gen(function* () {
   const resolveCheckpoints = Effect.fn("CheckpointStore.resolveCheckpoints")(function* (
     operation: string,
     cwd: string,
+    strictWorkflowCapture = false,
   ) {
-    const handle = yield* vcsRegistry.resolve({ cwd });
-    if (!handle.driver.checkpoints) {
+    const driver = strictWorkflowCapture
+      ? yield* vcsRegistry.get("git")
+      : (yield* vcsRegistry.resolve({ cwd })).driver;
+    const kind = driver.capabilities.kind;
+    if (!driver.checkpoints) {
       return yield* new VcsUnsupportedOperationError({
         operation,
-        kind: handle.kind,
-        detail: `${handle.kind} driver does not implement checkpoint operations.`,
+        kind,
+        detail: `${kind} driver does not implement checkpoint operations.`,
       });
     }
-    return handle.driver.checkpoints satisfies VcsCheckpointOps;
+    return driver.checkpoints satisfies VcsCheckpointOps;
   });
 
   const isGitRepository: CheckpointStore["Service"]["isGitRepository"] = (cwd) =>
@@ -125,7 +137,11 @@ export const make = Effect.gen(function* () {
   const captureCheckpoint: CheckpointStore["Service"]["captureCheckpoint"] = Effect.fn(
     "captureCheckpoint",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.captureCheckpoint", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(
+      "CheckpointStore.captureCheckpoint",
+      input.cwd,
+      input.strictWorkflowCapture,
+    );
     return yield* checkpoints.captureCheckpoint(input);
   });
 
@@ -143,10 +159,25 @@ export const make = Effect.gen(function* () {
     return yield* checkpoints.restoreCheckpoint(input);
   });
 
+  const resolvePinnedTree: CheckpointStore["Service"]["resolvePinnedTree"] = Effect.fn(
+    "resolvePinnedTree",
+  )(function* (input) {
+    const checkpoints = yield* resolveCheckpoints(
+      "CheckpointStore.resolvePinnedTree",
+      input.cwd,
+      true,
+    );
+    return yield* checkpoints.resolvePinnedTree(input);
+  });
+
   const diffCheckpoints: CheckpointStore["Service"]["diffCheckpoints"] = Effect.fn(
     "diffCheckpoints",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.diffCheckpoints", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(
+      "CheckpointStore.diffCheckpoints",
+      input.cwd,
+      input.pinned,
+    );
     return yield* checkpoints.diffCheckpoints(input);
   });
 
@@ -156,6 +187,7 @@ export const make = Effect.gen(function* () {
     const checkpoints = yield* resolveCheckpoints(
       "CheckpointStore.deleteCheckpointRefs",
       input.cwd,
+      input.pinned,
     );
     return yield* checkpoints.deleteCheckpointRefs(input);
   });
@@ -164,6 +196,7 @@ export const make = Effect.gen(function* () {
     isGitRepository,
     captureCheckpoint,
     hasCheckpointRef,
+    resolvePinnedTree,
     restoreCheckpoint,
     diffCheckpoints,
     deleteCheckpointRefs,

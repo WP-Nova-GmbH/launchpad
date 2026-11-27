@@ -150,6 +150,16 @@ export function formatShortTimestamp(isoDate: string, timestampFormat: Timestamp
   return getTimestampFormatter(timestampFormat, false).format(date);
 }
 
+export function formatAbsoluteTimestamp(isoDate: string, timestampFormat: TimestampFormat): string {
+  const date = parseTimestampDate(isoDate);
+  if (!date) return "";
+  return date.toLocaleString(timestampLocale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    hour12: timestampFormat === "locale" ? undefined : timestampFormat === "12-hour",
+  });
+}
+
 const numericDateFormatter = new Intl.DateTimeFormat(timestampLocale, {
   month: "numeric",
   day: "numeric",

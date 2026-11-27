@@ -550,15 +550,18 @@ function FanoutSwitchRow(props: {
       label={props.label}
       subtitle={props.subtitle}
     >
-      <Pressable
-        accessibilityLabel={`Set ${props.label} on for selected environments`}
-        accessibilityRole="button"
-        disabled={props.disabled}
-        className="rounded-full bg-subtle px-3 py-2 active:opacity-70"
-        onPress={() => props.onValueChange(true)}
-      >
-        <Text className="text-sm font-t3-medium text-foreground">Mixed · Set on</Text>
-      </Pressable>
+      <View className="flex-row flex-wrap items-center gap-2">
+        <Text className="text-sm text-foreground-muted">Mixed</Text>
+        <Pressable
+          accessibilityLabel={`Set ${props.label} on for selected environments`}
+          accessibilityRole="button"
+          disabled={props.disabled}
+          className="rounded-full bg-subtle px-3 py-2 active:opacity-70"
+          onPress={() => props.onValueChange(true)}
+        >
+          <Text className="text-sm font-t3-medium text-foreground">Set on</Text>
+        </Pressable>
+      </View>
     </SettingsControlRow>
   );
 }

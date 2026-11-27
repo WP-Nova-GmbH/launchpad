@@ -24,9 +24,13 @@ export interface CodexAppServerClientOptions {
   readonly logger?: (
     event: CodexProtocol.CodexAppServerProtocolLogEvent,
   ) => Effect.Effect<void, never>;
+  readonly onIdleInputFence?: CodexProtocol.CodexAppServerPatchedProtocolOptions["onIdleInputFence"];
 }
 
 interface CodexAppServerClientRaw {
+  readonly reserveIdleShutdown?: CodexProtocol.CodexAppServerPatchedProtocol["reserveIdleShutdown"];
+  readonly releaseIdleShutdown?: CodexProtocol.CodexAppServerPatchedProtocol["releaseIdleShutdown"];
+  readonly awaitInputDrained?: CodexProtocol.CodexAppServerPatchedProtocol["awaitInputDrained"];
   readonly notifications: CodexProtocol.CodexAppServerPatchedProtocol["incomingNotifications"];
   readonly requests: CodexProtocol.CodexAppServerPatchedProtocol["incomingRequests"];
   readonly request: CodexProtocol.CodexAppServerPatchedProtocol["request"];
@@ -188,6 +192,7 @@ const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make")(func
     ...(options.logIncoming !== undefined ? { logIncoming: options.logIncoming } : {}),
     ...(options.logOutgoing !== undefined ? { logOutgoing: options.logOutgoing } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
+    ...(options.onIdleInputFence ? { onIdleInputFence: options.onIdleInputFence } : {}),
     onNotification: dispatchNotification,
     onRequest: dispatchRequest,
   });
@@ -218,6 +223,9 @@ const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make")(func
 
   return CodexAppServerClient.of({
     raw: {
+      reserveIdleShutdown: transport.reserveIdleShutdown,
+      releaseIdleShutdown: transport.releaseIdleShutdown,
+      awaitInputDrained: transport.awaitInputDrained,
       notifications: transport.incomingNotifications,
       requests: transport.incomingRequests,
       request: transport.request,

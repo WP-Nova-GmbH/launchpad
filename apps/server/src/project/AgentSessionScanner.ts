@@ -168,6 +168,12 @@ export interface AgentSessionThread {
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
 }
 
+export type AgentSessionReadProgress = {
+  readonly bytesRead: number;
+  readonly totalBytes: number;
+};
+type ReportReadProgress = (progress: AgentSessionReadProgress) => Effect.Effect<void>;
+
 export type AgentSessionRecentThread =
   | {
       readonly _tag: "Importable";
@@ -192,6 +198,7 @@ export class AgentSessionScanner extends Context.Service<
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      onReadProgress?: ReportReadProgress,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
@@ -646,6 +653,11 @@ export const make = Effect.gen(function* () {
     path.join(homeDir, "Documents", "Codex"),
   ];
 
+  // Compare canonical paths as well: macOS resolves /var and /tmp through /private.
+  const realBaseDir = yield* fileSystem.realPath(baseDir).pipe(Effect.orElseSucceed(() => baseDir));
+  const realWorktreesDir = yield* fileSystem
+    .realPath(worktreesDir)
+    .pipe(Effect.orElseSucceed(() => worktreesDir));
   const isExcludedProjectPath = (candidatePath: string) =>
     excludedProjectRoots.has(normalizeProjectPathForComparison(candidatePath)) ||
     excludedProjectAncestors.some((ancestor) =>
@@ -656,7 +668,11 @@ export const make = Effect.gen(function* () {
     normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
       normalizeForWorktreeMatch(baseDir, foldWorktreeCase),
     ) ||
-    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase);
+    normalizeForWorktreeMatch(candidatePath, foldWorktreeCase).startsWith(
+      normalizeForWorktreeMatch(realBaseDir, foldWorktreeCase),
+    ) ||
+    isT3ManagedWorktree(candidatePath, worktreesDir, foldWorktreeCase) ||
+    isT3ManagedWorktree(candidatePath, realWorktreesDir, foldWorktreeCase);
 
   const listDirectory = (directory: string) =>
     fileSystem.readDirectory(directory).pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
@@ -819,6 +835,7 @@ export const make = Effect.gen(function* () {
     expected: ReturnType<typeof transcriptIdentity>,
     recordLimit: number,
     source: AgentSessionSource,
+    onReadProgress?: ReportReadProgress,
   ) {
     if (expected.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return null;
 
@@ -834,6 +851,10 @@ export const make = Effect.gen(function* () {
             let recordBytes = 0;
             let recordCount = 0;
             let bytesRead = 0;
+            let nextProgressBytes = 4 * 1024 * 1024;
+            if (onReadProgress !== undefined) {
+              yield* onReadProgress({ bytesRead: 0, totalBytes: expected.size });
+            }
             const reserve = (bytes: number) => {
               recordBytes += bytes;
               if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
@@ -885,6 +906,13 @@ export const make = Effect.gen(function* () {
                 return true;
               });
               if (!withinBudget) return null;
+              if (
+                onReadProgress !== undefined &&
+                (bytesRead >= nextProgressBytes || bytesRead === expected.size)
+              ) {
+                yield* onReadProgress({ bytesRead, totalBytes: expected.size });
+                nextProgressBytes = bytesRead + 4 * 1024 * 1024;
+              }
             }
 
             if (recordStarted && !(yield* Effect.try(finishRecord))) return null;
@@ -1328,6 +1356,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    onReadProgress?: ReportReadProgress,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1425,6 +1454,7 @@ export const make = Effect.gen(function* () {
             identity,
             recordsRemaining,
             candidate.source,
+            onReadProgress,
           );
           if (snapshot === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
@@ -1487,7 +1517,8 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    onReadProgress,
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, onReadProgress));
 
   return AgentSessionScanner.of({ scan, recentThreads });
 });

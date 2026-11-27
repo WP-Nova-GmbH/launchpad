@@ -89,5 +89,14 @@ describe("classifyApprovalRequest", () => {
         }).kind,
       ).toBe("auto-approve");
     });
+
+    it("does not treat a proposed patch path as an executable command", () => {
+      expect(
+        classifyApprovalRequest({
+          requestType: "file_change_approval",
+          detail: "update /workspace/project/docs/git push.md",
+        }),
+      ).toEqual({ kind: "consult", toolKind: "file-change" });
+    });
   });
 });

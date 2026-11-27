@@ -1,3 +1,12 @@
+import { make as makeCheckoutAccess, resolveCheckoutPath } from "../../workspace/CheckoutAccess.ts";
+import { makeCheckoutCapture } from "../../persistence/CheckoutCapture.ts";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import { applyThreadPromptQueueChange } from "@t3tools/shared/threadPromptQueue";
+import { ProviderInstanceRegistry } from "../../provider/Services/ProviderInstanceRegistry.ts";
+import { VmWorkloadTracking } from "../../vmWorkloadCommand.ts";
+import { changesQueueProviders, validateThreadQueueProviders } from "../ThreadQueueProviders.ts";
+import { SetupProcessJournal } from "../../terminal/SetupProcessJournal.ts";
 import type {
   OrchestrationClientOrigin,
   OrchestrationEvent,
@@ -6,6 +15,7 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 import { OrchestrationCommand } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
@@ -29,6 +39,10 @@ import {
   orchestrationCommandsTotal,
   orchestrationCommandDuration,
 } from "../../observability/Metrics.ts";
+import {
+  makeThreadExecutionFence,
+  ThreadExecutionFenceError,
+} from "../../persistence/ThreadExecutionFence.ts";
 import { toPersistenceSqlError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepository } from "../../persistence/Services/OrchestrationCommandReceipts.ts";
@@ -50,10 +64,24 @@ import {
   type OrchestrationEngineShape,
   type OrchestrationDispatchOptions,
 } from "../Services/OrchestrationEngine.ts";
+import {
+  makeThreadHistoryBaseline,
+  isThreadHistoryBaselineError,
+  ThreadHistoryBaselineImporter,
+  ThreadHistoryBaselineError,
+  type ThreadHistoryBaselineInput,
+} from "../../relay/ThreadHistoryBaseline.ts";
+
+interface BaselineEnvelope {
+  baseline: ThreadHistoryBaselineInput;
+  result: Deferred.Deferred<{ sequence: number }, ThreadHistoryBaselineError>;
+}
 const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isOrchestrationCommandIdConflictError = Schema.is(OrchestrationCommandIdConflictError);
+
+const encodeDeliveryCommand = Schema.encodeEffect(Schema.fromJsonString(OrchestrationCommand));
 
 interface CommandEnvelope {
   command: OrchestrationCommand;
@@ -94,6 +122,16 @@ function commandProjectScope(command: OrchestrationCommand, readModel: Orchestra
 
 const makeOrchestrationEngine = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const executionFence = makeThreadExecutionFence(sql);
+  const captures = makeCheckoutCapture(sql);
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const checkoutAccess = yield* makeCheckoutAccess;
+  const vmMode = yield* VmWorkloadTracking;
+  // The event engine also serves offline tools without provider runtimes. Those
+  // tools may edit ordinary queues, but cannot approve a VM provider selection.
+  const providers = yield* Effect.serviceOption(ProviderInstanceRegistry);
+  const setupJournal = yield* SetupProcessJournal;
   const eventStore = yield* OrchestrationEventStore;
   const commandReceiptRepository = yield* OrchestrationCommandReceiptRepository;
   const projectionPipeline = yield* OrchestrationProjectionPipeline;
@@ -104,7 +142,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   let commandReadModel = createEmptyReadModel(yield* nowIso);
 
-  const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
+  const commandQueue = yield* Queue.unbounded<CommandEnvelope | BaselineEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
 
   const projectEventsOntoReadModel = (
@@ -123,6 +161,113 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     const dispatchStartSequence = commandReadModel.snapshotSequence;
     let processingStartedAtMs = 0;
     const aggregateRef = commandToAggregateRef(envelope.command);
+    const checkDeliveryIdentity = (generation: boolean) =>
+      Effect.gen(function* () {
+        const [delivery] = yield* sql<{
+          threadId: string;
+          generation: number;
+          normalized: string | null;
+        }>`
+        SELECT thread_id AS "threadId", generation, normalized_json AS normalized
+        FROM thread_relay_command_deliveries WHERE command_id = ${envelope.command.commandId}`;
+        if (!delivery) return;
+        const invalid = () =>
+          new ThreadExecutionFenceError({
+            threadId: delivery.threadId,
+            detail: "This command ID belongs to a different relay delivery.",
+          });
+        const encoded = yield* encodeDeliveryCommand(envelope.command).pipe(
+          Effect.mapError(invalid),
+        );
+        if (
+          aggregateRef.aggregateKind !== "thread" ||
+          aggregateRef.aggregateId !== delivery.threadId ||
+          delivery.normalized !== encoded
+        )
+          return yield* invalid();
+        if (generation) {
+          const owner = yield* executionFence.get(delivery.threadId);
+          if (!owner || owner.generation !== delivery.generation) return yield* invalid();
+        }
+      }).pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(toPersistenceSqlError("OrchestrationEngine.deliveryIdentity")(cause)),
+        ),
+      );
+    const checkExecutionFence = Effect.gen(function* () {
+      const workspaceRoot =
+        envelope.command.type === "project.create"
+          ? yield* checkoutAccess
+              .projectRegistrationPath(envelope.command.workspaceRoot)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new ThreadExecutionFenceError({ threadId: "", detail: cause.message }),
+                ),
+              )
+          : undefined;
+      yield* (
+        aggregateRef.aggregateKind === "thread"
+          ? executionFence
+              .assertMutable(aggregateRef.aggregateId, envelope.options?.expectedThreadOwnership)
+              .pipe(
+                Effect.andThen(
+                  envelope.options?.directClientCommand
+                    ? executionFence.assertDirectClientAllowed(
+                        aggregateRef.aggregateId,
+                        envelope.command.type,
+                      )
+                    : Effect.void,
+                ),
+              )
+          : executionFence.assertProjectMutable(aggregateRef.aggregateId, workspaceRoot)
+      ).pipe(
+        Effect.andThen(
+          envelope.command.type === "project.delete" && envelope.command.force
+            ? Effect.forEach(
+                commandReadModel.threads.filter(
+                  (thread) =>
+                    thread.deletedAt === null && thread.projectId === aggregateRef.aggregateId,
+                ),
+                (thread) =>
+                  executionFence.assertMutable(thread.id).pipe(
+                    Effect.andThen(
+                      envelope.options?.directClientCommand
+                        ? executionFence.assertDirectClientAllowed(thread.id).pipe(
+                            Effect.mapError((error) =>
+                              error._tag === "ThreadExecutionFenceError"
+                                ? new ThreadExecutionFenceError({
+                                    threadId: thread.id,
+                                    detail:
+                                      "Delete this project's managed threads through Launchpad Connect before deleting the project.",
+                                  })
+                                : error,
+                            ),
+                          )
+                        : Effect.void,
+                    ),
+                  ),
+                { discard: true },
+              )
+            : Effect.void,
+        ),
+        Effect.andThen(
+          envelope.command.type === "thread.create"
+            ? executionFence.assertCheckoutAvailable({ projectId: envelope.command.projectId })
+            : Effect.void,
+        ),
+        Effect.andThen(
+          envelope.command.type === "project.create" ||
+            (envelope.command.type === "project.meta.update" &&
+              envelope.command.workspaceRoot !== undefined)
+            ? executionFence.assertProjectPathMutable(workspaceRoot)
+            : Effect.void,
+        ),
+        Effect.andThen(checkDeliveryIdentity(true)),
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(toPersistenceSqlError("OrchestrationEngine.executionFence")(cause)),
+        ),
+      );
+    });
     const baseMetricAttributes = {
       commandType: envelope.command.type,
       aggregateKind: aggregateRef.aggregateKind,
@@ -152,6 +297,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           "orchestration.aggregate_id": aggregateRef.aggregateId,
         });
 
+        yield* checkDeliveryIdentity(false);
         const existingReceipt = yield* commandReceiptRepository.getByCommandId({
           commandId: envelope.command.commandId,
         });
@@ -188,6 +334,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             detail: envelope.options.rejection.detail,
           });
         }
+        yield* checkExecutionFence;
         if (
           envelope.command.type === "thread.create" ||
           (envelope.command.type === "thread.prompt.enqueue" &&
@@ -210,7 +357,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
             new OrchestrationCommandInvariantError({
               commandType: envelope.command.type,
               detail:
-                "The task or its setup changed during deletion. Review it and choose Delete again.",
+                "The task or its setup changed during cleanup. Review it and retry the action.",
             });
           if (
             yield* eventStore.hasEventAfter({
@@ -227,6 +374,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               !thread ||
               thread.deletedAt !== null ||
               thread.projectId !== deletion.projectId ||
+              (captured.worktreePath !== undefined &&
+                thread.worktreePath !== captured.worktreePath) ||
               (thread.promptQueue?.preparation?.attemptId ?? null) !==
                 captured.preparationAttemptId ||
               (yield* eventStore.hasEventAfter({
@@ -237,6 +386,22 @@ const makeOrchestrationEngine = Effect.gen(function* () {
               }))
             )
               return yield* changed();
+            if (envelope.options?.requireSetupCleanup) {
+              const owners = yield* setupJournal
+                .owners(captured.threadId)
+                .pipe(Effect.mapError(() => changed()));
+              const attempts = new Set([
+                ...(captured.cleanupAttemptIds ?? []),
+                ...owners.map((owner) => owner.attemptId),
+              ]);
+              for (const attemptId of attempts)
+                if (
+                  !(yield* setupJournal
+                    .confirmed({ threadId: captured.threadId, attemptId })
+                    .pipe(Effect.mapError(() => changed())))
+                )
+                  return yield* changed();
+            }
           }
           if (
             envelope.command.type === "project.delete" &&
@@ -316,6 +481,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
         // Shared admission depends on durable request state, including after restart.
         if (
+          envelope.command.type === "thread.move.claim" ||
           envelope.command.type === "thread.prompt.claim" ||
           envelope.command.type === "thread.prompt.steer"
         ) {
@@ -341,6 +507,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
           readModel: commandReadModel,
+          ...(envelope.command.type === "thread.archive" &&
+          deletion &&
+          envelope.options?.requireSetupCleanup
+            ? { allowFailedPreparationArchive: true }
+            : {}),
           ...(Option.isSome(userInputActivity)
             ? { userInputActivity: userInputActivity.value }
             : {}),
@@ -357,6 +528,47 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           ),
         );
         const plannedEvents = Array.isArray(eventBase) ? eventBase : [eventBase];
+        if ("threadId" in envelope.command && changesQueueProviders(envelope.command)) {
+          const thread = commandReadModel.threads.find(
+            (entry) => entry.id === aggregateRef.aggregateId,
+          );
+          if (thread) {
+            let proposedQueue = thread.promptQueue;
+            let proposedModelSelection = thread.modelSelection;
+            for (const event of plannedEvents) {
+              if (event.type === "thread.prompt-queue-changed")
+                proposedQueue = applyThreadPromptQueueChange(proposedQueue, event.payload, 0);
+              else if (event.type === "thread.meta-updated" && event.payload.modelSelection)
+                proposedModelSelection = event.payload.modelSelection;
+            }
+            const cancelling =
+              envelope.command.type === "thread.move.cancel" &&
+              proposedQueue?.entries.some(
+                (entry) =>
+                  entry.kind === "move" &&
+                  entry.messageId ===
+                    ("messageId" in envelope.command ? envelope.command.messageId : undefined) &&
+                  entry.state === "cancelling",
+              );
+            if (!cancelling)
+              yield* validateThreadQueueProviders(
+                { modelSelection: proposedModelSelection, promptQueue: proposedQueue },
+                vmMode,
+                envelope.command.type,
+                (id) =>
+                  Option.isSome(providers)
+                    ? providers.value
+                        .getInstance(id)
+                        .pipe(
+                          Effect.map(
+                            (instance) =>
+                              instance?.enabled === true && instance.driverKind === "codex",
+                          ),
+                        )
+                    : Effect.succeed(false),
+              );
+          }
+        }
         // Stamp the dispatching client's origin onto every event the command
         // produced. The decider stays pure; attribution is an engine concern.
         const eventBases =
@@ -366,9 +578,80 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                 ...planned,
                 metadata: { ...planned.metadata, origin: envelope.origin },
               }));
+        const startsWork =
+          envelope.command.type === "thread.turn.start" ||
+          envelope.command.type === "thread.prompt.claim" ||
+          envelope.command.type === "thread.prompt.steer";
+        const startingThread = startsWork
+          ? commandReadModel.threads.find((thread) => thread.id === aggregateRef.aggregateId)
+          : undefined;
+        const startingProject = startingThread
+          ? commandReadModel.projects.find((project) => project.id === startingThread.projectId)
+          : undefined;
+        const checkoutRoot =
+          startingThread && startingProject
+            ? yield* resolveCheckoutPath(
+                startingThread.worktreePath ?? startingProject.workspaceRoot,
+                fs,
+                path,
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ThreadExecutionFenceError({
+                      threadId: startingThread.id,
+                      detail: `The checkout could not be prepared: ${cause.message}`,
+                    }),
+                ),
+              )
+            : undefined;
         const committedCommand = yield* sql
           .withTransaction(
             Effect.gen(function* () {
+              // Recheck in the write transaction so a concurrent freeze cannot
+              // acknowledge a watermark and then receive another mutation.
+              yield* checkExecutionFence;
+              // Reserve accepted starts before publishing their events. A capture
+              // can then drain an accepted-but-not-yet-spawned turn safely.
+              if (checkoutRoot && startingThread) {
+                const [current] = yield* sql<{
+                  projectId: string;
+                  workspaceRoot: string;
+                  worktreePath: string | null;
+                }>`SELECT t.project_id AS "projectId", p.workspace_root AS "workspaceRoot",
+                  t.worktree_path AS "worktreePath"
+                  FROM projection_threads t JOIN projection_projects p ON p.project_id=t.project_id
+                  WHERE t.thread_id=${startingThread.id} AND t.deleted_at IS NULL`;
+                if (
+                  !current ||
+                  current.projectId !== startingThread.projectId ||
+                  current.workspaceRoot !== startingProject?.workspaceRoot ||
+                  current.worktreePath !== startingThread.worktreePath
+                )
+                  return yield* new ThreadExecutionFenceError({
+                    threadId: startingThread.id,
+                    detail: "The thread checkout changed while preparing this request. Retry it.",
+                  });
+                yield* captures
+                  .admit({
+                    threadId: startingThread.id,
+                    kind: "provider",
+                    workId: `request:${envelope.command.commandId}`,
+                    checkoutRoot,
+                    ...(envelope.options?.parentCheckoutAdmissionId
+                      ? { parentAdmissionId: envelope.options.parentCheckoutAdmissionId }
+                      : {}),
+                  })
+                  .pipe(
+                    Effect.catchTag("CheckoutCaptureError", (error) =>
+                      Effect.fail(
+                        new ThreadExecutionFenceError({
+                          threadId: startingThread.id,
+                          detail: error.message,
+                        }),
+                      ),
+                    ),
+                  );
+              }
               const committedEvents: OrchestrationEvent[] = [];
               const attachmentCleanups: Effect.Effect<void>[] = [];
               let nextCommandReadModel = commandReadModel;
@@ -501,7 +784,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
                   status: "rejected",
                   error: error.message,
                 })
-                .pipe(Effect.result);
+                .pipe(
+                  Effect.andThen((receipt) => Effect.as(checkExecutionFence, receipt)),
+                  sql.withTransaction,
+                  Effect.catchTag("SqlError", (cause) =>
+                    Effect.fail(toPersistenceSqlError("OrchestrationEngine.rejectionFence")(cause)),
+                  ),
+                  Effect.result,
+                );
               // A failed receipt write is unresolved, not a durable rejection.
               if (saved._tag === "Failure") error = saved.failure;
             }
@@ -516,7 +806,47 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   yield* projectionPipeline.bootstrap;
   commandReadModel = yield* projectionSnapshotQuery.getCommandReadModel();
 
-  const worker = Effect.forever(Queue.take(commandQueue).pipe(Effect.flatMap(processEnvelope)));
+  const baseline = makeThreadHistoryBaseline(
+    sql,
+    eventStore,
+    commandReceiptRepository,
+    projectionPipeline,
+  );
+  const processBaseline = (envelope: BaselineEnvelope) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const result = yield* baseline.install(envelope.baseline);
+          // A failed refresh rolls back the import too, so the in-memory writer cannot lag a committed baseline.
+          const model = yield* projectionSnapshotQuery.getCommandReadModel();
+          return { result, model };
+        }),
+      )
+      .pipe(
+        Effect.flatMap(({ result, model }) =>
+          Effect.gen(function* () {
+            commandReadModel = model;
+            if (result.event) yield* PubSub.publish(eventPubSub, result.event);
+            return { sequence: result.sequence };
+          }),
+        ),
+        Effect.mapError((error) =>
+          isThreadHistoryBaselineError(error)
+            ? error
+            : new ThreadHistoryBaselineError({
+                message: "Imported history requires read-model recovery before activation.",
+              }),
+        ),
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.done(envelope.result, exit)),
+      );
+  const worker = Effect.forever(
+    Queue.take(commandQueue).pipe(
+      Effect.flatMap((envelope) =>
+        "baseline" in envelope ? processBaseline(envelope) : processEnvelope(envelope),
+      ),
+    ),
+  );
   yield* Effect.forkScoped(worker);
   yield* Effect.logDebug("orchestration engine started").pipe(
     Effect.annotateLogs({ sequence: commandReadModel.snapshotSequence }),
@@ -551,7 +881,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* Deferred.await(result);
     });
 
-  return {
+  const engine = {
     readEvents,
     readThreadEvents,
     getThreadReplayStats,
@@ -569,9 +899,17 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     // atomic on the single-threaded event loop.
     latestSequence: Effect.sync(() => commandReadModel.snapshotSequence),
   } satisfies OrchestrationEngineShape;
+  const importer = ThreadHistoryBaselineImporter.of({
+    install: (baseline) =>
+      Effect.gen(function* () {
+        const result = yield* Deferred.make<{ sequence: number }, ThreadHistoryBaselineError>();
+        yield* Queue.offer(commandQueue, { baseline, result });
+        return yield* Deferred.await(result);
+      }),
+  });
+  return Context.make(OrchestrationEngineService, engine).pipe(
+    Context.add(ThreadHistoryBaselineImporter, importer),
+  );
 });
 
-export const OrchestrationEngineLive = Layer.effect(
-  OrchestrationEngineService,
-  makeOrchestrationEngine,
-);
+export const OrchestrationEngineLive = Layer.effectContext(makeOrchestrationEngine);

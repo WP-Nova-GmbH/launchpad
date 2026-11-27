@@ -37,6 +37,7 @@ import { isElectron } from "../../env";
 import { useOpenInPreferredEditor } from "../../editorPreferences";
 import { formatShortcutLabel } from "../../keybindings";
 import { cn } from "../../lib/utils";
+import { isWindowAlertDialogOpen } from "../../lib/windowAlertDialog";
 import { serverEnvironment } from "../../state/server";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { Badge } from "../ui/badge";
@@ -1367,6 +1368,7 @@ export function KeybindingsSettingsPanel() {
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       const isMod = event.metaKey || event.ctrlKey;
       if (!isMod || event.altKey || event.key.toLowerCase() !== "f") return;
+      if (isWindowAlertDialogOpen()) return;
 
       const target = event.target;
       if (

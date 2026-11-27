@@ -78,6 +78,13 @@ export function browseInputEndPaddingClass(input: {
  */
 export type SearchOverlayMode = "command" | "files" | "content";
 
+export function allowedSearchOverlayMode(
+  mode: SearchOverlayMode,
+  canUseLiveWorkspace: boolean,
+): SearchOverlayMode | null {
+  return mode === "command" || canUseLiveWorkspace ? mode : null;
+}
+
 export type CommandPaletteOpenIntent =
   | { readonly kind: "add-project" | "new-thread-in" | "change-theme" }
   | {

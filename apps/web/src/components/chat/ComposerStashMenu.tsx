@@ -4,6 +4,7 @@ import { assistantCitationsToPlainText } from "@t3tools/shared/assistantCitation
 
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { cn } from "~/lib/utils";
+import { isWindowAlertDialogOpen } from "../../lib/windowAlertDialog";
 import { type PromptStashEntry } from "../../promptStashStore";
 import { ComposerBanner } from "./ComposerBanner";
 
@@ -50,6 +51,7 @@ export const ComposerStashMenu = memo(function ComposerStashMenu(props: {
 
   useEffect(() => {
     const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (isWindowAlertDialogOpen()) return;
       const drawer = drawerRef.current;
       if (
         (drawer && event.composedPath().includes(drawer)) ||
@@ -66,6 +68,7 @@ export const ComposerStashMenu = memo(function ComposerStashMenu(props: {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (isWindowAlertDialogOpen()) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();

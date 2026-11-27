@@ -371,6 +371,92 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
       }),
   );
 
+  it.effect.each([1, 7, 1024])(
+    "dispatches idle fences in input order and preserves split UTF-8 across %i-byte chunks",
+    (chunkSize) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const seen: unknown[] = [];
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          onNotification: ({ params }) =>
+            Effect.sync(() => {
+              seen.push(params);
+            }),
+          onIdleInputFence: (nonce, completeFrame) =>
+            Effect.sync(() => {
+              seen.push({ nonce, completeFrame });
+            }),
+        });
+        const completeNonce = "a".repeat(32),
+          partialNonce = "b".repeat(32);
+        const first = encodeJsonl({ method: "x/first", params: "already dispatched" });
+        const second = encodeJsonl({ method: "x/second", params: "hé🙂" });
+        const partialAt = second.indexOf(0xc3) + 1;
+        const bytes = new Uint8Array([
+          ...first,
+          ...encoder.encode(`\x1elaunchpad-idle:${completeNonce}\x1f`),
+          ...second.subarray(0, partialAt),
+          ...encoder.encode(`\x1elaunchpad-idle:${partialNonce}\x1f`),
+          ...second.subarray(partialAt),
+        ]);
+        for (let offset = 0; offset < bytes.length; offset += chunkSize)
+          yield* Queue.offer(input, bytes.subarray(offset, offset + chunkSize));
+        yield* Queue.end(input);
+        yield* transport.awaitInputDrained;
+        assert.deepEqual(seen, [
+          "already dispatched",
+          { nonce: completeNonce, completeFrame: true },
+          { nonce: partialNonce, completeFrame: false },
+          "hé🙂",
+        ]);
+      }),
+  );
+
+  it.effect.each(["\x1elaunchpad-idle:incomplete", `\x1e${"x".repeat(64)}`])(
+    "does not confirm an incomplete or oversized idle fence",
+    (frame) =>
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          onIdleInputFence: () => Effect.die("Invalid fence reached callback"),
+        });
+        yield* Queue.offer(input, encoder.encode(frame));
+        yield* Queue.end(input);
+        assert.instanceOf(
+          yield* Effect.flip(transport.awaitInputDrained),
+          CodexError.CodexAppServerTransportError,
+        );
+      }),
+  );
+
+  it.effect("vetoes a frozen fence if a native request arrived after shutdown reservation", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const fences = yield* Queue.unbounded<boolean>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        onIdleInputFence: (_nonce, completeFrame) =>
+          Queue.offer(fences, completeFrame).pipe(Effect.asVoid),
+        onRequest: () => Effect.succeed({ accepted: true }),
+      });
+      const fence = encoder.encode(`\x1elaunchpad-idle:${"a".repeat(32)}\x1f`);
+      assert.equal(yield* transport.reserveIdleShutdown, true);
+      yield* Queue.offer(input, encodeJsonl({ id: 60, method: "approval/late", params: {} }));
+      assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+        id: 60,
+        result: { accepted: true },
+      });
+      yield* Queue.offer(input, fence);
+      assert.equal(yield* Queue.take(fences), false);
+      yield* transport.releaseIdleShutdown;
+      assert.equal(yield* transport.reserveIdleShutdown, true);
+      yield* Queue.offer(input, fence);
+      assert.equal(yield* Queue.take(fences), true);
+    }),
+  );
+
   it.effect("reports a malformed fragmented final line before input stream termination", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();
@@ -805,3 +891,137 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 });
+
+it.effect("reserves an idle transport without cancelling pending RPCs or accepting new ones", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({ stdio });
+      const request = yield* transport.request("thread/read", {}).pipe(Effect.forkScoped);
+      yield* Queue.take(output);
+      assert.equal(yield* transport.reserveIdleShutdown, false);
+      yield* Queue.offer(input, encodeJsonl({ id: 1, result: { completed: true } }));
+      assert.deepEqual(yield* Fiber.join(request), { completed: true });
+      assert.equal(yield* transport.reserveIdleShutdown, true);
+      const rejected = yield* Effect.result(transport.request("turn/start", {}));
+      assert.equal(rejected._tag, "Failure");
+      assert.equal(yield* Queue.size(output), 0);
+      yield* transport.releaseIdleShutdown;
+      const resumed = yield* transport.request("thread/read", {}).pipe(Effect.forkScoped);
+      assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+        id: 3,
+        method: "thread/read",
+        params: {},
+      });
+      yield* Queue.offer(input, encodeJsonl({ id: 3, result: { resumed: true } }));
+      assert.deepEqual(yield* Fiber.join(resumed), { resumed: true });
+    }),
+  ),
+);
+
+it.effect("refuses idle reservation while a native request handler is still active", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const entered = yield* Deferred.make<void>(),
+        release = yield* Deferred.make<void>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        onRequest: () =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as({ done: true }),
+          ),
+      });
+      yield* Queue.offer(input, encodeJsonl({ id: 51, method: "approval/pending", params: {} }));
+      yield* Deferred.await(entered);
+      assert.equal(yield* transport.reserveIdleShutdown, false);
+      yield* Deferred.succeed(release, undefined);
+      assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+        id: 51,
+        result: { done: true },
+      });
+    }),
+  ),
+);
+
+it.effect(
+  "waits for the actual final native notification, including an unterminated last line",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { stdio, input } = yield* makeInMemoryStdio();
+        const entered = yield* Deferred.make<void>(),
+          release = yield* Deferred.make<void>();
+        const seen: string[] = [];
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          onNotification: (notification) =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(
+                Effect.sync(() => {
+                  seen.push(notification.method);
+                }),
+              ),
+            ),
+        });
+        yield* Queue.offer(
+          input,
+          encoder.encode(encodeUnknownJsonString({ method: "final/output", params: {} })),
+        );
+        yield* Queue.end(input);
+        yield* Deferred.await(entered);
+        yield* Deferred.succeed(release, undefined);
+        yield* transport.awaitInputDrained;
+        assert.deepEqual(seen, ["final/output"]);
+      }),
+    ),
+);
+
+it.effect("never reports malformed native output as a successfully drained input", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({ stdio });
+      yield* Queue.offer(input, encoder.encode("{broken"));
+      yield* Queue.end(input);
+      assert.equal((yield* Effect.result(transport.awaitInputDrained))._tag, "Failure");
+    }),
+  ),
+);
+
+it.effect(
+  "rejects late native request handlers after idle reservation without cancelling earlier work",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { stdio, input, output } = yield* makeInMemoryStdio();
+        let handlers = 0;
+        const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+          stdio,
+          onRequest: () =>
+            Effect.sync(() => {
+              handlers++;
+              return { accepted: true };
+            }),
+        });
+        assert.equal(yield* transport.reserveIdleShutdown, true);
+        yield* Queue.offer(input, encodeJsonl({ id: 60, method: "approval/late", params: {} }));
+        assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+          id: 60,
+          error: CodexError.CodexAppServerRequestError.overloaded(
+            "Codex provider is stopping.",
+          ).toProtocolError(),
+        });
+        assert.equal(handlers, 0);
+        yield* transport.releaseIdleShutdown;
+        yield* Queue.offer(input, encodeJsonl({ id: 61, method: "approval/normal", params: {} }));
+        assert.deepEqual(yield* decodeJson(yield* Queue.take(output)), {
+          id: 61,
+          result: { accepted: true },
+        });
+        assert.equal(handlers, 1);
+      }),
+    ),
+);

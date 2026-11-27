@@ -1,3 +1,4 @@
+import type { RelayWorkflowVmFollowUpConnection } from "@t3tools/contracts/relay";
 import {
   type ClientConnectionMethod,
   EnvironmentId,
@@ -71,9 +72,11 @@ export class RemoteEnvironmentAuthorization extends Context.Service<
     }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeDpop: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
+      readonly workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
     }) => Effect.Effect<AuthorizedRemoteEnvironment, ConnectionAttemptError>;
     readonly authorizeDpopHttp: (input: {
       readonly expectedEnvironmentId: EnvironmentId;
+      readonly workflowFollowUp?: RelayWorkflowVmFollowUpConnection;
       readonly rejectedAccessToken?: string;
     }) => Effect.Effect<AuthorizedRemoteHttpEnvironment, ConnectionAttemptError>;
   }
@@ -251,6 +254,7 @@ export const make = Effect.gen(function* () {
   const obtainBootstrap = Effect.fn("relay.connection.bootstrap.obtain")(function* (
     environmentId: EnvironmentId,
     identity: ClientCapabilities.CloudSessionIdentity,
+    workflowFollowUp?: RelayWorkflowVmFollowUpConnection,
   ) {
     yield* assertSession(identity);
     const clerkToken = yield* cloudSession.clerkToken.pipe(
@@ -266,6 +270,7 @@ export const make = Effect.gen(function* () {
         scopes: [RelayEnvironmentConnectScope],
         environmentId,
         ...(Option.isSome(deviceId) ? { deviceId: deviceId.value } : {}),
+        ...(workflowFollowUp ? { workflowFollowUp } : {}),
       })
       .pipe(Effect.mapError(mapManagedRelayError));
     if (connected.environmentId !== environmentId) {
@@ -283,8 +288,9 @@ export const make = Effect.gen(function* () {
       environmentId: EnvironmentId,
       thumbprint: string,
       identity: ClientCapabilities.CloudSessionIdentity,
+      workflowFollowUp?: RelayWorkflowVmFollowUpConnection,
     ) {
-      const bootstrap = yield* obtainBootstrap(environmentId, identity);
+      const bootstrap = yield* obtainBootstrap(environmentId, identity, workflowFollowUp);
       const descriptor = yield* fetchDescriptor(bootstrap.endpoint.httpBaseUrl, "relay").pipe(
         Effect.provideService(HttpClient.HttpClient, httpClient),
         Effect.withSpan("environment.authorization.descriptor"),
@@ -314,7 +320,6 @@ export const make = Effect.gen(function* () {
         httpBaseUrl: bootstrap.endpoint.httpBaseUrl,
         credential: bootstrap.credential,
         dpopProof: bootstrapProof,
-        scopes: presentation.scopes,
         clientMetadata: presentation.metadata,
       }).pipe(
         Effect.mapError(mapRemoteDpopEnvironmentError),
@@ -352,6 +357,18 @@ export const make = Effect.gen(function* () {
       ),
       Effect.withSpan("environment.authorization.dpopKey.resolve"),
     );
+    // The operator token belongs to this connection attempt only and never shares the
+    // viewer's persisted environment token or renewal promise.
+    if (input.workflowFollowUp) {
+      const token = yield* exchangeDpopToken(
+        input.expectedEnvironmentId,
+        thumbprint,
+        identity,
+        input.workflowFollowUp,
+      );
+      yield* assertSession(identity);
+      return { token, fromCache: false, identity };
+    }
     const selected = yield* tokenLock.withPermits(1)(
       Effect.gen(function* () {
         yield* assertSession(identity);
@@ -483,9 +500,10 @@ export const make = Effect.gen(function* () {
     }
     const socket = yield* createDpopSocketUrl(selected.token).pipe(Effect.result);
     if (Result.isFailure(socket)) {
-      yield* tokenLock.withPermits(1)(
-        removeRejectedToken(input.expectedEnvironmentId, selected.token.accessToken),
-      );
+      if (!input.workflowFollowUp)
+        yield* tokenLock.withPermits(1)(
+          removeRejectedToken(input.expectedEnvironmentId, selected.token.accessToken),
+        );
       return yield* mapDpopSocketError(socket.failure);
     }
     yield* assertSession(selected.identity);

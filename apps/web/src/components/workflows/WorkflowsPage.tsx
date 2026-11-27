@@ -1,0 +1,1740 @@
+import type { MouseEvent, ReactNode } from "react";
+import { WorkflowAlert } from "./WorkflowAlert";
+import { useAtomValue } from "@effect/atom-react";
+import { workflowTriggerLabel } from "./WorkflowTriggerInspector";
+import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
+  ArrowLeftIcon,
+  CopyIcon,
+  EllipsisIcon,
+  ChevronRightIcon,
+  PlayIcon,
+  RefreshCwIcon,
+  CloudIcon,
+  MonitorIcon,
+  GitBranchIcon,
+} from "lucide-react";
+import { RepositorySourcesButton } from "./WorkflowSources";
+import { ClerkFailed, ClerkLoaded, ClerkLoading, useAuth } from "@clerk/react";
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRouter,
+  useSearch,
+} from "@tanstack/react-router";
+import { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from "react";
+import {
+  RelayRepositoryId,
+  type RelayRepositorySummary,
+  type RelayOrganizationProject,
+} from "@t3tools/contracts/relay";
+import type {
+  RepositoryWorkflow,
+  WorkflowAutomationSummary,
+  WorkflowCatalog,
+} from "@t3tools/contracts/workflows";
+import {
+  workflowDraftAtom,
+  workflowCatalogRevisionAtom,
+  normalizeWorkflowAutomation,
+  workflowSessionKey,
+  workflowEditorDirty,
+  workflowDraftAutomationResolved,
+  clearWorkflowScope,
+  replaceNewWorkflowDraft,
+  type WorkflowEditorDraft,
+  type WorkflowScope,
+} from "@t3tools/client-runtime/relay/workflow-session";
+import { hasCloudPublicConfig } from "../../cloud/publicConfig";
+import { useManagedRelayOrganizationCatalog } from "../../cloud/managedRelayState";
+import { useT3ConnectAuthPrompt } from "../clerk/useT3ConnectAuthPrompt";
+import { appAtomRegistry } from "../../rpc/atomRegistry";
+import { WorkspacePageContainer } from "../WorkspacePageContainer";
+import { WorkspacePageHeader } from "../WorkspacePageHeader";
+import { isElectron } from "../../env";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { cn } from "../../lib/utils";
+import { searchableSetting } from "../settings/settingsSearch";
+import { Button } from "../ui/button";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "../ui/tooltip";
+import { Spinner } from "../ui/spinner";
+import { Collapsible, CollapsiblePanel, CollapsibleTrigger } from "../ui/collapsible";
+import { Menu, MenuTrigger, MenuPopup, MenuItem } from "../ui/menu";
+import { WorkflowCopyDialog } from "./WorkflowCopyDialog";
+import {
+  WorkflowCatalogDraft,
+  WorkflowCatalogEmpty,
+  WorkflowDraftReplacementDialog,
+  WorkflowTemplateDialog,
+} from "./WorkflowTemplateDialog";
+import { WorkflowBuilder } from "./WorkflowBuilder";
+import { WorkflowRun } from "./WorkflowRun";
+import { WorkflowJob } from "./WorkflowJob";
+import { WorkflowJobs } from "./WorkflowJobs";
+import { workflowRunsBackLocation } from "./workflowRunsNavigation";
+import { WorkflowRepositoryChooser, WorkflowRepositorySwitcher } from "./WorkflowRepositoryPicker";
+import {
+  useWorkflowClient,
+  useWorkflowDrafts,
+  workflowError,
+  savedWorkflowDraft,
+  workflowMachineCheckoutIssue,
+  hasWorkflowRunSubmission,
+  newWorkflowDraft,
+  copiedWorkflowDraft,
+  workflowCopyNeedsCheckout,
+  type WorkflowTemplate,
+  useActiveWorkflowView,
+  confirmWorkflow,
+  saveWorkflowDraft,
+} from "./workflowState";
+import { updateWorkflowDrafts } from "@t3tools/client-runtime/relay/workflow-session";
+
+type WorkflowView = "catalog" | "builder" | "run" | "job";
+
+function openWorkflowEditorFromRow(event: MouseEvent<HTMLLIElement>) {
+  const { currentTarget: row, target } = event;
+  if (
+    event.defaultPrevented ||
+    event.button !== 0 ||
+    event.altKey ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.shiftKey ||
+    !(target instanceof Element) ||
+    !row.contains(target) ||
+    target.closest('a, button, [role="alert"], [data-workflow-row-actions]')
+  ) {
+    return;
+  }
+
+  const selection = row.ownerDocument.getSelection();
+  if (
+    selection &&
+    !selection.isCollapsed &&
+    selection.rangeCount > 0 &&
+    selection.getRangeAt(0).intersectsNode(row)
+  ) {
+    return;
+  }
+
+  row.querySelector<HTMLAnchorElement>("[data-workflow-edit-link]")?.click();
+}
+
+// Create and Edit share the mounted editor when the first save promotes the route.
+export function WorkflowEditorPage() {
+  return <WorkflowsPage view="builder" />;
+}
+
+function WorkflowPageFrame({
+  children,
+  overlays,
+  contentClassName,
+}: {
+  children: ReactNode;
+  overlays?: ReactNode;
+  contentClassName?: string | undefined;
+}) {
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col md:[--workflow-page-gutter:--spacing(12)] md:[[data-sidebar-state=collapsed]_&]:[--workflow-page-gutter:max(--spacing(12),var(--workspace-titlebar-content-left))]">
+      {overlays}
+      <WorkspacePageHeader
+        electron={isElectron}
+        className="md:scrollbar-gutter-stable md:overflow-hidden md:[--workspace-gutter-start:0px] md:[--workspace-gutter-end:0px] md:[--workspace-titlebar-content-left:0px]"
+      >
+        <h1 className="text-sm font-medium md:ms-[max(0px,calc((100%_+_var(--workspace-native-controls-inset)_-_var(--container-5xl))/2))] md:ps-(--workflow-page-gutter)">
+          Workflows
+        </h1>
+      </WorkspacePageHeader>
+      <div
+        className="min-h-0 flex-1 overflow-y-auto scrollbar-gutter-stable"
+        data-workflow-runs-scroll-container
+      >
+        <WorkspacePageContainer
+          width="wide"
+          className={cn("md:ps-(--workflow-page-gutter)", contentClassName)}
+        >
+          {children}
+        </WorkspacePageContainer>
+      </div>
+    </div>
+  );
+}
+
+function WorkflowPageLoading() {
+  return (
+    <WorkflowPageFrame contentClassName="min-h-full items-center justify-center">
+      <Spinner />
+    </WorkflowPageFrame>
+  );
+}
+
+export function WorkflowsPage({ view = "catalog" }: { view?: WorkflowView }) {
+  return hasCloudPublicConfig() ? (
+    <>
+      <ClerkLoading>
+        <WorkflowPageLoading />
+      </ClerkLoading>
+      <ClerkFailed>
+        <WorkflowNotice
+          title="Could not load Launchpad Connect sign-in"
+          message="Reload Launchpad to try again."
+          actions={
+            <Button variant="outline" onClick={() => window.location.reload()}>
+              Retry
+            </Button>
+          }
+        />
+      </ClerkFailed>
+      <ClerkLoaded>
+        <ConfiguredWorkflowsPage view={view} />
+      </ClerkLoaded>
+    </>
+  ) : (
+    <WorkflowNotice
+      title="Workflows unavailable"
+      message="Launchpad Connect is not configured."
+      variant="info"
+    />
+  );
+}
+
+function WorkflowNotice({
+  title,
+  message,
+  actions,
+  variant = "error",
+}: {
+  title: string;
+  message: string;
+  actions?: ReactNode;
+  variant?: "error" | "warning" | "info";
+}) {
+  const navigate = useNavigate();
+  return (
+    <WorkflowPageFrame>
+      <WorkflowAlert
+        title={title}
+        variant={variant}
+        actions={
+          actions ?? (
+            <Button variant="outline" onClick={() => navigate({ to: "/" })}>
+              Back to projects
+            </Button>
+          )
+        }
+      >
+        {message}
+      </WorkflowAlert>
+    </WorkflowPageFrame>
+  );
+}
+
+function ConfiguredWorkflowsPage({ view }: { view: WorkflowView }) {
+  const { isLoaded, isSignedIn, userId } = useAuth();
+  const { openAuthPrompt } = useT3ConnectAuthPrompt();
+  const catalog = useManagedRelayOrganizationCatalog({ allowMissingProjects: true });
+  const { refresh: refreshCatalog } = catalog;
+  const navigate = useNavigate();
+  const router = useRouter();
+  const params = useParams({ strict: false });
+  const repositoryId = "repositoryId" in params ? params.repositoryId : undefined;
+  const [accessAttempt, setAccessAttempt] = useState(0);
+  const selection = useMemo(
+    () => ({ accountId: catalog.accountId, repositoryId, accessAttempt }),
+    [catalog.accountId, repositoryId, accessAttempt],
+  );
+  const [checkedSelection, setCheckedSelection] = useState<typeof selection | null>(null);
+  useEffect(() => {
+    let current = true;
+    void refreshCatalog().then(() => {
+      if (current) setCheckedSelection(selection);
+    });
+    return () => {
+      current = false;
+    };
+  }, [selection, refreshCatalog]);
+  const entry = catalog.data?.repositories.find(
+    (entry) => entry.repository.repositoryId === repositoryId,
+  );
+  const retryOnJobNavigation =
+    view === "job" && checkedSelection === selection && (!entry || !!catalog.error);
+  useEffect(() => {
+    if (!retryOnJobNavigation) return;
+    // Clicking the current run also triggers navigation, with the same job ID and history key.
+    return router.subscribe("onBeforeNavigate", ({ toLocation }) => {
+      const { routeParams } = router.getMatchedRoutes(toLocation.pathname);
+      if (routeParams.repositoryId === repositoryId && routeParams.jobId) {
+        setAccessAttempt((attempt) => attempt + 1);
+      }
+    });
+  }, [retryOnJobNavigation, repositoryId, router]);
+  const entryOrganizationId = entry?.repository.organizationId;
+  const entryRepositoryId = entry?.repository.repositoryId;
+  const scope =
+    userId && entryOrganizationId && entryRepositoryId
+      ? { accountId: userId, organizationId: entryOrganizationId, repositoryId: entryRepositoryId }
+      : null;
+  const emptyChooser = !repositoryId && catalog.data?.repositories.length === 0;
+  const checkingAccess = !!repositoryId && (!entry || view === "job");
+  if (
+    !isLoaded ||
+    (isSignedIn &&
+      (catalog.accountId !== userId ||
+        (checkingAccess && checkedSelection !== selection) ||
+        (catalog.isPending && (!catalog.data || emptyChooser || (repositoryId && !entry)))))
+  )
+    return <WorkflowPageLoading />;
+  if (!isSignedIn || !userId)
+    return (
+      <WorkflowNotice
+        title="Sign in to use workflows"
+        variant="info"
+        message="Sign in to Launchpad Connect to manage repository workflows."
+        actions={<Button onClick={() => openAuthPrompt()}>Sign in</Button>}
+      />
+    );
+  if (!catalog.data || (catalog.error && (emptyChooser || checkingAccess)))
+    return (
+      <WorkflowNotice
+        title={catalog.error ? "Could not load repositories" : "Organization required"}
+        variant={catalog.error ? "error" : "info"}
+        message={catalog.error ?? "Join or create an organization to use repository workflows."}
+        actions={
+          <>
+            <Button variant="outline" onClick={catalog.refresh}>
+              <RefreshCwIcon aria-hidden />
+              Refresh
+            </Button>
+            <Button variant="ghost" onClick={() => navigate({ to: "/settings/organization" })}>
+              Organization settings
+            </Button>
+          </>
+        }
+      />
+    );
+  if (repositoryId && !entry)
+    return (
+      <UnavailableWorkflowRepository
+        scope={{
+          accountId: userId,
+          organizationId: catalog.data.membership.organization.organizationId,
+          repositoryId: RelayRepositoryId.make(repositoryId),
+        }}
+      />
+    );
+  if (!entry || !scope)
+    return (
+      <WorkflowPageFrame>
+        <WorkflowRepositoryChooser
+          key={catalog.data.membership.organization.organizationId}
+          repositories={catalog.data.repositories}
+          canManageRepositories={catalog.data.membership.role === "admin"}
+          onManageRepositories={() => {
+            void navigate({
+              to: "/settings/organization",
+              hash: searchableSetting("organization-repositories").id,
+            });
+          }}
+          onSelect={(repositoryId) => {
+            void navigate({
+              to: "/workflows/$repositoryId",
+              params: { repositoryId },
+              search: { tab: "workflows" },
+            });
+          }}
+        />
+      </WorkflowPageFrame>
+    );
+  const { membership } = catalog.data;
+  const organizationAdmin =
+    membership.userId === scope.accountId &&
+    membership.organization.organizationId === scope.organizationId &&
+    membership.role === "admin";
+  return (
+    <WorkflowRepositoryView
+      key={workflowSessionKey(scope, "repository")}
+      scope={scope}
+      entry={entry}
+      repositories={catalog.data.repositories}
+      allProjects={catalog.data.projects}
+      refreshOrganizationCatalog={refreshCatalog}
+      projectsUnavailable={catalog.data.projectsUnavailable === true}
+      copyRepositories={catalog.data.repositories.filter(
+        (destination) =>
+          catalog.data!.membership.role === "admin" || destination.role === "maintainer",
+      )}
+      projects={catalog.data.projects.filter(
+        (project) =>
+          project.repositoryCanonicalKey !== null &&
+          entry.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
+      )}
+      canConfigure={catalog.data.membership.role === "admin" || entry.role === "maintainer"}
+      organizationAdmin={organizationAdmin}
+      view={view}
+    />
+  );
+}
+
+function UnavailableWorkflowRepository({ scope }: { scope: WorkflowScope }) {
+  const { accountId, organizationId, repositoryId } = scope;
+  const navigate = useNavigate();
+  useEffect(() => {
+    clearWorkflowScope(appAtomRegistry, { accountId, organizationId, repositoryId });
+  }, [accountId, organizationId, repositoryId]);
+  return (
+    <WorkflowNotice
+      title="Repository unavailable"
+      message="This repository is unavailable or you no longer have access."
+      actions={
+        <>
+          <Button variant="outline" onClick={() => navigate({ to: "/workflows" })}>
+            Choose a repository
+          </Button>
+          <Button variant="ghost" onClick={() => navigate({ to: "/settings/organization" })}>
+            Organization settings
+          </Button>
+        </>
+      }
+    />
+  );
+}
+
+function workflowCopyCheckouts(
+  projects: ReadonlyArray<RelayOrganizationProject>,
+  destination: RelayRepositorySummary,
+) {
+  return projects.filter(
+    (project) =>
+      project.repositoryCanonicalKey !== null &&
+      destination.repository.canonicalKeys.includes(project.repositoryCanonicalKey),
+  );
+}
+
+function WorkflowRepositoryView({
+  scope,
+  entry,
+  repositories,
+  allProjects,
+  copyRepositories,
+  projects,
+  projectsUnavailable,
+  refreshOrganizationCatalog,
+  canConfigure,
+  organizationAdmin,
+  view,
+}: {
+  scope: WorkflowScope;
+  entry: RelayRepositorySummary;
+  repositories: ReadonlyArray<RelayRepositorySummary>;
+  copyRepositories: ReadonlyArray<RelayRepositorySummary>;
+  allProjects: ReadonlyArray<RelayOrganizationProject>;
+  projects: ReadonlyArray<RelayOrganizationProject>;
+  projectsUnavailable: boolean;
+  refreshOrganizationCatalog: () => void;
+  canConfigure: boolean;
+  organizationAdmin: boolean;
+  view: WorkflowView;
+}) {
+  const navigate = useNavigate();
+  const params = useParams({ strict: false });
+  const search = useSearch({ strict: false });
+  const runsReturn = useLocation({ select: ({ state }) => state.workflowRunsReturn });
+  const tab = "tab" in search && search.tab === "runs" ? "runs" : "workflows";
+  const catalogPage = view === "catalog";
+  const desktop = useMediaQuery("(min-width: 48rem)");
+  const compactCatalogHeader = catalogPage && desktop;
+  const tabSize = compactCatalogHeader ? "compact" : "default";
+  const workflowId = "workflowId" in params ? params.workflowId : undefined;
+  const jobId = "jobId" in params ? params.jobId : undefined;
+  const call = useWorkflowClient(scope);
+  const drafts = useWorkflowDrafts();
+  const catalogRevision = useAtomValue(workflowCatalogRevisionAtom);
+  const [automationSupported, setAutomationSupported] = useState(false);
+  const [vmAutomationAvailable, setVmAutomationAvailable] = useState(false);
+  const [vmAuthoring, setVmAuthoring] = useState<WorkflowCatalog["vmAuthoring"] | null>(null);
+  const [vmExecutionAvailable, setVmExecutionAvailable] = useState(false);
+  const [summaries, setSummaries] = useState<ReadonlyArray<WorkflowAutomationSummary>>([]);
+  const [listedWorkflows, setWorkflows] = useState<ReadonlyArray<RepositoryWorkflow>>([]);
+  const workflows = listedWorkflows.map((workflow) => {
+    const baseline = drafts.editors[workflowSessionKey(scope, workflow.workflowId)]?.baseline;
+    return baseline && baseline.revision > workflow.revision ? baseline : workflow;
+  });
+  const archivedWorkflows = workflows.filter((workflow) => workflow.archived);
+  const archivedOnly =
+    archivedWorkflows.length > 0 && archivedWorkflows.length === workflows.length;
+  const [archiveExpanded, setArchiveExpanded] = useState<boolean | null>(null);
+  const archiveOpen = archiveExpanded ?? archivedOnly;
+  const [restoreNotice, setRestoreNotice] = useState("");
+  const [restoreFocusId, setRestoreFocusId] = useState<string | null>(null);
+  const restoreFocus = useRef<HTMLButtonElement | null>(null);
+  const restoredWorkflowEdit = useRef<HTMLAnchorElement>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [codexRefreshVersion, setCodexRefreshVersion] = useState(0);
+  const active = useActiveWorkflowView();
+  const canChooseTemplate = canConfigure && view === "catalog" && tab === "workflows";
+  useLayoutEffect(() => {
+    if (!restoreFocusId) return;
+    const source = restoreFocus.current;
+    restoreFocus.current = null;
+    if (!source || !canChooseTemplate) return;
+    const { activeElement, body } = source.ownerDocument;
+    if (activeElement === source || activeElement === body) restoredWorkflowEdit.current?.focus();
+  }, [restoreFocusId, canChooseTemplate]);
+  const [templateDialog, setTemplateDialog] = useState<
+    "picker" | { draft: WorkflowEditorDraft; template: WorkflowTemplate } | null
+  >(null);
+  const [selectedTemplate, setSelectedTemplate] = useState<WorkflowTemplate>("review");
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  const templateOpener = useRef<HTMLButtonElement>(null);
+  const closeTemplates = useCallback(() => {
+    setTemplateDialog(null);
+    setTemplateError(null);
+  }, []);
+  const templateCatalog = useRef({ canChooseTemplate, projects, projectsUnavailable, vmAuthoring });
+  useLayoutEffect(() => {
+    templateCatalog.current = { canChooseTemplate, projects, projectsUnavailable, vmAuthoring };
+    // oxlint-disable-next-line react/set-state-in-effect -- Close the dialog when its catalog view loses ownership.
+    if (!canChooseTemplate && templateDialog) closeTemplates();
+  }, [
+    canChooseTemplate,
+    projects,
+    projectsUnavailable,
+    vmAuthoring,
+    templateDialog,
+    closeTemplates,
+  ]);
+  const newWorkflowSlot = workflowSessionKey(scope, "new");
+  const newWorkflowId = drafts.newWorkflowIds[newWorkflowSlot];
+  const newWorkflow = newWorkflowId
+    ? drafts.editors[workflowSessionKey(scope, newWorkflowId)]
+    : undefined;
+  const retainedDraft = newWorkflow?.baseline ? undefined : newWorkflow;
+  const retainedDraftRecovery =
+    canConfigure && retainedDraft && vmAuthoring === null
+      ? "Your draft is kept. Retry to load workflow settings before resuming it."
+      : null;
+  const firstWorkflow = loaded && !error && workflows.length === 0;
+  const [copy, setCopy] = useState<RepositoryWorkflow | null>(null);
+  const listedCopySource =
+    copy && workflows.find((workflow) => workflow.workflowId === copy.workflowId);
+  const copySource =
+    copy && listedCopySource && listedCopySource.revision > copy.revision ? listedCopySource : copy;
+  const [copyDestination, setCopyDestination] = useState<RelayRepositoryId>(scope.repositoryId);
+  const copyDestinationScope = { ...scope, repositoryId: copyDestination };
+  const copyRepository = copyRepositories.find(
+    (entry) => entry.repository.repositoryId === copyDestination,
+  );
+  const copyCheckoutIssue =
+    copySource &&
+    copyRepository &&
+    workflowCopyNeedsCheckout(copySource, !!vmAuthoring) &&
+    workflowCopyCheckouts(allProjects, copyRepository).length === 0
+      ? projectsUnavailable
+        ? "unavailable"
+        : "missing"
+      : null;
+  const copyDraftId = drafts.newWorkflowIds[workflowSessionKey(copyDestinationScope, "new")];
+  const copyDraft =
+    copyRepository && copyDraftId
+      ? drafts.editors[workflowSessionKey(copyDestinationScope, copyDraftId)]
+      : undefined;
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const copyRequest = useRef<object | null>(null);
+  const copyCatalog = useRef({
+    allProjects,
+    copyRepositories,
+    copySource,
+    vmAuthoring,
+  });
+  useLayoutEffect(() => {
+    copyCatalog.current = {
+      allProjects,
+      copyRepositories,
+      copySource,
+      vmAuthoring,
+    };
+  }, [allProjects, copyRepositories, copySource, vmAuthoring]);
+  useLayoutEffect(
+    () => () => {
+      copyRequest.current = null;
+    },
+    [],
+  );
+  const closeCopy = () => {
+    copyRequest.current = null;
+    setCopy(null);
+    setCopyBusy(false);
+    setCopyError(null);
+  };
+  const copySaved = async () => {
+    if (!copySource || copyRequest.current || copyDraft?.operation || copyCheckoutIssue) return;
+    if (!copyRepository) {
+      setCopyError("Choose a repository you can configure.");
+      return;
+    }
+    // A replacement only authorizes the draft shown when the user pressed the button.
+    const expectedDraft = copyDraft;
+    const request = {};
+    copyRequest.current = request;
+    setCopyBusy(true);
+    setCopyError(null);
+    const owns = () => active.current && copyRequest.current === request;
+    try {
+      const saved = (
+        await call((client, token) =>
+          client.listWorkflows({ clerkToken: token, repositoryId: scope.repositoryId }),
+        )
+      ).find((entry) => entry.workflowId === copySource.workflowId);
+      if (!owns()) return;
+      if (!saved) throw new Error("The saved source workflow is no longer available.");
+      const current = copyCatalog.current;
+      if (saved.revision < (current.copySource?.revision ?? copySource.revision))
+        throw new Error("The saved workflow changed while loading. Try again.");
+      setCopy(saved);
+      if (saved.definition.target.kind !== copySource.definition.target.kind)
+        throw new Error(
+          "The saved workflow’s execution target changed. Review the copy before continuing.",
+        );
+      const currentDestination = current.copyRepositories.find(
+        (entry) => entry.repository.repositoryId === copyDestination,
+      );
+      if (!currentDestination) throw new Error("Choose a repository you can configure.");
+      if (saved.definition.target.kind === "vm" && !current.vmAuthoring)
+        throw new Error("Update the relay to copy a VM workflow.");
+      const targets = workflowCopyCheckouts(current.allProjects, currentDestination);
+      // The dialog will show the checkout requirement for the newly read source and catalog.
+      if (workflowCopyNeedsCheckout(saved, !!current.vmAuthoring) && targets.length === 0) return;
+      const draft = copiedWorkflowDraft(
+        saved,
+        targets,
+        copyDestination === scope.repositoryId,
+        !!current.vmAuthoring,
+      );
+      if (!draft) throw new Error("Could not prepare a draft for the destination repository.");
+      if (!replaceNewWorkflowDraft(appAtomRegistry, copyDestinationScope, expectedDraft, draft))
+        throw new Error(
+          "The destination draft changed while copying. Review it before continuing.",
+        );
+      closeCopy();
+      void navigate({
+        to: "/workflows/$repositoryId/new",
+        params: { repositoryId: copyDestination },
+      });
+    } catch (cause) {
+      if (owns()) setCopyError(workflowError(cause));
+    } finally {
+      if (owns()) {
+        copyRequest.current = null;
+        setCopyBusy(false);
+      }
+    }
+  };
+  const openDraft = () =>
+    void navigate({
+      to: "/workflows/$repositoryId/new",
+      params: { repositoryId: scope.repositoryId },
+    });
+  const resumeDraft = () => {
+    const state = appAtomRegistry.get(workflowDraftAtom);
+    const currentId = state.newWorkflowIds[newWorkflowSlot];
+    const current = currentId ? state.editors[workflowSessionKey(scope, currentId)] : undefined;
+    if (
+      templateCatalog.current.canChooseTemplate &&
+      templateCatalog.current.vmAuthoring !== null &&
+      state.accountId === scope.accountId &&
+      current === retainedDraft &&
+      current &&
+      !current.baseline
+    )
+      openDraft();
+  };
+  const openTemplates = () => {
+    setSelectedTemplate("review");
+    setTemplateError(null);
+    setTemplateDialog("picker");
+  };
+  const installTemplate = (
+    template: WorkflowTemplate,
+    expected: WorkflowEditorDraft | undefined,
+  ) => {
+    const current = templateCatalog.current;
+    if (!active.current || !current.canChooseTemplate || current.vmAuthoring === null) return;
+    const draft = newWorkflowDraft(current.projects, template, !!current.vmAuthoring);
+    if (!draft) {
+      setTemplateError(
+        current.projectsUnavailable
+          ? "Machine checkouts could not be loaded. Retry loading checkouts."
+          : "This template requires a Machine checkout in this repository.",
+      );
+    } else if (!replaceNewWorkflowDraft(appAtomRegistry, scope, expected, draft)) {
+      setTemplateError(
+        "The retained draft changed while you were confirming. Review it before trying again.",
+      );
+    } else {
+      closeTemplates();
+      openDraft();
+      return;
+    }
+    setTemplateDialog("picker");
+  };
+  const useTemplate = (template: WorkflowTemplate) => {
+    if (templateDialog !== "picker" || !templateCatalog.current.canChooseTemplate) return;
+    if (newWorkflow?.operation) {
+      setTemplateError(
+        newWorkflow.operation.state === "pending"
+          ? "Wait for the existing draft to finish saving before starting another."
+          : "Resume the existing draft to resolve its save before starting another.",
+      );
+    } else if (retainedDraft) {
+      setTemplateError(null);
+      setTemplateDialog({ draft: retainedDraft, template });
+    } else {
+      installTemplate(template, newWorkflow);
+    }
+  };
+  const createWorkflow =
+    canChooseTemplate && !retainedDraft ? (
+      <Button ref={templateOpener} disabled={vmAuthoring === null} onClick={openTemplates}>
+        Create workflow
+      </Button>
+    ) : null;
+  const loadGeneration = useRef(0);
+  const refresh = useCallback(async () => {
+    const generation = ++loadGeneration.current;
+    try {
+      const result = await call((client, token) =>
+        client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+      );
+      if (generation !== loadGeneration.current) return;
+      setWorkflows(result.workflows);
+      setVmAuthoring(result.vmAuthoring);
+      setVmExecutionAvailable(result.vmExecutionAvailable === true);
+      setAutomationSupported(result.automationSupported === true);
+      setVmAutomationAvailable(result.vmAutomationAvailable === true);
+      setSummaries(result.automationSummaries ?? []);
+      setLoaded(true);
+      setError(null);
+    } catch (cause) {
+      if (generation !== loadGeneration.current) return;
+      setError(workflowError(cause));
+      setLoaded(true);
+    }
+  }, [call, scope.repositoryId]);
+  const refreshView = () => {
+    refreshOrganizationCatalog();
+    void refresh();
+    if (view === "builder") setCodexRefreshVersion((version) => version + 1);
+  };
+  useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- The relay read settles asynchronously; this effect owns the initial request.
+    void refresh();
+    const onFocus = () => void refresh();
+    if (typeof window !== "undefined") window.addEventListener("focus", onFocus);
+    return () => {
+      loadGeneration.current++;
+      if (typeof window !== "undefined") window.removeEventListener("focus", onFocus);
+    };
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Canonical write receipts invalidate the repository catalog, including detached Save completions.
+  }, [refresh, catalogRevision]);
+  const back = () => {
+    if (view === "job") return navigate(workflowRunsBackLocation(scope, jobId, runsReturn));
+    return navigate({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId: scope.repositoryId },
+      search: { tab: "workflows" },
+    });
+  };
+  const selectRepository = (repositoryId: RelayRepositoryId) => {
+    void navigate({
+      to: "/workflows/$repositoryId",
+      params: { repositoryId },
+      search: { tab },
+    });
+  };
+  const workflow =
+    workflows.find((workflow) => workflow.workflowId === workflowId) ??
+    (workflowId
+      ? (drafts.editors[workflowSessionKey(scope, workflowId)]?.baseline ?? undefined)
+      : undefined);
+  const runRevisionConflict =
+    view === "run" && workflow && drafts.accountId === scope.accountId
+      ? drafts.runs[workflowSessionKey(scope, workflow.workflowId)]?.runRevisionConflict
+      : undefined;
+  const runPreviewOutdated =
+    workflow && runRevisionConflict !== undefined && workflow.revision < runRevisionConflict;
+  const restore = async (workflow: RepositoryWorkflow, button: HTMLButtonElement) => {
+    const hadFocus = button.ownerDocument.activeElement === button;
+    const key = workflowSessionKey(scope, workflow.workflowId);
+    const state = appAtomRegistry.get(workflowDraftAtom);
+    const existing = state.editors[key];
+    if (state.accountId !== scope.accountId || existing?.operation?.state === "pending") return;
+    const canRestore = () => {
+      const catalog = templateCatalog.current;
+      return (
+        active.current &&
+        catalog.canChooseTemplate &&
+        (!!existing?.operation ||
+          !workflowMachineCheckoutIssue(workflow, catalog.projects, catalog.projectsUnavailable))
+      );
+    };
+    if (!canRestore()) return;
+    if (!existing?.operation) {
+      if (
+        existing &&
+        workflowEditorDirty(existing) &&
+        !(await confirmWorkflow("Discard your unsaved edits before restoring this workflow?"))
+      )
+        return;
+      const current = appAtomRegistry.get(workflowDraftAtom);
+      if (
+        !canRestore() ||
+        current.accountId !== scope.accountId ||
+        current.editors[key] !== existing
+      )
+        return;
+      updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+        ...state,
+        editors: { ...state.editors, [key]: savedWorkflowDraft(workflow, automationSupported) },
+      }));
+    }
+    if (hadFocus) {
+      restoreFocus.current = button;
+      setRestoreFocusId(null);
+    }
+    setRestoreNotice("");
+    const saved = await saveWorkflowDraft(
+      scope,
+      workflow.workflowId,
+      (payload) =>
+        call((client, token) =>
+          client.saveWorkflow({ clerkToken: token, repositoryId: scope.repositoryId, payload }),
+        ),
+      existing?.operation ? undefined : false,
+      {
+        automationSupported,
+        read: () =>
+          call((client, token) =>
+            client.readWorkflowCatalog({ clerkToken: token, repositoryId: scope.repositoryId }),
+          ),
+      },
+    );
+    if (!active.current) return;
+    if (saved && !saved.archived) {
+      setArchiveExpanded((expanded) => expanded ?? true);
+      if (hadFocus && restoreFocus.current === button) setRestoreFocusId(saved.workflowId);
+      setRestoreNotice(`${saved.definition.name} restored. Automatic triggering is off.`);
+    } else if (restoreFocus.current === button) {
+      restoreFocus.current = null;
+    }
+    if (saved || existing?.operation) void refresh();
+    if (!saved) refreshOrganizationCatalog();
+  };
+  const canEnableTarget = (
+    workflow: RepositoryWorkflow,
+    draft?: RepositoryWorkflow["definition"],
+  ) =>
+    vmAutomationAvailable ||
+    (workflow.definition.target.kind === "machine" && draft?.target.kind !== "vm");
+  const setupTrigger = (workflow: RepositoryWorkflow, enabled?: boolean) => {
+    const key = workflowSessionKey(scope, workflow.workflowId);
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => {
+      const draft = state.editors[key] ?? savedWorkflowDraft(workflow, automationSupported);
+      if (draft.operation || (enabled !== false && !canEnableTarget(workflow, draft.definition)))
+        return { ...state, editors: { ...state.editors, [key]: { ...draft, triggerSetup: true } } };
+      const automation = normalizeWorkflowAutomation(
+        workflowDraftAutomationResolved(draft) ? draft.automation : workflow.automation,
+      );
+      return {
+        ...state,
+        editors: {
+          ...state.editors,
+          [key]: {
+            ...draft,
+            triggerSetup: true,
+            ...(!workflowDraftAutomationResolved(draft) &&
+            draft.baseline?.revision === workflow.revision
+              ? { baseline: workflow }
+              : {}),
+            automationResolved: true,
+            automation: {
+              ...automation,
+              ...(enabled !== undefined ? { enabled: enabled && !!automation.trigger } : {}),
+            },
+          },
+        },
+      };
+    });
+    void navigate({
+      to: "/workflows/$repositoryId/$workflowId/edit",
+      params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+    });
+  };
+  const toggleAutomation = (workflow: RepositoryWorkflow) => {
+    if (!automationSupported || error || workflow.archived) return;
+    const current =
+      appAtomRegistry.get(workflowDraftAtom).editors[
+        workflowSessionKey(scope, workflow.workflowId)
+      ];
+    if (
+      current?.operation?.state === "pending" ||
+      (!workflow.automation?.enabled && !canEnableTarget(workflow, current?.definition)) ||
+      (current?.baseline && current.baseline.revision > workflow.revision)
+    )
+      return;
+    setupTrigger(workflow, !workflow.automation?.enabled);
+  };
+  const rows = (archived: boolean) => {
+    const entries = workflows.filter((workflow) => workflow.archived === archived);
+    if (!entries.length) return null;
+
+    return (
+      <ul
+        role="list"
+        aria-label={archived ? "Archived workflows" : "Workflows"}
+        className="grid gap-y-px"
+      >
+        {entries.map((workflow) => {
+          const key = workflowSessionKey(scope, workflow.workflowId);
+          const local = drafts.editors[key];
+          const editorDirty = !!local && workflowEditorDirty(local);
+          const runDraft = drafts.runs[key];
+          const { name, target } = workflow.definition;
+          const machineProject =
+            target.kind === "machine"
+              ? projects.find(
+                  (project) =>
+                    project.environmentId === target.environmentId &&
+                    project.projectId === target.projectId,
+                )
+              : undefined;
+          const checkoutIssue = workflowMachineCheckoutIssue(
+            workflow,
+            projects,
+            projectsUnavailable,
+          );
+          const restoreIssue = archived && checkoutIssue;
+          const restoreBlocked = !!restoreIssue && !local?.operation;
+          const canRecoverInVm =
+            restoreIssue === "missing" &&
+            projects.length === 0 &&
+            !!vmAuthoring &&
+            vmExecutionAvailable;
+          const restoreHint = `workflow-restore-${workflow.workflowId}`;
+          const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
+          const canStartRun = !archived && !vmUnavailable && !checkoutIssue;
+          const hasRunSubmission = hasWorkflowRunSubmission(runDraft, canStartRun);
+          const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
+          const startedJobId =
+            !archived && checkoutIssue && !hasRunSubmission && !hasRetainedInstructions
+              ? runDraft?.startedJobId
+              : null;
+          const runLabel = hasRunSubmission
+            ? "View run submission"
+            : hasRetainedInstructions
+              ? "View retained instructions"
+              : startedJobId
+                ? "View started run"
+                : "Run";
+          const summary = summaries.find(
+            (item) =>
+              item.workflowId === workflow.workflowId && item.revision === workflow.revision,
+          );
+          const trigger = workflow.automation?.trigger;
+          const triggerState = automationSupported ? summary?.state : undefined;
+          const triggerLabel = archived
+            ? trigger
+              ? "Automatic triggering off"
+              : "Manual run"
+            : !automationSupported
+              ? "Automation state unavailable on this relay"
+              : triggerState === "on"
+                ? "Automatic"
+                : triggerState === "off"
+                  ? trigger
+                    ? "Automatic triggering off"
+                    : "Manual run"
+                  : triggerState === "needs_attention"
+                    ? "Needs attention"
+                    : "Automation state unavailable";
+          const triggerIssue = local?.error ?? summary?.reason;
+          const triggerReason = !archived && !local?.error ? triggerIssue : undefined;
+          const showTriggerSettings =
+            !archived && canConfigure && (!!triggerIssue || triggerState === "needs_attention");
+          const canToggle =
+            canConfigure &&
+            automationSupported &&
+            !archived &&
+            (!!workflow.automation?.enabled || canEnableTarget(workflow, local?.definition));
+          const canCopy =
+            copyRepositories.length > 0 && (target.kind === "machine" || !!vmAuthoring);
+
+          return (
+            <li
+              key={workflow.workflowId}
+              className={cn(
+                "relative grid grid-cols-1 items-center gap-x-4 gap-y-2 rounded-md py-2.5 @min-[34rem]/workflow-catalog:grid-cols-[minmax(0,1fr)_fit-content(45%)]",
+                "after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:border-b after:border-border last:after:hidden",
+                compactCatalogHeader ? "px-2" : "px-3",
+                canConfigure && "cursor-pointer hover:bg-accent/35",
+              )}
+              onClick={canConfigure ? openWorkflowEditorFromRow : undefined}
+            >
+              <div className="min-w-0 space-y-1 wrap-anywhere">
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                  {canConfigure ? (
+                    <Link
+                      to="/workflows/$repositoryId/$workflowId/edit"
+                      params={{
+                        repositoryId: scope.repositoryId,
+                        workflowId: workflow.workflowId,
+                      }}
+                      aria-label={`${editorDirty ? "Resume editing" : "Edit"} ${name}`}
+                      className="text-sm font-medium before:pointer-events-none before:absolute before:inset-0 before:rounded-md focus-visible:outline-none focus-visible:before:ring-2 focus-visible:before:ring-ring focus-visible:before:ring-inset"
+                      data-workflow-edit-link
+                      ref={
+                        !archived && restoreFocusId === workflow.workflowId
+                          ? restoredWorkflowEdit
+                          : undefined
+                      }
+                    >
+                      {name}
+                    </Link>
+                  ) : (
+                    <p className="text-sm font-medium">{name}</p>
+                  )}
+                  {editorDirty ? (
+                    <span className="text-xs text-muted-foreground">Unsaved changes</span>
+                  ) : null}
+                </div>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                  <div
+                    role="status"
+                    aria-atomic="true"
+                    className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1"
+                  >
+                    <span
+                      className={
+                        triggerState === "needs_attention"
+                          ? "font-medium text-warning-foreground"
+                          : undefined
+                      }
+                    >
+                      <span className="sr-only">{name}: </span>
+                      {triggerLabel}
+                    </span>
+                    {trigger ? <span>{workflowTriggerLabel(trigger)}</span> : null}
+                    {/* Keep refresh updates in the persistent trigger announcement. */}
+                    {triggerReason ? <span className="sr-only">{triggerReason}</span> : null}
+                  </div>
+                  {target.kind === "vm" ? (
+                    <>
+                      <span className="inline-flex items-center gap-1.5">
+                        <CloudIcon aria-hidden className="size-3.5 shrink-0" />
+                        VM
+                      </span>
+                      <span className="inline-flex min-w-0 items-center gap-1.5">
+                        <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+                        <span>
+                          <span className="sr-only">Base branch: </span>
+                          {target.baseBranch ?? "Repository default"}
+                        </span>
+                      </span>
+                    </>
+                  ) : machineProject ? (
+                    <span className="inline-flex min-w-0 items-center gap-1.5">
+                      <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                      <span>
+                        {machineProject.machineLabel} / {machineProject.title}
+                      </span>
+                    </span>
+                  ) : canConfigure && restoreBlocked ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <MonitorIcon aria-hidden className="size-3.5 shrink-0" />
+                      Machine
+                    </span>
+                  ) : (
+                    <span>
+                      {projectsUnavailable
+                        ? "Machine checkout not verified"
+                        : "Machine checkout unavailable"}
+                    </span>
+                  )}
+                </div>
+                {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
+                  <p className="text-xs text-muted-foreground">VM execution unavailable</p>
+                ) : null}
+                {!archived && checkoutIssue === "missing" && !canConfigure ? (
+                  <p className="text-xs text-muted-foreground">
+                    Ask a repository maintainer to update this workflow’s checkout.
+                  </p>
+                ) : null}
+                {!archived && local?.error ? (
+                  <div role="alert" className="cursor-auto text-xs">
+                    <p className="font-medium text-error-foreground">
+                      Workflow change not confirmed
+                    </p>
+                    <p className="text-muted-foreground">{local.error}</p>
+                  </div>
+                ) : null}
+                {triggerReason || showTriggerSettings ? (
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                    {triggerReason ? <p aria-hidden>{triggerReason}</p> : null}
+                    {showTriggerSettings ? (
+                      <Button
+                        variant="ghost"
+                        size="compact"
+                        aria-label={`Trigger settings for ${name}`}
+                        onClick={() => setupTrigger(workflow)}
+                      >
+                        Trigger settings
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+              <div
+                data-workflow-row-actions
+                className="flex w-fit min-w-0 max-w-full cursor-auto flex-wrap items-center justify-end gap-2 justify-self-end empty:hidden pointer-coarse:gap-4 [&>button]:max-w-full"
+              >
+                {archived && canConfigure ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-label={
+                      local?.operation?.state === "pending"
+                        ? `Saving ${name}`
+                        : local?.operation
+                          ? `Retry save for ${name}`
+                          : `Restore ${name}`
+                    }
+                    aria-describedby={restoreBlocked ? restoreHint : undefined}
+                    disabled={restoreBlocked || local?.operation?.state === "pending"}
+                    onClick={(event) => void restore(workflow, event.currentTarget)}
+                  >
+                    <ArchiveRestoreIcon aria-hidden />
+                    {local?.operation?.state === "pending"
+                      ? "Saving…"
+                      : local?.operation
+                        ? "Retry save"
+                        : "Restore"}
+                  </Button>
+                ) : null}
+                {!archived && checkoutIssue === "missing" && canConfigure ? (
+                  <Button
+                    variant="ghost"
+                    size="sm-multiline"
+                    aria-label={`Change checkout for ${name}`}
+                    onClick={() =>
+                      void navigate({
+                        to: "/workflows/$repositoryId/$workflowId/edit",
+                        params: {
+                          repositoryId: scope.repositoryId,
+                          workflowId: workflow.workflowId,
+                        },
+                        search: { settings: "execution" },
+                      })
+                    }
+                  >
+                    <MonitorIcon aria-hidden />
+                    Change checkout
+                  </Button>
+                ) : null}
+                {hasRunSubmission || canStartRun || hasRetainedInstructions || startedJobId ? (
+                  <Button
+                    variant="ghost"
+                    size="sm-multiline"
+                    aria-label={`${runLabel} for ${name}`}
+                    onClick={() =>
+                      startedJobId
+                        ? navigate({
+                            to: "/workflows/$repositoryId/jobs/$jobId",
+                            params: { repositoryId: scope.repositoryId, jobId: startedJobId },
+                          })
+                        : navigate({
+                            to: "/workflows/$repositoryId/$workflowId/run",
+                            params: {
+                              repositoryId: scope.repositoryId,
+                              workflowId: workflow.workflowId,
+                            },
+                          })
+                    }
+                  >
+                    {runLabel === "Run" ? (
+                      <PlayIcon aria-hidden />
+                    ) : (
+                      <ChevronRightIcon aria-hidden />
+                    )}
+                    {runLabel}
+                  </Button>
+                ) : null}
+                {canCopy || canToggle ? (
+                  <Menu>
+                    <MenuTrigger
+                      render={
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={`More actions for ${name}`}
+                        />
+                      }
+                    >
+                      <EllipsisIcon aria-hidden />
+                    </MenuTrigger>
+                    <MenuPopup align="end">
+                      {canCopy ? (
+                        <MenuItem
+                          onClick={() => {
+                            setCopyDestination(
+                              copyRepositories.some(
+                                (entry) => entry.repository.repositoryId === scope.repositoryId,
+                              )
+                                ? scope.repositoryId
+                                : copyRepositories[0]!.repository.repositoryId,
+                            );
+                            setCopyError(null);
+                            setCopy(workflow);
+                          }}
+                        >
+                          <CopyIcon aria-hidden />
+                          Copy workflow
+                        </MenuItem>
+                      ) : null}
+                      {canToggle ? (
+                        <MenuItem
+                          disabled={
+                            !!error ||
+                            !summary ||
+                            local?.operation?.state === "pending" ||
+                            (!!local?.baseline && local.baseline.revision > workflow.revision)
+                          }
+                          onClick={() => toggleAutomation(workflow)}
+                        >
+                          {local?.operation?.state === "pending"
+                            ? "Saving…"
+                            : local?.operation
+                              ? "Retry trigger change"
+                              : workflow.automation?.enabled
+                                ? "Turn off automatic triggering"
+                                : trigger
+                                  ? "Turn on automatic triggering"
+                                  : "Set up automatic triggering"}
+                        </MenuItem>
+                      ) : null}
+                    </MenuPopup>
+                  </Menu>
+                ) : null}
+              </div>
+              {archived && local?.error ? (
+                <div className="col-span-full cursor-auto">
+                  <WorkflowAlert title="Workflow change not confirmed">{local.error}</WorkflowAlert>
+                </div>
+              ) : null}
+              {canConfigure && restoreBlocked ? (
+                <div id={restoreHint} className="col-span-full cursor-auto">
+                  <WorkflowAlert
+                    title={
+                      restoreIssue === "unavailable"
+                        ? "Could not load Machine checkouts"
+                        : "Machine checkout unavailable"
+                    }
+                    variant="warning"
+                    actions={
+                      restoreIssue === "unavailable" ? (
+                        <Button size="sm" variant="outline" onClick={refreshOrganizationCatalog}>
+                          <RefreshCwIcon aria-hidden />
+                          Retry loading checkouts
+                        </Button>
+                      ) : projects.length || canRecoverInVm ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          aria-label={
+                            canRecoverInVm
+                              ? `Choose execution target for ${name}`
+                              : `Choose checkout for ${name}`
+                          }
+                          onClick={() =>
+                            void navigate({
+                              to: "/workflows/$repositoryId/$workflowId/edit",
+                              params: {
+                                repositoryId: scope.repositoryId,
+                                workflowId: workflow.workflowId,
+                              },
+                              search: { settings: "execution" },
+                            })
+                          }
+                        >
+                          {canRecoverInVm ? <CloudIcon aria-hidden /> : <MonitorIcon aria-hidden />}
+                          {canRecoverInVm ? "Choose execution target" : "Choose checkout"}
+                        </Button>
+                      ) : organizationAdmin ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            void navigate({
+                              to: "/settings/organization",
+                              hash: searchableSetting("organization-machines").id,
+                            })
+                          }
+                        >
+                          Machines settings
+                        </Button>
+                      ) : null
+                    }
+                  >
+                    {restoreIssue === "unavailable"
+                      ? "Reload the checkout list before restoring this workflow."
+                      : projects.length
+                        ? "Choose and save a checkout in Workflow settings before restoring."
+                        : canRecoverInVm
+                          ? "Choose VM in Workflow settings and save before restoring."
+                          : organizationAdmin
+                            ? "To keep this workflow on a Machine, connect one with a checkout of this repository."
+                            : "To keep this workflow on a Machine, ask an organization admin to connect one with a checkout of this repository."}
+                  </WorkflowAlert>
+                </div>
+              ) : null}
+            </li>
+          );
+        })}
+      </ul>
+    );
+  };
+  if (view === "builder")
+    return (
+      <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+        <WorkspacePageHeader electron={isElectron}>
+          <div className="flex min-w-0 flex-1 items-center gap-2 [-webkit-app-region:no-drag]">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Back to workflows"
+              onClick={back}
+            >
+              <ArrowLeftIcon />
+            </Button>
+            <div className="min-w-0 flex-1 max-w-64">
+              <WorkflowRepositorySwitcher
+                compact
+                current={entry}
+                repositories={repositories}
+                onSelect={selectRepository}
+              />
+            </div>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Refresh workflows"
+                    onClick={refreshView}
+                  />
+                }
+              >
+                <RefreshCwIcon aria-hidden />
+              </TooltipTrigger>
+              <TooltipPopup>Refresh workflows</TooltipPopup>
+            </Tooltip>
+          </div>
+        </WorkspacePageHeader>
+        {error ? (
+          <div className="px-4 py-2">
+            <WorkflowAlert
+              title="Could not refresh workflows"
+              actions={
+                <Button variant="outline" size="sm" onClick={refreshView}>
+                  Retry
+                </Button>
+              }
+            >
+              {error}{" "}
+              {workflowId || vmAuthoring !== null
+                ? "Showing the last available data. Your edits are kept."
+                : (retainedDraftRecovery ??
+                  "Retry to load workflow settings before creating a workflow.")}
+            </WorkflowAlert>
+          </div>
+        ) : null}
+        {!loaded ? (
+          <Spinner />
+        ) : !workflowId && vmAuthoring === null ? null : (
+          <WorkflowBuilder
+            scope={scope}
+            repositoryName={entry.repository.name}
+            automationSupported={automationSupported}
+            vmAutomationAvailable={vmAutomationAvailable}
+            automationReason={
+              summaries.find(
+                (item) =>
+                  item.workflowId === workflow?.workflowId && item.revision === workflow?.revision,
+              )?.reason
+            }
+            workflow={workflow}
+            workflowId={workflowId}
+            isNew={!workflowId}
+            openExecutionSettings={"settings" in search && search.settings === "execution"}
+            projects={projects}
+            projectsUnavailable={projectsUnavailable}
+            refreshProjects={refreshOrganizationCatalog}
+            vmAuthoring={vmAuthoring ?? undefined}
+            vmExecutionAvailable={vmExecutionAvailable}
+            codexRefreshVersion={codexRefreshVersion}
+            canConfigure={canConfigure}
+            organizationAdmin={organizationAdmin}
+            call={call}
+            refresh={refresh}
+          />
+        )}
+      </div>
+    );
+  const catalogTabs = (
+    <div
+      className={cn("flex flex-wrap gap-2", catalogPage && "md:gap-1")}
+      role="tablist"
+      aria-label="Workflow catalog"
+    >
+      <Button
+        role="tab"
+        size={tabSize}
+        aria-selected={tab === "workflows"}
+        variant={tab === "workflows" ? "secondary" : "ghost"}
+        onClick={() =>
+          navigate({
+            to: "/workflows/$repositoryId",
+            params: { repositoryId: scope.repositoryId },
+            search: { tab: "workflows" },
+          })
+        }
+      >
+        Workflows
+      </Button>
+      <Button
+        role="tab"
+        size={tabSize}
+        aria-selected={tab === "runs"}
+        variant={tab === "runs" ? "secondary" : "ghost"}
+        onClick={() => {
+          if (tab === "runs") return;
+          void navigate({
+            to: "/workflows/$repositoryId",
+            params: { repositoryId: scope.repositoryId },
+            search: { tab: "runs" },
+          });
+        }}
+      >
+        Runs
+      </Button>
+    </div>
+  );
+  const refreshWorkflowsButton = (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="ghost"
+            size={compactCatalogHeader ? "icon-sm" : "icon"}
+            aria-label="Refresh workflows"
+            onClick={refreshView}
+          />
+        }
+      >
+        <RefreshCwIcon aria-hidden />
+      </TooltipTrigger>
+      <TooltipPopup>Refresh workflows</TooltipPopup>
+    </Tooltip>
+  );
+  const catalogActions =
+    tab === "workflows" && (catalogPage || canConfigure) ? (
+      <div className="flex flex-wrap items-center gap-2 pointer-coarse:gap-y-4">
+        {loaded && canConfigure ? (
+          <RepositorySourcesButton
+            repositoryId={scope.repositoryId}
+            repositoryName={entry.repository.name}
+          />
+        ) : null}
+        {catalogPage ? refreshWorkflowsButton : null}
+        {loaded && !firstWorkflow ? createWorkflow : null}
+      </div>
+    ) : null;
+  return (
+    <WorkflowPageFrame
+      contentClassName={catalogPage ? "gap-3 pointer-coarse:gap-y-4 md:pt-3" : undefined}
+      overlays={
+        <>
+          {copySource ? (
+            <WorkflowCopyDialog
+              source={copySource}
+              sourceRepositoryId={scope.repositoryId}
+              repositories={copyRepositories}
+              destination={copyRepository}
+              existingDraft={copyDraft}
+              checkoutIssue={copyCheckoutIssue}
+              onRefreshCheckouts={refreshOrganizationCatalog}
+              busy={copyBusy}
+              error={copyError}
+              onSelectDestination={(id) => {
+                if (copyRequest.current) return;
+                setCopyDestination(id);
+                setCopyError(null);
+              }}
+              onClose={closeCopy}
+              onCopy={() => void copySaved()}
+            />
+          ) : null}
+          {templateDialog && canChooseTemplate && vmAuthoring !== null ? (
+            templateDialog === "picker" ? (
+              <WorkflowTemplateDialog
+                repositoryName={entry.repository.name}
+                vmAuthoring={!!vmAuthoring}
+                hasMachineCheckout={projects.length > 0}
+                projectsUnavailable={projectsUnavailable}
+                selected={selectedTemplate}
+                onSelect={setSelectedTemplate}
+                finalFocus={templateOpener}
+                error={templateError}
+                onRefreshCheckouts={() => {
+                  setTemplateError(null);
+                  refreshOrganizationCatalog();
+                }}
+                onOpenMachines={
+                  organizationAdmin
+                    ? () => {
+                        closeTemplates();
+                        void navigate({
+                          to: "/settings/organization",
+                          hash: searchableSetting("organization-machines").id,
+                        });
+                      }
+                    : undefined
+                }
+                onCreate={useTemplate}
+                onClose={closeTemplates}
+              />
+            ) : (
+              <WorkflowDraftReplacementDialog
+                repositoryName={entry.repository.name}
+                draft={templateDialog.draft}
+                template={templateDialog.template}
+                finalFocus={templateOpener}
+                onKeep={closeTemplates}
+                onReplace={() => installTemplate(templateDialog.template, templateDialog.draft)}
+              />
+            )
+          ) : null}
+        </>
+      }
+    >
+      {!(view === "job" && jobId && loaded) ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {!catalogPage ? (
+              <Button variant="ghost" onClick={back}>
+                {view === "job" ? (
+                  "← Back to runs"
+                ) : (
+                  <>
+                    <ArrowLeftIcon aria-hidden />
+                    Back to workflows
+                  </>
+                )}
+              </Button>
+            ) : null}
+            <div className={catalogPage ? "w-fit min-w-0 max-w-full" : "w-72 max-w-full"}>
+              <WorkflowRepositorySwitcher
+                current={entry}
+                repositories={repositories}
+                onSelect={selectRepository}
+                inline={catalogPage}
+              />
+            </div>
+          </div>
+          {catalogPage ? null : refreshWorkflowsButton}
+        </div>
+      ) : null}
+      {catalogPage ? (
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b pb-2 pointer-coarse:gap-y-4">
+          {catalogTabs}
+          {catalogActions}
+        </div>
+      ) : null}
+      {error && !runPreviewOutdated ? (
+        <WorkflowAlert
+          title="Could not refresh workflows"
+          actions={
+            <Button variant="outline" size="sm" onClick={refreshView}>
+              Retry
+            </Button>
+          }
+        >
+          {error}{" "}
+          {(canChooseTemplate && retainedDraftRecovery) || "Showing the last available data."}
+        </WorkflowAlert>
+      ) : null}
+      {!loaded ? (
+        <Spinner />
+      ) : view === "run" ? (
+        workflow ? (
+          <WorkflowRun
+            canConfigure={canConfigure}
+            organizationAdmin={organizationAdmin}
+            scope={scope}
+            workflow={workflow}
+            projects={projects}
+            projectsUnavailable={projectsUnavailable}
+            refreshProjects={refreshOrganizationCatalog}
+            call={call}
+            refreshWorkflow={refresh}
+            workflowRefreshFailed={error !== null}
+            vmExecutionAvailable={vmExecutionAvailable}
+          />
+        ) : (
+          <WorkflowAlert
+            title="Workflow unavailable"
+            actions={
+              <Button variant="outline" onClick={refreshView}>
+                <RefreshCwIcon aria-hidden />
+                Refresh workflows
+              </Button>
+            }
+          >
+            This workflow may have been removed or your access may have changed. Refresh or return
+            to the list.
+          </WorkflowAlert>
+        )
+      ) : view === "job" && jobId ? (
+        <WorkflowJob
+          scope={scope}
+          jobId={jobId}
+          projects={projects}
+          canConfigure={canConfigure}
+          organizationAdmin={organizationAdmin}
+          refreshCatalog={refreshView}
+        />
+      ) : (
+        <>
+          {!catalogPage ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              {catalogTabs}
+              {catalogActions}
+            </div>
+          ) : null}
+          {tab === "workflows" ? (
+            <div className="@container/workflow-catalog">
+              {canChooseTemplate && retainedDraft ? (
+                <div className={workflows.length ? "mb-4" : undefined}>
+                  <WorkflowCatalogDraft
+                    draft={retainedDraft}
+                    actions={
+                      <div className="flex flex-wrap gap-2">
+                        {!retainedDraft.operation ? (
+                          <Button
+                            ref={templateOpener}
+                            variant="outline"
+                            disabled={vmAuthoring === null}
+                            onClick={openTemplates}
+                          >
+                            Start another workflow
+                          </Button>
+                        ) : null}
+                        <Button
+                          ref={retainedDraft.operation ? templateOpener : undefined}
+                          disabled={vmAuthoring === null}
+                          onClick={resumeDraft}
+                        >
+                          Resume draft
+                        </Button>
+                      </div>
+                    }
+                  />
+                </div>
+              ) : null}
+              {projectsUnavailable &&
+              workflows.some(
+                ({ archived, definition }) => !archived && definition.target.kind === "machine",
+              ) ? (
+                <div className="mb-3">
+                  <WorkflowAlert
+                    title="Could not load Machine checkouts"
+                    variant="warning"
+                    actions={
+                      <Button size="sm" variant="outline" onClick={refreshOrganizationCatalog}>
+                        <RefreshCwIcon aria-hidden />
+                        Retry loading checkouts
+                      </Button>
+                    }
+                  >
+                    Reload the checkout list to verify the saved checkouts before running these
+                    workflows.
+                  </WorkflowAlert>
+                </div>
+              ) : null}
+              {rows(false)}
+              {firstWorkflow && !(canChooseTemplate && retainedDraft) ? (
+                <WorkflowCatalogEmpty actions={createWorkflow} />
+              ) : archivedOnly ? (
+                <div className="flex items-start gap-3 rounded-lg border bg-card p-4 text-card-foreground">
+                  <ArchiveIcon
+                    aria-hidden
+                    className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+                  />
+                  <div className="space-y-1">
+                    <h2 className="text-sm font-semibold">No active workflows</h2>
+                    <p className="text-sm text-muted-foreground">
+                      {canConfigure
+                        ? "Restore an archived workflow to make it available again."
+                        : "A repository maintainer or organization admin can restore a workflow."}
+                    </p>
+                  </div>
+                </div>
+              ) : null}
+              {archivedWorkflows.length ? (
+                <Collapsible open={archiveOpen} onOpenChange={setArchiveExpanded} className="mt-6">
+                  <CollapsibleTrigger
+                    aria-label="Archived workflows"
+                    aria-description={`${archivedWorkflows.length} archived`}
+                    className="flex w-full items-center gap-2 rounded-md py-2 text-start text-sm font-medium"
+                  >
+                    <ChevronRightIcon
+                      aria-hidden
+                      className={archiveOpen ? "size-4 rotate-90" : "size-4"}
+                    />
+                    Archived workflows
+                    <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                      {archivedWorkflows.length}
+                    </span>
+                  </CollapsibleTrigger>
+                  <CollapsiblePanel>
+                    {canConfigure ? (
+                      <p className="pb-3 text-xs text-muted-foreground">
+                        Automatic triggering stays off when you restore a workflow.
+                      </p>
+                    ) : null}
+                    {rows(true)}
+                  </CollapsiblePanel>
+                </Collapsible>
+              ) : null}
+              <p
+                role="status"
+                className={restoreNotice ? "mt-3 text-sm text-muted-foreground" : "sr-only"}
+              >
+                {restoreNotice}
+              </p>
+            </div>
+          ) : (
+            <WorkflowJobs scope={scope} workflows={workflows} refreshWorkflows={refresh} />
+          )}
+        </>
+      )}
+    </WorkflowPageFrame>
+  );
+}

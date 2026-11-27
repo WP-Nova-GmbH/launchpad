@@ -1,3 +1,4 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { useAtomValue } from "@effect/atom-react";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -102,7 +103,7 @@ import {
   type ComposerDraft,
   waitForComposerDraftsLoaded,
 } from "../../state/use-composer-drafts";
-import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
+import { useEnvironmentServerConfig, useProjects, useServerConfigs } from "../../state/entities";
 import { useProjectClone } from "../../state/projectClones";
 import { projectEnvironment } from "../../state/projects";
 import { sourceControlEnvironment } from "../../state/sourceControl";
@@ -181,6 +182,11 @@ export function NewTaskDraftScreen(props: {
   readonly incomingShareId?: string;
 }) {
   const projects = useProjects();
+  const configs = useServerConfigs();
+  const blockedInitialVm = [...configs].some(
+    ([id, config]) =>
+      id === props.initialProjectRef?.environmentId && !canCreateThreadInEnvironment(config),
+  );
   const flow = useNewTaskFlow();
   const navigation = useNavigation();
   const {
@@ -1756,6 +1762,17 @@ export function NewTaskDraftScreen(props: {
       <FilePreviewModal source={previewFile} onRequestClose={closeMediaPreview} />
     </View>
   );
+
+  if (blockedInitialVm)
+    return (
+      <View className="flex-1 gap-4 bg-sheet p-6">
+        <Text className="text-lg font-semibold">This VM belongs to an existing thread</Text>
+        <Text>Start a thread on your machine, then use Run on to move it to a private VM.</Text>
+        <Pressable accessibilityRole="button" onPress={closeNewTask}>
+          <Text className="text-primary">Back</Text>
+        </Pressable>
+      </View>
+    );
 
   if (isAndroid) {
     return (

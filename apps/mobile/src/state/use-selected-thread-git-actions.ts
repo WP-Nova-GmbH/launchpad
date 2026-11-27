@@ -26,7 +26,7 @@ import { showGitActionResult } from "./use-vcs-action-state";
 import { useThreadSelection } from "./use-thread-selection";
 import { useSelectedThreadWorktree } from "./use-selected-thread-worktree";
 
-export function useSelectedThreadGitActions() {
+export function useSelectedThreadGitActions(enabled = true) {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -39,7 +39,7 @@ export function useSelectedThreadGitActions() {
   const { selectedThreadCwd, selectedThreadWorktreePath } = useSelectedThreadWorktree();
   const runStackedAction = useAtomCommand(
     vcsActionManager.runStackedAction({
-      environmentId: selectedThread?.environmentId ?? null,
+      environmentId: enabled ? (selectedThread?.environmentId ?? null) : null,
       cwd: selectedThreadCwd,
     }),
     { reportFailure: false },
@@ -48,11 +48,11 @@ export function useSelectedThreadGitActions() {
   const selectedThreadGitRootCwd = selectedThreadProject?.workspaceRoot ?? null;
   const branchTarget = useMemo(
     () => ({
-      environmentId: selectedThread?.environmentId ?? null,
+      environmentId: enabled ? (selectedThread?.environmentId ?? null) : null,
       cwd: selectedThreadGitRootCwd,
       query: null,
     }),
-    [selectedThread?.environmentId, selectedThreadGitRootCwd],
+    [enabled, selectedThread?.environmentId, selectedThreadGitRootCwd],
   );
   const branchState = useBranches(branchTarget);
   const updateThreadGitContext = useCallback(
@@ -77,7 +77,7 @@ export function useSelectedThreadGitActions() {
 
   const refreshSelectedThreadGitStatus = useCallback(
     async (options?: { readonly quiet?: boolean; readonly cwd?: string | null }) => {
-      if (!selectedThread || !selectedThreadProject) {
+      if (!enabled || !selectedThread || !selectedThreadProject) {
         return null;
       }
 
@@ -112,15 +112,15 @@ export function useSelectedThreadGitActions() {
       setPendingConnectionError(null);
       return result.value;
     },
-    [refreshStatus, selectedThread, selectedThreadCwd, selectedThreadProject],
+    [enabled, refreshStatus, selectedThread, selectedThreadCwd, selectedThreadProject],
   );
 
   useEffect(() => {
-    if (!selectedThread || !selectedThreadProject) {
+    if (!enabled || !selectedThread || !selectedThreadProject) {
       return;
     }
     void refreshSelectedThreadGitStatus({ quiet: true });
-  }, [refreshSelectedThreadGitStatus, selectedThread, selectedThreadProject]);
+  }, [enabled, refreshSelectedThreadGitStatus, selectedThread, selectedThreadProject]);
 
   const runSelectedThreadGitMutation = useCallback(
     async <T, E>(
@@ -133,7 +133,7 @@ export function useSelectedThreadGitActions() {
       }) => Promise<AtomCommandResult<T, E>>,
       options?: { readonly managedExternally?: boolean },
     ): Promise<T | null> => {
-      if (!selectedThread || !selectedThreadProject || !selectedThreadCwd) {
+      if (!enabled || !selectedThread || !selectedThreadProject || !selectedThreadCwd) {
         return null;
       }
 
@@ -161,7 +161,7 @@ export function useSelectedThreadGitActions() {
       }
       return result.value;
     },
-    [selectedThread, selectedThreadCwd, selectedThreadProject],
+    [enabled, selectedThread, selectedThreadCwd, selectedThreadProject],
   );
 
   const refreshSelectedThreadBranches = useCallback(async (): Promise<ReadonlyArray<VcsRef>> => {

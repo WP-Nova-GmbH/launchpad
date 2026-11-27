@@ -26,6 +26,14 @@ import {
   resolveLatestProviderVersion,
 } from "../providerMaintenance.ts";
 import { CodexDriver } from "./CodexDriver.ts";
+import {
+  ThreadVmCodexAuthContext,
+  ThreadVmCodexAuthSourceError,
+} from "../../relay/ThreadVmCodexAuthSource.ts";
+import {
+  OrganizationProviderAccounts,
+  none as noOrganizationAccounts,
+} from "../../relay/OrganizationProviderAccounts.ts";
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-codex-driver-maintenance-",
@@ -368,5 +376,67 @@ it.layer(testLayer)("CodexDriver", (it) => {
         }
       }).pipe(Effect.scoped),
     { skip: windowsHost },
+  );
+});
+
+it.layer(testLayer)("organization-managed CodexDriver", (it) => {
+  it.effect("never copies legacy credentials and omits native account controls", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "managed-codex-driver-" });
+      const instance = yield* CodexDriver.create({
+        instanceId: ProviderInstanceId.make("managed-codex"),
+        displayName: undefined,
+        enabled: false,
+        environment: [],
+        config: { ...CodexDriver.defaultConfig(), homePath: home },
+      });
+      expect(instance.accountAuth).toBeUndefined();
+      expect(instance.accountExport).toBeUndefined();
+      expect(instance.consumeResetCredit).toBeUndefined();
+      expect(yield* fs.exists(NodePath.join(home, "auth.json"))).toBe(false);
+    }).pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+      Effect.provideService(OrganizationProviderAccounts, {
+        ...noOrganizationAccounts,
+        current: Effect.die("Managed Codex must not access legacy renewable credentials"),
+      }),
+      Effect.provideService(ThreadVmCodexAuthContext, {
+        current: Effect.succeed({
+          connectionId: "connection",
+          label: "Organization account",
+          status: Effect.die("Disabled provider must not probe"),
+          preflight: Effect.void,
+        }),
+        refresh: Effect.succeed(false),
+        markApplied: Effect.void,
+        withReloadLock: (effect) => effect,
+        personalPreflight: Effect.void,
+      }),
+      Effect.scoped,
+    ),
+  );
+
+  it.effect("fails an unverified VM source instead of constructing a personal provider", () =>
+    Effect.gen(function* () {
+      const error = yield* CodexDriver.create({
+        instanceId: ProviderInstanceId.make("managed-codex"),
+        displayName: undefined,
+        enabled: false,
+        environment: [],
+        config: CodexDriver.defaultConfig(),
+      }).pipe(Effect.flip);
+      expect(error.detail).toContain("Could not verify");
+    }).pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn),
+      Effect.provideService(ThreadVmCodexAuthContext, {
+        current: Effect.fail(new ThreadVmCodexAuthSourceError({ reason: "unavailable" })),
+        refresh: Effect.succeed(false),
+        markApplied: Effect.void,
+        withReloadLock: (effect) => effect,
+        personalPreflight: Effect.void,
+      }),
+      Effect.scoped,
+    ),
   );
 });

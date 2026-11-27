@@ -4,6 +4,11 @@ status: accepted
 
 # Executors are long-lived environments, not ephemeral workers
 
+This decision describes the existing managed executor model. The planned replacement in
+[ADR-0021](./0021-self-hosted-e2b-replaces-managed-machine-provisioning.md) uses per-thread
+VMs and supersedes that provisioning choice once implemented; the state-preservation
+constraints below still apply.
+
 The relay is growing into an org control plane that provisions the compute agents run
 on. We considered making those machines ephemeral — created per run and destroyed
 afterwards — which is the natural shape for a pipeline product. We rejected it: an

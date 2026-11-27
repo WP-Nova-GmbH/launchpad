@@ -10,6 +10,8 @@ import * as Option from "effect/Option";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 
+import type { ConfirmShutdownInput } from "../../persistence/ProviderSessionRuntime.ts";
+
 import type {
   ProviderSessionDirectoryPersistenceError,
   ProviderValidationError,
@@ -43,6 +45,7 @@ export type ProviderSessionDirectoryWriteError =
 
 export interface ProviderSessionDirectoryUpsertOptions {
   readonly onConflict?: "update" | "ignore";
+  readonly expectedRuntimeEpisode?: string;
 }
 
 export interface ProviderSessionDirectoryShape {
@@ -50,6 +53,10 @@ export interface ProviderSessionDirectoryShape {
     binding: ProviderRuntimeBinding,
     options?: ProviderSessionDirectoryUpsertOptions,
   ) => Effect.Effect<void, ProviderSessionDirectoryWriteError>;
+
+  readonly confirmShutdown: (
+    input: ConfirmShutdownInput,
+  ) => Effect.Effect<boolean, ProviderSessionDirectoryPersistenceError>;
 
   /** Record an imported file without changing the current provider session. */
   readonly recordImportedTranscript: (input: {

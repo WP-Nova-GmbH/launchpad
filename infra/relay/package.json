@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "node --env-file-if-exists=.env scripts/dev-server.ts",
     "db:migrate": "node --env-file-if-exists=.env node_modules/drizzle-kit/bin.cjs migrate",
+    "vm:migration": "node scripts/thread-vm-migration.ts",
     "deploy": "alchemy deploy",
     "push:android:smoke": "node scripts/android-push-smoke.ts",
     "push:android:watch": "node scripts/android-push-watch.ts",
@@ -23,7 +24,10 @@
     "@t3tools/shared": "workspace:*",
     "alchemy": "2.0.0-beta.79",
     "drizzle-orm": "1.0.0-rc.5-ab785fc",
-    "effect": "catalog:"
+    "e2b": "2.61.0",
+    "effect": "catalog:",
+    "jose": "catalog:",
+    "tldts": "7.4.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260601.1",

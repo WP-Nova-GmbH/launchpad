@@ -997,14 +997,13 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
       : null,
     clientSession.client.os ?? null,
     clientSession.client.browser ?? null,
-    clientSession.client.ipAddress ?? null,
   ].filter((value): value is string => value !== null);
   const deviceLabel =
     clientSession.client.label ??
     ([clientSession.client.os, clientSession.client.browser].filter(Boolean).join(" · ") ||
       clientSession.subject);
   const personLabel = clientSession.user?.displayName ?? null;
-  const primaryLabel = personLabel ? `${personLabel} · ${deviceLabel}` : deviceLabel;
+  const primaryLabel = personLabel ?? deviceLabel;
 
   return (
     <div className={accessRowClassName(presentation)}>
@@ -1023,15 +1022,23 @@ const ConnectedClientListRow = memo(function ConnectedClientListRow({
               </span>
             ) : null}
           </div>
-          <p className="text-xs text-muted-foreground">
-            {deviceInfoBits.length > 0 ? (
-              <>
-                {deviceInfoBits.join(" · ")}
-                <span aria-hidden> · </span>
-              </>
-            ) : null}
+          {personLabel ? <p className="text-xs text-muted-foreground">{deviceLabel}</p> : null}
+          {deviceInfoBits.length > 0 ? (
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              {deviceInfoBits.map((part) => (
+                <span key={part}>{part}</span>
+              ))}
+            </div>
+          ) : null}
+          {clientSession.client.ipAddress ? (
+            <p className="font-mono text-xs text-muted-foreground">
+              {clientSession.client.ipAddress}
+            </p>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+            <span className="text-muted-foreground">Access</span>
             <AccessScopeSummary scopes={clientSession.scopes} label="Client scopes" />
-          </p>
+          </div>
         </div>
         <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
           {primaryEnvironment ? (
@@ -1536,13 +1543,11 @@ function SavedBackendListRow({
   // Settings → Organization, so it wears that label instead of its transport
   // and this device cannot switch it off or remove it.
   const organizationMachine = environment.organizationMachine;
-  const subtitleText = [
+  const subtitleParts = [
     organizationMachine ? "Organization machine" : environmentTransportLabel(environment),
     resumingServerUpdate ? "Restarting" : status.text,
     enabled && versionMismatch ? serverVersion : null,
-  ]
-    .filter((value): value is string => value !== null)
-    .join(" · ");
+  ].filter((value): value is string => value !== null);
 
   // Only a connected, enabled machine can take a remote update; a switched-off
   // one keeps the version note so the icon is not a surprise later.
@@ -1563,13 +1568,15 @@ function SavedBackendListRow({
             render={
               <span
                 className={cn(
-                  "block truncate",
+                  "flex min-w-0 flex-wrap gap-x-4 gap-y-1",
                   enabled && status.tone === "error" && !resumingServerUpdate && "text-destructive",
                 )}
               />
             }
           >
-            {subtitleText}
+            {subtitleParts.map((part) => (
+              <span key={part}>{part}</span>
+            ))}
           </TooltipTrigger>
           <TooltipPopup side="top" className="whitespace-pre-wrap">
             {unsupported

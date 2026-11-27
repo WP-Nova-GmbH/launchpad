@@ -5,7 +5,10 @@ import { createContext, useContext, useMemo, useState, type ReactNode } from "re
 import { useEnvironments, type EnvironmentPresentation } from "../../state/environments";
 import { useProjects } from "../../state/entities";
 import { useMobileProjectGroupingSettings } from "../../state/project-grouping";
-import { toggleSettingsEnvironment } from "./settings-environment-filter.logic";
+import {
+  canManageSettingsWorkspace,
+  toggleSettingsEnvironment,
+} from "./settings-environment-filter.logic";
 
 export type SettingsTarget = EnvironmentPresentation & {
   readonly serverConfig: NonNullable<EnvironmentPresentation["serverConfig"]>;
@@ -14,7 +17,9 @@ export type SettingsTarget = EnvironmentPresentation & {
 function connectedSettingsTargets(environments: readonly EnvironmentPresentation[]) {
   return environments.filter(
     (entry): entry is SettingsTarget =>
-      entry.connection.phase === "connected" && entry.serverConfig !== null,
+      entry.connection.phase === "connected" &&
+      entry.serverConfig !== null &&
+      canManageSettingsWorkspace(entry.serverConfig.environment.capabilities),
   );
 }
 
@@ -31,7 +36,7 @@ const SettingsEnvironmentFilterContext = createContext<{
 } | null>(null);
 
 export function SettingsEnvironmentFilterProvider(props: { readonly children: ReactNode }) {
-  const { environments } = useEnvironments();
+  const { environments, presentationById } = useEnvironments();
   const projects = useProjects();
   const groupingSettings = useMobileProjectGroupingSettings();
   const groupingMode = groupingSettings.sidebarProjectGroupingMode;
@@ -40,10 +45,15 @@ export function SettingsEnvironmentFilterProvider(props: { readonly children: Re
   const projectGroups = useMemo(
     () =>
       buildProjectGroups({
-        projects,
+        projects: projects.filter((project) =>
+          canManageSettingsWorkspace(
+            presentationById.get(project.environmentId)?.serverConfig?.environment.capabilities,
+            project.id,
+          ),
+        ),
         settings: { sidebarProjectGroupingMode: groupingMode, sidebarProjectGroupingOverrides: {} },
       }),
-    [projects, groupingMode],
+    [projects, groupingMode, presentationById],
   );
   const availableTargets = useMemo(() => connectedSettingsTargets(environments), [environments]);
   const selectedTargets = useMemo(

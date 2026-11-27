@@ -36,6 +36,7 @@ import {
 } from "../../themePalette";
 import { cn } from "../../lib/utils";
 import { Button } from "../ui/button";
+import { isWindowAlertDialogOpen } from "../../lib/windowAlertDialog";
 import { Input } from "../ui/input";
 import { Switch } from "../ui/switch";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
@@ -643,9 +644,19 @@ export function ThemeEditorPanel({
         getThemeEditorColorFamily(inspection.role)?.label ?? getThemeRoleLabel(inspection.role),
       );
     };
-    const handlePointerOver = (event: PointerEvent) => {
+    const inspectionTarget = (event: Event) => {
       const target = event.target;
-      if (!(target instanceof Element) || target.closest("[data-theme-editor-panel]")) {
+      if (
+        isWindowAlertDialogOpen() ||
+        !(target instanceof Element) ||
+        target.closest("[data-theme-editor-panel]")
+      )
+        return null;
+      return target;
+    };
+    const handlePointerOver = (event: PointerEvent) => {
+      const target = inspectionTarget(event);
+      if (!target) {
         clearHover();
         return;
       }
@@ -671,8 +682,8 @@ export function ThemeEditorPanel({
       if (event.relatedTarget === null) clearHover();
     };
     const handlePointerDown = (event: PointerEvent) => {
-      const target = event.target;
-      if (!(target instanceof Element) || target.closest("[data-theme-editor-panel]")) return;
+      const target = inspectionTarget(event);
+      if (!target) return;
       event.preventDefault();
       event.stopPropagation();
       clearHoverTimer();
@@ -686,15 +697,14 @@ export function ThemeEditorPanel({
       shouldDisarmAfterClick = true;
     };
     const blockInspectedClick = (event: MouseEvent) => {
-      const target = event.target;
-      if (!(target instanceof Element) || target.closest("[data-theme-editor-panel]")) return;
+      if (!inspectionTarget(event)) return;
       event.preventDefault();
       event.stopPropagation();
       if (shouldDisarmAfterClick) setIsInspecting(false);
       shouldDisarmAfterClick = false;
     };
     const cancelInspection = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.key !== "Escape" || isWindowAlertDialogOpen()) return;
       event.preventDefault();
       clearHover();
       clearInspectorSelection();

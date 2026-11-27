@@ -636,7 +636,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       const threadDetail = yield* snapshotQuery.getThreadDetailById(ThreadId.make("thread-1"));
       assert.equal(threadDetail._tag, "Some");
       if (threadDetail._tag === "Some") {
-        assert.deepEqual(threadDetail.value, snapshot.threads[0]);
+        assert.deepEqual(threadDetail.value, { ...snapshot.threads[0]!, workflowJob: null });
       }
 
       const threadShell = yield* snapshotQuery.getThreadShellById(ThreadId.make("thread-1"));
@@ -2699,6 +2699,34 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("returns the effective pause state in workflow thread snapshots", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("workflow:pause-test:agent");
+      const sql = yield* SqlClient.SqlClient;
+      const query = yield* ProjectionSnapshotQuery;
+      yield* sql`INSERT INTO projection_threads
+        (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
+        VALUES (${threadId}, 'pause-test-project', 'Workflow thread', '{"provider":"codex","model":"gpt-5-codex"}',
+          'full-access', 'default', '2026-09-28T10:00:00Z', '2026-09-28T10:00:00Z')`;
+      yield* sql`INSERT INTO repository_workflow_jobs (job_id, thread_id, status, execution_reserved, record_json)
+        VALUES ('pause-test', ${threadId}, 'awaiting_review', 0,
+          '{"workflow":{"repositoryId":"repo-1"},"manualPause":{"state":"requested"}}')`;
+
+      const readWorkflowJob = query
+        .getThreadDetailSnapshot(threadId)
+        .pipe(Effect.map((snapshot) => Option.getOrThrow(snapshot).thread.workflowJob));
+      const review = { jobId: "pause-test", repositoryId: "repo-1", status: "awaiting_review" };
+      assert.deepEqual(yield* readWorkflowJob, review);
+
+      yield* sql`UPDATE repository_workflow_jobs
+        SET record_json = json_set(record_json, '$.manualPause.state', 'paused') WHERE thread_id = ${threadId}`;
+      assert.deepEqual(yield* readWorkflowJob, { ...review, status: "paused" });
+
+      yield* sql`UPDATE repository_workflow_jobs SET status = 'cancelled' WHERE thread_id = ${threadId}`;
+      assert.isNull(yield* readWorkflowJob);
+    }),
+  );
+
   it.effect("windows to the last N user-anchored turns with subagent turns riding along", () =>
     Effect.gen(function* () {
       yield* seedFanOutThread();
@@ -3602,6 +3630,46 @@ projectionSnapshotLayer("ProjectionSnapshotQuery activities by kind", (it) => {
         [["setup-live", "worktree-setup", { phase: "running" }]],
       );
       assert.deepEqual(yield* query.listActivitiesByKind("nope"), []);
+    }),
+  );
+});
+
+projectionSnapshotLayer("portable thread routing", (it) => {
+  it.effect("exposes durable ownership on active, individual and archived shells", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const query = yield* ProjectionSnapshotQuery;
+      const id = ThreadId.make("routing-marker-thread");
+      yield* sql`INSERT INTO projection_projects
+        (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+        VALUES ('routing-marker-project', 'Project', '/routing-marker', '[]', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z')`;
+      yield* sql`INSERT INTO projection_threads
+        (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, created_at, updated_at)
+        VALUES (${id}, 'routing-marker-project', 'Thread', '{"provider":"codex","model":"gpt-5"}',
+          'full-access', 'default', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z')`;
+      assert.isUndefined(Option.getOrThrow(yield* query.getThreadShellById(id)).relayRouting);
+      yield* sql`INSERT INTO thread_execution_fences
+        (thread_id, relay_url, environment_id, project_id, generation, operation_id, phase)
+        VALUES (${id}, 'https://relay.example.test', 'source', 'routing-marker-project', 3, 'enrollment-operation', 'frozen')`;
+      for (const phase of ["frozen", "active", "draining", "retired"] as const) {
+        yield* sql`UPDATE thread_execution_fences SET phase = ${phase} WHERE thread_id = ${id}`;
+        const expected = { relayUrl: "https://relay.example.test", generation: 3, phase };
+        assert.deepStrictEqual(
+          (yield* query.getShellSnapshot()).threads.find((thread) => thread.id === id)
+            ?.relayRouting,
+          expected,
+        );
+        assert.deepStrictEqual(
+          Option.getOrThrow(yield* query.getThreadShellById(id)).relayRouting,
+          expected,
+        );
+      }
+      yield* sql`UPDATE projection_threads SET archived_at = '2026-10-07T00:00:01Z' WHERE thread_id = ${id}`;
+      assert.deepStrictEqual(
+        (yield* query.getArchivedShellSnapshot()).threads.find((thread) => thread.id === id)
+          ?.relayRouting,
+        { relayUrl: "https://relay.example.test", generation: 3, phase: "retired" },
+      );
     }),
   );
 });

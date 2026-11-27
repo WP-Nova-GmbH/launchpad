@@ -24,14 +24,15 @@ export function useReviewHeaderPresentation(props: {
   readonly subtitle: string;
   readonly androidSubtitle: string;
   readonly selectedThreadCwd: string | null;
+  readonly workspaceEnabled: boolean;
   readonly selectedSection: ReviewSectionItem | null;
   readonly onRefresh: () => Promise<void>;
 }): ReviewHeaderPresentation {
   const { selectedThread } = useThreadSelection();
-  const gitState = useSelectedThreadGitState();
-  const gitActions = useSelectedThreadGitActions();
+  const gitState = useSelectedThreadGitState(props.workspaceEnabled);
+  const gitActions = useSelectedThreadGitActions(props.workspaceEnabled);
   const gitStatusQuery = useEnvironmentQuery(
-    selectedThread !== null && props.selectedThreadCwd !== null
+    props.workspaceEnabled && selectedThread !== null && props.selectedThreadCwd !== null
       ? vcsEnvironment.status({
           environmentId: selectedThread.environmentId,
           input: { cwd: props.selectedThreadCwd },
@@ -41,7 +42,7 @@ export function useReviewHeaderPresentation(props: {
   // The selection-based git hooks only apply when this review belongs to the
   // selected thread (it always does when reached from the thread's toolbar).
   const gitMenuAvailable =
-    selectedThread !== null && String(selectedThread.id) === String(props.threadId);
+    props.workspaceEnabled && selectedThread !== null && selectedThread.id === props.threadId;
   const gitMenu = useThreadGitMenuDefinition({
     environmentId: props.environmentId,
     threadId: props.threadId,

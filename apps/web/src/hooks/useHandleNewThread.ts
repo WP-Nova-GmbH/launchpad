@@ -1,10 +1,16 @@
+import { canCreateThreadInEnvironment } from "@t3tools/client-runtime/relay/portableThreadPresentation";
 import { useAtomValue } from "@effect/atom-react";
 import {
   scopedProjectKey,
   scopeProjectRef,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
-import { DEFAULT_SERVER_SETTINGS, type ScopedProjectRef, type ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_SERVER_SETTINGS,
+  type ScopedProjectRef,
+  type ServerConfig,
+  type ThreadId,
+} from "@t3tools/contracts";
 import { useParams, useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo } from "react";
 import {
@@ -30,6 +36,7 @@ import {
   resolveNewThreadModelSelectionOverride,
 } from "../lib/chatThreadActions";
 import { readT3ProjectFile } from "../lib/t3ProjectFileDefaults";
+import { canUseLiveProjectWorkspace } from "../lib/workflowResultGitAccess";
 import { environmentServerConfigsAtom } from "../state/server";
 import { resolveThreadRouteTarget } from "../threadRoutes";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";
@@ -40,6 +47,13 @@ interface NewThreadWorkspaceOptions {
   worktreePath?: string | null;
   envMode?: DraftThreadEnvMode;
   startFromOrigin?: boolean;
+}
+
+function canCreateThreadForProject(projectId: string, config: ServerConfig | undefined): boolean {
+  return (
+    canCreateThreadInEnvironment(config) &&
+    canUseLiveProjectWorkspace({ projectId, capabilities: config?.environment.capabilities })
+  );
 }
 
 // The workspace options the caller passed explicitly, shaped for the draft
@@ -77,9 +91,12 @@ export function useNewThreadHandler() {
       // prepared checkout, a task to write — addresses that one rather than looking the project
       // up again and finding whichever draft it happens to hold.
     ): Promise<{ draftId: DraftId; threadId: ThreadId } | null> => {
+      const config = environmentServerConfigs.get(projectRef.environmentId);
+      if (!canCreateThreadForProject(projectRef.projectId, config)) {
+        return Promise.resolve(null);
+      }
       const projects = readProjects();
-      const targetServerSettings =
-        environmentServerConfigs.get(projectRef.environmentId)?.settings ?? DEFAULT_SERVER_SETTINGS;
+      const targetServerSettings = config?.settings ?? DEFAULT_SERVER_SETTINGS;
       const {
         getComposerDraft,
         getDraftSessionByLogicalProjectKey,
@@ -451,7 +468,15 @@ export function useHandleNewThread() {
         : useComposerDraftStore.getState().getDraftSession(routeTarget.draftId)
       : null,
   );
-  const projects = useProjects();
+  const allProjects = useProjects();
+  const configs = useAtomValue(environmentServerConfigsAtom);
+  const projects = useMemo(
+    () =>
+      allProjects.filter((project) =>
+        canCreateThreadForProject(project.id, configs.get(project.environmentId)),
+      ),
+    [allProjects, configs],
+  );
   const orderedProjects = useMemo(() => {
     return orderItemsByPreferredIds({
       items: projects,
@@ -464,10 +489,16 @@ export function useHandleNewThread() {
     });
   }, [projectOrder, projects]);
   const handleNewThread = useNewThreadHandler();
+  const canCreateThreadInProject = useCallback(
+    (ref: ScopedProjectRef) =>
+      canCreateThreadForProject(ref.projectId, configs.get(ref.environmentId)),
+    [configs],
+  );
 
   return {
     activeDraftThread,
     activeThread,
+    canCreateThreadInProject,
     defaultProjectRef: orderedProjects[0]
       ? scopeProjectRef(orderedProjects[0].environmentId, orderedProjects[0].id)
       : null,
