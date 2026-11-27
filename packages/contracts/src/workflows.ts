@@ -892,6 +892,8 @@ export const SaveRepositoryWorkflow = Schema.Struct({
 });
 export const RunRepositoryWorkflow = Schema.Struct({
   workflowId: TrimmedNonEmptyString,
+  // Older clients did not identify the preview they reviewed.
+  expectedRevision: Schema.optionalKey(Revision),
   expectedTargetKind: Schema.Literals(["machine", "vm"]),
   instruction: Instruction,
   requestId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
@@ -934,6 +936,7 @@ export class WorkflowConflictError extends Schema.TaggedError<WorkflowConflictEr
   "WorkflowConflictError",
   {
     message: Schema.String,
+    workflowRevision: Schema.optionalKey(Revision),
   },
   { httpApiStatus: 409 },
 ) {}

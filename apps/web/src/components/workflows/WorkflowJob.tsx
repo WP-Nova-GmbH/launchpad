@@ -1478,6 +1478,7 @@ export function WorkflowJob({
       scope={scope}
       jobId={jobId}
       title={selectedJob.workflow?.definition.name ?? "Workflow workspace"}
+      organizationAdmin={organizationAdmin}
       onWorkspaceUnavailable={onWorkspaceUnavailable}
       savedResultsAction={savedResultsAction}
     />

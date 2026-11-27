@@ -160,7 +160,8 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
   it.live("admits one queued job and replays it after the gate or prerequisites change", () =>
     testAdmission(
       Effect.gen(function* () {
-        const run = runRepositoryWorkflow("repo", request);
+        const reviewed = { ...request, expectedRevision: 1 };
+        const run = runRepositoryWorkflow("repo", reviewed);
         const [first, second] = yield* Effect.all([run, run], { concurrency: 2 });
         expect(first.jobId).toBe(second.jobId);
         expect(first).toMatchObject({
@@ -168,6 +169,12 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
           runtime: null,
           vmAdmission: { codexConnectionId: "codex", hasSecrets: false },
         });
+        yield* saveRepositoryWorkflow("repo", {
+          workflowId: request.workflowId,
+          expectedRevision: 1,
+          definition: { ...definition, target: { kind: "vm", baseBranch: "release/next" } },
+          archived: false,
+        }).pipe(withPrincipal("maintainer"));
         const sql = (yield* RelayDb).$client;
         yield* sql`UPDATE relay_codex_vm_connections SET status='disconnected' WHERE organization_id='org'`;
         yield* sql`INSERT INTO relay_repository_workflow_configurations VALUES
@@ -176,7 +183,7 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
         const gateOff = Effect.provideService(ThreadVmRuntimeConfiguration, {
           settings: undefined,
         });
-        const replay = yield* runRepositoryWorkflow("repo", { ...request, replayOnly: true }).pipe(
+        const replay = yield* runRepositoryWorkflow("repo", { ...reviewed, replayOnly: true }).pipe(
           gateOff,
         );
         expect(replay.jobId).toBe(first.jobId);
@@ -186,6 +193,32 @@ describe.skipIf(!databaseUrl)("manual VM admission (PostgreSQL)", () => {
         }).pipe(gateOff, Effect.flip);
         expect(conflict._tag).toBe("WorkflowConflictError");
         expect(yield* (yield* Workflows).listJobs("repo")).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.live("rejects a stale reviewed revision before creating a job", () =>
+    testAdmission(
+      Effect.gen(function* () {
+        const latest = yield* saveRepositoryWorkflow("repo", {
+          workflowId: request.workflowId,
+          expectedRevision: 1,
+          definition: { ...definition, target: { kind: "vm", baseBranch: "release/next" } },
+          archived: false,
+        }).pipe(withPrincipal("maintainer"));
+        const rejection = yield* runRepositoryWorkflow("repo", {
+          ...request,
+          expectedRevision: 1,
+        }).pipe(Effect.flip);
+        expect(rejection).toMatchObject({
+          _tag: "WorkflowConflictError",
+          workflowRevision: latest.revision,
+        });
+        expect(yield* (yield* Workflows).listJobs("repo")).toHaveLength(0);
+
+        expect(
+          yield* runRepositoryWorkflow("repo", { ...request, expectedRevision: latest.revision }),
+        ).toMatchObject({ status: "queued" });
       }),
     ),
   );

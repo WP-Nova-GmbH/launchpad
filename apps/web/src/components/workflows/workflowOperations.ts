@@ -401,6 +401,9 @@ async function checkEarlierWorkflowRun(
       workflowId: id,
       instruction: attempt.instruction,
       expectedTargetKind: "vm",
+      ...(attempt.expectedRevision !== undefined
+        ? { expectedRevision: attempt.expectedRevision }
+        : {}),
       requestId: attempt.requestId,
       replayOnly: true,
     });
@@ -418,6 +421,7 @@ export async function runWorkflowDraft(
     | {
         kind: "start";
         targetKind: WorkflowTarget["kind"];
+        expectedRevision: number;
         replaceUncertain?: boolean;
         retryStart?: boolean;
       }
@@ -453,6 +457,7 @@ export async function runWorkflowDraft(
       requestId: randomUUID(),
       state: "pending",
       instruction: draft.instruction,
+      expectedRevision: intent.expectedRevision,
       ...(intent.targetKind === "vm" ? { targetKind: "vm" } : {}),
     };
   }
@@ -474,6 +479,7 @@ export async function runWorkflowDraft(
           recovery,
           error: null,
           startedJobId: null,
+          runRevisionConflict: intent.kind === "start" ? undefined : draft.runRevisionConflict,
           vmStartFailure: retryingStart ? draft.vmStartFailure : undefined,
           vmStartFailureRevision: retryingStart ? draft.vmStartFailureRevision : undefined,
         },
@@ -486,6 +492,9 @@ export async function runWorkflowDraft(
       workflowId: id,
       instruction: operation.instruction,
       expectedTargetKind: operation.targetKind ?? "machine",
+      ...(operation.expectedRevision !== undefined
+        ? { expectedRevision: operation.expectedRevision }
+        : {}),
       ...(operation.targetKind === "vm" ? { requestId: operation.requestId } : {}),
       ...(intent.kind === "recover" && intent.replayOnly ? { replayOnly: true } : {}),
     });
@@ -520,6 +529,10 @@ export async function runWorkflowDraft(
     const rejected =
       intent.kind === "start" &&
       (cause instanceof WorkflowRequestNotSentError || definitiveRejection(cause));
+    const revisionConflict =
+      isRequestFailed(cause) && cause.transportFailed !== true && isConflict(cause.cause)
+        ? cause.cause.workflowRevision
+        : undefined;
     const vmStartRejection =
       rejected &&
       !previous &&
@@ -547,6 +560,7 @@ export async function runWorkflowDraft(
                 : undefined,
             startedJobId: rejected ? draft.startedJobId : current.startedJobId,
             error: workflowError(cause),
+            runRevisionConflict: revisionConflict ?? current.runRevisionConflict,
             vmStartFailure: vmStartRejection?.vmStartFailure,
             vmStartFailureRevision: vmStartRejection?.vmStartFailureRevision,
           },

@@ -165,7 +165,11 @@ describe("workflow writes surviving navigation", () => {
   it("keeps one Run request in flight and retains its acknowledged job link after unmount", async () => {
     const result = deferred<RepositoryWorkflowJob>();
     const start = vi.fn(() => result.promise);
-    const intent = { kind: "start", targetKind: "machine" } as const;
+    const intent = {
+      kind: "start",
+      targetKind: "machine",
+      expectedRevision: saved.revision,
+    } as const;
     const pending = runWorkflowDraft(scope, saved.workflowId, intent, start);
     expect(await runWorkflowDraft(scope, saved.workflowId, intent, start)).toBeNull();
     expect(start).toHaveBeenCalledTimes(1);
@@ -187,7 +191,7 @@ describe("workflow writes surviving navigation", () => {
       await runWorkflowDraft(
         scope,
         saved.workflowId,
-        { kind: "start", targetKind: "machine" },
+        { kind: "start", targetKind: "machine", expectedRevision: saved.revision },
         start,
       ),
     ).toBeNull();
@@ -199,7 +203,7 @@ describe("workflow writes surviving navigation", () => {
     });
   });
   it("keeps a temporary VM blocker and its instructions until the retry is acknowledged", async () => {
-    const intent = { kind: "start", targetKind: "vm" } as const;
+    const intent = { kind: "start", targetKind: "vm", expectedRevision: saved.revision } as const;
     const vmStartFailure = { kind: "github-verification-temporary" } as const;
     const start = vi.fn(async () => {
       throw new ManagedRelay.ManagedRelayRequestFailedError({
@@ -242,7 +246,7 @@ describe("workflow writes surviving navigation", () => {
     await runWorkflowDraft(
       scope,
       saved.workflowId,
-      { kind: "start", targetKind: "vm" },
+      { kind: "start", targetKind: "vm", expectedRevision: saved.revision },
       async () => {
         throw new ManagedRelay.ManagedRelayRequestFailedError({
           action: "runWorkflow",
@@ -275,7 +279,7 @@ describe("workflow writes surviving navigation", () => {
     const lostReply = async () => {
       throw new Error("Reply lost");
     };
-    const start = { kind: "start", targetKind: "vm" } as const;
+    const start = { kind: "start", targetKind: "vm", expectedRevision: saved.revision } as const;
     const additional = { ...start, replaceUncertain: true };
     await runWorkflowDraft(scope, saved.workflowId, start, lostReply);
     const originalId = run().operation!.requestId;
@@ -374,7 +378,7 @@ describe("workflow writes surviving navigation", () => {
     const pending = runWorkflowDraft(
       scope,
       saved.workflowId,
-      { kind: "start", targetKind: "machine" },
+      { kind: "start", targetKind: "machine", expectedRevision: saved.revision },
       () => result.promise,
     );
     setWorkflowSessionAccount(appAtomRegistry, "different-account");

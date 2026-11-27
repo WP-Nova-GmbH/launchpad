@@ -21,7 +21,7 @@ function deferred<T>() {
 const fixture = vi.hoisted(() => ({
   session: { accountId: "owner" },
   relayUrl: "https://relay.example.test",
-  index: { entries: [] as RelayPortableThreadSummary[], next: null },
+  index: { entries: [] as RelayPortableThreadSummary[], next: null as string | null },
   placement: null as RelayPortableThreadSummary["placement"] | null,
   detail: {
     history: { thread: { messages: [] }, deleted: false },
@@ -503,14 +503,29 @@ for (const [surface, Component] of [
       ["paused", "Resume VM", "resume"],
       ["saved", "Restore VM", "restore"],
     ] as const)(
-      "preserves the %s recovery action and opens the saved view afterward",
+      "opens a %s conversation from a later page and keeps the page when returning",
       async (state, label, action) => {
-        fixture.index.entries = [entry("First", state)];
+        const first = entry("First");
+        const older = entry("Older", state);
+        fixture.index = { entries: [first], next: "second-page" };
+        fixture.commands.loadIndex.mockImplementation(async (input) => {
+          fixture.index =
+            input.after === "second-page" || input.preserveLoadedPages
+              ? { entries: [first, older], next: "third-page" }
+              : { entries: [first], next: "second-page" };
+          return { _tag: "Success", value: null };
+        });
         await render();
+        expect(content()).not.toContain("Older");
+        await click("More threads");
+        await render();
+        expect(content()).toContain("Older");
         await click(label);
+        expect(content()).toContain("Older");
+        expect(content()).not.toContain("First");
         expect(fixture.run).toHaveBeenCalledWith(
           expect.objectContaining({
-            threadId: "First",
+            threadId: "Older",
             environmentId: "vm",
             action: expect.objectContaining({ type: action }),
           }),
@@ -526,9 +541,13 @@ for (const [surface, Component] of [
               }),
             }),
           );
-        expect(fixture.commands.loadIndex).toHaveBeenCalledTimes(2);
-        expect(fixture.commands.loadHistory).toHaveBeenCalledWith({ threadId: "First" });
+        expect(fixture.commands.loadIndex).toHaveBeenLastCalledWith({ preserveLoadedPages: true });
+        expect(fixture.commands.loadHistory).toHaveBeenCalledWith({ threadId: "Older" });
         expect(fixture.commands.openChat).not.toHaveBeenCalled();
+        await click("All threads");
+        expect(content()).toContain("First");
+        expect(content()).toContain("Older");
+        expect(content()).toContain("More threads");
       },
     );
 

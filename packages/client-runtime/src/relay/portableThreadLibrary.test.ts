@@ -515,6 +515,148 @@ describe("retained conversation view", () => {
         }),
       ),
   );
+  it.effect("refreshes loaded pages without resetting the list or reading later pages", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const newer = { ...summary, placement: { ...summary.placement, threadId: "a-newer" } };
+        const cursors: Array<string | null> = [];
+        let refreshed = false;
+        let failSecondPage = false;
+        const h = yield* harness(async (url, init) => {
+          const cursor = new URL(new Request(url, init).url).searchParams.get("after");
+          cursors.push(cursor);
+          switch (cursor) {
+            case null:
+              return Response.json({ entries: [newer], next: "second-page" });
+            case "second-page":
+              return failSecondPage
+                ? new Response(null, { status: 503 })
+                : Response.json({
+                    entries: [
+                      { ...summary, vm: { ...vmSummary, state: refreshed ? "running" : "saved" } },
+                    ],
+                    next: "third-page",
+                  });
+            default:
+              throw new Error(`Unexpected page ${cursor}`);
+          }
+        });
+        yield* Effect.promise(() => h.library.loadIndex.run(h.registry, {}));
+        yield* Effect.promise(() => h.library.loadIndex.run(h.registry, { after: "second-page" }));
+
+        failSecondPage = true;
+        expect(
+          (yield* Effect.promise(() =>
+            h.library.loadIndex.run(h.registry, { preserveLoadedPages: true }),
+          ))._tag,
+        ).toBe("Failure");
+        expect(h.registry.get(h.library.indexAtom)?.entries).toMatchObject([
+          { placement: newer.placement },
+          { placement: summary.placement, vm: { state: "saved" } },
+        ]);
+
+        failSecondPage = false;
+        refreshed = true;
+        yield* Effect.promise(() =>
+          h.library.loadIndex.run(h.registry, { preserveLoadedPages: true }),
+        );
+        expect(h.registry.get(h.library.indexAtom)).toMatchObject({
+          entries: [
+            { placement: newer.placement },
+            { placement: summary.placement, vm: { state: "running" } },
+          ],
+          next: "third-page",
+        });
+        expect(cursors).toEqual([null, "second-page", null, "second-page", null, "second-page"]);
+      }),
+    ),
+  );
+  it.effect.each([false, true])(
+    "keeps the previous range when a new thread shifts its page boundary (removed: %s)",
+    (removed) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const first = { ...summary, placement: { ...summary.placement, threadId: "first" } };
+          const inserted = { ...summary, placement: { ...summary.placement, threadId: "a-new" } };
+          const later = { ...summary, placement: { ...summary.placement, threadId: "tail" } };
+          const unread = { ...summary, placement: { ...summary.placement, threadId: "unread" } };
+          const cursors: Array<string | null> = [];
+          let insertedBeforeRefresh = false;
+          const h = yield* harness(async (url, init) => {
+            const search = new URL(new Request(url, init).url).searchParams;
+            const cursor = search.get("after");
+            cursors.push(cursor);
+            if (removed && insertedBeforeRefresh && cursor !== later.placement.threadId)
+              expect(search.get("boundary")).toBe(summary.placement.threadId);
+            const withBoundary = (reachedBoundary: boolean) =>
+              removed && insertedBeforeRefresh ? { reachedBoundary } : {};
+            if (cursor === null && insertedBeforeRefresh) {
+              return Response.json({
+                entries: [inserted],
+                next: inserted.placement.threadId,
+                ...withBoundary(false),
+              });
+            }
+            if (cursor === null || cursor === inserted.placement.threadId) {
+              return Response.json({
+                entries: [first],
+                next: first.placement.threadId,
+                ...withBoundary(false),
+              });
+            }
+            if (cursor === first.placement.threadId) {
+              return removed && insertedBeforeRefresh
+                ? Response.json({
+                    entries: [later],
+                    next: later.placement.threadId,
+                    ...withBoundary(true),
+                  })
+                : Response.json({ entries: [summary], next: summary.placement.threadId });
+            }
+            if (cursor === later.placement.threadId) {
+              return Response.json({ entries: [unread], next: unread.placement.threadId });
+            }
+            throw new Error(`Unexpected page ${cursor}`);
+          });
+          yield* Effect.promise(() => h.library.loadIndex.run(h.registry, {}));
+          yield* Effect.promise(() =>
+            h.library.loadIndex.run(h.registry, { after: first.placement.threadId }),
+          );
+
+          insertedBeforeRefresh = true;
+          const result = yield* Effect.promise(() =>
+            h.library.loadIndex.run(h.registry, { preserveLoadedPages: true }),
+          );
+          expect(result._tag).toBe("Success");
+          expect(
+            h.registry.get(h.library.indexAtom)?.entries.map((entry) => entry.placement.threadId),
+          ).toEqual([
+            inserted.placement.threadId,
+            first.placement.threadId,
+            removed ? later.placement.threadId : summary.placement.threadId,
+          ]);
+          expect(h.registry.get(h.library.indexAtom)?.next).toBe(
+            removed ? later.placement.threadId : summary.placement.threadId,
+          );
+          expect(cursors).toEqual([
+            null,
+            first.placement.threadId,
+            null,
+            inserted.placement.threadId,
+            first.placement.threadId,
+          ]);
+          if (removed) {
+            yield* Effect.promise(() =>
+              h.library.loadIndex.run(h.registry, { after: later.placement.threadId }),
+            );
+            expect(h.registry.get(h.library.indexAtom)?.entries.at(-1)?.placement.threadId).toBe(
+              unread.placement.threadId,
+            );
+            expect(h.registry.get(h.library.indexAtom)?.next).toBe(unread.placement.threadId);
+          }
+        }),
+      ),
+  );
   it.effect("refreshes only new relay events and preserves earlier authors and attachments", () =>
     Effect.scoped(
       Effect.gen(function* () {

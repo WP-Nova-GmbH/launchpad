@@ -673,6 +673,11 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
     workflow.organizationId !== organizationId
   )
     return yield* tenancyNotFound("repository_not_found");
+  if (payload.expectedRevision !== undefined && payload.expectedRevision !== workflow.revision)
+    return yield* new WorkflowConflictError({
+      message: "The saved workflow changed. Review it and try again.",
+      workflowRevision: workflow.revision,
+    });
   if (workflow.archived)
     return yield* new WorkflowInvalidError({ message: "Restore this workflow before running it." });
   if (workflow.definition.target.kind !== payload.expectedTargetKind)
@@ -770,6 +775,7 @@ const admitRepositoryWorkflow = Effect.fn("WorkflowsApi.admitManual")(function* 
     {
       expectedRevision: workflow.revision,
       expectedTargetKind: payload.expectedTargetKind,
+      hasReviewedRevision: payload.expectedRevision !== undefined,
       ...(vm ? { vm } : {}),
     },
   );

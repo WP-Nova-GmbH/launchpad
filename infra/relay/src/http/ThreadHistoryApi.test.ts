@@ -35,9 +35,14 @@ const membership = Effect.fnUntraced(function* (userId: string, role = "admin") 
   yield* sql`INSERT INTO relay_organization_members(organization_id,user_id,role,created_at,updated_at)
     VALUES('org',${userId},${role},'now','now')`;
 });
-const listAs = Effect.fnUntraced(function* (userId: string, after?: string, limit = 100) {
+const listAs = Effect.fnUntraced(function* (
+  userId: string,
+  after?: string,
+  limit = 100,
+  boundary?: string,
+) {
   const db = yield* PgDrizzle.makeWithDefaults();
-  return yield* listPortableThreads({ limit, ...(after === undefined ? {} : { after }) }).pipe(
+  return yield* listPortableThreads({ limit, after, boundary }).pipe(
     Effect.provideService(RelayDb, db),
     Effect.provideService(RelayClientPrincipal, { userId, token: "test" }),
   );
@@ -496,8 +501,8 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
               yield* sql`INSERT INTO relay_thread_vm_allocations(allocation_id,thread_id,organization_id,owner_user_id,template_id,compute_ref,state)
               VALUES(${NodeCrypto.randomUUID()},${id},'org',${owner},'template',${`compute-${id}`},${index === 1 ? "paused" : "creating"})`;
             yield* enroll(foreign);
-            yield* sql`INSERT INTO relay_thread_deletions(thread_id,operation_id,owner_user_id,generation,host_id,phase)
-        VALUES(${ids[2]},${NodeCrypto.randomUUID()},${owner},1,'host','stopping')`;
+            yield* sql`INSERT INTO relay_thread_deletions(thread_id,operation_id,owner_user_id,requester_user_id,generation,host_id,phase)
+        VALUES(${ids[2]},${NodeCrypto.randomUUID()},${owner},${owner},1,'host','stopping')`;
             yield* sql`INSERT INTO relay_thread_local_enrollments(thread_id,operation_id,phase)
         VALUES(${ids[3]},${NodeCrypto.randomUUID()},'aborted')`;
             const first = yield* listAs(owner, undefined, 1);
@@ -521,6 +526,31 @@ describe.skipIf(!process.env.LAUNCHPAD_VM_TEST_DATABASE_URL)(
             yield* sql`DELETE FROM relay_organization_members WHERE user_id=${foreign}`;
             expect(yield* listAs(foreign)).toEqual({ entries: [], next: null });
           }),
+      );
+      it.effect("reports passing an absent boundary while preserving later pages", () =>
+        Effect.gen(function* () {
+          const owner = NodeCrypto.randomUUID();
+          yield* membership(owner);
+          const first = yield* enroll(owner, `a-${owner}`);
+          const passed = yield* enroll(owner, `c-${owner}`);
+          const later = yield* enroll(owner, `d-${owner}`);
+          yield* enroll(owner, `e-${owner}`);
+          const boundary = `b-${owner}`;
+          const initial = yield* listAs(owner, undefined, 1, boundary);
+          expect(initial).toMatchObject({ next: first, reachedBoundary: false });
+          const crossing = yield* listAs(owner, first, 1, boundary);
+          expect(crossing).toMatchObject({
+            entries: [{ placement: { threadId: passed } }],
+            next: passed,
+            reachedBoundary: true,
+          });
+          const unread = yield* listAs(owner, passed, 1);
+          expect(unread).toMatchObject({
+            entries: [{ placement: { threadId: later } }],
+            next: later,
+          });
+          expect(unread.reachedBoundary).toBeUndefined();
+        }),
       );
       it.effect(
         "shows initial VM metadata before setup and orders later renames by relay cursor across moves",

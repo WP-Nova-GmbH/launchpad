@@ -41,6 +41,7 @@ import {
   editWorkflowRun,
   runWorkflowDraft,
   workflowRunPending,
+  workflowMachineCheckoutIssue,
 } from "./workflowState";
 import type { RelayOrganizationProject } from "@t3tools/contracts/relay";
 import { appAtomRegistry } from "../../rpc/atomRegistry";
@@ -50,7 +51,11 @@ type WorkflowRunProps = {
   scope: WorkflowScope;
   workflow: RepositoryWorkflow;
   projects: ReadonlyArray<RelayOrganizationProject>;
+  projectsUnavailable?: boolean;
+  refreshProjects?: () => void;
   call: ReturnType<typeof useWorkflowClient>;
+  refreshWorkflow: () => Promise<void>;
+  workflowRefreshFailed?: boolean;
   vmExecutionAvailable?: boolean;
   canConfigure?: boolean;
   organizationAdmin?: boolean;
@@ -78,8 +83,33 @@ const latestAdditionalRunContexts = new WeakMap<
   string
 >();
 
+type RemovedRunFocus = { key: string; element: Element };
+
 export function WorkflowRun(props: WorkflowRunProps) {
+  const removedRecoveryFocus = useRef<RemovedRunFocus | null>(null);
   const { workflow, vmExecutionAvailable } = props;
+  const key = workflowSessionKey(props.scope, workflow.workflowId);
+  const registerRecoveryRegion = useCallback(
+    (node: HTMLElement | null) => {
+      if (!node) return;
+      return () => {
+        const focused = node.ownerDocument.activeElement;
+        if (focused && node.contains(focused))
+          removedRecoveryFocus.current = { key, element: focused };
+      };
+    },
+    [key],
+  );
+  const restoreRemovedFocus = useCallback(
+    (target: HTMLElement | null) => {
+      const previous = removedRecoveryFocus.current;
+      removedRecoveryFocus.current = null;
+      if (!previous || previous.key !== key) return;
+      const { activeElement, body } = previous.element.ownerDocument;
+      if (activeElement === previous.element || activeElement === body) target?.focus();
+    },
+    [key],
+  );
   const kind = workflow.definition.target.kind;
   const vmUnavailable = kind === "vm" && !vmExecutionAvailable;
   return (
@@ -90,6 +120,8 @@ export function WorkflowRun(props: WorkflowRunProps) {
       )}
       {...props}
       vmUnavailable={vmUnavailable}
+      registerRecoveryRegion={registerRecoveryRegion}
+      restoreRemovedFocus={restoreRemovedFocus}
     />
   );
 }
@@ -98,29 +130,36 @@ function WorkflowRunForm({
   scope,
   workflow,
   projects,
+  projectsUnavailable,
+  refreshProjects,
   call,
+  refreshWorkflow,
+  workflowRefreshFailed,
   vmUnavailable,
+  registerRecoveryRegion,
+  restoreRemovedFocus,
   canConfigure = false,
   organizationAdmin = false,
-}: WorkflowRunProps & { vmUnavailable: boolean }) {
+}: WorkflowRunProps & {
+  vmUnavailable: boolean;
+  registerRecoveryRegion: (node: HTMLElement | null) => (() => void) | undefined;
+  restoreRemovedFocus: (target: HTMLElement | null) => void;
+}) {
   const navigate = useNavigate();
   const active = useActiveWorkflowView();
   const submission = useRef<{ draft: WorkflowRunDraft } | null>(null);
   const confirmationRequest = useRef<AdditionalRunConfirmation | null>(null);
   const [confirmation, setConfirmation] = useState<AdditionalRunConfirmation | null>(null);
+  const [refreshingPreview, setRefreshingPreview] = useState(false);
+  const previewRefresh = useRef(false);
+  const [previewRefreshFailed, setPreviewRefreshFailed] = useState(false);
   const runHeading = useRef<HTMLHeadingElement>(null);
+  const startRunControl = useRef<HTMLButtonElement>(null);
   const additionalRunControl = useRef<HTMLButtonElement>(null);
   const keepEditingControl = useRef<HTMLButtonElement>(null);
   const startedRunControl = useRef<HTMLButtonElement>(null);
   const recoveryControl = useRef<HTMLButtonElement>(null);
-  const removedRecoveryFocus = useRef<Element | null>(null);
-  const registerRecoveryRegion = useCallback((node: HTMLElement | null) => {
-    if (!node) return;
-    return () => {
-      const focused = node.ownerDocument.activeElement;
-      if (focused && node.contains(focused)) removedRecoveryFocus.current = focused;
-    };
-  }, []);
+  const key = workflowSessionKey(scope, workflow.workflowId);
   useLayoutEffect(
     () => () => {
       // Invalidate callbacks when the next form commits, before passive cleanup.
@@ -129,26 +168,30 @@ function WorkflowRunForm({
     },
     [],
   );
+  const registerStartRun = useCallback(
+    (button: HTMLButtonElement | null) => {
+      startRunControl.current = button;
+      const restoreFocus = registerRecoveryRegion(button);
+      return () => {
+        restoreFocus?.();
+        startRunControl.current = null;
+      };
+    },
+    [registerRecoveryRegion],
+  );
   const drafts = useWorkflowDrafts();
-  const key = workflowSessionKey(scope, workflow.workflowId);
   const draft =
     (drafts.accountId === scope.accountId ? drafts.runs[key] : undefined) ?? emptyWorkflowRun;
   const previousStartedJobId = useRef(draft.startedJobId);
   useLayoutEffect(() => {
     const confirmedRun = draft.startedJobId && draft.startedJobId !== previousStartedJobId.current;
     previousStartedJobId.current = draft.startedJobId;
-    const previous = removedRecoveryFocus.current;
-    if (!previous) return;
-    removedRecoveryFocus.current = null;
-    const { activeElement, body } = previous.ownerDocument;
-    if (activeElement === previous || activeElement === body) {
-      const target =
-        (confirmedRun ? startedRunControl.current : null) ??
+    restoreRemovedFocus(
+      (confirmedRun ? startedRunControl.current : null) ??
         recoveryControl.current ??
         startedRunControl.current ??
-        runHeading.current;
-      target?.focus();
-    }
+        runHeading.current,
+    );
   });
   const editor = drafts.accountId === scope.accountId ? drafts.editors[key] : undefined;
   const unsavedDefinition =
@@ -173,8 +216,25 @@ function WorkflowRunForm({
   );
   const submissionPending = draft.operation?.state === "pending";
   const pending = workflowRunPending(draft);
+  const runRevisionConflict = draft.runRevisionConflict;
+  const needsPreviewRefresh = (current: WorkflowRunDraft) =>
+    current.runRevisionConflict !== undefined && workflow.revision < current.runRevisionConflict;
+  const previewOutdated = needsPreviewRefresh(draft);
   const uncertain = draft.operation?.state === "uncertain";
-  const runBlocked = vmUnavailable || workflow.archived;
+  const checkoutIssue = workflowMachineCheckoutIssue(workflow, projects, projectsUnavailable);
+  const runBlocked = vmUnavailable || workflow.archived || checkoutIssue !== null;
+  const reviewRevision =
+    runRevisionConflict !== undefined && !previewOutdated && !runBlocked ? workflow.revision : null;
+  useLayoutEffect(() => {
+    if (reviewRevision === null) return;
+    const heading = runHeading.current;
+    const focused = heading?.ownerDocument.activeElement;
+    if (
+      focused &&
+      (focused === startRunControl.current || focused === additionalRunControl.current)
+    )
+      heading?.focus();
+  }, [reviewRevision]);
   const rejectedRevision = draft.vmStartFailureRevision;
   const sameRejectedBranch =
     savedTarget.kind === "vm" &&
@@ -198,12 +258,17 @@ function WorkflowRunForm({
     navigate({
       to: "/workflows/$repositoryId/$workflowId/edit",
       params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
-      ...(vmStartFailure?.kind === "base-branch-unavailable"
+      ...(checkoutIssue === "missing" || vmStartFailure?.kind === "base-branch-unavailable"
         ? { search: { settings: "execution" as const } }
         : {}),
     });
   const canRetryStart = vmStartFailure?.kind === "github-verification-temporary";
-  const replayOnly = runBlocked || savedTarget.kind !== "vm";
+  const replayOnly =
+    runBlocked ||
+    savedTarget.kind !== "vm" ||
+    previewOutdated ||
+    (draft.operation?.targetKind === "vm" &&
+      draft.operation.expectedRevision !== workflow.revision);
   const pendingRecovery =
     submissionPending && draft.recovery?.kind !== "additional-rejected"
       ? draft.recovery
@@ -221,6 +286,7 @@ function WorkflowRunForm({
   const confirming =
     !!confirmation &&
     !runBlocked &&
+    !previewOutdated &&
     confirmation.draft === draft &&
     confirmation.context === confirmationContext;
   if (confirmation && !confirming) setConfirmation(null);
@@ -230,7 +296,10 @@ function WorkflowRunForm({
     const request = confirmationRequest.current;
     if (
       request &&
-      (runBlocked || request.draft !== draft || request.context !== confirmationContext)
+      (runBlocked ||
+        previewOutdated ||
+        request.draft !== draft ||
+        request.context !== confirmationContext)
     )
       confirmationRequest.current = null;
   });
@@ -250,6 +319,7 @@ function WorkflowRunForm({
       runBlocked ||
       workflowRunPending(current) ||
       current?.operation?.state !== "uncertain" ||
+      needsPreviewRefresh(current) ||
       !current.instruction.trim()
     )
       return;
@@ -274,6 +344,7 @@ function WorkflowRunForm({
       intent.kind === "start" &&
       (!current.instruction.trim() ||
         runBlocked ||
+        needsPreviewRefresh(current) ||
         (current.operation?.state === "uncertain" ? current !== confirmed?.draft : !!confirmed))
     )
       return;
@@ -291,6 +362,7 @@ function WorkflowRunForm({
           ? {
               kind: "start",
               targetKind: savedTarget.kind,
+              expectedRevision: workflow.revision,
               replaceUncertain: !!confirmed,
               retryStart: canRetryStart,
             }
@@ -324,6 +396,13 @@ function WorkflowRunForm({
       if (!ownsSubmission()) return;
       const latest = appAtomRegistry.get(workflowDraftAtom).runs[key];
       if (
+        !job &&
+        latest &&
+        latest.runRevisionConflict !== runRevisionConflict &&
+        needsPreviewRefresh(latest)
+      )
+        void reloadPreview();
+      if (
         job &&
         (intent.kind === "start" || (intent.kind === "recover" && !latest?.instruction.trim()))
       )
@@ -335,6 +414,47 @@ function WorkflowRunForm({
       if (submission.current === request) submission.current = null;
     }
   };
+  const reloadPreview = async () => {
+    if (previewRefresh.current) return;
+    previewRefresh.current = true;
+    setRefreshingPreview(true);
+    setPreviewRefreshFailed(false);
+    try {
+      await refreshWorkflow();
+    } catch {
+      if (active.current) setPreviewRefreshFailed(true);
+    } finally {
+      previewRefresh.current = false;
+      if (active.current) setRefreshingPreview(false);
+    }
+  };
+  const previewNotice =
+    runRevisionConflict !== undefined ? (
+      <WorkflowAlert
+        title={previewOutdated ? "Saved workflow changed" : "Review the updated workflow"}
+        variant="warning"
+        actions={
+          previewOutdated ? (
+            <Button
+              ref={registerRecoveryRegion}
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-disabled={refreshingPreview || undefined}
+              onClick={() => void reloadPreview()}
+            >
+              {refreshingPreview ? "Refreshing workflow…" : "Refresh workflow"}
+            </Button>
+          ) : undefined
+        }
+      >
+        {previewOutdated
+          ? !refreshingPreview && (previewRefreshFailed || workflowRefreshFailed)
+            ? "Could not refresh the saved workflow. Try again. Your instructions are kept."
+            : "Refresh to see the current saved workflow. Your instructions are kept."
+          : `Review the target and steps for revision ${workflow.revision} before starting a run.`}
+      </WorkflowAlert>
+    ) : null;
   const previousSubmission = uncertain
     ? draft.operation
     : submissionPending
@@ -462,7 +582,7 @@ function WorkflowRunForm({
   }
   const error =
     vmStartError ??
-    (draft.error && !uncertain && !staleVmStartFailure ? (
+    (draft.error && !uncertain && !staleVmStartFailure && runRevisionConflict === undefined ? (
       <WorkflowAlert
         title="Could not start this run"
         actions={
@@ -474,11 +594,12 @@ function WorkflowRunForm({
         {draft.error} Your instructions are kept.
       </WorkflowAlert>
     ) : null);
-  const additionalRunError = additionalRejected ? (
-    <WorkflowAlert title="Could not start the additional run">
-      {draft.error} Your instructions are kept.
-    </WorkflowAlert>
-  ) : null;
+  const additionalRunError =
+    additionalRejected && runRevisionConflict === undefined ? (
+      <WorkflowAlert title="Could not start the additional run">
+        {draft.error} Your instructions are kept.
+      </WorkflowAlert>
+    ) : null;
   const recovery = previousSubmission ? (
     <WorkflowAlert
       title={
@@ -608,13 +729,30 @@ function WorkflowRunForm({
           Run {workflow.definition.name}
         </h1>
         <WorkflowAlert
-          title={workflow.archived ? "Workflow archived" : "VM execution unavailable"}
+          title={
+            workflow.archived
+              ? "Workflow archived"
+              : checkoutIssue === "unavailable"
+                ? "Could not load Machine checkouts"
+                : checkoutIssue === "missing"
+                  ? "Machine checkout unavailable"
+                  : "VM execution unavailable"
+          }
           variant="warning"
           actions={
             <>
-              {canConfigure ? (
+              {!workflow.archived && checkoutIssue === "unavailable" ? (
+                <Button ref={registerRecoveryRegion} variant="outline" onClick={refreshProjects}>
+                  <RefreshCwIcon aria-hidden />
+                  Retry loading checkouts
+                </Button>
+              ) : canConfigure ? (
                 <Button variant="outline" onClick={editWorkflow}>
-                  {workflow.archived ? "Open workflow settings" : "Edit workflow"}
+                  {workflow.archived
+                    ? "Open workflow settings"
+                    : checkoutIssue === "missing"
+                      ? "Change checkout"
+                      : "Edit workflow"}
                 </Button>
               ) : null}
               <Button variant="ghost" onClick={backToWorkflows}>
@@ -625,7 +763,13 @@ function WorkflowRunForm({
         >
           {workflow.archived
             ? "Restore this workflow before running it."
-            : "Running VM workflows is not available yet."}
+            : checkoutIssue === "unavailable"
+              ? "Reload the checkout list to verify this workflow’s saved checkout."
+              : checkoutIssue === "missing"
+                ? canConfigure
+                  ? "Choose and save a checkout in Workflow settings before running."
+                  : "Ask a repository maintainer to update this workflow’s checkout."
+                : "Running VM workflows is not available yet."}
         </WorkflowAlert>
         {recovery}
         {earlierRecovery}
@@ -636,6 +780,7 @@ function WorkflowRunForm({
             <Textarea readOnly value={draft.instruction} />
           </label>
         ) : null}
+        {previewOutdated ? previewNotice : null}
         {error}
         {startedJob}
       </div>
@@ -736,13 +881,17 @@ function WorkflowRunForm({
           This run uses the saved workflow.
         </WorkflowAlert>
       ) : null}
-      {!previousSubmission ? (
-        <details className="space-y-3">
+      {previewNotice}
+      {!previousSubmission || runRevisionConflict !== undefined ? (
+        <details
+          className="space-y-3"
+          open={(runRevisionConflict !== undefined && !previewOutdated) || undefined}
+        >
           <summary className="cursor-pointer text-sm font-medium">
             Workflow steps ({workflow.definition.steps.length})
           </summary>
           <p className="text-xs text-muted-foreground">
-            Uses the saved definition available at dispatch.
+            Changes saved while a run is queued can apply when it starts.
           </p>
           <ol className="mt-3 space-y-3">
             {workflow.definition.steps.map((step, index) => {
@@ -791,7 +940,9 @@ function WorkflowRunForm({
               type="button"
               variant="outline"
               size="sm-multiline"
-              aria-disabled={pending || confirming || !draft.instruction.trim() || undefined}
+              aria-disabled={
+                pending || confirming || previewOutdated || !draft.instruction.trim() || undefined
+              }
               onClick={openConfirmation}
             >
               <PlayIcon aria-hidden />
@@ -813,11 +964,11 @@ function WorkflowRunForm({
         </Button>
         {!previousSubmission && !canRetryStart ? (
           <Button
-            ref={registerRecoveryRegion}
+            ref={registerStartRun}
             type="submit"
             size="sm"
             disabled={!draft.instruction.trim()}
-            aria-disabled={pending || undefined}
+            aria-disabled={pending || previewOutdated || undefined}
           >
             <PlayIcon aria-hidden />
             {pending ? "Submitting…" : "Run workflow"}

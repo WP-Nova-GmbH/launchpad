@@ -97,6 +97,7 @@ export interface WorkflowRunDraft {
     readonly instruction: string;
     /** VM requests replay the captured payload. Machine submissions retain their existing retry flow. */
     readonly targetKind?: "vm";
+    readonly expectedRevision?: number;
     readonly receiptError?: string | undefined;
   } | null;
   readonly earlierUnconfirmedRuns?:
@@ -114,6 +115,7 @@ export interface WorkflowRunDraft {
     | undefined;
   readonly startedJobId: string | null;
   readonly error: string | null;
+  readonly runRevisionConflict?: number | undefined;
   readonly vmStartFailure?: VmWorkflowStartFailure | undefined;
   /** Saved revision checked by the relay when it rejected this start. */
   readonly vmStartFailureRevision?: number | undefined;

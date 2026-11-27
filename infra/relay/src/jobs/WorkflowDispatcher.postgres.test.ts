@@ -26,58 +26,76 @@ if (!databaseUrl)
   throw new Error("Manual workflow dispatch tests require WORKFLOW_SOURCES_TEST_DATABASE_URL.");
 
 describe("initial manual workflow offer (PostgreSQL)", () => {
-  it.live("rejects a target edit between validating Run and inserting the job", () =>
-    withDatabase(
-      configured(
-        Effect.gen(function* () {
-          yield* seed;
-          const original = yield* save("flow", trigger, false);
-          const store = yield* Workflows;
-          const inserting = yield* Deferred.make<void>();
-          const release = yield* Deferred.make<void>();
-          const run = yield* runRepositoryWorkflow("repo", {
-            workflowId: original.workflowId,
-            instruction: "Test",
-            expectedTargetKind: "machine",
-          }).pipe(
-            Effect.provideService(Workflows, {
-              ...store,
-              createManualJob: (...args) =>
-                Deferred.succeed(inserting, undefined).pipe(
-                  Effect.andThen(Deferred.await(release)),
-                  Effect.andThen(store.createManualJob(...args)),
-                ),
-            }),
-            Effect.flip,
-            Effect.forkChild,
-          );
-          yield* Deferred.await(inserting);
-          yield* saveRepositoryWorkflow("repo", {
-            workflowId: original.workflowId,
-            expectedRevision: original.revision,
-            definition: { ...original.definition, target: { kind: "vm", baseBranch: null } },
-            archived: false,
-          });
-          yield* Deferred.succeed(release, undefined);
-          expect(yield* Fiber.join(run)).toMatchObject({
-            _tag: "WorkflowInvalidError",
-            message:
-              "The workflow execution target changed. Review the saved target and try again.",
-          });
-          expect(yield* store.listJobs("repo")).toEqual([]);
-        }).pipe(
-          Effect.provide([machines, repositories, organizations, catalog, workflows]),
-          Effect.provide(
-            Layer.mock(EnvironmentConnector)({
-              dispatchJob: () => Effect.die("A stale Run must not contact an executor"),
-            }),
+  for (const { change, reviewed } of [
+    { change: "target edit", reviewed: false },
+    { change: "target edit", reviewed: true },
+    { change: "archive", reviewed: true },
+  ] as const)
+    it.live(
+      `rejects a ${change} between checking and inserting a ${reviewed ? "reviewed" : "legacy"} Run`,
+      () =>
+        withDatabase(
+          configured(
+            Effect.gen(function* () {
+              yield* seed;
+              const original = yield* save("flow", trigger, false);
+              const store = yield* Workflows;
+              const inserting = yield* Deferred.make<void>();
+              const release = yield* Deferred.make<void>();
+              const run = yield* runRepositoryWorkflow("repo", {
+                workflowId: original.workflowId,
+                instruction: "Test",
+                expectedTargetKind: "machine",
+                ...(reviewed ? { expectedRevision: original.revision } : {}),
+              }).pipe(
+                Effect.provideService(Workflows, {
+                  ...store,
+                  createManualJob: (...args) =>
+                    Deferred.succeed(inserting, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                      Effect.andThen(store.createManualJob(...args)),
+                    ),
+                }),
+                Effect.flip,
+                Effect.forkChild,
+              );
+              yield* Deferred.await(inserting);
+              const latest = yield* saveRepositoryWorkflow("repo", {
+                workflowId: original.workflowId,
+                expectedRevision: original.revision,
+                definition:
+                  change === "archive"
+                    ? original.definition
+                    : { ...original.definition, target: { kind: "vm", baseBranch: null } },
+                archived: change === "archive",
+              });
+              yield* Deferred.succeed(release, undefined);
+              expect(yield* Fiber.join(run)).toMatchObject(
+                reviewed
+                  ? { _tag: "WorkflowConflictError", workflowRevision: latest.revision }
+                  : {
+                      _tag: "WorkflowInvalidError",
+                      message:
+                        "The workflow execution target changed. Review the saved target and try again.",
+                    },
+              );
+              expect(yield* store.listJobs("repo")).toEqual([]);
+            }).pipe(
+              Effect.provide([machines, repositories, organizations, catalog, workflows]),
+              Effect.provide(
+                Layer.mock(EnvironmentConnector)({
+                  dispatchJob: () => Effect.die("A stale Run must not contact an executor"),
+                }),
+              ),
+              Effect.provideService(ThreadVmRuntimeConfiguration, { settings: undefined }),
+              Effect.provideService(RelayClientPrincipal, {
+                userId: "maintainer",
+                token: "fixture",
+              }),
+            ),
           ),
-          Effect.provideService(ThreadVmRuntimeConfiguration, { settings: undefined }),
-          Effect.provideService(RelayClientPrincipal, { userId: "maintainer", token: "fixture" }),
         ),
-      ),
-    ),
-  );
+    );
 
   for (const delayedOperation of ["status", "start"] as const)
     it.live(`reconciles a VM edit while the Machine ${delayedOperation} request is in flight`, () =>

@@ -74,7 +74,7 @@ import {
   useWorkflowDrafts,
   workflowError,
   savedWorkflowDraft,
-  restoreCheckoutIssue,
+  workflowMachineCheckoutIssue,
   hasWorkflowRunSubmission,
   newWorkflowDraft,
   copiedWorkflowDraft,
@@ -732,6 +732,12 @@ function WorkflowRepositoryView({
     (workflowId
       ? (drafts.editors[workflowSessionKey(scope, workflowId)]?.baseline ?? undefined)
       : undefined);
+  const runRevisionConflict =
+    view === "run" && workflow && drafts.accountId === scope.accountId
+      ? drafts.runs[workflowSessionKey(scope, workflow.workflowId)]?.runRevisionConflict
+      : undefined;
+  const runPreviewOutdated =
+    workflow && runRevisionConflict !== undefined && workflow.revision < runRevisionConflict;
   const restore = async (workflow: RepositoryWorkflow, button: HTMLButtonElement) => {
     const hadFocus = button.ownerDocument.activeElement === button;
     const key = workflowSessionKey(scope, workflow.workflowId);
@@ -744,7 +750,7 @@ function WorkflowRepositoryView({
         active.current &&
         catalog.canChooseTemplate &&
         (!!existing?.operation ||
-          !restoreCheckoutIssue(workflow, catalog.projects, catalog.projectsUnavailable))
+          !workflowMachineCheckoutIssue(workflow, catalog.projects, catalog.projectsUnavailable))
       );
     };
     if (!canRestore()) return;
@@ -877,8 +883,12 @@ function WorkflowRepositoryView({
                     project.projectId === target.projectId,
                 )
               : undefined;
-          const restoreIssue =
-            archived && restoreCheckoutIssue(workflow, projects, projectsUnavailable);
+          const checkoutIssue = workflowMachineCheckoutIssue(
+            workflow,
+            projects,
+            projectsUnavailable,
+          );
+          const restoreIssue = archived && checkoutIssue;
           const restoreBlocked = !!restoreIssue && !local?.operation;
           const canRecoverInVm =
             restoreIssue === "missing" &&
@@ -887,14 +897,20 @@ function WorkflowRepositoryView({
             vmExecutionAvailable;
           const restoreHint = `workflow-restore-${workflow.workflowId}`;
           const vmUnavailable = target.kind === "vm" && !vmExecutionAvailable;
-          const canStartRun = !archived && !vmUnavailable;
+          const canStartRun = !archived && !vmUnavailable && !checkoutIssue;
           const hasRunSubmission = hasWorkflowRunSubmission(runDraft, canStartRun);
           const hasRetainedInstructions = !canStartRun && !!runDraft?.instruction.trim();
+          const startedJobId =
+            !archived && checkoutIssue && !hasRunSubmission && !hasRetainedInstructions
+              ? runDraft?.startedJobId
+              : null;
           const runLabel = hasRunSubmission
             ? "View run submission"
             : hasRetainedInstructions
               ? "View retained instructions"
-              : "Run";
+              : startedJobId
+                ? "View started run"
+                : "Run";
           const summary = summaries.find(
             (item) =>
               item.workflowId === workflow.workflowId && item.revision === workflow.revision,
@@ -1015,13 +1031,18 @@ function WorkflowRepositoryView({
                   ) : (
                     <span>
                       {projectsUnavailable
-                        ? "Machine target not verified"
-                        : "Machine target unavailable"}
+                        ? "Machine checkout not verified"
+                        : "Machine checkout unavailable"}
                     </span>
                   )}
                 </div>
                 {!archived && vmUnavailable && !hasRunSubmission && !hasRetainedInstructions ? (
                   <p className="text-xs text-muted-foreground">VM execution unavailable</p>
+                ) : null}
+                {!archived && checkoutIssue === "missing" && !canConfigure ? (
+                  <p className="text-xs text-muted-foreground">
+                    Ask a repository maintainer to update this workflow’s checkout.
+                  </p>
                 ) : null}
                 {!archived && local?.error ? (
                   <div role="alert" className="cursor-auto text-xs">
@@ -1074,19 +1095,44 @@ function WorkflowRepositoryView({
                         : "Restore"}
                   </Button>
                 ) : null}
-                {hasRunSubmission || canStartRun || hasRetainedInstructions ? (
+                {!archived && checkoutIssue === "missing" && canConfigure ? (
+                  <Button
+                    variant="ghost"
+                    size="sm-multiline"
+                    aria-label={`Change checkout for ${name}`}
+                    onClick={() =>
+                      void navigate({
+                        to: "/workflows/$repositoryId/$workflowId/edit",
+                        params: {
+                          repositoryId: scope.repositoryId,
+                          workflowId: workflow.workflowId,
+                        },
+                        search: { settings: "execution" },
+                      })
+                    }
+                  >
+                    <MonitorIcon aria-hidden />
+                    Change checkout
+                  </Button>
+                ) : null}
+                {hasRunSubmission || canStartRun || hasRetainedInstructions || startedJobId ? (
                   <Button
                     variant="ghost"
                     size="sm-multiline"
                     aria-label={`${runLabel} for ${name}`}
                     onClick={() =>
-                      navigate({
-                        to: "/workflows/$repositoryId/$workflowId/run",
-                        params: {
-                          repositoryId: scope.repositoryId,
-                          workflowId: workflow.workflowId,
-                        },
-                      })
+                      startedJobId
+                        ? navigate({
+                            to: "/workflows/$repositoryId/jobs/$jobId",
+                            params: { repositoryId: scope.repositoryId, jobId: startedJobId },
+                          })
+                        : navigate({
+                            to: "/workflows/$repositoryId/$workflowId/run",
+                            params: {
+                              repositoryId: scope.repositoryId,
+                              workflowId: workflow.workflowId,
+                            },
+                          })
                     }
                   >
                     {runLabel === "Run" ? (
@@ -1484,7 +1530,7 @@ function WorkflowRepositoryView({
           {catalogActions}
         </div>
       ) : null}
-      {error ? (
+      {error && !runPreviewOutdated ? (
         <WorkflowAlert
           title="Could not refresh workflows"
           actions={
@@ -1507,7 +1553,11 @@ function WorkflowRepositoryView({
             scope={scope}
             workflow={workflow}
             projects={projects}
+            projectsUnavailable={projectsUnavailable}
+            refreshProjects={refreshOrganizationCatalog}
             call={call}
+            refreshWorkflow={refresh}
+            workflowRefreshFailed={error !== null}
             vmExecutionAvailable={vmExecutionAvailable}
           />
         ) : (
@@ -1574,6 +1624,26 @@ function WorkflowRepositoryView({
                       </div>
                     }
                   />
+                </div>
+              ) : null}
+              {projectsUnavailable &&
+              workflows.some(
+                ({ archived, definition }) => !archived && definition.target.kind === "machine",
+              ) ? (
+                <div className="mb-3">
+                  <WorkflowAlert
+                    title="Could not load Machine checkouts"
+                    variant="warning"
+                    actions={
+                      <Button size="sm" variant="outline" onClick={refreshOrganizationCatalog}>
+                        <RefreshCwIcon aria-hidden />
+                        Retry loading checkouts
+                      </Button>
+                    }
+                  >
+                    Reload the checkout list to verify the saved checkouts before running these
+                    workflows.
+                  </WorkflowAlert>
                 </div>
               ) : null}
               {rows(false)}

@@ -120,51 +120,60 @@ function LibraryBody() {
   );
 
   const overviewAbort = useRef<AbortController | null>(null);
+  const [expandedThreadId, setExpandedThreadId] = useState<ThreadId | null>(null);
+  const [selection, setSelection] = useState<{
+    session: typeof session;
+    threadId: ThreadId;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [overviewSession, setOverviewSession] = useState(session);
+  if (overviewSession !== session) {
+    setOverviewSession(session);
+    setExpandedThreadId(null);
+    setBusy(false);
+    setError(null);
+  }
   useEffect(() => {
     if (!session) return;
     const controller = new AbortController();
     overviewAbort.current = controller;
-    return () => controller.abort();
-  }, [session]);
-  const [expandedThreadId, setExpandedThreadId] = useState<ThreadId | null>(null);
-  const [selected, setSelected] = useState<ThreadId | null>(null),
-    [error, setError] = useState<string | null>(null),
-    [busy, setBusy] = useState(false);
-  useEffect(() => {
-    if (!session) return;
-    let active = true;
     void loadIndex({}).then((result) => {
-      if (active && result._tag !== "Success")
+      if (!controller.signal.aborted && result._tag === "Failure")
         setError(failureMessage(result, "Could not read saved threads."));
     });
-    return () => {
-      active = false;
-    };
+    return () => controller.abort();
   }, [session, loadIndex]);
   const load = async (after?: string) => {
+    const abort = overviewAbort.current;
+    if (!abort || abort.signal.aborted) return;
     setBusy(true);
     setError(null);
-    const result = await loadIndex(after === undefined ? {} : { after });
-    if (result._tag !== "Success")
-      setError(failureMessage(result, "Could not read saved threads."));
-    setBusy(false);
+    try {
+      const result = await loadIndex(
+        after === undefined ? { preserveLoadedPages: true } : { after },
+      );
+      if (!abort.signal.aborted && result._tag === "Failure")
+        setError(failureMessage(result, "Could not read saved threads."));
+    } finally {
+      if (!abort.signal.aborted) setBusy(false);
+    }
   };
   const capabilityState = useAtomValue(threadVmControls.capabilitiesAtom);
   const capabilities =
     capabilityState.error || capabilityState.isPending ? null : capabilityState.data;
   const runPrimary = async (entry: RelayPortableThreadSummary) => {
     const abort = overviewAbort.current;
-    if (!abort || abort.signal.aborted) return;
+    if (!session || !abort || abort.signal.aborted || busy) return;
+    const threadId = ThreadId.make(entry.placement.threadId);
     const label = portableThreadOverviewAction(entry, capabilities);
     if (label === "Manage VM") {
-      setSelected(ThreadId.make(entry.placement.threadId));
+      setSelection({ session, threadId });
       return;
     }
-    if (busy) return;
     setBusy(true);
     setError(null);
-    const threadId = ThreadId.make(entry.placement.threadId),
-      environmentId = EnvironmentId.make(entry.placement.environmentId);
+    const environmentId = EnvironmentId.make(entry.placement.environmentId);
     try {
       if (label === "Open chat") {
         const result = await openChat({
@@ -193,17 +202,23 @@ function LibraryBody() {
                 },
         });
         if (success && !abort.signal.aborted) {
-          await loadIndex({});
-          setSelected(threadId);
+          setSelection({ session, threadId });
+          await load();
         }
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Could not start the VM action.");
+      if (!abort.signal.aborted)
+        setError(cause instanceof Error ? cause.message : "Could not start the VM action.");
     } finally {
-      setBusy(false);
+      if (!abort.signal.aborted) setBusy(false);
     }
   };
-  const summary = index?.entries.find((entry) => entry.placement.threadId === selected);
+  const summary =
+    selection && selection.session === session
+      ? index?.entries.find((entry) => entry.placement.threadId === selection.threadId)
+      : undefined;
+  if (selection && (selection.session !== session || (index && !summary))) setSelection(null);
+  const selected = summary !== undefined;
   const allowance = index?.allowance;
   if (
     expandedThreadId &&
@@ -221,7 +236,7 @@ function LibraryBody() {
             Refresh
           </Action>
         )}
-        {selected && <Action onPress={() => setSelected(null)}>All threads</Action>}
+        {selected && <Action onPress={() => setSelection(null)}>All threads</Action>}
       </View>
       {!selected && allowance && (
         <View className="gap-2 rounded-xl border border-border bg-card p-4">
@@ -406,7 +421,9 @@ function LibraryBody() {
                             </View>
                           )}
                         </View>
-                        <Action onPress={() => setSelected(threadId)}>Read conversation</Action>
+                        <Action onPress={() => setSelection({ session, threadId })}>
+                          Read conversation
+                        </Action>
                       </View>
                     )}
                   </View>

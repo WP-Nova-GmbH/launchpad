@@ -32,7 +32,7 @@ import { WorkflowRequestNotSentError, workflowRunPending } from "./workflowOpera
 
 export const WORKFLOW_REVIEW_ANCHOR = "workflow-review";
 
-export function restoreCheckoutIssue(
+export function workflowMachineCheckoutIssue(
   workflow: RepositoryWorkflow,
   projects: ReadonlyArray<RelayOrganizationProject>,
   projectsUnavailable = false,

@@ -3089,6 +3089,7 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
           );
           expect(yield* open).toMatchObject({
             state: "unavailable",
+            canRetry: false,
             detail: expect.stringMatching(/original Codex connection/),
           });
           expect(
@@ -3425,6 +3426,7 @@ describe.skipIf(!databaseUrl)("workflow VM ownership and capacity foundation (Po
         yield* replaceCodex;
         expect(yield* open).toMatchObject({
           state: "unavailable",
+          canRetry: false,
           detail: expect.stringMatching(/original Codex connection/),
         });
         expect((yield* f.placements.getAny(f.threadId))?.operationId).toBeNull();

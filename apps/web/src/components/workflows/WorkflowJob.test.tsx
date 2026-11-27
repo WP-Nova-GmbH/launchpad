@@ -605,6 +605,28 @@ describe("successful run outcome", () => {
     },
   );
 
+  it("offers role-appropriate recovery while the follow-up waits for the original Codex account", async () => {
+    await mountVmFollowUp();
+    fixture.call.mockResolvedValueOnce({
+      state: "waiting_codex",
+      detail: "Reconnect the run’s original Codex account in Organization settings to continue.",
+    });
+    await press("Continue in VM");
+    const settingsLinks = () =>
+      renderer!.root
+        .findAllByType("a")
+        .filter((link) => link.props.href === "/settings/organization#organization-codex-vms");
+    expect(text(renderer!.root)).toContain("Ask an organization admin");
+    expect(settingsLinks()).toHaveLength(0);
+    await act(() => renderer!.update(view("job", true, true)));
+    expect(settingsLinks()).toHaveLength(1);
+    expect(text(settingsLinks()[0]!)).toContain("Open Codex for VMs");
+    expect(findButton("Retry opening VM")).toBeUndefined();
+    fixture.call.mockResolvedValueOnce(restoredVm);
+    await pollFollowUp();
+    expect(fixture.open).toHaveBeenCalledOnce();
+  });
+
   it("retries opening the same VM after a failed request", async () => {
     await mountVmFollowUp();
     const client = {

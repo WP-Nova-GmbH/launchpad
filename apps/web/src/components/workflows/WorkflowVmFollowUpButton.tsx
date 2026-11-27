@@ -11,12 +11,14 @@ import {
   CloudIcon,
   CloudOffIcon,
   RotateCwIcon,
+  Settings2Icon,
   UnlinkIcon,
 } from "lucide-react";
 
 import { appAtomRegistry } from "../../rpc/atomRegistry";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { connectWorkflowVmFollowUp } from "../../state/workflowVmFollowUp";
+import { searchableSetting } from "../settings/settingsSearch";
 import { Button } from "../ui/button";
 import { WorkflowOutcome } from "./WorkflowOutcome";
 import { useWorkflowClient, workflowError } from "./workflowState";
@@ -40,6 +42,7 @@ export function WorkflowVmFollowUpButton({
   scope,
   jobId,
   title,
+  organizationAdmin,
   onWorkspaceUnavailable,
   savedResultsAction,
   runDetailsFallback = false,
@@ -47,6 +50,7 @@ export function WorkflowVmFollowUpButton({
   scope: WorkflowScope;
   jobId: string;
   title: string;
+  organizationAdmin: boolean;
   onWorkspaceUnavailable?: () => void;
   savedResultsAction?: ReactNode;
   runDetailsFallback?: boolean;
@@ -192,7 +196,16 @@ export function WorkflowVmFollowUpButton({
     ) {
       detail = "The conversation opens when the VM is ready.";
     }
-    if (state.phase === "waiting_codex") tone = "warning";
+    if (state.phase === "waiting_codex") {
+      tone = "warning";
+      if (organizationAdmin) {
+        detail =
+          "Reconnect the run’s original Codex account. Then open this run from Workflows → Runs and select Continue in VM.";
+      } else {
+        heading = "Waiting for Codex reconnection";
+        detail = "Ask an organization admin to reconnect the run’s original Codex account.";
+      }
+    }
   } else if (state.state === "failed" || state.state === "unavailable") {
     const failed = state.state === "failed";
     heading = failed ? "Couldn’t open VM" : "Workspace unavailable";
@@ -217,6 +230,20 @@ export function WorkflowVmFollowUpButton({
             <Button ref={actionButton} size="sm" onClick={start}>
               {state.state === "failed" ? <RotateCwIcon aria-hidden /> : <CloudIcon aria-hidden />}
               {state.state === "failed" ? "Retry opening VM" : "Continue in VM"}
+            </Button>
+          ) : state.state === "pending" && state.phase === "waiting_codex" && organizationAdmin ? (
+            <Button
+              variant="outline"
+              size="sm"
+              render={
+                <Link
+                  to="/settings/organization"
+                  hash={searchableSetting("organization-codex-vms").id}
+                />
+              }
+            >
+              <Settings2Icon aria-hidden />
+              Open Codex for VMs
             </Button>
           ) : state.state === "unavailable" ? (
             (savedResultsAction ??

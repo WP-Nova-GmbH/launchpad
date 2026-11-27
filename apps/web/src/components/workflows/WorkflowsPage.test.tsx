@@ -60,6 +60,7 @@ const fixture = vi.hoisted(() => ({
   refreshCatalog: vi.fn<() => void | Promise<void>>(),
   codexStatus: vi.fn<() => Promise<"connected" | "disconnected" | "reconnect_required">>(),
   realDepartureGuard: false,
+  realRun: false,
   organizationRole: "admin" as "admin" | "member",
   tab: "runs",
   workflowId: undefined as string | undefined,
@@ -174,7 +175,13 @@ vi.mock("./WorkflowEditorDepartureGuard", async () => {
       fixture.realDepartureGuard ? <WorkflowEditorDepartureGuard {...props} /> : null,
   };
 });
-vi.mock("./WorkflowRun", () => ({ WorkflowRun: () => null }));
+vi.mock("./WorkflowRun", async () => {
+  const { WorkflowRun } = await vi.importActual<typeof import("./WorkflowRun")>("./WorkflowRun");
+  return {
+    WorkflowRun: (props: ComponentProps<typeof WorkflowRun>) =>
+      fixture.realRun ? <WorkflowRun {...props} /> : null,
+  };
+});
 vi.mock("./WorkflowJob", () => ({ WorkflowJob: () => null }));
 vi.mock("../../state/environments", () => ({ useEnvironment: () => null }));
 vi.mock("../../hooks/useSettings", () => ({
@@ -517,6 +524,7 @@ beforeEach(() => {
   fixture.codexStatus.mockReset().mockResolvedValue("connected");
   fixture.save.mockReset();
   fixture.realDepartureGuard = false;
+  fixture.realRun = false;
   fixture.organizationRole = "admin";
   fixture.tab = "runs";
   fixture.workflowId = undefined;
@@ -749,7 +757,7 @@ it.effect("keeps the Runs list context when leaving a Run while the catalog load
 );
 
 async function mountCatalog(
-  view: "catalog" | "builder" = "catalog",
+  view: "catalog" | "builder" | "run" = "catalog",
   options: Parameters<typeof create>[1] = {
     createNodeMock: (element) => (element.type === "form" ? {} : null),
   },
@@ -766,6 +774,53 @@ async function mountCatalog(
     await Promise.all(deliveries);
   });
 }
+
+it.effect("reports a stale Run preview reload failure once in the Run form and can retry it", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.realRun = true;
+      fixture.workflowId = workflow.workflowId;
+      fixture.projects = [checkout];
+      const updated = {
+        ...workflow,
+        revision: 2,
+        definition: { ...workflow.definition, name: "Updated workflow" },
+      };
+      fixture.definitions
+        .mockResolvedValueOnce([workflow])
+        .mockRejectedValueOnce(new Error("Catalog offline"))
+        .mockResolvedValueOnce([updated]);
+      const key = workflowSessionKey(starterScope, workflow.workflowId);
+      updateWorkflowDrafts(appAtomRegistry, starterScope.accountId, (state) => ({
+        ...state,
+        runs: {
+          [key]: {
+            instruction: "Keep these instructions",
+            operation: null,
+            startedJobId: null,
+            error: null,
+            runRevisionConflict: 2,
+          },
+        },
+      }));
+
+      await mountCatalog("run");
+      await press("Refresh workflow");
+      expect(content()).toContain("Could not refresh the saved workflow");
+      expect(content()).not.toContain("Could not refresh workflows");
+      expect(buttons("Refresh workflow")).toHaveLength(1);
+      expect(button("Run workflow").props["aria-disabled"]).toBe(true);
+      expect(renderer!.root.findByType("textarea").props.value).toBe("Keep these instructions");
+
+      await press("Refresh workflow");
+      expect(content()).toContain("Review the updated workflow");
+      expect(content()).toMatch(/Run\s+Updated workflow/u);
+      expect(button("Refresh workflow")).toBeUndefined();
+      expect(renderer!.root.findByType("textarea").props.value).toBe("Keep these instructions");
+    });
+  }),
+);
 
 it.effect("keeps restored History in place when the selected Runs tab is clicked again", () =>
   Effect.gen(function* () {
@@ -909,6 +964,7 @@ it.effect.each(["maintainer", "developer"] as const)(
         fixture.tab = "workflows";
         fixture.organizationRole = "member";
         fixture.repositories = [{ ...catalog.repositories[0]!, role }];
+        fixture.projects = [checkout];
         fixture.definitions.mockResolvedValue([workflow]);
         await mountCatalog();
 
@@ -923,6 +979,106 @@ it.effect.each(["maintainer", "developer"] as const)(
           expect(title).toBeUndefined();
         }
 
+        await press(`Run for ${name}`);
+        expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/workflows/$repositoryId/$workflowId/run",
+          params: { repositoryId, workflowId: workflow.workflowId },
+        });
+      });
+    }),
+);
+
+it.effect.each(["maintainer", "developer"] as const)(
+  "replaces Run with checkout recovery for a repository %s",
+  (role) =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.organizationRole = "member";
+        fixture.repositories = [{ ...catalog.repositories[0]!, role }];
+        fixture.definitions.mockResolvedValue([workflow]);
+        await mountCatalog();
+
+        const name = workflow.definition.name;
+        expect(content()).toContain("Machine checkout unavailable");
+        expect(button(`Run for ${name}`)).toBeUndefined();
+        if (role === "maintainer") {
+          await press(`Change checkout for ${name}`);
+          expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
+            to: "/workflows/$repositoryId/$workflowId/edit",
+            params: { repositoryId, workflowId: workflow.workflowId },
+            search: { settings: "execution" },
+          });
+        } else {
+          expect(content()).toContain("Ask a repository maintainer");
+          expect(button(`Change checkout for ${name}`)).toBeUndefined();
+        }
+      });
+    }),
+);
+
+it.effect("keeps an acknowledged run reachable after its Machine checkout disappears", () =>
+  Effect.gen(function* () {
+    yield* serve;
+    yield* Effect.promise(async () => {
+      fixture.tab = "workflows";
+      fixture.organizationRole = "member";
+      fixture.repositories = [{ ...catalog.repositories[0]!, role: "developer" }];
+      fixture.projects = [checkout];
+      fixture.definitions.mockResolvedValue([workflow]);
+      await mountCatalog();
+
+      const name = workflow.definition.name;
+      expect(button(`Run for ${name}`)).toBeDefined();
+      fixture.refreshCatalog.mockImplementationOnce(() => {
+        fixture.projects = [];
+      });
+      await press("Refresh workflows");
+      expect(button(`Run for ${name}`)).toBeUndefined();
+
+      const key = workflowSessionKey(starterScope, workflow.workflowId);
+      await act(() =>
+        updateWorkflowDrafts(appAtomRegistry, starterScope.accountId, (state) => ({
+          ...state,
+          runs: {
+            ...state.runs,
+            [key]: { instruction: "", operation: null, startedJobId: "confirmed-run", error: null },
+          },
+        })),
+      );
+      await press(`View started run for ${name}`);
+      expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
+        to: "/workflows/$repositoryId/jobs/$jobId",
+        params: { repositoryId, jobId: "confirmed-run" },
+      });
+    });
+  }),
+);
+
+it.effect(
+  "retries a failed checkout list before offering to start an active Machine workflow",
+  () =>
+    Effect.gen(function* () {
+      yield* serve;
+      yield* Effect.promise(async () => {
+        fixture.tab = "workflows";
+        fixture.projectsUnavailable = true;
+        fixture.definitions.mockResolvedValue([workflow]);
+        await mountCatalog();
+
+        const name = workflow.definition.name;
+        expect(content()).toContain("Could not load Machine checkouts");
+        expect(content()).not.toContain("Machine checkout unavailable");
+        expect(button(`Change checkout for ${name}`)).toBeUndefined();
+        expect(button(`Run for ${name}`)).toBeUndefined();
+        fixture.refreshCatalog.mockImplementationOnce(() => {
+          fixture.projectsUnavailable = false;
+          fixture.projects = [checkout];
+        });
+        await press("Retry loading checkouts");
+
+        expect(content()).not.toContain("Could not load Machine checkouts");
         await press(`Run for ${name}`);
         expect(fixture.navigate).toHaveBeenCalledExactlyOnceWith({
           to: "/workflows/$repositoryId/$workflowId/run",
@@ -2336,6 +2492,7 @@ it.effect(
       yield* serve;
       yield* Effect.promise(async () => {
         fixture.tab = "workflows";
+        fixture.projects = [checkout];
         fixture.definitions.mockResolvedValue([
           { ...workflow, automation: { enabled: true, trigger: null } },
         ]);

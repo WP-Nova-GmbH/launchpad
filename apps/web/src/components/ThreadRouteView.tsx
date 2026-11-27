@@ -362,6 +362,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
             scope={effectiveOrigin}
             jobId={effectiveOrigin.jobId}
             title={workflowConversation?.title ?? serverThread?.title ?? "Workflow workspace"}
+            organizationAdmin={workflowConversation?.organizationAdmin ?? false}
             runDetailsFallback
           />
         </div>

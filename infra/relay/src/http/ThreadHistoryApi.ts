@@ -39,10 +39,11 @@ const decodeThreadSummary = Schema.decodeUnknownEffect(RelayPortableThreadSummar
 
 /** Relay-only discovery: saved or preparing threads need no live environment. */
 export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
-  function* (input: { after?: string | undefined; limit: number }) {
+  function* (input: { after?: string | undefined; boundary?: string | undefined; limit: number }) {
     const sql = (yield* RelayDb).$client;
     const { userId } = yield* RelayClientPrincipal;
-    const candidates = yield* sql<{ threadId: string }>`SELECT t.thread_id AS "threadId"
+    const candidates = yield* sql<{ threadId: string; atOrPastBoundary: boolean }>`SELECT
+      t.thread_id AS "threadId", t.thread_id >= ${input.boundary ?? ""} AS "atOrPastBoundary"
       FROM relay_thread_placements t
       JOIN relay_organization_members m ON m.organization_id=t.organization_id AND m.user_id=${userId}
       JOIN relay_repositories r ON r.organization_id=t.organization_id AND r.repository_id=t.repository_id
@@ -158,10 +159,14 @@ export const listPortableThreads = Effect.fn("relay.api.thread_history.list")(
         }),
       ).pipe(Effect.catchTag("RelayTenancyNotFoundError", () => Effect.succeed(null))),
     );
+    const next = candidates.length > input.limit ? scanned.at(-1)!.threadId : null;
     return {
       entries: entries.filter((entry) => entry !== null),
       ...(allowance ? { allowance } : {}),
-      next: candidates.length > input.limit ? scanned.at(-1)!.threadId : null,
+      ...(input.boundary === undefined
+        ? {}
+        : { reachedBoundary: next === null || scanned.at(-1)?.atOrPastBoundary === true }),
+      next,
     };
   },
   Effect.catchTags({

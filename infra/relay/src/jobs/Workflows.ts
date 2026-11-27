@@ -452,6 +452,7 @@ export const make = Effect.gen(function* () {
       expected: {
         readonly expectedRevision: number;
         readonly expectedTargetKind: RepositoryWorkflow["definition"]["target"]["kind"];
+        readonly hasReviewedRevision: boolean;
         readonly vm?: {
           readonly codexConnectionId: string;
           readonly github: WorkflowVmGitHubResolution;
@@ -482,16 +483,22 @@ export const make = Effect.gen(function* () {
               yield* requireWorkflowVmLimit(row.organizationId);
             }
             const workflow = yield* lockSavedWorkflow(row.record.workflowId, row.repositoryId);
+            const targetChanged = workflow?.definition.target.kind !== expected.expectedTargetKind;
+            // A reviewed preview can be refreshed. Keep the older errors for requests without one.
+            if (
+              workflow &&
+              workflow.revision !== expected.expectedRevision &&
+              (expected.hasReviewedRevision || (!workflow.archived && !targetChanged))
+            )
+              return yield* new WorkflowConflictError({
+                message: "The workflow changed while checking this run. Review it and try again.",
+                workflowRevision: workflow.revision,
+              });
             if (!workflow || workflow.archived)
               return yield* new WorkflowInvalidError({
                 message: "The workflow is archived or unavailable. Restore it before running.",
               });
-            if (workflow.definition.target.kind !== expected.expectedTargetKind)
-              return yield* workflowRunTargetChanged();
-            if (workflow.revision !== expected.expectedRevision)
-              return yield* new WorkflowConflictError({
-                message: "The workflow changed while checking this run. Review it and try again.",
-              });
+            if (targetChanged) return yield* workflowRunTargetChanged();
             if (!vm) return yield* createJob(row);
             yield* recheckWorkflowVmGitHub(sql, row, vm.github);
             const codex = yield* getWorkflowVmCodexConnection(row.organizationId, true);

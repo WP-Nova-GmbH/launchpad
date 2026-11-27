@@ -383,6 +383,7 @@ export class ManagedRelayTenancyClient extends Context.Service<
     readonly listPortableThreads: (input: {
       readonly clerkToken: string;
       readonly after?: string;
+      readonly boundary?: string;
       readonly limit: number;
     }) => Effect.Effect<RelayPortableThreadPage, ManagedRelayClientError>;
     readonly getPortableThreadPlacement: (input: {
@@ -1561,6 +1562,7 @@ const make = Effect.fn("ManagedRelayTenancyClient.make")(function* (
             query: {
               limit: input.limit,
               ...(input.after === undefined ? {} : { after: input.after }),
+              ...(input.boundary === undefined ? {} : { boundary: input.boundary }),
             },
           })
           .pipe(

@@ -14,8 +14,9 @@ import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import { it as effectTest } from "@effect/vitest";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
-import { RelayRepositoryId } from "@t3tools/contracts/relay";
+import { RelayMachineId, RelayRepositoryId } from "@t3tools/contracts/relay";
 import {
+  WorkflowConflictError,
   WorkflowInvalidError,
   WorkflowSubmissionPendingError,
   type RepositoryWorkflow,
@@ -108,7 +109,24 @@ const job: RepositoryWorkflowJob = {
 };
 const read = vi.fn<() => Promise<RepositoryWorkflowJob>>();
 const call: Props["call"] = async <A,>() => (await read()) as A;
-const base: Props = { scope, workflow, projects: [], call };
+const checkout = {
+  environmentId: EnvironmentId.make("environment"),
+  projectId: ProjectId.make("project"),
+  machineId: RelayMachineId.make("machine"),
+  machineLabel: "Build machine",
+  title: "Workflow checkout",
+  repositoryCanonicalKey: "github.com/launchpad/example",
+  createdAt: "now",
+  updatedAt: "now",
+  catalogUpdatedAt: "now",
+} satisfies Props["projects"][number];
+const base: Props = {
+  scope,
+  workflow,
+  projects: [checkout],
+  call,
+  refreshWorkflow: async () => {},
+};
 const key = workflowSessionKey(scope, workflow.workflowId);
 const otherKey = workflowSessionKey(scope, otherWorkflow.workflowId);
 const draft = () => appAtomRegistry.get(workflowDraftAtom).runs[key]!;
@@ -229,6 +247,59 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
+describe("Machine checkout readiness", () => {
+  it.each([true, false])(
+    "keeps instructions and offers role-appropriate checkout recovery (%s)",
+    async (canConfigure) => {
+      await mount({ ...base, projects: [], canConfigure });
+
+      expect(alertText()).toContain("Machine checkout unavailable");
+      expect(button("Run workflow")).toBeUndefined();
+      expect(renderer!.root.findByType("textarea").props).toMatchObject({
+        value: "Run A",
+        readOnly: true,
+      });
+      if (canConfigure) {
+        await press("Change checkout");
+        expect(navigate).toHaveBeenCalledExactlyOnceWith({
+          to: "/workflows/$repositoryId/$workflowId/edit",
+          params: { repositoryId: scope.repositoryId, workflowId: workflow.workflowId },
+          search: { settings: "execution" },
+        });
+      } else {
+        expect(button("Change checkout")).toBeUndefined();
+        expect(alertText()).toContain("Ask a repository maintainer");
+      }
+      expect(read).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retries a failed checkout read and preserves the draft for the restored form", async () => {
+    const refreshProjects = vi.fn();
+    await mount({
+      ...base,
+      projects: [],
+      projectsUnavailable: true,
+      canConfigure: true,
+      refreshProjects,
+    });
+
+    expect(alertText()).toContain("Could not load Machine checkouts");
+    expect(alertText()).not.toContain("Machine checkout unavailable");
+    expect(button("Change checkout")).toBeUndefined();
+    expect(button("Run workflow")).toBeUndefined();
+    await press("Retry loading checkouts");
+    expect(refreshProjects).toHaveBeenCalledOnce();
+    expect(read).not.toHaveBeenCalled();
+
+    await update(base);
+    expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+    expect(button("Run workflow").props.disabled).toBeFalsy();
+    await submit();
+    expect(read).toHaveBeenCalledOnce();
+  });
+});
+
 describe("Run receipt and navigation ownership", () => {
   it("lets the relay check VM publishing readiness and keeps instructions when blocked", async () => {
     const message = "Give the organization's GitHub App Contents write access.";
@@ -282,6 +353,7 @@ describe("Run receipt and navigation ownership", () => {
         workflowId: workflow.workflowId,
         instruction: "Run A",
         expectedTargetKind: "machine",
+        expectedRevision: workflow.revision,
       },
     });
     expect(alertText()).toContain(message);
@@ -586,7 +658,7 @@ describe("VM Run submission recovery", () => {
     });
   });
 
-  it.each(["archived", "gated"] as const)(
+  it.each(["archived", "gated", "checkout removed"] as const)(
     "keeps the Machine history shortcut after the form becomes %s",
     async (condition) => {
       read.mockRejectedValueOnce(new Error("Reply lost"));
@@ -595,7 +667,9 @@ describe("VM Run submission recovery", () => {
       await edit("");
       await update({
         ...base,
-        workflow: condition === "archived" ? { ...workflow, archived: true } : vmWorkflow,
+        ...(condition === "checkout removed"
+          ? { projects: [] }
+          : { workflow: condition === "archived" ? { ...workflow, archived: true } : vmWorkflow }),
       });
 
       expect(renderer!.root.findAllByType("form")).toHaveLength(0);
@@ -610,7 +684,7 @@ describe("VM Run submission recovery", () => {
     },
   );
 
-  it.each(["enabled", "gate closed", "Machine target", "archived"] as const)(
+  it.each(["enabled", "gate closed", "Machine target", "archived", "newer revision"] as const)(
     "recovers the captured VM request after reopening with %s and keeps newer instructions",
     async (condition) => {
       const { call, runWorkflow } = captureSubmissions();
@@ -626,6 +700,7 @@ describe("VM Run submission recovery", () => {
         workflowId: workflow.workflowId,
         instruction: "Run A",
         expectedTargetKind: "vm",
+        expectedRevision: vmWorkflow.revision,
         requestId: expect.any(String),
       });
       await edit("Instructions for a separate run");
@@ -635,6 +710,7 @@ describe("VM Run submission recovery", () => {
         ...(condition === "gate closed" ? { vmExecutionAvailable: false } : {}),
         ...(condition === "Machine target" ? { workflow } : {}),
         ...(condition === "archived" ? { workflow: { ...vmWorkflow, archived: true } } : {}),
+        ...(condition === "newer revision" ? { workflow: { ...vmWorkflow, revision: 2 } } : {}),
       });
       if (condition === "gate closed" || condition === "archived") {
         expect(renderer!.root.findAllByType("form")).toHaveLength(0);
@@ -849,6 +925,7 @@ describe("VM Run submission recovery", () => {
         workflowId: workflow.workflowId,
         instruction: "A different run",
         expectedTargetKind: targetKind,
+        expectedRevision: workflow.revision,
         ...(targetKind === "vm" ? { requestId: expect.any(String) } : {}),
       });
       expect(replacement.requestId).not.toBe(original.requestId);
@@ -1081,6 +1158,130 @@ describe("VM Run submission recovery", () => {
       expect(draft().startedJobId).toBe(job.jobId);
     },
   );
+
+  it.each(["base branch", "execution target", "archive"] as const)(
+    "moves focus to the refreshed Run heading when the saved workflow changes (%s)",
+    async (change) => {
+      const { call, runWorkflow } = captureSubmissions();
+      const refreshWorkflow = vi.fn(async () => {});
+      read.mockRejectedValueOnce(
+        new ManagedRelay.ManagedRelayRequestFailedError({
+          action: "runWorkflow",
+          cause: new WorkflowConflictError({
+            message: "The saved workflow changed.",
+            workflowRevision: 2,
+          }),
+        }),
+      );
+      const initial = {
+        ...base,
+        workflow: vmWorkflow,
+        vmExecutionAvailable: true,
+        call,
+        refreshWorkflow,
+      };
+      const body = {};
+      const ownerDocument: { activeElement: object; body: object } = { activeElement: body, body };
+      let start: object | undefined;
+      const focusHeading = vi.fn();
+      let renderedHeading: object | undefined;
+      let headings = 0;
+      await mount(initial, false, {
+        createNodeMock(element) {
+          if (element.type === "h1") {
+            headings += 1;
+            const heading = {
+              ownerDocument,
+              focus: () => {
+                focusHeading();
+                ownerDocument.activeElement = heading;
+              },
+            };
+            renderedHeading = heading;
+            return heading;
+          }
+          if (element.type === "button" && (element.props as { type?: string }).type === "submit") {
+            const button = { ownerDocument, contains: (node: object) => node === button };
+            start = button;
+            return button;
+          }
+          return null;
+        },
+      });
+      ownerDocument.activeElement = start ?? body;
+      await submit();
+
+      expect(refreshWorkflow).toHaveBeenCalledOnce();
+      expect(alertText()).toContain("Saved workflow changed");
+      expect(draft()).toMatchObject({ instruction: "Run A", operation: null });
+      await submit();
+      expect(runWorkflow).toHaveBeenCalledTimes(1);
+
+      await update({
+        ...initial,
+        workflow: {
+          ...vmWorkflow,
+          archived: change === "archive",
+          revision: 2,
+          definition: {
+            ...vmWorkflow.definition,
+            target:
+              change === "execution target"
+                ? workflow.definition.target
+                : { kind: "vm", baseBranch: "release/2.x" },
+          },
+        },
+      });
+      expect(headings).toBe(change === "base branch" ? 1 : 2);
+      expect(focusHeading).toHaveBeenCalledOnce();
+      expect(ownerDocument.activeElement).toBe(renderedHeading);
+      expect(renderer!.root.findByType("textarea").props.value).toBe("Run A");
+      expect(runWorkflow).toHaveBeenCalledTimes(1);
+      if (change === "archive") {
+        expect(alertText()).toContain("Workflow archived");
+        expect(button("Run workflow")).toBeUndefined();
+        return;
+      }
+
+      expect(alertText()).toContain("Review the updated workflow");
+      expect(visibleText(renderer!.root)).toContain(
+        change === "execution target" ? "Build machine / Workflow checkout" : "release/2.x",
+      );
+      expect(renderer!.root.findByType("details").props.open).toBe(true);
+
+      await submit();
+      expect(runWorkflow.mock.calls[1]?.[0].payload).toMatchObject({
+        expectedRevision: 2,
+        instruction: "Run A",
+      });
+      expect(navigate).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("checks an earlier VM submission without a captured revision for a receipt only", async () => {
+    const { call, runWorkflow } = captureSubmissions();
+    const operation = {
+      requestId: "legacy-submission",
+      state: "uncertain",
+      instruction: "Run A",
+      targetKind: "vm",
+    } as const;
+    updateWorkflowDrafts(appAtomRegistry, scope.accountId, (state) => ({
+      ...state,
+      runs: { ...state.runs, [key]: { ...state.runs[key]!, operation } },
+    }));
+    await mount({ ...base, workflow: vmWorkflow, vmExecutionAvailable: true, call });
+    await press("Check previous submission");
+
+    expect(runWorkflow.mock.calls[0]?.[0].payload).toEqual({
+      workflowId: workflow.workflowId,
+      expectedTargetKind: "vm",
+      instruction: "Run A",
+      requestId: operation.requestId,
+      replayOnly: true,
+    });
+    expect(navigate).toHaveBeenCalledOnce();
+  });
 
   it("lets a first VM preflight rejection keep the instructions for a fresh submission", async () => {
     const { call, runWorkflow } = captureSubmissions();

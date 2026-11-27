@@ -87,7 +87,7 @@ import {
   editWorkflowDraft,
   selectWorkflowStep,
   savedWorkflowDraft,
-  restoreCheckoutIssue,
+  workflowMachineCheckoutIssue,
   hasWorkflowRunSubmission,
   newWorkflowDraft,
   saveWorkflowDraft,
@@ -699,7 +699,7 @@ function WorkflowBuilderEditor({
       return;
     const restoreBlocked = () =>
       baseline.archived &&
-      !!restoreCheckoutIssue(
+      !!workflowMachineCheckoutIssue(
         baseline,
         restoreCatalog.current.projects,
         restoreCatalog.current.projectsUnavailable,
@@ -1250,7 +1250,7 @@ function WorkflowBuilderWorkspace({
         : (checkoutWarning ?? "Machine checkouts could not be loaded")
     : "Choose an execution target";
   const restoreIssue = draft.baseline?.archived
-    ? restoreCheckoutIssue(draft.baseline, projects, projectsUnavailable)
+    ? workflowMachineCheckoutIssue(draft.baseline, projects, projectsUnavailable)
     : null;
   const restoreWarning =
     restoreIssue === "unavailable"

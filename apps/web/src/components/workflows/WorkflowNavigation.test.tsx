@@ -31,7 +31,14 @@ vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => fixture.p
 vi.mock("../../cloud/publicConfig", () => ({ hasCloudPublicConfig: () => true }));
 vi.mock("../../cloud/managedRelayState", () => ({
   useManagedRelayOrganizationCatalog: () => ({
-    data: { repositories: [{ repository: { ...fixture.origin, name: "repository" } }] },
+    data: {
+      membership: {
+        userId: origin.accountId,
+        organization: { organizationId: origin.organizationId },
+        role: "member",
+      },
+      repositories: [{ repository: { ...fixture.origin, name: "repository" } }],
+    },
   }),
 }));
 vi.mock("./workflowState", () => ({

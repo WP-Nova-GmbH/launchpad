@@ -103,6 +103,10 @@ export function useWorkflowConversation({
     environmentId,
     title: job?.workflow?.definition.name ?? threadTitle ?? "Workflow run",
     repository: repository.name,
+    organizationAdmin:
+      catalog.data?.membership.userId === origin.accountId &&
+      catalog.data.membership.organization.organizationId === origin.organizationId &&
+      catalog.data.membership.role === "admin",
     job,
     readOnly: readOnly && !followUp,
     followUp,

@@ -53,6 +53,7 @@ const waitingForCodex = {
 } as const;
 const codexReplaced = {
   state: "unavailable",
+  canRetry: false,
   detail:
     "The run’s original Codex connection is no longer available. Saved results are still available.",
 } as const;

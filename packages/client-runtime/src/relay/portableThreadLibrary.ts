@@ -176,8 +176,11 @@ export interface PortableThreadIndexState {
   readonly relayUrl: string;
   readonly entries: ReadonlyArray<RelayPortableThreadSummary>;
   readonly next: string | null;
+  readonly loadedPages: number;
   readonly allowance?: RelayThreadVmAllowance;
 }
+type PortableThreadIndexRequest = { after?: string; preserveLoadedPages?: boolean };
+
 export interface PortableThreadDetailState {
   readonly session: ManagedRelaySession;
   readonly history: PortableThreadHistory;
@@ -263,18 +266,25 @@ export function createPortableThreadLibraryAtoms<R, E>(
   );
   const indexScheduler = createAtomCommandScheduler();
   const readIndex = Effect.fnUntraced(function* (
-    input: { after?: string },
+    input: PortableThreadIndexRequest,
     registry: AtomRegistry.AtomRegistry,
     complete = false,
   ) {
     const { relay, clerkToken, session, request: firstRead } = yield* authorize(registry);
-    const previous = registry.get(indexAtom);
+    const snapshot = registry.get(indexAtom);
+    const previous = snapshot?.relayUrl === relay.relayUrl ? snapshot : null;
     if (input.after !== undefined && previous?.next !== input.after)
       return yield* new OrchestrationDispatchCommandError({
         message: "Refresh the saved thread list before loading more.",
       });
     let after = input.after;
-    let entries = input.after === undefined ? [] : [...(previous?.entries ?? [])];
+    const entries = after === undefined ? [] : [...(previous?.entries ?? [])];
+    const initialPageCount = after === undefined ? 0 : (previous?.loadedPages ?? 0);
+    const retainedRange = after === undefined && input.preserveLoadedPages ? previous : null;
+    const previousBoundary =
+      retainedRange?.next ?? retainedRange?.entries.at(-1)?.placement.threadId;
+    let reachedBoundary = previousBoundary === undefined;
+    let pagesRead = 0;
     let state: PortableThreadIndexState;
     let request = firstRead;
     do {
@@ -283,6 +293,9 @@ export function createPortableThreadLibraryAtoms<R, E>(
         clerkToken,
         limit: 100,
         ...(after === undefined ? {} : { after }),
+        ...(previousBoundary === undefined || reachedBoundary
+          ? {}
+          : { boundary: previousBoundary }),
       });
       if (!isPortableThreadPlacementReadScopeCurrent(registry, session, relay.relayUrl))
         return null;
@@ -302,9 +315,20 @@ export function createPortableThreadLibraryAtoms<R, E>(
         relayUrl: relay.relayUrl,
         entries,
         next: page.next,
+        loadedPages: initialPageCount + ++pagesRead,
         ...(page.allowance ? { allowance: page.allowance } : {}),
       };
-      after = complete ? (page.next ?? undefined) : undefined;
+      // Let the relay compare against a boundary that may have been deleted. Older relays
+      // can still be refreshed by matching the boundary if it appears in the returned pages.
+      if (!reachedBoundary) {
+        reachedBoundary =
+          page.reachedBoundary ??
+          (page.next === previousBoundary ||
+            page.entries.some((entry) => entry.placement.threadId === previousBoundary));
+      }
+      const readMore =
+        complete || !reachedBoundary || pagesRead < (retainedRange?.loadedPages ?? 1);
+      after = readMore ? (page.next ?? undefined) : undefined;
       if (after !== undefined)
         request = beginPortableThreadPlacementRead(registry, session, relay.relayUrl);
     } while (after !== undefined);
@@ -334,8 +358,8 @@ export function createPortableThreadLibraryAtoms<R, E>(
   const loadIndex = createRuntimeCommand(runtime, {
     label: "read portable threads",
     scheduler: indexScheduler,
-    concurrency: { mode: "serial", key: (_input: { after?: string }) => "index" },
-    execute: Effect.fnUntraced(function* (input: { after?: string }, registry) {
+    concurrency: { mode: "serial", key: (_input: PortableThreadIndexRequest) => "index" },
+    execute: Effect.fnUntraced(function* (input: PortableThreadIndexRequest, registry) {
       return yield* readIndex(input, registry);
     }),
   });

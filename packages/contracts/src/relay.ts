@@ -4322,6 +4322,7 @@ const RelayThreadHistoryGroup = HttpApiGroup.make("threadHistory")
       headers: RelayBearerRequestHeaders,
       query: Schema.Struct({
         after: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(191))),
+        boundary: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(191))),
         limit: Schema.NumberFromString.check(
           Schema.isInt(),
           Schema.isBetween({ minimum: 1, maximum: 100 }),

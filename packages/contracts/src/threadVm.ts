@@ -288,6 +288,7 @@ export const RelayPortableThreadSummary = Schema.Struct({
 export type RelayPortableThreadSummary = typeof RelayPortableThreadSummary.Type;
 export const RelayPortableThreadPage = Schema.Struct({
   entries: Schema.Array(RelayPortableThreadSummary),
+  reachedBoundary: Schema.optionalKey(Schema.Boolean),
   allowance: Schema.optionalKey(RelayThreadVmAllowance),
   next: Schema.NullOr(TrimmedNonEmptyString),
 });

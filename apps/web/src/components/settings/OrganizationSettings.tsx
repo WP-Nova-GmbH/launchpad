@@ -1,4 +1,5 @@
 import { RepositorySourcesButton } from "../workflows/WorkflowSources";
+import { RemoveRepositoryButton } from "./RemoveRepositoryButton";
 import { WorkflowSourcesSettings } from "./WorkflowSources";
 import {
   BuildingIcon,
@@ -126,8 +127,16 @@ const MACHINE_ROLE_LABELS: Readonly<Record<RelayMachineRole, string>> = {
  * so is cheaper than someone looking for a registered repository under
  * Connections, Source Control, and Projects in turn.
  */
-function SectionNote({ children }: { children: ReactNode }) {
-  return <p className="px-3 py-3 text-sm text-muted-foreground sm:px-4">{children}</p>;
+function SectionNote({ children, id }: { children: ReactNode; id?: string }) {
+  return (
+    <p
+      id={id}
+      tabIndex={id ? -1 : undefined}
+      className="px-3 py-3 text-sm text-muted-foreground sm:px-4"
+    >
+      {children}
+    </p>
+  );
 }
 
 function RoleBadge({ children }: { children: string }) {
@@ -406,16 +415,17 @@ function MembersSection({ state }: { state: OrganizationAdminState }) {
 function RepositoryRow({
   entry,
   state,
-  canConfigure,
+  isAdmin,
   members,
   access,
 }: {
   entry: RelayRepositorySummary;
   state: OrganizationAdminState;
-  canConfigure: boolean;
+  isAdmin: boolean;
   members: ReadonlyArray<RelayOrganizationMember>;
   access: ReadonlyArray<RelayRepositoryAccessEntry>;
 }) {
+  const canConfigure = isAdmin || entry.role === "maintainer";
   const [alias, setAlias] = useState("");
   const [grantUserId, setGrantUserId] = useState("");
   const [grantRole, setGrantRole] = useState<RelayRepositoryRole>("developer");
@@ -428,16 +438,12 @@ function RepositoryRow({
         entry.role ? `Your role: ${REPOSITORY_ROLE_LABELS[entry.role]}` : "No role of your own"
       }
       control={
-        canConfigure ? (
-          <Button
-            size="icon-sm"
-            variant="ghost"
-            aria-label={`Remove ${entry.repository.name}`}
+        isAdmin ? (
+          <RemoveRepositoryButton
+            repository={entry.repository}
             disabled={state.busy}
-            onClick={() => void state.deleteRepository(repositoryId)}
-          >
-            <TrashIcon />
-          </Button>
+            onRemove={state.deleteRepository}
+          />
         ) : null
       }
     >
@@ -1406,7 +1412,7 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
       title={searchableSetting("organization-repositories").title}
       icon={<FolderGit2Icon className="size-4 text-muted-foreground" />}
     >
-      <SectionNote>
+      <SectionNote id="organization-repositories-description">
         A repository here is the organization&apos;s record of a codebase, recognised by its git
         remote. Registering one does not check anything out — it decides who may work in it and lets
         any checkout on any machine be recognised as the same repository.
@@ -1431,7 +1437,7 @@ function RepositoriesSection({ state }: { state: OrganizationAdminState }) {
             key={entry.repository.repositoryId}
             entry={entry}
             state={state}
-            canConfigure={isAdmin || entry.role === "maintainer"}
+            isAdmin={isAdmin}
             members={snapshot.members}
             access={snapshot.access.get(entry.repository.repositoryId) ?? []}
           />
@@ -1844,7 +1850,12 @@ function ConfiguredOrganizationSettings() {
           ) : null}
           <ProviderAccountsSection state={state} />
           <SkillsSection state={state} />
-          <RepositoriesSection state={state} />
+          {state.snapshot && state.snapshot.membership.userId === userId ? (
+            <RepositoriesSection
+              key={`${userId}:${state.snapshot.membership.organization.organizationId}`}
+              state={state}
+            />
+          ) : null}
           {state.snapshot ? (
             <ThreadVmPolicySettings
               isAdmin={state.snapshot.membership.role === "admin"}
